@@ -76,7 +76,7 @@ func ResolveEntry(input string) (Resolved, error) {
 			if !shortName(seg) {
 				return Resolved{}, fmt.Errorf("%w: the second segment is neither a uid nor a short name", ErrInvalidName)
 			}
-			uid, err := uidResolverSeam(seg)
+			uid, err := resolveUID(seg)
 			if err != nil {
 				return Resolved{}, fmt.Errorf("%w: user %s does not resolve to a uid: %w", ErrInvalidName, seg, err)
 			}

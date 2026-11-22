@@ -33,6 +33,7 @@ func FuzzResolveEntry(f *testing.F) {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, in string) {
+		setSeam(t, &timerSeam, neverFires)
 		setSeam(t, &uidResolverSeam, func(name string) (uint32, error) {
 			switch name {
 			case "alice":

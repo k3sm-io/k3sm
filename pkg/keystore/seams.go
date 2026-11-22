@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os/user"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -48,44 +49,121 @@ const generatedUIDDeadline = 250 * time.Millisecond
 // FFFFEEEE-DDDD-CCCC-BBBB-AAAA followed by the uid in hex. It is no answer.
 var synthesizedGUIDPrefix = []byte{0xFF, 0xFF, 0xEE, 0xEE, 0xDD, 0xDD, 0xCC, 0xCC, 0xBB, 0xBB, 0xAA, 0xAA}
 
+// maxOutstandingLookups bounds the GeneratedUID lookups outstanding at once,
+// across uids. A lookup past its deadline cannot be cancelled and holds an
+// OS thread until the call returns, so without a bound a directory service
+// that never answers would pin a thread per request.
+const maxOutstandingLookups = 8
+
+// flight is one outstanding GeneratedUID lookup, which every concurrent
+// caller for its uid joins.
+type flight struct {
+	// done is closed once the lookup returned and left lookups.inflight;
+	// g and err are set before it is closed.
+	done chan struct{}
+	// expired is closed by the caller that started the lookup once its
+	// deadline passed: a later caller then fails closed at once.
+	expired chan struct{}
+	g       [generationSize]byte
+	err     error
+}
+
+// lookups holds the outstanding lookups, at most one per uid.
+var lookups = struct {
+	mu       sync.Mutex
+	inflight map[uint32]*flight
+}{inflight: map[uint32]*flight{}}
+
 // lookupGeneratedUID reads uid's live GeneratedUID through the seam, within
 // generatedUIDDeadline. A lookup past the deadline, an error, a synthesized
 // answer and an all-zero one each fail closed with ErrScopeOwnerUnknown: a
 // directory service that is slow or not up yet must never read as a
 // changed owner, and nothing in the scope may open on a guess.
 //
-// The real lookup cannot be cancelled, so a lookup past the deadline is
-// abandoned: its goroutine ends when the call returns, and its answer is
-// dropped into a buffered channel nobody reads.
+// At most one lookup per uid is outstanding: a caller that finds one joins
+// it, and once that lookup is past its deadline every later caller for the
+// uid fails closed at once and starts none. At most maxOutstandingLookups
+// are outstanding across uids; past that a new uid fails closed at once. A
+// lookup past its deadline is abandoned, not cancelled (the real call
+// cannot be): it leaves the table when the call returns.
 func lookupGeneratedUID(uid uint32) ([generationSize]byte, error) {
-	type answer struct {
-		g   [generationSize]byte
-		err error
+	var zero [generationSize]byte
+	lookups.mu.Lock()
+	if f, ok := lookups.inflight[uid]; ok {
+		lookups.mu.Unlock()
+		select {
+		case <-f.done:
+			return checkGeneratedUID(uid, f.g, f.err)
+		case <-f.expired:
+			return zero, fmt.Errorf("%w: an earlier GeneratedUID lookup for uid %d is still outstanding past its %s deadline", ErrScopeOwnerUnknown, uid, generatedUIDDeadline)
+		}
 	}
+	if len(lookups.inflight) >= maxOutstandingLookups {
+		lookups.mu.Unlock()
+		return zero, fmt.Errorf("%w: %d GeneratedUID lookups are already outstanding", ErrScopeOwnerUnknown, maxOutstandingLookups)
+	}
+	f := &flight{done: make(chan struct{}), expired: make(chan struct{})}
+	lookups.inflight[uid] = f
+	lookups.mu.Unlock()
 	// The seam is read here, not in the goroutine, which may outlive the
 	// call and so must not read a package variable after it returns.
 	lookup := generatedUIDSeam
 	expired, stop := timerSeam(generatedUIDDeadline)
 	defer stop()
-	ch := make(chan answer, 1)
 	go func() {
 		g, err := lookup(uid)
-		ch <- answer{g, err}
+		lookups.mu.Lock()
+		f.g, f.err = g, err
+		delete(lookups.inflight, uid)
+		lookups.mu.Unlock()
+		close(f.done)
 	}()
+	select {
+	case <-f.done:
+		return checkGeneratedUID(uid, f.g, f.err)
+	case <-expired:
+		close(f.expired)
+		return zero, fmt.Errorf("%w: the GeneratedUID lookup for uid %d did not answer within %s", ErrScopeOwnerUnknown, uid, generatedUIDDeadline)
+	}
+}
+
+// checkGeneratedUID judges a lookup's answer: an error, a synthesized
+// GeneratedUID or an all-zero one is ErrScopeOwnerUnknown.
+func checkGeneratedUID(uid uint32, g [generationSize]byte, err error) ([generationSize]byte, error) {
 	var zero [generationSize]byte
+	switch {
+	case err != nil:
+		return zero, fmt.Errorf("%w: the GeneratedUID lookup for uid %d failed: %w", ErrScopeOwnerUnknown, uid, err)
+	case bytes.HasPrefix(g[:], synthesizedGUIDPrefix):
+		return zero, fmt.Errorf("%w: uid %d has no directory record (the lookup synthesized its GeneratedUID)", ErrScopeOwnerUnknown, uid)
+	case g == zero:
+		return zero, fmt.Errorf("%w: the GeneratedUID lookup for uid %d answered all zeros", ErrScopeOwnerUnknown, uid)
+	}
+	return g, nil
+}
+
+// resolveUID resolves a short name through the uid resolver within
+// generatedUIDDeadline, the same deadline as the GeneratedUID lookup; past
+// it the resolution fails. Like that lookup, a call past the deadline is
+// abandoned, not cancelled.
+func resolveUID(name string) (uint32, error) {
+	type answer struct {
+		uid uint32
+		err error
+	}
+	resolve := uidResolverSeam // read before the goroutine, as in lookupGeneratedUID
+	expired, stop := timerSeam(generatedUIDDeadline)
+	defer stop()
+	ch := make(chan answer, 1)
+	go func() {
+		uid, err := resolve(name)
+		ch <- answer{uid, err}
+	}()
 	select {
 	case a := <-ch:
-		switch {
-		case a.err != nil:
-			return zero, fmt.Errorf("%w: the GeneratedUID lookup for uid %d failed: %w", ErrScopeOwnerUnknown, uid, a.err)
-		case bytes.HasPrefix(a.g[:], synthesizedGUIDPrefix):
-			return zero, fmt.Errorf("%w: uid %d has no directory record (the lookup synthesized its GeneratedUID)", ErrScopeOwnerUnknown, uid)
-		case a.g == zero:
-			return zero, fmt.Errorf("%w: the GeneratedUID lookup for uid %d answered all zeros", ErrScopeOwnerUnknown, uid)
-		}
-		return a.g, nil
+		return a.uid, a.err
 	case <-expired:
-		return zero, fmt.Errorf("%w: the GeneratedUID lookup for uid %d did not answer within %s", ErrScopeOwnerUnknown, uid, generatedUIDDeadline)
+		return 0, fmt.Errorf("the account lookup did not answer within %s", generatedUIDDeadline)
 	}
 }
 

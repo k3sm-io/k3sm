@@ -194,6 +194,12 @@ var (
 	// synthesized value for a uid with no directory record. Nothing in the
 	// scope opens and no scope key is minted.
 	ErrScopeOwnerUnknown = errors.New("the user scope's owner could not be confirmed: the uid's GeneratedUID lookup failed, timed out or found no directory record, so nothing in the scope was opened or created")
+	// ErrRewrapInProgress is a user scope's refusal to write while a Rewrap is
+	// half done: master.next, or its fingerprint, is in the master directory.
+	// The user path never completes a swap or mints a master, and a .user it
+	// created would refuse Rewrap's resume, so it changes nothing until root
+	// finishes the rewrap.
+	ErrRewrapInProgress = errors.New("a keystore rewrap is in progress: root must finish it (run rewrap again) before a user scope can be written; nothing was changed")
 	// ErrRewrapResumed reports that Rewrap found an earlier, interrupted
 	// rewrap whose new key was already live for some record, completed it
 	// under that key rather than the one supplied, and stopped. The master is

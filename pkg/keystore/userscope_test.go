@@ -89,14 +89,14 @@ func copyTree(t *testing.T, src, dst string) {
 // with ErrScopeOwnerChanged.
 func TestScopeKeyGeneratedUIDMismatch(t *testing.T) {
 	ctx := context.Background()
-	s, server := newTestStore(t)
+	s, server := newMasteredStore(t)
 	owner := guid(0xA1)
-	table := map[uint32][generationSize]byte{501: owner}
+	table := map[uint32][generationSize]byte{1001: owner}
 	fakeGUIDs(t, table)
-	u := userScope(t, s, 501)
-	userPut(t, u, "user/501/token", "first value")
+	u := userScope(t, s, 1001)
+	userPut(t, u, "user/1001/token", "first value")
 
-	b, err := os.ReadFile(filepath.Join(scopeDir(server, "501"), scopeKeyName))
+	b, err := os.ReadFile(filepath.Join(scopeDir(server, "1001"), scopeKeyName))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,41 +114,41 @@ func TestScopeKeyGeneratedUIDMismatch(t *testing.T) {
 	if !bytes.Equal(k.wrap, hmacSHA256(mustMaster(t, server), []byte(scopeWrapLabel))) {
 		t.Fatal("the wrap key is not HMAC(M, k3sm-keystore-scope-wrap-v1)")
 	}
-	pt, err := r.open(k.wrap, "user/501")
+	pt, err := r.open(k.wrap, "user/1001")
 	if err != nil || len(pt) != scopeKeySize {
 		t.Fatalf("scope.key under W: %d bytes, %v; want %d bytes", len(pt), err, scopeKeySize)
 	}
-	if _, err := r.open(k.seal, "user/501"); !errors.Is(err, ErrCorrupt) {
+	if _, err := r.open(k.seal, "user/1001"); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("scope.key opened under the system seal key: %v", err)
 	}
-	if _, err := r.open(k.wrap, "user/502"); !errors.Is(err, ErrCorrupt) {
+	if _, err := r.open(k.wrap, "user/1002"); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("scope.key opened as another scope: %v", err)
 	}
 
 	// The uid now names another account: nothing in the scope opens, and
 	// nothing is minted over it.
-	table[501] = guid(0xB2)
-	if _, _, err := u.Current(ctx, "user/501/token"); !errors.Is(err, ErrScopeOwnerChanged) {
+	table[1001] = guid(0xB2)
+	if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, ErrScopeOwnerChanged) {
 		t.Fatalf("Current with a changed owner: %v, want ErrScopeOwnerChanged", err)
 	}
 	if _, err := u.List(ctx); !errors.Is(err, ErrScopeOwnerChanged) {
 		t.Fatalf("List with a changed owner: %v, want ErrScopeOwnerChanged", err)
 	}
-	if _, err := u.Put(ctx, "user/501/other", KindOpaque, []byte("x")); !errors.Is(err, ErrScopeOwnerChanged) {
+	if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("x")); !errors.Is(err, ErrScopeOwnerChanged) {
 		t.Fatalf("Put with a changed owner: %v, want ErrScopeOwnerChanged", err)
 	}
-	if after, err := os.ReadFile(filepath.Join(scopeDir(server, "501"), scopeKeyName)); err != nil || !bytes.Equal(after, b) {
+	if after, err := os.ReadFile(filepath.Join(scopeDir(server, "1001"), scopeKeyName)); err != nil || !bytes.Equal(after, b) {
 		t.Fatalf("scope.key changed after a refused Put: %v", err)
 	}
 
 	// A synthesized answer is not a changed owner.
-	table[501] = synthesizedGUID(501)
-	if _, _, err := u.Current(ctx, "user/501/token"); !errors.Is(err, ErrScopeOwnerUnknown) || errors.Is(err, ErrScopeOwnerChanged) {
+	table[1001] = synthesizedGUID(1001)
+	if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, ErrScopeOwnerUnknown) || errors.Is(err, ErrScopeOwnerChanged) {
 		t.Fatalf("Current with a synthesized GeneratedUID: %v, want ErrScopeOwnerUnknown", err)
 	}
 
-	table[501] = owner
-	if _, v, err := u.Current(ctx, "user/501/token"); err != nil || string(v) != "first value" {
+	table[1001] = owner
+	if _, v, err := u.Current(ctx, "user/1001/token"); err != nil || string(v) != "first value" {
 		t.Fatalf("Current with the owner back: %q, %v", v, err)
 	}
 }
@@ -181,7 +181,7 @@ func TestGeneratedUIDLookupDeadlineFailsClosed(t *testing.T) {
 	// deadline that has passed.
 	stall := func(t *testing.T) *time.Duration {
 		release := make(chan struct{})
-		t.Cleanup(func() { close(release) })
+		t.Cleanup(func() { close(release); waitLookupsIdle(t) })
 		setSeam(t, &generatedUIDSeam, func(uint32) ([generationSize]byte, error) {
 			<-release
 			return guid(0xA1), nil
@@ -193,7 +193,7 @@ func TestGeneratedUIDLookupDeadlineFailsClosed(t *testing.T) {
 
 	t.Run("past the deadline", func(t *testing.T) {
 		asked := stall(t)
-		if _, err := lookupGeneratedUID(501); !errors.Is(err, ErrScopeOwnerUnknown) {
+		if _, err := lookupGeneratedUID(1001); !errors.Is(err, ErrScopeOwnerUnknown) {
 			t.Fatalf("lookup past the deadline: %v, want ErrScopeOwnerUnknown", err)
 		}
 		if *asked != 250*time.Millisecond {
@@ -205,29 +205,29 @@ func TestGeneratedUIDLookupDeadlineFailsClosed(t *testing.T) {
 		setSeam(t, &generatedUIDSeam, func(uint32) ([generationSize]byte, error) {
 			return [generationSize]byte{}, errors.New("opendirectoryd is not up")
 		})
-		if _, err := lookupGeneratedUID(501); !errors.Is(err, ErrScopeOwnerUnknown) {
+		if _, err := lookupGeneratedUID(1001); !errors.Is(err, ErrScopeOwnerUnknown) {
 			t.Fatalf("lookup in error: %v, want ErrScopeOwnerUnknown", err)
 		}
 	})
 	t.Run("synthesized or zero", func(t *testing.T) {
 		for _, g := range [][generationSize]byte{synthesizedGUID(48213), synthesizedGUID(0), {}} {
-			fakeGUIDs(t, map[uint32][generationSize]byte{501: g})
-			if _, err := lookupGeneratedUID(501); !errors.Is(err, ErrScopeOwnerUnknown) {
+			fakeGUIDs(t, map[uint32][generationSize]byte{1001: g})
+			if _, err := lookupGeneratedUID(1001); !errors.Is(err, ErrScopeOwnerUnknown) {
 				t.Fatalf("lookup answering %x: %v, want ErrScopeOwnerUnknown", g, err)
 			}
 		}
 	})
 	t.Run("in time", func(t *testing.T) {
-		fakeGUIDs(t, map[uint32][generationSize]byte{501: guid(0xA1)})
-		if g, err := lookupGeneratedUID(501); err != nil || g != guid(0xA1) {
+		fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
+		if g, err := lookupGeneratedUID(1001); err != nil || g != guid(0xA1) {
 			t.Fatalf("lookup in time: %x, %v", g, err)
 		}
 	})
 	t.Run("no mint past the deadline", func(t *testing.T) {
-		s, server := newTestStore(t)
+		s, server := newMasteredStore(t)
 		stall(t)
-		u := userScope(t, s, 501)
-		if _, err := u.Put(context.Background(), "user/501/token", KindOpaque, []byte("v")); !errors.Is(err, ErrScopeOwnerUnknown) {
+		u := userScope(t, s, 1001)
+		if _, err := u.Put(context.Background(), "user/1001/token", KindOpaque, []byte("v")); !errors.Is(err, ErrScopeOwnerUnknown) {
 			t.Fatalf("Put past the deadline: %v, want ErrScopeOwnerUnknown", err)
 		}
 		if _, err := os.Lstat(filepath.Join(server, "keystore", userScopesName)); !errors.Is(err, fs.ErrNotExist) {
@@ -235,12 +235,12 @@ func TestGeneratedUIDLookupDeadlineFailsClosed(t *testing.T) {
 		}
 	})
 	t.Run("nothing opens past the deadline", func(t *testing.T) {
-		s, _ := newTestStore(t)
-		fakeGUIDs(t, map[uint32][generationSize]byte{501: guid(0xA1)})
-		u := userScope(t, s, 501)
-		userPut(t, u, "user/501/token", "v")
+		s, _ := newMasteredStore(t)
+		fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
+		u := userScope(t, s, 1001)
+		userPut(t, u, "user/1001/token", "v")
 		stall(t)
-		if _, _, err := u.Current(context.Background(), "user/501/token"); !errors.Is(err, ErrScopeOwnerUnknown) {
+		if _, _, err := u.Current(context.Background(), "user/1001/token"); !errors.Is(err, ErrScopeOwnerUnknown) {
 			t.Fatalf("Current past the deadline: %v, want ErrScopeOwnerUnknown", err)
 		}
 		if _, err := u.List(context.Background()); !errors.Is(err, ErrScopeOwnerUnknown) {
@@ -254,23 +254,23 @@ func TestGeneratedUIDLookupDeadlineFailsClosed(t *testing.T) {
 // master it was wrapped under.
 func TestScopeCopyWithoutMasterOpensNothing(t *testing.T) {
 	ctx := context.Background()
-	table := map[uint32][generationSize]byte{501: guid(0xA1), 502: guid(0xB2)}
-	a, serverA := newTestStore(t)
+	table := map[uint32][generationSize]byte{1001: guid(0xA1), 1002: guid(0xB2)}
+	a, serverA := newMasteredStore(t)
 	fakeGUIDs(t, table)
-	u501 := userScope(t, a, 501)
-	userPut(t, u501, "user/501/token", "the value")
-	u502 := userScope(t, a, 502)
-	userPut(t, u502, "user/502/mine", "502's value")
+	u501 := userScope(t, a, 1001)
+	userPut(t, u501, "user/1001/token", "the value")
+	u502 := userScope(t, a, 1002)
+	userPut(t, u502, "user/1002/mine", "1002's value")
 
 	// Another keystore, its own master, the same uid and owner.
-	b, serverB := newTestStore(t)
+	b, serverB := newMasteredStore(t)
 	mustPut(t, b, "system-entry", KindOpaque, []byte("x"))
 	if err := os.Mkdir(filepath.Join(serverB, "keystore", userScopesName), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	copyTree(t, scopeDir(serverA, "501"), scopeDir(serverB, "501"))
-	ub := userScope(t, b, 501)
-	if _, v, err := ub.Current(ctx, "user/501/token"); !errors.Is(err, ErrCorrupt) {
+	copyTree(t, scopeDir(serverA, "1001"), scopeDir(serverB, "1001"))
+	ub := userScope(t, b, 1001)
+	if _, v, err := ub.Current(ctx, "user/1001/token"); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("a copied scope opened under another master: %q, %v; want ErrCorrupt", v, err)
 	}
 	if _, err := ub.List(ctx); !errors.Is(err, ErrCorrupt) {
@@ -278,22 +278,22 @@ func TestScopeCopyWithoutMasterOpensNothing(t *testing.T) {
 	}
 
 	// One user's entry moved into another user's scope does not open there.
-	copyTree(t, filepath.Join(scopeDir(serverA, "501"), scopeEntriesName, "token"), filepath.Join(scopeDir(serverA, "502"), scopeEntriesName, "token"))
-	if _, v, err := u502.Current(ctx, "user/502/token"); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("501's record opened in 502's scope: %q, %v; want ErrCorrupt", v, err)
+	copyTree(t, filepath.Join(scopeDir(serverA, "1001"), scopeEntriesName, "token"), filepath.Join(scopeDir(serverA, "1002"), scopeEntriesName, "token"))
+	if _, v, err := u502.Current(ctx, "user/1002/token"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("1001's record opened in 1002's scope: %q, %v; want ErrCorrupt", v, err)
 	}
 
 	// Nor does one user's scope.key in another's place.
-	k501, err := os.ReadFile(filepath.Join(scopeDir(serverA, "501"), scopeKeyName))
+	k501, err := os.ReadFile(filepath.Join(scopeDir(serverA, "1001"), scopeKeyName))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(scopeDir(serverA, "502"), scopeKeyName), k501, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(scopeDir(serverA, "1002"), scopeKeyName), k501, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	table[502] = table[501]
-	if _, v, err := u502.Current(ctx, "user/502/token"); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("501's scope.key opened as 502's: %q, %v; want ErrCorrupt", v, err)
+	table[1002] = table[1001]
+	if _, v, err := u502.Current(ctx, "user/1002/token"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("1001's scope.key opened as 1002's: %q, %v; want ErrCorrupt", v, err)
 	}
 }
 
@@ -301,14 +301,14 @@ func TestScopeCopyWithoutMasterOpensNothing(t *testing.T) {
 // equality oracle across users.
 func TestFingerprintsDifferAcrossScopes(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newTestStore(t)
-	fakeGUIDs(t, map[uint32][generationSize]byte{501: guid(0xA1), 502: guid(0xB2)})
+	s, _ := newMasteredStore(t)
+	fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1), 1002: guid(0xB2)})
 	const value = "the same low-entropy value"
 	sys := mustPut(t, s, "same", KindOpaque, []byte(value))
-	v501 := userPut(t, userScope(t, s, 501), "user/501/same", value)
-	v502 := userPut(t, userScope(t, s, 502), "user/502/same", value)
+	v501 := userPut(t, userScope(t, s, 1001), "user/1001/same", value)
+	v502 := userPut(t, userScope(t, s, 1002), "user/1002/same", value)
 	seen := map[string]string{}
-	for who, fp := range map[string]string{"system": sys.Fingerprint, "user/501": v501.Fingerprint, "user/502": v502.Fingerprint} {
+	for who, fp := range map[string]string{"system": sys.Fingerprint, "user/1001": v501.Fingerprint, "user/1002": v502.Fingerprint} {
 		if fp == "" {
 			t.Fatalf("%s has no fingerprint", who)
 		}
@@ -318,9 +318,9 @@ func TestFingerprintsDifferAcrossScopes(t *testing.T) {
 		seen[fp] = who
 	}
 	// List shows the same per-scope fingerprint Put returned.
-	l, err := userScope(t, s, 501).List(ctx)
+	l, err := userScope(t, s, 1001).List(ctx)
 	if err != nil || len(l) != 1 || l[0].Current.Fingerprint != v501.Fingerprint {
-		t.Fatalf("List of user/501: %+v, %v", l, err)
+		t.Fatalf("List of user/1001: %+v, %v", l, err)
 	}
 }
 
@@ -329,30 +329,39 @@ func TestFingerprintsDifferAcrossScopes(t *testing.T) {
 // nothing.
 func TestOtherUserIsNotFound(t *testing.T) {
 	ctx := context.Background()
-	s, server := newTestStore(t)
-	fakeGUIDs(t, map[uint32][generationSize]byte{501: guid(0xA1), 502: guid(0xB2)})
+	s, server := newMasteredStore(t)
+	fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1), 1002: guid(0xB2)})
 	mustPut(t, s, "sys", KindOpaque, []byte("system value"))
-	u501 := userScope(t, s, 501)
-	userPut(t, u501, "user/501/mine", "501's value")
-	userPut(t, userScope(t, s, 502), "user/502/theirs", "502's value")
+	u501 := userScope(t, s, 1001)
+	userPut(t, u501, "user/1001/mine", "1001's value")
+	userPut(t, userScope(t, s, 1002), "user/1002/theirs", "1002's value")
 
-	_, _, absent := u501.Current(ctx, "user/501/absent")
+	_, _, absent := u501.Current(ctx, "user/1001/absent")
 	if !errors.Is(absent, ErrNotFound) {
 		t.Fatalf("an absent entry of the caller's own: %v, want ErrNotFound", absent)
 	}
-	for _, name := range []string{"user/502/theirs", "user/502/absent", "system/sys", "system/absent", "user/503/x"} {
+	for _, name := range []string{"user/1002/theirs", "user/1002/absent", "system/sys", "system/absent", "user/1003/x"} {
 		_, v, err := u501.Current(ctx, name)
 		if !errors.Is(err, ErrNotFound) || err.Error() != absent.Error() {
-			t.Fatalf("Current %s as uid 501: %q, %v; want %q", name, v, err, absent)
+			t.Fatalf("Current %s as uid 1001: %q, %v; want %q", name, v, err, absent)
 		}
-		if _, err := u501.Put(ctx, name, KindOpaque, []byte("v")); !errors.Is(err, ErrNotFound) || strings.Contains(err.Error(), "50") || strings.Contains(err.Error(), "theirs") {
-			t.Fatalf("Put %s as uid 501: %v, want a bare ErrNotFound", name, err)
+		if _, err := u501.Put(ctx, name, KindOpaque, []byte("v")); !errors.Is(err, ErrNotFound) || strings.Contains(err.Error(), "100") || strings.Contains(err.Error(), "theirs") {
+			t.Fatalf("Put %s as uid 1001: %v, want a bare ErrNotFound", name, err)
 		}
 	}
-	if _, err := os.Lstat(scopeDir(server, "503")); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Lstat(scopeDir(server, "1003")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("a refused name created a scope: %v", err)
 	}
-	if _, v, err := userScope(t, s, 502).Current(ctx, "user/502/theirs"); err != nil || string(v) != "502's value" {
-		t.Fatalf("502's own entry: %q, %v", v, err)
+	if _, v, err := userScope(t, s, 1002).Current(ctx, "user/1002/theirs"); err != nil || string(v) != "1002's value" {
+		t.Fatalf("1002's own entry: %q, %v", v, err)
 	}
+}
+
+// newMasteredStore is newTestStore with the master already minted, as a
+// root put mints it: a user Put never does.
+func newMasteredStore(t *testing.T) (*FileStore, string) {
+	t.Helper()
+	s, server := newTestStore(t)
+	mustPut(t, s, "seed", KindOpaque, []byte("minted by a root put"))
+	return s, server
 }

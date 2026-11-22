@@ -43,10 +43,20 @@ import (
 //
 // Not here yet, and each the change named in the design: the delivery record
 // (kind 0xFD) and scope-key Rewrap (Rewrap refuses while .user exists until
-// then), quotas, and the user-scope floor. Until the user-scope floor lands,
-// a user entry's pointer is checked against no floor, so a copied-back older
-// pointer of a user entry is not refused; no caller outside this package
-// reaches the user scope until the socket does, after the floor.
+// then), quotas, and the user-scope floor.
+//
+// Until the user-scope floor lands, a user entry is read against no floor,
+// with two consequences. A copied-back older pointer of a user entry is not
+// refused. And an entry directory with no current pointer cannot be told
+// apart: the system scope's interrupted-put rule needs the floor to tell a
+// crashed Put (generation, maybe v1) from a committed entry whose current,
+// or current and v1, were unlinked, and without it the two shapes are the
+// same files. So the user scope treats every entry directory without a
+// current pointer as damage: ErrCorrupt, never ErrNotFound, and never
+// removed, a crashed user Put included (openUserEntry, createUserEntry). The
+// user-scope floor brings back the interrupted-put rule. No caller outside
+// this package reaches the user scope before the socket does, after the
+// floor (TestUserScopeIsUnexported).
 
 const (
 	// scopeKeyName is a scope's wrapped key, scopeEntriesName its entries'
@@ -63,6 +73,28 @@ const (
 	maxScopeKeyRecordSize = headerSize + len(scopeKeyRecordName) + scopeKeySize + tagSize
 )
 
+// The uids a user scope may belong to: the socket's eligible peers
+// (docs/design/keystore.md § "User scope", "The socket"). Below 501 are
+// system accounts; at 2^31 and above, nobody among them, no login user, and
+// a signed 32-bit reading would turn the uid negative.
+const (
+	minScopeUID = 501
+	maxScopeUID = 2147483647
+)
+
+// errIneligibleUID reports a uid that has no user scope.
+var errIneligibleUID = errors.New("the uid has no user scope: a user scope belongs to a login uid from 501 to 2147483647 that is not the service user's")
+
+// eligibleUID refuses a uid outside the eligible range, and the service
+// uid, which every native Pod shares. The socket refuses such a peer first;
+// this is the store's own layer.
+func (s *FileStore) eligibleUID(uid uint32) error {
+	if uid < minScopeUID || uid > maxScopeUID || uid == s.uid {
+		return fmt.Errorf("%w: uid %d", errIneligibleUID, uid)
+	}
+	return nil
+}
+
 // errNoScopeKey is a scope with no scope.key, or no directory for it: the one
 // absence a mutating operation mints over.
 var errNoScopeKey = fmt.Errorf("%w: no scope key", ErrScopeAbsent)
@@ -78,11 +110,15 @@ type UserScope struct {
 	scope string
 }
 
-// UserScope returns uid's view of the store. Uid 0 is refused: root has no
-// user scope.
+// UserScope returns uid's view of the store. A uid outside 501 to
+// 2147483647, or the service uid, is refused: root has no user scope, and
+// neither has a system account, nobody or the service user.
 func (s *FileStore) UserScope(uid uint32) (*UserScope, error) {
 	scope := userScopeOf(uid)
 	if err := checkScope(scope); err != nil {
+		return nil, err
+	}
+	if err := s.eligibleUID(uid); err != nil {
 		return nil, err
 	}
 	return &UserScope{s: s, uid: uid, scope: scope}, nil
@@ -118,7 +154,9 @@ func (u *UserScope) own(op, input string) (string, error) {
 
 // Put stores value as version 1 of input, minting the scope on the uid's
 // first mutating operation: the scope key is bound to the uid's live
-// GeneratedUID, and a lookup that fails mints nothing.
+// GeneratedUID, and a lookup that fails mints nothing. It never mints the
+// master, which root verbs create (ErrMasterMissing without one), and never
+// writes while a Rewrap is half done (ErrRewrapInProgress).
 func (u *UserScope) Put(ctx context.Context, input string, kind Kind, value []byte) (Version, error) {
 	v, err := u.put(ctx, input, kind, value)
 	if err != nil {
@@ -138,14 +176,17 @@ func (u *UserScope) put(ctx context.Context, input string, kind Kind, value []by
 	if err := checkValue(kind, value); err != nil {
 		return Version{}, err
 	}
-	root, done, err := u.s.openLocked(ctx, true, true)
+	// The entries' directory is never created here: a root put creates it
+	// with the master.
+	root, done, err := u.s.openLocked(ctx, false, true)
+	if errors.Is(err, fs.ErrNotExist) {
+		return Version{}, fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)
+	}
 	if err != nil {
 		return Version{}, err
 	}
 	defer done()
-	// The master is taken, or minted, before .user exists: the mint counts
-	// .user as an entry.
-	k, err := u.s.masterForPut(root)
+	k, err := u.masterForWrite()
 	if err != nil {
 		return Version{}, err
 	}
@@ -157,12 +198,88 @@ func (u *UserScope) put(ctx context.Context, input string, kind Kind, value []by
 		return Version{}, err
 	}
 	defer func() { _ = entries.Close() }() // writes are fsynced by writeFile
-	e, err := u.s.createEntry(entries, name, nil)
+	e, err := u.createUserEntry(entries, name)
 	if err != nil {
 		return Version{}, err
 	}
 	defer e.close()
 	return u.s.writeEntry(e, uk, kind, value)
+}
+
+// masterForWrite loads the master for a user-scope write, read-only: it
+// never mints a master and never completes a master swap, both root's. A
+// master.next or master.next.sha256 in the master directory is a Rewrap half
+// done, ErrRewrapInProgress: a .user created now would refuse its resume, and
+// a scope.key sealed now would be under a W the Rewrap is about to replace.
+// The caller holds the exclusive store lock, which Rewrap takes too.
+func (u *UserScope) masterForWrite() (keys, error) {
+	root, err := u.s.openMasterDir(false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return keys{}, ErrMasterMissing
+	}
+	if err != nil {
+		return keys{}, fmt.Errorf("%w: %w", ErrMasterUntrusted, err)
+	}
+	for _, n := range []string{masterNextName, masterNextFingerprintName} {
+		_, err := root.Lstat(n)
+		if err == nil {
+			_ = root.Close() // read-only
+			return keys{}, fmt.Errorf("%w (%s is present)", ErrRewrapInProgress, n)
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			_ = root.Close() // read-only
+			return keys{}, fmt.Errorf("check for %s: %w", n, err)
+		}
+	}
+	_ = root.Close() // read-only
+	return u.s.loadMaster()
+}
+
+// createUserEntry makes name's directory in entries with a fresh
+// generation. An existing directory is never removed: one with a current
+// pointer is ErrExists, and one without is damage (openUserEntry), since
+// without the user-scope floor a crashed Put cannot be told from a committed
+// entry whose pointer was unlinked.
+func (u *UserScope) createUserEntry(entries *os.Root, name string) (*entry, error) {
+	made, err := u.s.mkdirAt(entries, name)
+	if errors.Is(err, fs.ErrExist) {
+		e, oerr := openUserEntry(entries, name)
+		if oerr != nil {
+			return nil, oerr
+		}
+		e.close()
+		return nil, ErrExists
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create the entry directory: %w", err)
+	}
+	return u.s.initEntry(entries, name, made)
+}
+
+// errUserNoPointer is a user entry directory with no current pointer.
+var errUserNoPointer = fmt.Errorf("%w: the entry has no current pointer; until the user-scope floor lands an interrupted put cannot be told from a committed entry whose pointer was removed, so it is refused and kept, not removed", ErrCorrupt)
+
+// openUserEntry opens name's directory in a user scope's entries/ and reads
+// its generation. A missing directory is ErrNotFound; a directory with no
+// current pointer, whatever else it holds, is errUserNoPointer (ErrCorrupt,
+// never ErrNotFound).
+func openUserEntry(entries *os.Root, name string) (*entry, error) {
+	e, err := openEntryDirRaw(entries, name)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := e.root.Lstat(currentName); err != nil {
+		e.close()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, errUserNoPointer
+		}
+		return nil, err
+	}
+	if e.generation, err = readGeneration(e.root); err != nil {
+		e.close()
+		return nil, err
+	}
+	return e, nil
 }
 
 // Current returns the version input's pointer names, with its value.
@@ -176,7 +293,7 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 		return Version{}, nil, err
 	}
 	err = u.read(ctx, func(entries *os.Root, uk keys) error {
-		e, err := openEntry(entries, name, nil)
+		e, err := openUserEntry(entries, name)
 		if err != nil {
 			return err
 		}
@@ -209,7 +326,7 @@ func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 			if checkName(name) != nil {
 				continue
 			}
-			e, err := openEntry(entries, name, nil)
+			e, err := openUserEntry(entries, name)
 			if errors.Is(err, ErrNotFound) {
 				continue
 			}
@@ -376,6 +493,9 @@ func parseScopeKey(b []byte) (record, error) {
 // was lost, and ErrScopeAbsent, as the master is never minted over entries.
 // The caller holds the exclusive lock.
 func (u *UserScope) mint(root *os.Root, wrap []byte) (keys, *os.Root, error) {
+	if err := u.s.eligibleUID(u.uid); err != nil {
+		return keys{}, nil, err
+	}
 	g, err := lookupGeneratedUID(u.uid)
 	if err != nil {
 		return keys{}, nil, err

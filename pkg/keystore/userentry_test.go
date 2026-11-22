@@ -31,6 +31,7 @@ import (
 func resolverTable(t *testing.T, table map[string]uint32) *[]string {
 	t.Helper()
 	asked := new([]string)
+	setSeam(t, &timerSeam, neverFires)
 	setSeam(t, &uidResolverSeam, func(name string) (uint32, error) {
 		*asked = append(*asked, name)
 		uid, ok := table[name]
