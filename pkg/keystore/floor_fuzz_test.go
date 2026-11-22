@@ -51,13 +51,10 @@ func FuzzParseFloor(f *testing.F) {
 			if err := checkName(name); err != nil {
 				t.Fatalf("accepted entry name %q: %v", name, err)
 			}
-			g, err := hex.DecodeString(e.Generation)
-			if err != nil || len(g) != generationSize || hex.EncodeToString(g) != e.Generation {
-				t.Fatalf("accepted generation %q for %q", e.Generation, name)
-			}
-			if (e.Seq == 0) == (e.Deleted == 0) {
-				t.Fatalf("accepted %+v for %q: want a live entry (a sequence) or a tombstone (a delete sequence), one of the two", e, name)
-			}
+			checkFloorEntry(t, name, e)
+		}
+		if n := fl.deadSize(); n > maxTombstoneSize {
+			t.Fatalf("accepted tombstones of %d bytes", n)
 		}
 		again, err := marshalFloor(fl)
 		if err != nil {
@@ -110,5 +107,37 @@ func TestParseFloorStrict(t *testing.T) {
 		if fl, err := parseFloor([]byte(b)); !errors.Is(err, errFloorMalformed) || fl != nil {
 			t.Errorf("%s: parseFloor(%q) = %v, %v; want errFloorMalformed", name, b, fl, err)
 		}
+	}
+}
+
+// checkFloorEntry fails t unless e, name's record, is one every check can
+// rely on: a live record (a canonical generation and a sequence) or none,
+// at least one burial when there is no live record, at most
+// maxBuriedPerName burials of canonical generations, oldest first, none of
+// them the live generation and every delete sequence in 1 to maxDeleteSeq.
+func checkFloorEntry(t *testing.T, name string, e floorEntry) {
+	t.Helper()
+	canonical := func(g string) bool {
+		b, err := hex.DecodeString(g)
+		return err == nil && len(b) == generationSize && hex.EncodeToString(b) == g
+	}
+	bs := e.burials()
+	if e.live() != (e.Generation != "") || (e.live() && !canonical(e.Generation)) {
+		t.Fatalf("record %q has live part %q at sequence %d", name, e.Generation, e.Seq)
+	}
+	if !e.live() && len(bs) == 0 {
+		t.Fatalf("record %q has sequence 0 and buries nothing", name)
+	}
+	for i := len(bs); i < len(e.Buried); i++ {
+		if e.Buried[i] != (burial{}) {
+			t.Fatalf("record %q has a burial after its last: %+v", name, e.Buried)
+		}
+	}
+	var prev uint64
+	for _, b := range bs {
+		if !canonical(b.Generation) || b.Generation == e.Generation || b.Deleted <= prev || b.Deleted > maxDeleteSeq {
+			t.Fatalf("record %q has burials %+v", name, bs)
+		}
+		prev = b.Deleted
 	}
 }

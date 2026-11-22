@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -38,8 +39,9 @@ type rawTombstone struct {
 }
 
 // tombstonesOf reads the tombstones object of the floor file under server,
-// as JSON, without the store's decoder; an absent file or field is none.
-func tombstonesOf(t *testing.T, server string) map[string]rawTombstone {
+// as JSON, without the store's decoder: each name's buried generations,
+// oldest first. An absent file or field is none.
+func tombstonesOf(t *testing.T, server string) map[string][]rawTombstone {
 	t.Helper()
 	b, err := os.ReadFile(floorPath(server))
 	if errors.Is(err, os.ErrNotExist) {
@@ -49,7 +51,7 @@ func tombstonesOf(t *testing.T, server string) map[string]rawTombstone {
 		t.Fatal(err)
 	}
 	var f struct {
-		Tombstones map[string]rawTombstone `json:"tombstones"`
+		Tombstones map[string][]rawTombstone `json:"tombstones"`
 	}
 	if err := json.Unmarshal(b, &f); err != nil {
 		t.Fatal(err)
@@ -106,7 +108,7 @@ func TestTombstoneRefusesPutBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	ts := tombstonesOf(t, server)
-	if ts["k"].Generation != gen || ts["k"].Deleted == 0 {
+	if len(ts["k"]) != 1 || ts["k"][0].Generation != gen || ts["k"][0].Deleted == 0 {
 		t.Fatalf("tombstones after the Delete = %+v, want k's generation %s", ts, gen)
 	}
 	floorBefore, err := os.ReadFile(floorPath(server))
@@ -157,7 +159,7 @@ func TestTombstoneRefusesPutBack(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(server, "keystore", "k")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("put-back entry after Delete: %v, want it gone", err)
 	}
-	if got := tombstonesOf(t, server)["k"]; got != ts["k"] {
+	if got := tombstonesOf(t, server)["k"]; !slices.Equal(got, ts["k"]) {
 		t.Fatalf("tombstone after the second Delete = %+v, want %+v kept", got, ts["k"])
 	}
 
@@ -198,11 +200,11 @@ func TestTombstoneRefusesPutBack(t *testing.T) {
 	}
 }
 
-// TestTombstoneClearedByPut (U192): a Put of a deleted name mints a new
-// generation and replaces the tombstone with a live entry at sequence 1, and
-// that live entry's generation still refuses the deleted copy. rm of an
-// absent name writes no floor.
-func TestTombstoneClearedByPut(t *testing.T) {
+// TestTombstoneKeptByPut (U192): a Put of a deleted name mints a new
+// generation and records it live at sequence 1 beside the name's buried
+// generation, which it keeps, so the deleted copy is still refused as
+// deleted. rm of an absent name writes no floor.
+func TestTombstoneKeptByPut(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
 	mustPut(t, s, "k", KindOpaque, []byte("one"))
@@ -210,7 +212,8 @@ func TestTombstoneClearedByPut(t *testing.T) {
 	if err := s.Delete(ctx, "k"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := tombstonesOf(t, server)["k"]; !ok {
+	buried := tombstonesOf(t, server)["k"]
+	if len(buried) != 1 {
 		t.Fatal("no tombstone after the Delete")
 	}
 	floorBefore, err := os.ReadFile(floorPath(server))
@@ -224,23 +227,19 @@ func TestTombstoneClearedByPut(t *testing.T) {
 		t.Fatalf("floor after rm of an absent name = %s, %v; want it unchanged", after, err)
 	}
 	mustPut(t, s, "k", KindOpaque, []byte("two"))
-	if ts := tombstonesOf(t, server); len(ts) != 0 {
-		t.Fatalf("tombstones after the Put = %+v, want none", ts)
+	if ts := tombstonesOf(t, server); len(ts) != 1 || !slices.Equal(ts["k"], buried) {
+		t.Fatalf("tombstones after the Put = %+v, want k's kept, %+v", ts, buried)
 	}
 	if f := floorOf(t, server)["k"]; f.Generation != generationOf(t, server, "k") || f.Seq != 1 {
 		t.Fatalf("floor after the Put = %+v, want the new generation at sequence 1", f)
 	}
-	if b, err := os.ReadFile(floorPath(server)); err != nil || strings.Contains(string(b), "tombstones") {
-		t.Fatalf("floor after the Put = %s, %v; want no tombstones field", b, err)
-	}
-	// The old copy over the new entry is refused by the generation.
+	// The old copy over the new entry is refused as deleted.
 	if err := os.RemoveAll(filepath.Join(server, "keystore", "k")); err != nil {
 		t.Fatal(err)
 	}
 	putBack(t, server, old, "k")
-	if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("Current of the old copy after the new Put: %v, want ErrCorrupt", err)
-	}
+	_, _, err = s.Current(ctx, "k")
+	refusedAsDeleted(t, "Current of the old copy after the new Put", err)
 }
 
 // TestDeleteWithoutMasterTombstones (U192): Delete needs no master to write
@@ -259,7 +258,7 @@ func TestDeleteWithoutMasterTombstones(t *testing.T) {
 	if err := s.Delete(ctx, "a"); err != nil {
 		t.Fatalf("Delete without the master: %v", err)
 	}
-	if ts := tombstonesOf(t, server); ts["a"].Generation != genA || ts["a"].Deleted != 1 {
+	if ts := tombstonesOf(t, server); len(ts["a"]) != 1 || ts["a"][0].Generation != genA || ts["a"][0].Deleted != 1 {
 		t.Fatalf("tombstones = %+v, want a's generation at delete sequence 1", ts)
 	}
 
@@ -268,7 +267,7 @@ func TestDeleteWithoutMasterTombstones(t *testing.T) {
 	if err := s.Delete(ctx, "c"); err != nil {
 		t.Fatalf("Delete of c without the master: %v", err)
 	}
-	if ts := tombstonesOf(t, server); ts["c"].Generation != genC || ts["c"].Deleted != 2 {
+	if ts := tombstonesOf(t, server); len(ts["c"]) != 1 || ts["c"][0].Generation != genC || ts["c"][0].Deleted != 2 {
 		t.Fatalf("tombstones = %+v, want c's recorded generation at delete sequence 2", ts)
 	}
 
@@ -277,7 +276,125 @@ func TestDeleteWithoutMasterTombstones(t *testing.T) {
 	if err := s.Delete(ctx, "b"); err != nil {
 		t.Fatalf("Delete of b without the master or a floor: %v", err)
 	}
-	if ts := tombstonesOf(t, server); len(ts) != 1 || ts["b"].Generation != genB {
+	if ts := tombstonesOf(t, server); len(ts) != 1 || len(ts["b"]) != 1 || ts["b"][0].Generation != genB {
 		t.Fatalf("tombstones = %+v, want only b's", ts)
 	}
+}
+
+// copyEntryAs copies the saved entry directory old to a new directory beside
+// the store, named dst, with its generation file replaced by gen when gen is
+// set, and returns it: an attacker's planted copy.
+func copyEntryAs(t *testing.T, server, old, dst, gen string, files ...string) string {
+	t.Helper()
+	d := filepath.Join(server, dst)
+	if err := os.Mkdir(d, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		copyFile(t, filepath.Join(old, f), filepath.Join(d, f))
+	}
+	if gen != "" {
+		writeFile(t, filepath.Join(d, generationName), gen+"\n")
+	}
+	return d
+}
+
+// refusedAsDeleted fails t unless err refuses a put-back copy as a deleted
+// generation.
+func refusedAsDeleted(t *testing.T, what string, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "records as deleted") {
+		t.Fatalf("%s: %v, want ErrCorrupt naming the deleted generation", what, err)
+	}
+}
+
+// TestTombstoneSurvivesPlantedGeneration (G23): a directory planted under a
+// deleted name with another generation in its generation file, removed by
+// root's rm, never replaces the tombstone, so the original deleted copy put
+// back afterwards is still refused.
+func TestTombstoneSurvivesPlantedGeneration(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	files := []string{generationName, "v1", currentName}
+	// 1. The real entry, and a copy of it.
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	old := saveEntry(t, server, "k", files...)
+	// 2. Root deletes it: the tombstone records its generation.
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	// 3. A copy with a changed generation file is planted under the name.
+	planted := copyEntryAs(t, server, old, "planted", strings.Repeat("ee", generationSize), files...)
+	putBack(t, server, planted, "k")
+	// 4. Root runs rm on it.
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete of the planted copy: %v", err)
+	}
+	// 5. The original deleted copy put back is still refused.
+	putBack(t, server, old, "k")
+	_, _, err := s.Current(ctx, "k")
+	refusedAsDeleted(t, "Current of the original copy after the planted rm", err)
+}
+
+// TestTombstonesKeptAcrossRecreate (G23, U192): a Put of a deleted name does
+// not clear the name's buried generations. The first deleted copy is refused
+// while the re-created entry is live, and after it is deleted too.
+func TestTombstonesKeptAcrossRecreate(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	files := []string{generationName, "v1", currentName}
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	g1 := saveEntry(t, server, "k", files...)
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	mustPut(t, s, "k", KindOpaque, []byte("two"))
+	g2 := copyEntryAs(t, server, filepath.Join(server, "keystore", "k"), "g2", "", files...)
+
+	// G1 over the live G2.
+	if err := os.Rename(filepath.Join(server, "keystore", "k"), filepath.Join(server, "live-k")); err != nil {
+		t.Fatal(err)
+	}
+	g1copy := copyEntryAs(t, server, g1, "g1-copy", "", files...)
+	putBack(t, server, g1copy, "k")
+	_, _, err := s.Current(ctx, "k")
+	refusedAsDeleted(t, "Current of G1 while G2 is live", err)
+	if err := os.RemoveAll(filepath.Join(server, "keystore", "k")); err != nil {
+		t.Fatal(err)
+	}
+	putBack(t, server, filepath.Join(server, "live-k"), "k")
+	mustCurrent(t, s, "k", "two")
+
+	// G2 deleted: both of its predecessors stay refused.
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	putBack(t, server, g1, "k")
+	_, _, err = s.Current(ctx, "k")
+	refusedAsDeleted(t, "Current of G1 after G2 is deleted", err)
+	if err := os.RemoveAll(filepath.Join(server, "keystore", "k")); err != nil {
+		t.Fatal(err)
+	}
+	putBack(t, server, g2, "k")
+	_, _, err = s.Current(ctx, "k")
+	refusedAsDeleted(t, "Current of G2 after it is deleted", err)
+}
+
+// TestDeleteBuriesFloorGeneration (G23): rm of a decoy directory swapped in
+// under a live name buries the generation the floor records live, not the
+// decoy's, so the real entry put back afterwards is refused.
+func TestDeleteBuriesFloorGeneration(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	files := []string{generationName, "v1", currentName}
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	real := saveEntry(t, server, "k", files...)
+	// The decoy: the same files under another generation.
+	writeFile(t, entryPath(server, "k", generationName), strings.Repeat("dd", generationSize)+"\n")
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete of the decoy: %v", err)
+	}
+	putBack(t, server, real, "k")
+	_, _, err := s.Current(ctx, "k")
+	refusedAsDeleted(t, "Current of the real entry after the decoy rm", err)
 }

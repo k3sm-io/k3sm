@@ -112,7 +112,7 @@ func TestNonRootDataRootFlockBlocksNoRootVerb(t *testing.T) {
 		}
 	}
 	fl := floorOf(t, server)
-	if fl["a"].Deleted == 0 {
+	if len(fl["a"].burials()) == 0 {
 		t.Fatalf("floor after the Delete still records a live: %+v, want a tombstone", fl)
 	}
 	if fl["b"].Seq != 1 {

@@ -207,14 +207,22 @@ func TestFloorRefusesCopiedBackPointer(t *testing.T) {
 		if err := os.Rename(old, filepath.Join(server, "keystore", "k")); err != nil {
 			t.Fatal(err)
 		}
+		// The deleted generation stays buried after the new Put, so that is
+		// the refusal.
 		var stale *staleError
 		_, _, err := s.Current(ctx, "k")
-		if !errors.As(err, &stale) || !stale.generation {
-			t.Fatalf("Current over an old generation: %v, want the floor's generation refusal", err)
+		if !errors.As(err, &stale) || !stale.deleted {
+			t.Fatalf("Current over an old generation: %v, want the floor's deleted refusal", err)
 		}
-		// The refusal names the case it covers: a put-back after a newer Put,
-		// never a deleted entry put back in general, which is accepted
-		// (TestDeletedEntryPutBack).
+		// With its burial gone (pruned), the live record of the new
+		// generation still refuses it: the generation refusal, which names
+		// its case, a put-back after a newer Put.
+		live := floorOf(t, server)["k"]
+		putFloorFile(t, server, floor{"k": {Generation: live.Generation, Seq: live.Seq}})
+		_, _, err = s.Current(ctx, "k")
+		if !errors.As(err, &stale) || !stale.generation {
+			t.Fatalf("Current over a pruned generation: %v, want the floor's generation refusal", err)
+		}
 		if msg := err.Error(); !strings.Contains(msg, "after a newer put of the name") {
 			t.Errorf("generation refusal %q does not say the put-back followed a newer put", msg)
 		}
@@ -344,7 +352,7 @@ func TestFloorRaised(t *testing.T) {
 		if err := s.Delete(ctx, "k"); err != nil {
 			t.Fatal(err)
 		}
-		if f := floorOf(t, server)["k"]; f.Deleted == 0 || f.Seq != 0 {
+		if f := floorOf(t, server)["k"]; len(f.burials()) == 0 || f.live() {
 			t.Fatalf("floor after Delete = %+v, want the deleted entry's tombstone", f)
 		}
 	})
@@ -432,7 +440,7 @@ func TestFloorRaised(t *testing.T) {
 		if err := s.Delete(ctx, "a"); err != nil {
 			t.Fatalf("Delete without the master: %v", err)
 		}
-		if fl := floorOf(t, server); len(fl) != 2 || fl["b"].Seq != 1 || fl["a"].Deleted != 1 {
+		if fl := floorOf(t, server); len(fl) != 2 || fl["b"].Seq != 1 || fl["a"].Buried[0].Deleted != 1 {
 			t.Fatalf("floor = %+v, want b live and a's tombstone", fl)
 		}
 	})

@@ -29,6 +29,16 @@ import (
 // "Pointer sequence and floor", "A deleted entry put back is refused", gate
 // row U192.
 
+// buriedEntry is a record with no live entry that buries gen once per
+// delete sequence in deleted, oldest first.
+func buriedEntry(gen string, deleted ...uint64) floorEntry {
+	var e floorEntry
+	for i, d := range deleted {
+		e.Buried[i] = burial{Generation: gen, Deleted: d}
+	}
+	return e
+}
+
 // TestTombstonePrune (U192): tombstones take at most maxTombstoneSize of the
 // floor and only what live entries leave of maxFloorSize; prune removes them
 // oldest first (lowest delete sequence) and never a live entry, and size is
@@ -38,16 +48,18 @@ func TestTombstonePrune(t *testing.T) {
 	t.Run("the tombstone budget", func(t *testing.T) {
 		fl := floor{"live": {Generation: gen, Seq: 3}}
 		n := 0
-		for fl.size()-fl.liveSize() <= maxTombstoneSize {
+		for fl.deadSize() <= maxTombstoneSize {
 			name := fmt.Sprintf("t-%s-%06d", strings.Repeat("x", 200), n)
 			fl[name] = floorEntry{Generation: gen, Seq: 1}
-			if !fl.bury(name, nil) {
-				t.Fatalf("bury %s changed nothing", name)
+			if g, _ := fl.bury(name, nil); g != gen {
+				t.Fatalf("bury %s buried %q, want the live generation", name, g)
 			}
 			n++
 		}
-		fl.prune()
-		if got := fl.size() - fl.liveSize(); got > maxTombstoneSize {
+		if got := fl.prune(); len(got) == 0 || len(got) >= n {
+			t.Fatalf("prune dropped %d of %d burials", len(got), n)
+		}
+		if got := fl.deadSize(); got > maxTombstoneSize {
 			t.Fatalf("tombstones after prune take %d bytes, want at most %d", got, maxTombstoneSize)
 		}
 		if fl["live"].Seq != 3 {
@@ -56,8 +68,8 @@ func TestTombstonePrune(t *testing.T) {
 		// The oldest went: delete sequence 1 is gone and the newest stays.
 		var lowest, highest uint64 = 1 << 63, 0
 		for _, e := range fl {
-			if e.Deleted != 0 {
-				lowest, highest = min(lowest, e.Deleted), max(highest, e.Deleted)
+			for _, b := range e.burials() {
+				lowest, highest = min(lowest, b.Deleted), max(highest, b.Deleted)
 			}
 		}
 		if lowest == 1 || highest != uint64(n) {
@@ -82,7 +94,7 @@ func TestTombstonePrune(t *testing.T) {
 		}
 		live := maps.Clone(fl)
 		for i := range 64 {
-			fl[fmt.Sprintf("t-%03d", i)] = floorEntry{Generation: gen, Deleted: uint64(i + 1)}
+			fl[fmt.Sprintf("t-%03d", i)] = buriedEntry(gen, uint64(i+1))
 		}
 		if fl.size() <= maxFloorSize {
 			t.Fatalf("setup: floor of %d bytes is not over the cap", fl.size())
@@ -114,7 +126,7 @@ func TestTombstoneNeverRefusesPut(t *testing.T) {
 	s, server := newTestStore(t)
 	mustPut(t, s, "k", KindOpaque, []byte("one"))
 	gen := strings.Repeat("cd", generationSize)
-	keep := floor{"k": floorOf(t, server)["k"], "old": {Generation: gen, Deleted: 1}, "older": {Generation: gen, Deleted: 2}}
+	keep := floor{"k": floorOf(t, server)["k"], "old": buriedEntry(gen, 1), "older": buriedEntry(gen, 2)}
 	fillFloor(t, server, keep, maxFloorSize)
 	if _, err := s.Put(ctx, "new", KindOpaque, []byte("new")); err != nil {
 		t.Fatalf("Put over a floor full of tombstones: %v", err)
@@ -143,12 +155,13 @@ func TestTombstoneNeverRefusesPut(t *testing.T) {
 	}
 }
 
-// TestParseFloorTombstones (U192): a floor with no tombstones field, the
-// shape every earlier build wrote, parses as a floor with no tombstones; a
-// floor with tombstones parses and encodes back byte for byte; a tombstone
-// is parsed as strictly as an entry.
+// TestParseFloorTombstones (U192): a floor with no tombstones field parses
+// as a floor that buries nothing; a floor with tombstones, a name with a live
+// entry and burials included, parses and encodes back byte for byte; a
+// burial is parsed as strictly as an entry, and the bounds hold on read.
 func TestParseFloorTombstones(t *testing.T) {
 	const gen = "0123456789abcdef0123456789abcdef"
+	const gen2 = "fedcba9876543210fedcba9876543210"
 	old := `{"version":1,"scope":"system","entries":{"a":{"generation":"` + gen + `","seq":4}}}` + "\n"
 	fl, err := parseFloor([]byte(old))
 	if err != nil || !maps.Equal(fl, floor{"a": {Generation: gen, Seq: 4}}) {
@@ -157,8 +170,12 @@ func TestParseFloorTombstones(t *testing.T) {
 	if again, err := marshalFloor(fl); err != nil || string(again) != old {
 		t.Fatalf("the old floor encodes as %q, %v; want it unchanged", again, err)
 	}
-	withTomb := `{"version":1,"scope":"system","entries":{"a":{"generation":"` + gen + `","seq":4}},"tombstones":{"b":{"generation":"` + gen + `","deleted":2},"c":{"generation":"` + gen + `","deleted":1}}}` + "\n"
-	want := floor{"a": {Generation: gen, Seq: 4}, "b": {Generation: gen, Deleted: 2}, "c": {Generation: gen, Deleted: 1}}
+	withTomb := `{"version":1,"scope":"system","entries":{"a":{"generation":"` + gen + `","seq":4}},"tombstones":{"a":[{"generation":"` + gen2 + `","deleted":3}],"b":[{"generation":"` + gen + `","deleted":2}],"c":[{"generation":"` + gen + `","deleted":1},{"generation":"` + gen2 + `","deleted":4}]}}` + "\n"
+	a := floorEntry{Generation: gen, Seq: 4}
+	a.Buried[0] = burial{Generation: gen2, Deleted: 3}
+	c := buriedEntry(gen, 1)
+	c.Buried[1] = burial{Generation: gen2, Deleted: 4}
+	want := floor{"a": a, "b": buriedEntry(gen, 2), "c": c}
 	fl, err = parseFloor([]byte(withTomb))
 	if err != nil || !maps.Equal(fl, want) {
 		t.Fatalf("parseFloor(tombstones) = %v, %v; want %v", fl, err, want)
@@ -166,29 +183,56 @@ func TestParseFloorTombstones(t *testing.T) {
 	if again, err := marshalFloor(fl); err != nil || string(again) != withTomb || len(again) != fl.size() {
 		t.Fatalf("the floor with tombstones encodes as %q, %v", again, err)
 	}
-	onlyTomb := `{"version":1,"scope":"system","entries":{},"tombstones":{"b":{"generation":"` + gen + `","deleted":1}}}`
+	onlyTomb := `{"version":1,"scope":"system","entries":{},"tombstones":{"b":[{"generation":"` + gen + `","deleted":1}]}}`
 	if _, err := parseFloor([]byte(onlyTomb)); err != nil {
 		t.Fatalf("parseFloor(only a tombstone): %v", err)
 	}
 	head := `{"version":1,"scope":"system","entries":{},"tombstones":`
+	one := func(g string, d uint64) string { return fmt.Sprintf(`{"generation":%q,"deleted":%d}`, g, d) }
+	var nine []string
+	for i := range maxBuriedPerName + 1 {
+		nine = append(nine, one(fmt.Sprintf("%032x", i), uint64(i+1)))
+	}
 	for name, b := range map[string]string{
-		"empty tombstones":       head + `{}}`,
-		"null tombstones":        head + `null}`,
-		"deleted zero":           head + `{"b":{"generation":"` + gen + `","deleted":0}}}`,
-		"a seq in a tombstone":   head + `{"b":{"generation":"` + gen + `","deleted":1,"seq":1}}}`,
-		"an unknown field":       head + `{"b":{"generation":"` + gen + `","deleted":1,"x":1}}}`,
-		"an uppercase gen":       head + `{"b":{"generation":"` + strings.ToUpper(gen) + `","deleted":1}}}`,
-		"a short gen":            head + `{"b":{"generation":"abcd","deleted":1}}}`,
-		"a bad name":             head + `{"B/x":{"generation":"` + gen + `","deleted":1}}}`,
-		"a duplicate tombstone":  head + `{"b":{"generation":"` + gen + `","deleted":1},"b":{"generation":"` + gen + `","deleted":2}}}`,
-		"deleted in an entry":    `{"version":1,"scope":"system","entries":{"a":{"generation":"` + gen + `","seq":1,"deleted":1}}}`,
-		"tombstones first":       `{"version":1,"scope":"system","tombstones":{"b":{"generation":"` + gen + `","deleted":1}},"entries":{}}`,
-		"live and tombstoned":    `{"version":1,"scope":"system","entries":{"b":{"generation":"` + gen + `","seq":1}},"tombstones":{"b":{"generation":"` + gen + `","deleted":1}}}`,
-		"unsorted tombstones":    head + `{"c":{"generation":"` + gen + `","deleted":1},"b":{"generation":"` + gen + `","deleted":2}}}`,
-		"case-variant tombstone": `{"version":1,"scope":"system","entries":{},"Tombstones":{"b":{"generation":"` + gen + `","deleted":1}}}`,
+		"empty tombstones":          head + `{}}`,
+		"null tombstones":           head + `null}`,
+		"an empty list":             head + `{"b":[]}}`,
+		"a null list":               head + `{"b":null}}`,
+		"an object, not a list":     head + `{"b":` + one(gen, 1) + `}}`,
+		"deleted zero":              head + `{"b":[` + one(gen, 0) + `]}}`,
+		"deleted past the cap":      head + `{"b":[` + one(gen, maxDeleteSeq+1) + `]}}`,
+		"deleted at MaxUint64":      head + `{"b":[{"generation":"` + gen + `","deleted":18446744073709551615}]}}`,
+		"a seq in a tombstone":      head + `{"b":[{"generation":"` + gen + `","deleted":1,"seq":1}]}}`,
+		"an unknown field":          head + `{"b":[{"generation":"` + gen + `","deleted":1,"x":1}]}}`,
+		"an uppercase gen":          head + `{"b":[` + one(strings.ToUpper(gen), 1) + `]}}`,
+		"a short gen":               head + `{"b":[` + one("abcd", 1) + `]}}`,
+		"a bad name":                head + `{"B/x":[` + one(gen, 1) + `]}}`,
+		"a duplicate tombstone":     head + `{"b":[` + one(gen, 1) + `],"b":[` + one(gen, 2) + `]}}`,
+		"a generation buried twice": head + `{"b":[` + one(gen, 1) + `,` + one(gen, 2) + `]}}`,
+		"burials newest first":      head + `{"b":[` + one(gen, 2) + `,` + one(gen2, 1) + `]}}`,
+		"a delete sequence reused":  head + `{"b":[` + one(gen, 1) + `],"c":[` + one(gen, 1) + `]}}`,
+		"over the per-name cap":     head + `{"b":[` + strings.Join(nine, ",") + `]}}`,
+		"deleted in an entry":       `{"version":1,"scope":"system","entries":{"a":{"generation":"` + gen + `","seq":1,"deleted":1}}}`,
+		"tombstones first":          `{"version":1,"scope":"system","tombstones":{"b":[` + one(gen, 1) + `]},"entries":{}}`,
+		"live and buried":           `{"version":1,"scope":"system","entries":{"b":{"generation":"` + gen + `","seq":1}},"tombstones":{"b":[` + one(gen, 1) + `]}}`,
+		"unsorted tombstones":       head + `{"c":[` + one(gen, 1) + `],"b":[` + one(gen, 2) + `]}}`,
+		"case-variant tombstone":    `{"version":1,"scope":"system","entries":{},"Tombstones":{"b":[` + one(gen, 1) + `]}}`,
 	} {
 		if fl, err := parseFloor([]byte(b)); !errors.Is(err, errFloorMalformed) || fl != nil {
 			t.Errorf("%s: parseFloor(%q) = %v, %v; want errFloorMalformed", name, b, fl, err)
 		}
+	}
+	// Tombstones over maxTombstoneSize are refused on read, even inside
+	// maxFloorSize.
+	big := floor{}
+	for i := 0; big.deadSize() <= maxTombstoneSize; i++ {
+		big[fmt.Sprintf("t-%s-%06d", strings.Repeat("z", 200), i)] = buriedEntry(gen, uint64(i+1))
+	}
+	b, err := marshalFloor(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fl, err := parseFloor(b); !errors.Is(err, errFloorMalformed) || fl != nil {
+		t.Errorf("parseFloor(tombstones of %d bytes) = %v; want errFloorMalformed", big.deadSize(), err)
 	}
 }

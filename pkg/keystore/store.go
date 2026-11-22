@@ -536,9 +536,10 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // entry that records its generation into a tombstone. A symlink or any other non-directory at
 // the name is unlinked without being followed.
 //
-// A completed Delete replaces the name's floor record with a tombstone of
-// the deleted generation (floor.bury), so an older copy of the entry put back
-// is refused by every reader; it needs no master. An interrupted Put's
+// A completed Delete buries the generation the floor records live for the
+// name, or, when the floor has no record for the name at all, the deleted
+// directory's (floor.bury), so an older copy of the entry put back is
+// refused by every reader; it needs no master. It never removes a burial. An interrupted Put's
 // generation never committed a pointer, and a non-directory has none, so
 // removing either leaves the floor alone, and so does a Delete of an absent
 // name. A crash after the directory is gone leaves a live floor for a name
@@ -642,14 +643,18 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err := syncDir(root); err != nil {
 		return err
 	}
-	// The name's record becomes its tombstone, so an older copy of this
-	// entry put back is refused. A generation that did not read is taken
-	// from the floor's live entry, if it has one (bury).
+	// The floor's live generation for the name is buried, so an older copy
+	// of this entry put back is refused. The directory's generation, which
+	// the service user could have written, is buried only when the floor
+	// has no record for the name at all (bury).
 	var deleted *[generationSize]byte
 	if genErr == nil {
 		deleted = &gen
 	}
-	_, err = fdir.update(func(fl floor) bool { return fl.bury(name, deleted) })
+	_, err = fdir.update(func(fl floor) bool {
+		g, _ := fl.bury(name, deleted)
+		return g != ""
+	})
 	return err
 }
 
@@ -933,8 +938,8 @@ func openEntryDir(root *os.Root, name string, fl floor) (*entry, error) {
 // that file whole, by rename. The two are compared as generation bytes, as
 // every reader decodes them, not as text.
 //
-// A tombstone of dir's generation makes it damage too: an older copy of a
-// deleted entry put back, never an interrupted Put. A tombstone of another
+// A buried generation equal to dir's makes it damage too: an older copy of a
+// deleted entry put back, never an interrupted Put. A burial of another
 // generation records nothing about dir.
 func committedBefore(dir *os.Root, name string, fl floor) (bool, error) {
 	f, ok := fl[name]
@@ -950,15 +955,15 @@ func committedBefore(dir *os.Root, name string, fl floor) (bool, error) {
 	case err != nil:
 		return false, err
 	}
+	if f.buries(hex.EncodeToString(gen[:])) {
+		return false, buriedShapeError{&staleError{name: name, deleted: true}}
+	}
+	if !f.live() {
+		return false, nil
+	}
 	recorded, err := hex.DecodeString(f.Generation)
 	if err != nil {
 		return false, fmt.Errorf("%w: entry %q", errFloorMalformed, name)
-	}
-	if f.Deleted != 0 {
-		if bytes.Equal(recorded, gen[:]) {
-			return false, buriedShapeError{&staleError{name: name, deleted: true}}
-		}
-		return false, nil
 	}
 	return bytes.Equal(recorded, gen[:]), nil
 }

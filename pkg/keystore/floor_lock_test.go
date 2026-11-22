@@ -82,7 +82,11 @@ func TestFloorWriteRereads(t *testing.T) {
 		}
 	})
 
-	t.Run("a stale Delete cannot erase a newer Put's floor entry", func(t *testing.T) {
+	// The floor records k live at a generation the Delete never read: the
+	// Delete buries the floor's own live generation, root's record, rather
+	// than trust the directory it read, so whatever stands under the name
+	// at that generation is refused, never accepted.
+	t.Run("a Delete buries the floor's live generation, not the directory's", func(t *testing.T) {
 		s, server := newTestStore(t)
 		mustPut(t, s, "k", KindOpaque, []byte("one"))
 		mustPut(t, s, "other", KindOpaque, []byte("one"))
@@ -100,8 +104,8 @@ func TestFloorWriteRereads(t *testing.T) {
 			t.Fatalf("Delete: %v", err)
 		}
 		got := floorOf(t, server)
-		if got["k"] != newer {
-			t.Fatalf("floor k after the Delete = %+v, want the newer Put's %+v kept", got["k"], newer)
+		if got["k"].live() || !got["k"].buries(newer.Generation) || len(got["k"].burials()) != 1 {
+			t.Fatalf("floor k after the Delete = %+v, want the floor's live %s buried", got["k"], newer.Generation)
 		}
 		if got["other"] != start["other"] {
 			t.Fatalf("floor other after the Delete = %+v, want %+v", got["other"], start["other"])
@@ -112,7 +116,7 @@ func TestFloorWriteRereads(t *testing.T) {
 		if err := s.Delete(t.Context(), "gone"); err != nil {
 			t.Fatalf("Delete gone: %v", err)
 		}
-		if f := floorOf(t, server)["gone"]; f.Deleted == 0 {
+		if f := floorOf(t, server)["gone"]; len(f.burials()) == 0 {
 			t.Fatalf("the Delete left its own generation's floor entry live: %+v, want a tombstone", f)
 		}
 	})
@@ -227,7 +231,7 @@ func TestDataRootFlockBlocksNoFloorWrite(t *testing.T) {
 			}
 		}
 		fl := floorOf(t, server)
-		if fl["a"].Deleted == 0 {
+		if len(fl["a"].burials()) == 0 {
 			t.Fatalf("floor after the Delete still records a live: %+v, want a tombstone", fl)
 		}
 		if fl["b"].Seq != 1 {

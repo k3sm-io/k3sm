@@ -320,7 +320,7 @@ accepted, because there is no recorded fact to refuse against:
   verb writes the file from the authenticated pointers (this is also the restore procedure).
 - *The floor file exists but has no entry for the name.* This is the state an interrupted Put
   leaves (`current` written, floor not yet), and the state after a Delete whose tombstone was
-  pruned. A tombstone of another generation than the pointer's counts as no entry. The
+  pruned. A name with only buried generations, none the pointer's, counts as no entry. The
   pointer is accepted if it authenticates, and the next root-run verb records its sequence
   and generation. The residual is a stale backup of a deleted entry whose tombstone was
   pruned, restored under the same name: it is accepted, which is the deliberate-restore case
@@ -356,72 +356,86 @@ first Put mints no master.
 - **Put:** write `generation`, `v1`, `current` (sequence 1), then set the floor entry.
 - **Rotate:** write the new version file, flip `current` (sequence + 1), then raise the
   floor to that sequence.
-- **Delete:** remove `current`, then the entry directory, then replace the floor entry with
-  the name's tombstone.
+- **Delete:** remove `current`, then the entry directory, then bury the floor's live
+  generation for the name.
 
 **A deleted entry put back is refused: the tombstone.** A completed Delete does not remove
-the name's floor entry. It replaces it, in the same floor write, with a tombstone: a per-name
-record of the generation the deleted directory carried and a delete sequence. The floor file
-gains a `tombstones` object after `entries`:
+the name's floor record. In the same floor write it buries a generation: it adds it to the
+name's buried set, a per-name list of generations a Delete removed, each with a delete
+sequence. The floor file gains a `tombstones` object after `entries`, mapping a name to its
+buried set, oldest first:
 
 ```json
-{"version": 1, "scope": "system", "entries": {"signer-key": {"generation": "<hex>", "seq": 7}}, "tombstones": {"old-key": {"generation": "<hex>", "deleted": 3}}}
+{"version": 1, "scope": "system", "entries": {"signer-key": {"generation": "<hex>", "seq": 7}}, "tombstones": {"old-key": [{"generation": "<hex>", "deleted": 3}], "signer-key": [{"generation": "<hex>", "deleted": 1}, {"generation": "<hex>", "deleted": 4}]}}
 ```
 
-- *The record.* `deleted` is the delete sequence: one more than the highest `deleted` among
-  the floor's tombstones, or 1 when there are none. It orders tombstones for pruning and means
-  nothing else. A name has at most one record in the floor, a live entry or a tombstone, never
-  both. The tombstone's generation is the one the deleted directory's `generation` file
-  holds; when that file does not read, it is the generation the floor recorded live for the
-  name; with neither, Delete records nothing, as before. Delete replaces the name's live entry
-  of that generation. A live entry of another generation is kept and no tombstone is written:
-  under the floor lock it can only be a newer Put's, recorded while the Delete ran (G7), and
-  its generation already refuses the deleted one. A tombstone that already records the same
-  generation is kept as it is.
-- *Refusal.* A reader or verb that opens an entry directory whose generation equals the
-  generation the floor's tombstone records for that name refuses it as `ErrCorrupt`, with the
-  floor's own message: an older copy of a deleted entry was put back, do not restore from
-  backup, `rm` removes it. That holds for `Current`, `Get`, `List` (the entry is listed with
-  `Err`), Rotate, Rewrap (which refuses, as for any entry `List` marks corrupt), and the floor
-  raise at the start of every root verb, which never records that generation. A put-back
-  directory with no `current`, in the shape a crashed Put leaves, is damage rather than an
-  interrupted Put when its generation is tombstoned: listed with `Err`, and `ErrExists` from
-  Put. Put of a name whose put-back directory has a `current` answers `ErrExists` too, so the
-  operator removes it with `rm` first. `rm` removes a put-back directory as it removes any
-  corrupt entry, and keeps the tombstone. A directory of another generation under a
-  tombstoned name is not refused by the tombstone: it is a Put that crashed after its pointer
-  and before its floor write, the raise records it, and that live entry replaces the
-  tombstone.
-- *Clearing.* A Put of the name mints a fresh generation, and its floor write replaces the
-  tombstone with a live entry at sequence 1. The live entry's generation then refuses the
-  deleted generation (the generation refusal), so dropping the tombstone loses nothing. `rm`
-  of an absent name answers `ErrNotFound` and writes no floor: it neither adds a tombstone nor
-  clears one. Delete of an interrupted Put also answers `ErrNotFound` and records no
-  tombstone, since that generation never committed a pointer.
+- *The record.* `deleted` is the delete sequence: one more than the highest `deleted` in the
+  floor, or 1 when there is none. It orders burials for pruning and means nothing else, so
+  when it would pass 2^53 the next Delete first renumbers every burial 1 to n in its order: the
+  sequence never wraps. A name may hold a live entry and a buried set together, as
+  `signer-key` above: a Put of a deleted name records its new generation live and keeps every
+  generation buried before it. A live generation is never also buried.
+- *What Delete buries.* Delete buries the generation the floor records live for the name,
+  root's own record, whatever the deleted directory's `generation` file says. That file is in
+  the service user's tree, so it is trusted only when the floor has no record for the name at
+  all (no live entry and no buried set): then Delete buries the generation it read. A name
+  with a buried set and no live entry buries nothing more, so a planted generation file can
+  never push a real burial out of the per-name cap below. Delete never removes or replaces a
+  buried generation; a floor write never lowers what the floor refuses on data from the
+  service user's tree. A directory planted under a deleted name with a changed `generation`
+  file and removed by `rm` therefore leaves the buried set as it was, and a decoy directory
+  swapped in under a live name before `rm` buries the floor's live generation, not the
+  decoy's. With neither a live record nor a readable generation, Delete records nothing.
+- *The per-name cap.* A name keeps at most 8 buried generations. A Delete that buries a ninth
+  drops the name's oldest, and that is a prune (below): logged, and the only way, besides the
+  floor's own prune, that a buried generation leaves the floor.
+- *Refusal.* A reader or verb that opens an entry directory whose generation is in the name's
+  buried set refuses it as `ErrCorrupt`, with the floor's own message: an older copy of a
+  deleted entry was put back, do not restore from backup, and the same-backup restore recipe
+  in the user docs if the put-back was deliberate. That holds for `Current`, `Get`, `List`
+  (the entry is listed with `Err`), Rotate, Rewrap (which refuses, as for any entry `List`
+  marks corrupt), and the floor raise at the start of every root verb, which never records a
+  buried generation, while the name is live under a newer generation and after it is deleted
+  too. A put-back directory with no `current`, in the shape a crashed Put leaves, is damage
+  rather than an interrupted Put when its generation is buried: listed with `Err`, and
+  `ErrExists` from Put. Put of a name whose put-back directory has a `current` answers
+  `ErrExists` too, so the operator removes it with `rm` first. `rm` removes a put-back
+  directory as it removes any corrupt entry, and keeps the buried set. A directory of a
+  generation not in the buried set under a name with no live entry is a Put that crashed after
+  its pointer and before its floor write: the raise records it live beside the buried set.
+- *Put keeps the buried set.* A Put of the name mints a fresh generation and records it live
+  at sequence 1; the buried set stays. Dropping it would let an old copy of the first
+  generation back once the second is deleted too. `rm` of an absent name answers `ErrNotFound`
+  and writes no floor. Delete of an interrupted Put also answers `ErrNotFound` and buries
+  nothing, since that generation never committed a pointer.
 - *Bound and pruning.* Tombstones share the floor's 4 MiB cap, split this way: live entries
-  may use all of it, and tombstones at most 1 MiB of it, and only what live entries leave.
-  Every floor write, after it applies its own change, prunes tombstones oldest first (lowest
-  `deleted`, then by name) until the tombstones fit in 1 MiB and the file fits in 4 MiB. A live
+  may use all of it, and the `tombstones` object at most 1 MiB of it, and only what live
+  entries leave. Every floor write, after it applies its own change, prunes buried
+  generations oldest first (lowest `deleted`, then by name) until the tombstones fit in 1 MiB
+  and the file fits in 4 MiB; a name left with no live entry and no burial is removed. A live
   entry is never pruned. Past the cap the floor therefore prunes rather than fails closed, and
-  the room check Put and Rotate make counts only live entries, so a tombstone never refuses a
+  the room check Put and Rotate make counts only live entries, so a burial never refuses a
   Put or a Rotate; `errFloorFull` keeps its meaning, that the live entries alone would not
-  fit. The residual of a pruned tombstone is the behaviour before this change: an old copy of
-  that deleted entry put back under its name is accepted, until a Put of the name records a
-  new generation. 1 MiB holds about 3,500 tombstones of the longest names and about 16,000 of
-  short ones.
-- *Deletion without the master.* Delete still works without the master. Writing a tombstone
-  needs only the directory's `generation` file (or the floor's own record) and the floor lock,
-  never a key. Over a full floor Delete still runs, since the tombstone it adds is pruned
+  fit. The residual of a pruned burial is the behaviour before this change: an old copy of
+  that deleted entry put back under its name is accepted, unless the name's live entry of
+  another generation refuses it. The oldest burials are the longest-revoked keys, and any
+  root-run churn, bulk puts included, can evict them. 1 MiB holds about 3,500 burials of the
+  longest names and about 16,000 of short ones.
+- *Deletion without the master.* Delete still works without the master. A burial needs only
+  the floor's own record (or, with none, the directory's `generation` file) and the floor
+  lock, never a key. Over a full floor Delete still runs, since the burial it adds is pruned
   before any live entry is touched. Delete over an absent floor file writes the file holding
-  only the tombstone; the other entries are then recorded by the next root verb that opens
+  only the burial; the other entries are then recorded by the next root verb that opens
   the master, and readers accept them meanwhile (a floor with no entry for the name).
 - *Format.* The floor stays format version 1: nothing has shipped, so this is a hard cut with
   no migration. `tombstones` is optional and comes after `entries`; a verb writes it only when
   the floor holds a tombstone, so `"tombstones":{}` is not the encoding a verb writes and is
   refused. A floor with no `tombstones` field, the shape every earlier build wrote, parses as a
-  floor with no tombstones. A tombstone is parsed as strictly as an entry: a name `put` would
-  refuse, a generation that is not 32 lower-case hex digits, a `deleted` of 0, a field the
-  format does not have, or a name that also has a live entry is `ErrCorrupt` with the floor's
+  floor with no tombstones. A burial is parsed as strictly as an entry: a name `put` would
+  refuse, a generation that is not 32 lower-case hex digits, a `deleted` of 0 or above 2^53,
+  a field the format does not have, an empty or over-cap buried set, burials not oldest
+  first, a delete sequence used twice in the floor, a generation buried twice, a burial of the
+  name's live generation, or tombstones over 1 MiB is `ErrCorrupt` with the floor's
   message. A reader that rejects unknown fields, a build from before this change included,
   refuses a floor with tombstones whole, so it fails closed.
 
@@ -435,7 +449,7 @@ writes, so they raise the floor by calling `RaiseFloor` at their start; until th
 does so lands, a floor that lags its pointer is raised by the next write verb or
 `RaiseFloor`, and readers meanwhile accept the lag. A floor entry for a name with no
 directory (a crash during Delete) is overwritten by a later Put, and a retried `rm` of the name
-answers `ErrNotFound` and leaves it, so it stays a live entry rather than a tombstone until
+answers `ErrNotFound` and leaves it, so it stays a live entry rather than a burial until
 that Put.
 
 **The residual against a process that can read the master.** The pointer's authentication
@@ -608,7 +622,7 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   wait. Under it each verb re-reads
   `keystore-floor.json` and applies only its own change to what it read (Rotate and the
   start of a verb raise a sequence of the same generation, Put sets sequence 1 for a new
-  generation, Delete replaces the name's entry of the deleted generation with its tombstone and prunes tombstones to fit), holding
+  generation and keeps the name's burials, Delete buries the floor's live generation and prunes burials to fit), holding
   the lock through the rename and the directory fsync. This lock defends against a writer
   under a swapped `.lock` writing the floor; it does not stop racing entry files under a
   swapped `.lock`. Only root can open `keystore-lock`, so only root can hold this lock. The
@@ -4142,7 +4156,7 @@ last pull request lands and no row is pending.
 | G20 | The reconciler only Gets, creates and updates its labelled `Opaque` Secrets, and leaves an unlabelled or foreign Secret alone | unit over a fake client that records every call |
 | G21 | The rollback recipe in this document runs as written and is a byte-exact round trip | a script test that pipes `show --reveal` into `rotate --in -`, then compares the new current version's value byte for byte (`cmp`) with version N's, for an opaque entry and an Ed25519 entry |
 | G22 | `hack/ci.sh` passes | the gate runs it |
-| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current` |
+| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current`; a directory planted with a changed generation file and removed by `rm`, a delete, re-create, delete cycle, and a decoy swapped in before `rm`, each leaving the original copy refused |
 
 Phase A is complete when the gate passes with no row pending. A row can be reworded or dropped only by a change
 to this document, reviewed like any other.
@@ -4361,7 +4375,7 @@ carried by the unit rows.
 | U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
-| U192 | the floor's tombstone: a completed Delete replaces the name's floor entry with a tombstone of the deleted generation and a delete sequence, without the master too; a later Put clears it; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry; a floor with no `tombstones` field parses, and a tombstone is parsed as strictly as an entry | `k3sm/pkg/keystore::TestTombstoneClearedByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestParseFloorTombstones`, `FuzzParseFloor` | checked: the floor's tombstone |
+| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (the directory's only when the floor has no record of the name) with a delete sequence, without the master too; a later Put keeps the buried set; at most 8 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestParseFloorTombstones`, `FuzzParseFloor` | checked: the floor's tombstone |
 
 ### Rig legs
 

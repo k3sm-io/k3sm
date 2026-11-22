@@ -595,7 +595,7 @@ func TestDeleteDirectoryAtCurrent(t *testing.T) {
 	if err := s.Delete(ctx, "a"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if f := floorOf(t, server)["a"]; f.Deleted == 0 {
+	if f := floorOf(t, server)["a"]; len(f.burials()) == 0 {
 		t.Fatalf("floor entry for a after Delete = %+v, want it replaced by a tombstone", f)
 	}
 	if _, err := os.Lstat(filepath.Join(server, "keystore", "a")); !errors.Is(err, fs.ErrNotExist) {
