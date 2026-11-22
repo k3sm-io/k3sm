@@ -116,7 +116,8 @@ Exit codes: 0 done; 1 refused or failed; 2 usage; 3 rewrap completed an
 earlier interrupted rewrap instead (run it again with a new key); 4 the verb
 (put, rotate, rm, list, show or floor merge) is done, but the floor dropped a
 recorded deletion to stay within its limits, so a copy of that deleted entry
-put back is accepted.
+put back is accepted; 5 floor merge written, input not renamed: rerun to
+clear the guard (it wins over 4, and the report lists any drops).
 `
 
 // Exit codes of `k3sm keys`.
@@ -134,6 +135,11 @@ const (
 	// included), or a floor merge that reports a drop. list and show warn
 	// of their floor raise's eviction on stderr and exit 0.
 	keysCommitted = 4
+	// keysNotRenamed is a floor merge that was written but whose input,
+	// keystore-floor.json.pre-restore, was not renamed: the guard stays,
+	// and a rerun clears it. It wins over keysCommitted; the report still
+	// lists every burial dropped.
+	keysNotRenamed = 5
 )
 
 // The keystore's two directories in the server work dir. pkg/keystore's
@@ -996,9 +1002,10 @@ func (k *keepFlag) Set(q string) error {
 // and per burial dropped ("dropped
 // system/<name>: ..."), preceded by "already merged" when the live floor
 // already held everything the input records (a rerun: nothing is written,
-// the input is only renamed). It exits 0 when the merge is written, and
-// keysCommitted, the report printed, when it is written but dropped a burial
-// or its input could not be renamed (keystore.Committed).
+// the input is only renamed). It exits 0 when the merge is written,
+// keysCommitted, the report printed, when it is written but dropped a
+// burial, and keysNotRenamed, the report printed, when it is written but
+// its input could not be renamed (keystore.Committed), which wins.
 func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if len(args) == 0 || args[0] != "merge" {
 		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops]")
@@ -1049,8 +1056,8 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	}
 	if err != nil {
 		// Written, but the input was not renamed: the report above stands,
-		// and a rerun renames it.
-		return v.failf(keysCommitted, "%v", err)
+		// drops included, and a rerun renames it.
+		return v.failf(keysNotRenamed, "%v", err)
 	}
 	if len(r.Dropped) > 0 {
 		return v.failf(keysCommitted, "the merge is written, but it dropped %d deleted generation(s) to keep the floor within its caps", len(r.Dropped))

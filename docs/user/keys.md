@@ -70,7 +70,9 @@ interrupted rewrap instead of yours (run it again with a new key), 4 `put`, `rot
 limits, so a copy of that deleted entry put back is accepted. An `rm` that exits 4 and prints
 `deleted` deleted the entry, even when it says its files were left behind; one that prints no
 `deleted` found nothing to delete. `list` and `show` print such a drop as a warning and exit 0.
-Delete entries you no longer use to make room.
+Delete entries you no longer use to make room. 5 `floor merge` wrote the merge, but did not
+rename `keystore-floor.json.pre-restore`: run it again to finish the restore. Exit 5 wins over 4,
+and the report still lists every dropped deletion.
 
 ## Giving a Value
 
@@ -350,8 +352,8 @@ sudo k3sm keys floor merge
 ```
 
 Once the merge is written, it renames the file to `keystore-floor.json.merged-<time>`, the time in
-seconds since 1970, and the other verbs work again. If it prints its report and exits 4 saying the
-file was not renamed, the merge is written: run the same command again. The second run writes
+seconds since 1970, and the other verbs work again. If it prints its report and exits 5, the merge is
+written, but the file was not renamed: run the same command again to clear the guard. The second run writes
 nothing more, prints `already merged` and renames the file. The merge takes no file name: it reads only `/var/lib/k3sm/keystore-floor.json.pre-restore`,
 the floor the steps above moved aside, so it never reads the floor saved with the backup or any
 other copy. It refuses, and changes nothing, if that file is missing, if the restored

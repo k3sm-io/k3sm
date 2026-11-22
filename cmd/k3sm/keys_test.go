@@ -2529,7 +2529,8 @@ func TestKeysPendingMergeGuard(t *testing.T) {
 // TestKeysFloorMergeCommittedRerun (U192): a merge whose floor write landed
 // but whose rename failed (every keystore-floor.json.merged-<unix> name the
 // clock can reach during the run is taken) prints its full report and exits
-// keysCommitted; the guard stays, and a rerun of the same input, with the
+// keysNotRenamed (5), not keysCommitted, which means a burial was dropped;
+// the guard stays, and a rerun of the same input, with the
 // names freed, prints "already merged", renames the input and clears it.
 func TestKeysFloorMergeCommittedRerun(t *testing.T) {
 	h := newKeysHarness(t)
@@ -2549,8 +2550,8 @@ func TestKeysFloorMergeCommittedRerun(t *testing.T) {
 		taken = append(taken, p)
 	}
 	aside := recipeFloor(h) + ".pre-restore"
-	if code := h.run("floor", "merge"); code != keysCommitted {
-		t.Fatalf("merge with the rename failing: exit %d, stdout %q, stderr %q; want %d", code, h.stdout.String(), h.stderr.String(), keysCommitted)
+	if code := h.run("floor", "merge"); code != 5 {
+		t.Fatalf("merge with the rename failing: exit %d, stdout %q, stderr %q; want 5", code, h.stdout.String(), h.stderr.String())
 	}
 	if out := h.stdout.String(); !strings.Contains(out, "buried live 1\n") || !strings.Contains(out, "buried live system/k:") {
 		t.Fatalf("merge with the rename failing printed %q; want the full report", out)
