@@ -138,8 +138,10 @@ func (l *appendLog) keyBound() int {
 	return int(min(l.s.logReadBound()/int64(minFloorLine)+1, maxFloorKeysCeiling))
 }
 
-// keyShare is the most keys one uid's grant lines may hold in the floor:
-// keyBound/maxKeyShareDivisor. A revocation's line is never held to it.
+// keyShare is the most live keys one uid's grant lines may hold in the
+// floor: keyBound/maxKeyShareDivisor. A key a tombstone buries no longer
+// counts against it, though it still counts against keyBound. A
+// revocation's line is never held to it.
 func (l *appendLog) keyShare() int {
 	if l.maxKeys != 0 {
 		if l.maxShare != 0 {
@@ -352,8 +354,10 @@ type logState struct {
 	// hardCap and bound are the hard cap and logReadBound it was read
 	// under.
 	hardCap, bound int64
-	// keys is the floor's count of distinct keys, and uidKeys that count
-	// per uid, each key charged to its scope's uid.
+	// keys is the floor's count of distinct keys, buried ones included,
+	// which bounds the reader's memory; uidKeys is, per uid, the count of
+	// its keys whose latest line is live (no tombstone buries them), each
+	// key charged to its scope's uid, which the key share holds.
 	keys    int
 	uidKeys map[uint32]int
 	// off is where reading stopped: just past the last whole line read.
@@ -982,7 +986,9 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 				return 0, errFloorTooManyKeys
 			}
 			st.keys++
-			st.uidKeys[uid]++
+			if !r.tomb {
+				st.uidKeys[uid]++
+			}
 			nk := nameKey{r.key.scope, r.key.name}
 			if _, ok := st.firstGen[nk]; ok {
 				st.moreGens[nk] = append(st.moreGens[nk], r.key.gen)
@@ -992,6 +998,10 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		}
 		switch {
 		case r.tomb:
+			if inSeq && !st.buried[r.key] {
+				// A live key buried: it no longer holds its uid's share.
+				st.uidKeys[uid]--
+			}
 			st.buried[r.key] = true
 		case !inSeq || r.seq > seq:
 			st.maxSeq[r.key] = r.seq
