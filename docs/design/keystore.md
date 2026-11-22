@@ -2942,6 +2942,13 @@ the uid throughout.
     goes, so a revoked credential stays delivered. `nodes` update is therefore a
     revocation-freezing permission; the user docs say to grant it to no one who should not hold
     that power, and `doctor` names the extra server.
+19. The GeneratedUID binding trusts whatever the directory service answers. On a Mac bound to
+    a network directory (LDAP, or Active Directory with mobile accounts), the GeneratedUID
+    `mbr_uid_to_uuid` returns comes from that directory, so whoever controls the directory,
+    or its answers to this Mac, can make a reused uid look like the scope's original owner,
+    or make the real owner look changed (`ErrScopeOwnerChanged`, which deletes nothing in
+    this release). The binding closes uid reuse by local accounts; it is no defence against
+    the directory itself.
 ### What the user scope does not do
 
 Phase B direct mounts; a ServiceAccount rotate transport, deferred to a new endpoint with its
