@@ -85,7 +85,9 @@
 # shape (root runs the verbs and owns the data root, the service user owns the
 # store; the tests take the service user from K3SM_KEYSTORE_TEST_UID and
 # K3SM_KEYSTORE_TEST_GID, or the local user _k3sm). It builds the test binary
-# as the invoking user and runs only that binary under sudo -n. It passes when
+# as the invoking user and runs only that binary under sudo -n, from the
+# package's source directory as go test does, so the tests that read the
+# source tree find it; root builds nothing. It passes when
 # no test failed and the binary exited 0. It then runs the root-run rows
 # (declared with rootpend or rootcheck): each by name, in its own k3sm
 # package's binary, built the same way and run the same way. A checked
@@ -94,7 +96,8 @@
 # --check nor a unit mode runs a root-run row: each prints it as ROOT and
 # leaves it out of the count, as pending. Exit status: 0 pass; 1 fail; 3 sudo
 # -n is unavailable (run sudo -v first, or run as a user sudo lets run it), or
-# nothing failed and a root-run row is pending.
+# nothing failed and a root-run row is pending; 2 the source tree is dirty
+# (git status shows any change or untracked file), so it does not start.
 #
 # G1 diffs go.mod and go.sum against KEYSTORE_BASE (default: the merge base
 # with origin/main). KEYSTORE_SKIP_G22=1 marks G22 PENDING instead of running
@@ -207,8 +210,29 @@ cd "$K3SM_ROOT"
 root_tmp=""
 root_t=""
 root_ids=()
+
+# tree_state prints the k3sm checkout's git status, untracked files listed
+# one by one, sorted. Root runs the test binaries in the source tree, so each
+# run is bracketed by two of these.
+tree_state() {
+	git -C "$K3SM_ROOT" status --porcelain --untracked-files=all | LC_ALL=C sort
+}
+
+# tree_dirtied prints each status line in tree_state now that is not in $1,
+# a tree_state taken before a root run, and fails if any is (or if git
+# fails): a root run that leaves anything new in the source tree fails.
+tree_dirtied() {
+	local now new line
+	now="$(tree_state)" || { echo "  git status of $K3SM_ROOT failed"; return 1; }
+	new="$(LC_ALL=C comm -13 <(printf '%s\n' "$1") <(printf '%s\n' "$now") | grep -v '^$' || true)"
+	if [ -n "$new" ]; then
+		while IFS= read -r line; do echo "  left in the source tree: $line"; done <<<"$new"
+		return 1
+	fi
+}
+
 run_root() {
-	local t out rc=0 n m f
+	local t out rc=0 n m f before
 	t="$(mktemp -d "${TMPDIR:-/tmp}/keystore-root.XXXXXX")" || { echo "R1 FAIL as root: mktemp -d failed"; return 1; }
 	root_tmp="$t"
 	# The store refuses an unclean DataRoot, and macOS's TMPDIR ends in a
@@ -221,8 +245,7 @@ run_root() {
 		echo "R1 FAIL as root: the test binary did not build"
 		return 1
 	fi
-	# The committed fuzz corpus is read from ./testdata, beside the binary.
-	if ! cp -R pkg/keystore/testdata "$t/testdata" || ! mkdir "$t/tmp"; then
+	if ! mkdir "$t/tmp"; then
 		echo "R1 FAIL as root: could not lay out $t"
 		return 1
 	fi
@@ -234,7 +257,12 @@ run_root() {
 	root_ids=()
 	if [ -n "${K3SM_KEYSTORE_TEST_UID+set}" ]; then root_ids+=("K3SM_KEYSTORE_TEST_UID=$K3SM_KEYSTORE_TEST_UID"); fi
 	if [ -n "${K3SM_KEYSTORE_TEST_GID+set}" ]; then root_ids+=("K3SM_KEYSTORE_TEST_GID=$K3SM_KEYSTORE_TEST_GID"); fi
-	out="$(cd "$t" && sudo -n env TMPDIR="$t/tmp" ${root_ids[@]+"${root_ids[@]}"} ./keystore.test -test.count=1 -test.v 2>&1)" || rc=$?
+	# The binary runs in the package's source directory, as go test runs it,
+	# so the tests that read the source tree (and the committed fuzz corpus
+	# in ./testdata) find it. Root only runs the binary built above, and a
+	# run that leaves anything new in the tree fails.
+	before="$(tree_state)" || { echo "R1 FAIL as root: git status of $K3SM_ROOT failed"; return 1; }
+	out="$(cd "$K3SM_ROOT/pkg/keystore" && sudo -n env TMPDIR="$t/tmp" ${root_ids[@]+"${root_ids[@]}"} "$t/keystore.test" -test.count=1 -test.v 2>&1)" || rc=$?
 	# sudo -n that cannot run the binary prints only its own refusal.
 	if [ "$rc" -ne 0 ] && ! grep -q -- '^=== RUN' <<<"$out" && grep -q '^sudo: ' <<<"$out"; then
 		printf '%s\n' "$out"
@@ -244,6 +272,10 @@ run_root() {
 	n="$(grep -c -- '^--- PASS: ' <<<"$out" || true)"
 	m="$(grep -c -- '^--- SKIP: ' <<<"$out" || true)"
 	f="$(grep -c -- '--- FAIL: ' <<<"$out" || true)"
+	if ! tree_dirtied "$before"; then
+		echo "R1 FAIL as root: the run changed the source tree ($n tests passed, $m skipped)"
+		return 1
+	fi
 	if [ "$rc" -eq 0 ] && [ "$f" -eq 0 ]; then
 		echo "R1 PASS as root: $n tests passed, $m skipped"
 		return 0
@@ -254,8 +286,10 @@ run_root() {
 }
 
 # root_build sets RB to a fresh directory under root_t holding package $1's
-# test binary, pkg.test, built as the invoking user, and its testdata.
+# test binary, pkg.test, built as the invoking user, and RS to that
+# package's source directory, where the binary runs, as go test runs it.
 RB=""
+RS=""
 root_bin_n=0
 root_build() {
 	local rel d
@@ -272,14 +306,14 @@ root_build() {
 		return 1
 	fi
 	[ -f "$d/pkg.test" ] || { echo "keystore: $1 has no test binary"; return 1; }
-	if [ -d "${rel}testdata" ]; then cp -R "${rel}testdata" "$d/testdata" || return 1; fi
 	RB="$d"
+	RS="$K3SM_ROOT/${rel#./}"
 }
 
 # judge_root_row runs root-run row $1's named tests by name under sudo -n, one
 # binary per package, and fails it unless each printed PASS: a SKIP fails.
 judge_root_row() {
-	local i="$1" id="${R_ID[$1]}" spec p pkgs="" names t out rc bad=0
+	local i="$1" id="${R_ID[$1]}" spec p pkgs="" names t out rc bad=0 before
 	for spec in ${R_TESTS[$i]}; do
 		case " $pkgs " in *" ${spec%%::*} "*) ;; *) pkgs="$pkgs ${spec%%::*}" ;; esac
 	done
@@ -293,7 +327,12 @@ judge_root_row() {
 			return 1
 		fi
 		rc=0
-		out="$(cd "$RB" && sudo -n env TMPDIR="$RB/tmp" ${root_ids[@]+"${root_ids[@]}"} ./pkg.test -test.count=1 -test.v -test.run "^($names)\$" 2>&1)" || rc=$?
+		before="$(tree_state)" || { echo "$id FAIL as root: git status of $K3SM_ROOT failed"; return 1; }
+		out="$(cd "$RS" && sudo -n env TMPDIR="$RB/tmp" ${root_ids[@]+"${root_ids[@]}"} "$RB/pkg.test" -test.count=1 -test.v -test.run "^($names)\$" 2>&1)" || rc=$?
+		if ! tree_dirtied "$before"; then
+			echo "$id FAIL as root: the run of $p changed the source tree"
+			bad=1
+		fi
 		for t in ${names//|/ }; do
 			if grep -q -- "--- SKIP: $t " <<<"$out"; then
 				echo "$id FAIL as root: $t ($p) skipped, and a root-run row fails on SKIP"
@@ -314,7 +353,17 @@ judge_root_row() {
 
 # run_root_mode is --root: R1, then every root-run row.
 run_root_mode() {
-	local rc=0 i=0
+	local rc=0 i=0 dirty
+	# Root runs the test binaries in the source tree, and a run that leaves
+	# anything new there fails. In a tree already dirty a root-owned leftover
+	# could hide among the changes, or be committed with them, so a root run
+	# starts only from a clean tree.
+	dirty="$(tree_state)" || { echo "keystore: --root: git status of $K3SM_ROOT failed" >&2; return 2; }
+	if [ -n "$dirty" ]; then
+		printf '%s\n' "$dirty" >&2
+		echo "keystore: --root refuses a dirty source tree: root runs the tests in it and fails a run that leaves anything new, so start from a clean checkout (commit or remove the changes above)" >&2
+		return 2
+	fi
 	run_root || rc=$?
 	if [ "$rc" -eq 3 ] || [ -z "$root_t" ]; then return "$rc"; fi
 	while [ "$i" -lt "$nrows" ]; do
@@ -666,7 +715,7 @@ check U116 "the Pod uid refusal applies to native Pods only: a vm Pod with runAs
 	runtimed/pkg/runtime::TestVMPodGuestUIDNotRefused
 rootpend U118 "root-run: the old log is never service-user-owned while unflagged: in audit --rotate and floor --rebuild the step that clears sappnd on the old file, and on each archive rotate shifts, also fchowns it to root and fchmods it 0600 on the verb's descriptor; the service user's open(O_WRONLY|O_TRUNC) of each, between the clear and the re-flag, gets EACCES and changes no byte (append-only files)" \
 	k3sm/cmd/k3sm::TestMaintenanceOldFileRootOwnedWhileUnflagged
-rootpend U119 "root-run: the floor lock is keystore-lock, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root, rm-scope, floor --rebuild and audit --rotate included; a non-root process holding the old data-root flock blocks none of them (append-only files)" \
+rootcheck U119 "root-run: the floor lock is keystore-lock, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root, rm-scope, floor --rebuild and audit --rotate included; a non-root process other than the service user holding the old data-root flock blocks none of them (append-only files)" \
 	k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb
 pend U120 "the activated listening descriptor reaches no child (integration): an exec.Command child, the runtimed helper and a Pod through the exec shim each list their open descriptors, and the listening socket is among none of them (socket listener)" \
 	k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild
@@ -929,6 +978,7 @@ U118|EACCES
 U118|fchmods it 0600 on the verb's descriptor
 U119|keystore-lock
 U119|blocks none of them
+U119|other than the service user
 U120|among none of them
 U121|never relaxed to accept uid 0
 U123|another honoured record claims at the same (namespace, secretName)
