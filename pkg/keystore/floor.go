@@ -84,6 +84,26 @@ const (
 	maxDeleteSeq uint64 = 1 << 53
 )
 
+// The floor's limits as the code reads them. Each is its production
+// constant above, and nothing but a test changes one: a test lowers them
+// (setFloorLimits, setSeam) so it can reach a limit without writing
+// megabytes or planting a hundred thousand files, and restores them when it
+// ends. A test that lowers one does not run in parallel.
+var (
+	// floorSizeLimit is maxFloorSize.
+	floorSizeLimit = maxFloorSize
+	// floorEntriesLimit is maxFloorEntries: floorSizeLimit over
+	// minFloorEntrySize.
+	floorEntriesLimit = maxFloorEntries
+	// tombstoneSizeLimit is maxTombstoneSize.
+	tombstoneSizeLimit = maxTombstoneSize
+	// buriedPerNameLimit is maxBuriedPerName.
+	buriedPerNameLimit = maxBuriedPerName
+	// floorDirNamesBound bounds syncFloor's listing of keystore/. It is
+	// maxDirNames.
+	floorDirNamesBound = maxDirNames
+)
+
 var (
 	// errFloorUntrusted refuses a floor, or a data root holding it, that the
 	// service user could have written. It is about every entry, so it fails the
@@ -156,7 +176,7 @@ func (e floorEntry) buries(g string) bool {
 // oldest is dropped to make room, and returned.
 func (e *floorEntry) add(b burial) (burial, bool) {
 	bs := e.burials()
-	if len(bs) < maxBuriedPerName {
+	if len(bs) < buriedPerNameLimit {
 		e.Buried = append(slices.Clone(bs), b)
 		return burial{}, false
 	}
@@ -337,7 +357,7 @@ func (fl floor) grow(name string, e floorEntry) int {
 // Rotate. A verb asks it before it writes anything, so a full floor refuses
 // the verb rather than a write after its entry files.
 func (fl floor) room(name string, e floorEntry) error {
-	if n := fl.liveSize() + fl.grow(name, e); n > maxFloorSize {
+	if n := fl.liveSize() + fl.grow(name, e); n > floorSizeLimit {
 		return fmt.Errorf("%w (%d bytes)", errFloorFull, n)
 	}
 	return nil
@@ -368,7 +388,7 @@ func (fl floor) prune() []pruned {
 		}
 	}
 	live := fl.liveSize()
-	if t := tombstonesSize(names, sum); t <= maxTombstoneSize && live+t <= maxFloorSize {
+	if t := tombstonesSize(names, sum); t <= tombstoneSizeLimit && live+t <= floorSizeLimit {
 		return nil
 	}
 	sort.Slice(all, func(i, j int) bool {
@@ -379,7 +399,7 @@ func (fl floor) prune() []pruned {
 	})
 	var out []pruned
 	for _, a := range all {
-		if t := tombstonesSize(names, sum); t <= maxTombstoneSize && live+t <= maxFloorSize {
+		if t := tombstonesSize(names, sum); t <= tombstoneSizeLimit && live+t <= floorSizeLimit {
 			break
 		}
 		// A name's burials are oldest first, and so is this walk, so the
@@ -660,7 +680,7 @@ func (s *FileStore) readFloor(dir *os.Root, named fs.FileInfo) (floor, error) {
 	if err := s.floorOwned(opened); err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", errFloorUntrusted, s.dataRoot, err)
 	}
-	b, fi, err := readFile(dir, floorName, maxFloorSize)
+	b, fi, err := readFile(dir, floorName, int64(floorSizeLimit))
 	if errors.Is(err, fs.ErrNotExist) {
 		// An absent floor switches the check off, so absent must mean no
 		// name at all: a dangling symlink also fails the open as not found.
@@ -730,8 +750,8 @@ func parseFloor(b []byte) (floor, error) {
 	}
 	seen := map[uint64]bool{}
 	for name, bs := range f.Tombstones {
-		if len(bs) == 0 || len(bs) > maxBuriedPerName {
-			return nil, fmt.Errorf("%w: tombstone %q holds %d generations, want 1 to %d", errFloorMalformed, name, len(bs), maxBuriedPerName)
+		if len(bs) == 0 || len(bs) > buriedPerNameLimit {
+			return nil, fmt.Errorf("%w: tombstone %q holds %d generations, want 1 to %d", errFloorMalformed, name, len(bs), buriedPerNameLimit)
 		}
 		e := fl[name]
 		e.Buried = make([]burial, 0, len(bs))
@@ -746,8 +766,8 @@ func parseFloor(b []byte) (floor, error) {
 		}
 		fl[name] = e
 	}
-	if n := fl.deadSize(); n > maxTombstoneSize {
-		return nil, fmt.Errorf("%w: tombstones take %d bytes, over %d", errFloorMalformed, n, maxTombstoneSize)
+	if n := fl.deadSize(); n > tombstoneSizeLimit {
+		return nil, fmt.Errorf("%w: tombstones take %d bytes, over %d", errFloorMalformed, n, tombstoneSizeLimit)
 	}
 	canon, err := marshalFloor(fl)
 	if err != nil {
@@ -1015,7 +1035,7 @@ func (l *floorLock) update(op func(floor) bool) (floor, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(b) > maxFloorSize {
+	if len(b) > floorSizeLimit {
 		return nil, fmt.Errorf("%w (%d bytes)", errFloorFull, len(b))
 	}
 	if err := l.s.writeFileAs(l.root, floorName, b, uint32(l.s.floorUID), uint32(l.s.floorGID), floorFileMode); err != nil {
@@ -1064,7 +1084,7 @@ func loopCtx(ctx context.Context, i int) error {
 // that would take the floor over the size is left out, so that entry's floor
 // stays where it was, behind its pointer, which readers accept.
 func (s *FileStore) syncFloor(ctx context.Context, entries *os.Root, l *floorLock, fl floor, k keys) (floor, error) {
-	names, err := readDirNames(entries, maxDirNames)
+	names, err := readDirNames(entries, floorDirNamesBound)
 	if err != nil {
 		return nil, err
 	}
@@ -1092,8 +1112,8 @@ func (s *FileStore) syncFloor(ctx context.Context, entries *os.Root, l *floorLoc
 			found = append(found, raised{name, e.generation, seq})
 		}
 	}
-	if len(found) > maxFloorEntries {
-		return nil, fmt.Errorf("%w: the keystore holds %d entries, and the floor can hold at most %d", errFloorFull, len(found), maxFloorEntries)
+	if len(found) > floorEntriesLimit {
+		return nil, fmt.Errorf("%w: the keystore holds %d entries, and the floor can hold at most %d", errFloorFull, len(found), floorEntriesLimit)
 	}
 	return l.update(func(fl floor) bool {
 		changed := false
@@ -1118,7 +1138,7 @@ func (s *FileStore) syncFloor(ctx context.Context, entries *os.Root, l *floorLoc
 			case live > 0:
 				grow++ // the comma before it
 			}
-			if size+grow > maxFloorSize {
+			if size+grow > floorSizeLimit {
 				continue // left where it was: see above
 			}
 			fl[r.name] = raised
