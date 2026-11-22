@@ -17,9 +17,12 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -242,10 +245,12 @@ func TestTombstoneKeptByPut(t *testing.T) {
 	refusedAsDeleted(t, "Current of the old copy after the new Put", err)
 }
 
-// TestDeleteWithoutMasterTombstones (U192): Delete needs no master to write
-// its tombstone: with the floor present, over an absent floor file (which it
-// writes holding only the tombstone), and for a generation file that does
-// not read, whose tombstone takes the floor's recorded generation.
+// TestDeleteWithoutMasterTombstones (U192): Delete needs no master to bury
+// the floor's live record: with the floor present, and for a generation file
+// that does not read, whose tombstone takes the floor's recorded
+// generation. Over an absent floor file with no master it buries nothing,
+// since only a pointer authenticated under the master vouches for the
+// directory's generation; with the master it rebuilds the floor and buries.
 func TestDeleteWithoutMasterTombstones(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
@@ -271,12 +276,27 @@ func TestDeleteWithoutMasterTombstones(t *testing.T) {
 		t.Fatalf("tombstones = %+v, want c's recorded generation at delete sequence 2", ts)
 	}
 
-	// An absent floor file: Delete writes one holding the tombstone.
+	// An absent floor file and no master: the directory's generation file
+	// is the service user's to write and no pointer can vouch for it, so
+	// Delete buries nothing (the residual: run rm with the master).
 	remove(t, floorPath(server))
 	if err := s.Delete(ctx, "b"); err != nil {
 		t.Fatalf("Delete of b without the master or a floor: %v", err)
 	}
-	if ts := tombstonesOf(t, server); len(ts) != 1 || len(ts["b"]) != 1 || ts["b"][0].Generation != genB {
+	if _, err := os.Lstat(floorPath(server)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("floor after a master-less Delete with no record: %v, want it still absent", err)
+	}
+
+	// With the master, an absent floor is rebuilt from the authenticated
+	// pointers first, and the Delete buries the rebuilt record.
+	s2, server2 := newTestStore(t)
+	mustPut(t, s2, "b", KindOpaque, []byte("b"))
+	genB = generationOf(t, server2, "b")
+	remove(t, floorPath(server2))
+	if err := s2.Delete(ctx, "b"); err != nil {
+		t.Fatalf("Delete of b with the master and no floor: %v", err)
+	}
+	if ts := tombstonesOf(t, server2); len(ts) != 1 || len(ts["b"]) != 1 || ts["b"][0].Generation != genB {
 		t.Fatalf("tombstones = %+v, want only b's", ts)
 	}
 }
@@ -570,4 +590,56 @@ func TestDeleteBuriesWithDirectoryGone(t *testing.T) {
 			t.Fatalf("floor after rm of a gone name = %s, %v; want it unchanged", after, err)
 		}
 	})
+}
+
+// TestDeleteIgnoresPlantedGeneration (G23, U192): a directory planted under
+// a name the floor has no record of, with a generation file whose pointer
+// does not authenticate under it, buries nothing when root runs rm, with
+// the master and without, so it can never push a real burial out: over a
+// tombstone budget one more burial would overflow, the floor is left byte
+// for byte as it was.
+func TestDeleteIgnoresPlantedGeneration(t *testing.T) {
+	ctx := context.Background()
+	files := []string{generationName, "v1", currentName}
+	for _, master := range []bool{true, false} {
+		t.Run(map[bool]string{true: "with the master", false: "without the master"}[master], func(t *testing.T) {
+			s, server := newTestStore(t)
+			mustPut(t, s, "a", KindOpaque, []byte("a"))
+			src := saveEntry(t, server, "a", files...)
+			// Burials up to the tombstone budget, so a burial of the long
+			// planted name would make the write prune the oldest of them.
+			planted := nameOfLen(200, "x")
+			gen := strings.Repeat("ab", generationSize)
+			fl := floor{"a": floorOf(t, server)["a"]}
+			extra := buriedSize(planted, []burial{{Generation: gen, Deleted: 1 << 20}}) + 1
+			for i := 0; ; i++ {
+				name := fmt.Sprintf("t-%s-%06d", strings.Repeat("z", 200), i)
+				next := floor{name: buriedEntry(gen, uint64(i+1))}
+				maps.Copy(next, fl)
+				if next.deadSize() > maxTombstoneSize {
+					break
+				}
+				fl = next
+			}
+			if fl.deadSize()+extra <= maxTombstoneSize {
+				t.Fatalf("setup: tombstones of %d bytes leave room for %d more", fl.deadSize(), extra)
+			}
+			putFloorFile(t, server, fl)
+			before, err := os.ReadFile(floorPath(server))
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := copyEntryAs(t, server, src, "planted", strings.Repeat("ee", generationSize), files...)
+			putBack(t, server, d, planted)
+			if !master {
+				remove(t, filepath.Join(server, "cred", "keystore-master", masterName))
+			}
+			if err := s.Delete(ctx, planted); err != nil {
+				t.Fatalf("Delete of the planted directory: %v", err)
+			}
+			if after, err := os.ReadFile(floorPath(server)); err != nil || !bytes.Equal(after, before) {
+				t.Fatalf("floor after rm of the planted directory changed (%d bytes, was %d), %v; want no burial added and none pruned", len(after), len(before), err)
+			}
+		})
+	}
 }

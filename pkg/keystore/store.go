@@ -558,8 +558,10 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // under it is ErrNotFound. So a directory moved away during rm and moved
 // back is refused, and so is one a crash after the directory's removal left
 // a live record for, once rm runs again or a Put of the name replaces that
-// record (floor.set buries it). With no record for the name at all, the
-// deleted directory's generation is buried.
+// record (floor.set buries it). With no live record, the deleted
+// directory's generation is buried only when the master is loaded and the
+// directory's pointer authenticates under it: a Put that crashed after its
+// pointer. A master-less Delete of such a directory buries nothing.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -600,7 +602,8 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// Delete must work without the master, so the other entries' floors are
 	// raised only when it opens. A keystore with more entries than the floor
 	// holds is not raised, but Delete still runs: it is how room is made.
-	if k, kerr := s.loadMasterLocked(); kerr == nil {
+	k, kerr := s.loadMasterLocked()
+	if kerr == nil {
 		synced, err := s.syncFloor(ctx, root, fdir, fl, k)
 		switch {
 		case err == nil:
@@ -626,14 +629,20 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		}
 		return nil
 	}
-	// The generation is read before anything is removed: it is the one the
-	// tombstone records.
-	gen, genErr := [generationSize]byte{}, error(nil)
+	// The generation is read before anything is removed, and kept only
+	// when the master is loaded and the directory's pointer authenticates
+	// under it: the generation file is in the service user's tree, and only
+	// a pointer sealed under the master shows the generation is real (a Put
+	// that crashed after its pointer, before its floor write).
+	var authentic *[generationSize]byte
 	if raw, err := openEntryDirRaw(root, name); err == nil {
-		gen, genErr = readGeneration(raw.root)
+		if gen, gerr := readGeneration(raw.root); gerr == nil && kerr == nil {
+			raw.generation = gen
+			if _, _, perr := raw.pointer(k); perr == nil {
+				authentic = &gen
+			}
+		}
 		raw.close()
-	} else {
-		genErr = err
 	}
 	e, err := openEntryDir(root, name, fl)
 	damaged := errors.Is(err, errNoPointer)
@@ -681,17 +690,13 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		return err
 	}
 	// The floor's live generation for the name is buried, so an older copy
-	// of this entry put back is refused. The directory's generation, which
-	// the service user could have written, is buried only when the floor
-	// has no record for the name at all (bury).
-	var deleted *[generationSize]byte
-	if genErr == nil {
-		deleted = &gen
-	}
+	// of this entry put back is refused. With no live record, the
+	// directory's generation is buried only when its pointer authenticated
+	// under it (bury).
 	var buried string
 	var dropped []pruned
 	after, err := fdir.update(func(fl floor) bool {
-		buried, dropped = fl.bury(name, deleted)
+		buried, dropped = fl.bury(name, authentic)
 		return buried != ""
 	})
 	if err != nil {

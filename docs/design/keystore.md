@@ -377,15 +377,16 @@ buried set, oldest first:
   generation buried before it. A live generation is never also buried.
 - *What Delete buries.* Delete buries the generation the floor records live for the name,
   root's own record, whatever the deleted directory's `generation` file says. That file is in
-  the service user's tree, so it is trusted only when the floor has no record for the name at
-  all (no live entry and no buried set): then Delete buries the generation it read. A name
-  with a buried set and no live entry buries nothing more, so a planted generation file can
-  never push a real burial out of the per-name cap below. Delete never removes or replaces a
+  the service user's tree, so with no live record Delete buries the generation it read only
+  when the master is loaded and the directory's `current` authenticates under that
+  generation: a Put that crashed after its pointer and before its floor write. A planted
+  generation file under a name with no live record therefore buries nothing, and can never
+  push a real burial out of the per-name cap or the tombstone budget below. Delete never removes or replaces a
   buried generation; a floor write never lowers what the floor refuses on data from the
   service user's tree. A directory planted under a deleted name with a changed `generation`
   file and removed by `rm` therefore leaves the buried set as it was, and a decoy directory
   swapped in under a live name before `rm` buries the floor's live generation, not the
-  decoy's. With neither a live record nor a readable generation, Delete records nothing.
+  decoy's. With neither a live record nor an authenticated pointer, Delete records nothing.
 - *No directory to delete.* Delete buries the live record whatever stands under the name: no
   directory (or no `keystore/` at all), a non-directory it unlinks, or an incomplete Put it
   removes. It then succeeds and logs at Warn that the entry directory was already gone and
@@ -434,12 +435,16 @@ buried set, oldest first:
   the per-name cap's included, logs at Warn through `log/slog` with the count and the names,
   and a Delete whose own new burial the same write prunes logs that too. 1 MiB holds about 3,500 burials of the
   longest names and about 16,000 of short ones.
-- *Deletion without the master.* Delete still works without the master. A burial needs only
-  the floor's own record (or, with none, the directory's `generation` file) and the floor
-  lock, never a key. Over a full floor Delete still runs, since the burial it adds is pruned
-  before any live entry is touched. Delete over an absent floor file writes the file holding
-  only the burial; the other entries are then recorded by the next root verb that opens
-  the master, and readers accept them meanwhile (a floor with no entry for the name).
+- *Deletion without the master.* Delete still works without the master. Burying the floor's
+  live record needs only that record and the floor lock, never a key. Over a full floor Delete
+  still runs, since the burial it adds is pruned before any live entry is touched. Without the
+  master no pointer can vouch for a directory's generation, so a master-less Delete under a
+  name with no live record buries nothing. That includes an absent floor file, which then stays
+  absent until the next root verb that opens the master rebuilds it, and a Put that crashed
+  after its pointer under a name with no live record (none at all, or only burials): that
+  generation is lost from the floor, and a copy of it put back later is accepted. The remedy
+  is to run `rm` with the master available: the floor raise at its start records the crashed
+  Put's pointer live, and the Delete buries it.
 - *Format.* The floor stays format version 1: nothing has shipped, so this is a hard cut with
   no migration. `tombstones` is optional and comes after `entries`; a verb writes it only when
   the floor holds a tombstone, so `"tombstones":{}` is not the encoding a verb writes and is
@@ -4396,7 +4401,7 @@ carried by the unit rows.
 | U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
-| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (the directory's only when the floor has no record of the name) with a delete sequence, without the master too; a later Put keeps the buried set; at most 8 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `FuzzParseFloor` | checked: the floor's tombstone |
+| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 8 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `FuzzParseFloor` | checked: the floor's tombstone |
 
 ### Rig legs
 

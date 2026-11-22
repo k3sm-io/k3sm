@@ -520,22 +520,23 @@ func (fl floor) set(name string, gen [generationSize]byte) (bool, string, []prun
 
 // bury is Delete applied to fl. It buries the generation the floor records
 // live for name, root's own record, whatever the deleted directory claimed.
-// Only when the floor has no record for name at all does it bury dirGen,
-// the deleted directory's generation file (nil when it did not read), which
-// the service user could have written: a name with burials but no live
-// record buries nothing more, so a planted generation can never push a real
-// burial out of the per-name cap. bury never removes or replaces a burial
+// With no live record it buries dirGen, the deleted directory's generation,
+// which the caller passes only when the directory's pointer authenticated
+// under it with the master (a Put that crashed after its pointer, before
+// its floor write), and nil otherwise: a generation file alone is the
+// service user's to write, so a planted one never buries anything and never
+// pushes a real burial out. bury never removes or replaces a burial
 // except that, at maxBuriedPerName, the name's oldest is dropped to make
 // room. It returns the generation it buried ("" for none) and what it
 // dropped. The new burial's delete sequence is one more than the highest in
 // the floor (renumber keeps that under maxDeleteSeq).
 func (fl floor) bury(name string, dirGen *[generationSize]byte) (string, []pruned) {
-	f, ok := fl[name]
+	f := fl[name]
 	var g string
 	switch {
 	case f.live():
 		g = f.Generation
-	case !ok && dirGen != nil:
+	case dirGen != nil:
 		g = hex.EncodeToString(dirGen[:])
 	default:
 		return "", nil
