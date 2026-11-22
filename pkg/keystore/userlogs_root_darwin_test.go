@@ -99,6 +99,7 @@ func TestAppendOnlyFlagHoldsAsRoot(t *testing.T) {
 		attempt func(t *testing.T) error
 	}{
 		{"ftruncate on the O_APPEND descriptor", func(*testing.T) error { return unix.Ftruncate(int(f.Fd()), 0) }},
+		{"truncate by path", func(*testing.T) error { return unix.Truncate(p, 0) }},
 		{"O_RDWR open", func(*testing.T) error {
 			fd, err := unix.Open(p, unix.O_RDWR, 0)
 			if err == nil {
