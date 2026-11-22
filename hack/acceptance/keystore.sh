@@ -96,7 +96,8 @@
 # --check nor a unit mode runs a root-run row: each prints it as ROOT and
 # leaves it out of the count, as pending. Exit status: 0 pass; 1 fail; 3 sudo
 # -n is unavailable (run sudo -v first, or run as a user sudo lets run it), or
-# nothing failed and a root-run row is pending.
+# nothing failed and a root-run row is pending; 2 the source tree is dirty
+# (git status shows any change or untracked file), so it does not start.
 #
 # G1 diffs go.mod and go.sum against KEYSTORE_BASE (default: the merge base
 # with origin/main). KEYSTORE_SKIP_G22=1 marks G22 PENDING instead of running
@@ -352,7 +353,17 @@ judge_root_row() {
 
 # run_root_mode is --root: R1, then every root-run row.
 run_root_mode() {
-	local rc=0 i=0
+	local rc=0 i=0 dirty
+	# Root runs the test binaries in the source tree, and a run that leaves
+	# anything new there fails. In a tree already dirty a root-owned leftover
+	# could hide among the changes, or be committed with them, so a root run
+	# starts only from a clean tree.
+	dirty="$(tree_state)" || { echo "keystore: --root: git status of $K3SM_ROOT failed" >&2; return 2; }
+	if [ -n "$dirty" ]; then
+		printf '%s\n' "$dirty" >&2
+		echo "keystore: --root refuses a dirty source tree: root runs the tests in it and fails a run that leaves anything new, so start from a clean checkout (commit or remove the changes above)" >&2
+		return 2
+	fi
 	run_root || rc=$?
 	if [ "$rc" -eq 3 ] || [ -z "$root_t" ]; then return "$rc"; fi
 	while [ "$i" -lt "$nrows" ]; do
