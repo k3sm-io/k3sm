@@ -979,15 +979,23 @@ func TestOwnership(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
 	var (
-		mu    sync.Mutex
-		owned []os.FileInfo
+		mu        sync.Mutex
+		owned     []os.FileInfo
+		lockOwned bool
 	)
 	s.chown = func(f *os.File, uid, gid int) error {
-		// The floor, in the data root, is the one file handed to its own
-		// owner, root (floorIDs) rather than the service user.
+		// The floor and its lock, keystore-lock, both in the data root, are
+		// the files handed to their own owner, root (floorIDs), rather than
+		// the service user.
 		wantUID, wantGID := int(s.uid), int(s.gid)
-		if strings.Contains(filepath.Base(f.Name()), floorName) {
+		base := filepath.Base(f.Name())
+		if strings.Contains(base, floorName) || base == floorLockName {
 			wantUID, wantGID = s.floorUID, s.floorGID
+		}
+		if base == floorLockName && uid == wantUID && gid == wantGID {
+			mu.Lock()
+			lockOwned = true
+			mu.Unlock()
 		}
 		if uid != int(wantUID) || gid != int(wantGID) {
 			return fmt.Errorf("chown to %d:%d, want %d:%d", uid, gid, wantUID, wantGID)
@@ -1042,6 +1050,9 @@ func TestOwnership(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+	if !lockOwned {
+		t.Errorf("%s was never handed to the floor's owner %d:%d", floorLockName, s.floorUID, s.floorGID)
 	}
 	// cred, keystore-master, master, master.sha256, keystore, .lock, a,
 	// a/generation, a/v1, a/current.

@@ -118,23 +118,53 @@ func TestFloorWriteRereads(t *testing.T) {
 	})
 }
 
-// TestFloorLockBoundedWait: a held data-root lock gives a timeout error
+// holdFloorLock takes an exclusive flock on s's keystore-lock, creating it
+// if no verb has yet, and holds it until the test ends.
+func holdFloorLock(t *testing.T, s *FileStore) {
+	t.Helper()
+	f, err := os.OpenFile(filepath.Join(s.dataRoot, floorLockName), os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, floorLockMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// holdDataRootFlock takes an exclusive flock on s's data-root directory
+// itself, as any local process able to open it could, and holds it until
+// the test ends.
+func holdDataRootFlock(t *testing.T, s *FileStore) {
+	t.Helper()
+	f, err := os.Open(s.dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// floorVerbs returns each verb that writes the floor, bound to ctx and s,
+// over an entry a that exists and a name b that does not.
+func floorVerbs(ctx context.Context, s *FileStore) map[string]func() error {
+	return map[string]func() error{
+		"Put":        func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err },
+		"Rotate":     func() error { _, err := s.Rotate(ctx, "a", []byte("b")); return err },
+		"Delete":     func() error { return s.Delete(ctx, "a") },
+		"RaiseFloor": func() error { return s.RaiseFloor(ctx) },
+		"Rewrap":     func() error { return s.Rewrap(ctx, rewrapKey(9)) },
+	}
+}
+
+// TestFloorLockBoundedWait: a held keystore-lock gives a timeout error
 // within the bound to every verb that writes the floor, never a hang, and a
 // cancelled context ends the wait. Readers do not take it. It runs in a
 // synctest bubble, as TestLockBoundedWait does, so the production bound
-// passes at once.
+// passes at once on the bubble's clock and no wall clock is read.
 func TestFloorLockBoundedWait(t *testing.T) {
-	hold := func(t *testing.T, s *FileStore) {
-		t.Helper()
-		f, err := os.Open(s.dataRoot)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = f.Close() })
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-			t.Fatal(err)
-		}
-	}
 	t.Run("held", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			ctx := t.Context()
@@ -144,17 +174,12 @@ func TestFloorLockBoundedWait(t *testing.T) {
 				t.Fatalf("lockWait = %v, want the production bound %v", s.lockWait, lockTimeout)
 			}
 			before := floorOf(t, server)
-			hold(t, s)
-			for op, fn := range map[string]func() error{
-				"Put":        func() error { _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); return err },
-				"Rotate":     func() error { _, err := s.Rotate(ctx, "a", []byte("b")); return err },
-				"Delete":     func() error { return s.Delete(ctx, "a") },
-				"RaiseFloor": func() error { return s.RaiseFloor(ctx) },
-			} {
+			holdFloorLock(t, s)
+			for op, fn := range floorVerbs(ctx, s) {
 				start := time.Now()
 				err := fn()
 				if took := time.Since(start); !errors.Is(err, errLockTimeout) || took < s.lockWait || took > s.lockWait+time.Second {
-					t.Fatalf("%s under a held data-root lock: %v after %v of bubble time, want errLockTimeout after %v", op, err, took, s.lockWait)
+					t.Fatalf("%s under a held keystore-lock: %v after %v of bubble time, want errLockTimeout after %v", op, err, took, s.lockWait)
 				}
 			}
 			mustCurrent(t, s, "a", "a")
@@ -170,7 +195,7 @@ func TestFloorLockBoundedWait(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			s, _ := newTestStore(t)
 			mustPut(t, s, "a", KindOpaque, []byte("a"))
-			hold(t, s)
+			holdFloorLock(t, s)
 			s.lockWait = time.Minute
 			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 			defer cancel()
@@ -183,6 +208,169 @@ func TestFloorLockBoundedWait(t *testing.T) {
 			}
 		})
 	})
+}
+
+// TestDataRootFlockBlocksNoFloorWrite: a flock held on the data-root
+// directory itself, which any local process able to open the 0755 data root
+// can take, no longer blocks a verb that writes the floor. It runs in a
+// synctest bubble, so a verb that did wait on it would fail with
+// errLockTimeout at once rather than after the wall-clock bound.
+func TestDataRootFlockBlocksNoFloorWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := t.Context()
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("a"))
+		holdDataRootFlock(t, s)
+		for _, op := range []string{"Put", "Rotate", "RaiseFloor", "Rewrap", "Delete"} {
+			if err := floorVerbs(ctx, s)[op](); err != nil {
+				t.Fatalf("%s under a flock held on the data-root directory: %v, want success", op, err)
+			}
+		}
+		fl := floorOf(t, server)
+		if _, ok := fl["a"]; ok {
+			t.Fatalf("floor after the Delete still records a: %+v", fl)
+		}
+		if fl["b"].Seq != 1 {
+			t.Fatalf("floor b after the Put = %+v, want sequence 1", fl["b"])
+		}
+	})
+}
+
+// TestFloorLockFileUntrustedRefused: keystore-lock is judged on the
+// descriptor the lock is taken on, and a verb that writes the floor refuses
+// one that is not a regular file, not owned by root (the floor's owner), or
+// group- or other-accessible, and changes nothing.
+func TestFloorLockFileUntrustedRefused(t *testing.T) {
+	ctx := context.Background()
+	lockPath := func(s *FileStore) string { return filepath.Join(s.dataRoot, floorLockName) }
+	cases := []struct {
+		name   string
+		damage func(t *testing.T, s *FileStore)
+	}{
+		{"group-readable", func(t *testing.T, s *FileStore) { chmod(t, lockPath(s), 0o640) }},
+		{"other-readable", func(t *testing.T, s *FileStore) { chmod(t, lockPath(s), 0o604) }},
+		{"group-writable", func(t *testing.T, s *FileStore) { chmod(t, lockPath(s), 0o620) }},
+		{"not owned by root", func(t *testing.T, s *FileStore) {
+			// Non-root, the data root and the lock file have one owner, the
+			// running user, and no other can be made.
+			if !asRoot() {
+				t.Skip("needs root to give the file to another user")
+			}
+			if err := os.Lchown(lockPath(s), int(otherUID(t)), 0); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a symlink", func(t *testing.T, s *FileStore) {
+			copyFile(t, lockPath(s), lockPath(s)+".real")
+			replaceWithSymlink(t, lockPath(s), floorLockName+".real")
+		}},
+		{"a dangling symlink", func(t *testing.T, s *FileStore) { replaceWithSymlink(t, lockPath(s), "nowhere") }},
+		{"a FIFO", func(t *testing.T, s *FileStore) { replaceWithFIFO(t, lockPath(s)) }},
+		{"a directory", func(t *testing.T, s *FileStore) {
+			if err := os.Remove(lockPath(s)); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(lockPath(s), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			mustPut(t, s, "a", KindOpaque, []byte("a"))
+			if _, err := os.Lstat(lockPath(s)); err != nil {
+				t.Fatalf("the first Put left no %s: %v", floorLockName, err)
+			}
+			before := floorOf(t, server)
+			tc.damage(t, s)
+			for op, fn := range floorVerbs(ctx, s) {
+				err := fn()
+				if !errors.Is(err, errFloorUntrusted) || !strings.Contains(err.Error(), floorLockName) {
+					t.Fatalf("%s over a %s %s: %v, want errFloorUntrusted naming it", op, tc.name, floorLockName, err)
+				}
+			}
+			if after := floorOf(t, server); !maps.Equal(after, before) {
+				t.Fatalf("floor after the refused verbs = %+v, was %+v", after, before)
+			}
+			if _, err := os.Lstat(filepath.Join(server, "keystore", "b")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the refused Put left b: %v", err)
+			}
+		})
+	}
+}
+
+// TestFloorLockFileRecheckedAfterFlock: once keystore-lock is flocked, it is
+// Lstat'd again through the data root it was opened in, and the verb refuses
+// (errFloorUntrusted) a name that no longer holds the locked file, which
+// would let two writers lock different files. Its link count is not judged:
+// macOS lets any local user hard-link a file it cannot read, so a refusal of
+// a second link would hand every user a lasting block on the floor verbs,
+// and a second link is the same inode, so it changes nothing about the lock.
+func TestFloorLockFileRecheckedAfterFlock(t *testing.T) {
+	ctx := context.Background()
+	lockPath := func(s *FileStore) string { return filepath.Join(s.dataRoot, floorLockName) }
+	t.Run("a hard link outside the data root blocks nothing", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("a"))
+		// t.TempDir is on the data root's volume, as the data root is
+		// another t.TempDir.
+		if err := os.Link(lockPath(s), filepath.Join(t.TempDir(), "held")); err != nil {
+			t.Fatal(err)
+		}
+		for _, op := range []string{"Put", "Rotate", "RaiseFloor", "Rewrap", "Delete"} {
+			if err := floorVerbs(ctx, s)[op](); err != nil {
+				t.Fatalf("%s with a second link to %s: %v, want success", op, floorLockName, err)
+			}
+		}
+		if fl := floorOf(t, server); fl["b"].Seq != 1 {
+			t.Fatalf("floor b after the Put = %+v, want sequence 1", fl["b"])
+		}
+	})
+	t.Run("replaced after the open", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("a"))
+		before := floorOf(t, server)
+		replaced := 0
+		// The hook runs after the flock, before the re-check: a new file of
+		// the same owner and mode is renamed over the name.
+		s.dataRootLocked = func() {
+			replaced++
+			tmp := lockPath(s) + ".new"
+			if err := os.WriteFile(tmp, nil, floorLockMode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(tmp, lockPath(s)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s.Rotate(ctx, "a", []byte("b")); !errors.Is(err, errFloorUntrusted) || !strings.Contains(err.Error(), floorLockName) {
+			t.Fatalf("Rotate over a %s replaced after its open: %v, want errFloorUntrusted naming it", floorLockName, err)
+		}
+		if replaced != 1 {
+			t.Fatalf("the lock file was replaced %d times, want 1", replaced)
+		}
+		if after := floorOf(t, server); !maps.Equal(after, before) {
+			t.Fatalf("floor after the refused Rotate = %+v, was %+v", after, before)
+		}
+		mustCurrent(t, s, "a", "a")
+	})
+}
+
+// TestFloorLockFileCreated: the first verb that writes the floor creates
+// keystore-lock in the data root, a regular file owned by the floor's owner
+// (root in production) and mode 0600.
+func TestFloorLockFileCreated(t *testing.T) {
+	s, _ := newTestStore(t)
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	fi, err := os.Lstat(filepath.Join(s.dataRoot, floorLockName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := fi.Sys().(*syscall.Stat_t)
+	if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 || int(st.Uid) != s.floorUID || int(st.Gid) != s.floorGID {
+		t.Fatalf("%s is %s owned by %d:%d, want a regular file 0600 owned by %d:%d", floorLockName, fi.Mode(), st.Uid, st.Gid, s.floorUID, s.floorGID)
+	}
 }
 
 // TestFloorNotWritableChangesNothing: a verb that cannot write the floor

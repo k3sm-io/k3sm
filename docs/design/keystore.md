@@ -533,21 +533,34 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
 - Each file write is still temp-and-rename, so a process that dies releases the lock and
   leaves a state the next operation can finish or discard. The lock is for serialization,
   not for crash safety.
-- Every verb that writes the floor also takes `flock(2)` on the data root directory itself,
-  opened `O_NOFOLLOW|O_DIRECTORY` and judged root-owned and not shared on that descriptor,
-  after `keystore/.lock` and with the same bounded wait. Under it each verb re-reads
+- Every verb that writes the floor also takes `flock(2)` on `keystore-lock`, a root:wheel
+  0600 file in the data root: the data root is opened `O_NOFOLLOW|O_DIRECTORY` and judged
+  root-owned and not shared on that descriptor, and the file is created
+  `O_CREAT|O_EXCL|O_NOFOLLOW` through that directory, opened `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`
+  and refused unless, on that descriptor, it is a regular file owned by root with no group
+  or other access; after the flock its name is `lstat`ed again through the same directory
+  and must still be the held file. Its link count is not judged: macOS lets any local user
+  hard-link a file it cannot read, so refusing a second link would let anyone block every
+  floor verb, and a link elsewhere is the same file, so it changes nothing about the lock.
+  The order is `keystore/.lock` first, then `keystore-lock`, each with the same bounded
+  wait. Under it each verb re-reads
   `keystore-floor.json` and applies only its own change to what it read (Rotate and the
   start of a verb raise a sequence of the same generation, Put sets sequence 1 for a new
   generation, Delete removes the entry only if it records the deleted generation), holding
   the lock through the rename and the directory fsync. This lock defends against a writer
   under a swapped `.lock` writing the floor; it does not stop racing entry files under a
-  swapped `.lock`. The data root is root:wheel 0755, so any local process able to open it,
-  not only the service user, can take this lock and hold it. A root verb that writes the
-  floor then fails with the lock timeout after the bounded wait; while the lock is held,
-  Delete and Rotate fail too, so a compromised secret cannot be removed or replaced until
-  the holder lets go. That is a denial of
-  service against the root write verbs and nothing more: holding the lock writes nothing,
-  so the floor, the entries and the readers (which do not take it) lose no integrity.
+  swapped `.lock`. Only root can open `keystore-lock`, so only root can hold this lock. The
+  data root itself is root:wheel 0755 and any local process can open it and `flock(2)` it,
+  but no verb takes that lock, so holding it blocks nothing (U119). This closes the denial
+  of service for every local process except the service user, and every native Pod runs as
+  the service user ("Threat model"). It owns `keystore/.lock`, which every root write verb
+  takes first, so any native Pod can hold that lock and keep revocation and rotation
+  failing: each Delete and Rotate fails with the lock timeout after the bounded wait, again
+  and again, and the failure does not clear until the holder lets go or exits. That residual
+  is accepted, since every native Pod is the service user, one trust domain with the master.
+  Holding the lock costs no integrity, because holding a lock writes nothing; that covers a
+  held `.lock`, not a replaced one, whose limits are the swapped-`.lock` caveat above (the
+  floor stays defended, racing entry files do not).
 - An entry directory with no `current` is an incomplete Put only in the one shape a crashed
   Put can leave, ignoring leftover `.tmp` files, and only when the floor does not record its
   generation; any other directory with no `current` is damage. "An entry directory with no
@@ -757,7 +770,7 @@ rewrap --key-out FILE | --key-in FILE
       under, and refuses any other. Takes no value.
       Prints that entry backups taken earlier no longer open.
 
-deliver system/<name> --namespace NS [--secret NAME] [--data-key KEY]
+deliver system/<name> --namespace NS [--secret NAME] [--item FIELD=KEY ...] [--data-key KEY]
       Root delivery: declare delivery of an existing system entry as a
       Secret. Refuses a name that does not exist. Warns when secrets
       encryption is off on this data root.
@@ -791,14 +804,20 @@ itself is never flocked:
 
 ```json
 {"version": 1, "targets": [
-  {"entry": "system/signer-key", "namespace": "payments", "secretName": "signer-key", "dataKey": "private.key"}
+  {"entry": "system/signer-key", "namespace": "payments", "secretName": "signer-key",
+   "items": [{"field": "value", "key": "private.key"}]}
 ]}
 ```
 
 `entry` is the scope-qualified name (amended by the user scope's naming rule: the file only
 ever names `system/` entries, since a user entry reaches a namespace only through a
-`KeyDelivery`). `secretName` defaults to the entry name without its `system/` prefix and
-`dataKey` to `value`. The file is root-owned
+`KeyDelivery`). `secretName` defaults to the entry name without its `system/` prefix.
+`items` is the projection list of "Typed credentials", in the `credential.Item` JSON form
+(`{"field": …, "key": …}`, 1 to 8, keys unique), parsed strictly; the verb fills it from
+`--item`, from `--data-key K` (which is `--item value=K`), or with neither from the entry
+kind's default (`value=value` for `opaque` and `ed25519`), and refuses an `ssh` entry without
+`--item`. This file format, `version: 1` with `items`, is the one "Typed credentials" binds; a
+target carries no `dataKey` field. The file is root-owned
 and outside the service user's tree for the reason the manifest directory is
 (`pkg/install/statetree.go`'s `ManifestDirMode`): the declaration decides which namespace
 the admin client writes a Secret into, so a file any process running as the service user
@@ -822,8 +841,8 @@ for the root-file delivery. The user scope's `KeyDelivery` reconciler is separat
 differs on purpose: it deletes the Secrets it owns when authority is lost, and an unbound
 ClusterRole ships for admins to bind ("User scope", "KeyDelivery").
 
-**Ed25519 encoding in the Secret:** the stored seed or expanded key, base64 under
-`dataKey` exactly as Kubernetes already base64-encodes every Secret `data` value — no PEM
+**Ed25519 encoding in the Secret:** the stored seed or expanded key, base64 under the
+item's key exactly as Kubernetes already base64-encodes every Secret `data` value — no PEM
 wrapping, no bundled public key.
 
 **Ownership label:** `k3sm.io/keystore-delivery: <entry-name>`, distinct from
@@ -862,13 +881,13 @@ and a create happens only after the state file was written successfully in that 
 **Re-delivery on rotation:** the sweep compares the target's current version and
 fingerprint (`Store.Current`'s `Version.Version` and `Version.Fingerprint`) against the
 Secret's own `k3sm.io/keystore-version` and `k3sm.io/keystore-fingerprint` annotations, and
-checks that `data` holds exactly the declared `dataKey` and that its bytes are the stored
+checks that `data` holds exactly the declared items' keys and that their bytes are the projected
 value (`subtle.ConstantTimeCompare`, so an edit of `data` that leaves the annotations intact is
 drift: re-applied and logged, without the value); any mismatch re-applies `data` and
 both annotations — content-derived, like the embedded reconciler's own checksum-skip. The
 version alone is not enough: an entry deleted and put back starts at version 1 again with a
 new value, and `pkg/keystore` exposes no generation, so the value's fingerprint is what
-tells the two apart. A changed `dataKey` re-applies too, and the stale key leaves `data`. An
+tells the two apart. A changed item list re-applies too, and a stale key leaves `data`. An
 `immutable` Secret the reconciler owns cannot be updated, so a re-delivery deletes it with
 `DeleteOptions{Preconditions: {UID: <recorded UID>}}`, creates it again and records the new
 UID, logging both steps without the value. It is the reconciler's only delete, and it is safe
@@ -1316,11 +1335,13 @@ deleted and their deliveries withdrawn, and the user declares them again with `d
 
 **The `deliveries` record has its own bound.** It is exempt from the store's 64 KiB value cap
 and holds at most 320 entries: 64 live entries plus 256 withdrawn tombstones. An entry is at
-most 1,280 bytes: the UID (36 bytes), the KeyDelivery's `metadata.name` (at most 253), the
-target tuple (`entry` at most 269 bytes, `namespace` 63, `secretName` 253, `dataKey` 253,
-`requestedBy` 21), the 32-byte digest, the last delivered version (8 bytes), a state byte and
-seven 4-byte length prefixes, 1,217 bytes in all. So the record's plaintext is at most 400 KiB plus a 16-byte header, and the
-store refuses to read or write a sealed record over 416 KiB.
+most 3,328 bytes: the UID (36 bytes), the KeyDelivery's `metadata.name` (at most 253), the
+target tuple (`entry` at most 269 bytes, `namespace` 63, `secretName` 253, `requestedBy` 21,
+and `items`: at most 8 items, each a `field` of at most 32 bytes and a `key` of at most 253,
+each length-prefixed, 8 × 293 = 2,344 bytes in one length-prefixed blob), the 32-byte digest,
+the last delivered version (8 bytes), a state byte and seven 4-byte length prefixes, 3,308
+bytes in all. So the record's plaintext is at most 1,040 KiB plus a 16-byte header, and the
+store refuses to read or write a sealed record over 1,056 KiB.
 
 - *`deliver` is refused at the bound.* It adds an entry, and answers `quota` when the record
   has 64 live entries or 320 in all.
@@ -2085,19 +2106,24 @@ layer.**
 
 A namespaced declaration, `KeyDelivery` in `keystore.k3sm.io/v1alpha1`, delivers a user
 entry into a namespace as a Secret. It borrows ExternalSecret's explicit target and policy
-fields (a named target Secret, a data key), not its code, since reusing ExternalSecret would
+fields (a named target Secret, explicit data keys), not its code, since reusing ExternalSecret would
 add a dependency and a provider model k3sm does not have. The CRD is alpha: the user docs say
-it may change and that a conversion is owed if it does.
+it may change and that a conversion is owed if it does. The Go type is
+`k3sm.io/apis/keystore/v1alpha1.KeyDelivery`, and the CRD is
+`apis/config/crd/keystore.k3sm.io_keydeliveries.yaml`.
 
 **Shape.**
 
 - `metadata.name` is free.
 - `spec.entry` (scope-qualified, the entry pattern above), `spec.secretName` (the target
-  Secret), `spec.dataKey` and `spec.requestedBy` are all required in the schema, except
-  `dataKey`, which defaults to `value`. `requestedBy` also carries the pattern
+  Secret), `spec.items` and `spec.requestedBy` are all required in the schema, with no
+  defaults. `items` is the projection list of "Typed credentials" (`{field, key}`, 1 to 8,
+  keys unique, no default because the API server cannot see the entry's kind); there is no
+  `dataKey`. `requestedBy` also carries the pattern
   `^k3sm:local:[1-9][0-9]{0,9}$`. All four are immutable through CRD CEL transition rules
-  (`self == oldSelf`), so the CRD is safe without the admission policy (U18). They are
-  required or defaulted because a CEL transition rule does not run when the old value is
+  (`self == oldSelf`, and for `items` a comparison as a map, so a reorder is not a change),
+  so the CRD is safe without the admission policy (U18). They are
+  required because a CEL transition rule does not run when the old value is
   absent: an optional field left out at create could be set later, by an update, to any value,
   and the immutability rule would never run. A field present from the first write is covered
   for the object's whole life.
@@ -2109,9 +2135,12 @@ it may change and that a conversion is owed if it does.
   ```
 
 - The status subresource is on: `observedGeneration`, `conditions` (`Authorized`, `Ready`,
-  `SecretRetained`) as
+  `SecretRetained`, and for kinds with an expiry `CredentialValid`) as
   the source of truth, and `deliveredVersion`; no value and no fingerprint of an opaque value.
   `conditions` is `listType=map` keyed by `type`, so each condition type appears once.
+  **Every condition carries its own `observedGeneration`**, all four of them: the CRD makes it
+  a required field of each condition, and the reconciler sets it on every write, since
+  `meta.SetStatusCondition` does not fill it in (U43, U142).
 - Condition reasons are a closed set listed in the schema description. "No such entry" and
   "not yours" share one reason, `EntryUnavailable`, so status reveals nothing about existence;
   `NotRecorded` is reported only after the entry's owner has matched `requestedBy`.
@@ -2134,7 +2163,10 @@ objects lose their claim at once, whatever their check reads (Open requirement 1
   ownership against the record; it is never an input to precedence, so a writer who rewrites it
   to name another recorded UID cannot move the target to that object (U111). The set
   is closed per condition: a condition carries only the reasons its own rows below give, with
-  the status those rows give.
+  the status those rows give. The set is `ConditionReasons()` in
+  `k3sm.io/apis/keystore/v1alpha1`, with the `Reason*` constants beside it, and the
+  `CredentialValid` reasons are `credential.Validities()`. `CredentialValid` is absent for kinds
+  without an expiry, and `Ready` does not change on expiry or revocation.
 
   | reason | condition | status | when |
   |---|---|---|---|
@@ -2150,6 +2182,7 @@ objects lose their claim at once, whatever their check reads (Open requirement 1
   | `SecretClaimed` | `Ready` | `False` | an older KeyDelivery owns the target Secret |
   | `EncryptionOff` | `Ready` | `False` | secrets encryption is off and the override is not set (G18) |
   | `UserScopeOff` | `Ready` | `False` | more than one server is registered |
+  | `ProjectionInvalid` | `Ready` | `False` | an item names a field the entry's kind does not have ("Typed credentials"); any existing Secret is left untouched: an error, not a denial |
   | `DeletePending` | `SecretRetained` | `True` | `Authorized` is `False` and the Secret this object owns is due for deletion but still exists: the delete call failed, or the owner's reconciler allowance is exhausted |
   | `Unowned` | `SecretRetained` | `True` | `Authorized` is `False` with `NotRecorded` for a UID never recorded, and a labelled Secret names this UID: it is not this object's to delete, and it stays |
   | `Indeterminate` | `SecretRetained` | `True` | `Authorized` is `Unknown` and a labelled Secret that is this object's recorded target stays, at its last version |
@@ -2157,6 +2190,12 @@ objects lose their claim at once, whatever their check reads (Open requirement 1
 | `UserScopeOff` | `SecretRetained` | `True` | more than one server is registered and a labelled Secret that is this object's recorded target stays; it must be deleted by hand |
 | `OwnerUnresolvable` | `SecretRetained` | `True` | the entry owner's uid has no directory record (the lookup answers a synthesized GeneratedUID), and a labelled Secret that is this object's recorded target stays |
   | `NoneRetained` | `SecretRetained` | `False` | no labelled Secret of this object stays while `Authorized` is `Unknown` or `False`; and whenever `Authorized` is `True` |
+  | `Valid` | `CredentialValid` | `True` | kinds with an expiry only (`token`, `oauth`): not expiring, refresh healthy |
+  | `Expiring` | `CredentialValid` | `True` | inside the expiry threshold of "Typed credentials" |
+  | `RefreshFailing` | `CredentialValid` | `True` | oauth: the last server refresh failed transiently and the access token is still valid |
+  | `Expired` | `CredentialValid` | `False` | past the (access) expiry with no newer version |
+  | `Revoked` | `CredentialValid` | `False` | oauth: the token endpoint answered a code in the profile's `revokedErrorCodes` |
+  | `Indeterminate` | `CredentialValid` | `Unknown` | the entry could not be opened |
 
   **What each `Authorized=False` reason does to the Secret.** Every reason is tied to one
   action, and the status says which:
@@ -2238,7 +2277,9 @@ nil object becomes CEL `null` (`pkg/admission/conversion.go:137`, read into `obj
 `oldObject` on an UPDATE or a DELETE.
 
 **Who creates one.** The owner, through the socket: `k3sm keys deliver user/<uid>/<name>
---namespace NS --secret S [--data-key K]` (the short-name form is accepted).
+--namespace NS --secret S [--item field=key …] [--data-key K]` (the short-name form is
+accepted; `--data-key K` is `--item value=K`, and with no `--item` the CLI takes the kind's
+default from "Typed credentials", refusing an `ssh` entry).
 
 - The server creates the object with the admin client **impersonating exactly
   `k3sm:local:<peer uid>`** with the group `k3sm:local-users`. The uid is the peer uid the
@@ -2252,13 +2293,18 @@ nil object becomes CEL `null` (`pkg/admission/conversion.go:137`, read into `obj
   `NS`.
 - After the create, the server appends to the caller's sealed `deliveries` record (kind
   0xFD, under the user-scope floor) the object's `metadata.uid` and `metadata.name`, the full **target tuple**
-  (`entry`, `namespace`, `secretName`, `dataKey`, `requestedBy`), all under the record's seal,
+  (`entry`, `namespace`, `secretName`, `items`, `requestedBy`), all under the record's seal,
   and the **target digest**
   `sha256("k3sm-keystore-delivery-target/v1" ‖ LP(entry) ‖ LP(namespace) ‖ LP(secretName) ‖
-  LP(dataKey) ‖ LP(requestedBy))` (U14, U41). The digest is over those five strings only, as
-  the live object's spec gives them, never over the object's serialised shape, so a field the
-  API server adds or a defaulted field it fills in changes no digest. `requestedBy` is in the digest, so an object
-  whose requester is changed under its UID fails the digest like a retargeted one. The digest
+  LP(items))`, where `items` is one length-prefixed blob of the items sorted by `key` bytewise,
+  each `LP(field) ‖ LP(key)` ("Typed credentials", U14, U41, U161). The digest is over those
+  values only, as the live object's spec gives them, never over the object's serialised shape,
+  so a field the API server adds changes no digest, and a reorder of `items` changes none
+  either. `requestedBy` is not in the digest and needs no place there: check 1 below holds
+  `requestedBy` to the owner of the entry the digest binds, and the CRD's cross-field rule ties
+  it to the entry's uid, so an object whose requester is changed under its UID fails check 1
+  (`EntryUnavailable`) while a retargeted one fails the digest. The record keeps `requestedBy`
+  in its tuple for `withdraw` and the reviews. The digest
   checks a live object against the record; the tuple is what lets the reconciler and root find
   the one Secret a recorded UID owns without trusting anything written on the Secret itself
   ("Ownership at deletion rests on the record").
@@ -2448,13 +2494,26 @@ object has a UID the owner never recorded, a retargeted one fails the digest, an
 has no record: each is refused (E7, E8). Admin can still delete any KeyDelivery and read any
 delivered Secret, as today.
 
-**Writes.** One labelled `Opaque` Secret per honoured object, with Phase A's label key
-`k3sm.io/keystore-delivery` set to the constant value `keydelivery`, Phase A's version
-annotation, an owner annotation naming the KeyDelivery's UID and the entry it delivers (the
-entry in the annotation `k3sm.io/keystore-entry`), and an ownerReference to the KeyDelivery
-as the garbage-collection backstop. The label value is a constant because Phase A's label
-value is an entry name, and `user/<uid>/<name>` is not a valid label value (a label value
-allows no `/`), so the entry goes in the annotation.
+**Writes.** One labelled `Opaque` Secret per honoured object, whose `data` holds exactly one
+key per item, rendered by `typed.Project` ("Typed credentials"), with:
+
+- the label `k3sm.io/keystore-delivery` (`credential.LabelDelivery`, Phase A's label key) set to
+  the constant value `keydelivery` (`credential.LabelValueKeyDelivery`);
+- the version annotation `k3sm.io/keystore-version` (`credential.AnnotationVersion`);
+- the **owner annotation**, two keys: `k3sm.io/keystore-delivery-uid`, holding the
+  KeyDelivery's `metadata.uid`, and `k3sm.io/keystore-entry` (`credential.AnnotationEntry`),
+  naming the entry it delivers;
+- the content digest annotation `k3sm.io/keystore-digest` (below);
+- and an ownerReference to the KeyDelivery as the garbage-collection backstop.
+
+The label, the version and the entry keys are public names in `k3sm.io/apis/keystore/credential`,
+because the provider and other readers match on them. `k3sm.io/keystore-delivery-uid` and
+`k3sm.io/keystore-digest` are read only by the reconciler, `rm-scope` and the mount audit, so
+they are declared in `pkg/keystore/reconcile`, not in `apis`. The label value is a constant
+because Phase A's label value is an entry name, and `user/<uid>/<name>` is not a valid label
+value (a label value allows no `/`), so the entry goes in the annotation. Everywhere this
+document says "the owner annotation names a UID", the UID is read from
+`k3sm.io/keystore-delivery-uid`.
 
 **`Ready=Delivered` checks the content, not only the version.** The reconciler also writes the
 annotation `k3sm.io/keystore-digest`, the sha256 of the Secret's `data` (each key and value
@@ -2653,7 +2712,7 @@ never acts by path where the service user can write"):
 - a symlink, a FIFO, a socket, a device or any non-regular file is refused, and so is a
   directory anywhere but where the layout puts one (`.user/`, `.user/<uid>/`, `entries/`,
   `entries/<name>/`); the verb stops and changes nothing further;
-- every read is bounded: a record at the store's maximum record size (416 KiB for the
+- every read is bounded: a record at the store's maximum record size (1,056 KiB for the
   `deliveries` record, "Quotas"), a `generation` file at
   its fixed size, a directory listing at the store's entry bound; a longer file is refused;
 - after each open the verb re-checks with `fstat` and `SameFile` that the descriptor is the
@@ -2988,8 +3047,9 @@ text points here.
    `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise at the start of `list` and
    `show`, `rm-scope`, `floor --rebuild` and `audit --rotate`. The server never takes it. This
    changes Phase A code already merged and Phase A's "Concurrency" text, so it is also filed as
-   its own change. *Test:* U119, root-run: a non-root process holding the old data-root flock
-   blocks none of those verbs.
+   its own change. *Test:* U119, root-run: a non-root process other than the service user
+   holding the old data-root flock blocks none of those verbs (the service user still owns
+   `keystore/.lock`; see "Concurrency").
 3. **The activated listener must reach no child (K9a).** The listening descriptor launchd
    passes to the server must not be inherited by any process the server starts. *Fix:* the
    server sets `FD_CLOEXEC` on it before any other work, and no spawn path passes it on.
@@ -3109,6 +3169,765 @@ Two facts are open but are not spike legs: whether the admission policy sees the
 user in `request.userInfo.username` (U40 and E3), and whether the rig runs with
 `--secrets-encryption` (E1).
 
+## Typed credentials
+
+The user scope stores and delivers one opaque value or one Ed25519 key per entry. This section
+extends it to the credentials a service actually issues: a token that expires, an SSH key, and
+an OAuth access and refresh pair. It adds multi-field and access-only projection into a Secret,
+expiry and revocation visible on the KeyDelivery, a per-pod mount audit, and a server-side
+refresher for OAuth pairs. Where an earlier section of this document disagrees with this one,
+this one binds, and the earlier text has been amended to match: the target digest, the
+`deliveries` record bound, the KeyDelivery shape and reasons, the delivered Secret's metadata
+keys and the root-file format.
+
+Entry names follow the existing grammar ("Scope strings and names"): a service credential is
+`user/<uid>/<service>.<account>` or `system/<service>.<account>`, for example
+`user/501/github.ci-bot`. Values still arrive only on stdin or over `k3sm-keys/1`. Nothing in
+k3sm names a service: a service is described by data (a refresh profile, below), never by code.
+
+What the user scope already gives and this section keeps: both scopes; one KeyDelivery per
+(namespace, Secret) and delivery to any number of namespaces; rotation without a pod restart for
+a Secret **volume**, since the provider re-renders a volume about once a minute and never through
+`subPath` (`pkg/provider/projectedrefresh.go`), while `env`, `envFrom` and `subPath` consumers see
+a new value only after a restart, as upstream; `Authorized` and `Ready` with "a denial deletes;
+an error does not"; an audit line for every socket call, root verb and reconciler write; `exec`
+injection; no system grants; a single server; delivery refused while secrets encryption is off
+(G18).
+
+The record kinds as merged are `KindUnknown = 0` (never written), `KindEd25519 = 1` and
+`KindOpaque = 2` (`pkg/keystore/keystore.go`, `record.go`). Kinds 0xFF (the pointer), 0xFE and
+0xFD are unchanged.
+
+### Record kinds, the typed envelope and retention
+
+`recordFormat` stays 1. Three kind bytes are added; 6 to 0xFC stay unassigned.
+
+| byte | kind (`--kind`) | sealed plaintext | fingerprint |
+|---|---|---|---|
+| 1 | `ed25519` | 32- or 64-byte key, unchanged | `hex(sha256(pub))`, unchanged |
+| 2 | `opaque` | raw bytes, unchanged | keyed HMAC, unchanged |
+| 3 | `token` | envelope: `value`, `expiresAt`, `issuedAt` | keyed HMAC over the canonical envelope |
+| 4 | `ssh` | envelope: `algorithm` (1 = ed25519), `seed` (32 B), `comment` (optional) | OpenSSH `SHA256:<b64>` of the public key, the string a forge shows |
+| 5 | `oauth` | envelope: `accessToken`, `accessExpiresAt`, `accessIssuedAt`, `refreshToken`, `refreshExpiresAt` (optional), `tokenType` (optional, default `Bearer`), `refreshOwner` | keyed HMAC over the canonical envelope |
+
+- A credential that never expires is `opaque`. `token` always carries `expiresAt`, so "token"
+  always means "it expires".
+- **An OAuth pair is one record**: one entry, one version per refresh. The access and refresh
+  tokens move together under one pointer flip and one floor line. Two entries would need
+  cross-entry atomicity, which the store does not have.
+- **Kind is fixed when the entry is created.** `rotate`, and `put` over an existing name, refuse a
+  different kind with `ErrKindMismatch` (wire `kind-mismatch`). A KeyDelivery's immutable `items`
+  is therefore valid for the entry's whole life; changing kind means a new entry name (U146).
+
+**The envelope** (kinds 3 to 5):
+
+- Layout: a 1-byte envelope version (1), then TLV fields: tag (1 B), length (2 B big-endian),
+  value.
+- Tags: token 0x10 `value`, 0x11 `expiresAt`, 0x12 `issuedAt`; ssh 0x20 `algorithm`, 0x21 `seed`,
+  0x22 `comment`; oauth 0x30 `accessToken`, 0x31 `accessExpiresAt`, 0x32 `accessIssuedAt`, 0x33
+  `refreshToken`, 0x34 `refreshExpiresAt`, 0x35 `tokenType`, 0x36 `refreshOwner`. Strictly
+  ascending, no duplicates, every required tag present, the per-kind set closed.
+- Bounds: token value at most 16 KiB, access token 32 KiB, refresh token 8 KiB, comment 255
+  printable ASCII bytes, `tokenType` 32 bytes of `[A-Za-z]`, `refreshOwner` 70 bytes in the
+  refresh-owner grammar. Times are Unix seconds, int64 big-endian. The whole envelope fits
+  `MaxValueSize` (64 KiB).
+- **`issuedAt` and `accessIssuedAt` are sealed**, stamped from the server's clock seam at `put`,
+  `rotate` or refresh. The `Expiring` threshold and the refresh schedule use them, never the
+  record's `created` header, which stays unauthenticated display metadata: a party who can write
+  record files but not the master cannot move a credential's timing (U144).
+- A bad envelope (unknown tag, wrong order, missing field, out of bounds) is `ErrCorrupt`: no
+  build writes one.
+- Binary, not JSON, like the record layer ("Record encoding").
+- **Where it lives.** The codec, the projection renderer and the SSH helpers are a pure,
+  seam-free package, `pkg/keystore/typed`. It imports no Kubernetes package and holds no store
+  state.
+- **Tests pin the bytes.** Committed per-kind golden vectors under
+  `pkg/keystore/typed/testdata/envelope/` (U143). `FuzzEnvelopeParse` asserts that an accepted
+  input re-encodes byte-identically and that an error never contains input bytes; its seeds live
+  in `testdata/fuzz/FuzzEnvelopeParse/`, which a lint keeps non-empty (U154).
+
+**Binding into the AAD.** The kind byte is already `LP(kind)` in the six-field AAD ("Record
+encoding"), so relabelling a typed record as another kind fails to open. The metadata sits
+inside the sealed plaintext, which GCM authenticates and hides: a disk reader learns neither
+expiry nor owner. No AAD field is added and the offset table does not change.
+
+**Kind-byte table** (U145): 1, 2, 3, 4, 5 and 0xFF are known; 6 to 0xFC and an unknown envelope
+version are `ErrKindUnsupported`; 0xFD and 0xFE stay `ErrCorrupt` until their own changes give
+them meaning.
+
+**Retention, with a sealed low-water mark.**
+
+- `token` and `ssh` keep the unbounded retention of every other kind.
+- `oauth` keeps the current version and one previous. Otherwise refreshes would fill the 16 MiB
+  quota and keep dead refresh tokens forever; a pruned version's refresh token is gone, which is
+  the point.
+- **The mark lives in the current-pointer plaintext.** Today that is 16 bytes (`version`,
+  `sequence`). A pointer that records a prune carries 24 bytes: `version`, `sequence`, `low`,
+  where `low` is the oldest retained version and `1 ≤ low ≤ version`. A 16-byte pointer means
+  `low = 1`, so every existing pointer and every `token` or `ssh` pointer stays byte-identical.
+  Any other size, or `low` out of range, is `ErrCorrupt`.
+- *Why the pointer.* The mark must move in the same atomic step as `current`, and the pointer's
+  rename is already the entry's one commit point, so a crash never leaves a mark that disagrees
+  with `current`. It must be authenticated: the pointer is sealed under the entry's AAD, so a disk
+  writer can neither lower it (making pruned versions look missing, which reads as damage) nor
+  raise it (hiding committed versions). List, Rewrap, Delete and the floor already open the
+  pointer first. A separate mark file would need cross-file atomicity, and the floor file is
+  unsealed.
+- *The write order:* seal version V+1, write the pointer `{V+1, seq+1, low = V}`, the floor line,
+  the audit line, then unlink every version below `low`. A crash after the pointer leaves files
+  below `low` on disk; they are not committed, List ignores them, and the next write, Rewrap and
+  Delete unlink them.
+- **The committed range is `low..current`.** This amends the contiguity rule ("v1 to the version
+  `current` names") for List ("List, when one entry is corrupt"), Rewrap ("re-seals every
+  committed version"), Delete, the floor and the pointer copy-back check. A version missing inside
+  `low..current` is still damage. A copied-back pointer naming a version below another pointer's
+  `low` fails the floor's sequence check as before (U151, U152).
+- `rotate --from-version` is refused for `oauth`: resurrecting a rotated refresh token can trip a
+  provider's reuse detection and revoke the whole grant family (U153).
+
+**The refresh token is write-only after `put`, and the store enforces it by type.**
+
+- For kinds 3 to 5, `Store.Get` and `Current` return the kind and a `typed.Credential`, decoded
+  inside the store. `typed.Credential` has no refresh field to fill, so the socket, both
+  reconcilers, `exec`, `show --reveal` and `typed.Project` never hold the refresh token's bytes.
+- The full envelope comes back only from an opener in `pkg/keystore/internal/refreshopen`.
+  `pkg/keystore` installs the opener at init, and only `pkg/keystore/refresh` calls it. Go's
+  internal-package rule keeps every package outside `pkg/keystore/...` from importing it, and an
+  import-graph test keeps every sibling but `refresh` (and the installing `pkg/keystore`) out.
+- A behavioural test plants a refresh token, calls every exported method of `pkg/keystore` and
+  every consumer interface (the socket handlers, both reconcilers' store interfaces,
+  `typed.Project`), and scans every result for its raw, standard and URL-safe base64, and
+  percent-encoded forms (U149).
+- Writing is unrestricted by kind: `put`, the owner's `rotate` and the refresher's `RotateIf`
+  take a full pair in.
+- Root can still read the master. That is not defended against, as before.
+
+### Unknown kinds, ownership and rollback
+
+- **No format bump.** `parseRecord`'s refusal splits: a kind byte in 6 to 0xFC, or an unknown
+  envelope version, is `ErrKindUnsupported`: "this entry was written by a newer k3sm; upgrade". It
+  is not wrapped in `ErrCorrupt`, whose text says to restore from backup. `list` shows such an
+  entry as `unsupported` and exits 1, like `corrupt`.
+- **The reconcilers' mapping is unchanged.** Only `ErrNotFound` (and, once allowed,
+  `ErrScopeOwnerChanged`) are denials. `ErrKindUnsupported` and `ErrCorrupt` fall under U55's rule
+  that every other sentinel is `Indeterminate`, so U55's allow-list test needs no change; the
+  typed case is its own row (U164). Nothing is deleted on either error.
+- **No interim guard.** A reconciler that meets kind 3 to 5 before projection lands takes the
+  unknown-kind path: `Indeterminate`, nothing written, nothing deleted.
+- Rewrap stays kind-agnostic: it re-seals bytes and keeps the kind byte, over `low..current`.
+- **A reader that predates typed kinds** refuses kinds 3 to 5 as `ErrCorrupt`. No release ships
+  the user scope without them, because the release before has no keystore at all.
+- **Rolling back past typed kinds needs re-logins, not a restore.** A build without typed kinds,
+  or without the refresher, cannot read or refresh `server/` pairs, and a provider has usually
+  rotated their refresh tokens already. So each owner signs in again for their `server/` pairs
+  after rolling forward. A `corrupt` or `unsupported` typed entry then is **not** a
+  restore-from-backup case: a backup holds older, already-rotated refresh tokens the provider
+  refuses. `list`, `doctor` and the user docs say so.
+
+### Projection: KeyDelivery `items` and the root-file target
+
+`spec.items` replaces a single data key. It is a list of `{field, key}`, the
+`k3sm.io/apis/keystore/credential` `Item` type, **required, with no CRD default**: a kind-blind
+default is wrong for `oauth`, and the API server cannot see the entry's kind.
+
+- `minItems` 1, `maxItems` 8; `listType=map` keyed by `key`, so keys are unique.
+- `key` matches the Secret data-key pattern `^[-._a-zA-Z0-9]+$`, `maxLength` 253, and a CEL rule
+  refuses `.` and any key starting with `..`, as the API server's own data-key check does
+  (U139).
+- `field` is a CRD `enum` equal to `credential.Fields()`, the union of the field table across
+  kinds, `maxLength` 32 (`credential.MaxFieldLength`). `refreshToken` (`credential.RefreshTokenField`)
+  is in no kind's fields, so the schema refuses it (U140, E31). A field in the enum but wrong for
+  the entry's kind is caught at reconcile as `ProjectionInvalid`.
+- **Immutable, order-insensitive.** The transition rule compares items as a map:
+  `size(self) == size(oldSelf) && self.all(i, oldSelf.exists(o, o.key == i.key && o.field == i.field))`.
+  A reorder is accepted; a changed `field`, `key` or count is refused. U139 tests both and the
+  rule's CEL cost estimate.
+- There is no `spec.dataKey`. The CRD's first tagged shape is this one.
+
+**The field table** lives in `k3sm.io/apis/keystore/credential` (`FieldsFor`, `Fields`). The CRD
+enum, the CLI and `typed.Project` all derive from it, and a conformance test in k3sm checks that
+`Project` supports exactly the table's fields per kind (U160).
+
+| kind | projectable fields | rendering in the Secret | CLI default with no `--item` |
+|---|---|---|---|
+| `opaque` | `value` | the bytes | `value=value` |
+| `ed25519` | `value` | the seed or key, as the root-file delivery renders it | `value=value` |
+| `token` | `value`, `expiresAt` | the bytes; RFC 3339 UTC text | `value=token`, `expiresAt=expires_at` |
+| `ssh` | `privateKey`, `publicKey` | unencrypted OpenSSH PEM; an `authorized_keys` line with the comment | **none: refused** |
+| `oauth` | `accessToken`, `accessExpiresAt`, `tokenType` | the bytes; RFC 3339 UTC; text | `accessToken=access_token`, `accessExpiresAt=access_expires_at` |
+
+- **Access-only is structural.** No kind has a projectable refresh field, so no KeyDelivery,
+  root-file target, `exec --field` or `show --field` can name one, and `Project` receives a
+  `typed.Credential`, which has none (U140, U141, U149, U160).
+- **An `ssh` private key is projected only when named.** The CLI has no default for `ssh`:
+  delivering an ssh entry must name `--item privateKey=…`, and without items it is refused
+  (U163).
+- A field that the entry's kind does not have sets `Ready=False`, reason `ProjectionInvalid`, and
+  leaves any existing Secret untouched: an error, not a denial (U161).
+- **Item order is not semantic** anywhere: the CRD rule compares as a map, and the digest sorts
+  by key.
+- **The target digest** is
+  `sha256("k3sm-keystore-delivery-target/v1" ‖ LP(entry) ‖ LP(namespace) ‖ LP(secretName) ‖ LP(items))`,
+  where `items` is one length-prefixed blob: the items sorted by `key` bytewise, each
+  `LP(field) ‖ LP(key)`. Golden vectors (one item, two items, a shuffled input) are committed under
+  `testdata` (U161). The label stays `/v1`, since nothing has shipped. This replaces the earlier
+  five-string digest over `dataKey` and `requestedBy` ("KeyDelivery", U14, U41).
+- **The root-file target** (`keystore-delivery.json`) carries the same `items`, in the
+  `credential.Item` JSON form `{"field": …, "key": …}`, at file `version: 1`.
+  `sudo k3sm keys deliver system/… --item field=key …` writes it, and it is parsed strictly
+  (U162; "Delivery reconciler").
+- `typed.Project(kind, cred, items) (map[string][]byte, error)` serves both reconcilers.
+- **Secrets at rest.** G18 (delivery refused while secrets encryption is off) covers kinds 3 to 5
+  unchanged; a row proves it for each typed kind (U164).
+- **File modes are the pod's, and they are not a confidentiality control.** k3sm sets no mode;
+  `defaultMode` and `items[].mode` decide. Native pods share the service uid
+  (`runtimed/pkg/mount/doc.go`), so mode bits protect nothing from another process in any pod; the
+  Seatbelt read scope is the only barrier. OpenSSH refuses a private key readable beyond its
+  owner, so an ssh key needs `defaultMode` 0400 or 0600. The user docs say: mount a volume, never
+  use `subPath`; deliver long-lived keys (`ssh`, `token`) only to dedicated namespaces whose pods
+  run trusted code; rendered files stay on the pod's data volume until the pod is reaped.
+- **CLI:** `--data-key K` is shorthand for `--item value=K`; with no `--item`, the CLI takes the
+  table's per-kind default.
+
+### Expiry and revocation: `CredentialValid` and Events
+
+- **`Ready` means delivered.** It does not change on expiry or revocation. The CRD description and
+  the user docs say that health readers read `CredentialValid`, and that
+  `kubectl wait --for=condition=Ready` says nothing about the credential's health.
+- **`CredentialValid`** is set only for kinds with an expiry (`token`, `oauth`) and is absent for
+  the others. Its reasons are `credential.Validities()`, the `Validity` type:
+
+| reason | status | when |
+|---|---|---|
+| `Valid` | `True` | not expiring, refresh healthy |
+| `Expiring` | `True` | token: remaining ≤ min(30 d, 25% of `expiresAt − issuedAt`); oauth: the same rule on `refreshExpiresAt − accessIssuedAt` of the first version, when `refreshExpiresAt` is known |
+| `RefreshFailing` | `True` | oauth: the last server refresh failed transiently and the access token is still valid |
+| `Expired` | `False` | token: past `expiresAt`; oauth: past `accessExpiresAt` with no newer version |
+| `Revoked` | `False` | oauth: the token endpoint answered an error code in the profile's `revokedErrorCodes` |
+| `Indeterminate` | `Unknown` | the entry could not be opened ("Unknown kinds, ownership and rollback") |
+
+- **`Valid`, `Expiring` and `RefreshFailing` share `True` deliberately.** The access token still
+  works in all three, and readers key on the reason (the tolerant-reader rule). The CRD
+  description and the docs say so.
+- **Every condition carries `observedGeneration`**: `Authorized`, `Ready`, `SecretRetained` and
+  `CredentialValid`. The CRD requires it on each condition, since `meta.SetStatusCondition` does
+  not fill it in (U142, U165).
+- **Expiry never deletes a Secret.** An expired token is harmless, and a clock step must not
+  delete a Secret. Withdrawal is the owner's act (U168).
+- `Revoked` is evidence k3sm holds itself. k3sm cannot see revocation of a `token`, so a token is
+  only ever `Expiring` or `Expired`.
+- **Where refresh state comes from.** `pkg/keystore/reconcile` defines a consumer-side
+  `RefreshStatus` interface (per entry: state `ok`, `failing`, `revoked` or `off`, a cause, the
+  last refresh time). `pkg/keystore/refresh` implements it from its persisted state. Until the
+  refresher lands the reconciler holds a nil `RefreshStatus` and derives oauth conditions from
+  stored expiry only.
+- **Events fire on real transitions only.** The reconciler takes the previous state from the
+  KeyDelivery's persisted status (reason and `lastTransitionTime`), never from memory, so a server
+  restart re-emits nothing. Hysteresis: a reason must hold for two consecutive evaluations, or
+  60 s, before it replaces the previous one, except `Revoked` and `Expired`, which apply at once
+  (U166).
+- **The Events** use `events.k8s.io/v1`, `regarding` the KeyDelivery and `related` the Secret, so
+  `kubectl describe secret` shows them. Reasons and types are `credential.EventReasons()`:
+
+| reason | type | when |
+|---|---|---|
+| `CredentialExpiring` | `Warning` | into `Expiring` |
+| `CredentialExpired` | `Warning` | into `Expired` |
+| `CredentialRefreshFailing` | `Warning` | into `RefreshFailing` |
+| `CredentialRevoked` | `Warning` | into `Revoked` |
+| `CredentialRecovered` | `Normal` | back to `Valid` after any other reason |
+
+  Routine successful refreshes emit no Event.
+- **What a message may carry:** the KeyDelivery name, the Secret name, the delivered version,
+  RFC 3339 times, and for `RefreshFailing` one cause from the closed set `invalid_client`,
+  `unauthorized_client`, `invalid_scope`, `server_error`, `temporarily_unavailable`, `http-4xx`,
+  `http-5xx`, `network`, `dns`, `tls`, `clock-skew`, `dial-refused`, `profile-unavailable`,
+  `client-secret-unavailable`, `response-invalid`, `log-full`, `multi-server`.
+- **What a message may never carry:** a value, a length, a fingerprint, the endpoint's
+  `error_description` or body, a response header, or the caller's uid (U167).
+- The reconciler requeues at the next threshold time through its clock seam (the controller's
+  rate-limited `AddAfter`) rather than waiting for a sweep.
+- **The same facts without Kubernetes.** `k3sm keys list -o json` and the socket's `list` and
+  `deliveries` replies gain `kind`, `expires_at`, `access_expires_at`, `refresh_expires_at`,
+  `refresh_owner`, `refresh_state` (`credential.RefreshStates()`) and `last_refresh_at`: metadata,
+  never bytes. Reading them opens each typed entry's current version under the owner's scope key,
+  inside the existing per-uid `list` rate limit. An entry that does not open shows `corrupt` or
+  `unsupported` with null metadata. The keys are snake_case to match the existing `-o json`
+  output, deliberately (U159).
+
+### Per-pod mount audit
+
+Two observers; the server holds the durable record.
+
+1. **The durable line: `pkg/keystore/mountaudit`**, its own package beside `reconcile`, with its
+   own informer, RBAC (list and watch pods, cluster-wide) and failure policy.
+   - **Level-based.** It keeps a mounted set keyed by (pod UID, Secret, version), fed by a shared
+     pod informer and a Secret lister filtered on `k3sm.io/keystore-delivery`, and reconciles the
+     set against the cache. It acts on state, not edges, so a relist emits nothing.
+   - **On startup** it computes the set from the cache, writes **one** baseline summary line
+     (`op: pod-mount-baseline`, a count per namespace), and emits per-pod lines only for later
+     changes (U169).
+   - Lines, with `via: mountaudit`: `op: pod-mount` when a pod referencing a labelled Secret first
+     has a started container on a node; `op: pod-refresh` when the Secret's version annotation
+     moves, **only for a `secret` volume or projected `secret` source mounted without `subPath`**;
+     `op: pod-unmount` on deletion, including `DeleteFinalStateUnknown` tombstones, and when a pod
+     reaches `Succeeded` or `Failed`.
+   - **Refs that never refresh are named as such.** An `env.valueFrom.secretKeyRef`,
+     `envFrom.secretRef` or `subPath` reference gets its `pod-mount` line with `refreshes: false`,
+     and never a `pod-refresh` line (U170). The docs say a `pod-refresh` line means "a new version
+     was available to a refreshing mount", not "the pod read it".
+   - **Fields, a closed set:** `namespace`, `pod`, `podUID`, `node`, `secret`, `delivery` (the
+     KeyDelivery UID from the Secret's `k3sm.io/keystore-delivery-uid` annotation, or `file` for a
+     root-file target), `entry`, `version`, `ref` (`volume`, `projected`, `env` or `envFrom`),
+     `subPath` (bool), `refreshes` (bool), `keys` (the data keys referenced, or `*`) (U171).
+   - It covers root-file deliveries too, by label. It runs on the server only, so old workers need
+     nothing (E18 still holds).
+2. **The node's trace: the provider.** An injected `MountObserver` seam is called by the
+   **caller** of `kubeResolver.Secret()` (at create and in `refreshProjectedOnce`), outside the
+   byte-handling closure.
+   - It reads the Secret's label and version annotation from the provider's Secret **lister**,
+     never from the data bytes. `mount.SourceData` and the runtimed seam do not change.
+   - For a labelled Secret it records a Normal Event `KeystoreSecretMounted` on the Pod, once per
+     pod per delivered version, naming the Secret and the version, and logs one Info line on its
+     node with the same fields.
+   - Dedupe state is bounded and lives on the pod's track, so it ends with the pod. After a
+     provider restart the observer re-derives each running pod's last-seen version from the lister
+     and the pod's start, so it does not re-emit (U173).
+   - It is not audit-grade: Events are writable by namespace editors and age out. The docs say so,
+     and say it must not feed automated decisions.
+
+- **Built from metadata only.** Every mount line, Event and log line is assembled from object
+  metadata. Never in one: a value, a value length, a fingerprint, the pod's env, args, image,
+  annotations or ServiceAccount token, or the entry's owner uid. The Pod Event also omits
+  `entry`. A planted-token test covers the resolver's error path (U171, U173).
+- **Pod churn cannot fill the log, and cannot hide a first read.**
+  - A first-seen (pod UID, Secret) pair is **never** dropped by a rate limit. Only repeats
+    (`pod-refresh`, and a re-mount of an already-seen pair) are limited: 30 a minute per namespace
+    and 120 a minute across all namespaces, with one dropped-count summary line per window.
+  - Mount lines are observations, not gates, and are a server class, charged to no uid ("The
+    audit-log budget").
+  - They **stop at the log's soft cap**, first-seen lines included, with one summary line, a
+    `doctor` row and a server Warn, so they never push the log to the hard cap and never turn on
+    `ErrLogFull` for real operations. The soft-cap stop is the only thing that drops a first-seen
+    line; the 80% Warn fires before it (U172, U174).
+  - A failed append is logged and never fails anything.
+
+### SSH keys
+
+- **Stored format:** the 32-byte ed25519 seed and an optional comment, in the kind-4 envelope.
+  **ed25519 only** in this release.
+- **k3sm both generates and stores.** `k3sm keys generate user/<uid>/<service>.<account> --kind ssh
+  [--comment C]`, a socket `generate` op (and a root verb for `system/`), mints from the store's
+  random seam inside the server and returns only the public key line and its OpenSSH fingerprint.
+  The private half leaves the store only by projection to a Secret (U148, U157).
+- `k3sm keys pubkey <entry>` prints the public line at any time. A public key is not a value; U37's
+  "no non-root verb writes a value to stdout" is amended to say so.
+- Import is `put --kind ssh --in -` of an **unencrypted OpenSSH ed25519** private key. An encrypted
+  key, RSA, ECDSA or an SSH certificate is refused with `invalid-value`, because there is no
+  passphrase path.
+- **Library.** OpenSSH key parsing and marshalling use `golang.org/x/crypto/ssh`
+  (`ParseRawPrivateKey`, `MarshalPrivateKey`, `MarshalAuthorizedKey`, `FingerprintSHA256`) in
+  `pkg/keystore/typed`. `golang.org/x/crypto` is already a direct dependency of k3sm. It parses
+  untrusted input, which stays on the maintained library.
+- **Tests do not compare the library with itself.** `TestSSHFingerprintMatchesOpenSSH` checks
+  against a committed `ssh-keygen -l -E sha256` output for a committed key (U148).
+
+### Refresh owners and the refresher
+
+- Every `oauth` record names exactly one refresh owner in its sealed envelope, in the grammar
+  `credential.RefreshOwnerPattern` (`^(local|server/[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$`, at most
+  `credential.MaxRefreshOwnerLength`, 70 bytes), parsed by `credential.ParseRefreshOwner`:
+  - **`server/<profile>`**: the k3sm server refreshes, using the refresh profile `<profile>` (a
+    DNS-1123 label) that root declared. The server is then the only writer of refreshes for that
+    pair.
+  - **`local`**: a process outside k3sm (an app, a LaunchAgent running as the owner's uid)
+    refreshes and writes each new pair through the socket's `rotate`. The server never refreshes
+    a `local` pair, and still computes `CredentialValid` from the stored expiry.
+- **Who holds the refresh token:** only the keystore, sealed under the owner's scope key. Only the
+  refresher reads it, through the opener, in the server process, as the service user. It never
+  reaches the socket, a Secret, `exec`, `show`, a log, an Event or an audit line.
+- **A pod is never a refresh owner in this release.** Pods cannot reach the socket, and a
+  pod-reachable write endpoint is deferred.
+- **No exec hooks.** The only refresh procedure built in is RFC 6749 §6, the `refresh_token`
+  grant. A "hook" is a declared profile (data), never a program.
+- **The store interface.** The refresher is not a socket peer. Its consumer interface,
+  `OAuthRefreshStore`, has the opener for a `server/`-owned pair's current version and
+  `RotateIf(name, expectVersion, value)`, a compare-and-swap Rotate, with bytes taken only from a
+  token-endpoint response. It has no reveal, show, list or rewrap method (U150).
+- **A re-login by the owner always wins.** If the owner rotates a new pair while a refresh is in
+  flight, `RotateIf` fails on the version check and the refresher's result is discarded (U185).
+- **`refresh-now`.** `k3sm keys refresh <entry>`, socket op `refresh-now`, is owner-only, 1 a minute
+  per entry, and answers `refresh-not-owned` for a `local` pair. On a parked pair it sends no
+  request and replies with state `revoked` (U189).
+- **How a pair arrives.** A client pipes the token endpoint's **RFC 6749 §5.1 JSON response** on
+  stdin: `k3sm keys put user/<uid>/<svc>.<acct> --kind oauth --refresh-owner server/<profile> --in -`.
+  One server-side parser (fuzzed, at most 64 KiB) takes `access_token`, `token_type`,
+  `expires_in` or `expires_at`, `refresh_token` and `refresh_token_expires_in`, stamps
+  `accessIssuedAt` and the absolute expiries from the clock seam at receipt, and drops every other
+  field (`id_token` and `scope` included). A response carrying an `error` field is refused with
+  `invalid-value`, and the CLI prints only the RFC 6749 `error` code, never the description or any
+  token. `put` checks the named profile exists (`refresh-profile-unknown`) (U156).
+- **Schedule.**
+  - Refresh at 50% of `accessExpiresAt − accessIssuedAt`, with ±10% jitter and a lead of at least
+    5 minutes before expiry; due pairs are taken nearest-expiry first.
+  - At most one refresh per entry per 10 minutes. Globally 4 concurrent refreshes and 60 a minute
+    per profile.
+  - **Fairness, per uid on a profile:** at most 10 refreshes a minute and 8 `server/`-owned pairs
+    per uid on one profile (a ninth `put` is `quota`); at most 32 `server/`-owned pairs per user
+    scope (`quota`).
+  - Transient failures back off from 30 seconds to 15 minutes. **A pair keeps retrying at the
+    15-minute maximum after its access token expires**, and is never abandoned while its refresh
+    token may still be valid (before `refreshExpiresAt`, or always when that is unknown). Only a
+    revoked-code answer parks it (U182).
+- **Lock order.** The per-entry lease (in process), then the store's `.lock` taken shared, then
+  the store's own write path; never `.lock` before the lease. No refresh starts while the
+  `keystore-maintenance` marker exists or a maintenance verb holds or waits for `.lock`
+  exclusively: the shared acquisition is a non-blocking try, and a refusal reschedules the pair at
+  +30 s without growing its backoff. A started refresh holds `.lock` shared from opening version V
+  through its audit line, at most the 30 s client timeout plus the write, so a maintenance verb
+  waits for in-flight refreshes instead of racing them; if the bounded lock wait is shorter than
+  35 s, the maintenance verb answers busy rather than proceeding (U188).
+- **The success path, in order:**
+  1. Take the lease; check the server count and the maintenance marker; take `.lock` shared.
+  2. Open current version V through the opener.
+  3. POST the grant.
+  4. On success, `RotateIf(V)` with the new access token, its `accessIssuedAt` and expiry. Keep the
+     old refresh token when the response omits one (RFC 6749 allows that); store the new one when
+     it rotates.
+  5. Write the floor line, then fold the success into the entry's daily `refresh-ok-summary` line.
+  6. Prune to two versions.
+  7. The reconciler re-delivers within one sweep and the provider re-renders the volume within
+     about a minute, so no pod restarts (U183).
+- **How failure surfaces.**
+  - An error code in the profile's `revokedErrorCodes` gives `Revoked`, an audit line
+    `result: revoked`, and the pair **parked**: no retry until its version changes. Unparking by a
+    new `put` or `rotate` is limited to once per entry per 10 minutes.
+  - Every other failure gives `RefreshFailing` with a closed cause, retried with backoff, and
+    `Expired` once the access token lapses.
+  - **Park and failure state persists** in `keystore-run/refresh-state.json`, the service user's,
+    mode 0600, atomically replaced: per entry name the state, the cause, the park version and
+    `last_refresh_at`. Names and states only, never a secret. Losing it costs one retry per parked
+    pair, which re-learns the same answer (U184).
+- **Shutdown.** On SIGTERM (`launchctl kickstart -k`, reboot, uninstall) the refresher stops
+  starting refreshes, cancels any not yet sent, and waits up to 10 s for in-flight ones to commit.
+  launchd's default 20 s `ExitTimeOut` covers it, and a test holds that the shipped plist does not
+  lower it. A SIGKILL or power loss mid-refresh is a residual ("Threats").
+- **Single server only.** The server count is checked before each refresh and on a watch of server
+  registrations. With more than one server registered, the refresher starts nothing, system-scope
+  pairs included, and pairs show `RefreshFailing` (`multi-server`); `doctor` shows it once at
+  cluster level. When the count is back to one, the refresher resumes on its own (U187).
+
+### Refresh profiles and the HTTP client
+
+- **Root declares profiles**: `sudo k3sm keys refresh-profile add <name> --token-url https://…
+  --client-id ID [--client-secret-entry system/<name>] [--auth-style header|params]
+  [--revoked-error-codes c1,c2] [--allow-private]`, plus `rm`, `list` and `test`.
+- **URL validation at `add`:** `https` only; no userinfo; no fragment; no IP-literal host unless
+  `--allow-private` (U176).
+- **The file** is `/var/lib/k3sm/keystore-refresh-profiles.json`, **`0640 root:_k3sm`**,
+  atomically replaced. Format:
+  `{"version":1,"profiles":{"<name>":{"tokenURL","clientID","clientSecretEntry","authStyle","revokedErrorCodes","allowPrivate"}}}`,
+  parsed strictly like the floor (an unknown field, non-canonical bytes or more than 1 MiB is a
+  refusal). `revokedErrorCodes` defaults to `["invalid_grant"]`.
+- It is read on the opened descriptor through **the floor's owner-check helper and its stat seam**
+  (owner root, group `_k3sm`, no other-read, no write but root), so the rows need no root. It is
+  re-read on fsnotify plus a sweep (U175).
+- **A profile changed or removed mid-flight:** in-flight grants finish against the old values;
+  pairs naming a removed profile get `RefreshFailing` (`profile-unavailable`) and keep retrying at
+  the maximum backoff, in case it returns.
+- **Why root.** A profile decides where refresh tokens are sent and makes the control-plane process
+  dial out, the same reason `keystore-delivery.json` is root's. Any user may *reference* any
+  profile: it holds no user secret, and a user's refresh token reaches only the endpoint root
+  chose.
+- Pods are denied the file by the `keystore-*` prefix deny ("Pod denies"; E35), which is a hard
+  dependency of every change that writes a new `keystore-*` file or anything under
+  `keystore-run/`.
+- **A confidential client's secret** is a `system/` entry. Only the server refresher reads it, to
+  authenticate to the profile's endpoint. That is not a grant ("No system grants"): no non-root
+  principal reads, delivers or execs it. `--client-secret-entry` is refused unless the entry exists
+  and is `opaque` or `token`.
+- **Generic error mapping.** A profile declares the error codes that mean "revoked". The client
+  also treats an HTTP 200 whose body carries an `error` field as an error. No service is named in
+  code. Recorded real response shapes (success, revoked, bad client, 200-with-error) are golden
+  fixtures under `pkg/keystore/refresh/testdata/` (U179).
+- **The HTTP client.**
+  - `golang.org/x/oauth2` performs the grant (`Config.TokenSource(…).Token()`,
+    `RetrieveError.ErrorCode`). It is already in `hack/deps.lock` as an indirect module; making it
+    direct changes `go.mod` but not the lock graph, and that one diff is the only `go.mod` change
+    the typed credentials make. A `RetrieveError` is converted to a closed cause at the call site
+    and never formatted, because its `Error()` embeds the body.
+  - k3sm's own `http.Client`: `https` only; **`Transport.Proxy = nil`** (an HTTP proxy is
+    unsupported in this release, and the docs say so); no redirects (`CheckRedirect` returns
+    `ErrUseLastResponse`, so a 3xx is `response-invalid`); system trust roots, no per-profile CA
+    (a profile CA would be a new trust root); a 30 s timeout; responses capped at 64 KiB and never
+    logged (U177).
+  - **The dial guard** runs in `net.Dialer.Control`, on the resolved address, so DNS rebinding
+    cannot get round it. Denied: loopback, unspecified, link-local (including 169.254.169.254),
+    multicast, RFC 1918, CGNAT 100.64.0.0/10 (the mesh), ULA fc00::/7, IPv4-mapped IPv6, and NAT64
+    (64:ff9b::/96, 64:ff9b:1::/48). A profile's root-only `--allow-private` lifts the RFC 1918,
+    CGNAT and ULA entries for that profile only; loopback, unspecified, link-local and multicast
+    stay denied for every profile (U178, E36).
+  - **Causes** distinguish `dns` (resolution failed), `tls`, `clock-skew` (a certificate outside
+    its validity window by the server's clock), `dial-refused` (the guard), `network` and the rest.
+- **Seams, and where they are tested.** Three seams, a `RoundTripper` factory, a resolver and the
+  `Dialer.Control` function, plus the clock. The guard is tested by calling the Control function
+  with synthetic addresses, including a fake resolver that rebinds to 169.254.169.254; the
+  redirect, cap, 200-with-error and timeout tests use a fake `RoundTripper`, so no test-only trust
+  root or dial path exists in the shipped client. `testing/synctest` is used only with an
+  in-bubble fake `RoundTripper`. The seam guard (`TestRealPrimitivesUnreachable`) lands with the
+  seams, and `pkg/keystore/refresh` and `pkg/keystore/mountaudit` join U58's closed seam-package
+  list (U180). The refresher adds its jitter and schedule-clock seams to the same guard.
+- **`sudo k3sm keys refresh-profile test <name>`** probes a profile from the root CLI with the same
+  client package. It sends a freshly generated random refresh token, so no user's refresh token is
+  sent (the client secret goes only to the endpoint it already belongs to), and expects an error
+  code in the profile's `revokedErrorCodes`. It prints `ok` with the latency, or the closed cause,
+  and exits non-zero on anything else (U181).
+
+### Wire protocol additions
+
+`k3sm-keys/1` stays version 1, since none of it has shipped.
+
+- `put` and `rotate` headers gain `kind` (`opaque`, `ed25519`, `token`, `ssh`, `oauth`),
+  `expires_at` (token, RFC 3339), `format: token-response` (oauth) and `refresh_owner`.
+- New ops `generate`, `pubkey` and `refresh-now`.
+- `read-for-exec` gains `field` (default per kind: token `value`, oauth `accessToken`; ssh needs an
+  explicit field). `refreshToken` is not a field (U158).
+- `deliver` gains `items`. `list` and `deliveries` replies gain the metadata above.
+- **Must-understand headers.** The HELLO reply carries a capability list (`typed`, `items`,
+  `generate`, `refresh-now`). The mutating ops `put`, `rotate`, `deliver`, `read-for-exec` and
+  `generate` refuse any header they do not know with the new error `unknown-header`; non-mutating
+  ops stay tolerant. This amends U27 ("an unknown header field is ignored" now holds for
+  non-mutating ops only). The CLI checks HELLO's capabilities before it sends a typed header, and
+  against a daemon without them refuses locally ("the server is older than this CLI; restart
+  it"), which closes the upgrade window between the symlink flip and the server's restart (U155).
+- New error codes: `kind-unsupported`, `kind-mismatch`, `invalid-value`, `projection-invalid`,
+  `refresh-profile-unknown`, `refresh-not-owned`, `unknown-header`.
+- New audit `op` values: `generate`, `refresh`, `refresh-ok-summary`, `refresh-now`, `pod-mount`,
+  `pod-mount-baseline`, `pod-refresh`, `pod-unmount`, `profile-add`, `profile-rm`. `via` gains
+  `refresher` and `mountaudit`, and `via` is an open set ("The audit log": readers ignore unknown
+  values).
+
+### Public names live in `apis`
+
+The stdlib-only leaf `k3sm.io/apis/keystore/credential`, beside `apis/keystore/entry`, holds every
+name a consumer matches on, with vector tests (U141):
+
+- the kind names, `Kind` (`ed25519`, `opaque`, `token`, `ssh`, `oauth`; `Kinds()`);
+- the projection field table (`Field`, `FieldsFor`, `Fields`, `MaxFieldLength`,
+  `RefreshTokenField`) and the `Item` type `{field, key}`, which the CRD's Go type embeds and the
+  root-file JSON reuses;
+- the refresh-owner grammar and its vectors (`RefreshOwnerPattern`, `ParseRefreshOwner`,
+  `MaxRefreshOwnerLength`);
+- `ConditionCredentialValid` and its reasons, the `Validity` type (`Validities()`); the Event
+  reasons and types (`EventReasons()`, `KeystoreSecretMounted` included);
+- the `refresh_state` values (`RefreshStates()`);
+- the metadata keys a reader matches on, so the provider never imports `pkg/keystore`:
+  `LabelDelivery` (`k3sm.io/keystore-delivery`), `LabelValueKeyDelivery` (`keydelivery`, its value
+  on a Secret a KeyDelivery wrote), `AnnotationVersion` (`k3sm.io/keystore-version`),
+  `AnnotationEntry` (`k3sm.io/keystore-entry`, the entry a KeyDelivery's Secret delivers) and
+  `FinalizerDelivery` (`keystore.k3sm.io/delivery`).
+
+`k3sm.io/apis/keystore/v1alpha1` holds the `KeyDelivery` type (`spec.items` of `credential.Item`),
+the condition names `ConditionAuthorized`, `ConditionReady`, `ConditionSecretRetained` and
+`ConditionCredentialValid`, the `Reason*` constants, and `ConditionReasons()`, the closed reason set
+per condition, which the CRD description lists (U142).
+
+**The Secret's metadata, reconciled.** A Secret a KeyDelivery wrote carries the label
+`k3sm.io/keystore-delivery: keydelivery`, the version annotation `k3sm.io/keystore-version` and the
+entry annotation `k3sm.io/keystore-entry`: the public names above. It also carries two annotations
+only the reconciler, `rm-scope` and the mount audit read, declared in `pkg/keystore/reconcile`
+rather than `apis` because no outside reader matches on them:
+`k3sm.io/keystore-delivery-uid`, the **owner annotation** holding the KeyDelivery's
+`metadata.uid`, and `k3sm.io/keystore-digest`, the content digest that `Ready=Delivered` checks
+("KeyDelivery", Writes). Wherever this document says "the owner annotation" it means
+`k3sm.io/keystore-delivery-uid` together with `k3sm.io/keystore-entry`. The root-file delivery's
+Secrets keep their own shape: the label's value is the entry name, with the version and
+`k3sm.io/keystore-fingerprint` annotations.
+
+Rendering stays in k3sm (`pkg/keystore/typed`). The conformance test iterates the `apis` table
+and checks `typed.Project` supports exactly those fields per kind (U160), so the two cannot drift.
+
+### The audit-log budget
+
+- **Refresher lines are a server class**: charged to no uid's share (U51), counted against the
+  log's soft and hard caps only.
+- **Success is compacted**: one `refresh-ok-summary` line per entry per UTC day (the count and the
+  first and last success times). The refresher keeps the day's count in `refresh-state.json` and
+  appends the line when the UTC day rolls, or at shutdown. Every failure, park, unpark,
+  `refresh-now` and state change is its own line.
+- **Mount lines** are the same server class.
+- **The arithmetic** (defaults: soft cap 64 MiB, hard cap 256 MiB, per-uid share at most 1/16 of
+  the hard cap, 16 MiB; a refresher line is at most 512 bytes, U183):
+  - The 10-minute per-entry interval bounds a pair to 144 refreshes a day. Uncompacted, 32 pairs
+    would write 32 × 144 × 512 B ≈ 2.25 MiB a day and reach the soft cap in about 28 days.
+  - Compacted, 32 pairs write 32 summary lines a day whatever the lifetime: about 5.7 MiB a year.
+    One user at the full 32-pair quota takes more than 11 years to reach the soft cap alone;
+    eight such users still take more than a year.
+  - Failures are bounded by the backoff: a pair failing without pause writes at most about 100
+    lines a day at the 15-minute maximum, so one user's 32 pairs all failing write about 1.6 MiB a
+    day, and the 80% Warn fires after about four weeks of total outage for that user, well before
+    the soft cap.
+- **A `doctor` row and a server Warn fire at 80% of the soft cap**, with the rotate hint, beside
+  the existing soft-cap row (U24, U174).
+
+### Observability
+
+- **`doctor` rows** (U190): the refresher on or off, with the reason (`multi-server`, `no
+  profiles`, `maintenance`); profiles loaded, and parse errors by name; `server/` pairs failing and
+  revoked, by count; the last outbound success per profile; the audit log against its soft cap.
+- **Logs at Warn or Error** for every refresher state change (on or off, park, unpark, failing,
+  recovered, a profile-file reload failure), under the os_log subsystem `io.k3sm.keystore`. Lines
+  carry names and closed causes only, never a body.
+- **`k3sm keys refresh-profile test <name>`** is the pre-deploy probe for egress, TLS and the
+  profile's error shape.
+
+### Rig credentials and custody
+
+The rig legs E28 to E36 prove the typed credentials against a real forge (GitHub) through public
+surfaces only.
+
+- **No GitHub App private key is ever used or stored**, and no installation token is minted. The
+  gate never holds a credential: it registers public halves, starts flows and pipes responses into
+  `k3sm keys put`.
+- **The test repository** is a private repository the operator owns, with Actions disabled at
+  creation.
+- **Push** uses an SSH deploy key k3sm generates in the server (`k3sm keys generate --kind ssh`);
+  the gate registers only its public half, one key per run.
+- **The pull request** uses a GitHub App **user access token**: an `oauth` pair owned by
+  `server/github-e2e`, obtained once through GitHub's device flow, which needs only the App's
+  `client_id`. The operator approves the code in the browser, attended, once; the gate pipes the
+  token response straight into `k3sm keys put --kind oauth --in -` and never echoes or stores it.
+- **The client secret** is `system/github-app.e2e`, put once by the operator with sudo. Only the
+  server refresher reads it.
+- **Lifetime.** The refresh token lives about 6 months, so later runs are unattended while the pair
+  survives on the server node. If it is lost, E28 and E32 report **PENDING** (exit 3), never FAIL
+  and never green, and the operator repeats the device flow.
+- **Host key.** `known_hosts` is built from GitHub's published SSH keys (`gh api meta`), and ssh
+  runs with `StrictHostKeyChecking=yes`. git, ssh and curl come from a pinned pod image, by digest.
+- **Cleanup.** Every object carries a run-id label or name. A trap removes them on any exit, and a
+  start-of-run sweep removes earlier runs' deploy keys, branches, pull requests, labelled
+  namespaces and per-run deploy-key entries. The long-lived oauth pair is kept.
+- **Failures.** GitHub outages, 5xx, 429 and secondary rate limits are PENDING (infrastructure),
+  checked by a rate-limit preflight and bounded deadlines on every poll; there are no fixed
+  sleeps.
+- **Evidence scans have positive controls.** Each negative scan first proves it can find a needle:
+  the scanner reads the needle into a variable that is never printed or written and prints only
+  match counts. For the planted pair (E31, E33) the planted access token must be found
+  base64-encoded in the Secret before the scan for the planted refresh token counts. The real
+  refresh token is unknown to everyone, so it is never a needle.
+- **The scheduled refresh path** is shown by a unit row on a fake `RoundTripper` (U182). The rig proves
+  `refresh-now` rotation (E32) and revocation (E33). The real grant is never revoked.
+
+**The tracer (E28)**, per run, unattended once seeded: preflight and sweep (the oauth pair shows
+`refresh_state ok`, else PENDING); generate a per-run deploy key and register its public half;
+deliver it with `--item privateKey=id_ed25519 --item publicKey=id_ed25519.pub` and the oauth pair
+with the CLI defaults into a per-run namespace, expecting `Ready=True Delivered` on both and
+`CredentialValid=True Valid` on the oauth one, with an in-leg negative control (`--item value=x`
+on the oauth entry gives `Ready=False ProjectionInvalid`); one pod mounts both as volumes (no
+`subPath`, `defaultMode: 0400`), pushes a branch over ssh and opens a pull request with the
+access token read from its file, never from argv; `k3sm keys refresh` then rotates the pair and a
+bounded poll sees the pod's access-token hash change with `restartCount` 0 (E32); the evidence is
+the audit log's `generate`, `deliver`, `deliver-write`, `refresh-now`, refresher, `pod-mount` and
+`pod-refresh` lines, the Pod's `KeystoreSecretMounted` Events, and positive-controlled scans that
+find neither the access token nor the deploy private key anywhere they should not be. Without
+projection the oauth delivery sets `ProjectionInvalid`; without the mount audit there is no
+`pod-mount` line; without the refresher the hash never changes.
+
+### Threats, and what this does not do
+
+**New residuals**, added to `limitations.md`:
+
+- **Rotation loss.** A SIGKILL or power loss after the token endpoint rotates a refresh token and
+  before `RotateIf` commits loses the new token. The next refresh gets a revoked code, the pair
+  shows `Revoked`, and the owner signs in again. The SIGTERM drain covers ordinary restarts; no
+  write-ahead is possible for the rest.
+- A pod holding an access token holds it until it expires. Access-only narrows the exposure from
+  the refresh lifetime to the access lifetime; it does not remove it. An SSH key or a `token` in a
+  Secret is long-lived: revocation means rotating and unregistering it at the provider. Every
+  process in every native pod runs as the service uid, so `defaultMode` protects nothing between
+  pods, and rendered files stay on the pod's data volume until the pod is reaped.
+- The server dials the token endpoints root declared. A compromised endpoint receives refresh
+  tokens for the pairs that name it. TLS uses the system roots; there is no proxy support.
+- Conditions use the server's clock. A skewed clock gives a false `Expiring` or `Expired`, which
+  never deletes anything, or a `clock-skew` TLS failure.
+- The Pod `KeystoreSecretMounted` Event and the node log are not audit-grade: a namespace editor
+  can forge or delete the Event. The server's line is the record, and it is an observation, not
+  proof of the bytes read. `env`, `envFrom` and `subPath` consumers keep the old value until
+  restarted.
+- A profile's `system/` client secret is used by the server on users' behalf. Users never receive
+  it.
+- `keystore-refresh-profiles.json` is readable by root and the `_k3sm` group (the service user,
+  which every native pod process shares; pods are kept out only by the prefix deny). It reveals
+  each profile's name, token URL, client ID, client-secret entry name, auth style, revoked error
+  codes and `allowPrivate` flag. It holds no secret.
+
+**Defended:** no refresh token in any Secret, verb, Event, log or audit line, by type and by
+schema (U140, U149, U160, E31); SSRF by users, since profiles are root's and the post-DNS guard
+denies private, mesh, metadata and translated ranges with no ambient proxy (U177, U178, E36);
+parser abuse, by fuzzed, size-capped envelope, token-response and profile parsers (U143, U156,
+U175, U154); log exhaustion by refreshes or pod churn (U172, U174, U183); a suppressed first read
+(U172); a double refresh across servers, including a server joining mid-run (U187); an unsupported
+kind deleting Secrets (U164); a silent downgrade across version skew (U155).
+
+**What this does not do:** sign-in flows in k3sm (a client signs in and pipes the response); token
+revocation at the provider (RFC 7009), or revoking a real grant in tests; GitHub App private keys
+or installation tokens; exec or plugin refresh hooks; a per-profile CA or HTTP proxies; RSA, ECDSA
+or certificate SSH keys, or an ssh-agent; templated outputs such as `.git-credentials`; a
+pod-reachable refresh endpoint; multi-server refresh; isolation between pods; `status -o json`
+fields; anything that names a service in code.
+
+### One-way doors
+
+| door | choice |
+|---|---|
+| kind bytes | 3 token, 4 ssh, 5 oauth; 6 to 0xFC unassigned; no format bump; kind fixed per entry |
+| envelope v1 | version byte; TLV; tags 0x10–0x12, 0x20–0x22, 0x30–0x36; sealed `issuedAt`/`accessIssuedAt`; field bounds |
+| pointer low-water mark | a 24-byte pointer `{version, sequence, low}` after a prune; 16 bytes means `low = 1`; committed range `low..current` |
+| refresh-owner grammar | `local` or `server/<profile>` |
+| write-only refresh token | `typed.Credential` has no refresh field; one opener, one importer |
+| CRD | `spec.items[{field,key}]`, required, no default, `field` enum, key pattern with the `.` and `..` refusal, immutable as a map, `listType=map`; no `dataKey`; `observedGeneration` on every condition |
+| public names | `k3sm.io/apis/keystore/credential`: kinds, fields, item type, validities, Event reasons and types, `refresh_state`, metadata keys |
+| condition and reasons | `CredentialValid`: `Valid`, `Expiring`, `RefreshFailing` (all True), `Expired`, `Revoked`, `Indeterminate`; `ProjectionInvalid`; `Ready` means delivered |
+| target digest | binds `entry`, `namespace`, `secretName` and canonical, key-sorted `items` |
+| root files | `keystore-delivery.json` `items`; `keystore-refresh-profiles.json` v1, `0640 root:_k3sm` |
+| wire additions | ops `generate`, `pubkey`, `refresh-now`; HELLO capabilities; must-understand headers on mutating ops; seven error codes |
+| `list -o json` | `kind`, `expires_at`, `access_expires_at`, `refresh_expires_at`, `refresh_owner`, `refresh_state`, `last_refresh_at`; snake_case, like the existing keys |
+| audit | new `op` values; `via: refresher`, `via: mountaudit`; `via` open; the server class; the mount-line fields |
+| CLI | `--kind token\|ssh\|oauth`, `--expires-at`, `--refresh-owner`, `--item`, `generate`, `pubkey`, `refresh`, `refresh-profile add\|rm\|list\|test`, `--allow-private`, `--revoked-error-codes` |
+
+### Deployment
+
+One binary and one deploy, with no flag and no phased rollout. No proto, no kine encoding and no provider-to-runtimed contract changes
+(`mount.SourceData` is unchanged). The CRD drops `spec.dataKey` only from an untagged shape: no
+`apis` tag has carried a KeyDelivery type before `items`, so there is no published field, no
+stored object and no consumer that could go first. The socket protocol is internal and unshipped;
+the HELLO capability check closes the upgrade window. A dev build without typed kinds shows typed
+entries as `corrupt`, and its reconciler leaves their Secrets alone.
+
+Pre-deploy: `sudo k3sm keys refresh-profile add`, then `refresh-profile test`, before any
+`server/` pair is put; the server needs direct outbound HTTPS to profile endpoints (no proxy).
+Rollback is revert, rebuild, reinstall; rolling back past typed kinds or the refresher means
+owners sign in again for their `server/` pairs after rolling forward ("Unknown kinds, ownership
+and rollback").
+
+### Gate mechanics
+
+- **Every U row here is a hermetic, unit-tier Go test run by `--check`** (fake seams, no network,
+  no privilege). Root-file checks reuse the floor's owner-check helper and stat seam, so no row
+  needs root.
+- **Row ids** continue after U137 and E27: U138 to U191, and the rig legs E28 to E36. `--listed`
+  refuses a duplicated U or E id, in the script's rows, its expected-row list, one mode's row list
+  or the design's tables (U138).
+- New gate modes, each in `keystore.sh`'s `MODES`, usage and `mode_rows`: `--credential` (U18, U19,
+  U139 to U142), `--typed` (U143 to U154), `--typed-cli` (U155 to U159), `--projection` (U160 to
+  U164), `--expiry` (U165 to U168), `--mount-audit` (U169 to U174), `--refresh-profiles` (U175 to
+  U181), `--refresh` (U182 to U190) and `--typed-docs` (U191). Each leg maps to one mode (the last
+  feature to land), or to plain `--lab`.
+- **Fuzz targets** (`FuzzEnvelopeParse`, `FuzzTokenResponseParse`, `FuzzProfileFile`) each assert
+  that an accepted input re-encodes identically (for the token response, re-parses to the same
+  stored fields) and that an error never contains input bytes; a lint keeps each
+  `testdata/fuzz/<Name>/` non-empty (U154).
+
 ## Non-goals
 
 Beyond Phases B and C: isolating one native Pod's delivered Secret from another; protecting
@@ -3167,7 +3986,8 @@ to this document, reviewed like any other.
 ### User-scope rows
 
 The user scope adds the U rows below (unit tier unless the row says otherwise) and the rig legs
-under "Rig legs". The gate runs each row's named tests in the repo the row names (`k3sm/…`,
+under "Rig legs". U138 to U191 and the legs E28 to E36 are the typed credentials' ("Typed credentials", "Gate
+mechanics"); their ids continue after U137 and E27, and `--listed` refuses a duplicated id. The gate runs each row's named tests in the repo the row names (`k3sm/…`,
 `runtimed/…`, `apis/…`, package paths relative to the module), and fails a row whose named
 test is absent or skipped. Each change runs the rows it delivers in its own gate mode, and the
 rig rows as an explicit, recorded step. Every row below is pending until the change named in
@@ -3199,11 +4019,11 @@ carried by the unit rows.
 | U11 | the Go resolver takes the grammar from `apis/keystore/entry` and passes the shared entry-grammar vectors; `checkScope` refuses `user/0`; an all-digit second segment resolves as a uid even when an account of that name exists; `pkg/keystore` imports no Kubernetes package; Phase A's `checkName`, as a fourth consumer, gives every valid-scope vector's verdict on its name part | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestEntryGrammarVectorsCheckName`, `TestCheckScopeRefusesUserZero`, `TestAllDigitSegmentIsAlwaysUID`, `TestKeystoreIsKubernetesFree` | checked: the user-scope store |
 | U12 | master Rewrap re-wraps every `scope.key` and leaves user records byte-identical; resumable at every step | `k3sm/pkg/keystore::TestRewrapRewrapsScopeKeysResumable` (fault injection, as G12) | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; the 65th live delivery answers `ErrQuota` to `deliver`; `rm` and `withdraw` still work | `k3sm/pkg/keystore::TestUserScopeQuota`, `TestDeliveryRecordQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
-| U14 | the delivery record stores UID, the full target tuple (`entry`, `namespace`, `secretName`, `dataKey`, `requestedBy`) under its seal, and the target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label; the digest covers `entry`, `namespace`, `secretName`, `dataKey` and `requestedBy` | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel`, `TestDeliveryDigestCoversRequestedBy` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U14 | the delivery record stores UID, the full target tuple (`entry`, `namespace`, `secretName`, `items`, `requestedBy`) under its seal, and the target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label; the digest covers `entry`, `namespace`, `secretName` and the key-sorted `items`, and a reorder of `items` leaves it unchanged | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel`, `TestDeliveryDigestCoversTargetAndItems` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U15 | (reserved for the K0 amendment if leg 5 finds a second Pod-uid path) | none | pending: K0 amendment |
 | U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, wasm (a native Pod whose process is the `k3sm-wasmhost` helper, `runtimed/pkg/wasmhost/doc.go:20`), the profile an exec-session process runs under (`runtimed/pkg/execsession/doc.go:17`), a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-sock/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` still gets the denies under the work dir; a vm or container-vm guest gets no data-root share; over the whole rendered profile of every variant, including a Pod root equal to the data root and a Pod root that is a parent of it, no emitted allow matches any keystore path; the keystore stanza is the profile's last rule, written in the `/var`, `/private/var` and `/System/Volumes/Data` spellings, and the `keystore-` prefix deny is a regex rule in either letter case; a caller path naming a keystore path is refused with `ErrProtectedPath` and a pods root under a `keystore-*` name is refused; beside the read and connect cases, a file write, create, unlink and rename and a `network-bind` on `keystore-sock/`, on `keys.sock` and on every `keystore-*` name are each refused; every case also holds through `/System/Volumes/Data/private/var/lib/k3sm/...` and through the data volume's mount path | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestShimProfileKeepsTheKeystoreDeniesLast`, `TestKeystoreDenyStanzaShape`, `TestDataRootRefusesPodRootUnderKeystoreName`, `TestValidateRefusesKeystoreExtraPaths`, `TestEmptyDataRootFailsClosed`, `TestDataRootRefusesWhatCannotHoldTheDeny`, `TestKeystoreDeniesUnderSandboxExec`; rig leg E10 | checked: runtimed's sandbox change |
 | U17 | runtimed refuses a Pod identity it may not hold through `Credential.CheckPodIdentity` (`pkg/supervisor/privdrop.go`), not in `resolveCredential`: at `startContainer`, at `Exec` (an exec session), at the resident shim's `dropShim` and in `RunLaunchSequence`. A drop target uid is refused if it is 0, negative, 501 or above, or the service uid; groups are refused if they are 0, 20, 80, the privileged system groups (wheel, daemon, kmem, sys, tty, operator, procview, procmod, _developer), the service gid, negative or out of range, and a gid of 501 or above is refused unless it is an admitted `fsGroup`; a missing group defaults to `nobody`; a gid-only drop that leaves uid 0 is refused; an inherited uid with no drop (the daemon's own euid: the service uid, a rootless server's login uid or root on a root daemon) is allowed. The system gids (1, 2, 3, 4, 5, 8, 9, 204) are refused as the primary gid and as a supplemental gid (`runtimed/pkg/supervisor::TestRunLaunchSequenceRefusesPodGroups`, `runtimed/pkg/runtime::TestPodGroupsRefused`, `runtimed/pkg/supervisor::TestFSGroupGidAllowList`). A gid in 1..500 is refused for a Pod drop, as the primary or a supplemental group, when the host assigns it; an unassigned gid is allowed, and so is `nobody`; the never-list is always refused, a lookup error refuses, and an operator-admitted `fsGroup` the host assigns is still refused (`runtimed/pkg/supervisor::TestPodGroupsHostAssigned`). The service identity (the `_k3sm` lookup and the owners of the installed directories) is resolved again on every drop check (`runtimed/pkg/runtime::TestStartContainerResolvesTheServiceOwnerEachStart`), and a symlink at an installed path refuses every drop (`runtimed/pkg/runtime::TestSymlinkedWorkDirRefusesDrops`). When the account lookup returns not-found, a drop to the owner of the installed work dir or the keystore socket dir is refused (the installed service-uid fallback: `runtimed/pkg/supervisor::TestResolveServiceIdentityInstalledOwner`, `runtimed/pkg/runtime::TestServiceUIDFromInstalledDirs`). The live check is strict, a denial is an EPERM and planting is included (`runtimed/pkg/sandbox::TestKeystoreDeniesUnderSandboxExec`, `runtimed/pkg/sandbox::TestShimProfileKeepsTheKeystoreDeniesLast`) | `runtimed/pkg/runtime::TestStartContainerRefusesAPodIdentity`, `TestExecRefusesAPodIdentity`, `TestPodUIDInLoginRangeRefused`, `TestPodGroupsRefused`, `TestServiceUIDFromInstalledDirs`; `runtimed/internal/execshim::TestDropShim`; `runtimed/pkg/runtime::TestStartContainerResolvesTheServiceOwnerEachStart`, `TestSymlinkedWorkDirRefusesDrops`; `runtimed/pkg/supervisor::TestRunLaunchSequenceRefusesPodUID`, `TestRunLaunchSequenceRefusesPodGroups`, `TestFSGroupGidAllowList`, `TestResolveServiceIdentityInstalledOwner`, `TestPodGroupsHostAssigned`; `runtimed/pkg/sandbox::TestKeystoreDeniesUnderSandboxExec`, `TestShimProfileKeepsTheKeystoreDeniesLast`; rig legs E21, E22 | checked: runtimed's sandbox change |
-| U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` required (`dataKey` defaults to `value`) and immutable by CEL transition rules; `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed; a `system/…` entry is refused | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap`, `TestKeyDeliveryRefusesSystemEntry` | pending: the `KeyDelivery` API |
+| U18 | CRD: `entry`, `secretName`, `items`, `requestedBy` required with no default and immutable by CEL transition rules (`items` as a map); `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed; a `system/…` entry is refused | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap`, `TestKeyDeliveryRefusesSystemEntry` | pending: the `KeyDelivery` API |
 | U19 | the CRD pattern, its `maxLength` of 269, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors, `user/1/` and `system/` each with a 254-byte name refused | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
 | U20 | a user-scope `current` copied back is refused against the floor log, with the user-scope floor message, which names `floor --rebuild`, not removing `keystore-floor.json` | `k3sm/pkg/keystore::TestUserFloorRefusesCopiedBackCurrent`; rig leg E9 | pending: the append-only files |
 | U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear or a log is not the service user's (seams: chflags flag source, file-attribute writer, euid source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
@@ -3281,7 +4101,7 @@ carried by the unit rows.
 | U93 | the sweep period is 30 s by default; two consecutive deleting observations count only when at least 60 s apart on the clock seam, however many sweeps run between them | `k3sm/pkg/keystore/reconcile::TestDeletingObservationsSpacedOnClock` | pending: the KeyDelivery reconciler (lifecycle) |
 | U94 | `withdraw` opens the caller's scope and so runs the GeneratedUID check: a reused uid with a changed GeneratedUID gets `scope-owner-changed` and deletes nothing (seams: GeneratedUID lookup, peer-credential source) | `k3sm/pkg/keystore/socket::TestWithdrawChecksGeneratedUID` | pending: KeyDelivery authoring |
 | U95 | `rm-scope` lists every RoleBinding and ClusterRoleBinding with the subject `k3sm:local:<uid>` and refuses, changing nothing, unless none exist or `--keep-bindings` is given | `k3sm/cmd/k3sm::TestRmScopeRefusesWithBindings` | pending: the KeyDelivery reconciler (lifecycle) |
-| U96 | the `deliveries` record is exempt from the 64 KiB value cap and bounded at 64 live entries plus 256 withdrawn tombstones, 1,280 bytes an entry, 416 KiB sealed; at the bound `deliver` answers `quota` and a withdrawal still succeeds, in place; a tombstone is pruned only after its Secret is seen gone (Get not found) on two sweeps at least 60 s apart | `k3sm/pkg/keystore/reconcile::TestDeliveriesRecordBoundAndPrune`, `TestRevocationNeverRefusedAtRecordBound` | pending: the KeyDelivery reconciler (lifecycle) |
+| U96 | the `deliveries` record is exempt from the 64 KiB value cap and bounded at 64 live entries plus 256 withdrawn tombstones, 3,328 bytes an entry (8 items), 1,056 KiB sealed; at the bound `deliver` answers `quota` and a withdrawal still succeeds, in place; a tombstone is pruned only after its Secret is seen gone (Get not found) on two sweeps at least 60 s apart | `k3sm/pkg/keystore/reconcile::TestDeliveriesRecordBoundAndPrune`, `TestRevocationNeverRefusedAtRecordBound` | pending: the KeyDelivery reconciler (lifecycle) |
 | U97 | when `rotate` answers `ErrQuota`, `rm` then `put` recovers: `rm` frees every version and `put` stores the value as version 1 of a new generation; the `quota` error names that recovery | `k3sm/pkg/keystore::TestRotateQuotaRecoveredByRmThenPut` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U98 | the sealed `deliveries` record stores each delivery's KeyDelivery `metadata.name`; the orphan sweep checks the object with a live Get by that name sent to the API server, never an informer cache and never a List; not found, or another UID, deletes only on two consecutive observations at least 60 s apart, and any other answer in between resets the count; no sweep runs before the KeyDelivery and Secret informers sync | `k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName`, `TestOrphanSweepNeedsTwoObservations` | pending: the KeyDelivery reconciler (lifecycle) |
 | U99 | under the store lock, before every audit or floor append, the server compares its descriptor's `(dev, ino)` with the canonical name's and reopens on a mismatch, recounting the per-uid shares from the new file; `audit --rotate` and `floor --rebuild` each complete while the server never saw the marker, and every later line lands in the new canonical file, none in an archive or an unlinked file (seam: chflags flag source) | `k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch` | pending: the socket listener (the server append path) |
@@ -3303,7 +4123,7 @@ carried by the unit rows.
 | U115 | `rm-scope` names each blocking binding, a RoleBinding with its namespace; `--remove-bindings` deletes each listed binding through the admin client before anything else changes, and a failed delete stops the verb, changing nothing further | `k3sm/cmd/k3sm::TestRmScopeNamesBindingsAndRemovesThem` | pending: the KeyDelivery reconciler (lifecycle) |
 | U116 | the Pod uid refusal applies to native Pods only: a vm Pod with `runAsUser: 1000` is allowed, since a guest uid has no host meaning, while a native Pod with the same drop target is refused; the guest's groups skip the host group rules the same way | `runtimed/pkg/runtime::TestVMPodGuestUIDNotRefused` (the refusal sits on the native spawn path, `checkPodUID` in `pkg/runtime/security.go`; the same test, in `pkg/runtime/vmcontainers_test.go`, also pins that a vm Pod's `runAsGroup` of 1000 reaches the guest's GID and SupplementalGIDs unrefused) | checked: runtimed's sandbox change |
 | U118 | the old log is never service-user-owned while unflagged (integration, a root-run row: `--root`): in `audit --rotate` and `floor --rebuild` the step that clears `sappnd` on the old file, and on each archive rotate shifts, also `fchown`s it to root and `fchmod`s it 0600 on the verb's descriptor; the service user's `open(O_WRONLY\|O_TRUNC)` of each, between the clear and the re-flag, gets EACCES and changes no byte | `k3sm/cmd/k3sm::TestMaintenanceOldFileRootOwnedWhileUnflagged` (integration, root-run) | pending: the append-only files |
-| U119 | the floor lock is `keystore-lock`, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root (`put`, `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise of `list` and `show`, `rm-scope`, `floor --rebuild`, `audit --rotate`); run as root (a root-run row, `--root`), a non-root process holding the old data-root flock blocks none of them | `k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb` (integration, root-run) | pending: the append-only files |
+| U119 | the floor lock is `keystore-lock`, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root (`put`, `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise of `list` and `show`, `rm-scope`, `floor --rebuild`, `audit --rotate`); run as root (a root-run row, `--root`), a non-root process other than the service user holding the old data-root flock blocks none of them | `k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb` (integration, root-run) | checked as a root-run row (`--root`) for the verbs that exist: `put`, `rotate`, `rm`, `rewrap` and the floor raise; `rm-scope`, `floor --rebuild` and `audit --rotate` take it as they land (the append-only files) |
 | U120 | the activated listening descriptor reaches no child (integration): the server spawns each child type, an `exec.Command` child, the runtimed helper and a Pod through the exec shim, lists each one's open descriptors, and the listening socket is among none of them | `k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild` (integration) | pending: the socket listener |
 | U121 | under activation, a client whose connected peer reads as uid 0 or as launchd's code refuses and writes nothing; U36 is never relaxed to accept uid 0, and if K7a finds the client-side peer names launchd the self-bind form ships (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer` | pending: the socket listener |
 | U122 | when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup | `k3sm/pkg/provider::TestPodProfileDeniesLaunchdSocketActivation`; rig leg E27 | pending: the socket listener |
@@ -3322,6 +4142,60 @@ carried by the unit rows.
 | U135 | the KeyDelivery admission policy's `failurePolicy` is `Fail`, and the namespace-controller exemption admits DELETE only: the namespace controller's UPDATE of another author's object is refused | `k3sm/pkg/policy::TestKeyDeliveryVAPFailurePolicyFail`, `TestNamespaceControllerExemptOnlyForDelete` | pending: KeyDelivery authoring |
 | U136 | every root verb and `doctor` line that prints annotation text strips control characters first: an owner or entry annotation carrying terminal escapes prints without them | `k3sm/cmd/k3sm::TestRootVerbsStripAnnotationControlChars` | pending: the socket operations, the KeyDelivery reconciler (lifecycle) |
 | U137 | the listener refuses a sandboxed peer before the first frame: it calls `sandbox_check` on the peer's audit token through the peer-sandbox source, a constructor parameter that refuses nil, so a Pod process is refused whatever its uid (seam: peer-sandbox source) | `k3sm/pkg/keystore/socket::TestListenerRefusesSandboxedPeer`; rig leg E26 | pending: the socket listener |
+| U138 | `--listed` fails on a duplicated U or E id: in the script's rows, its expected-row list, one mode's row list, or the design's gate and leg tables | `hack/acceptance/keystore.sh --listed` (its duplicate-id lint, `lint_unique_ids`) | pending: the typed-credential design |
+| U139 | `items` required, no default, 1 to 8, unique keys, the key pattern with `.` and a `..` prefix refused, both `maxLength`s, immutable as a map (a reorder accepted, a change refused), CEL cost within budget; no `dataKey` | `apis/config/crd::TestKeyDeliveryItemsSchema`, `TestItemKeyMatchesIsConfigMapKey`, `TestKeyDeliveryHasNoDataKey`, `TestItemsReorderAcceptedChangeRefused`, `TestItemsCELCostWithinBudget` | pending: the typed KeyDelivery API |
+| U140 | the `field` enum equals the credential table's union; a KeyDelivery naming `refreshToken` is refused by the schema; rig leg E31 | `apis/config/crd::TestFieldEnumEqualsCredentialTable`, `TestSchemaRefusesRefreshTokenField` | pending: the typed KeyDelivery API |
+| U141 | the credential leaf: kind names, field table vectors, no refresh field, the item type, the refresh-owner vectors, closed validity, Event and `refresh_state` sets, the metadata keys; stdlib only | `apis/keystore/credential::TestFieldTableVectors`, `TestNoRefreshField`, `TestRefreshOwnerGrammarVectors`, `TestNameSetsClosed`, `TestImportsStdlibOnly` | pending: the typed KeyDelivery API |
+| U142 | the CRD descriptions list the `CredentialValid` reasons and `ProjectionInvalid`, say `Ready` means delivered and that Valid, Expiring and RefreshFailing share True; every condition has `observedGeneration` | `apis/config/crd::TestKeyDeliveryReasonDescriptions`, `TestConditionsCarryObservedGeneration` | pending: the typed KeyDelivery API |
+| U143 | the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is `ErrCorrupt`; the fuzz invariants hold | `k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors`, `TestEnvelopeRejectsUnknownTagDuplicateAndOrder`, `FuzzEnvelopeParse` | pending: the typed store |
+| U144 | token and oauth require a sealed `issuedAt`/`accessIssuedAt` stamped from the clock seam; editing the `created` header changes no typed time | `k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed`, `TestCreatedHeaderEditChangesNoTypedTime` | pending: the typed store |
+| U145 | a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are `ErrKindUnsupported`, 0xFD and 0xFE `ErrCorrupt`; `list` shows `unsupported` | `k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen`, `TestKindByteTable` | pending: the typed store |
+| U146 | `rotate` and `put` over an existing entry cannot change its kind (`ErrKindMismatch`) | `k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind` | pending: the typed store |
+| U147 | token needs `expiresAt`; oauth needs access token, access expiry, refresh token and an owner in the grammar | `k3sm/pkg/keystore::TestTypedPutValidation` | pending: the typed store |
+| U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH` | pending: the typed store |
+| U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential`, `TestRefreshOpenerImportGraph` | pending: the typed store |
+| U150 | `RotateIf` refuses a stale version | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused` | pending: the typed store |
+| U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test) | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep` | pending: the typed store |
+| U152 | a pruned oauth entry: List shows it healthy, Rewrap re-seals `low..current`, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught | `k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt`, `TestRewrapHandlesPrunedOAuth`, `TestDeletePrunedOAuthEntry`, `TestGapInsideCommittedRangeIsCorrupt`, `TestCopyBackAcrossPruneCaught` | pending: the typed store |
+| U153 | `--from-version` is refused for oauth | `k3sm/pkg/keystore::TestFromVersionRefusedForOAuth` | pending: the typed store |
+| U154 | every `Fuzz*` target in the keystore packages has a non-empty committed seed directory | `k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds` | pending: the typed store |
+| U155 | HELLO lists capabilities; mutating ops refuse an unknown header (`unknown-header`), non-mutating ops tolerate it; the CLI refuses a typed request to a daemon without the capability | `k3sm/pkg/keystore/socket::TestHelloListsCapabilities`, `TestMutatingOpRefusesUnknownHeader`, `TestNonMutatingOpToleratesUnknownHeader`, `k3sm/cmd/k3sm::TestCLIRefusesTypedAgainstOldDaemon` | pending: the typed verbs |
+| U156 | an oauth put takes an RFC 6749 response, stamps times from the clock, drops `id_token` and unknown fields; an `error` response is refused printing only the code | `k3sm/pkg/keystore/socket::TestPutOAuthTokenResponse`, `TestTokenResponseWithErrorRefused`, `FuzzTokenResponseParse` | pending: the typed verbs |
+| U157 | `generate` returns only the public key; `pubkey` prints only the public line | `k3sm/pkg/keystore/socket::TestGenerateReturnsPublicKeyOnly`, `k3sm/cmd/k3sm::TestKeysPubkeyPrintsOnlyPublicKey` | pending: the typed verbs |
+| U158 | the kind flags; per-kind `exec` field defaults, ssh needs a field; `show --field` and `exec --field` refuse `refreshToken`; `kind-mismatch` on the wire | `k3sm/cmd/k3sm::TestKeysPutKindFlags`, `TestKeysExecFieldDefaults`, `TestFieldSelectionRefusesRefreshToken`, `k3sm/pkg/keystore/socket::TestRotateKindMismatch` | pending: the typed verbs |
+| U159 | `list -o json` and the socket `list` carry the typed metadata (snake_case) and no token bytes (planted) | `k3sm/cmd/k3sm::TestKeysListJSONTypedMetadata` | pending: the typed verbs |
+| U160 | `typed.Project` is exact per kind and supports exactly the `apis` table's fields; a planted refresh token is in no projection for any item set | `k3sm/pkg/keystore/typed::TestProjectFieldsPerKind`, `TestProjectSupportsExactlyCredentialTable`, `TestProjectNeverEmitsRefreshToken` | pending: typed projection |
+| U161 | the Secret's data keys equal `items`; a field wrong for the kind gives `ProjectionInvalid` with the Secret unchanged; digest golden vectors over entry, namespace, secretName and key-sorted items, order-insensitive | `k3sm/pkg/keystore/reconcile::TestItemsProjectExactKeys`, `TestProjectionInvalidLeavesSecret`, `TestDigestGoldenVectors` | pending: typed projection |
+| U162 | root-file `items` are parsed strictly and use the same projection | `k3sm/pkg/keystore/reconcile::TestRootFileItemsStrictAndProjected` | pending: typed projection |
+| U163 | `--item`, `--data-key` shorthand, per-kind defaults; an ssh delivery without items is refused | `k3sm/cmd/k3sm::TestDeliverItemDefaultsPerKind`, `TestDeliverSSHWithoutItemsRefused` | pending: typed projection |
+| U164 | `ErrKindUnsupported` and `ErrCorrupt` on a typed entry are `Indeterminate`; encryption off refuses every typed kind (G18) | `k3sm/pkg/keystore/reconcile::TestTypedEntryErrorsAreIndeterminate`, `TestEncryptionOffRefusesTypedKinds` | pending: typed projection |
+| U165 | the `CredentialValid` table on a fake clock, thresholds from `issuedAt`, the oauth rules, the nil-`RefreshStatus` fallback, `observedGeneration` set | `k3sm/pkg/keystore/reconcile::TestCredentialValidConditionTable`, `TestExpiringThresholdUsesIssuedAt`, `TestNilRefreshStatusUsesStoredExpiry` | pending: expiry and revocation |
+| U166 | Events: `events.k8s.io`, `related` the Secret, Warning or Normal per reason, once per real transition with hysteresis; prior state from persisted status, so a restart re-emits none | `k3sm/pkg/keystore/reconcile::TestCredentialEventsOncePerTransition`, `TestCredentialEventTypesAndRelated`, `TestRestartReemitsNoCredentialEvent` | pending: expiry and revocation |
+| U167 | messages carry names, times and a closed cause only (planted token and error body absent) | `k3sm/pkg/keystore/reconcile::TestCredentialEventsCarryNamesOnly` | pending: expiry and revocation |
+| U168 | expiry never deletes the Secret and never changes `Ready`; requeue at the next threshold | `k3sm/pkg/keystore/reconcile::TestExpiredKeepsSecret`, `TestRequeueAtNextThreshold` | pending: expiry and revocation |
+| U169 | the mount observer is level-based: one baseline line at start, a relist emits nothing, tombstones and terminal pods unmount | `k3sm/pkg/keystore/mountaudit::TestStartupBaselineOneLine`, `TestRelistEmitsNothing`, `TestTombstoneAndTerminalPodsUnmount` | pending: the mount audit |
+| U170 | `pod-refresh` only for volume and projected refs without `subPath`; env, envFrom and `subPath` get `refreshes: false` and never `pod-refresh` | `k3sm/pkg/keystore/mountaudit::TestPodRefreshOnlyForRefreshingRefs` | pending: the mount audit |
+| U171 | the mount-line field set is closed; lines are built from metadata only, on the error path too (planted token) | `k3sm/pkg/keystore/mountaudit::TestMountLineFieldsClosed`, `TestMountLinesMetadataOnly` | pending: the mount audit |
+| U172 | a first-seen pair is never rate-limited; repeats are limited per namespace and globally, with a summary; all stop at the soft cap; never `ErrLogFull`; an append failure fails nothing; server class | `k3sm/pkg/keystore/mountaudit::TestFirstSeenNeverDropped`, `TestRepeatsRateLimitedAndGlobalCap`, `TestMountLinesStopAtSoftCap`, `TestMountLinesNotCharged` | pending: the mount audit |
+| U173 | the provider's `MountObserver`: at the caller of `Secret()`, metadata from the lister, once per pod per version, labelled Secrets only, bounded per pod track, no re-emit after a restart, no value in the Event | `k3sm/pkg/provider::TestKeystoreSecretMountedOncePerVersion`, `TestMountObserverReadsListerNotData`, `TestMountObserverRestartReplay`, `TestKeystoreMountEventCarriesNoValue` | pending: the mount audit |
+| U174 | a `doctor` row and a server Warn at 80% of the soft cap | `k3sm/cmd/k3sm::TestDoctorAuditSoftCapWarnAt80` | pending: the mount audit |
+| U175 | the profile file is strict and fuzzed; owner and mode `0640 root:_k3sm` through the floor helper's stat seam; `--client-secret-entry` checks; `revokedErrorCodes` default | `k3sm/pkg/keystore/refresh::TestProfileFileStrict`, `TestProfileFileOwnerAndMode`, `FuzzProfileFile`, `TestRevokedErrorCodesDefault` | pending: refresh profiles |
+| U176 | `refresh-profile add` validates the URL: https, no userinfo, no fragment, no IP literal without `--allow-private` | `k3sm/cmd/k3sm::TestRefreshProfileAddValidatesURL` | pending: refresh profiles |
+| U177 | `Proxy` is nil; a redirect is `response-invalid`; 64 KiB cap; timeout; a 200 with an `error` field is an error (fake `RoundTripper`) | `k3sm/pkg/keystore/refresh::TestRefreshClientProxyNil`, `TestRefreshClientRefusesRedirect`, `TestRefreshResponseCap`, `TestHTTP200WithErrorIsError` | pending: refresh profiles |
+| U178 | the dial guard's deny table on synthetic addresses, the `--allow-private` override, and a rebind to 169.254.169.254 through a fake resolver; rig leg E36 | `k3sm/pkg/keystore/refresh::TestDialGuardDenyTable`, `TestDialGuardAllowPrivate`, `TestDialGuardRefusesRebindToLinkLocal` | pending: refresh profiles |
+| U179 | error mapping against golden response fixtures; the cause set is closed (`dns`, `clock-skew` included); a `RetrieveError` body never reaches a log or error | `k3sm/pkg/keystore/refresh::TestErrorMappingGoldenFixtures`, `TestRefreshCausesClosedSet`, `TestRetrieveErrorBodyNeverSurfaces` | pending: refresh profiles |
+| U180 | the refresh package's `TestMain` stubs its `RoundTripper` factory, resolver, `Control` and clock seams; refresh and mountaudit are on U58's seam-package list | `k3sm/pkg/keystore/refresh::TestRealPrimitivesUnreachable`, `k3sm/pkg/keystore::TestEverySeamPackageHasAGuard` | pending: refresh profiles |
+| U181 | `refresh-profile test` sends a random refresh token, never a stored one, and passes only on a revoked-code answer | `k3sm/cmd/k3sm::TestRefreshProfileTestSendsNoStoredToken` | pending: refresh profiles |
+| U182 | schedule at half of `accessExpiresAt − accessIssuedAt`, lead, jitter, minimum interval, nearest-expiry first, backoff bound, retry at the maximum past access expiry (`synctest`, in-bubble fake `RoundTripper`) | `k3sm/pkg/keystore/refresh::TestRefreshSchedule`, `TestRetriesPastAccessExpiry` | pending: the refresher |
+| U183 | success rotates via `RotateIf` and prunes; a missing `refresh_token` keeps the old one; one compacted summary line per entry per UTC day, at most 512 bytes, charged to no uid | `k3sm/pkg/keystore/refresh::TestRefreshRotatesEntry`, `TestRefreshKeepsRefreshTokenWhenNotReturned`, `TestRefreshOkCompactedPerDay`, `TestRefresherLinesServerClass` | pending: the refresher |
+| U184 | a revoked code parks; unpark by a new version at most once per 10 minutes; `refresh-state.json` holds names and states only; losing it costs one retry | `k3sm/pkg/keystore/refresh::TestRevokedCodeParks`, `TestUnparkRateLimited`, `TestRefreshStateFileHoldsNoSecret`, `TestLostRefreshStateCostsOneRetry` | pending: the refresher |
+| U185 | an owner's rotate during a refresh wins | `k3sm/pkg/keystore/refresh::TestOwnerRotateDuringRefreshWins` | pending: the refresher |
+| U186 | `local` is never server-refreshed; per-uid-per-profile fairness; global and per-user caps | `k3sm/pkg/keystore/refresh::TestLocalOwnerNeverServerRefreshed`, `TestRefreshFairnessPerUIDPerProfile`, `TestRefreshCaps` | pending: the refresher |
+| U187 | a second server joining mid-run pauses the refresher before its next refresh; removing it resumes with no restart | `k3sm/pkg/keystore/refresh::TestSecondServerPausesAndRemovalResumes` | pending: the refresher |
+| U188 | SIGTERM stops new refreshes and drains in-flight ones within 10 s; no refresh starts under the maintenance marker or exclusive lock; the lock order holds | `k3sm/pkg/keystore/refresh::TestShutdownDrainsWithin10s`, `TestNoRefreshUnderMaintenance`, `TestLockOrderLeaseThenLock` | pending: the refresher |
+| U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
+| U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
+| U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
 
 ### Rig legs
 
@@ -3366,6 +4240,15 @@ E20 attended.
 | E25 | (helper variant only) a native Pod tries `connect(2)` to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an `append` | `EPERM` for the Pod; the helper refuses the user by uid and the program by the pin, and no line is appended | yes | the helper pin (U70): a line from an unpinned peer is appended |
 | E26 | a native Pod on a test build whose Pod profile omits the keystore deny stanza (restored at the end) tries `connect(2)` to `keys.sock` | the listener refuses the connection before any frame, since the peer is sandboxed, and writes a `refused` line | yes | the sandboxed-peer refusal (U137): the Pod's connection reaches the frame reader |
 | E27 | a native Pod calls `launch_activate_socket` for the server's socket name | no descriptor is returned, and nothing in the Pod can accept on `keys.sock` | yes | the launchd lookup deny (U122): the Pod obtains the server's listener |
+| E28 | **the typed-credential tracer** ("Rig credentials and custody"): a generated deploy key and a server-refreshed oauth pair delivered into one pod, which pushes over ssh and opens a pull request; then `k3sm keys refresh` | push and pull request succeed; the access-token file's hash changes in the same pod with `restartCount` 0; mount lines; the positive-controlled scans find nothing they should not; PENDING (exit 3) if the oauth pair is missing or not `ok` | yes | typed projection, the mount audit or the refresher |
+| E29 | a synthetic `token` put with `--expires-at` now+8 m, delivered | `Valid`, then `Expiring` after about 6 m, then `Expired` at 8 m; one Warning Event each, `related` the Secret; the Secret kept; `Ready` unchanged | no (U165, U166, U168) | expiry and revocation |
+| E30 | `generate --kind ssh`; deliver `--item privateKey=id_ed25519 --item publicKey=id_ed25519.pub` (`defaultMode` 0400); the pod runs `ssh-keygen -y -f id_ed25519`; a delivery without items is refused | the output equals `k3sm keys pubkey`; the fingerprint matches | no (U148, U163) | typed projection |
+| E31 | a synthetic oauth pair (`local`, planted access and refresh tokens) put from a token-response JSON, then delivered with the CLI default | positive control: the planted access token is found base64-encoded in the Secret; then every Secret, Event, pod log and `keystore-audit.log` holds no planted refresh-token bytes (raw, base64, URL-encoded); a KeyDelivery naming `refreshToken` is refused by the schema | no (U140, U149, U160) | typed projection |
+| E32 | on the real `server/github-e2e` pair, `k3sm keys refresh` (recorded during E28) | the pod's `access_token` hash changes without a restart; one `refresh-now` and one refresher line; `refresh_state ok`; `CredentialValid=True Valid`; PENDING (exit 3) if the pair is missing or not `ok` | yes | the refresher |
+| E33 | a separate entry holding a planted random refresh token against the real token endpoint, delivered; `k3sm keys refresh` | `Revoked` through the profile's `revokedErrorCodes` (the endpoint answers HTTP 200 with an `error` field); one `CredentialRevoked` Warning Event; parked: a second `refresh-now` sends nothing; a positive-controlled scan as E31 | no (U184) | the refresher |
+| E34 | two pods mount a delivered Secret; delete one; churn 200 short pods; rotate the entry 40 times in a minute | `pod-mount` for every first-seen pod, `pod-unmount`s, `pod-refresh` lines with one rate summary; no `ErrLogFull`; `put` still works | no (U169, U172) | the mount audit |
+| E35 | precondition: `refresh-profile list` shows a profile; a pod reads a sibling non-keystore file in the same directory (positive control), then `keystore-refresh-profiles.json` and `keystore-run/refresh-state.json` | the sibling read succeeds; both keystore reads are EPERM; a regression guard, which cannot fail before refresh profiles land | no (U16) | the `keystore-*` prefix deny |
+| E36 | a profile with `https://localhost:<port>/token`, a loopback listener on that port counting accepted connections, a pair naming it, `k3sm keys refresh` | `RefreshFailing` with cause `dial-refused`; the listener counted 0 connections; the redirect case is unit-only (U177) | no (U178) | refresh profiles |
 
 ## Open questions
 
