@@ -1761,4 +1761,26 @@ func TestRewrapWarnsWhenUserScopesExist(t *testing.T) {
 			}
 		})
 	}
+	// A .user that appears during the run, after the opening check, still
+	// gets the closing warning: the check is made again once Rewrap returns.
+	t.Run("user scopes appear during the run", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/a", []byte("a-value"))
+		made := false
+		h.keyOutStep = func(string) error {
+			if !made {
+				made = true
+				p := filepath.Join(h.keystoreDir(), ".user")
+				if err := os.Mkdir(p, 0o700); err != nil {
+					return err
+				}
+				keysGiveToService(t, p)
+			}
+			return nil
+		}
+		h.mustRun(0, "rewrap", "--key-out", filepath.Join(t.TempDir(), "new-master"))
+		if got := strings.Count(h.stderr.String(), keystore.UserScopeRewrapWarning); got != 1 {
+			t.Fatalf("rewrap printed the user-scope warning %d times, want the closing one:\n%s", got, h.stderr.String())
+		}
+	})
 }
