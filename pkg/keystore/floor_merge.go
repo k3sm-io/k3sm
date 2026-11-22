@@ -30,13 +30,23 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 )
 
 // floorPreRestoreName is the live floor as the restore recipe moves it
 // aside, directly under the data root. While it is there the restore is
 // unfinished: the merge has not run.
 const floorPreRestoreName = floorName + ".pre-restore"
+
+// floorRestoredName records, beside the floor, the restored floor's newest
+// delete sequence as the first Delete run while a restore is unfinished
+// found it, and the moved-aside floor it was run beside (restoredRecord).
+// The merge's older-input check compares against it, so the deletions rm
+// writes while the merge is pending do not make the floor moved aside look
+// older than the restored one (checkMergeInput).
+const floorRestoredName = floorName + ".restored-deleted"
 
 // errMergePending refuses a verb that changes the keystore while the
 // restore's moved-aside floor is in the data root: the merge has not run, so
@@ -193,7 +203,20 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	}
 	from := in.fl
 	if live == nil {
-		return r, checkMergeInput(live, from)
+		return r, checkMergeInput(live, from, 0)
+	}
+	// The restored floor's newest deletion before any Delete run while the
+	// merge is pending: rm raises the live floor's, never the floor moved
+	// aside's.
+	restoredDeleted := live.lastDeleted()
+	if d, ok, err := fdir.restored(); err != nil {
+		return r, err
+	} else if ok {
+		restoredDeleted = min(restoredDeleted, d)
+	}
+	guard := false
+	if named, err := fdir.root.Lstat(floorPreRestoreName); err == nil && os.SameFile(named, in.info) {
+		guard = true
 	}
 	ptrs, unverified, err := s.restoredPointers(ctx, live, from)
 	if err != nil {
@@ -212,9 +235,12 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 		if err := s.renameMerged(in); err != nil {
 			return MergeReport{}, err
 		}
+		if guard {
+			fdir.clearRestored()
+		}
 		return pr, nil
 	}
-	if err := checkMergeInput(live, from); err != nil {
+	if err := checkMergeInput(live, from, restoredDeleted); err != nil {
 		return r, err
 	}
 	// As Put and Rotate ask room before they write: a merge whose write
@@ -249,6 +275,9 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	}
 	if err := s.renameMerged(in); err != nil {
 		return r, fmt.Errorf("%w: the merge is written, but its input was not renamed, so the verbs that change the keystore still refuse; run the same merge again, which writes nothing more and renames it: %w", errCommitted, err)
+	}
+	if guard {
+		fdir.clearRestored()
 	}
 	return r, nil
 }
@@ -307,16 +336,17 @@ func (s *FileStore) renameMerged(in *mergeInput) error {
 // keystore-lock, that cannot be the restore's: an absent live floor (the
 // saved floor was never put back, and merging into nothing would write the
 // moved-aside floor's burials alone, with no live records), a from whose
-// highest delete sequence is below live's (from is older than the floor it
-// would merge into: the restored floor, most likely, not the one moved
-// aside), and a from equal to live (the same floor merged into itself:
-// parseFloor accepts one encoding per floor, so equal floors are
+// highest delete sequence is below restoredDeleted, the restored floor's
+// before any Delete run while the merge is pending (from is older than the
+// floor it would merge into: the restored floor, most likely, not the one
+// moved aside), and a from equal to live (the same floor merged into
+// itself: parseFloor accepts one encoding per floor, so equal floors are
 // byte-identical files, up to the trailing newline).
-func checkMergeInput(live, from floor) error {
+func checkMergeInput(live, from floor, restoredDeleted uint64) error {
 	if live == nil {
 		return errors.New("the live keystore floor is absent, so there is nothing to merge into: restore the saved keystore-floor.json first, with install -o root -g wheel -m 0644 as docs/user/keys.md describes, then run the merge again")
 	}
-	if a, l := from.lastDeleted(), live.lastDeleted(); a < l {
+	if a, l := from.lastDeleted(), restoredDeleted; a < l {
 		return fmt.Errorf("the floor file to merge records deletions older than the live floor's (its newest deletion is %d, the live floor's %d): it is not the floor moved aside before the restore, which is never older than the restored one. Check that you named keystore-floor.json.pre-restore, not the restored floor", a, l)
 	}
 	if floorsSame(live, from) {
@@ -611,4 +641,102 @@ func sortedNames(set map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// restoredRecord is what floorRestoredName holds: the restored floor's
+// newest delete sequence, and the inode of the moved-aside floor it belongs
+// to, so a record left from an earlier restore (its moved-aside floor
+// removed by hand, not merged) is never read as this one's.
+type restoredRecord struct {
+	deleted uint64
+	guard   uint64
+}
+
+// guardInode is the inode of the moved-aside floor in the data root.
+func (l *floorLock) guardInode() (uint64, error) {
+	fi, err := l.root.Lstat(floorPreRestoreName)
+	if err != nil {
+		return 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return 0, fmt.Errorf("%s: inode unknown", floorPreRestoreName)
+	}
+	return uint64(st.Ino), nil
+}
+
+// restored returns the restored floor's newest delete sequence the first
+// Delete under the moved-aside floor now in the data root recorded, and
+// whether there is one. A record of another moved-aside floor is none. A
+// record the floor's owner did not write, or one that does not parse, is
+// refused as errFloorUntrusted.
+func (l *floorLock) restored() (uint64, bool, error) {
+	guard, err := l.guardInode()
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	b, fi, err := readFile(l.root, floorRestoredName, 64)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("%w: %s: %w", errFloorUntrusted, floorRestoredName, err)
+	}
+	if err := l.s.floorOwned(fi); err != nil {
+		return 0, false, fmt.Errorf("%w: %s: %w", errFloorUntrusted, floorRestoredName, err)
+	}
+	r, err := parseRestored(b)
+	if err != nil {
+		return 0, false, fmt.Errorf("%w: %s: %w", errFloorUntrusted, floorRestoredName, err)
+	}
+	if r.guard != guard {
+		return 0, false, nil
+	}
+	return r.deleted, true, nil
+}
+
+// recordRestored writes floorRestoredName from fl, the live floor read
+// under keystore-lock, unless it already holds the record for the
+// moved-aside floor now in the data root: only the first Delete of a
+// pending merge records it, before its own burial.
+func (l *floorLock) recordRestored(fl floor) error {
+	if _, ok, err := l.restored(); err != nil || ok {
+		return err
+	}
+	guard, err := l.guardInode()
+	if err != nil {
+		return err
+	}
+	b := marshalRestored(restoredRecord{deleted: fl.lastDeleted(), guard: guard})
+	return l.s.writeFileAs(l.root, floorRestoredName, b, uint32(l.s.floorUID), uint32(l.s.floorGID), floorFileMode)
+}
+
+// clearRestored removes floorRestoredName once the merge has cleared the
+// guard it belongs to. A failure is logged only: restored reads a record as
+// none once its moved-aside floor is gone.
+func (l *floorLock) clearRestored() {
+	if err := l.root.Remove(floorRestoredName); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		slog.Warn("keystore floor: could not remove the restored floor's delete record after the merge; the next restore ignores it", "err", err)
+	}
+}
+
+// marshalRestored encodes r as two decimal numbers, its delete sequence and
+// its moved-aside floor's inode, and a newline.
+func marshalRestored(r restoredRecord) []byte {
+	return []byte(strconv.FormatUint(r.deleted, 10) + " " + strconv.FormatUint(r.guard, 10) + "\n")
+}
+
+// parseRestored parses what marshalRestored writes, in that one encoding.
+func parseRestored(b []byte) (restoredRecord, error) {
+	d, g, ok := strings.Cut(strings.TrimSuffix(string(b), "\n"), " ")
+	deleted, derr := strconv.ParseUint(d, 10, 64)
+	guard, gerr := strconv.ParseUint(g, 10, 64)
+	r := restoredRecord{deleted: deleted, guard: guard}
+	if !ok || derr != nil || gerr != nil || deleted > maxDeleteSeq || !bytes.Equal(marshalRestored(r), b) {
+		return restoredRecord{}, errors.New("malformed")
+	}
+	return r, nil
 }

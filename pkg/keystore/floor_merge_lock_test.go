@@ -120,8 +120,9 @@ func TestMergeFloorRefusesWrongInput(t *testing.T) {
 }
 
 // TestPendingMergeGuard (U192): while keystore-floor.json.pre-restore is in
-// the data root, a restore is unfinished, so Put, Rotate, Delete and Rewrap
-// refuse, naming keys floor merge, and RaiseFloor writes nothing; a
+// the data root, a restore is unfinished, so Put, Rotate and Rewrap refuse,
+// naming keys floor merge, and RaiseFloor writes nothing (Delete runs:
+// TestPendingMergeDeleteMakesRoom); a
 // successful merge renames its input to keystore-floor.json.merged-<unix>,
 // which clears the guard.
 func TestPendingMergeGuard(t *testing.T) {
@@ -136,7 +137,6 @@ func TestPendingMergeGuard(t *testing.T) {
 	for verb, run := range map[string]func() error{
 		"Put":    func() error { _, err := s.Put(ctx, "n", KindOpaque, []byte("v")); return err },
 		"Rotate": func() error { _, err := s.Rotate(ctx, "k", []byte("two")); return err },
-		"Delete": func() error { return s.Delete(ctx, "k") },
 		"Rewrap": func() error { return s.Rewrap(ctx, rewrapKey(1)) },
 	} {
 		if err := run(); !errors.Is(err, errMergePending) || !strings.Contains(err.Error(), "keys floor merge") {

@@ -338,9 +338,10 @@ sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystor
 ```
 
 Before you start the server, carry over every deletion recorded since the backup. The floor you
-moved aside records every entry deleted while it was live. Until you merge it, `put`, `rotate`,
-`rm` and `rewrap` refuse with a message that names `keys floor merge`, and `list` and `show` read
-the restored entries without updating the floor, with a warning on stderr. A server started
+moved aside records every entry deleted while it was live. Until you merge it, `put`, `rotate`
+and `rewrap` refuse with a message that names `keys floor merge`, and `list` and `show` read the
+restored entries without updating the floor, with a warning on stderr. `rm` still deletes, with
+the same warning, and the merge keeps each deletion it records. A server started
 before the merge delivers no keys to the cluster: it logs an error and tries again until the
 merge has run. Merge those deletions into the restored floor:
 

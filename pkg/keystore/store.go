@@ -588,6 +588,13 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // A Delete whose floor writes drop any burial, its own or another name's,
 // to the tombstone budget or the per-name cap, fails with
 // ErrTombstoneEvicted, though the entry is deleted.
+//
+// Unlike Put, Rotate and Rewrap, Delete runs while a restore is unfinished
+// (keystore-floor.json.pre-restore in the data root), so rm can make room
+// for a merge refused because the floor is full. It then raises no other
+// entry's floor, and the first such Delete records the restored floor's
+// newest delete sequence first (recordRestored), which the merge's
+// older-input check compares against instead of the live floor's.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -609,13 +616,20 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// record needs nothing the service user controls, so it lands before
 	// .lock, which the service user can hold or replace, and before
 	// keystore/ is judged, which it can make refused.
-	fdir, _, err := s.lockFloor(ctx)
+	fdir, fl, err := s.lockFloor(ctx)
 	if err != nil {
 		return err
 	}
 	defer fdir.unlock()
-	if err := fdir.mergePending(); err != nil {
-		return err
+	// Delete runs while a restore is unfinished, so rm can make room for a
+	// merge refused as full: it only buries and removes, and the merge
+	// only adds burials, so a burial written now is kept by it. It raises
+	// no other entry's floor then, as RaiseFloor does not.
+	pending := fdir.mergePending() != nil
+	if pending {
+		if err := fdir.recordRestored(fl); err != nil {
+			return err
+		}
 	}
 	if err := s.step("bury " + name); err != nil {
 		return evicted(fdir, nil, err)
@@ -653,7 +667,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// deletion: it is recorded from the floor alone, and the failure is
 	// logged.
 	k, kerr := s.loadMasterLocked()
-	if kerr == nil {
+	if kerr == nil && !pending {
 		synced, err := s.syncFloor(ctx, root, fdir, after, k)
 		switch {
 		case err == nil:
