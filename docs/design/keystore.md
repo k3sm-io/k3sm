@@ -437,17 +437,18 @@ per-user delivery list. No record carries either yet, and a reader refuses them,
 kind byte not in "Record encoding", as `ErrCorrupt`. The entries'-directory name `.user` is
 reserved for user scopes too, and nothing creates it yet. The first-Put mint counts it as an
 entry, whatever its type, so a missing master with only `.user` present is
-`ErrMasterMissing`, never a new master. Rewrap refuses with `ErrScopeUnsupported`, writing
-nothing, while `.user` exists, whatever its type: this build cannot re-wrap user scopes, and a
-master rewrapped under them would leave them unreadable. The refusal names the reserved path,
-and says that a `.user` that is not a user scope must be removed by root. A user scope's store, its own key wrapped by the master, its
+`ErrMasterMissing`, never a new master. History: Phase A's Rewrap refused with
+`ErrScopeUnsupported`, writing nothing, while `.user` existed, whatever its type, since that
+build could not re-wrap user scopes and a master rewrapped under them would have left them
+unreadable; the refusal named the reserved path. The change that re-wraps scope keys lifted
+it (below). A user scope's store, its own key wrapped by the master, its
 non-root API, RBAC, delivery and on-disk location are specified under "User scope"; the
 scope is in the format now so that adding one needs no format change.
 
 Amended by the user scope: the user-scope store writes kind `0xFE` records (`scope.key`)
 and creates `.user`; the change that adds the sealed delivery record writes kind `0xFD`.
-The same change that adds the delivery record re-wraps scope keys in Rewrap and lifts the
-`ErrScopeUnsupported` refusal; every build before it keeps the refusal, so a rollback to one
+The same change that adds the delivery record re-wraps scope keys in Rewrap and lifted the
+`ErrScopeUnsupported` refusal; every build before it kept the refusal, so a rollback to one
 cannot rewrap the master out from under user scopes ("User scope", "Rewrap of scope keys").
 
 ### Master file trust
@@ -654,11 +655,12 @@ the conservative way:
   key; otherwise it is `ErrCorrupt` and is not renamed. Before step 5 `master.next` is read
   again, and after its rename `master` is read back; each must be the key the records were
   sealed under, or the Rewrap stops with `ErrMasterUntrusted` before the fingerprint rename.
-- *A `.user` created during the run* is caught by one more check, right before step 5: the
-  Rewrap stops with `ErrScopeUnsupported`, the master not swapped and `master.next` still
-  agreeing, every record readable, and a rerun with the same key completes it once `.user`
-  is gone. This refusal, and the `.user` refusal in the list below, are lifted by the change
-  that re-wraps scope keys ("User scope", "Rewrap of scope keys").
+- *A `.user` created during the run* was, in Phase A, caught by one more check right before
+  step 5: the Rewrap stopped with `ErrScopeUnsupported`, the master not swapped. That check,
+  and the `.user` refusal in the list below, are history: the change that re-wraps scope keys
+  lifted them ("User scope", "Rewrap of scope keys"). In their place, right before step 5, the
+  Rewrap walks `.user` again and refuses with `ErrCorrupt`, the master not swapped, unless the
+  scopes holding a `scope.key` are exactly those it re-sealed.
 - *Recovery for a stuck `master.next`.* If the service user replaces or removes
   `master.next` mid-run, after some record has moved, those records are sealed under the
   caller's new key, which then exists only as the caller's input; the next run's step 2
@@ -1306,9 +1308,20 @@ record at the previous sequence plus 1; the empty record the mint writes is sequ
 **Rewrap of scope keys.** The change that adds quotas and the delivery record extends
 Rewrap's two-phase procedure with one class of record: each `scope.key`, re-sealed under the
 new `W`. User records stay sealed under their `K_u`, byte for byte unchanged, and the run is
-resumable at every step as G12 requires (U12). Until that change, Rewrap refuses with
-`ErrScopeUnsupported` while a `.user` directory exists (U5), which is what keeps a rollback
-to an earlier build from orphaning user scopes.
+resumable at every step as G12 requires (U12). Before that change, Rewrap refused with
+`ErrScopeUnsupported` while a `.user` directory existed (U5), which is what keeps a rollback
+to an earlier build from orphaning user scopes. No user scope existed outside the package
+before that change: the user scope was reachable only from inside `pkg/keystore`, a gate a
+test enforces (`TestUserScopeIsUnexported`), so no build ever shipped a scope without its
+`deliveries` record, and none needs a migration.
+
+**One damaged scope blocks Rewrap.** Rewrap refuses, writing nothing, while any scope's
+`scope.key` does not open, a scope directory or `.user` is not one the store trusts, a
+`scope.key.new` is not a file Rewrap wrote, or `.user` lists past its name bound: re-wrapping
+past it would leave that scope sealed under a master that no longer exists. The refusal is
+`ErrCorrupt` and names the scope. The recovery is root's: restore the scope from a backup, or,
+until `rm-scope` lands, remove that scope's directory `.user/<uid>/` by hand (its owner loses
+its values and re-puts them), then run `rewrap` again.
 
 **Rewrap does not re-key `K_u`.** It re-seals each `scope.key` under the new `W`, but the
 `K_u` inside is the same 32 bytes, and every user record stays sealed under it. So an old master
