@@ -103,3 +103,46 @@ func TestDeleteBuriesPastPlantedNames(t *testing.T) {
 	_, _, err := s.Current(ctx, "k")
 	refusedAsDeleted(t, "Current of the copy put back", err)
 }
+
+// TestDeleteBuriesAuthenticatedDirectoryGeneration (G23, U192): when the
+// directory under the name has another generation than the floor's live
+// record and its pointer authenticates under it with the master, Delete
+// buries both, the floor's live generation first, so a copy of either put
+// back is refused as deleted. A decoy whose pointer does not authenticate
+// under its generation file still buries only the floor's live one.
+func TestDeleteBuriesAuthenticatedDirectoryGeneration(t *testing.T) {
+	ctx := context.Background()
+	files := []string{generationName, "v1", currentName}
+	other := strings.Repeat("11", generationSize)
+	t.Run("authenticated", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		mustPut(t, s, "other", KindOpaque, []byte("one"))
+		gen := generationOf(t, server, "k")
+		old := saveEntry(t, server, "k", files...)
+		start := floorOf(t, server)
+		putFloorFile(t, server, floor{"k": {Generation: other, Seq: 1}, "other": start["other"]})
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatal(err)
+		}
+		ts := tombstonesOf(t, server)["k"]
+		if len(ts) != 2 || ts[0].Generation != other || ts[1].Generation != gen {
+			t.Fatalf("tombstones of k = %+v, want the floor's live %s, then the directory's %s", ts, other, gen)
+		}
+		putBack(t, server, old, "k")
+		_, _, err := s.Current(ctx, "k")
+		refusedAsDeleted(t, "Current of the authenticated directory put back", err)
+	})
+	t.Run("a decoy generation file", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		gen := generationOf(t, server, "k")
+		writeFile(t, entryPath(server, "k", generationName), strings.Repeat("dd", generationSize)+"\n")
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatal(err)
+		}
+		if ts := tombstonesOf(t, server)["k"]; len(ts) != 1 || ts[0].Generation != gen {
+			t.Fatalf("tombstones of k = %+v, want only the floor's live %s", ts, gen)
+		}
+	})
+}

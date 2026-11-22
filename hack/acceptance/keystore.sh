@@ -508,7 +508,7 @@ check G21 "the rollback recipe is a byte-exact round trip: show --reveal into ro
 	k3sm/cmd/k3sm::TestKeysRollbackRoundTrip
 special g22 G22
 check G23 "a deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by rm, which keeps the tombstone" \
-	TestTombstoneRefusesPutBack TestTombstoneSurvivesPlantedGeneration TestTombstonesKeptAcrossRecreate TestDeleteBuriesFloorGeneration TestDeleteBuriesWithDirectoryGone TestDeleteFaultAfterBurial TestDeleteBuriesPastPlantedNames TestDeleteClearsUserFlags TestBuriedErrorPointsToRestore TestRefusalLeadsWithSafeAction
+	TestTombstoneRefusesPutBack TestTombstoneSurvivesPlantedGeneration TestTombstonesKeptAcrossRecreate TestDeleteBuriesFloorGeneration TestDeleteBuriesWithDirectoryGone TestDeleteFaultAfterBurial TestDeleteBuriesPastPlantedNames TestDeleteClearsUserFlags TestBuriedErrorPointsToRestore TestRefusalLeadsWithSafeAction TestDeleteBuriesAuthenticatedDirectoryGeneration
 
 pend U1 "rotate --from-version N writes version N's bytes as a new version server side; no value leaves the store (keys verbs)" \
 	k3sm/cmd/k3sm::TestKeysRotateFromVersionNoValueOut

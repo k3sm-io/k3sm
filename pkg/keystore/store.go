@@ -282,7 +282,11 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 	if err != nil {
 		return Version{}, fmt.Errorf("the entry is stored, but recording its floor failed (the next keys verb records it): %w", err)
 	}
-	logBuried(name, buried, dropped, after)
+	var gs []string
+	if buried != "" {
+		gs = []string{buried}
+	}
+	logBuried(name, gs, dropped, after)
 	return v, nil
 }
 
@@ -647,18 +651,19 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err := s.step("bury " + name); err != nil {
 		return err
 	}
-	var buried string
+	var gs []string
 	var dropped []pruned
 	after, err := fdir.update(func(fl floor) bool {
-		buried, dropped = fl.bury(name, authentic)
-		return buried != ""
+		gs, dropped = fl.bury(name, authentic)
+		return len(gs) > 0
 	})
 	if err != nil {
 		return err
 	}
-	logBuried(name, buried, dropped, after)
+	logBuried(name, gs, dropped, after)
+	buried := len(gs) > 0
 	if !present {
-		if buried == "" {
+		if !buried {
 			return ErrNotFound
 		}
 		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
@@ -671,12 +676,12 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err != nil {
 		return leftBehind(name, after, err)
 	}
-	if interrupted && buried == "" {
+	if interrupted && !buried {
 		// Not an entry, and nothing recorded for it: the answer is
 		// ErrNotFound, though its directory is removed.
 		return ErrNotFound
 	}
-	if buried != "" && interrupted {
+	if buried && interrupted {
 		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
 	}
 	return nil
@@ -752,31 +757,34 @@ func leftBehind(name string, after floor, err error) error {
 // directory moved away during rm, or left gone by a Delete that crashed
 // before its floor write and was run again, is refused when it is put back.
 func buryGone(fdir *floorLock, name string) error {
-	var buried string
+	var gs []string
 	var dropped []pruned
 	after, err := fdir.update(func(fl floor) bool {
-		buried, dropped = fl.bury(name, nil)
-		return buried != ""
+		gs, dropped = fl.bury(name, nil)
+		return len(gs) > 0
 	})
 	if err != nil {
 		return err
 	}
-	if buried == "" {
+	if len(gs) == 0 {
 		return ErrNotFound
 	}
 	slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
-	logBuried(name, buried, dropped, after)
+	logBuried(name, gs, dropped, after)
 	return nil
 }
 
-// logBuried logs what a floor write that buried generation buried ("" for
-// none) for name dropped: the per-name cap's drop is a prune too, and over
-// a full floor the write may prune the very burial it added. after is the
-// floor as written.
-func logBuried(name, buried string, dropped []pruned, after floor) {
+// logBuried logs what a floor write that buried the generations buried for
+// name dropped: the per-name cap's drop is a prune too, and over a full
+// floor the write may prune the very burials it added. after is the floor
+// as written.
+func logBuried(name string, buried []string, dropped []pruned, after floor) {
 	logPruned(dropped)
-	if buried != "" && !after[name].buries(buried) {
-		slog.Warn("keystore floor: the burial this write added was pruned in the same write, so an old copy of the deleted entry put back is not refused as deleted", "name", name)
+	for _, g := range buried {
+		if !after[name].buries(g) {
+			slog.Warn("keystore floor: the burial this write added was pruned in the same write, so an old copy of the deleted entry put back is not refused as deleted", "name", name)
+			return
+		}
 	}
 }
 

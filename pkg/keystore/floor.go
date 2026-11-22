@@ -519,7 +519,11 @@ func (fl floor) set(name string, gen [generationSize]byte) (bool, string, []prun
 	var buried string
 	var dropped []pruned
 	if f.live() {
-		buried, dropped = fl.bury(name, nil)
+		var gs []string
+		gs, dropped = fl.bury(name, nil)
+		if len(gs) > 0 {
+			buried = gs[0]
+		}
 		f = fl[name]
 	}
 	f.Generation, f.Seq = g, 1
@@ -528,47 +532,50 @@ func (fl floor) set(name string, gen [generationSize]byte) (bool, string, []prun
 }
 
 // bury is Delete applied to fl. It buries the generation the floor records
-// live for name, root's own record, whatever the deleted directory claimed.
-// With no live record it buries dirGen, the deleted directory's generation,
-// which the caller passes only when the directory's pointer authenticated
+// live for name, root's own record, whatever the deleted directory claimed,
+// and dirGen, the deleted directory's generation, when it is another one.
+// The caller passes dirGen only when the directory's pointer authenticated
 // under it with the master (a Put that crashed after its pointer, before
-// its floor write), and nil otherwise: a generation file alone is the
-// service user's to write, so a planted one never buries anything and never
-// pushes a real burial out. bury never removes or replaces a burial
-// except that, at maxBuriedPerName, the name's oldest is dropped to make
-// room. It returns the generation it buried ("" for none) and what it
-// dropped. The new burial's delete sequence is one more than the highest in
-// the floor (renumber keeps that under maxDeleteSeq).
-func (fl floor) bury(name string, dirGen *[generationSize]byte) (string, []pruned) {
+// its floor write, or a directory of another generation than the floor's
+// live record), and nil otherwise: a generation file alone is the service
+// user's to write, so a planted one never buries anything and never pushes a
+// real burial out. A generation already buried is not buried again. bury
+// never removes or replaces a burial except that, at maxBuriedPerName, the
+// name's oldest is dropped to make room. It returns the generations it
+// buried, the live one first (none for no change), and what it dropped.
+// Each new burial's delete sequence is one more than the highest in the
+// floor (renumber keeps that under maxDeleteSeq).
+func (fl floor) bury(name string, dirGen *[generationSize]byte) ([]string, []pruned) {
 	f := fl[name]
-	var g string
-	switch {
-	case f.live():
-		g = f.Generation
-	case dirGen != nil:
-		g = hex.EncodeToString(dirGen[:])
-	default:
-		return "", nil
+	var gs []string
+	if f.live() && !f.buries(f.Generation) {
+		// A live generation that is also buried is not reachable from a
+		// floor parseFloor accepts.
+		gs = append(gs, f.Generation)
 	}
-	if f.buries(g) {
-		// Not reachable from a floor parseFloor accepts: a live generation
-		// is never also buried.
-		return "", nil
+	if dirGen != nil {
+		if g := hex.EncodeToString(dirGen[:]); g != f.Generation && !f.buries(g) {
+			gs = append(gs, g)
+		}
 	}
-	last := fl.lastDeleted()
-	if last >= maxDeleteSeq {
-		last = fl.renumber()
-		// renumber rewrote the name's own burials in fl: f, copied before
-		// it, holds the old sequences.
-		f = fl[name]
+	if len(gs) == 0 {
+		return nil, nil
 	}
-	f.Generation, f.Seq = "", 0
 	var out []pruned
-	if dropped, ok := f.add(burial{Generation: g, Deleted: last + 1}); ok {
-		out = append(out, pruned{name: name, generation: dropped.Generation})
+	for _, g := range gs {
+		last := fl.lastDeleted()
+		if last >= maxDeleteSeq {
+			last = fl.renumber()
+		}
+		// Read after renumber, which rewrites the name's own burials in fl.
+		f = fl[name]
+		f.Generation, f.Seq = "", 0
+		if dropped, ok := f.add(burial{Generation: g, Deleted: last + 1}); ok {
+			out = append(out, pruned{name: name, generation: dropped.Generation})
+		}
+		fl[name] = f
 	}
-	fl[name] = f
-	return g, out
+	return gs, out
 }
 
 // lastDeleted is the highest delete sequence in fl, or 0 for none.

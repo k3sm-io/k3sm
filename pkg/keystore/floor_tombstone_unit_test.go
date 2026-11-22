@@ -53,7 +53,7 @@ func TestTombstonePrune(t *testing.T) {
 		for fl.deadSize() <= maxTombstoneSize {
 			name := fmt.Sprintf("t-%s-%06d", strings.Repeat("x", 200), n)
 			fl[name] = floorEntry{Generation: gen, Seq: 1}
-			if g, _ := fl.bury(name, nil); g != gen {
+			if g, _ := fl.bury(name, nil); len(g) != 1 || g[0] != gen {
 				t.Fatalf("bury %s buried %q, want the live generation", name, g)
 			}
 			n++

@@ -386,9 +386,12 @@ buried set, oldest first:
   generation buried before it. A live generation is never also buried.
 - *What Delete buries.* Delete buries the generation the floor records live for the name,
   root's own record, whatever the deleted directory's `generation` file says. That file is in
-  the service user's tree, so with no live record Delete buries the generation it read only
-  when the master is loaded and the directory's `current` authenticates under that
-  generation: a Put that crashed after its pointer and before its floor write. A planted
+  the service user's tree, so Delete also buries the generation it read only when the master
+  is loaded and the directory's `current` authenticates under that generation, and only when
+  it is not the live one or already buried: with no live record, a Put that crashed after its
+  pointer and before its floor write; with a live record of another generation, a directory
+  of a generation the floor no longer records live. The floor's live generation is buried
+  first, so it has the lower delete sequence. A planted
   generation file under a name with no live record therefore buries nothing, and can never
   push a real burial out of the per-name cap or the tombstone budget below. Delete never removes or replaces a
   buried generation; a floor write never lowers what the floor refuses on data from the

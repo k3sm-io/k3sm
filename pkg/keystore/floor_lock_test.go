@@ -83,10 +83,11 @@ func TestFloorWriteRereads(t *testing.T) {
 	})
 
 	// The floor records k live at a generation the Delete never read: the
-	// Delete buries the floor's own live generation, root's record, rather
-	// than trust the directory it read, so whatever stands under the name
-	// at that generation is refused, never accepted.
-	t.Run("a Delete buries the floor's live generation, not the directory's", func(t *testing.T) {
+	// Delete buries the floor's own live generation, root's record, so
+	// whatever stands under the name at that generation is refused, never
+	// accepted; the directory's generation is buried too, after it, because
+	// its pointer authenticates under it with the master.
+	t.Run("a Delete buries the floor's live generation, then the authenticated directory's", func(t *testing.T) {
 		s, server := newTestStore(t)
 		mustPut(t, s, "k", KindOpaque, []byte("one"))
 		mustPut(t, s, "other", KindOpaque, []byte("one"))
@@ -104,8 +105,10 @@ func TestFloorWriteRereads(t *testing.T) {
 			t.Fatalf("Delete: %v", err)
 		}
 		got := floorOf(t, server)
-		if got["k"].live() || !got["k"].buries(newer.Generation) || len(got["k"].burials()) != 1 {
-			t.Fatalf("floor k after the Delete = %+v, want the floor's live %s buried", got["k"], newer.Generation)
+		// The directory's own generation authenticated under the master, so
+		// it is buried too, after the floor's live one.
+		if bs := got["k"].burials(); got["k"].live() || len(bs) != 2 || bs[0].Generation != newer.Generation || bs[1].Generation != start["k"].Generation {
+			t.Fatalf("floor k after the Delete = %+v, want the floor's live %s buried, then the directory's %s", got["k"], newer.Generation, start["k"].Generation)
 		}
 		if got["other"] != start["other"] {
 			t.Fatalf("floor other after the Delete = %+v, want %+v", got["other"], start["other"])

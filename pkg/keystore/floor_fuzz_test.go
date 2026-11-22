@@ -203,8 +203,8 @@ func TestFloorOpsProperty(t *testing.T) {
 				if rng.IntN(2) == 0 {
 					dir = &gen
 				}
-				g, d := fl.bury(name, dir)
-				if g != "" {
+				gs, d := fl.bury(name, dir)
+				for _, g := range gs {
 					want[key{name, g}] = true
 				}
 				dropped = d
@@ -291,7 +291,7 @@ func TestDeleteSequenceNeverWraps(t *testing.T) {
 	b.Buried[1] = burial{Generation: g(6), Deleted: maxDeleteSeq - 2}
 	fl := floor{"a": a, "b": b}
 	fl["c"] = floorEntry{Buried: [maxBuriedPerName]burial{{Generation: g(4), Deleted: maxDeleteSeq - 1}}}
-	if got, _ := fl.bury("b", nil); got != g(3) {
+	if got, _ := fl.bury("b", nil); len(got) != 1 || got[0] != g(3) {
 		t.Fatalf("bury b buried %q", got)
 	}
 	// In delete order: b g5, a g1, b g6, c g4, a g2, then the new b g3.
