@@ -1053,7 +1053,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	for _, name := range r.BuriedLive {
 		// The floors cannot tell an undo from a restore: in an undo a
 		// buried-live entry may be one the undo brings back.
-		fmt.Fprintf(env.stdout, "buried live %s: the floor moved aside records this version as deleted, so the merge buries it and it is refused. In an undo, a version the first merge retired is buried by the reverse merge: pass --keep %s to bring it back. An entry deleted since the restore stays deleted: remove its files with sudo k3sm keys rm %s --yes\n", qualify(name), qualify(name), qualify(name))
+		fmt.Fprintf(env.stdout, "buried live %s: the floor moved aside records this version as deleted, so the merge buries it and removes its restored files\n", qualify(name))
 	}
 	revoked := 0
 	for _, name := range r.Kept {

@@ -499,7 +499,7 @@ func (s *FileStore) removeStaged(st *mergeStaging, names []string) error {
 			return err
 		}
 		if err := tree.RemoveAll(name); err != nil {
-			return fmt.Errorf("remove the staged directory of %s, deleted under the guard, from %s/%s: %w; nothing is written, run the merge again", name, preRestoreDirName, stagedTreeName, err)
+			return fmt.Errorf("remove the staged directory of %s, which the merge buries, from %s/%s: %w; nothing is written, run the merge again", name, preRestoreDirName, stagedTreeName, err)
 		}
 	}
 	return syncDir(tree)

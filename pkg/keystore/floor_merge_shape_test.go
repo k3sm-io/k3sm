@@ -345,3 +345,56 @@ func TestFloorMergeShapeDryRunParity(t *testing.T) {
 		t.Fatalf("live floor after the refused merges = %s, %v; want it unchanged", after, err)
 	}
 }
+
+// TestFloorMergeRemovesBuriedLiveStaged (U192): the merge removes the staged
+// directory of every entry it buries live, not only those rm buried under
+// the guard, so a later prune that drops the burial brings nothing back. A
+// name --keep keeps is not buried live, and its directory moves into place.
+func TestFloorMergeRemovesBuriedLiveStaged(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		t.Run(map[bool]string{false: "buried live", true: "kept"}[keep], func(t *testing.T) {
+			ctx := context.Background()
+			s, server := newTestStore(t)
+			mustPut(t, s, "k", KindOpaque, []byte("v"))
+			mustPut(t, s, "other", KindOpaque, []byte("v"))
+			live := floorOf(t, server)
+			aside := floor{"other": live["other"], "k": {Buried: []burial{{Generation: live["k"].Generation, Deleted: 1}}}}
+			writeAsideFloor(t, server, aside)
+			stageTree(t, s)
+			var opts MergeOptions
+			if keep {
+				opts.Keep = []string{"k"}
+			}
+			r, err := s.MergeFloor(ctx, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(filepath.Join(s.dir, "other")); err != nil {
+				t.Fatalf("other's directory after the merge: %v, want it moved into place", err)
+			}
+			if keep {
+				if len(r.BuriedLive) != 0 {
+					t.Fatalf("MergeFloor keeping k: %+v, want nothing buried live", r)
+				}
+				mustCurrent(t, s, "k", "v")
+				return
+			}
+			if len(r.BuriedLive) != 1 || r.BuriedLive[0] != "k" {
+				t.Fatalf("MergeFloor: %+v, want k buried live", r)
+			}
+			if _, err := os.Lstat(filepath.Join(s.dir, "k")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("k's directory after the merge: %v, want it removed", err)
+			}
+			// A prune that drops k's burial, as the tombstone budget does.
+			fl := floorOf(t, server)
+			delete(fl, "k")
+			putFloorFile(t, server, fl)
+			if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Current k after its burial was pruned: %v, want ErrNotFound", err)
+			}
+			if _, err := os.Lstat(filepath.Join(s.dir, "k")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("k's directory after the prune: %v, want it still absent", err)
+			}
+		})
+	}
+}

@@ -305,11 +305,13 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if err := s.chownStaged(st); err != nil {
 		return r, err
 	}
-	// rm under the guard buried these entries while their files were
-	// staged, out of its reach: the merge removes them before the tree
-	// moves into place, so no second rm is needed. A failure here leaves
+	// rm under the guard buried some entries while their files were
+	// staged, out of its reach, and the merge buries others live: it
+	// removes the staged directory of each before the tree moves into
+	// place, so none is left for a later prune of its burial to bring
+	// back. A name --keep keeps is not buried live. A failure here leaves
 	// the floor unwritten.
-	if err := s.removeStaged(st, guardBuried(live, plan.merged)); err != nil {
+	if err := s.removeStaged(st, unionNames(guardBuried(live, plan.merged), pr.BuriedLive)); err != nil {
 		return r, err
 	}
 	// Only keystore-lock: the merge writes the root-owned floor and nothing
@@ -337,7 +339,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	}
 	r.Unverified = unionNames(unverified, r.Unverified)
 	for _, name := range r.BuriedLive {
-		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and the restored entry is refused; rm removes its directory, and in an undo --keep brings back a version the first merge retired", "name", name)
+		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and removed its restored directory; in an undo --keep brings back a version the first merge retired", "name", name)
 	}
 	if err := s.moveStaged(st); err != nil {
 		return r, fmt.Errorf("%w: the merge is written, but the restored keystore/ is still staged in pre-restore.d/restored: %w; run the same merge again, which writes nothing more and moves it into place", errCommitted, err)

@@ -2866,8 +2866,11 @@ func TestKeysFloorMergeReportCodes(t *testing.T) {
 		h.mustRun(0, "rm", "system/rb", "--yes")
 		restore(t, h, b)
 		h.mustRun(0, "floor", "merge")
-		if out := h.stdout.String(); !strings.Contains(out, "buried by the reverse merge: pass --keep system/rb to bring it back") {
-			t.Fatalf("merge printed %q; want the buried-live line to name --keep for an undo", out)
+		if out := h.stdout.String(); !strings.Contains(out, "buried live system/rb: ") || !strings.Contains(out, "removes its restored files") || strings.Contains(out, "keys rm") {
+			t.Fatalf("merge printed %q; want the buried-live line to say its files are removed, naming no rm", out)
+		}
+		if _, err := os.Lstat(filepath.Join(h.work, "keystore", "rb")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("rb's directory after the merge: %v, want it removed", err)
 		}
 	})
 }
