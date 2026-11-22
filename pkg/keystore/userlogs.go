@@ -285,11 +285,13 @@ var (
 	errFloorBuried = errors.New("the user-scope floor buries this generation: the entry was deleted")
 )
 
-// errFloorDegraded refuses a live floor line, and a read of a generation
-// the floor has no line for, while the floor holds damaged lines: a skipped
-// line could be a tombstone, so a live line written now could bring a
-// deleted entry back. It is root's to clear.
-var errFloorDegraded = fmt.Errorf("the user-scope floor %s holds damaged lines, one of which could be a tombstone, so it is in a degraded mode that writes no live line and trusts no generation it has no line for: rm and withdraw still work; root must read the damage count (CheckLogBounds, at the server's start) and run sudo k3sm doctor (the floor rebuild verb is not yet available)", userFloorLogName)
+// errFloorDegraded refuses a key a damaged floor line could name, and, while
+// the floor holds damage no key can be read from, a put or deliver line and
+// a generation the floor has no line for: a skipped line could be a
+// tombstone, so a live line written now could bring a deleted entry back.
+// No verb clears it yet: root reads the damage and acknowledges damage no
+// key can be read from as root maintenance, which never lifts a key's taint.
+var errFloorDegraded = fmt.Errorf("the user-scope floor %s holds damaged lines, one of which could be a tombstone for this key or, when no key can be read from it, for any: no live line is written for such a key and no generation is trusted that the floor has no line for; rm and withdraw still work; root must read the damage count (CheckLogBounds, at the server's start), and can acknowledge damage no key can be read from as root maintenance, which never lifts a key's taint", userFloorLogName)
 
 // floorTombstone is a tombstone line's last field, where a live line has
 // its sequence.

@@ -249,11 +249,3 @@ func (l *appendLog) warnServedOverDamage(s *logState) {
 	l.servedWarned[id] = true
 	slog.Warn("the user-scope floor holds damaged lines; generations it has a line for and no damaged line could name are still served", "log", l.name, "damaged", s.damaged(), "first", s.badAt)
 }
-
-// unattributable reports whether the floor holds unattributable damage that
-// counts, which refuses every put and deliver line and every live line for
-// a generation the floor has no line for. The caller holds f.log.mu.
-func (f *fileFloorLog) unattributable(state *logState) bool {
-	_, ok := state.unattributedAt()
-	return ok
-}

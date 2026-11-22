@@ -65,7 +65,7 @@ func corruptTombstones(t *testing.T, s *FileStore, scope, name string, gen [gene
 // tombstone is then lost to damage, and its tree is copied back with a
 // pointer that authenticates: the catch-up refuses to give its generation
 // a live line (and the start step quarantines its scope), a put refuses before its first
-// write naming doctor, Current refuses, and rm and withdraw still work.
+// write naming CheckLogBounds and the acknowledgement, Current refuses, and rm and withdraw still work.
 func TestFloorDamageDegradesLiveLines(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
@@ -119,7 +119,7 @@ func TestFloorDamageDegradesLiveLines(t *testing.T) {
 	if !errors.Is(err, errFloorDegraded) {
 		t.Fatalf("put over a damaged floor: %v, want errFloorDegraded", err)
 	}
-	for _, want := range []string{"doctor", "CheckLogBounds"} {
+	for _, want := range []string{"CheckLogBounds", "root maintenance"} {
 		if !bytes.Contains([]byte(err.Error()), []byte(want)) {
 			t.Fatalf("the put's refusal %q does not name %s", err, want)
 		}
