@@ -1207,16 +1207,17 @@ brings back every entry deleted since the backup, with their burials gone, until
 below carries them over.
 
 *Restoring with the saved floor: the merge.* Before `k3sm start`, the recipe runs
-`sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore`
-(`FileStore.MergeFloor`). It reads the moved-aside file as the floor is read (a regular file,
-not a symlink, owned by root and not group- or other-writable, at most 4 MiB, in a directory
-judged on its descriptor as the data root is: owned by root and not group- or other-writable,
-so no other user can swap the file in) and parses it
-with the same strict parser. It refuses, writing nothing, when the live floor is absent ("restore
-the saved keystore-floor.json first": merging into nothing would leave the moved-aside burials
-with no live records), when the file's highest delete sequence is below the live floor's (it is
-older than the floor it would merge into, so it is the restored floor named by mistake, not the
-one moved aside), and when it is the live floor itself (equal floors are byte-identical files,
+`sudo k3sm keys floor merge` (`FileStore.MergeFloor`). It takes no path: its only input is the
+data root's `keystore-floor.json.pre-restore`, read under `keystore-lock` through the data root
+the lock judged, as the floor is read (a regular file, never followed, owned by root and not
+group- or other-writable, at most 4 MiB), and parsed with the same strict parser. So the floor
+saved with the backup, or any other copy, can never be its input, and nothing needs to tell the
+two apart by age (`TestMergeFloorReadsOnlyTheGuardFile`, `TestKeysFloorMergeTakesNoFile`). The
+name must still be the file it read when it writes and when it renames it: a guard file
+replaced by another inode during the merge refuses it, writing nothing. It refuses, writing
+nothing, when the live floor is absent ("restore the saved keystore-floor.json first": merging
+into nothing would leave the moved-aside burials with no live records) and when the guard file
+is the live floor itself, by inode or byte for byte (equal floors are byte-identical files,
 since the parser accepts one encoding per floor). Then, under `keystore-lock` alone, it adds every
 burial it records that the restored floor lacks, oldest first, each at the next delete
 sequence, so the merged burials keep their order. It writes only the root-owned floor and
@@ -1271,14 +1272,13 @@ under `keystore-lock`, before they write anything, with a message naming `keys f
 (`errMergePending`), and RaiseFloor, which the read verbs call first, raises nothing and logs
 that at Warn, so `list` and `show` still read the restored entries and no pointer put back
 before the merge is recorded. A successful merge renames its input to
-`keystore-floor.json.merged-<unix>` beside it, through the directory descriptor it judged the
-input in (never over an existing file, and only if the name is still the file it read), which
+`keystore-floor.json.merged-<unix>` beside it, through the data root descriptor the lock
+judged (never over an existing file, and only if the name is still the file it read), which
 clears the guard. A rename that fails after the write is reported as committed: the verb prints
 the full report and exits 4. A rerun is safe: the input is read again under `keystore-lock`, and
 the merge first runs on a copy of the live floor. When every burial and fence the input records
-is already there, it writes nothing, only renames the input, and reports `already merged`, even
-when the input's newest deletion is below the live floor's (a Delete since). An input that is
-the data root's live floor, by path or by inode, is refused outright
+is already there, it writes nothing, only renames the input, and reports `already merged`. A guard file that is
+the data root's live floor by inode is refused outright
 (`TestMergeFloorCommittedRerun`, `TestKeysFloorMergeCommittedRerun`). `k3sm start` is not hooked: its start path has no cheap synchronous
 check of the keystore, and it writes no floor. The delivery reconciler, the server's one reader
 that publishes a value, is: each sweep first asks `FileStore.MergePending` (a Lstat of

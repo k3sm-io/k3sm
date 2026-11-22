@@ -114,12 +114,12 @@ func TestFloorMergeCapsAndPrune(t *testing.T) {
 	for i := range 40 {
 		aside[fmt.Sprintf("name-%02d", i)] = floorEntry{Buried: []burial{{Generation: mgen(100 + i), Deleted: uint64(i + 1)}}}
 	}
-	path := writeAsideFloor(t, server, aside)
+	writeAsideFloor(t, server, aside)
 	// The moved-aside floor fits the budget alone; with the restored
 	// floor's own burials it does not.
 	setFloorLimits(t, smallFloorSize, 3100)
 	buf := captureWarn(t)
-	got, err := s.MergeFloor(ctx, path, nil)
+	got, err := s.MergeFloor(ctx, MergeOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestFloorMergeCapsAndPrune(t *testing.T) {
 	}
 }
 
-// TestFloorMergeRefusesUntrusted (U192): the moved-aside file is parsed by
+// TestFloorMergeRefusesUntrusted (U192): the guard file is parsed by
 // parseFloor and judged as the floor is, so a malformed or symlinked one is
 // refused and the live floor is left as it was.
 func TestFloorMergeRefusesUntrusted(t *testing.T) {
@@ -154,18 +154,18 @@ func TestFloorMergeRefusesUntrusted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bad := filepath.Join(filepath.Dir(server), "bad.json")
-	if err := os.WriteFile(bad, []byte(`{"version":1,"scope":"system","entries":{},"tombstones":{"k":[]}}`), 0o644); err != nil {
+	guard := floorPath(server) + ".pre-restore"
+	if err := os.WriteFile(guard, []byte(`{"version":1,"scope":"system","entries":{},"tombstones":{"k":[]}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeFloor(ctx, bad, nil); !errors.Is(err, ErrCorrupt) {
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); !errors.Is(err, ErrCorrupt) {
 		t.Errorf("MergeFloor of a malformed floor: %v, want ErrCorrupt", err)
 	}
-	link := filepath.Join(filepath.Dir(server), "link.json")
-	if err := os.Symlink(floorPath(server), link); err != nil {
+	remove(t, guard)
+	if err := os.Symlink(floorPath(server), guard); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeFloor(ctx, link, nil); !errors.Is(err, errFloorUntrusted) {
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); !errors.Is(err, errFloorUntrusted) {
 		t.Errorf("MergeFloor of a symlink: %v, want errFloorUntrusted", err)
 	}
 	if after, err := os.ReadFile(floorPath(server)); err != nil || string(after) != string(before) {
@@ -221,14 +221,14 @@ func TestMergeFloorKeep(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
 	putFloorFile(t, server, floor{"a": {Generation: mgen(1), Seq: 1}, "b": {Generation: mgen(2), Seq: 1}})
-	path := writeAsideFloor(t, server, floor{
+	writeAsideFloor(t, server, floor{
 		"a": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}},
 		"b": {Buried: []burial{{Generation: mgen(2), Deleted: 2}}},
 	})
-	if _, err := s.MergeFloor(ctx, path, []string{"Bad Name"}); !errors.Is(err, ErrInvalidName) {
+	if _, err := s.MergeFloor(ctx, MergeOptions{Keep: []string{"Bad Name"}}); !errors.Is(err, ErrInvalidName) {
 		t.Fatalf("MergeFloor with an invalid keep name: %v, want ErrInvalidName", err)
 	}
-	r, err := s.MergeFloor(ctx, path, []string{"a"})
+	r, err := s.MergeFloor(ctx, MergeOptions{Keep: []string{"a"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,32 +291,14 @@ func TestFloorMergeRetiresAsideLive(t *testing.T) {
 	}
 }
 
-// TestFloorMergeRefusesUntrustedPlace (U192): the moved-aside file and the
-// directory holding it are judged as the floor and the data root are: a
-// parent directory group- or other-writable, a file another uid owns (the
-// floorUID seam stands in for root) and a mode-0666 file are each refused,
-// and the live floor is left as it was.
+// TestFloorMergeRefusesUntrustedPlace (U192): the guard file and the data
+// root holding it are judged as the floor and the data root are: a data
+// root group- or other-writable, a file another uid owns (the floorUID seam
+// stands in for root) and a mode-0666 file are each refused, and the live
+// floor is left as it was.
 func TestFloorMergeRefusesUntrustedPlace(t *testing.T) {
 	ctx := context.Background()
 	aside := floor{"k": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}}
-	plant := func(t *testing.T, dirMode, fileMode os.FileMode) string {
-		t.Helper()
-		b, err := marshalFloor(aside)
-		if err != nil {
-			t.Fatal(err)
-		}
-		dir := t.TempDir()
-		p := filepath.Join(dir, "keystore-floor.json.pre-restore")
-		if err := os.WriteFile(p, b, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		for path, mode := range map[string]os.FileMode{p: fileMode, dir: dirMode} {
-			if err := os.Chmod(path, mode); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return p
-	}
 	for _, tc := range []struct {
 		name              string
 		dirMode, fileMode os.FileMode
@@ -324,17 +306,28 @@ func TestFloorMergeRefusesUntrustedPlace(t *testing.T) {
 		want              string
 	}{
 		{"a trusted place is merged", 0o755, 0o644, false, ""},
-		{"a group-writable parent", 0o775, 0o644, false, "the directory holding the floor file to merge"},
-		{"an other-writable parent", 0o757, 0o644, false, "the directory holding the floor file to merge"},
+		{"a group-writable data root", 0o775, 0o644, false, "group- or other-writable"},
+		{"an other-writable data root", 0o757, 0o644, false, "group- or other-writable"},
 		{"a file another uid owns", 0o755, 0o644, true, "owned by uid"},
-		{"a mode-0666 file", 0o755, 0o666, false, "the floor file to merge: mode 0666"},
+		{"a mode-0666 file", 0o755, 0o666, false, "keystore-floor.json.pre-restore: mode 0666"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, server := newTestStore(t)
 			putFloorFile(t, server, floor{"live": {Generation: mgen(9), Seq: 1}})
-			path := plant(t, tc.dirMode, tc.fileMode)
+			path := writeAsideFloor(t, server, aside)
+			dataRoot := filepath.Dir(floorPath(server))
+			fi, err := os.Stat(dataRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dataRoot, fi.Mode().Perm()) })
+			for p, mode := range map[string]os.FileMode{path: tc.fileMode, dataRoot: tc.dirMode} {
+				if err := os.Chmod(p, mode); err != nil {
+					t.Fatal(err)
+				}
+			}
 			before, err := os.ReadFile(floorPath(server))
-			if err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err != nil {
 				t.Fatal(err)
 			}
 			if tc.otherOwner {
@@ -346,7 +339,7 @@ func TestFloorMergeRefusesUntrustedPlace(t *testing.T) {
 					s.floorUID++
 				}
 			}
-			_, err = s.MergeFloor(ctx, path, nil)
+			_, err = s.MergeFloor(ctx, MergeOptions{})
 			if tc.want == "" {
 				if err != nil {
 					t.Fatalf("MergeFloor from a trusted place: %v", err)
@@ -383,7 +376,7 @@ func TestMergeFloorRefusesDroppingItsOwnBurials(t *testing.T) {
 	// The moved-aside floor parses under the tombstone budget, but its
 	// live generations, each retired by the merge, take the burials over it.
 	setFloorLimits(t, smallFloorSize, 1000)
-	r, err := s.MergeFloor(ctx, path, nil)
+	r, err := s.MergeFloor(ctx, MergeOptions{})
 	if !errors.Is(err, errFloorFull) || Committed(err) {
 		t.Fatalf("MergeFloor dropping its own burials = %+v, %v; want errFloorFull, not committed", r, err)
 	}

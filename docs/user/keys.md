@@ -346,16 +346,17 @@ before the merge delivers no keys to the cluster: it logs an error and tries aga
 merge has run. Merge those deletions into the restored floor:
 
 ```
-sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore
+sudo k3sm keys floor merge
 ```
 
 Once the merge is written, it renames the file to `keystore-floor.json.merged-<time>`, the time in
 seconds since 1970, and the other verbs work again. If it prints its report and exits 4 saying the
 file was not renamed, the merge is written: run the same command again. The second run writes
-nothing more, prints `already merged` and renames the file. The merge refuses, and changes nothing, if the restored `keystore-floor.json` is not in place yet
-(put it back with `install` first), or if the file you name is the restored floor rather than the
-one you moved aside: one whose newest deletion is older than the restored floor's, or the live floor
-itself.
+nothing more, prints `already merged` and renames the file. The merge takes no file name: it reads only `/var/lib/k3sm/keystore-floor.json.pre-restore`,
+the floor the steps above moved aside, so it never reads the floor saved with the backup or any
+other copy. It refuses, and changes nothing, if that file is missing, if the restored
+`keystore-floor.json` is not in place yet (put it back with `install` first), or if the file is
+the live floor itself.
 
 The merge keeps every key revoked since the backup refused: a key created after the backup, every
 older version of a name deleted more than once, and an entry the backup holds that you deleted
@@ -364,7 +365,7 @@ the backup may have revoked the key. To bring back an entry you deleted by mista
 reason to restore, name it with `--keep`, once for each entry:
 
 ```
-sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore --keep system/<name>
+sudo k3sm keys floor merge --keep system/<name>
 ```
 
 Decide before you run the merge: once it has deleted an entry again, running it once more with

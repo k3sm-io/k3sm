@@ -49,7 +49,7 @@ func TestPendingMergeDeleteMakesRoom(t *testing.T) {
 	for i := range gone {
 		aside[fmt.Sprintf("gone-%02d", i)] = floorEntry{Generation: mgen(100 + i), Seq: 1}
 	}
-	path := writeAsideFloor(t, server, aside)
+	writeAsideFloor(t, server, aside)
 	probe := maps.Clone(restored)
 	probe.merge(aside, nil, nil)
 	b, err := marshalFloor(probe)
@@ -60,7 +60,7 @@ func TestPendingMergeDeleteMakesRoom(t *testing.T) {
 	// burials it adds, and there are no others to drop.
 	size := len(b) - 200
 	setFloorLimits(t, size, size)
-	_, err = s.MergeFloor(ctx, path, nil)
+	_, err = s.MergeFloor(ctx, MergeOptions{})
 	if !errors.Is(err, errFloorFull) || !strings.Contains(err.Error(), "sudo k3sm keys rm system/<name> --yes") || !strings.Contains(err.Error(), "run the merge again") {
 		t.Fatalf("MergeFloor over a full floor: %v, want errFloorFull naming keys rm and running the merge again", err)
 	}
@@ -72,7 +72,7 @@ func TestPendingMergeDeleteMakesRoom(t *testing.T) {
 	if fl := floorOf(t, server); fl.lastDeleted() <= aside.lastDeleted() {
 		t.Fatalf("the live floor's newest deletion is %d, want it above the moved-aside floor's %d", fl.lastDeleted(), aside.lastDeleted())
 	}
-	if _, err := s.MergeFloor(ctx, path, nil); err != nil {
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
 		t.Fatalf("MergeFloor after the deletes: %v", err)
 	}
 	if err := s.MergePending(); err != nil {
@@ -101,11 +101,11 @@ func TestPendingMergeDeleteBurialSurvivesMerge(t *testing.T) {
 	giveToService(t, old, filepath.Join(old, generationName), filepath.Join(old, "v1"), filepath.Join(old, currentName))
 	aside := floorOf(t, server)
 	aside["gone"] = floorEntry{Buried: []burial{{Generation: mgen(1), Deleted: 1}}}
-	path := writeAsideFloor(t, server, aside)
+	writeAsideFloor(t, server, aside)
 	if err := s.Delete(ctx, "k"); err != nil {
 		t.Fatalf("Delete with a merge pending: %v, want nil", err)
 	}
-	if _, err := s.MergeFloor(ctx, path, nil); err != nil {
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
 		t.Fatalf("MergeFloor after the delete: %v", err)
 	}
 	if fl := floorOf(t, server); !fl["k"].buries(gen) || fl["k"].live() {

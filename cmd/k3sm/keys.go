@@ -73,15 +73,15 @@ const keysUsage = `Usage:
         --key-in FILE only finishes an interrupted rewrap, with the key its
         --key-out saved: the recorded master.next.sha256, or a key some
         record already opens under; any other key is refused
-  sudo k3sm keys floor merge FLOOR [--keep system/<name>]...
+  sudo k3sm keys floor merge [--keep system/<name>]...
         after a restore, before k3sm start: merge every deleted generation
-        the floor FILE you moved aside records (keystore-floor.json.pre-restore)
-        into the restored floor, so keys revoked since the backup stay
+        the floor you moved aside to keystore-floor.json.pre-restore in the
+        data root records (the only file it reads) into the restored floor, so keys revoked since the backup stay
         refused. A restored entry deleted since the backup is deleted again
         (buried live); --keep, repeatable, keeps that entry's restored
         version live instead, for an entry you are restoring on purpose.
-        Until it runs, put, rotate, rm and rewrap refuse; once written,
-        FLOOR is renamed to keystore-floor.json.merged-<unix>
+        Until it runs, put, rotate and rewrap refuse; once written, the
+        file is renamed to keystore-floor.json.merged-<unix>
   sudo k3sm keys deliver system/<name> --namespace NS [--secret S] [--data-key K]
         declare that the server delivers the entry's current version as an
         Opaque Secret S (default: <name>) in NS, under data key K
@@ -154,7 +154,7 @@ type keysStore interface {
 	InterruptedRewrap(ctx context.Context) (fingerprint [sha256.Size]byte, ok bool, err error)
 	RecordsSealedUnder(ctx context.Context, key []byte) (bool, error)
 	UserScopesExist(ctx context.Context) (bool, error)
-	MergeFloor(ctx context.Context, path string, keep []string) (keystore.MergeReport, error)
+	MergeFloor(ctx context.Context, opts keystore.MergeOptions) (keystore.MergeReport, error)
 	MergePending() error
 }
 
@@ -973,9 +973,9 @@ func (k *keepFlag) Set(q string) error {
 	return nil
 }
 
-// keysFloor is "k3sm keys floor merge FLOOR [--keep system/<name>]...": it
-// merges the deleted generations the moved-aside floor file FLOOR records
-// into the live floor a restore put back (keystore.FileStore.MergeFloor),
+// keysFloor is "k3sm keys floor merge [--keep system/<name>]...": it
+// merges the deleted generations the data root's moved-aside floor,
+// keystore-floor.json.pre-restore, records into the live floor a restore put back (keystore.FileStore.MergeFloor),
 // keeping live the restored generation of each entry --keep names, and
 // prints a summary:
 //
@@ -997,7 +997,7 @@ func (k *keepFlag) Set(q string) error {
 // or its input could not be renamed (keystore.Committed).
 func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if len(args) == 0 || args[0] != "merge" {
-		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge FLOOR [--keep system/<name>]...")
+		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge [--keep system/<name>]...")
 		return keysBadUsage
 	}
 	v := newKeysVerb("floor merge", env)
@@ -1007,14 +1007,9 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return keysBadUsage
 	}
-	if len(pos) != 1 {
-		return v.failf(keysBadUsage, "want one argument: the floor file moved aside before the restore")
+	if len(pos) != 0 {
+		return v.failf(keysBadUsage, "takes no file: it reads only keystore-floor.json.pre-restore in the data root, the floor the restore recipe moves aside")
 	}
-	path := pos[0]
-	if !filepath.IsAbs(path) {
-		return v.failf(keysBadUsage, "the floor file must be an absolute path")
-	}
-	path = filepath.Clean(path)
 	if code := v.requireRoot(); code != keysOK {
 		return code
 	}
@@ -1022,7 +1017,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	r, err := s.MergeFloor(ctx, path, keep)
+	r, err := s.MergeFloor(ctx, keystore.MergeOptions{Keep: keep})
 	if err != nil && !keystore.Committed(err) {
 		return v.failf(keysRefused, "%v", err)
 	}

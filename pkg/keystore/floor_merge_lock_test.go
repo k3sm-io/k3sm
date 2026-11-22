@@ -60,9 +60,9 @@ func TestMergeFloorIgnoresEntryLock(t *testing.T) {
 			s, server := newTestStore(t)
 			mustPut(t, s, "k", KindOpaque, []byte("one"))
 			s.lockWait = 200 * time.Millisecond
-			path := writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
+			writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
 			tc.plant(t, filepath.Join(server, "keystore", lockName))
-			r, err := s.MergeFloor(ctx, path, nil)
+			r, err := s.MergeFloor(ctx, MergeOptions{})
 			if err != nil || r.Merged != 1 {
 				t.Fatalf("MergeFloor under a %s .lock = %+v, %v; want 1 merged", tc.name, r, err)
 			}
@@ -75,9 +75,8 @@ func TestMergeFloorIgnoresEntryLock(t *testing.T) {
 
 // TestMergeFloorRefusesWrongInput (U192): the merge refuses, writing
 // nothing, onto an absent live floor (the saved floor was never put back),
-// from a file whose highest delete sequence is below the live floor's (the
-// restored floor, not the one moved aside) and from a file equal to the
-// live floor.
+// from a guard file that is the live floor's own inode (a hard link) and
+// from a guard file equal to the live floor.
 func TestMergeFloorRefusesWrongInput(t *testing.T) {
 	ctx := context.Background()
 	aside := floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 3}}}}
@@ -87,8 +86,8 @@ func TestMergeFloorRefusesWrongInput(t *testing.T) {
 		want string
 	}{
 		{"an absent live floor", nil, "restore the saved keystore-floor.json first"},
-		{"an older input", floor{"x": {Buried: []burial{{Generation: mgen(2), Deleted: 7}}}}, "older than the live floor's"},
-		{"the live floor itself", aside, "the live floor itself"},
+		{"the live floor's own inode", floor{"x": {Buried: []burial{{Generation: mgen(2), Deleted: 7}}}}, "is the live floor itself"},
+		{"the live floor itself", aside, "the live floor itself, byte for byte"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, server := newTestStore(t)
@@ -96,12 +95,15 @@ func TestMergeFloorRefusesWrongInput(t *testing.T) {
 				putFloorFile(t, server, tc.live)
 			}
 			path := writeAsideFloor(t, server, aside)
-			if tc.name == "the live floor itself" {
-				// Named by its own path: refused outright, never renamed.
-				path = floorPath(server)
+			if tc.name == "the live floor's own inode" {
+				// A hard link: refused outright, never renamed.
+				remove(t, path)
+				if err := os.Link(floorPath(server), path); err != nil {
+					t.Fatal(err)
+				}
 			}
 			before, _ := os.ReadFile(floorPath(server))
-			_, err := s.MergeFloor(ctx, path, nil)
+			_, err := s.MergeFloor(ctx, MergeOptions{})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("MergeFloor: %v, want a refusal saying %q", err, tc.want)
 			}
@@ -152,7 +154,7 @@ func TestPendingMergeGuard(t *testing.T) {
 	mustCurrent(t, s, "k", "one")
 	at := time.Unix(1795370000, 0)
 	s.now = func() time.Time { return at }
-	if _, err := s.MergeFloor(ctx, path, nil); err != nil {
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
@@ -247,7 +249,7 @@ func TestMergeFloorRefusesUnmatchedKeep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeFloor(ctx, path, []string{"a", "typo"}); err == nil || !strings.Contains(err.Error(), "typo") {
+	if _, err := s.MergeFloor(ctx, MergeOptions{Keep: []string{"a", "typo"}}); err == nil || !strings.Contains(err.Error(), "typo") {
 		t.Fatalf("MergeFloor keeping an unmatched name: %v, want a refusal naming it", err)
 	}
 	if after, _ := os.ReadFile(floorPath(server)); string(after) != string(before) {
@@ -276,7 +278,7 @@ func TestMergeFloorCommittedRerun(t *testing.T) {
 	if err := os.WriteFile(taken, []byte("earlier\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r, err := s.MergeFloor(ctx, path, nil)
+	r, err := s.MergeFloor(ctx, MergeOptions{})
 	if !Committed(err) || r.Merged != 1 {
 		t.Fatalf("MergeFloor with the merged name taken = %+v, %v; want the report, committed", r, err)
 	}
@@ -291,7 +293,7 @@ func TestMergeFloorCommittedRerun(t *testing.T) {
 		t.Fatal(err)
 	}
 	at = at.Add(time.Second)
-	r, err = s.MergeFloor(ctx, path, nil)
+	r, err = s.MergeFloor(ctx, MergeOptions{})
 	if err != nil || !r.AlreadyMerged || r.Merged != 0 || r.AlreadyPresent != 1 {
 		t.Fatalf("the rerun = %+v, %v; want it already merged", r, err)
 	}
@@ -307,9 +309,9 @@ func TestMergeFloorCommittedRerun(t *testing.T) {
 		if err := s.Delete(ctx, "n"); err != nil {
 			t.Fatal(err)
 		}
-		path := writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
+		writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
 		at = at.Add(time.Second)
-		r, err := s.MergeFloor(ctx, path, nil)
+		r, err := s.MergeFloor(ctx, MergeOptions{})
 		if err != nil || !r.AlreadyMerged {
 			t.Fatalf("the rerun after a Delete = %+v, %v; want it already merged", r, err)
 		}
