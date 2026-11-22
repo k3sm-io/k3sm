@@ -114,7 +114,9 @@ func TestTypedIssuedAtStampedAndSealed(t *testing.T) {
 		t.Fatalf("rotated token issuedAt %v, want %v", c.IssuedAt, later)
 	}
 	read, _ := mustCredential(t, s, "pair")
-	if _, err := s.RotateIf(context.Background(), "pair", KindOAuth, read, oauthEnvelope("a2", "r2")); err != nil {
+	o2 := oauthEnvelope("a2", "r2")
+	o2.Credential.AccessExpiresAt = later.Add(time.Hour) // an access token sealed already expired is refused
+	if _, err := s.RotateIf(context.Background(), "pair", KindOAuth, read, o2); err != nil {
 		t.Fatal(err)
 	}
 	if _, c := mustCredential(t, s, "pair"); !c.AccessIssuedAt.Equal(later) {

@@ -317,7 +317,29 @@ func Encode(kind credential.Kind, e Envelope) ([]byte, error) {
 	if len(b) > MaxEnvelopeSize {
 		return nil, fmt.Errorf("%w: the envelope is %d bytes, over %d", ErrInvalidCredential, len(b), MaxEnvelopeSize)
 	}
+	if err := checkExpiryOrder(kind, &e); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidCredential, err)
+	}
 	return b, nil
+}
+
+// checkExpiryOrder refuses a token whose expiresAt is not after its
+// issuedAt, and an oauth pair whose accessExpiresAt is not after its
+// accessIssuedAt, compared as the envelope holds them: in whole seconds.
+// Encode and Decode both apply it, so they accept the same envelopes.
+func checkExpiryOrder(kind credential.Kind, e *Envelope) error {
+	c := &e.Credential
+	switch kind {
+	case credential.KindToken:
+		if c.ExpiresAt.Unix() <= c.IssuedAt.Unix() {
+			return errors.New("expiresAt is not after issuedAt")
+		}
+	case credential.KindOAuth:
+		if c.AccessExpiresAt.Unix() <= c.AccessIssuedAt.Unix() {
+			return errors.New("accessExpiresAt is not after accessIssuedAt")
+		}
+	}
+	return nil
 }
 
 // decodeRefused is called with the partly decoded envelope of a refused
@@ -393,6 +415,9 @@ func Decode(kind credential.Kind, b []byte) (Envelope, error) {
 		if !fs[next].optional {
 			return refuse(fmt.Errorf("%w: kind %s is missing %s", ErrCorrupt, kind, fs[next].name))
 		}
+	}
+	if err := checkExpiryOrder(kind, &e); err != nil {
+		return refuse(fmt.Errorf("%w: %w", ErrCorrupt, err))
 	}
 	return e, nil
 }

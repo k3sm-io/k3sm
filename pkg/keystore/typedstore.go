@@ -330,12 +330,18 @@ func (s *FileStore) envelope(kind Kind, e typed.Envelope) ([]byte, error) {
 		// A token that expires at or before the time the store takes it is
 		// refused: it would be sealed already expired. An expiry the
 		// envelope lacks is refused by Encode, which names the field.
-		if !e.Credential.ExpiresAt.IsZero() && !e.Credential.ExpiresAt.After(now) {
+		// Compared in whole seconds, as the envelope seals both: an
+		// expiry within the issue second is sealed equal to it.
+		if exp := e.Credential.ExpiresAt; !exp.IsZero() && exp.Unix() <= now.Unix() {
 			return nil, fmt.Errorf("%w: the token expires at %s, not after its issue time %s", typed.ErrInvalidCredential,
-				e.Credential.ExpiresAt.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
+				exp.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
 		}
 	case KindOAuth:
 		e.Credential.AccessIssuedAt = now
+		if exp := e.Credential.AccessExpiresAt; !exp.IsZero() && exp.Unix() <= now.Unix() {
+			return nil, fmt.Errorf("%w: the access token expires at %s, not after its issue time %s", typed.ErrInvalidCredential,
+				exp.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
+		}
 	}
 	return typed.Encode(ck, e)
 }
