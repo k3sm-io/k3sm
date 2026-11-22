@@ -888,7 +888,7 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 		return nil
 	}
 	if !revoke {
-		return fmt.Errorf("%w (%s is past its hard cap)", ErrLogFull, l.name)
+		return l.pastCap()
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -941,13 +941,20 @@ func (l *appendLog) addKeyRoom(state *logState, uid uint32, n int, revoke bool) 
 	return nil
 }
 
+// pastCap is the one ErrLogFull text for a log past its hard cap and for
+// one at the reader's bound, so a caller cannot tell which it met, nor so
+// how far other uids' lines took the log.
+func (l *appendLog) pastCap() error {
+	return fmt.Errorf("%w (%s is past its hard cap)", ErrLogFull, l.name)
+}
+
 // revokeRoom refuses, as ErrLogFull, n more bytes for uid past the hard
 // cap: when they would take the log past logReadBound, or uid's lines that
 // start past the hard cap past its revocation budget. room and appendLine
 // both judge through it.
 func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64) error {
 	if size+n > l.s.logReadBound() {
-		return fmt.Errorf("%w (%s is at the reader's bound)", ErrLogFull, l.name)
+		return l.pastCap()
 	}
 	if state.pastCap[uid]+n > l.s.logRevokeBudget {
 		return fmt.Errorf("%w (the caller's revocation budget in %s is spent)", ErrLogFull, l.name)
@@ -1024,7 +1031,7 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 	}
 	if bound := l.s.logReadBound(); st.Size+int64(len(out)) > bound {
 		// Never make the damage the reader refuses.
-		return fmt.Errorf("%w (%s is at the reader's bound)", ErrLogFull, l.name)
+		return l.pastCap()
 	}
 	var state *logState
 	read := func() error {
@@ -1043,7 +1050,7 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 	}
 	if charge > 0 {
 		if !budget || uid == 0 {
-			return fmt.Errorf("%w (%s is past its hard cap)", ErrLogFull, l.name)
+			return l.pastCap()
 		}
 		if err := read(); err != nil {
 			return err
@@ -1575,12 +1582,12 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 	size := st.Size
 	for _, line := range lines {
 		if size >= s.logHardCap {
-			return fmt.Errorf("%w (%s would be past its hard cap before the put's last floor line)", ErrLogFull, l.name)
+			return l.pastCap()
 		}
 		size += int64(len(line))
 	}
 	if size > s.logReadBound() {
-		return fmt.Errorf("%w (%s would pass the reader's bound)", ErrLogFull, l.name)
+		return l.pastCap()
 	}
 	n := len(lines)
 	if newKeys != nil {

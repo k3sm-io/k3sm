@@ -148,3 +148,20 @@ func TestLogDataRootOpenNamesNoPath(t *testing.T) {
 		t.Fatalf("open of a missing data root: %v, want an error naming no path", err)
 	}
 }
+
+// A log past its hard cap and one at the reader's bound refuse with one
+// text, so a caller cannot tell which it met.
+func TestLogFullCapAndBoundReadTheSame(t *testing.T) {
+	s, _, _ := fileLogScope(t)
+	l := s.userFloor.(*fileFloorLog).log
+	s.logSoftCap, s.logHardCap = 1, 1
+	pastCap := l.room(1001, false)
+	state := &logState{pastCap: map[uint32]int64{}}
+	atBound := l.revokeRoom(state, s.logReadBound(), 1001, 1)
+	if !errors.Is(pastCap, ErrLogFull) || !errors.Is(atBound, ErrLogFull) {
+		t.Fatalf("the refusals: %v, %v, want ErrLogFull", pastCap, atBound)
+	}
+	if pastCap.Error() != atBound.Error() {
+		t.Fatalf("the hard-cap and reader's-bound refusals differ:\n%v\n%v", pastCap, atBound)
+	}
+}
