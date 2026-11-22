@@ -328,7 +328,13 @@ func TestFloorMergeRefusesUntrustedPlace(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.otherOwner {
-				s.floorUID++
+				// As root the config pins floorUID to 0, so hand the file to
+				// the service user; non-root, move the expected owner instead.
+				if asRoot() {
+					giveToService(t, path)
+				} else {
+					s.floorUID++
+				}
 			}
 			_, err = s.MergeFloor(ctx, path, nil)
 			if tc.want == "" {
