@@ -1079,6 +1079,11 @@ and the matching master, stop the server, `rm /var/lib/k3sm/keystore-floor.json`
 then run any root verb (`sudo k3sm keys list`), which rebuilds the floor from the restored
 pointers.
 
+**Restoring an entry deleted by mistake is the same act.** Its tombstone refuses the restored
+directory, which is the tombstone working ("A deleted entry put back is refused"). The restore of
+the same backup therefore puts back the `keystore-floor.json` saved with it, which records the
+entry live, or removes the floor as above; restoring `keystore/` alone leaves the entry refused.
+
 Amended by the user scope's append-only files: the matched set also includes `keystore/.user/`,
 `keystore-user-floor.log` and `keystore-audit.log`. The append-only flag does not survive
 `cp`, rsync or Time Machine, so every restore ends with `sudo k3sm keys floor --rebuild`, and
