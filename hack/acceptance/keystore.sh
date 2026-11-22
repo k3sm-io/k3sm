@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U137 (U15, U39 and U117 are unused),
-# the typed-credential rows U138 to U191, and the rig legs E1 to E36. Every row
+# rows G1 to G23, the user-scope rows U1 to U137 (U15, U39 and U117 are unused),
+# the typed-credential rows U138 to U191, the floor's tombstone row U192, and
+# the rig legs E1 to E36. Every row
 # is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -159,7 +160,8 @@ EXPECTED_ROWS="$EXPECTED_ROWS U150 U151 U152 U153 U154 U155 U156 U157 U158 U159 
 EXPECTED_ROWS="$EXPECTED_ROWS U162 U163 U164 U165 U166 U167 U168 U169 U170 U171 U172 U173"
 EXPECTED_ROWS="$EXPECTED_ROWS U174 U175 U176 U177 U178 U179 U180 U181 U182 U183 U184 U185"
 EXPECTED_ROWS="$EXPECTED_ROWS U186 U187 U188 U189 U190 U191"
-# >>> ADD NEW U ROWS (U192 upward) HERE <<<
+EXPECTED_ROWS="$EXPECTED_ROWS U192"
+# >>> ADD NEW U ROWS (U193 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25 E26 E27"
 EXPECTED_ROWS="$EXPECTED_ROWS E28 E29 E30 E31 E32 E33 E34 E35 E36"
@@ -505,6 +507,8 @@ check G20 "the reconciler only gets, creates and updates the Opaque Secrets it c
 check G21 "the rollback recipe is a byte-exact round trip: show --reveal into rotate --in -, the new version compared with version N byte for byte (bytes.Equal, as cmp), opaque and Ed25519" \
 	k3sm/cmd/k3sm::TestKeysRollbackRoundTrip
 special g22 G22
+check G23 "a deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by rm, which keeps the tombstone" \
+	TestTombstoneRefusesPutBack
 
 pend U1 "rotate --from-version N writes version N's bytes as a new version server side; no value leaves the store (keys verbs)" \
 	k3sm/cmd/k3sm::TestKeysRotateFromVersionNoValueOut
@@ -890,7 +894,9 @@ pend U190 "the refresher doctor rows; every state change logs at Warn or Error u
 	k3sm/cmd/k3sm::TestDoctorRefresherRows k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn
 pend U191 "examples/keydelivery-github.yaml validates against the apis CRD schema; limitations.md lists the typed-credential residuals (the typed-credential docs)" \
 	k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD TestLimitationsListTypedResiduals
-# >>> ADD NEW U ROWS (U192 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
+check U192 "the floor's tombstone: a completed Delete replaces the name's floor entry with a tombstone of the deleted generation and a delete sequence, without the master too; a later Put clears it; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry; a floor with no tombstones field parses, and a tombstone is parsed as strictly as an entry (the floor's tombstone)" \
+	TestTombstoneClearedByPut TestDeleteWithoutMasterTombstones TestTombstonePrune TestTombstoneNeverRefusesPut TestParseFloorTombstones FuzzParseFloor
+# >>> ADD NEW U ROWS (U193 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
 leg E2 "socket-ops" "the user, no sudo, puts user/<me>/e2e-token (short-name form): exit 0; the CLI prints the resolved user/<uid>; k3sm keys list shows it; the audit log has a put line with no value" "the socket operations"
