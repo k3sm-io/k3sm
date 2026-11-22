@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -145,8 +146,9 @@ func checkFloorEntry(t *testing.T, name string, e floorEntry) {
 	}
 }
 
-// TestFloorOpsProperty drives random sequences of set, raise, bury and
-// prune, each followed by the prune every floor write makes, and checks
+// TestFloorOpsProperty drives random sequences of set, raise, bury, prune
+// and a lift of every delete sequence to end at maxDeleteSeq (so the next
+// bury renumbers), each followed by the prune every floor write makes, and checks
 // after every step: no record has sequence 0 without a burial; a buried
 // generation leaves only by a drop bury or prune reports; no burial appears
 // but by bury; and the floor encodes to bytes that parse back to it, within
@@ -184,7 +186,7 @@ func TestFloorOpsProperty(t *testing.T) {
 			gen := gens[rng.IntN(len(gens))]
 			var dropped []pruned
 			op := ""
-			switch rng.IntN(4) {
+			switch rng.IntN(5) {
 			case 0:
 				op = "set"
 				fl.set(name, gen)
@@ -205,6 +207,18 @@ func TestFloorOpsProperty(t *testing.T) {
 			case 3:
 				op = "prune"
 				dropped = fl.prune()
+			case 4:
+				// Lift every delete sequence, order kept, so the highest
+				// is maxDeleteSeq and the next bury renumbers.
+				op = "lift"
+				if last := fl.lastDeleted(); last > 0 {
+					for n, e := range fl {
+						for i := range e.burials() {
+							e.Buried[i].Deleted += maxDeleteSeq - last
+						}
+						fl[n] = e
+					}
+				}
 			}
 			more := fl.prune()
 			prunes += len(more)
@@ -266,26 +280,37 @@ func TestDeleteSequenceNeverWraps(t *testing.T) {
 	var a floorEntry
 	a.Buried[0] = burial{Generation: g(1), Deleted: maxDeleteSeq - 5}
 	a.Buried[1] = burial{Generation: g(2), Deleted: maxDeleteSeq}
-	fl := floor{"a": a, "b": {Generation: g(3), Seq: 2}}
+	// b, the name buried, already holds burials of its own, which the
+	// renumber moves too.
+	b := floorEntry{Generation: g(3), Seq: 2}
+	b.Buried[0] = burial{Generation: g(5), Deleted: maxDeleteSeq - 7}
+	b.Buried[1] = burial{Generation: g(6), Deleted: maxDeleteSeq - 2}
+	fl := floor{"a": a, "b": b}
 	fl["c"] = floorEntry{Buried: [maxBuriedPerName]burial{{Generation: g(4), Deleted: maxDeleteSeq - 1}}}
 	if got, _ := fl.bury("b", nil); got != g(3) {
 		t.Fatalf("bury b buried %q", got)
 	}
-	if bs := fl["a"].burials(); bs[0].Deleted != 1 || bs[1].Deleted != 3 {
-		t.Fatalf("a after the renumber = %+v, want 1 and 3", bs)
+	// In delete order: b g5, a g1, b g6, c g4, a g2, then the new b g3.
+	if bs := fl["a"].burials(); bs[0].Deleted != 2 || bs[1].Deleted != 5 {
+		t.Fatalf("a after the renumber = %+v, want 2 and 5", bs)
 	}
-	if bs := fl["c"].burials(); bs[0].Deleted != 2 {
-		t.Fatalf("c after the renumber = %+v, want 2", bs)
+	if bs := fl["c"].burials(); bs[0].Deleted != 4 {
+		t.Fatalf("c after the renumber = %+v, want 4", bs)
 	}
-	if bs := fl["b"].burials(); len(bs) != 1 || bs[0].Deleted != 4 || fl["b"].live() {
-		t.Fatalf("b after the bury = %+v, want buried at 4", fl["b"])
+	wantB := []burial{{Generation: g(5), Deleted: 1}, {Generation: g(6), Deleted: 3}, {Generation: g(3), Deleted: 6}}
+	if bs := fl["b"].burials(); !slices.Equal(bs, wantB) || fl["b"].live() {
+		t.Fatalf("b after the bury = %+v, want %+v and no live record", fl["b"], wantB)
 	}
-	b, err := marshalFloor(fl)
+	enc, err := marshalFloor(fl)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := parseFloor(b); err != nil {
+	back, err := parseFloor(enc)
+	if err != nil {
 		t.Fatalf("the renumbered floor does not parse: %v", err)
+	}
+	if !maps.Equal(back, fl) {
+		t.Fatalf("the renumbered floor reads back as %+v, want %+v", back, fl)
 	}
 	// One below the cap: the new burial takes maxDeleteSeq itself.
 	fl = floor{"a": {Buried: [maxBuriedPerName]burial{{Generation: g(1), Deleted: maxDeleteSeq - 1}}}, "b": {Generation: g(3), Seq: 1}}

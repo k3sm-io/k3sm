@@ -538,6 +538,9 @@ func (fl floor) bury(name string, dirGen *[generationSize]byte) (string, []prune
 	last := fl.lastDeleted()
 	if last >= maxDeleteSeq {
 		last = fl.renumber()
+		// renumber rewrote the name's own burials in fl: f, copied before
+		// it, holds the old sequences.
+		f = fl[name]
 	}
 	f.Generation, f.Seq = "", 0
 	var out []pruned
