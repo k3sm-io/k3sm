@@ -58,12 +58,25 @@ func (v *keysVerb) deliveryPath() (string, error) {
 	return filepath.Join(executor.RuntimeRoot(work), keydeliver.FileName), nil
 }
 
+// lockDeclaration takes the writers' lock beside the declaration at path,
+// so a concurrent deliver or undeliver cannot lose this one's change.
+func (v *keysVerb) lockDeclaration(ctx context.Context, path string) (func(), error) {
+	unlock, err := keydeliver.Lock(ctx, filepath.Join(filepath.Dir(path), keydeliver.LockName), v.env.deliveryCheck, v.env.deliveryLockBusy)
+	if err != nil {
+		return nil, fmt.Errorf("the delivery declaration's lock (<data-root>/%s): %w", keydeliver.LockName, err)
+	}
+	return unlock, nil
+}
+
 // readDeclaration reads the declaration at path as the reconciler does, so a
 // file the server would refuse is refused here too rather than rewritten.
 func (v *keysVerb) readDeclaration(path string) (keydeliver.Declaration, error) {
 	d, _, _, err := keydeliver.Read(path, keydeliver.OpenNoFollow, v.env.deliveryCheck)
 	if err != nil {
 		return keydeliver.Declaration{}, fmt.Errorf("the delivery declaration (<data-root>/%s): %w", keydeliver.FileName, err)
+	}
+	if v.env.deliveryRead != nil {
+		v.env.deliveryRead()
 	}
 	return d, nil
 }
@@ -104,6 +117,11 @@ func keysDeliver(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysBadUsage, "%v", err)
 	}
+	unlock, err := v.lockDeclaration(ctx, path)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	defer unlock()
 	d, err := v.readDeclaration(path)
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
@@ -126,7 +144,7 @@ func keysDeliver(ctx context.Context, args []string, env keysEnv) int {
 	return keysOK
 }
 
-func keysUndeliver(_ context.Context, args []string, env keysEnv) int {
+func keysUndeliver(ctx context.Context, args []string, env keysEnv) int {
 	v := newKeysVerb("undeliver", env)
 	ns := v.fs.String("namespace", "", "the namespace the delivery is withdrawn from (required)")
 	pos, err := v.parse(args)
@@ -147,6 +165,11 @@ func keysUndeliver(_ context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysBadUsage, "%v", err)
 	}
+	unlock, err := v.lockDeclaration(ctx, path)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	defer unlock()
 	d, err := v.readDeclaration(path)
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)

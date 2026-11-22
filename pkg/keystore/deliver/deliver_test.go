@@ -726,3 +726,76 @@ func TestReconcilerReappliesChangedDataKey(t *testing.T) {
 	}
 	h.assertOnlyGetCreateUpdateSecrets(t)
 }
+
+// TestLockRefusesUntrustedFile: the writers' lock is refused when it is a
+// symlink, not a regular file, or shared-writable, judged on its descriptor.
+func TestLockRefusesUntrustedFile(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		{"symlink", func(t *testing.T, path string) {
+			target := filepath.Join(filepath.Dir(path), "elsewhere")
+			if err := os.WriteFile(target, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"directory", func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"group-writable", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, 0o620); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), LockName)
+			tc.setup(t, path)
+			if unlock, err := Lock(context.Background(), path, testCheck, nil); !errors.Is(err, ErrRefused) {
+				if unlock != nil {
+					unlock()
+				}
+				t.Fatalf("Lock: %v, want ErrRefused", err)
+			}
+		})
+	}
+}
+
+// TestLockBoundedWait: a lock another writer holds is retried a bounded
+// number of times, then refused with ErrLockBusy; once released it is taken.
+func TestLockBoundedWait(t *testing.T) {
+	path := filepath.Join(t.TempDir(), LockName)
+	unlock, err := Lock(context.Background(), path, testCheck, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waits := 0
+	ready := make(chan time.Time)
+	close(ready)
+	busy := func() <-chan time.Time { waits++; return ready }
+	if _, err := Lock(context.Background(), path, testCheck, busy); !errors.Is(err, ErrLockBusy) {
+		t.Fatalf("second Lock while held: %v, want ErrLockBusy", err)
+	}
+	if waits != lockAttempts {
+		t.Fatalf("waited %d times, want %d", waits, lockAttempts)
+	}
+	unlock()
+	again, err := Lock(context.Background(), path, testCheck, busy)
+	if err != nil {
+		t.Fatalf("Lock after release: %v", err)
+	}
+	again()
+	fi, err := os.Lstat(path)
+	if err != nil || fi.Mode() != lockMode {
+		t.Fatalf("lock file mode %v (%v), want %v", fi.Mode(), err, lockMode)
+	}
+}

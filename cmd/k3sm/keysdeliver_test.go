@@ -17,15 +17,20 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
+	"context"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"k3sm.io/k3sm/pkg/addons"
+	"k3sm.io/k3sm/pkg/keystore"
 	keydeliver "k3sm.io/k3sm/pkg/keystore/deliver"
 )
 
@@ -199,4 +204,75 @@ func TestKeysDeliverRefusals(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestKeysDeliverWritersSerialize: two deliver runs at once both land. The
+// first is parked between its read and its write of the declaration; the
+// second is let go as soon as it either reads (no lock: it reads the stale
+// file, and one target is lost) or finds the lock held; once the first has
+// written, the second retries, reads both, and writes both (G19).
+func TestKeysDeliverWritersSerialize(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/api-token", []byte("tok"))
+	h.euid = 0
+	uid, gid := keysServiceIDs(t)
+	floorUID, floorGID := keysFloorIDs()
+	env := func(stdout, stderr *bytes.Buffer, read func(), busy func() <-chan time.Time) keysEnv {
+		return keysEnv{
+			euid:       func() int { return 0 },
+			serviceIDs: func() (uint32, uint32, error) { return uid, gid, nil },
+			open: func(cfg keystore.Config) keysStore {
+				cfg.FloorUID, cfg.FloorGID = floorUID, floorGID
+				return keystore.New(cfg)
+			},
+			stdin:            strings.NewReader(""),
+			stdinTTY:         func() bool { return false },
+			stdoutTTY:        func() bool { return false },
+			deliveryCheck:    keysTestDeliveryCheck,
+			deliveryChown:    func(*os.File) error { return nil },
+			encryptionOn:     func(string) bool { return true },
+			deliveryLockBusy: busy,
+			deliveryRead:     read,
+			stdout:           stdout,
+			stderr:           stderr,
+		}
+	}
+	var (
+		readA, goA, doneA = make(chan struct{}), make(chan struct{}), make(chan struct{})
+		bReady            = make(chan struct{})
+		aWritten          = make(chan time.Time) // closed with doneA, as a lock retry's wait
+		bOnce             sync.Once
+		codeA, codeB      int
+		outA, errA        bytes.Buffer
+		outB, errB        bytes.Buffer
+	)
+	signalB := func() { bOnce.Do(func() { close(bReady) }) }
+	envA := env(&outA, &errA, func() { close(readA); <-goA }, nil)
+	envB := env(&outB, &errB, signalB, func() <-chan time.Time { signalB(); return aWritten })
+	go func() {
+		defer close(doneA)
+		defer close(aWritten)
+		codeA = runKeysWith(context.Background(), []string{"deliver", "system/api-token", "--namespace", "payments", "--work-dir", h.work}, envA)
+	}()
+	<-readA
+	doneB := make(chan struct{})
+	go func() {
+		defer close(doneB)
+		codeB = runKeysWith(context.Background(), []string{"deliver", "system/api-token", "--namespace", "ops", "--work-dir", h.work}, envB)
+	}()
+	<-bReady
+	close(goA)
+	<-doneA
+	<-doneB
+	if codeA != keysOK || codeB != keysOK {
+		t.Fatalf("exit %d and %d\nA: %s\nB: %s", codeA, codeB, errA.String(), errB.String())
+	}
+	var got []string
+	for _, tg := range h.declaration().Targets {
+		got = append(got, tg.Namespace)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"ops", "payments"}) {
+		t.Fatalf("declared namespaces %v, want both writers' (ops, payments)", got)
+	}
 }

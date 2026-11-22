@@ -199,7 +199,8 @@ The declaration is `/var/lib/k3sm/keystore-delivery.json`, owned by root, mode 0
 Secret into, so the server refuses the whole file, and delivers nothing from it, if it is not
 owned by root, is writable by its group or by others, is a symlink, is over 64 KiB, or holds a
 field or a version it does not know. The refusal is in the server log, and the verbs refuse that
-file too rather than overwrite it.
+file too rather than overwrite it. Two `deliver` or `undeliver` runs at once take turns on the lock file
+`/var/lib/k3sm/.keystore-delivery.lock`, so neither loses the other's change.
 
 ### While secrets encryption is off
 

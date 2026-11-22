@@ -248,8 +248,9 @@ check G17 "show prints a value only with --reveal, byte-exact for an opaque valu
 check G18 "delivery is refused while encryption is off, before any apiserver call, logged once per target; the server's override flag allows it; a target delivered under the override stays when it is removed; deliver prints the refusal" \
 	deliver:TestDeliveryRefusedWhileEncryptionOff deliver:TestDeliveryOverrideAllowsPlaintext deliver:TestDeliveredTargetStaysWhenOverrideRemoved \
 	cmd:TestKeysDeliveryServerFlag cmd:TestKeysDeliveryServerConfig cmd:TestKeysDeliverEncryptionOffNote
-check G19 "the delivery declaration is root-owned and not group- or other-writable, opened O_NOFOLLOW and judged on the descriptor, size- and count-capped and parsed strictly; anything else is refused whole, by the reconciler and by the verbs" \
-	deliver:TestDeclarationRootOwned deliver:TestDeclarationOpenedWithNoFollow cmd:TestKeysDeliverRefusals
+check G19 "the delivery declaration is root-owned and not group- or other-writable, opened O_NOFOLLOW and judged on the descriptor, size- and count-capped and parsed strictly; anything else is refused whole, by the reconciler and by the verbs; the verbs serialize on a root-owned lock file judged the same way" \
+	deliver:TestDeclarationRootOwned deliver:TestDeclarationOpenedWithNoFollow cmd:TestKeysDeliverRefusals \
+	deliver:TestLockRefusesUntrustedFile deliver:TestLockBoundedWait cmd:TestKeysDeliverWritersSerialize
 check G20 "the reconciler only gets, creates and updates its labelled Opaque Secrets: an unlabelled or foreign Secret is untouched, and no list or delete is ever made" \
 	deliver:TestReconcilerTouchesOnlyLabelledSecrets deliver:TestReconcilerRedeliversOnRotation \
 	deliver:TestReconcilerSkipsLabelledNonOpaque deliver:TestReconcilerContinuesAfterTargetFailure \

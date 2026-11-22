@@ -154,6 +154,13 @@ type keysEnv struct {
 	// hands a new one to root:wheel. A non-root test replaces both.
 	deliveryCheck keydeliver.FileCheck
 	deliveryChown func(f *os.File) error
+	// deliveryLockBusy is the wait between attempts at the declaration's
+	// lock while another writer holds it; nil is keydeliver.DefaultLockBusy.
+	// deliveryRead, when set, is called after the declaration is read and
+	// before it is written back, where a test parks a writer. Production
+	// leaves both nil.
+	deliveryLockBusy func() <-chan time.Time
+	deliveryRead     func()
 	// encryptionOn reports whether the server would start the work dir's
 	// apiserver with secrets encryption.
 	encryptionOn func(workDir string) bool
