@@ -577,7 +577,7 @@ func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSiz
 	}
 	deliveriesSeen.note(u.s.dir, u.scope, gen, seq)
 	if err := u.s.userFloor.append(u.scope, deliveriesFloorName, gen, seq); err != nil {
-		return fmt.Errorf("%w, and its floor line was not written: %w", ErrCommitted, err)
+		return committedf(err, "the deliveries record is written, but its floor line was not")
 	}
 	return nil
 }
@@ -936,7 +936,7 @@ func (u *UserScope) audit(op, name, namespace string, err error) error {
 func (u *UserScope) appendAudit(l auditLine, err error) error {
 	l.scope, l.result = u.scope, auditResult(err)
 	if aerr := u.s.auditSink.append(l); aerr != nil {
-		return fmt.Errorf("%w, and its audit line was not written: %w", ErrCommitted, aerr)
+		return committedf(aerr, "the change stands, but its audit line was not written")
 	}
 	return nil
 }

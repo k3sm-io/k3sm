@@ -212,6 +212,11 @@ var (
 	// from the pair it held: that pair is no longer current, and its refresh
 	// token may already be rotated at the provider. The next write records
 	// the floor and prunes what was left.
+	//
+	// ErrCommitted takes precedence: an error that matches it matches no
+	// other sentinel of this package, ErrCorrupt included, whatever its
+	// cause was (a floor refusal reads as ErrCorrupt). The cause is in the
+	// message only.
 	ErrCommitted = errors.New("the change was made")
 	// ErrRefreshOwnerFixed reports a rotation of an oauth entry whose new
 	// pair names another refresh owner: the owner is fixed when the entry

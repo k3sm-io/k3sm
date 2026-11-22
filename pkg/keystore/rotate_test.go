@@ -431,8 +431,8 @@ func TestFloorRaised(t *testing.T) {
 		s, server := newTestStore(t)
 		mustPut(t, s, "a", KindOpaque, []byte("a"))
 		s.step = failAt("write " + floorName)
-		if _, err := s.Put(ctx, "k", KindOpaque, []byte("one")); err == nil || !strings.Contains(err.Error(), "the entry is stored") {
-			t.Fatalf("Put through a crash at the floor write: %v, want the stored-but-unrecorded error", err)
+		if v, err := s.Put(ctx, "k", KindOpaque, []byte("one")); !errors.Is(err, ErrCommitted) || v.Version != 1 {
+			t.Fatalf("Put through a crash at the floor write: %+v, %v, want version 1 and ErrCommitted", v, err)
 		}
 		s.step = func(string) error { return nil }
 		mustCurrent(t, s, "k", "one")
@@ -496,11 +496,11 @@ func TestRotateCrashAtEveryStep(t *testing.T) {
 		s.step = func(name string) error { steps = append(steps, name); return nil }
 		mustRotate(t, s, "k", "two")
 	}
-	want := "write v2,write current,write " + floorName
+	want := "write v2,write current,sync current,write " + floorName
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Rotate steps = %v, want %s", steps, want)
 	}
-	for _, step := range steps[:2] { // the floor write comes after the flip (TestFloorRaised)
+	for _, step := range steps[:2] { // the sync and the floor write come after the flip (TestCommitPointReported)
 		t.Run(step, func(t *testing.T) {
 			s, server := newTestStore(t)
 			mustPut(t, s, "k", KindOpaque, []byte("one"))
@@ -539,7 +539,7 @@ func rotateCrashOAuthPrune(t *testing.T) {
 		s.step = func(name string) error { steps = append(steps, name); return nil }
 		mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a3", "r3"))
 	}
-	want := "write v3,write current,write " + floorName + ",prune k"
+	want := "write v3,write current,sync current,write " + floorName + ",prune k"
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("pruning Rotate steps = %v, want %s", steps, want)
 	}

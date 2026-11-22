@@ -1485,7 +1485,7 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 	// The steps come in this order, each directory's mkdir before anything
 	// written into it; that each parent is fsynced before its directory's
 	// step is TestMkdirSyncsParent's to check.
-	want := "mkdir keystore,mkdir cred,mkdir keystore-master,write master,write master.sha256,mkdir k,write generation,write v1,write current,write keystore-floor.json"
+	want := "mkdir keystore,mkdir cred,mkdir keystore-master,write master,write master.sha256,mkdir k,write generation,write v1,write current,sync current,write keystore-floor.json"
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Put steps = %v, want %s", steps, want)
 	}
@@ -1505,8 +1505,8 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 	}
 	others := []error{ErrMasterMissing, ErrMasterUntrusted, ErrCorrupt, ErrExists}
 	for _, step := range steps {
-		if step == "write "+floorName {
-			continue // after the pointer: the entry is committed (TestFloorRaised)
+		if step == "sync current" || step == "write "+floorName {
+			continue // after the pointer: the entry is committed (TestCommitPointReported)
 		}
 		t.Run(step, func(t *testing.T) {
 			want, ok := afterCrash[step]

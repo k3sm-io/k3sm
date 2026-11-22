@@ -809,7 +809,7 @@ partial U149 "write-only, structurally: a planted refresh token appears in no re
 check U150 "RotateIf refuses a stale version, and a version read from an entry since deleted and put again; a rotation never changes an oauth entry's refresh owner" \
 	k3sm/pkg/keystore::TestRotateIfStaleVersionRefused TestRotateIfRefusesRecreatedEntry TestRefreshOwnerFixedPerEntry
 check U151 "oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means low = 1); crash-safe at every step, prune included (the prune cases of the crash test); a failure after the pointer flip reports the commit" \
-	k3sm/pkg/keystore::TestOAuthPruneKeepsTwo TestPointerLowWaterMark TestRotateCrashAtEveryStep TestRotateReportsCommitAfterFlip TestPointerCanonicalForm
+	k3sm/pkg/keystore::TestOAuthPruneKeepsTwo TestPointerLowWaterMark TestRotateCrashAtEveryStep TestRotateReportsCommitAfterFlip TestCommitPointReported TestPointerCanonicalForm
 check U152 "a pruned oauth entry: List shows it healthy, Rewrap re-seals low..current, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught" \
 	k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt TestRewrapHandlesPrunedOAuth TestDeletePrunedOAuthEntry TestGapInsideCommittedRangeIsCorrupt TestCopyBackAcrossPruneCaught
 check U153 "--from-version is refused for oauth" \

@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -37,11 +38,14 @@ import (
 // typed.ErrInvalidCredential, a token without an expiry and an oauth pair
 // without its access token, access expiry, refresh token or a refresh owner
 // in the grammar. A put over an existing name of another kind is
-// ErrKindMismatch, and of the same kind ErrExists.
+// ErrKindMismatch, and of the same kind ErrExists. A failure after the
+// pointer's rename returns the new version with an error matching
+// ErrCommitted.
 func (s *FileStore) PutCredential(ctx context.Context, name string, kind Kind, e typed.Envelope) (Version, error) {
 	v, err := s.putCredential(ctx, name, kind, e)
 	if err != nil {
-		return Version{}, fmt.Errorf("put %s: %w", name, err)
+		// v is the committed version when err is ErrCommitted.
+		return v, fmt.Errorf("put %s: %w", name, err)
 	}
 	return v, nil
 }
@@ -66,7 +70,8 @@ func (s *FileStore) putCredential(ctx context.Context, name string, kind Kind, e
 // GenerateSSH creates name at version 1 holding a new ed25519 SSH key, its
 // seed drawn from the store's random seam, with comment (empty for none). It
 // returns the version and the public key's authorized_keys line; the private
-// half leaves the store only by projection.
+// half leaves the store only by projection. A failure after the commit point
+// returns both with an error matching ErrCommitted: the key exists.
 func (s *FileStore) GenerateSSH(ctx context.Context, name, comment string) (Version, string, error) {
 	seed, err := typed.GenerateSSH(s.rand)
 	if err != nil {
@@ -82,6 +87,9 @@ func (s *FileStore) GenerateSSH(ctx context.Context, name, comment string) (Vers
 		Seed:      seed,
 		Comment:   comment,
 	}})
+	if errors.Is(err, ErrCommitted) {
+		return v, line, err
+	}
 	if err != nil {
 		return Version{}, "", err
 	}

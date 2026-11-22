@@ -940,11 +940,17 @@ would publish a value the retry did not supply. The same applies to any version 
 numbered above the one `current` names. Seeing the orphan and removing it happens under
 the exclusive lock.
 
-**A rotation reports its commit outcome without ambiguity.** The pointer's rename is the
-commit point. A failure after it, at the floor write or at the oauth prune, returns the
-committed `Version` (the new one, now current) with an error matching the exported
-`ErrCommitted` (`errors.Is`), never a zero `Version` beside a bare error, which would read as
-nothing written. A refresher that gets `ErrCommitted` reads the entry again and works from what it
+**A write reports its commit outcome without ambiguity.** The pointer's rename is the
+commit point, for a Put (`Put`, `PutCredential`, `GenerateSSH`) as for a rotation (`Rotate`,
+`RotateCredential`, `RotateIf`, `RotateFrom`). The pointer is renamed into place first and
+its directory fsynced after, as a separate step, so a failed rename (nothing committed) is
+told apart from a failed fsync after it (committed). A failure after the rename, at the
+directory fsync, the floor write or the oauth prune, returns the committed `Version` (the
+new one, now current; `GenerateSSH` also returns its public key line) with an error matching
+the exported `ErrCommitted` (`errors.Is`), never a zero `Version` beside a bare error, which
+would read as nothing written. `ErrCommitted` takes precedence: the error matches no other
+sentinel, `ErrCorrupt` included, even when its cause is a floor refusal that does; the cause
+is in the message only. A refresher that gets `ErrCommitted` reads the entry again and works from what it
 reads; it never retries from the pair it held, which is no longer current and whose refresh token
 the provider may already have rotated. A failed prune is reported the same way rather than
 swallowed as best-effort: the change still stands and the next write prunes, but one rule for
@@ -4303,7 +4309,7 @@ carried by the unit rows.
 | U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH`, `k3sm/pkg/keystore::TestStoreGenerateSSHUsesRandomSeam` | checked: the typed envelope and the typed store |
 | U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential`, `k3sm/pkg/keystore/typed::TestEnvelopeRefusalsNeverCarryRefreshToken` | partial: every exported method of `*FileStore` and `*UserScope`, enumerated by reflection (a method neither called by hand, callable with built arguments nor allowlisted with a reason fails the test), the typed reads and the deliveries path checked (the typed store); pending: the consumer interfaces and `internal/refreshopen`'s import graph, `TestRefreshOpenerImportGraph` (the refresher) |
 | U150 | `RotateIf` refuses a stale version, and a version read from an entry since deleted and put again; a rotation never changes an oauth entry's refresh owner | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused`, `TestRotateIfRefusesRecreatedEntry`, `TestRefreshOwnerFixedPerEntry` | checked: the typed store |
-| U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test); a failure after the pointer flip reports the commit | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep`; a failure after the flip returns the new version with `ErrCommitted`, `TestRotateReportsCommitAfterFlip`; the pointer has one canonical form, `TestPointerCanonicalForm` | checked: the typed store |
+| U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test); a failure after the pointer flip reports the commit | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep`; a failure after the flip returns the new version with `ErrCommitted`, `TestRotateReportsCommitAfterFlip`, and so does a failure after any write's pointer rename (the directory fsync, the floor, the prune; put, rotate and generate alike), never also `ErrCorrupt`, `TestCommitPointReported`; the pointer has one canonical form, `TestPointerCanonicalForm` | checked: the typed store |
 | U152 | a pruned oauth entry: List shows it healthy, Rewrap re-seals `low..current`, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught | `k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt`, `TestRewrapHandlesPrunedOAuth`, `TestDeletePrunedOAuthEntry`, `TestGapInsideCommittedRangeIsCorrupt`, `TestCopyBackAcrossPruneCaught` | checked: the typed store |
 | U153 | `--from-version` is refused for oauth | `k3sm/pkg/keystore::TestFromVersionRefusedForOAuth` | checked: the typed store |
 | U154 | every `Fuzz*` target in the keystore packages has a non-empty committed seed directory | `k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds` | checked: the typed envelope |

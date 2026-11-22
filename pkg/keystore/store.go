@@ -215,10 +215,15 @@ func (s *FileStore) checkConfig() error {
 // the current pointer, then its floor; an entry directory without a pointer
 // in the shape a crashed Put leaves, whose generation the floor does not
 // record, is an interrupted Put, which the next Put of that name discards.
+// The pointer's rename is the commit point: a failure after it (the
+// directory fsync, the floor line) returns the new version with an error
+// matching ErrCommitted.
 func (s *FileStore) Put(ctx context.Context, name string, kind Kind, value []byte) (Version, error) {
 	v, err := s.put(ctx, name, kind, value)
 	if err != nil {
-		return Version{}, fmt.Errorf("put %s: %w", name, err)
+		// v is the committed version when err is ErrCommitted, and zero
+		// otherwise.
+		return v, fmt.Errorf("put %s: %w", name, err)
 	}
 	return v, nil
 }
@@ -286,12 +291,12 @@ func (s *FileStore) putChecked(ctx context.Context, name string, kind Kind, valu
 	}
 	v, err := s.writeEntry(e, k, kind, val)
 	if err != nil {
-		return Version{}, err
+		return v, err // v is the committed version when err is ErrCommitted
 	}
 	// A new generation replaces whatever an interrupted Delete left recorded
 	// for the name.
 	if _, err := fdir.update(func(fl floor) bool { return fl.set(name, e.generation) }); err != nil {
-		return Version{}, fmt.Errorf("the entry is stored, but recording its floor failed (the next keys verb records it): %w", err)
+		return v, committedf(err, "version 1 is current, but recording its floor failed (the next keys verb records it)")
 	}
 	return v, nil
 }
@@ -373,7 +378,9 @@ func (s *FileStore) initEntry(root *os.Root, name string, made fs.FileInfo) (*en
 	return e, nil
 }
 
-// writeEntry seals value as version 1 of e, then the pointer naming it.
+// writeEntry seals value as version 1 of e, then the pointer naming it. A
+// failure after the pointer's rename returns version 1 with an error
+// matching ErrCommitted.
 func (s *FileStore) writeEntry(e *entry, k keys, kind Kind, value []byte) (Version, error) {
 	created := s.now().Unix()
 	rec := record{kind: byte(kind), name: e.name, version: 1, generation: e.generation, created: created}
@@ -387,10 +394,38 @@ func (s *FileStore) writeEntry(e *entry, k keys, kind Kind, value []byte) (Versi
 	if err := ptr.seal(k.seal, k.scope, pointerPlaintext(1, 1), s.rand); err != nil {
 		return Version{}, err
 	}
-	if err := s.writeFile(e.root, currentName, ptr.marshal()); err != nil {
+	committed, err := s.commitPointer(e, ptr.marshal())
+	if !committed {
 		return Version{}, err
 	}
-	return versionOf(rec, value, k.fingerprint), nil
+	v := versionOf(rec, value, k.fingerprint)
+	if err != nil {
+		return v, committedf(err, "version 1 is current, but syncing its directory failed")
+	}
+	return v, nil
+}
+
+// commitPointer writes data as e's current pointer, whose rename is a
+// write's commit point. committed reports whether the rename succeeded: a
+// failure before it committed nothing, and a failure after it (the directory
+// fsync, behind the "sync current" step) committed the pointer.
+func (s *FileStore) commitPointer(e *entry, data []byte) (committed bool, err error) {
+	if err := s.renameInto(e.root, currentName, data, s.uid, s.gid, fileMode); err != nil {
+		return false, err
+	}
+	if err := s.step("sync " + currentName); err != nil {
+		return true, err
+	}
+	return true, syncDir(e.root)
+}
+
+// committedf is the error a write returns for cause, a failure after its
+// commit point: it matches ErrCommitted and nothing else. The cause is kept
+// in the message only, so a cause that matches ErrCorrupt (a floor refusal)
+// never makes a committed write read as a corrupt entry; ErrCommitted takes
+// precedence.
+func committedf(cause error, format string, args ...any) error {
+	return fmt.Errorf("%w: %s: %v", ErrCommitted, fmt.Sprintf(format, args...), cause)
 }
 
 // Current returns the version the current pointer names, with its value.
@@ -819,25 +854,29 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 	if err := ptr.seal(k.seal, k.scope, rangePlaintext(next, seq+1, newLow), s.rand); err != nil {
 		return Version{}, err
 	}
-	if err := s.writeFile(e.root, currentName, ptr.marshal()); err != nil {
+	flipped, err := s.commitPointer(e, ptr.marshal())
+	if !flipped {
 		return Version{}, err
 	}
 	// The pointer's rename was the commit point: from here a failure
 	// returns the committed version with ErrCommitted, never a zero Version
 	// that reads as nothing written.
 	committed := versionOf(rec, value, k.fingerprint)
+	if err != nil {
+		return committed, committedf(err, "version %d is current, but syncing its directory failed", next)
+	}
 	if _, err := fdir.update(func(fl floor) bool { return fl.raise(name, e.generation, seq+1) }); err != nil {
-		return committed, fmt.Errorf("%w: version %d is current, but recording its floor failed (the next keys verb records it): %w", ErrCommitted, next, err)
+		return committed, committedf(err, "version %d is current, but recording its floor failed (the next keys verb records it)", next)
 	}
 	if newLow > low {
 		// A crash before or during the prune leaves versions below newLow,
 		// which are not committed: the next write, Rewrap or Delete
 		// unlinks them.
 		if err := s.step("prune " + name); err != nil {
-			return committed, fmt.Errorf("%w: version %d is current, but pruning the versions below %d failed (the next write prunes them): %w", ErrCommitted, next, newLow, err)
+			return committed, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)", next, newLow)
 		}
 		if err := discardOrphans(ctx, e, newLow, next); err != nil {
-			return committed, fmt.Errorf("%w: version %d is current, but pruning the versions below %d failed (the next write prunes them): %w", ErrCommitted, next, newLow, err)
+			return committed, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)", next, newLow)
 		}
 	}
 	return committed, nil
