@@ -361,3 +361,38 @@ func TestFloorMergeRefusesUntrustedPlace(t *testing.T) {
 		})
 	}
 }
+
+// TestMergeFloorRefusesDroppingItsOwnBurials (U192): a merge whose write
+// would prune a burial it adds itself (a merged or retired generation, or a
+// revoked live one it buries) is refused before anything is written, as
+// errFloorFull, and its input is left in place, so the guard stays.
+func TestMergeFloorRefusesDroppingItsOwnBurials(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	putFloorFile(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}, "revoked": {Generation: mgen(3), Seq: 1}})
+	aside := floor{"revoked": {Buried: []burial{{Generation: mgen(3), Deleted: 1}}}}
+	for i := range 40 {
+		aside[fmt.Sprintf("name-%02d", i)] = floorEntry{Generation: mgen(100 + i), Seq: 1}
+	}
+	path := writeAsideFloor(t, server, aside)
+	before, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The moved-aside floor parses under the tombstone budget, but its
+	// live generations, each retired by the merge, take the burials over it.
+	setFloorLimits(t, smallFloorSize, 1000)
+	r, err := s.MergeFloor(ctx, path, nil)
+	if !errors.Is(err, errFloorFull) || Committed(err) {
+		t.Fatalf("MergeFloor dropping its own burials = %+v, %v; want errFloorFull, not committed", r, err)
+	}
+	if after, err := os.ReadFile(floorPath(server)); err != nil || string(after) != string(before) {
+		t.Errorf("floor after the refused merge changed: %s, %v", after, err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("the input after the refused merge: %v, want it left in place", err)
+	}
+	if err := s.MergePending(); !errors.Is(err, errMergePending) {
+		t.Errorf("MergePending after the refused merge = %v, want the guard in place", err)
+	}
+}

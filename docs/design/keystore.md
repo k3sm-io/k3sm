@@ -1280,7 +1280,12 @@ mode or flags recursively (`chown -R`, `chmod -R`, `chflags -R`) over a tree the
 wrote: root would follow a hard link planted in it to an unrelated inode
 (`TestKeysRollbackRoundTrip`). The merge keeps every live record of
 the restored floor not buried above. The write is pruned as every floor write is, the per-name cap
-included, and each burial dropped is logged at Warn and reported. The verb prints `merged N`,
+included, and each burial dropped is logged at Warn and reported. Only a burial the restored
+floor already held can be dropped: as Put and Rotate ask for room before they write, the merge
+first prunes its result on a copy, and when that would drop a burial the merge adds itself (a
+merged, retired or buried-live one) it refuses with the floor-full error, writing nothing and
+leaving its input in place, so the guard stays (`TestMergeFloorRefusesDroppingItsOwnBurials`). A
+fence is a mark on a live record, which no prune removes. The verb prints `merged N`,
 `already present N`, `buried live N`, `kept N`, `retired N`, `dropped N` and `fenced N`, one per line, then `buried live
 system/<name>: ...` for each name whose live generation it buried (and whose directory `rm`
 removes), `kept system/<name>: ...` for each name kept and `dropped system/<name>: ...` for each

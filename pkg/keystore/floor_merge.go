@@ -100,7 +100,9 @@ type MergeReport struct {
 	Unverified []string
 	// Dropped names, sorted and with repeats, each burial the write dropped
 	// to stay within the floor's caps (the per-name cap and the tombstone
-	// budget): a copy of it put back is accepted again.
+	// budget): a copy of it put back is accepted again. Each is one the live
+	// floor held before the merge: a merge that would drop one it adds is
+	// refused.
 	Dropped []string
 	// AlreadyMerged is set when the live floor already held every burial
 	// and fence the input records: the merge wrote nothing and only renamed
@@ -131,7 +133,10 @@ type MergeReport struct {
 // restored one, never a second, moved-aside one. keep holds
 // entry names, each checked as a name is; a name the merge does not keep
 // (it matched nothing) refuses the merge, with nothing written. The write is pruned as every
-// floor write is, and each burial it drops is logged at Warn and reported.
+// floor write is, and each burial it drops is logged at Warn and reported;
+// a write that would drop a burial the merge adds itself is refused before
+// it is made (mergeLoses), as errFloorFull, with nothing written and the
+// input not renamed.
 // Once the floor is written, the input is renamed to
 // keystore-floor.json.merged-<unix> beside it (renameMerged), which clears
 // the guard the restore's keystore-floor.json.pre-restore sets on every verb
@@ -193,7 +198,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	// floor already holds (a rerun after a failed rename) writes nothing
 	// and is only renamed, whatever its newest deletion.
 	probe := maps.Clone(live)
-	pr, _ := probe.merge(from, kept, ptrs)
+	pr, probeDropped := probe.merge(from, kept, ptrs)
 	if unmatched := unmatchedKeep(kept, pr.Kept); len(unmatched) > 0 {
 		return MergeReport{}, fmt.Errorf("--keep names %s, which the merge would not delete: it keeps an entry only when the floor moved aside records its restored generation as deleted, or holds a newer generation of a name the restored floor does not record. Nothing is written; check the names and run the merge again without them", strings.Join(unmatched, ", "))
 	}
@@ -206,6 +211,12 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	}
 	if err := checkMergeInput(live, from); err != nil {
 		return r, err
+	}
+	// As Put and Rotate ask room before they write: a merge whose write
+	// would drop a burial it adds is refused, with nothing written and the
+	// input left where it is, so the guard stays.
+	if lost := mergeLoses(live, probe, probeDropped); len(lost) > 0 {
+		return r, fmt.Errorf("%w: the merge would drop the deletions it adds for %s to stay within the floor's caps, so a copy of each would be accepted again. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished", errFloorFull, strings.Join(lost, ", "))
 	}
 	// Only keystore-lock: the merge writes the root-owned floor and nothing
 	// under keystore/, so it takes no keystore/.lock, which the service user
@@ -235,6 +246,23 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 		return r, fmt.Errorf("%w: the merge is written, but its input was not renamed, so the verbs that change the keystore still refuse; run the same merge again, which writes nothing more and renames it: %w", errCommitted, err)
 	}
 	return r, nil
+}
+
+// mergeLoses names, sorted and without repeats, each entry with a burial the
+// merge that took live to merged added (BuriedLive, a merged or a retired
+// burial) that the write would drop: at the per-name cap (capDropped, what
+// merge returned) or in the write's prune, run here on a copy. A burial live
+// already held is not the merge's own, and dropping it is reported, not
+// refused. A fence is a high-water mark on a live record, which no prune
+// removes.
+func mergeLoses(live, merged floor, capDropped []pruned) []string {
+	lost := map[string]bool{}
+	for _, p := range append(slices.Clone(capDropped), maps.Clone(merged).prune()...) {
+		if !live[p.name].buries(p.generation) {
+			lost[p.name] = true
+		}
+	}
+	return sortedNames(lost)
 }
 
 // changes reports whether the merge r reports changed the floor.
