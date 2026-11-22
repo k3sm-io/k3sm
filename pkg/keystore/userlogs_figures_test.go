@@ -136,3 +136,12 @@ func TestLogFullKeyRefusalsReadTheSame(t *testing.T) {
 	}
 }
 
+// The data root that does not open is reported without its path.
+func TestLogDataRootOpenNamesNoPath(t *testing.T) {
+	s, _, _ := fileLogScope(t)
+	s.dataRoot = filepath.Join(t.TempDir(), "no-such-data-root-7f3a")
+	_, err := s.openLogDataRoot()
+	if err == nil || strings.Contains(err.Error(), "no-such-data-root-7f3a") {
+		t.Fatalf("open of a missing data root: %v, want an error naming no path", err)
+	}
+}

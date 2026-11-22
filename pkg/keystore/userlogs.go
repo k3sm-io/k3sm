@@ -460,7 +460,7 @@ func (s *FileStore) openLogDataRoot() (int, error) {
 	}
 	dfd, err := unix.Open(s.dataRoot, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return -1, fmt.Errorf("open the data root %s: %w", s.dataRoot, err)
+		return -1, fmt.Errorf("open the data root: %w", err)
 	}
 	var st unix.Stat_t
 	if err := unix.Fstat(dfd, &st); err != nil {
