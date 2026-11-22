@@ -529,9 +529,9 @@ check U10 "user/<other>/... is ErrNotFound, same text as an absent entry; a shor
 check U11 "the Go resolver and Phase A's checkName pass the shared entry-grammar vectors; pkg/keystore imports no Kubernetes package" \
 	TestEntryGrammarVectorsResolver TestEntryGrammarVectorsCheckName TestCheckScopeRefusesUserZero TestAllDigitSegmentIsAlwaysUID TestKeystoreIsKubernetesFree
 check U12 "master Rewrap re-wraps every scope.key and leaves user records byte-identical; resumable at every step, by fault injection as G12" \
-	TestRewrapRewrapsScopeKeysResumable TestRewrapRefusesDamagedScopeTree
+	TestRewrapRewrapsScopeKeysResumable TestRewrapRefusesDamagedScopeTree TestRewrapVerifiesScopeKeysBeforeSwap TestRewrapRefusesStrayScopeDirs
 check U13 "quotas: the 257th entry and the byte budget answer ErrQuota, and so does the 65th live delivery; rm and withdraw still work" \
-	TestUserScopeQuota TestDeliveryRecordQuota TestRevocationIsUnconditional TestWithdrawFloorFaults
+	TestUserScopeQuota TestUserScopeQuotaCountsDeliveriesAndGeneration TestDeliveryRecordQuota TestRevocationIsUnconditional TestWithdrawFloorFaults TestWithdrawRefusesRollbackBelowSeen TestWithdrawBelowReadableFloorRefused TestDeleteOwnerChanged
 check U14 "the delivery record stores UID, the full target tuple under its seal, and target digest; add, look up and withdraw round-trip under the floor; the digest covers entry, namespace, secretName and the key-sorted items, a reorder leaving it unchanged" \
 	TestDeliveryRecordDigestRoundTrip TestDeliveryRecordVersionByteAndDigestLabel TestDeliveryDigestCoversTargetAndItems TestDeliveryFieldGrammarAtAdd TestDeliveryFieldGrammarAtParse
 check U101 "rewrap prints a warning whenever .user/ exists, before it starts and when it finishes, saying Rewrap does not re-key K_u and naming the procedure: each user re-puts their values after a suspected master exposure; with no .user/ it prints none" \
