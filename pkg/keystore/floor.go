@@ -217,7 +217,7 @@ func logPruned(ps []pruned) {
 type floorMalformedError struct{}
 
 func (*floorMalformedError) Error() string {
-	return "the keystore floor does not parse. Removing keystore-floor.json turns replay protection off until a root keys verb rebuilds it, and the rebuild records whatever pointers are under keystore/ as current, an older copy put back included: remove it as root only once those pointers are known to be current, then run any sudo k3sm keys verb to rebuild it"
+	return "the keystore floor does not parse. Removing keystore-floor.json turns replay protection off until a root keys verb rebuilds it, and the rebuild records whatever pointers are under keystore/ as current, an older copy put back included. It also discards every deletion the floor recorded, so every deleted entry, a key revoked by deleting it included, is accepted again if a copy of it is put back: remove it as root only once those pointers are known to be current, then run any sudo k3sm keys verb to rebuild it"
 }
 
 func (*floorMalformedError) Unwrap() error { return ErrCorrupt }

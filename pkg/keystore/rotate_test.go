@@ -647,8 +647,9 @@ func TestFloorScope(t *testing.T) {
 
 // TestFloorMalformedAdvice: a floor that does not parse is refused with
 // advice that says what removing it costs, never a bare "delete the file":
-// with no floor the stale-pointer check is off, and the rebuild trusts
-// whatever pointers are there.
+// with no floor the stale-pointer check is off, the rebuild trusts whatever
+// pointers are there, and every deleted entry, revoked keys included, is
+// accepted again if put back.
 func TestFloorMalformedAdvice(t *testing.T) {
 	s, server := newTestStore(t)
 	mustPut(t, s, "k", KindOpaque, []byte("v"))
@@ -658,7 +659,7 @@ func TestFloorMalformedAdvice(t *testing.T) {
 		t.Fatalf("Current over a malformed floor: %v, want errFloorMalformed", err)
 	}
 	msg := err.Error()
-	for _, want := range []string{"turns replay protection off", "known to be current", "rebuild"} {
+	for _, want := range []string{"turns replay protection off", "known to be current", "rebuild", "discards every deletion the floor recorded", "a key revoked by deleting it included, is accepted again"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("malformed-floor advice %q does not say %q", msg, want)
 		}
