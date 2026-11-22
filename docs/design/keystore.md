@@ -1376,8 +1376,11 @@ store refuses to read or write a sealed record over 1,056 KiB.
   tombstone lost. A withdrawal of a UID already withdrawn appends the record's floor line
   again, so a floor line an earlier withdrawal could not append is written by the next one; the
   floor keeps the highest sequence, so the repeat is idempotent. `rm` is a revocation too: it
-  only removes files, so it needs neither `W` nor `K_u`, and is never refused for the lookup
-  or for `ErrRewrapInProgress`.
+  only removes files, so it needs neither `W` nor `K_u`, and is never refused for a lookup
+  that fails or times out, or for `ErrRewrapInProgress`. A lookup that answers a real
+  GeneratedUID other than the one `scope.key` records refuses it with `ErrScopeOwnerChanged`:
+  the uid was reused, and its new holder must not delete the former owner's values (root
+  removes such a scope).
   *Residual (floor unreadable at a withdrawal).* With the floor unreadable, the withdrawal
   cannot check the record against it, only against the process's in-memory mark. A copy put
   back below a sequence this process has not seen (after a restart, say) is re-sealed with the

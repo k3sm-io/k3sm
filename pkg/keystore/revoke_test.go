@@ -254,3 +254,37 @@ func TestWithdrawBelowReadableFloorRefused(t *testing.T) {
 		}
 	}
 }
+
+// rm refuses when the uid's live GeneratedUID is a real answer that differs
+// from the scope's bound one: a recycled uid's new holder cannot delete the
+// former owner's values. A lookup that fails or times out still lets rm go
+// ahead, so revocation stays available.
+func TestDeleteOwnerChanged(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a real, different GeneratedUID refuses", func(t *testing.T) {
+		_, server, u := newDeliveryScope(t)
+		fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xB2)})
+		if err := u.Delete(ctx, "user/1001/token"); !errors.Is(err, ErrScopeOwnerChanged) {
+			t.Fatalf("rm by a recycled uid: %v, want ErrScopeOwnerChanged", err)
+		}
+		if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "token")); err != nil {
+			t.Fatalf("the former owner's entry after a refused rm: %v", err)
+		}
+	})
+	t.Run("a lookup error proceeds", func(t *testing.T) {
+		_, server, u := newDeliveryScope(t)
+		fakeGUIDs(t, map[uint32][generationSize]byte{})
+		if err := u.Delete(ctx, "user/1001/token"); err != nil {
+			t.Fatalf("rm while the lookup fails: %v", err)
+		}
+		checkEntryGone(t, server, "token")
+	})
+	t.Run("a lookup timeout proceeds", func(t *testing.T) {
+		_, server, u := newDeliveryScope(t)
+		stallLookups(t)
+		if err := u.Delete(ctx, "user/1001/token"); err != nil {
+			t.Fatalf("rm while the lookup times out: %v", err)
+		}
+		checkEntryGone(t, server, "token")
+	})
+}

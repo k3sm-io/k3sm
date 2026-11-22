@@ -108,9 +108,11 @@ func entryBytes(entries *os.Root, name string) (int64, error) {
 
 // Delete removes input and every version of it from the caller's scope:
 // rm. It is never refused for a quota, since it is how room is made, and,
-// as a revocation, never for the owner's GeneratedUID lookup or a Rewrap
-// half done: it only removes files, so it needs neither W nor K_u, and
-// opens no record. The scope must still have its scope.key, as every user
+// as a revocation, never for a GeneratedUID lookup that fails or times out,
+// or a Rewrap half done: it only removes files, so it needs neither W nor
+// K_u, and opens no record. A lookup that answers a real GeneratedUID other
+// than the one scope.key is bound to is ErrScopeOwnerChanged: the uid was
+// reused, and its new holder must not delete the former owner's values. The scope must still have its scope.key, as every user
 // verb's scope must. An entry directory without a current pointer, which
 // the user scope reads as damage, is removed too.
 //
@@ -144,11 +146,16 @@ func (u *UserScope) delete(ctx context.Context, name string) error {
 		return err
 	}
 	defer done()
-	entries, err := u.openEntriesForRevoke(root)
+	entries, gen, err := u.openEntriesForRevoke(root)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = entries.Close() }() // every removal is fsynced
+	// Only a real, different answer refuses; a lookup that fails or times
+	// out is no answer, and rm goes ahead.
+	if live, err := lookupGeneratedUID(u.uid); err == nil && live != gen {
+		return fmt.Errorf("%w: uid %d", ErrScopeOwnerChanged, u.uid)
+	}
 	fi, err := entries.Lstat(name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return ErrNotFound
@@ -183,22 +190,25 @@ func (u *UserScope) delete(ctx context.Context, name string) error {
 }
 
 // openEntriesForRevoke opens the scope's entries/ for an rm: the scope
-// directory must hold a scope.key the store trusts, which is not opened.
-func (u *UserScope) openEntriesForRevoke(root *os.Root) (*os.Root, error) {
+// directory must hold a scope.key the store trusts, which is not opened. It
+// returns the generation the scope.key record carries.
+func (u *UserScope) openEntriesForRevoke(root *os.Root) (*os.Root, [generationSize]byte, error) {
+	var zero [generationSize]byte
 	dir, err := u.openScopeDir(root, false)
 	if err != nil {
-		return nil, err
+		return nil, zero, err
 	}
 	defer func() { _ = dir.Close() }() // nothing is written in the scope directory
-	if _, err := u.s.readScopeKeyRecord(dir); err != nil {
-		return nil, err
+	r, err := u.s.readScopeKeyRecord(dir)
+	if err != nil {
+		return nil, zero, err
 	}
 	entries, err := u.s.openSubdir(dir, scopeEntriesName, false)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent)
+		return nil, zero, fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err)
+		return nil, zero, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err)
 	}
-	return entries, nil
+	return entries, r.generation, nil
 }
