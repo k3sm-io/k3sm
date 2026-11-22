@@ -51,9 +51,9 @@ limitations under the License.
 //     Store.Current's version or fingerprint, or its data is not exactly the
 //     declared key holding the stored bytes (compared in constant time, so a
 //     hand edit with the annotations left intact is re-applied and logged,
-//     without the value). An immutable one cannot be updated: it is left
-//     as it is and logged at Warn once per state change, for the operator to
-//     delete;
+//     without the value). An immutable one cannot be updated, so it is
+//     deleted under a precondition on the recorded UID, created again and the
+//     new UID recorded, both steps logged without the value;
 //   - anything else (no recorded UID, or a UID other than the recorded one,
 //     whatever its label): leaves it alone and logs why. The
 //     label is forgeable by anyone who can write Secrets in the namespace;
@@ -64,7 +64,8 @@ limitations under the License.
 // parses loses its state record, so declaring it again leaves the old Secret
 // alone; an absent declaration withdraws nothing and keeps every record.
 //
-// It never lists, never deletes and touches no other kind, so withdrawing a
+// It never lists, deletes only an owned immutable Secret (under a UID
+// precondition) and touches no other kind, so withdrawing a
 // target (`k3sm keys undeliver`) leaves its Secret in place. A per-target
 // failure is logged and the sweep moves on; each target's calls have their
 // own ten-second deadline, so one hung call cannot stall the rest. The data

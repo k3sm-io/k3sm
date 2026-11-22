@@ -23,7 +23,8 @@ pin, its date, and the tarball's sha256.
   as an `Opaque` Secret, and the server keeps that Secret at the entry's current version, so a
   `rotate` reaches it within a minute. The server only updates a Secret it created itself,
   recognised by the object's UID: one that already exists under that name is left alone, and
-  nothing is ever listed or deleted, so `undeliver` leaves the Secret in place. While secrets encryption is off,
+  nothing is ever listed, so `undeliver` leaves the Secret in place; the only delete re-creates
+  an immutable Secret the server created. While secrets encryption is off,
   delivery is refused unless the server is started with `--allow-plaintext-secrets-delivery`. See
   [Keys](docs/user/keys.md#delivering-an-entry-as-a-secret).
 - New unpinned Pods prefer a node whose Mac is not CPU-busy. Each node reports a `HostCPUBusy`

@@ -409,7 +409,7 @@ check G19 "the delivery declaration is root-owned and not group- or other-writab
 	TestNewDefaultsBindRoot TestDataRootDirectoryChecked TestStateFileOtherOwnerRefused TestStateDirServiceUserOwner \
 	TestDeclarationEntryField \
 	k3sm/cmd/k3sm::TestKeysDeliverRefusals TestKeysDeliverWritersSerialize TestKeysEnvDefaultsBindRoot TestKeysUndeliverSecret
-check G20 "the reconciler only gets, creates and updates the Opaque Secrets it created, proven by the UID it recorded, not the label: an unlabelled, foreign, pre-created or recreated Secret is untouched, and no list or delete is ever made; content drift is re-applied and an immutable Secret is logged; one hung call cannot stall the sweep; rm of a declared entry warns that its Secret keeps the value; no stored value reaches the log or the verbs' output" \
+check G20 "the reconciler only gets, creates and updates the Opaque Secrets it created, proven by the UID it recorded, not the label: an unlabelled, foreign, pre-created or recreated Secret is untouched, and no list is ever made, and no delete but an owned immutable Secret's under a UID precondition; content drift is re-applied; one hung call cannot stall the sweep; rm of a declared entry warns that its Secret keeps the value; no stored value reaches the log or the verbs' output" \
 	k3sm/pkg/keystore/deliver::TestReconcilerTouchesOnlyLabelledSecrets TestReconcilerRedeliversOnRotation \
 	TestReconcilerSkipsLabelledNonOpaque TestReconcilerContinuesAfterTargetFailure \
 	TestReconcilerRedeliversAfterRmPut TestReconcilerReappliesChangedDataKey \
@@ -418,6 +418,7 @@ check G20 "the reconciler only gets, creates and updates the Opaque Secrets it c
 	TestReconcilerLogsNoValue TestReconcilerTargetTimeout TestNewTargetTimeout TestWatchLogsErrors \
 	TestStateStockInstallShape TestMissingDeclarationKeepsRecords \
 	TestReconcilerRepointsOwnedSecret TestReconcilerRelabelledOwnedSecret \
+	TestReconcilerImmutableDeleteConflict \
 	k3sm/cmd/k3sm::TestKeysRmWarnsDeclared TestKeysDeliveryPrintsNoValue
 check G21 "the rollback recipe is a byte-exact round trip: show --reveal into rotate --in -, the new version compared with version N byte for byte (bytes.Equal, as cmp), opaque and Ed25519" \
 	k3sm/cmd/k3sm::TestKeysRollbackRoundTrip

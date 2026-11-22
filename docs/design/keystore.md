@@ -811,9 +811,10 @@ backstop, so a Rotate reaches its Secret within one interval.
 **Identity.** The reconciler runs in the server process and uses the admin client that
 process already holds for the embedded add-on reconciler (the `system:masters` admin
 kubeconfig). **It adds no role, no binding and no ServiceAccount.** What it does with that
-client is narrower than the client allows: Get, create and update of one named `Opaque`
-Secret per declared target, labelled as below, and nothing else — no list, no delete, no
-other kind, no Secret it does not own. The set of principals who can cause a write stays
+client is narrower than the client allows: get, create and update of one named `Opaque`
+Secret per declared target, labelled as below; delete only an owned immutable Secret, under a
+UID precondition; and nothing else — no list, no other delete, no other kind, no Secret it
+does not own. The set of principals who can cause a write stays
 {root on the node} because only root can edit the declaration. A bounded ServiceAccount in
 the manner of `kube-system/k3sm-manifests` would need a new Role granting Secret write,
 which widens what the control plane can do; Phase A does not add one. This paragraph holds
@@ -864,8 +865,11 @@ both annotations — content-derived, like the embedded reconciler's own checksu
 version alone is not enough: an entry deleted and put back starts at version 1 again with a
 new value, and `pkg/keystore` exposes no generation, so the value's fingerprint is what
 tells the two apart. A changed `dataKey` re-applies too, and the stale key leaves `data`. An
-`immutable` Secret the reconciler owns cannot be updated; it is logged at Warn once per state change, for the
-operator to delete, and Phase A never deletes it.
+`immutable` Secret the reconciler owns cannot be updated, so a re-delivery deletes it with
+`DeleteOptions{Preconditions: {UID: <recorded UID>}}`, creates it again and records the new
+UID, logging both steps without the value. It is the reconciler's only delete, and it is safe
+because the precondition proves the object is the one this server created; a failed
+precondition deletes and creates nothing.
 
 **Refusal while secrets encryption is off.** Delivery is refused by default; the override
 is explicit, as the maintainer answered on the issue. Two facts the first revision got

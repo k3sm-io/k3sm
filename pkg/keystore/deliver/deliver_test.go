@@ -224,7 +224,8 @@ func (h *harness) verbs() []string {
 }
 
 // assertOnlyGetCreateUpdateSecrets fails on any recorded call that is not a
-// get, create or update of a Secret: no list, no watch, no delete, no other
+// get, create or update of a Secret, or a delete under a UID precondition
+// (an owned immutable Secret's): no list, no watch, no other delete, no other
 // kind.
 func (h *harness) assertOnlyGetCreateUpdateSecrets(t *testing.T) {
 	t.Helper()
@@ -232,8 +233,15 @@ func (h *harness) assertOnlyGetCreateUpdateSecrets(t *testing.T) {
 		switch {
 		case a.GetResource().Resource != "secrets":
 			t.Errorf("touched another kind: %s %s", a.GetVerb(), a.GetResource().Resource)
+		case a.GetVerb() == "delete":
+			// The one delete allowed: an owned immutable Secret, under a
+			// precondition on its UID.
+			d, ok := a.(k8stesting.DeleteAction)
+			if !ok || d.GetDeleteOptions().Preconditions == nil || d.GetDeleteOptions().Preconditions.UID == nil || *d.GetDeleteOptions().Preconditions.UID == "" {
+				t.Errorf("made a delete without a UID precondition")
+			}
 		case a.GetVerb() != "get" && a.GetVerb() != "create" && a.GetVerb() != "update":
-			t.Errorf("made a %s call on secrets; only get, create and update are allowed", a.GetVerb())
+			t.Errorf("made a %s call on secrets; only get, create, update and a UID-preconditioned delete are allowed", a.GetVerb())
 		}
 	}
 }
@@ -967,10 +975,64 @@ func TestReconcilerReappliesDrift(t *testing.T) {
 	}
 }
 
-// TestReconcilerImmutableOwned: an immutable Secret the reconciler owns
-// cannot be updated, so it is not, and the reason is logged at Warn once per
-// state change, telling the operator to delete it (G20).
+// TestReconcilerImmutableOwned: an immutable Secret the server owns cannot
+// be updated, so a rotation deletes it under a UID precondition (the only
+// delete the reconciler makes), creates it again with the new value, and
+// records the new UID; both steps are logged without the value (G20).
 func TestReconcilerImmutableOwned(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("immutable-one"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	s := h.secret(t, "payments", "api-token")
+	oldUID := s.UID
+	yes := true
+	s.Immutable = &yes
+	if _, err := h.client.CoreV1().Secrets("payments").Update(ctx, s, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h.client.ClearActions()
+	h.store.set("api-token", 2, []byte("immutable-two"))
+	h.r.Sweep(ctx)
+	got := h.secret(t, "payments", "api-token")
+	if string(got.Data[DefaultDataKey]) != "immutable-two" || got.UID == oldUID || got.UID == "" {
+		t.Fatalf("the rotation did not land on a recreated Secret: %q, uid %q (was %q)", got.Data[DefaultDataKey], got.UID, oldUID)
+	}
+	if n := h.updates(); n != 0 {
+		t.Fatalf("an immutable Secret drew %d updates", n)
+	}
+	var deletes int
+	for _, a := range h.client.Actions() {
+		if d, ok := a.(k8stesting.DeleteAction); ok {
+			deletes++
+			pre := d.GetDeleteOptions().Preconditions
+			if pre == nil || pre.UID == nil || *pre.UID != oldUID {
+				t.Fatalf("the delete carries no precondition on the owned UID %q: %+v", oldUID, pre)
+			}
+		}
+	}
+	if deletes != 1 {
+		t.Fatalf("got %d deletes, want 1: %v", deletes, h.verbs())
+	}
+	h.assertOnlyGetCreateUpdateSecrets(t)
+	st, err := ReadState(filepath.Join(h.dir, StateFileName), OpenNoFollow, StateDirCheck(uint32(os.Geteuid())), StateFileCheck(uint32(os.Geteuid())))
+	if err != nil || st.UID("payments", "api-token") != string(got.UID) {
+		t.Fatalf("the new UID is not recorded (%q, %v), want %q", st.UID("payments", "api-token"), err, got.UID)
+	}
+	logs := h.logs.String()
+	if !strings.Contains(logs, "immutable") || !strings.Contains(logs, "re-created") {
+		t.Fatalf("the delete and the create are not both logged\n%s", logs)
+	}
+	if strings.Contains(logs, "immutable-one") || strings.Contains(logs, "immutable-two") {
+		t.Fatalf("the log carries a value\n%s", logs)
+	}
+}
+
+// TestReconcilerImmutableDeleteConflict: when the UID precondition fails (the
+// object is not the one recorded), the delete is refused and nothing is
+// created (G20).
+func TestReconcilerImmutableDeleteConflict(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("one"))
 	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
@@ -982,19 +1044,19 @@ func TestReconcilerImmutableOwned(t *testing.T) {
 	if _, err := h.client.CoreV1().Secrets("payments").Update(ctx, s, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	h.client.PrependReactor("delete", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewConflict(corev1.Resource("secrets"), "api-token", errors.New("Precondition failed: UID in precondition"))
+	})
 	h.client.ClearActions()
 	h.store.set("api-token", 2, []byte("two"))
 	h.r.Sweep(ctx)
-	h.r.Sweep(ctx)
-	if n := h.updates(); n != 0 {
-		t.Fatalf("an immutable Secret drew %d updates: %v", n, h.verbs())
+	for _, v := range h.verbs() {
+		if v == "create/secrets" || v == "update/secrets" {
+			t.Fatalf("a refused delete was followed by %s: %v", v, h.verbs())
+		}
 	}
-	logs := h.logs.String()
-	if n := strings.Count(logs, `level=WARN msg="keystore delivery: Secret is immutable`); n != 1 {
-		t.Fatalf("logged the immutable Secret %d times over two sweeps, want once at Warn\n%s", n, logs)
-	}
-	if !strings.Contains(logs, "delete it") {
-		t.Fatalf("the warning does not tell the operator to delete it\n%s", logs)
+	if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "one" {
+		t.Fatalf("the Secret changed: %q", got)
 	}
 }
 

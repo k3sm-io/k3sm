@@ -88,7 +88,8 @@ type Config struct {
 	StateDirOwners []uint32
 	// Client is the server's admin client, the one the embedded add-on
 	// reconciler uses. The reconciler only Gets, creates and updates Secrets
-	// through it.
+	// through it, and deletes an owned immutable one under a UID
+	// precondition.
 	Client kubernetes.Interface
 	// Store supplies each entry's current version.
 	Store ValueSource
@@ -101,7 +102,8 @@ type Config struct {
 }
 
 // Reconciler converges one labelled Opaque Secret per declared target. It
-// never lists, never deletes and never touches another kind (see doc.go).
+// never lists, deletes only an owned immutable Secret under a UID
+// precondition, and never touches another kind (see doc.go).
 //
 // Sweep and Run never return an error: every failure is logged here, at the
 // boundary that handles it, and the sweep moves on to the next target.
@@ -407,9 +409,7 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 		return
 	}
 	if cur.Immutable != nil && *cur.Immutable {
-		r.note(t, "immutable:"+want+":"+ver.Fingerprint, slog.LevelWarn,
-			"Secret is immutable, so it cannot be re-delivered; delete it and the next sweep creates it again",
-			"version", ver.Version)
+		r.recreateImmutable(ctx, sw, t, cur, ver, want, value)
 		return
 	}
 	if stamped && !current {
@@ -440,6 +440,26 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 	r.note(t, "ok:"+want, slog.LevelInfo, "re-delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
 }
 
+// recreateImmutable re-delivers an immutable Secret this server owns, which
+// cannot be updated: it deletes it under a precondition on the recorded UID,
+// so only that object can go, then creates it again and records the new UID.
+// It is the only delete the reconciler makes. A refused delete (the
+// precondition failed, or any error) creates nothing.
+func (r *Reconciler) recreateImmutable(ctx context.Context, sw *sweep, t Target, cur *corev1.Secret, ver keystore.Version, want string, value []byte) {
+	uid := cur.UID
+	err := r.client.CoreV1().Secrets(t.Namespace).Delete(ctx, t.Secret(), metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+	if err != nil && !apierrors.IsNotFound(err) {
+		r.note(t, "error:delete:"+err.Error(), slog.LevelWarn, "cannot delete the immutable Secret to re-deliver it; will retry", "err", err)
+		return
+	}
+	r.logger.Info("keystore delivery: deleted an immutable Secret this server created, to re-create it at the current version",
+		"entry", t.Entry, "namespace", t.Namespace, "secret", t.Secret(), "version", ver.Version)
+	if r.create(ctx, sw, t, ver, want, value) {
+		r.logger.Info("keystore delivery: re-created the immutable Secret",
+			"entry", t.Entry, "namespace", t.Namespace, "secret", t.Secret(), "version", ver.Version)
+	}
+}
+
 // notOurs is why cur is not a Secret this server created for t, or "" when it
 // is: it carries the UID recorded when this server created it. The UID alone
 // decides. The label proves nothing either way: a namespace writer can set it
@@ -467,11 +487,11 @@ func (r *Reconciler) notOurs(sw *sweep, t Target, cur *corev1.Secret) string {
 // create creates t's Secret and records its UID. The state file is written
 // before the first create of a sweep, so a Secret is never created that
 // could not then be recorded, and again after the create with the new UID.
-func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keystore.Version, want string, value []byte) {
+func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keystore.Version, want string, value []byte) bool {
 	if !sw.recorded {
 		if err := WriteState(r.statePath, sw.state, r.stateDirCheck, r.chown); err != nil {
 			r.note(t, "error:state:"+err.Error(), slog.LevelWarn, "cannot write the state file, so the Secret is not created; will retry", "file", r.statePath, "err", err)
-			return
+			return false
 		}
 		sw.recorded = true
 	}
@@ -489,18 +509,19 @@ func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keysto
 	created, err := secrets.Create(ctx, s, metav1.CreateOptions{})
 	if err != nil {
 		r.note(t, "error:create:"+err.Error(), slog.LevelWarn, "cannot create the Secret; will retry", "err", err)
-		return
+		return false
 	}
 	if created.UID == "" {
 		r.note(t, "error:uid", slog.LevelError, "the created Secret has no UID, so it cannot be recorded and is left alone; delete it")
-		return
+		return false
 	}
 	sw.state.Set(t.Namespace, t.Secret(), string(created.UID))
 	if err := WriteState(r.statePath, sw.state, r.stateDirCheck, r.chown); err != nil {
 		r.note(t, "error:record:"+err.Error(), slog.LevelError, "created the Secret but cannot record it, so later sweeps leave it alone; delete it to have it created again", "file", r.statePath, "err", err)
-		return
+		return false
 	}
 	r.note(t, "ok:"+want, slog.LevelInfo, "delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
+	return true
 }
 
 // upToDate reports whether a Secret this server owns holds the current

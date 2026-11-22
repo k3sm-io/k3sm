@@ -187,9 +187,9 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
   minute. The Secret's `k3sm.io/keystore-version` annotation says which version it holds.
 - **Edits are undone.** The server compares the Secret's data with the stored value, so a hand
   edit is put back within a minute, and logged without the value.
-- **An immutable Secret is stuck.** If someone sets `immutable: true` on a Secret the server
-  delivered, the server cannot update it, and logs a warning each time that changes. Delete the
-  Secret with kubectl; the server creates it again. The server never deletes it for you.
+- **An immutable Secret is re-created.** If someone sets `immutable: true` on a Secret the server
+  delivered, the server cannot update it. At the next change it deletes that Secret, only if
+  its UID is still the recorded one, creates it again with the current value, and logs both steps.
 - **Only its own Secrets.** The server labels each Secret it creates
   `k3sm.io/keystore-delivery: <entry>`, and records the Secret's UID in
   `/var/lib/k3sm/server/keystore-delivery-state.json` (owned by the server's user, mode 0600).
@@ -197,7 +197,8 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
   removed or changed it. Anyone who can write Secrets in the namespace can set the label, so the
   label alone does not count: a Secret of that name that someone else created first, or that was deleted and created
   again, is "not created by this server". The server leaves it alone and logs why: delete it, or
-  pick another `--secret`. The server never lists Secrets and never deletes one.
+  pick another `--secret`. The server never lists Secrets, and deletes one only to re-create an
+  immutable Secret it created.
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
   declaration (with `--secret S`, only the one into Secret `S`), and prints: the Secret stays; delete it with kubectl, and rotate the entry to
   revoke. A Pod that read the value still has it, which is why revoking it means rotating.
