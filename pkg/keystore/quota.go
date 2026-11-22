@@ -175,11 +175,16 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 
 // deleteBody is delete's work under the lock.
 func (u *UserScope) deleteBody(root *os.Root, name string) error {
-	entries, gen, err := u.openEntriesForRevoke(root)
+	// A scope.key that cannot be read refuses the rm before anything is
+	// written; entries/ that cannot be opened (entErr) is judged after the
+	// owner check, below.
+	entries, gen, entErr, err := u.openEntriesForRevoke(root)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = entries.Close() }() // every removal is fsynced
+	if entries != nil {
+		defer func() { _ = entries.Close() }() // every removal is fsynced
+	}
 	// Only a real, different answer refuses; a lookup that ran and failed
 	// or timed out is no answer, and rm goes ahead. One refused for
 	// capacity, where no lookup ran, refuses rm, retryably: going ahead on
@@ -191,10 +196,17 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	case err == nil && live != gen:
 		return fmt.Errorf("%w: uid %d", ErrScopeOwnerChanged, u.uid)
 	}
+	if entErr != nil {
+		// The scope is the owner's and entries/ cannot be opened (missing,
+		// or not what the store made): bury the floor's live generations
+		// for the name first, so a tree put back is refused, then report it.
+		return u.buryThen(name, entErr)
+	}
 	fi, err := entries.Lstat(name)
 	absent := errors.Is(err, fs.ErrNotExist)
 	if err != nil && !absent {
-		return err
+		// The name cannot be judged: bury, then report the Lstat's error.
+		return u.buryThen(name, err)
 	}
 	// The floor's live generations for the name, first and in every branch:
 	// whatever stands at the name, or nothing, rm buries them, so a retried
@@ -298,6 +310,34 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		return fmt.Errorf("%w, but %w", errCommitted, rerr)
 	}
 	return nil
+}
+
+// buryThen buries the floor's live generations for name, then returns
+// cause: wrapped in errCommitted when it buried any, so the rm is audited as
+// a revocation, and alone when the floor holds none live. A floor that
+// cannot be read, or that does not take a tombstone, refuses the rm with
+// nothing written.
+func (u *UserScope) buryThen(name string, cause error) error {
+	floorLive, err := u.s.userFloor.liveGens(u.scope, name)
+	if err != nil {
+		if aerr := u.s.admit(u.uid, false); aerr != nil {
+			return aerr
+		}
+		return fmt.Errorf("rm refused, nothing removed: read the user-scope floor's generations for the name: %w (and: %w)", err, cause)
+	}
+	if len(floorLive) == 0 {
+		if err := u.s.admit(u.uid, false); err != nil {
+			return err
+		}
+		return cause
+	}
+	if err := u.s.admit(u.uid, true); err != nil {
+		return err
+	}
+	if err := newBurial(name, floorLive).bury(u); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w, but nothing was removed; rm buried the floor's live generations: %w", errCommitted, cause)
 }
 
 // errRmNoGeneration refuses an rm, before anything is removed, when no
@@ -468,24 +508,25 @@ func headerGeneration(dir *os.Root, file, name string, pointer bool) ([generatio
 
 // openEntriesForRevoke opens the scope's entries/ for an rm: the scope
 // directory must hold a scope.key the store trusts, which is not opened. It
-// returns the generation the scope.key record carries.
-func (u *UserScope) openEntriesForRevoke(root *os.Root) (*os.Root, [generationSize]byte, error) {
-	var zero [generationSize]byte
+// returns the generation the scope.key record carries. err is a scope
+// directory or scope.key that cannot be read; entErr, with entries nil, is
+// an entries/ that cannot be opened once the scope.key has read.
+func (u *UserScope) openEntriesForRevoke(root *os.Root) (entries *os.Root, gen [generationSize]byte, entErr, err error) {
 	dir, err := u.openScopeDir(root, false)
 	if err != nil {
-		return nil, zero, err
+		return nil, gen, nil, err
 	}
 	defer func() { _ = dir.Close() }() // nothing is written in the scope directory
 	r, err := u.s.readScopeKeyRecord(dir)
 	if err != nil {
-		return nil, zero, err
+		return nil, gen, nil, err
 	}
-	entries, err := u.s.openSubdir(dir, scopeEntriesName, false)
+	entries, err = u.s.openSubdir(dir, scopeEntriesName, false)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, zero, fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent)
+		return nil, r.generation, fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent), nil
 	}
 	if err != nil {
-		return nil, zero, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err)
+		return nil, r.generation, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err), nil
 	}
-	return entries, r.generation, nil
+	return entries, r.generation, nil, nil
 }
