@@ -470,7 +470,10 @@ buried set, oldest first:
   fit. The residual of a pruned burial is the behaviour before this change: an old copy of
   that deleted entry put back under its name is accepted, unless the name's live entry of
   another generation refuses it. The oldest burials are the longest-revoked keys, and any
-  root-run churn, bulk puts included, can evict them, so every drop is visible: each prune,
+  root-run churn, bulk puts included, can evict them. That is also why no unprivileged caller
+  may ever drive Put or Delete of the system store: pruning is root-only on the assumption that
+  only root makes the writes that churn the floor, and a caller that could drive them could
+  evict any revoked key's burial at will. So every drop is visible: each prune,
   the per-name cap's included, logs at Warn through `log/slog` with the count and the names.
   A Delete whose floor writes drop any burial, its own new one, another name's, or the name's
   oldest at the per-name cap, fails with `ErrTombstoneEvicted`, naming the count (the floor
@@ -492,6 +495,12 @@ buried set, oldest first:
   with a `current` under a name the floor records nothing live for, whose generation it does
   not already bury, logs this residual at Warn, naming the remedy: rerun `rm` with the master.
   That covers a master-less Delete and, with the master, a pointer that does not authenticate.
+  *Residual (a directory's generation waits for `.lock`).* A Delete of a name with no live
+  floor record buries nothing until it holds `keystore/.lock`: the directory's generation is
+  buried only once the master opens its pointer, and that read is under `.lock`, which the
+  service user can hold past the bounded wait or replace. Such a Delete therefore records
+  nothing while `.lock` is unavailable, unlike the burial of a live record, which lands under
+  `keystore-lock` alone. Recorded, not built.
 - *Format.* The floor stays format version 1: nothing has shipped, so this is a hard cut with
   no migration. `tombstones` is optional and comes after `entries`; a verb writes it only when
   the floor holds a tombstone, so `"tombstones":{}` is not the encoding a verb writes and is
