@@ -23,11 +23,12 @@ import (
 
 // memFloor is an in-memory user-scope floor: the lines in order, read by
 // the floor's rule (the highest seq per scope, name and generation). failAppend,
-// when set, fails every append.
+// when set, fails every append, and failRead every read.
 type memFloor struct {
 	mu         sync.Mutex
 	lines      []memFloorLine
 	failAppend bool
+	failRead   bool
 }
 
 type memFloorLine struct {
@@ -39,6 +40,9 @@ type memFloorLine struct {
 func (f *memFloor) floor(scope, name string, gen [generationSize]byte) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failRead {
+		return 0, errors.New("injected floor read failure")
+	}
 	var max uint64
 	for _, l := range f.lines {
 		if l.scope == scope && l.name == name && l.gen == gen && l.seq > max {
@@ -58,15 +62,19 @@ func (f *memFloor) append(scope, name string, gen [generationSize]byte, seq uint
 	return nil
 }
 
-// memAudit is an in-memory audit sink.
+// memAudit is an in-memory audit sink. fail, when set, fails every append.
 type memAudit struct {
 	mu    sync.Mutex
 	lines []auditLine
+	fail  bool
 }
 
 func (a *memAudit) append(l auditLine) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.fail {
+		return errors.New("injected audit append failure")
+	}
 	a.lines = append(a.lines, l)
 	return nil
 }

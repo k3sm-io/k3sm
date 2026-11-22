@@ -482,22 +482,65 @@ func (u *UserScope) readScopeKey(dir *os.Root, wrap func() (keys, error)) ([]byt
 	if err != nil {
 		return nil, zero, err
 	}
-	ku, err := r.open(k.wrap, u.scope)
-	if err != nil && errors.Is(err, ErrCorrupt) && k.next != nil && k.next.wrap != nil {
-		ku, err = r.open(k.next.wrap, u.scope)
-	}
+	ku, err := u.openScopeKey(r, k)
 	if err != nil {
-		return nil, zero, fmt.Errorf("%s: %w", scopeKeyName, err)
-	}
-	if len(ku) != scopeKeySize {
-		clear(ku)
-		return nil, zero, fmt.Errorf("%w: %s holds %d bytes, want %d", ErrCorrupt, scopeKeyName, len(ku), scopeKeySize)
+		return nil, zero, err
 	}
 	if r.generation != live {
 		clear(ku)
 		return nil, zero, fmt.Errorf("%w: uid %d", ErrScopeOwnerChanged, u.uid)
 	}
 	return ku, r.generation, nil
+}
+
+// openScopeKey opens the scope.key record r under k's W and, failing that,
+// under master.next's W when k carries one, and returns K_u, which the
+// caller clears.
+func (u *UserScope) openScopeKey(r record, k keys) ([]byte, error) {
+	ku, err := r.open(k.wrap, u.scope)
+	if err != nil && errors.Is(err, ErrCorrupt) && k.next != nil && k.next.wrap != nil {
+		ku, err = r.open(k.next.wrap, u.scope)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", scopeKeyName, err)
+	}
+	if len(ku) != scopeKeySize {
+		clear(ku)
+		return nil, fmt.Errorf("%w: %s holds %d bytes, want %d", ErrCorrupt, scopeKeyName, len(ku), scopeKeySize)
+	}
+	return ku, nil
+}
+
+// openScopeForRevoke opens the scope for a revocation: a withdraw, which
+// only ever adds a tombstone. It reads no live GeneratedUID: the bound
+// generation is the one scope.key's record authenticates under W, so a
+// directory service that is slow, down, or answering for a new owner of the
+// uid never keeps a revoked credential delivered. It opens scope.key under
+// the live W or master.next's, so it runs at every step of a Rewrap, and
+// needs no entries/ directory.
+func (u *UserScope) openScopeForRevoke(root *os.Root, k keys) (*openedScope, error) {
+	dir, err := u.openScopeDir(root, false)
+	if err != nil {
+		return nil, err
+	}
+	r, err := u.s.readScopeKeyRecord(dir)
+	var ku []byte
+	if err == nil {
+		ku, err = u.openScopeKey(r, k)
+	}
+	if err != nil {
+		_ = dir.Close() // read-only so far
+		return nil, err
+	}
+	uk, err := deriveKeys(ku, u.scope)
+	dk := deliveriesKey(ku, u.scope)
+	clear(ku) // only the derived keys are kept
+	if err != nil {
+		clear(dk)
+		_ = dir.Close() // read-only so far
+		return nil, err
+	}
+	return &openedScope{dir: dir, key: dk, gen: r.generation, uk: uk}, nil
 }
 
 // readScopeKeyRecord reads and parses dir's scope.key, unopened. The file

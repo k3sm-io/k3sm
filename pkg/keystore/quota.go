@@ -102,10 +102,12 @@ func entryBytes(entries *os.Root, name string) (int64, error) {
 }
 
 // Delete removes input and every version of it from the caller's scope:
-// rm. It is never refused for a quota, since it is how room is made. Like
-// Put it opens the scope first, so the GeneratedUID check runs, never mints,
-// and refuses while a Rewrap is half done. An entry directory without a
-// current pointer, which the user scope reads as damage, is removed too.
+// rm. It is never refused for a quota, since it is how room is made, and,
+// as a revocation, never for the owner's GeneratedUID lookup or a Rewrap
+// half done: it only removes files, so it needs neither W nor K_u, and
+// opens no record. The scope must still have its scope.key, as every user
+// verb's scope must. An entry directory without a current pointer, which
+// the user scope reads as damage, is removed too.
 func (u *UserScope) Delete(ctx context.Context, input string) error {
 	if err := u.delete(ctx, input); err != nil {
 		return fail("rm", err)
@@ -129,11 +131,7 @@ func (u *UserScope) delete(ctx context.Context, input string) error {
 		return err
 	}
 	defer done()
-	k, err := u.masterForWrite()
-	if err != nil {
-		return err
-	}
-	_, entries, err := u.openScope(root, func() (keys, error) { return k, nil })
+	entries, err := u.openEntriesForRevoke(root)
 	if err != nil {
 		return err
 	}
@@ -169,4 +167,25 @@ func (u *UserScope) delete(ctx context.Context, input string) error {
 		return err
 	}
 	return syncDir(entries)
+}
+
+// openEntriesForRevoke opens the scope's entries/ for an rm: the scope
+// directory must hold a scope.key the store trusts, which is not opened.
+func (u *UserScope) openEntriesForRevoke(root *os.Root) (*os.Root, error) {
+	dir, err := u.openScopeDir(root, false)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = dir.Close() }() // nothing is written in the scope directory
+	if _, err := u.s.readScopeKeyRecord(dir); err != nil {
+		return nil, err
+	}
+	entries, err := u.s.openSubdir(dir, scopeEntriesName, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err)
+	}
+	return entries, nil
 }

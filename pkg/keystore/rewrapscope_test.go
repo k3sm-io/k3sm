@@ -164,6 +164,15 @@ func TestRewrapRewrapsScopeKeysResumable(t *testing.T) {
 			checkRewrapValues(t, s, vals)
 			checkUserScopeReads(t, u)
 			checkTreeUnchanged(t, before, userRecords(t, server))
+			// Revocation goes ahead at every step, the scope.key moved
+			// under master.next before the swap included (U13, U109).
+			if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil {
+				t.Fatalf("withdraw after a crash at %s: %v", step, err)
+			}
+			if d, err := u.lookupDelivery(ctx, testDelivery(1).uid); err != nil || !d.withdrawn {
+				t.Fatalf("delivery after the withdraw: withdrawn %v, %v", d.withdrawn, err)
+			}
+			before = userRecords(t, server)
 			_, nerr := os.Lstat(masterPath(server, masterNextName))
 			_, ferr := os.Lstat(masterPath(server, masterNextFingerprintName))
 			if nerr == nil || ferr == nil {

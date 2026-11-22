@@ -375,6 +375,15 @@ func (o *openedScope) close() {
 // 0600, of kind 0xFD named deliveries, at the scope's bound generation, and
 // at or above the floor's sequence for that generation.
 func (u *UserScope) readDeliveries(o *openedScope) ([]delivery, uint64, error) {
+	return u.readDeliveriesFloor(o, false)
+}
+
+// readDeliveriesFloor is readDeliveries. With revoke set, a floor that
+// cannot be read skips the floor check rather than refuse: a withdraw only
+// adds a tombstone, so it goes ahead without the floor (the residual is
+// named in docs/design/keystore.md § "Quotas", "Revocation always
+// succeeds").
+func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) ([]delivery, uint64, error) {
 	b, fi, err := readFile(o.dir, deliveriesName, maxDeliveriesRecordSize)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -395,10 +404,10 @@ func (u *UserScope) readDeliveries(o *openedScope) ([]delivery, uint64, error) {
 		return nil, 0, fmt.Errorf("%w: %s is not bound to this scope's owner", ErrCorrupt, deliveriesName)
 	}
 	fl, err := u.s.userFloor.floor(u.scope, deliveriesFloorName, o.gen)
-	if err != nil {
+	if err != nil && !revoke {
 		return nil, 0, err
 	}
-	if r.version < fl {
+	if err == nil && r.version < fl {
 		return nil, 0, fmt.Errorf("%w: the %s record (sequence %d) is older than the user-scope floor (sequence %d); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, fl)
 	}
 	pt, err := r.open(o.key, u.scope)
@@ -436,8 +445,16 @@ func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSiz
 	if err := u.s.writeFile(dir, deliveriesName, b); err != nil {
 		return err
 	}
-	return u.s.userFloor.append(u.scope, deliveriesFloorName, gen, seq)
+	if err := u.s.userFloor.append(u.scope, deliveriesFloorName, gen, seq); err != nil {
+		return fmt.Errorf("%w, and its floor line was not written: %w", errCommitted, err)
+	}
+	return nil
 }
+
+// errCommitted marks an error after a change was committed: the change
+// stands, and what follows it (a floor line, an audit line) was not
+// written.
+var errCommitted = errors.New("the change was made")
 
 // deliveriesKey derives the delivery-record key from K_u.
 func deliveriesKey(ku []byte, scope string) []byte {
@@ -529,27 +546,47 @@ func (u *UserScope) withdrawDelivery(ctx context.Context, uid string) error {
 	return nil
 }
 
+// withdrawLocked needs neither the owner's live GeneratedUID nor a floor it
+// can read, and runs with master.next present (openScopeForRevoke). An
+// already withdrawn UID re-appends the record's floor line, in case the
+// withdraw that wrote the tombstone could not: the floor keeps the highest
+// sequence, so a repeat is idempotent.
 func (u *UserScope) withdrawLocked(ctx context.Context, uid string) error {
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
-	return u.writeLocked(ctx, false, func(o *openedScope) error {
-		ds, seq, err := u.readDeliveries(o)
-		if err != nil {
-			return err
+	root, done, err := u.s.openLocked(ctx, false, true)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
+	}
+	if err != nil {
+		return err
+	}
+	defer done()
+	k, err := u.s.loadMaster()
+	if err != nil {
+		return err
+	}
+	o, err := u.openScopeForRevoke(root, k)
+	if err != nil {
+		return err
+	}
+	defer o.close()
+	ds, seq, err := u.readDeliveriesFloor(o, true)
+	if err != nil {
+		return err
+	}
+	for i := range ds {
+		if ds[i].uid != uid {
+			continue
 		}
-		for i := range ds {
-			if ds[i].uid != uid {
-				continue
-			}
-			if ds[i].withdrawn {
-				return nil
-			}
-			ds[i].withdrawn = true
-			return u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1)
+		if ds[i].withdrawn {
+			return u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq)
 		}
-		return ErrNotFound
-	})
+		ds[i].withdrawn = true
+		return u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1)
+	}
+	return ErrNotFound
 }
 
 // writeLocked runs fn on the opened scope under the exclusive lock. With
