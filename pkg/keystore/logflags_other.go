@@ -28,3 +28,11 @@ import (
 func fileFlags(*os.File) (uint32, error) {
 	return 0, errors.New("file flags are read on darwin only")
 }
+
+// fdFlags is the st_flags source for a directory. Off darwin there are no
+// file flags.
+func fdFlags(int) (uint32, error) { return 0, nil }
+
+// fdHasACL reports an extended ACL. Off darwin it is not read, and every log
+// is refused all the same (fileFlags).
+func fdHasACL(int) (bool, error) { return false, nil }

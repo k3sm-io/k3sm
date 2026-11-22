@@ -138,7 +138,7 @@ var (
 	errLogNotAppendOnly = errors.New("the keystore append-only log is not flagged append-only (SF_APPEND is clear), so it could be truncated or rewritten: a restore must end with sudo k3sm keys floor --rebuild and sudo k3sm keys audit --rotate")
 	// errLogUntrusted is a log, or the data root holding it, that is not
 	// what install makes.
-	errLogUntrusted = errors.New("the keystore append-only log is not trusted: it must be a regular file with one link, owned by the service user, mode 0600, in a data root owned by root and not group- or other-writable")
+	errLogUntrusted = errors.New("the keystore append-only log is not trusted: it must be a regular file with one link, owned by the service user, mode 0600, with no file flag but SF_APPEND and no extended ACL, in a data root owned by root, not group- or other-writable, with no such flag or ACL either")
 	// errLogNoSpace refuses an append because the log's file system has
 	// less than logFreeMargin free beyond the line: retryable once space
 	// is freed, never damage, and nothing was written.
@@ -352,6 +352,10 @@ func (s *FileStore) openLogDataRoot() (int, error) {
 		_ = unix.Close(dfd) // abandoned
 		return -1, fmt.Errorf("%w: the data root %s is owned by uid %d at mode %04o", errLogUntrusted, s.dataRoot, st.Uid, st.Mode&0o7777)
 	}
+	if err := judgeFlagsACL(dfd, fdFlags); err != nil {
+		_ = unix.Close(dfd) // abandoned
+		return -1, fmt.Errorf("the data root %s: %w", s.dataRoot, err)
+	}
 	return dfd, nil
 }
 
@@ -408,6 +412,30 @@ func (s *FileStore) judgeLog(f *os.File, st *unix.Stat_t) error {
 	}
 	if flags&sfAppend == 0 {
 		return errLogNotAppendOnly
+	}
+	return judgeFlagsACL(int(f.Fd()), func(int) (uint32, error) { return flags, nil })
+}
+
+// judgeFlagsACL refuses, as errLogUntrusted, the descriptor fd when its
+// st_flags, read through flags, carry any bit beside SF_APPEND (an
+// immutable or user append-only flag install never sets, and which an owner
+// who set it could clear), or when it carries a non-empty extended ACL,
+// which can grant what the mode does not show. An ACL that cannot be read is
+// refused too.
+func judgeFlagsACL(fd int, flags func(int) (uint32, error)) error {
+	fl, err := flags(fd)
+	if err != nil {
+		return fmt.Errorf("%w: read its flags: %w", errLogUntrusted, err)
+	}
+	if extra := fl &^ sfAppend; extra != 0 {
+		return fmt.Errorf("%w: flags %#x beside SF_APPEND", errLogUntrusted, extra)
+	}
+	acl, err := fdHasACL(fd)
+	if err != nil {
+		return fmt.Errorf("%w: read its ACL: %w", errLogUntrusted, err)
+	}
+	if acl {
+		return fmt.Errorf("%w: it carries an extended ACL", errLogUntrusted)
 	}
 	return nil
 }

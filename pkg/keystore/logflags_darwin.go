@@ -17,7 +17,9 @@ limitations under the License.
 package keystore
 
 import (
+	"encoding/binary"
 	"os"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -30,4 +32,74 @@ func fileFlags(f *os.File) (uint32, error) {
 		return 0, err
 	}
 	return st.Flags, nil
+}
+
+// fdFlags is the st_flags of the open descriptor fd, read with fstat.
+func fdFlags(fd int) (uint32, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return 0, err
+	}
+	return st.Flags, nil
+}
+
+// The fgetattrlist layout fdHasACL reads (<sys/attr.h>, <sys/kauth.h>).
+const (
+	// fsoptPackInvalAttrs is FSOPT_PACK_INVAL_ATTRS: every requested
+	// attribute keeps its slot, so the reply's layout is fixed.
+	fsoptPackInvalAttrs = 0x8
+	// aclReplyRef is the offset of the attrreference_t of
+	// ATTR_CMN_EXTENDED_SECURITY: after the reply's length and its
+	// attribute_set_t of returned attributes.
+	aclReplyRef = 4 + 5*4
+	// filesecMagic is KAUTH_FILESEC_MAGIC, and filesecEntryCount the offset
+	// of fsec_entrycount in a kauth_filesec: after the magic and the owner
+	// and group GUIDs.
+	filesecMagic      = 0x012cc16d
+	filesecEntryCount = 4 + 16 + 16
+	// filesecNoACL is KAUTH_FILESEC_NOACL, an entry count meaning no ACL.
+	filesecNoACL = 0xffffffff
+	// aclReplySize holds the reply's fixed part and a kauth_filesec header;
+	// a longer ACL is truncated, which keeps the entry count.
+	aclReplySize = 512
+)
+
+// fdHasACL reports whether the open descriptor fd carries a non-empty
+// extended ACL, read with fgetattrlist(2) for ATTR_CMN_EXTENDED_SECURITY,
+// which any caller that can stat the file may ask, root or not. x/sys/unix
+// wraps no acl_get_fd, and fgetxattr of com.apple.system.Security is EPERM
+// for every caller but root, so the service user could not use it.
+func fdHasACL(fd int) (bool, error) {
+	al := unix.Attrlist{
+		Bitmapcount: unix.ATTR_BIT_MAP_COUNT,
+		Commonattr:  unix.ATTR_CMN_RETURNED_ATTRS | unix.ATTR_CMN_EXTENDED_SECURITY,
+	}
+	buf := make([]byte, aclReplySize)
+	_, _, errno := unix.Syscall6(unix.SYS_FGETATTRLIST, uintptr(fd), uintptr(unsafe.Pointer(&al)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), fsoptPackInvalAttrs, 0)
+	if errno != 0 {
+		return false, errno
+	}
+	le := binary.LittleEndian
+	if le.Uint32(buf) < aclReplyRef+8 {
+		return false, unix.EINVAL
+	}
+	// The returned common attributes follow the length.
+	if le.Uint32(buf[4:])&unix.ATTR_CMN_EXTENDED_SECURITY == 0 {
+		return false, nil
+	}
+	off := int64(aclReplyRef) + int64(int32(le.Uint32(buf[aclReplyRef:])))
+	size := int64(le.Uint32(buf[aclReplyRef+4:]))
+	if size == 0 {
+		return false, nil
+	}
+	if size < filesecEntryCount+4 || off < 0 || off+filesecEntryCount+4 > int64(len(buf)) {
+		// A security attribute this reader cannot see into is refused.
+		return true, nil
+	}
+	sec := buf[off:]
+	if le.Uint32(sec) != filesecMagic {
+		return true, nil
+	}
+	count := le.Uint32(sec[filesecEntryCount:])
+	return count != 0 && count != filesecNoACL, nil
 }

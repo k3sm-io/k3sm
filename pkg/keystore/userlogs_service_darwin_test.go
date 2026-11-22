@@ -279,10 +279,6 @@ func defeatChild(t *testing.T, p, kind string) {
 			}
 		})
 	}
-	// An ACL write: x/sys/unix exposes no ACL call (acl_set_fd is libc's),
-	// and this package does not use cgo, so it is not attempted here.
-	t.Log("not attempted: an ACL write, which x/sys/unix gives no access to")
-
 	// Seek to 0 and write: O_APPEND puts the bytes at the end.
 	if _, err := unix.Seek(rw, 0, io.SeekStart); err != nil {
 		t.Fatal(err)
@@ -293,6 +289,43 @@ func defeatChild(t *testing.T, p, kind string) {
 	want += defeatSeeked
 	if b, err := os.ReadFile(p); err != nil || string(b) != want {
 		t.Fatalf("after seek-then-write the log holds %q (%v), want %q at the end", b, err, want)
+	}
+
+	// Last, since either can stop the appends above if it lands: the owner
+	// setting uchg beside sappnd, and the owner writing an ACL as chmod +a
+	// does (chmodx_np, fchmod_extended; a write of the com.apple.system.Security
+	// xattr is EPERM for every caller but root whatever the file, so it
+	// proves nothing). Each must be refused (EPERM, or a failed chmod), or,
+	// if it lands, the log must be refused by judgeLog.
+	judge := &FileStore{uid: uint32(os.Geteuid()), logFlags: fileFlags}
+	judged := func(what string) {
+		var st unix.Stat_t
+		if err := judge.judgeLog(f, &st); !errors.Is(err, errLogUntrusted) {
+			t.Errorf("%s landed on a flagged log and judgeLog answered %v, want errLogUntrusted", what, err)
+		}
+	}
+	t.Run("owner chflags uchg beside sappnd", func(t *testing.T) {
+		err := unix.Fchflags(fd, sfAppend|unix.UF_IMMUTABLE)
+		switch {
+		case errors.Is(err, unix.EPERM):
+		case err == nil:
+			judged("uchg")
+			t.Logf("uchg landed beside sappnd; clearing it: %v", unix.Fchflags(fd, sfAppend))
+		default:
+			t.Errorf("owner chflags uchg on a flagged log: %v, want EPERM", err)
+		}
+	})
+	t.Run("owner chmod +a", func(t *testing.T) {
+		out, err := exec.Command("/bin/chmod", "+a", "everyone allow write,delete", p).CombinedOutput()
+		if err != nil {
+			t.Logf("chmod +a refused: %v: %s", err, out)
+			return
+		}
+		judged("an ACL")
+		t.Logf("the ACL landed; removing it: %v", exec.Command("/bin/chmod", "-N", p).Run())
+	})
+	if b, err := os.ReadFile(p); err != nil || string(b) != want {
+		t.Fatalf("after the flag and ACL attempts the log holds %q (%v), want %q", b, err, want)
 	}
 }
 
