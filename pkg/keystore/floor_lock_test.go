@@ -300,6 +300,60 @@ func TestFloorLockFileUntrustedRefused(t *testing.T) {
 	}
 }
 
+// TestFloorLockFileRecheckedAfterFlock: once keystore-lock is flocked, it is
+// Lstat'd again through the data root it was opened in, and the verb refuses
+// (errFloorUntrusted) a name that no longer holds the locked file or a file
+// with a second hard link, either of which would let two writers lock
+// different files, or one lock under two names.
+func TestFloorLockFileRecheckedAfterFlock(t *testing.T) {
+	ctx := context.Background()
+	lockPath := func(s *FileStore) string { return filepath.Join(s.dataRoot, floorLockName) }
+	t.Run("hard-linked", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("a"))
+		before := floorOf(t, server)
+		if err := os.Link(lockPath(s), lockPath(s)+".link"); err != nil {
+			t.Fatal(err)
+		}
+		for op, fn := range floorVerbs(ctx, s) {
+			if err := fn(); !errors.Is(err, errFloorUntrusted) || !strings.Contains(err.Error(), floorLockName) {
+				t.Fatalf("%s over a hard-linked %s: %v, want errFloorUntrusted naming it", op, floorLockName, err)
+			}
+		}
+		if after := floorOf(t, server); !maps.Equal(after, before) {
+			t.Fatalf("floor after the refused verbs = %+v, was %+v", after, before)
+		}
+	})
+	t.Run("replaced after the open", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "a", KindOpaque, []byte("a"))
+		before := floorOf(t, server)
+		replaced := 0
+		// The hook runs after the flock, before the re-check: a new file of
+		// the same owner and mode is renamed over the name.
+		s.dataRootLocked = func() {
+			replaced++
+			tmp := lockPath(s) + ".new"
+			if err := os.WriteFile(tmp, nil, floorLockMode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(tmp, lockPath(s)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s.Rotate(ctx, "a", []byte("b")); !errors.Is(err, errFloorUntrusted) || !strings.Contains(err.Error(), floorLockName) {
+			t.Fatalf("Rotate over a %s replaced after its open: %v, want errFloorUntrusted naming it", floorLockName, err)
+		}
+		if replaced != 1 {
+			t.Fatalf("the lock file was replaced %d times, want 1", replaced)
+		}
+		if after := floorOf(t, server); !maps.Equal(after, before) {
+			t.Fatalf("floor after the refused Rotate = %+v, was %+v", after, before)
+		}
+		mustCurrent(t, s, "a", "a")
+	})
+}
+
 // TestFloorLockFileCreated: the first verb that writes the floor creates
 // keystore-lock in the data root, a regular file owned by the floor's owner
 // (root in production) and mode 0600.

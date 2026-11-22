@@ -130,8 +130,8 @@ type FileStore struct {
 	// takes the new directory's identity, where a test swaps the directory.
 	dirMade func(name string)
 	// dataRootLocked is called in lockFloor between keystore-lock's flock
-	// and the OpenRoot the floor is read through, where a test swaps the
-	// data root.
+	// and its re-check (then the OpenRoot the floor is read through), where
+	// a test swaps the data root or the lock file.
 	dataRootLocked func()
 	// euid is the effective uid that creates the store's directories, which
 	// a new directory must be owned by before it is handed over.

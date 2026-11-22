@@ -362,8 +362,9 @@ func parseFloor(b []byte) (floor, error) {
 }
 
 // floorLock is the floor held under its lock, which every floor write
-// takes: lock is keystore-lock in the data root, opened O_RDWR|O_NOFOLLOW|
-// O_NONBLOCK, judged on that descriptor and flocked; locked the data root's
+// takes: lock is keystore-lock in the data root, opened O_RDONLY|O_NOFOLLOW|
+// O_NONBLOCK, judged on that descriptor, flocked, and checked again after the
+// flock to be the one file at that name; locked the data root's
 // info, judged on its own descriptor; and root the os.Root the floor is read
 // and written through, checked to be the same directory.
 //
@@ -450,16 +451,21 @@ func (s *FileStore) checkFloorWritable() error {
 // through that same directory. The caller holds .lock, and releases the
 // returned lock with unlock.
 func (s *FileStore) lockFloor(ctx context.Context) (*floorLock, floor, error) {
-	f, fi, err := s.openFloorLock()
+	f, fi, lockRoot, err := s.openFloorLock()
 	if err != nil {
 		return nil, nil, err
 	}
+	defer func() { _ = lockRoot.Close() }() // only Lstats through it
 	l := &floorLock{s: s, lock: f, locked: fi}
 	if err := s.flockWait(ctx, f, syscall.LOCK_EX); err != nil {
 		l.unlock()
 		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
 	}
 	s.dataRootLocked()
+	if err := recheckFloorLock(lockRoot, f); err != nil {
+		l.unlock()
+		return nil, nil, err
+	}
 	if l.root, err = os.OpenRoot(s.dataRoot); err != nil {
 		l.unlock()
 		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
@@ -472,57 +478,88 @@ func (s *FileStore) lockFloor(ctx context.Context) (*floorLock, floor, error) {
 	return l, fl, nil
 }
 
+// recheckFloorLock refuses (errFloorUntrusted) the flocked keystore-lock f
+// unless the name, Lstat'd again through root, the data root f was opened in,
+// is still the file f holds, and that file has one link: a name replaced, or
+// a second name for the file, would let two writers lock different files.
+func recheckFloorLock(root *os.Root, f *os.File) error {
+	held, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("the keystore floor: %w", err)
+	}
+	named, err := root.Lstat(floorLockName)
+	if err != nil || !os.SameFile(held, named) {
+		return fmt.Errorf("%w: %s was replaced while it was locked (%v)", errFloorUntrusted, floorLockName, err)
+	}
+	if st, ok := held.Sys().(*syscall.Stat_t); !ok || st == nil || st.Nlink != 1 {
+		return fmt.Errorf("%w: %s has more than one link", errFloorUntrusted, floorLockName)
+	}
+	return nil
+}
+
 // openFloorLock opens keystore-lock in the data root, creating it root:wheel
-// 0600 if it is absent, and returns it with the data root's info. The data
+// 0600 if it is absent, and returns it with the data root's info and the
+// os.Root it was opened through, which the caller closes. The data
 // root is judged by openDataRoot and opened as an os.Root that must be the
 // directory judged. The file is created O_CREAT|O_EXCL|O_NOFOLLOW (exclusive
 // for the reason lock gives for .lock, and owned only if this call made it),
-// then opened O_RDWR|O_NOFOLLOW|O_NONBLOCK and refused (errFloorUntrusted)
+// then opened O_RDONLY|O_NOFOLLOW|O_NONBLOCK (flock needs no write access,
+// as for .lock) and refused (errFloorUntrusted)
 // unless, on that descriptor, it is a regular file owned by root (floorUID)
 // with no group or other access.
-func (s *FileStore) openFloorLock() (*os.File, fs.FileInfo, error) {
+func (s *FileStore) openFloorLock() (*os.File, fs.FileInfo, *os.Root, error) {
 	dir, fi, err := s.openDataRoot()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	_ = dir.Close() // judged; read-only
 	root, err := os.OpenRoot(s.dataRoot)
 	if err != nil {
-		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
+		return nil, nil, nil, fmt.Errorf("the keystore floor: %w", err)
 	}
-	defer func() { _ = root.Close() }() // only opens through it
+	f, err := s.openFloorLockIn(root, fi)
+	if err != nil {
+		_ = root.Close() // only opened through
+		return nil, nil, nil, err
+	}
+	return f, fi, root, nil
+}
+
+// openFloorLockIn is openFloorLock's work inside root, the data root opened,
+// which must be the directory fi describes.
+func (s *FileStore) openFloorLockIn(root *os.Root, fi fs.FileInfo) (*os.File, error) {
 	opened, err := root.Stat(".")
 	if err != nil {
-		return nil, nil, fmt.Errorf("the keystore floor: %w", err)
+		return nil, fmt.Errorf("the keystore floor: %w", err)
 	}
 	if !os.SameFile(fi, opened) {
-		return nil, nil, fmt.Errorf("%w: %s changed while it was opened", errFloorUntrusted, s.dataRoot)
+		return nil, fmt.Errorf("%w: %s changed while it was opened", errFloorUntrusted, s.dataRoot)
 	}
-	if c, err := root.OpenFile(floorLockName, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, floorLockMode); err == nil {
+	if c, err := root.OpenFile(floorLockName, os.O_RDONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, floorLockMode); err == nil {
 		err = s.ownAs(c, uint32(s.floorUID), uint32(s.floorGID), floorLockMode)
 		if cerr := c.Close(); err == nil {
 			err = cerr
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("create %s: %w", floorLockName, err)
+			return nil, fmt.Errorf("create %s: %w", floorLockName, err)
 		}
 	} else if !errors.Is(err, fs.ErrExist) {
-		return nil, nil, fmt.Errorf("create %s: %w", floorLockName, err)
+		return nil, fmt.Errorf("create %s: %w", floorLockName, err)
 	}
-	f, lfi, err := openRegular(root, floorLockName, os.O_RDWR, 0)
+	f, lfi, err := openRegular(root, floorLockName, os.O_RDONLY, 0)
 	if errors.Is(err, errBadFile) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ELOOP) || errors.Is(err, fs.ErrNotExist) {
 		// Not found after the create is a dangling symlink, which the
 		// exclusive create refuses as present.
-		return nil, nil, fmt.Errorf("%w: %s: %w", errFloorUntrusted, floorLockName, err)
+		return nil, fmt.Errorf("%w: %s: %w", errFloorUntrusted, floorLockName, err)
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("open %s: %w", floorLockName, err)
+		return nil, fmt.Errorf("open %s: %w", floorLockName, err)
 	}
 	if err := s.floorLockOwned(lfi); err != nil {
 		_ = f.Close() // refused; nothing written
-		return nil, nil, fmt.Errorf("%w: %s: %w", errFloorUntrusted, floorLockName, err)
+		return nil, fmt.Errorf("%w: %s: %w", errFloorUntrusted, floorLockName, err)
 	}
-	return f, fi, nil
+	return f, nil
 }
 
 // floorLockOwned refuses fi, keystore-lock, unless floorOwned accepts it
