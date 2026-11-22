@@ -369,8 +369,12 @@ first Put mints no master.
   `keystore/` itself and on the entry's files, and removes once more; root may clear those.
   It clears a file's flags only when the service user owns it and, for anything but a
   directory, when it has one link: a hard link shares its flags with names that may be outside
-  the keystore. A flag left in place is named in the error, a flag on `keystore/` included. A
-  removal that still fails, or a crash during it, leaves the entry already deleted and
+  the keystore. A symlink is never opened, so a flag the service user set on a symlink itself
+  (`chflags -h`) stays, and the symlink is left behind as an accepted residual, as the hard
+  link is: the burial has already landed, so the entry stays deleted and refused. The clear
+  opens at most 4096 files in all and stops with the verb's context; past the budget it fails
+  and the directory is left behind (`TestDeleteFlagClearBudget`). A flag left in place is
+  named in the error, a flag on `keystore/` included. A removal that still fails, or a crash during it, leaves the entry already deleted and
   refused: Delete returns an error saying so and that the directory is left behind, and
   `rm` run again removes the directory without changing the floor. A floor raise at the
   start that cannot complete (more names under `keystore/` than a read takes, which the

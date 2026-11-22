@@ -713,7 +713,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err := s.step("remove " + name); err != nil {
 		return evicted(fdir, capDropped, leftBehind(name, after, err))
 	}
-	interrupted, err := s.removeEntry(root, name, fi, after)
+	interrupted, err := s.removeEntry(ctx, root, name, fi, after)
 	if err != nil {
 		return evicted(fdir, capDropped, leftBehind(name, after, err))
 	}
@@ -809,19 +809,23 @@ func warnUnrecorded(root *os.Root, name string, fl floor, master bool) {
 // the removal answers EPERM, the user locking flags on keystore/ and the
 // entry's files are cleared (clearUserFlags) and the removal runs once more,
 // so a uchg the service user planted does not block it; a flag left in place
-// (a hard link, a file another user owns) is named in the error. fl, the floor
+// (a hard link, a file another user owns) is named in the error, and a clear
+// that ran out of its budget or its context fails the removal. fl, the floor
 // after the burial, tells an interrupted Put from an entry, which only
 // changes the answer, so it reports one (interrupted): an interrupted Put
 // with nothing buried is ErrNotFound, after its directory is removed (it may
 // hold a sealed v1 a Delete that crashed after removing the pointer left).
-func (s *FileStore) removeEntry(root *os.Root, name string, fi fs.FileInfo, fl floor) (interrupted bool, err error) {
+func (s *FileStore) removeEntry(ctx context.Context, root *os.Root, name string, fi fs.FileInfo, fl floor) (interrupted bool, err error) {
 	interrupted, err = s.removeEntryOnce(root, name, fi, fl)
 	if !errors.Is(err, syscall.EPERM) {
 		return interrupted, err
 	}
 	// A locking flag answers EPERM: clear them, and try once more. The
 	// first pass's answer stands, since it may have removed current.
-	skipped := clearUserFlags(root, name, s.uid)
+	skipped, ferr := clearUserFlags(ctx, root, name, s.uid)
+	if ferr != nil {
+		return interrupted, fmt.Errorf("%w (clearing its locking flags: %w)", err, ferr)
+	}
 	if _, err = s.removeEntryOnce(root, name, fi, fl); err != nil && len(skipped) > 0 {
 		err = fmt.Errorf("%w (a locking flag was left in place: %s)", err, strings.Join(skipped, "; "))
 	}

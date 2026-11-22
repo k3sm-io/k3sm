@@ -112,3 +112,40 @@ func TestDeleteClearsKeystoreDirFlag(t *testing.T) {
 		t.Fatalf("entry after Delete with uchg on keystore/: %v, want it removed", err)
 	}
 }
+
+// TestDeleteFlagClearBudget (G23): clearing the locking flags opens at most
+// flagOpenLimit files in all, so an entry the service user filled with
+// names cannot keep Delete walking it. Past the budget the clear fails; the
+// burial has already landed, so Delete reports the entry deleted and its
+// directory left behind, and the copy put back is refused.
+func TestDeleteFlagClearBudget(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	dir := filepath.Join(server, "keystore", "k")
+	for i := range 10 {
+		p := filepath.Join(dir, "planted-"+string(rune('a'+i)))
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		giveToService(t, p)
+	}
+	v1 := filepath.Join(dir, "v1")
+	if err := unix.Chflags(v1, unix.UF_IMMUTABLE); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Chflags(v1, 0) })
+	// keystore/ and the entry directory fit; the first file in it, in
+	// whatever order the directory lists them, does not.
+	setSeam(t, &flagOpenLimit, 2)
+	err := s.Delete(ctx, "k")
+	if err == nil || !strings.Contains(err.Error(), "left behind") || !strings.Contains(err.Error(), "flag") {
+		t.Fatalf("Delete past the flag-clear budget: %v, want the entry left behind and the budget named", err)
+	}
+	if _, err := os.Lstat(dir); err != nil {
+		t.Fatalf("entry after Delete past the budget: %v, want it left behind", err)
+	}
+	if e := readFloorFile(t, server)["k"]; e.live() || len(e.burials()) != 1 {
+		t.Errorf("floor record of k after Delete past the budget = %+v, want its generation buried", e)
+	}
+}

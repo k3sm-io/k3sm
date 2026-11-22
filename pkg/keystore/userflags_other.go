@@ -18,7 +18,10 @@ limitations under the License.
 
 package keystore
 
-import "os"
+import (
+	"context"
+	"os"
+)
 
 // clearUserFlags is a no-op off Darwin: BSD user flags are a Darwin feature.
-func clearUserFlags(*os.Root, string, uint32) []string { return nil }
+func clearUserFlags(context.Context, *os.Root, string, uint32) ([]string, error) { return nil, nil }

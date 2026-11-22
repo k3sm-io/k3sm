@@ -19,6 +19,7 @@ limitations under the License.
 package keystore
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"syscall"
@@ -30,6 +31,14 @@ import (
 // directory. Put writes no subdirectory, so anything deeper was planted, and
 // RemoveAll reports what it cannot remove.
 const maxFlagDepth = 8
+
+// maxFlagOpens bounds how many files clearUserFlags opens in all, keystore/
+// itself included: the service user can fill an entry with names, up to
+// maxDirNames in each of maxFlagDepth levels.
+const maxFlagOpens = 4096
+
+// flagOpenLimit is maxFlagOpens; tests lower it.
+var flagOpenLimit = maxFlagOpens
 
 const (
 	// ufNoUnlink is UF_NOUNLINK (uunlnk): 0x10 in the BSD header, commented
@@ -50,17 +59,38 @@ const (
 // flags. Delete calls it only after the removal answered EPERM, as
 // pkg/install's removeTreeFlagged does. Each file is opened without
 // following a symlink and changed through its descriptor (Fchflags), so a
-// symlink swapped in never redirects the change outside the entry. A file is
-// left alone, and returned in skipped, unless the service user (uid) owns
-// it, and, for anything but a directory, unless it has one link: a hard
-// link shares its flags with every other name of the file, which may be
-// outside the keystore. What it cannot open is left for the removal to
-// report.
-func clearUserFlags(root *os.Root, name string, uid uint32) (skipped []string) {
-	if why := clearFlagsAt(root, ".", uid); why != "" {
-		skipped = append(skipped, "keystore/ itself "+why)
+// symlink swapped in never redirects the change outside the entry; a symlink
+// itself is never opened, so a flag on one stays (docs/design/keystore.md §
+// "Deletion"). A file is left alone, and returned in skipped, unless the
+// service user (uid) owns it, and, for anything but a directory, unless it
+// has one link: a hard link shares its flags with every other name of the
+// file, which may be outside the keystore. What it cannot open is left for
+// the removal to report. It opens at most flagOpenLimit files in all and
+// fails past that (errFlagBudget), and stops with ctx's error (loopCtx).
+func clearUserFlags(ctx context.Context, root *os.Root, name string, uid uint32) (skipped []string, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return clearUserFlagsAt(root, name, name, uid, maxFlagDepth, skipped)
+	w := &flagWalk{ctx: ctx, uid: uid, left: flagOpenLimit - 1}
+	if why := clearFlagsAt(root, ".", uid); why != "" {
+		w.skipped = append(w.skipped, "keystore/ itself "+why)
+	}
+	err = w.clear(root, name, name, maxFlagDepth)
+	return w.skipped, err
+}
+
+// errFlagBudget fails a clearUserFlags that would open more than
+// flagOpenLimit files.
+var errFlagBudget = fmt.Errorf("the entry holds more files than the locking-flag clear opens (%d), so its flags were not all cleared", maxFlagOpens)
+
+// flagWalk is one clearUserFlags walk: what it skipped, how many more files
+// it may open, and how many it has opened, for loopCtx.
+type flagWalk struct {
+	ctx     context.Context
+	uid     uint32
+	left    int
+	opened  int
+	skipped []string
 }
 
 // clearFlagsAt clears the locking flags of name in root, refusing (a reason)
@@ -96,38 +126,50 @@ func clearFlagsOf(f *os.File, uid uint32) string {
 	return ""
 }
 
-func clearUserFlagsAt(root *os.Root, name, path string, uid uint32, depth int, skipped []string) []string {
+// clear clears name in root, at path for skipped, and, within depth, what
+// is under it.
+func (w *flagWalk) clear(root *os.Root, name, path string, depth int) error {
+	if w.left <= 0 {
+		return errFlagBudget
+	}
+	w.left--
+	if err := loopCtx(w.ctx, w.opened); err != nil {
+		return err
+	}
+	w.opened++
 	f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return skipped
+		return nil
 	}
 	fi, err := f.Stat()
 	if err != nil {
 		_ = f.Close() // read-only
-		return skipped
+		return nil
 	}
-	if why := clearFlagsOf(f, uid); why != "" {
-		skipped = append(skipped, path+" "+why)
+	if why := clearFlagsOf(f, w.uid); why != "" {
+		w.skipped = append(w.skipped, path+" "+why)
 	}
 	_ = f.Close() // read-only
 	if !fi.IsDir() || depth == 0 {
-		return skipped
+		return nil
 	}
 	sub, err := root.OpenRoot(name)
 	if err != nil {
-		return skipped
+		return nil
 	}
 	defer func() { _ = sub.Close() }() // read-only
 	// The directory opened must be the one whose flags were cleared.
 	if opened, err := sub.Stat("."); err != nil || !os.SameFile(fi, opened) {
-		return skipped
+		return nil
 	}
 	names, err := readDirNames(sub, maxDirNames)
 	if err != nil {
-		return skipped
+		return nil
 	}
 	for _, n := range names {
-		skipped = clearUserFlagsAt(sub, n, path+"/"+n, uid, depth-1, skipped)
+		if err := w.clear(sub, n, path+"/"+n, depth-1); err != nil {
+			return err
+		}
 	}
-	return skipped
+	return nil
 }
