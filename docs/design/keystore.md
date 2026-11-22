@@ -1019,22 +1019,26 @@ files (a version above `current` that authenticates, a pointer at the floor's se
 no cheap guard tells the two apart, so that crash is refused the same way rather than have
 its orphan discarded.
 
-**Retention:** every version is kept indefinitely in Phase A; nothing deletes a single old
-version short of `rm` of the whole entry. Settled in this document: the simplest correct
-answer, left for a later phase to bound once real usage shows it matters.
+**Retention:** an `ed25519`, `opaque`, `token` or `ssh` entry keeps every version, up to the
+version ceiling; nothing deletes a single old version short of `rm` of the whole entry. An
+oauth entry keeps its current version and one previous: each rotation records the oldest
+retained version in the sealed pointer and unlinks the versions below it (the oauth prune,
+"Record kinds, the typed envelope and retention"), and `Adopt` keeps the same rule.
 
 **Delivered-Secret movement:** covered above under "Re-delivery on rotation" — automatic
 on the next sweep after a Rotate.
 
-**Rollback:** no dedicated verb. An operator rolls back by writing the old version's value
-forward as a *new* version, never by pointing `current` backward at an existing version:
+**Rollback:** `sudo k3sm keys rotate system/NAME --from-version N` (`FileStore.RotateFrom`)
+writes version N's value forward as a *new* version inside k3sm, so the value never leaves the
+store; it is refused for oauth (`ErrFromVersionOAuth`) and for a source version of another kind
+(`ErrKindMismatch`). Nothing points `current` backward at an existing version. The same new
+version can also be written through a pipe:
 
 ```
 sudo k3sm keys show system/NAME --version N --reveal | sudo k3sm keys rotate system/NAME --in -
 ```
 
-`sudo k3sm keys rotate system/NAME --from-version N` writes the same new version without the
-value leaving the store (row U1); the pipe stays the recipe G21 checks.
+`--from-version` is row U1; the pipe stays the recipe G21 checks.
 
 A pipe, not a process substitution: `sudo` closes inherited descriptors, so a `<( … )`
 path would not open, and each side of the pipe runs its own `sudo`. The round trip is
