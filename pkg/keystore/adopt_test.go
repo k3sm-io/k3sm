@@ -23,6 +23,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"k3sm.io/apis/keystore/credential"
 	"k3sm.io/k3sm/pkg/keystore/typed"
@@ -170,6 +171,64 @@ func TestOAuthCrashOrphanAdopted(t *testing.T) {
 	// RotateIf from the adopted Version proceeds.
 	if next, err := s.RotateIf(ctx, "k", KindOAuth, v, oauthEnvelope("a5", "r5")); err != nil || next.Version != 4 {
 		t.Fatalf("RotateIf from the adopted version = %+v, %v", next, err)
+	}
+}
+
+// TestOrphanReportsSealedIssuedAt: Orphan reports, for each side, the
+// issuedAt sealed in a token's or an oauth pair's envelope (the access
+// token's), read without returning any secret; a kind with no issuedAt
+// reports the zero time.
+func TestOrphanReportsSealedIssuedAt(t *testing.T) {
+	ctx := context.Background()
+	orphanAt := typedNow.Add(30 * time.Minute) // before the envelopes expire
+	sshEnvelope := func(seed byte) typed.Envelope {
+		return typed.Envelope{Credential: typed.Credential{
+			Algorithm: typed.SSHAlgorithmEd25519,
+			Seed:      []byte(strings.Repeat(string(rune(seed)), 32)),
+		}}
+	}
+	for _, tc := range []struct {
+		kind        Kind
+		first, next typed.Envelope
+		raw         bool // an opaque entry, written with Put and Rotate
+		hasIssuedAt bool
+	}{
+		{kind: KindToken, first: tokenEnvelope("t1"), next: tokenEnvelope("t2"), hasIssuedAt: true},
+		{kind: KindOAuth, first: oauthEnvelope("a1", "r1"), next: oauthEnvelope("a2", "r2"), hasIssuedAt: true},
+		{kind: KindSSH, first: sshEnvelope('a'), next: sshEnvelope('b')},
+		{kind: KindOpaque, raw: true},
+	} {
+		t.Run(tc.kind.String(), func(t *testing.T) {
+			s, server := newTypedStore(t)
+			if tc.raw {
+				if _, err := s.Put(ctx, "k", tc.kind, []byte("o1")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				mustPutCredential(t, s, "k", tc.kind, tc.first)
+			}
+			s.now = func() time.Time { return orphanAt }
+			crashAfterVersionWrite(t, s, server, "k", func() error {
+				if tc.raw {
+					_, err := s.Rotate(ctx, "k", []byte("o2"))
+					return err
+				}
+				_, err := s.RotateCredential(ctx, "k", tc.kind, tc.next)
+				return err
+			})
+			info, err := s.Orphan(ctx, "k")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wantCur, wantOrphan time.Time
+			if tc.hasIssuedAt {
+				wantCur, wantOrphan = typedNow, orphanAt
+			}
+			if !info.CurrentIssuedAt.Equal(wantCur) || !info.OrphanIssuedAt.Equal(wantOrphan) ||
+				info.CurrentIssuedAt.IsZero() != wantCur.IsZero() || info.OrphanIssuedAt.IsZero() != wantOrphan.IsZero() {
+				t.Fatalf("Orphan issuedAt: current %v, orphan %v; want %v, %v", info.CurrentIssuedAt, info.OrphanIssuedAt, wantCur, wantOrphan)
+			}
+		})
 	}
 }
 

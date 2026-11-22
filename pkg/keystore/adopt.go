@@ -24,6 +24,9 @@ import (
 	"io/fs"
 	"math"
 	"slices"
+	"time"
+
+	"k3sm.io/k3sm/pkg/keystore/typed"
 )
 
 // This file is the recovery of an orphaned version: docs/design/keystore.md
@@ -50,6 +53,40 @@ type OrphanInfo struct {
 	// increasing order. A crashed rotation leaves only Current+1, so any
 	// here means an older pointer was copied back, and Adopt refuses.
 	Others []uint64
+	// CurrentIssuedAt and OrphanIssuedAt are the issue times sealed in
+	// each side's envelope: a token's issuedAt, an oauth pair's
+	// accessIssuedAt. Unlike Created they are authenticated. They are the
+	// zero time for a kind that seals none (ssh, ed25519, opaque) and for an
+	// envelope that does not decode.
+	CurrentIssuedAt time.Time
+	OrphanIssuedAt  time.Time
+}
+
+// sealedIssuedAt is the issue time sealed in val, a version of kind: a
+// token's issuedAt, an oauth pair's accessIssuedAt, the zero time for any
+// other kind or an envelope that does not decode. It decodes through the
+// typed read path and clears every secret the decode copied out, so only
+// the time leaves.
+func sealedIssuedAt(kind Kind, val []byte) time.Time {
+	ck, ok := credentialKind(kind)
+	if !ok {
+		return time.Time{}
+	}
+	env, err := typed.Decode(ck, val)
+	if err != nil {
+		return time.Time{}
+	}
+	clear(env.RefreshToken)
+	clear(env.Credential.Value)
+	clear(env.Credential.Seed)
+	clear(env.Credential.AccessToken)
+	switch kind {
+	case KindToken:
+		return env.Credential.IssuedAt
+	case KindOAuth:
+		return env.Credential.AccessIssuedAt
+	}
+	return time.Time{}
 }
 
 // sealedAbove returns, in increasing order, the versions of e above cur
@@ -165,7 +202,7 @@ func qualified(name string) string { return "system/" + name }
 
 // Orphan reports the lowest version of name above its current one that
 // authenticates as this entry's, next to the current one: their versions,
-// kinds and created times, and the pointer's sequence. It never opens a
+// kinds, created times and sealed issue times, and the pointer's sequence. It never opens a
 // value for the caller. An entry with no such version is ErrVersionNotFound.
 func (s *FileStore) Orphan(ctx context.Context, name string) (OrphanInfo, error) {
 	var info OrphanInfo
@@ -175,10 +212,12 @@ func (s *FileStore) Orphan(ctx context.Context, name string) (OrphanInfo, error)
 			return err
 		}
 		curV, val, err := e.version(k, cur)
-		clear(val)
 		if err != nil {
+			clear(val)
 			return err
 		}
+		curAt := sealedIssuedAt(curV.Kind, val)
+		clear(val)
 		above, err := sealedAbove(ctx, e, k, cur)
 		if err != nil {
 			return err
@@ -187,11 +226,13 @@ func (s *FileStore) Orphan(ctx context.Context, name string) (OrphanInfo, error)
 			return fmt.Errorf("%w: no sealed version lies above the current version %d", ErrVersionNotFound, cur)
 		}
 		orphan, val, err := e.version(k, above[0])
-		clear(val)
 		if err != nil {
+			clear(val)
 			return err
 		}
-		info = OrphanInfo{Current: curV, Seq: seq, Orphan: orphan, Others: above[1:]}
+		orphanAt := sealedIssuedAt(orphan.Kind, val)
+		clear(val)
+		info = OrphanInfo{Current: curV, Seq: seq, Orphan: orphan, Others: above[1:], CurrentIssuedAt: curAt, OrphanIssuedAt: orphanAt}
 		return nil
 	})
 	if err != nil {
