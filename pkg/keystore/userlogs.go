@@ -93,6 +93,15 @@ const (
 	// and 0.65 s (BenchmarkFloorReadAtKeyBound; docs/design/keystore.md §
 	// "Size caps").
 	maxFloorKeysCeiling = 1 << 20
+	// maxKeyShareDivisor bounds one uid's floor keys: a grant line that adds
+	// a key is refused once its scope's uid holds keyBound/maxKeyShareDivisor
+	// keys (docs/design/keystore.md § "Per-uid fairness").
+	maxKeyShareDivisor = 16
+	// revokeHeadroomDivisor sizes the revocation headroom, keyBound /
+	// revokeHeadroomDivisor keys past the key bound that only a revocation's
+	// line (a tombstone or a catch-up line) may add; the reader's key bound
+	// includes it.
+	revokeHeadroomDivisor = 16
 	// logFreeMargin is the free space an append leaves on the log's file
 	// system beyond its own line.
 	logFreeMargin = 1 << 20
@@ -113,15 +122,42 @@ var minFloorLine = func() int {
 
 // keyBound is the most distinct keys the floor may hold: as many as lines of
 // minFloorLine bytes fit in logReadBound, held to maxFloorKeysCeiling, which
-// is met first at the default caps. The writer refuses a line that would
-// add a key past it, so the reader never meets it in a floor the server
-// wrote.
+// is met first at the default caps. The writer refuses a grant's line that
+// would add a key past it, and a revocation's past it plus the revocation
+// headroom (keyHeadroom), so the reader, whose bound includes the headroom,
+// never meets damage in a floor the server wrote.
 func (l *appendLog) keyBound() int {
 	if l.maxKeys != 0 {
 		return l.maxKeys
 	}
 	return int(min(l.s.logReadBound()/int64(minFloorLine)+1, maxFloorKeysCeiling))
 }
+
+// keyShare is the most keys one uid's grant lines may hold in the floor:
+// keyBound/maxKeyShareDivisor. A revocation's line is never held to it.
+func (l *appendLog) keyShare() int {
+	if l.maxKeys != 0 {
+		if l.maxShare != 0 {
+			return l.maxShare
+		}
+		return l.maxKeys
+	}
+	return l.keyBound() / maxKeyShareDivisor
+}
+
+// keyHeadroom is the revocation headroom: the keys past keyBound that only
+// a revocation's line may add, so grants at the key bound cannot refuse a
+// tombstone or a catch-up line for a key the floor lacks.
+func (l *appendLog) keyHeadroom() int {
+	if l.maxKeys != 0 {
+		return l.maxHeadroom
+	}
+	return l.keyBound() / revokeHeadroomDivisor
+}
+
+// readKeyBound is the reader's key bound: keyBound plus the revocation
+// headroom. A floor holding more keys is damage.
+func (l *appendLog) readKeyBound() int { return l.keyBound() + l.keyHeadroom() }
 
 // logReadBound is the size past which a log is damage: the hard cap, the
 // revocation budgets of maxRevokeUIDs uids, and a margin.
@@ -288,6 +324,10 @@ type appendLog struct {
 	// maxKeys, when not 0, replaces maxFloorKeys: the test seam for the
 	// key bound.
 	maxKeys int
+	// maxShare and maxHeadroom, when maxKeys is set, replace the per-uid key
+	// share and the revocation headroom; left 0, the share is maxKeys and
+	// the headroom 0.
+	maxShare, maxHeadroom int
 	// readAt, when set, is the source sync reads f through: the test seam
 	// for a read I/O error.
 	readAt func(f *os.File) io.ReaderAt
@@ -307,8 +347,10 @@ type logState struct {
 	// hardCap and bound are the hard cap and logReadBound it was read
 	// under.
 	hardCap, bound int64
-	// keys is the floor's count of distinct keys.
-	keys int
+	// keys is the floor's count of distinct keys, and uidKeys that count
+	// per uid, each key charged to its scope's uid.
+	keys    int
+	uidKeys map[uint32]int
 	// off is where reading stopped: just past the last whole line read.
 	off int64
 	// lastAt and last are the start and bytes, its newline included, of the
@@ -472,7 +514,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		src = l.readAt(f)
 	}
 	fresh := func() {
-		*s = logState{dev: uint64(st.Dev), ino: st.Ino, birth: logBirth(&st), hardCap: l.s.logHardCap, bound: bound, pastCap: map[uint32]int64{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
+		*s = logState{dev: uint64(st.Dev), ino: st.Ino, birth: logBirth(&st), hardCap: l.s.logHardCap, bound: bound, pastCap: map[uint32]int64{}, uidKeys: map[uint32]int{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
 	}
 	if s.pastCap == nil || s.dev != uint64(st.Dev) || s.ino != st.Ino || s.birth != logBirth(&st) || s.hardCap != l.s.logHardCap || s.bound != bound || st.Size < s.off {
 		fresh()
@@ -682,6 +724,27 @@ func (l *appendLog) keyRoom(f *os.File, st unix.Stat_t) error {
 	return nil
 }
 
+// addKeyRoom refuses, as ErrLogFull, n more keys charged to uid: for a
+// revocation's line (revoke) past keyBound plus the revocation headroom; for
+// any other line past keyBound, or past uid's key share. appendLine and
+// floorGrantRoom both judge through it. The texts name the bound met, never
+// a figure.
+func (l *appendLog) addKeyRoom(state *logState, uid uint32, n int, revoke bool) error {
+	if revoke {
+		if state.keys+n > l.readKeyBound() {
+			return fmt.Errorf("%w (%s is at its key bound and revocation headroom)", ErrLogFull, l.name)
+		}
+		return nil
+	}
+	if state.keys+n > l.keyBound() {
+		return fmt.Errorf("%w (%s is at its key bound)", ErrLogFull, l.name)
+	}
+	if state.uidKeys[uid]+n > l.keyShare() {
+		return fmt.Errorf("%w (the caller's share of the key bound in %s is spent)", ErrLogFull, l.name)
+	}
+	return nil
+}
+
 // revokeRoom refuses, as ErrLogFull, n more bytes for uid past the hard
 // cap: when they would take the log past logReadBound, or uid's lines that
 // start past the hard cap past its revocation budget. room and appendLine
@@ -772,8 +835,10 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) err
 		if err != nil {
 			return fmt.Errorf("%s: %w", l.name, err)
 		}
-		if bound := l.keyBound(); adds && state.keys >= bound {
-			return fmt.Errorf("%w (%s is at its key bound)", ErrLogFull, l.name)
+		if adds {
+			if err := l.addKeyRoom(state, uid, 1, revoke); err != nil {
+				return err
+			}
 		}
 	}
 	if err := l.preflight(f, len(out), revoke); err != nil {
@@ -873,11 +938,13 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		// --rebuild writes 0 for an entry with no authenticated pointer, and
 		// that line is what keeps the entry damage, so it is present.
 		seq, inSeq := st.maxSeq[r.key]
+		uid := scopeUID(r.key.scope)
 		if !inSeq && !st.buried[r.key] {
-			if bound := l.keyBound(); st.keys >= bound {
+			if bound := l.readKeyBound(); st.keys >= bound {
 				return 0, fmt.Errorf("%w (%d)", errFloorTooManyKeys, bound)
 			}
 			st.keys++
+			st.uidKeys[uid]++
 		}
 		switch {
 		case r.tomb:
@@ -885,7 +952,7 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		case !inSeq || r.seq > seq:
 			st.maxSeq[r.key] = r.seq
 		}
-		return scopeUID(r.key.scope), nil
+		return uid, nil
 	}
 	l.addsKey = func(st *logState, line []byte) (bool, error) {
 		r, err := parseFloorLine(bytes.TrimSuffix(line, []byte{'\n'}))
@@ -1095,8 +1162,9 @@ func (s *FileStore) admit(uid uint32, revoke bool) error {
 // lines, one per name in names in the order it appends them, the floor
 // would refuse after its commit: a line that would start at or past the
 // hard cap (a grant's line draws on no revocation budget), lines that would
-// take the floor past logReadBound or past its key bound (each counted as a
-// new key), or lines the free-space margin would not hold. So a grant
+// take the floor past logReadBound, past its key bound or past the scope
+// uid's key share (each counted as a new key), or lines the free-space
+// margin would not hold. So a grant
 // committed without its floor line is left only by a crash or an I/O error
 // between this check and the append. Only the file-backed floor is held.
 func (s *FileStore) floorGrantRoom(scope string, names []string) error {
@@ -1141,8 +1209,8 @@ func (s *FileStore) floorGrantRoom(scope string, names []string) error {
 	if size > s.logReadBound() {
 		return fmt.Errorf("%w (%s would pass the reader's bound)", ErrLogFull, l.name)
 	}
-	if state.keys+len(lines) > l.keyBound() {
-		return fmt.Errorf("%w (%s has no room under its key bound)", ErrLogFull, l.name)
+	if err := l.addKeyRoom(state, scopeUID(scope), len(lines), false); err != nil {
+		return err
 	}
 	return l.preflight(f, total, false)
 }
