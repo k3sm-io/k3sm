@@ -218,33 +218,12 @@ var ErrRefused = errors.New("delivery declaration refused")
 // logs a refusal once per file state; it is nil when the file is absent or
 // could not be opened.
 func Read(path string, open Opener, check FileCheck) (d Declaration, fi fs.FileInfo, exists bool, err error) {
-	f, err := open(path)
-	if errors.Is(err, fs.ErrNotExist) {
+	data, fi, exists, err := readChecked(path, open, check)
+	if err != nil {
+		return Declaration{}, fi, exists, err
+	}
+	if !exists {
 		return Declaration{Version: SchemaVersion}, nil, false, nil
-	}
-	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			return Declaration{}, nil, true, fmt.Errorf("%w: a symlink", ErrRefused)
-		}
-		return Declaration{}, nil, true, fmt.Errorf("open: %w", err)
-	}
-	defer func() { _ = f.Close() }() // read-only: nothing to flush
-	fi, err = f.Stat()
-	if err != nil {
-		return Declaration{}, nil, true, fmt.Errorf("stat the opened file: %w", err)
-	}
-	if !fi.Mode().IsRegular() {
-		return Declaration{}, fi, true, fmt.Errorf("%w: not a regular file", ErrRefused)
-	}
-	if err := check(fi); err != nil {
-		return Declaration{}, fi, true, fmt.Errorf("%w: %w", ErrRefused, err)
-	}
-	if fi.Size() > MaxFileBytes {
-		return Declaration{}, fi, true, fmt.Errorf("%w: larger than %d bytes", ErrRefused, MaxFileBytes)
-	}
-	data, err := io.ReadAll(io.LimitReader(f, MaxFileBytes+1))
-	if err != nil {
-		return Declaration{}, fi, true, fmt.Errorf("read: %w", err)
 	}
 	d, err = Parse(data)
 	if err != nil {
@@ -253,16 +232,59 @@ func Read(path string, open Opener, check FileCheck) (d Declaration, fi fs.FileI
 	return d, fi, true, nil
 }
 
+// readChecked reads the file at path through open, judging the opened
+// descriptor with check: a regular file, passing check, at most MaxFileBytes.
+// A missing file is exists false and no error.
+func readChecked(path string, open Opener, check FileCheck) (data []byte, fi fs.FileInfo, exists bool, err error) {
+	f, err := open(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, false, nil
+	}
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, nil, true, fmt.Errorf("%w: a symlink", ErrRefused)
+		}
+		return nil, nil, true, fmt.Errorf("open: %w", err)
+	}
+	defer func() { _ = f.Close() }() // read-only: nothing to flush
+	fi, err = f.Stat()
+	if err != nil {
+		return nil, nil, true, fmt.Errorf("stat the opened file: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fi, true, fmt.Errorf("%w: not a regular file", ErrRefused)
+	}
+	if err := check(fi); err != nil {
+		return nil, fi, true, fmt.Errorf("%w: %w", ErrRefused, err)
+	}
+	if fi.Size() > MaxFileBytes {
+		return nil, fi, true, fmt.Errorf("%w: larger than %d bytes", ErrRefused, MaxFileBytes)
+	}
+	data, err = io.ReadAll(io.LimitReader(f, MaxFileBytes+1))
+	if err != nil {
+		return nil, fi, true, fmt.Errorf("read: %w", err)
+	}
+	if len(data) > MaxFileBytes {
+		return nil, fi, true, fmt.Errorf("%w: larger than %d bytes", ErrRefused, MaxFileBytes)
+	}
+	return data, fi, true, nil
+}
+
 // Write installs d at path, mode FileMode, atomically: a temp file in path's
 // directory is handed over by chown (production: root:wheel), chmodded,
 // written and fsynced, renamed over path, and the directory fsynced. The
 // rename replaces a symlink at path rather than following it. The temp file
 // is removed on every error return.
-func Write(path string, d Declaration, chown func(f *os.File) error) (err error) {
+func Write(path string, d Declaration, chown func(f *os.File) error) error {
 	data, err := d.Marshal()
 	if err != nil {
 		return fmt.Errorf("encode the declaration: %w", err)
 	}
+	return writeAtomic(path, data, FileMode, chown)
+}
+
+// writeAtomic installs data at path with mode, as Write describes.
+func writeAtomic(path string, data []byte, mode os.FileMode, chown func(f *os.File) error) (err error) {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
 	if err != nil {
@@ -274,7 +296,7 @@ func Write(path string, d Declaration, chown func(f *os.File) error) (err error)
 			_ = os.Remove(tmpPath) // best effort: the error already says the write failed
 		}
 	}()
-	if err := writeSynced(tmp, data, chown); err != nil {
+	if err := writeSynced(tmp, data, mode, chown); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
@@ -292,13 +314,13 @@ func Write(path string, d Declaration, chown func(f *os.File) error) (err error)
 }
 
 // writeSynced chowns, chmods, writes and fsyncs f, and closes it.
-func writeSynced(f *os.File, data []byte, chown func(*os.File) error) error {
+func writeSynced(f *os.File, data []byte, mode os.FileMode, chown func(*os.File) error) error {
 	steps := []struct {
 		what string
 		do   func() error
 	}{
 		{"chown", func() error { return chown(f) }},
-		{"chmod", func() error { return f.Chmod(FileMode) }},
+		{"chmod", func() error { return f.Chmod(mode) }},
 		{"write", func() error { _, err := f.Write(data); return err }},
 		{"sync", f.Sync},
 	}
@@ -314,7 +336,8 @@ func writeSynced(f *os.File, data []byte, chown func(*os.File) error) error {
 	return nil
 }
 
-// ChownRoot hands f to root:wheel, the declaration's owner.
+// ChownRoot hands f to root:wheel, the declaration's and the state file's
+// owner.
 func ChownRoot(f *os.File) error { return f.Chown(0, 0) }
 
 // RootCheck is the production FileCheck, the manifest directory's.

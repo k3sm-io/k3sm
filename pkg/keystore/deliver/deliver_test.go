@@ -37,6 +37,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -117,6 +118,16 @@ func newHarness(t *testing.T, encryptionOn, allowPlaintext bool, objs ...runtime
 		logs:   &syncBuffer{},
 	}
 	h.path = filepath.Join(h.dir, FileName)
+	// The apiserver assigns a UID on create; the fake does not, so this
+	// reactor stands in for it and lets the tracker store the object.
+	var uids int
+	h.client.PrependReactor("create", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if s, ok := a.(k8stesting.CreateAction).GetObject().(*corev1.Secret); ok && s.UID == "" {
+			uids++
+			s.UID = types.UID(fmt.Sprintf("uid-%d", uids))
+		}
+		return false, nil, nil
+	})
 	h.r = h.reconciler(encryptionOn, allowPlaintext)
 	return h
 }
@@ -133,7 +144,24 @@ func (h *harness) reconciler(encryptionOn, allowPlaintext bool) *Reconciler {
 		Logger:         slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	r.check = testCheck
+	// Non-root, a test cannot hand the state file to root.
+	r.chown = func(*os.File) error { return nil }
 	return r
+}
+
+// own records obj as created by the reconciler, as a create would have.
+func (h *harness) own(t *testing.T, objs ...*corev1.Secret) {
+	t.Helper()
+	st, err := ReadState(filepath.Join(h.dir, StateFileName), OpenNoFollow, testCheck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range objs {
+		st.Set(o.Namespace, o.Name, string(o.UID))
+	}
+	if err := WriteState(filepath.Join(h.dir, StateFileName), st, func(*os.File) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // testCheck stands the test user in for root.
@@ -419,7 +447,9 @@ func TestReconcilerTouchesOnlyLabelledSecrets(t *testing.T) {
 	foreign := secretObj("payments", "foreign", map[string]string{LabelKey: "someone-else"}, map[string][]byte{"value": []byte("theirs")})
 	ours := secretObj("payments", "ours", map[string]string{LabelKey: "api-token"}, map[string][]byte{"value": []byte("old")})
 	ours.Annotations = map[string]string{VersionAnnotation: "1"}
+	ours.UID = "ours-1"
 	h := newHarness(t, true, false, plain, foreign, ours)
+	h.own(t, ours)
 	h.store.set("api-token", 2, []byte("new"))
 	h.declare(t,
 		Target{Name: "api-token", Namespace: "payments", SecretName: "plain"},
@@ -496,7 +526,9 @@ func TestReconcilerRedeliversOnRotation(t *testing.T) {
 func TestReconcilerSkipsLabelledNonOpaque(t *testing.T) {
 	tls := secretObj("payments", "api-token", map[string]string{LabelKey: "api-token"}, map[string][]byte{"tls.crt": []byte("c"), "tls.key": []byte("k")})
 	tls.Type = corev1.SecretTypeTLS
+	tls.UID = "tls-1"
 	h := newHarness(t, true, false, tls)
+	h.own(t, tls)
 	h.store.set("api-token", 1, []byte("one"))
 	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
 	h.r.Sweep(context.Background())
@@ -797,5 +829,104 @@ func TestLockBoundedWait(t *testing.T) {
 	fi, err := os.Lstat(path)
 	if err != nil || fi.Mode() != lockMode {
 		t.Fatalf("lock file mode %v (%v), want %v", fi.Mode(), err, lockMode)
+	}
+}
+
+// updates counts the recorded updates of Secrets.
+func (h *harness) updates() int {
+	n := 0
+	for _, v := range h.verbs() {
+		if v == "update/secrets" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestReconcilerNeverWritesTenantPrecreated: a namespace writer who creates
+// the target Secret first, with the ownership label, does not get the value
+// written into it: the label is forgeable, and no UID was recorded for it
+// (G20).
+func TestReconcilerNeverWritesTenantPrecreated(t *testing.T) {
+	planted := secretObj("payments", "api-token", map[string]string{LabelKey: "api-token"}, map[string][]byte{"value": []byte("tenant's")})
+	planted.UID = "tenant-1"
+	h := newHarness(t, true, false, planted)
+	h.store.set("api-token", 1, []byte("the-stored-value"))
+	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	if n := h.updates(); n != 0 {
+		t.Fatalf("the tenant's pre-created Secret drew %d updates: %v", n, h.verbs())
+	}
+	if got := h.secret(t, "payments", "api-token"); string(got.Data["value"]) != "tenant's" {
+		t.Fatalf("the tenant's Secret now holds %q", got.Data["value"])
+	}
+	logs := h.logs.String()
+	if !strings.Contains(logs, "not created by this server") || strings.Count(logs, "not created by this server") != 1 {
+		t.Fatalf("the skip is not logged once with its reason\n%s", logs)
+	}
+}
+
+// TestReconcilerDoesNotAdoptRecreated: a Secret the reconciler created, then
+// deleted and recreated by someone else under the same name and label, has a
+// new UID and is not adopted (G20).
+func TestReconcilerDoesNotAdoptRecreated(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("one"))
+	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	if err := h.client.CoreV1().Secrets("payments").Delete(ctx, "api-token", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	again := secretObj("payments", "api-token", map[string]string{LabelKey: "api-token"}, map[string][]byte{"value": []byte("tenant's")})
+	again.UID = "tenant-2"
+	if _, err := h.client.CoreV1().Secrets("payments").Create(ctx, again, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h.client.ClearActions()
+	h.store.set("api-token", 2, []byte("two"))
+	h.r.Sweep(ctx)
+	if n := h.updates(); n != 0 {
+		t.Fatalf("the recreated Secret drew %d updates: %v", n, h.verbs())
+	}
+	if got := h.secret(t, "payments", "api-token"); string(got.Data["value"]) != "tenant's" {
+		t.Fatalf("the recreated Secret now holds %q", got.Data["value"])
+	}
+	if !strings.Contains(h.logs.String(), "not created by this server") {
+		t.Fatalf("the skip is not logged\n%s", h.logs.String())
+	}
+}
+
+// TestReconcilerRecordsCreatedUID: a create records the Secret's UID in the
+// state file beside the declaration, 0600, and the entry is dropped once the
+// target leaves the declaration (G20).
+func TestReconcilerRecordsCreatedUID(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("one"))
+	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	statePath := filepath.Join(h.dir, "keystore-delivery-state.json")
+	fi, err := os.Lstat(statePath)
+	if err != nil {
+		t.Fatalf("no state file after a create: %v", err)
+	}
+	if fi.Mode() != 0o600 {
+		t.Fatalf("state file mode %v, want 0600", fi.Mode())
+	}
+	b, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid := string(h.secret(t, "payments", "api-token").UID)
+	if uid == "" || !strings.Contains(string(b), `"uid": "`+uid+`"`) {
+		t.Fatalf("the state file does not record the created UID %q:\n%s", uid, b)
+	}
+	h.declare(t)
+	h.r.Sweep(ctx)
+	if b, err = os.ReadFile(statePath); err != nil || strings.Contains(string(b), uid) {
+		t.Fatalf("the withdrawn target's UID is still recorded (%v):\n%s", err, b)
 	}
 }

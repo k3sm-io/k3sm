@@ -768,10 +768,19 @@ wrapping, no bundled public key.
 **Ownership label:** `k3sm.io/keystore-delivery: <entry-name>`, distinct from
 `k3sm.io/managed` (reusing that label would make this reconciler's Secrets
 indistinguishable from the embedded add-on set's objects for "which reconciler may touch
-this," the exact hazard `pkg/addons/doc.go` warns a label-selector prune into). Ownership
-is checked by reading the existing Secret first: present and labelled for this entry name
-→ update; present without the label or for a different entry → left alone, skipped with a
-logged reason, never forced.
+this," the exact hazard `pkg/addons/doc.go` warns a label-selector prune into). The label
+is not proof of ownership: anyone who can write Secrets in the namespace can set it on a
+Secret they create first. So on create the reconciler records the UID the apiserver gave
+the Secret in `/var/lib/k3sm/keystore-delivery-state.json`, root:wheel 0600, written
+atomically and read with the declaration's descriptor checks. Ownership is checked by
+reading the existing Secret first: present, labelled for this entry name **and** carrying
+the recorded UID → update; anything else (no label, another entry's label, no recorded
+UID, a different UID because the Secret was deleted and recreated) → "not created by this
+server", left alone, skipped with a logged reason, never written into. An update writes
+only `data`, `type`, the label and the two annotations, and strips any `immutable` flag on
+its own object. A target that leaves the declaration loses its state entry, so declaring it
+again does not adopt the old Secret. A state file that fails its checks delivers nothing,
+and a create happens only after the state file was written successfully in that sweep.
 
 **Re-delivery on rotation:** the sweep compares the target's current version and
 fingerprint (`Store.Current`'s `Version.Version` and `Version.Fingerprint`) against the

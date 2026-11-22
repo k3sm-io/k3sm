@@ -251,10 +251,12 @@ check G18 "delivery is refused while encryption is off, before any apiserver cal
 check G19 "the delivery declaration is root-owned and not group- or other-writable, opened O_NOFOLLOW and judged on the descriptor, size- and count-capped and parsed strictly; anything else is refused whole, by the reconciler and by the verbs; the verbs serialize on a root-owned lock file judged the same way" \
 	deliver:TestDeclarationRootOwned deliver:TestDeclarationOpenedWithNoFollow cmd:TestKeysDeliverRefusals \
 	deliver:TestLockRefusesUntrustedFile deliver:TestLockBoundedWait cmd:TestKeysDeliverWritersSerialize
-check G20 "the reconciler only gets, creates and updates its labelled Opaque Secrets: an unlabelled or foreign Secret is untouched, and no list or delete is ever made" \
+check G20 "the reconciler only gets, creates and updates the Opaque Secrets it created, proven by the UID it recorded, not the label: an unlabelled, foreign, pre-created or recreated Secret is untouched, and no list or delete is ever made" \
 	deliver:TestReconcilerTouchesOnlyLabelledSecrets deliver:TestReconcilerRedeliversOnRotation \
 	deliver:TestReconcilerSkipsLabelledNonOpaque deliver:TestReconcilerContinuesAfterTargetFailure \
-	deliver:TestReconcilerRedeliversAfterRmPut deliver:TestReconcilerReappliesChangedDataKey
+	deliver:TestReconcilerRedeliversAfterRmPut deliver:TestReconcilerReappliesChangedDataKey \
+	deliver:TestReconcilerNeverWritesTenantPrecreated deliver:TestReconcilerDoesNotAdoptRecreated \
+	deliver:TestReconcilerRecordsCreatedUID
 check G21 "the rollback recipe is a byte-exact round trip: show --reveal into rotate --in -, the new version compared with version N byte for byte (bytes.Equal, as cmp), opaque and Ed25519" \
 	cmd:TestKeysRollbackRoundTrip
 # hack/ci.sh does not run this script, so G22 cannot recurse into it.

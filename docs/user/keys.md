@@ -186,9 +186,12 @@ data key `value` unless you pass `--data-key`. An `ed25519` entry is delivered a
 - **Rotation reaches the Secret.** After a `rotate`, the server updates the Secret within a
   minute. The Secret's `k3sm.io/keystore-version` annotation says which version it holds.
 - **Only its own Secrets.** The server labels each Secret it creates
-  `k3sm.io/keystore-delivery: <entry>`, and it only ever updates a Secret that carries that label
-  for that entry. If a Secret of that name already exists without the label, or labelled for
-  another entry, the server leaves it alone and logs why: delete it, or pick another
+  `k3sm.io/keystore-delivery: <entry>`, and records the Secret's UID in
+  `/var/lib/k3sm/keystore-delivery-state.json` (owned by root, mode 0600). It only ever updates a
+  Secret that carries that label for that entry and has the recorded UID. Anyone who can write
+  Secrets in the namespace can set the label, so the label alone does not count: a Secret of that
+  name that someone else created first, or that was deleted and created again, is "not created by
+  this server". The server leaves it alone and logs why: delete it, or pick another
   `--secret-name`. The server never lists Secrets and never deletes one.
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
   declaration, and prints: the Secret stays; delete it with kubectl, and rotate the entry to

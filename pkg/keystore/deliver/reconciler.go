@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -100,9 +101,14 @@ type Reconciler struct {
 	allowPlaintext bool
 	logger         *slog.Logger
 
+	// statePath is the state file beside the declaration (StateFileName).
+	statePath string
+
 	// Seams, fixed by New; tests replace them.
-	open     Opener
-	check    FileCheck
+	open  Opener
+	check FileCheck
+	// chown hands a new state file to its owner (production: ChownRoot).
+	chown    func(f *os.File) error
 	interval time.Duration
 	// newTicker returns the periodic sweep's channel and its stop.
 	newTicker func(d time.Duration) (<-chan time.Time, func())
@@ -116,8 +122,9 @@ type Reconciler struct {
 	// goroutine is the only production caller, but a test may call Sweep.
 	mu sync.Mutex
 	// fileState is the signature of the last logged declaration refusal, so an
-	// unchanged refused file logs once.
-	fileState string
+	// unchanged refused file logs once; stateFileState is the state file's.
+	fileState      string
+	stateFileState string
 	// targetState maps a target to its last logged outcome, so each target
 	// logs once per state change.
 	targetState map[string]string
@@ -131,6 +138,7 @@ func New(cfg Config) *Reconciler {
 	}
 	return &Reconciler{
 		path:           cfg.Path,
+		statePath:      filepath.Join(filepath.Dir(cfg.Path), StateFileName),
 		client:         cfg.Client,
 		store:          cfg.Store,
 		encryptionOn:   cfg.EncryptionOn,
@@ -138,6 +146,7 @@ func New(cfg Config) *Reconciler {
 		logger:         logger,
 		open:           OpenNoFollow,
 		check:          RootCheck,
+		chown:          ChownRoot,
 		interval:       addons.ManifestSweepInterval,
 		newTicker: func(d time.Duration) (<-chan time.Time, func()) {
 			t := time.NewTicker(d)
@@ -248,22 +257,49 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 	if !exists {
 		r.logger.Debug("keystore delivery: no declaration; nothing to deliver", "file", r.path)
 	}
+	// Ownership rests on the state file, so one that cannot be trusted
+	// delivers nothing: without it, no Secret is known to be ours.
+	st, err := ReadState(r.statePath, r.open, r.check)
+	if err != nil {
+		if sig := err.Error(); r.stateFileState != sig {
+			r.stateFileState = sig
+			r.logger.Warn("keystore delivery: state file refused; nothing delivered", "file", r.statePath, "reason", sig)
+		}
+		return
+	}
+	r.stateFileState = ""
+	sw := &sweep{state: st}
 	seen := make(map[string]bool, len(d.Targets))
+	declared := make(map[string]bool, len(d.Targets))
 	for _, t := range d.Targets {
 		if ctx.Err() != nil {
 			return
 		}
 		k := targetKey(t)
 		seen[k] = true
-		r.converge(ctx, t)
+		declared[stateKey(t.Namespace, t.Secret())] = true
+		r.converge(ctx, sw, t)
 	}
 	// Forget a withdrawn target, so declaring it again logs again. Its Secret
-	// stays: withdrawing a target never deletes anything.
+	// stays: withdrawing a target never deletes anything, but it is no longer
+	// recorded as ours, so declaring it again leaves it alone.
 	for k := range r.targetState {
 		if !seen[k] {
 			delete(r.targetState, k)
 		}
 	}
+	if sw.state.Retain(func(ns, name string) bool { return declared[stateKey(ns, name)] }) {
+		if err := WriteState(r.statePath, sw.state, r.chown); err != nil {
+			r.logger.Warn("keystore delivery: cannot drop withdrawn targets from the state file; will retry", "file", r.statePath, "err", err)
+		}
+	}
+}
+
+// sweep is one Sweep's working state: the ownership record, and whether it
+// was written this sweep (so the first create proves it can be).
+type sweep struct {
+	state    State
+	recorded bool
 }
 
 // targetKey identifies a target for the once-per-state log.
@@ -284,9 +320,9 @@ func (r *Reconciler) note(t Target, state string, level slog.Level, msg string, 
 
 // converge delivers one target: refuse it while encryption is off without
 // the override, else Get its Secret and create it (absent), update it
-// (labelled for this entry, at another version), or leave it alone (present
-// without the label, or labelled for another entry).
-func (r *Reconciler) converge(ctx context.Context, t Target) {
+// (present, with the UID this server recorded when it created it, at another
+// value), or leave it alone (any other Secret, labelled or not).
+func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 	if !r.encryptionOn && !r.allowPlaintext {
 		r.note(t, "refused:encryption-off", slog.LevelWarn,
 			"target refused; start the server with --"+AllowPlaintextFlag+" to deliver anyway",
@@ -302,12 +338,9 @@ func (r *Reconciler) converge(ctx context.Context, t Target) {
 		r.note(t, "error:get:"+err.Error(), slog.LevelWarn, "cannot read the Secret; will retry", "err", err)
 		return
 	default:
-		if owner, ok := cur.Labels[LabelKey]; !ok || owner != t.Name {
-			reason := "it has no " + LabelKey + " label, so k3sm did not create it"
-			if ok {
-				reason = "its " + LabelKey + " label names another entry"
-			}
-			r.note(t, "skipped:foreign:"+owner, slog.LevelWarn, "Secret left alone; delete it or pick another --secret-name", "reason", reason)
+		if reason := r.notOurs(sw, t, cur); reason != "" {
+			r.note(t, "skipped:foreign:"+reason, slog.LevelWarn,
+				"Secret left alone, not created by this server; delete it or pick another --secret-name", "reason", reason)
 			return
 		}
 		if cur.Type != corev1.SecretTypeOpaque {
@@ -325,21 +358,7 @@ func (r *Reconciler) converge(ctx context.Context, t Target) {
 	want := strconv.FormatUint(ver.Version, 10)
 
 	if cur == nil {
-		s := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:        t.Secret(),
-				Namespace:   t.Namespace,
-				Labels:      map[string]string{LabelKey: t.Name},
-				Annotations: map[string]string{VersionAnnotation: want, FingerprintAnnotation: ver.Fingerprint},
-			},
-			Type: corev1.SecretTypeOpaque,
-			Data: map[string][]byte{t.Key(): value},
-		}
-		if _, err := secrets.Create(ctx, s, metav1.CreateOptions{}); err != nil {
-			r.note(t, "error:create:"+err.Error(), slog.LevelWarn, "cannot create the Secret; will retry", "err", err)
-			return
-		}
-		r.note(t, "ok:"+want, slog.LevelInfo, "delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
+		r.create(ctx, sw, t, ver, want, value)
 		return
 	}
 	if upToDate(cur, want, ver.Fingerprint, t.Key()) {
@@ -350,15 +369,80 @@ func (r *Reconciler) converge(ctx context.Context, t Target) {
 	if next.Annotations == nil {
 		next.Annotations = map[string]string{}
 	}
+	if next.Labels == nil {
+		next.Labels = map[string]string{}
+	}
+	next.Labels[LabelKey] = t.Name
 	next.Annotations[VersionAnnotation] = want
 	next.Annotations[FingerprintAnnotation] = ver.Fingerprint
+	next.Type = corev1.SecretTypeOpaque
 	next.Data = map[string][]byte{t.Key(): value}
 	next.StringData = nil
+	next.Immutable = nil
 	if _, err := secrets.Update(ctx, next, metav1.UpdateOptions{}); err != nil {
 		r.note(t, "error:update:"+err.Error(), slog.LevelWarn, "cannot update the Secret; will retry", "err", err)
 		return
 	}
 	r.note(t, "ok:"+want, slog.LevelInfo, "re-delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
+}
+
+// notOurs is why cur is not a Secret this server created for t, or "" when it
+// is: labelled for t's entry, and with the UID recorded when it was created.
+// The label alone proves nothing, since a namespace writer can set it.
+func (r *Reconciler) notOurs(sw *sweep, t Target, cur *corev1.Secret) string {
+	owner, ok := cur.Labels[LabelKey]
+	switch {
+	case !ok:
+		return "it has no " + LabelKey + " label"
+	case owner != t.Name:
+		return "its " + LabelKey + " label names another entry"
+	}
+	switch uid := sw.state.UID(t.Namespace, t.Secret()); {
+	case uid == "":
+		return "no UID is recorded for it, so it was created by someone else"
+	case uid != string(cur.UID):
+		return "its UID is not the one recorded when this server created it, so it was recreated by someone else"
+	}
+	return ""
+}
+
+// create creates t's Secret and records its UID. The state file is written
+// before the first create of a sweep, so a Secret is never created that
+// could not then be recorded, and again after the create with the new UID.
+func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keystore.Version, want string, value []byte) {
+	if !sw.recorded {
+		if err := WriteState(r.statePath, sw.state, r.chown); err != nil {
+			r.note(t, "error:state:"+err.Error(), slog.LevelWarn, "cannot write the state file, so the Secret is not created; will retry", "file", r.statePath, "err", err)
+			return
+		}
+		sw.recorded = true
+	}
+	secrets := r.client.CoreV1().Secrets(t.Namespace)
+	s := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        t.Secret(),
+			Namespace:   t.Namespace,
+			Labels:      map[string]string{LabelKey: t.Name},
+			Annotations: map[string]string{VersionAnnotation: want, FingerprintAnnotation: ver.Fingerprint},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{t.Key(): value},
+	}
+	created, err := secrets.Create(ctx, s, metav1.CreateOptions{})
+	if err != nil {
+		r.note(t, "error:create:"+err.Error(), slog.LevelWarn, "cannot create the Secret; will retry", "err", err)
+		return
+	}
+	if created.UID == "" {
+		r.note(t, "error:uid", slog.LevelError, "the created Secret has no UID, so it cannot be recorded and is left alone; delete it")
+		return
+	}
+	sw.state.Set(t.Namespace, t.Secret(), string(created.UID))
+	if err := WriteState(r.statePath, sw.state, r.chown); err != nil {
+		r.note(t, "error:record:"+err.Error(), slog.LevelError, "created the Secret but cannot record it, so later sweeps leave it alone; delete it to have it created again", "file", r.statePath, "err", err)
+		return
+	}
+	r.note(t, "ok:"+want, slog.LevelInfo, "delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
 }
 
 // upToDate reports whether a Secret labelled for the entry already holds the

@@ -41,12 +41,20 @@ limitations under the License.
 //   - absent: creates an Opaque Secret labelled LabelKey=<entry> and
 //     annotated with the version and fingerprint, holding the entry's current
 //     value under the data key (an Ed25519 entry's stored seed or key bytes,
-//     with no PEM);
-//   - present and labelled for this entry: updates it only when its
-//     VersionAnnotation or FingerprintAnnotation differs from Store.Current's
-//     version or fingerprint, or its data is not exactly the declared key;
-//   - present without the label, or labelled for another entry: leaves it
-//     alone and logs why.
+//     with no PEM), and records the UID the apiserver gave it in the state
+//     file (StateFileName, root:wheel 0600, beside the declaration);
+//   - present, labelled for this entry and with the recorded UID: updates it
+//     only when its VersionAnnotation or FingerprintAnnotation differs from
+//     Store.Current's version or fingerprint, or its data is not exactly the
+//     declared key;
+//   - anything else (no label, another entry's label, no recorded UID, or a
+//     UID other than the recorded one): leaves it alone and logs why. The
+//     label is forgeable by anyone who can write Secrets in the namespace;
+//     the UID a create returned is not, and a recreated Secret gets a new one.
+//
+// An update writes data, type, the label and the two annotations, and strips
+// any immutable flag. A target withdrawn from the declaration loses its state
+// record, so declaring it again leaves the old Secret alone.
 //
 // It never lists, never deletes and touches no other kind, so withdrawing a
 // target (`k3sm keys undeliver`) leaves its Secret in place. A per-target
