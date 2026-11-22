@@ -118,3 +118,21 @@ func TestLogErrorsNameNoFigures(t *testing.T) {
 		}
 	})
 }
+
+// The two grant refusals for keys, the floor at its key bound and the
+// caller's share spent, read the same, so the text does not tell a caller
+// whether other uids filled the floor.
+func TestLogFullKeyRefusalsReadTheSame(t *testing.T) {
+	s, _, _ := fileLogScope(t)
+	l := s.userFloor.(*fileFloorLog).log
+	atBound := &logState{keys: l.keyBound(), uidKeys: map[uint32]int{}}
+	atShare := &logState{uidKeys: map[uint32]int{1001: l.keyShare()}}
+	eb, es := l.addKeyRoom(atBound, 1001, 1, false), l.addKeyRoom(atShare, 1001, 1, false)
+	if !errors.Is(eb, ErrLogFull) || !errors.Is(es, ErrLogFull) {
+		t.Fatalf("the key refusals: %v, %v, want ErrLogFull", eb, es)
+	}
+	if eb.Error() != es.Error() {
+		t.Fatalf("the key refusals differ:\n%v\n%v", eb, es)
+	}
+}
+

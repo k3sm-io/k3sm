@@ -868,7 +868,7 @@ func (l *appendLog) keyRoom(f *os.File, st unix.Stat_t) error {
 		return nil
 	}
 	if bound := l.keyBound(); state.keys+grantKeys > bound {
-		return fmt.Errorf("%w (%s is at its key bound)", ErrLogFull, l.name)
+		return fmt.Errorf("%w (%s has no room for the caller's keys under its key bound)", ErrLogFull, l.name)
 	}
 	return nil
 }
@@ -876,8 +876,7 @@ func (l *appendLog) keyRoom(f *os.File, st unix.Stat_t) error {
 // addKeyRoom refuses, as ErrLogFull, n more keys charged to uid: for a
 // revocation's line (revoke) past keyBound plus the revocation headroom; for
 // any other line past keyBound, or past uid's key share. appendLine and
-// floorGrantRoom both judge through it. The texts name the bound met, never
-// a figure.
+// floorGrantRoom both judge through it. The texts name no figure.
 func (l *appendLog) addKeyRoom(state *logState, uid uint32, n int, revoke bool) error {
 	if revoke {
 		if state.keys+n > l.readKeyBound() {
@@ -885,11 +884,10 @@ func (l *appendLog) addKeyRoom(state *logState, uid uint32, n int, revoke bool) 
 		}
 		return nil
 	}
-	if state.keys+n > l.keyBound() {
-		return fmt.Errorf("%w (%s is at its key bound)", ErrLogFull, l.name)
-	}
-	if state.uidKeys[uid]+n > l.keyShare() {
-		return fmt.Errorf("%w (the caller's share of the key bound in %s is spent)", ErrLogFull, l.name)
+	// One text for the floor at its key bound and the caller's share spent,
+	// so a caller cannot tell whether other uids filled the floor.
+	if state.keys+n > l.keyBound() || state.uidKeys[uid]+n > l.keyShare() {
+		return fmt.Errorf("%w (%s has no room for the caller's keys under its key bound)", ErrLogFull, l.name)
 	}
 	return nil
 }
