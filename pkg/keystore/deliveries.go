@@ -1198,7 +1198,7 @@ func (u *UserScope) grant(op, name, namespace string) *grantAudit {
 
 // take judges the user-scope floor, then appends the line once. Its error
 // refuses the grant, which has written nothing: a floor that is absent,
-// untrusted, unflagged, unreadable or malformed refuses before the ok line,
+// untrusted, unflagged, unreadable or past the reader's bound refuses before the ok line,
 // and the refusal is audited in its place (refused).
 func (g *grantAudit) take() error {
 	if g.tried {

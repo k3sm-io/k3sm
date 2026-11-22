@@ -35,11 +35,11 @@ func TestLogSyncForgetsOnNewBirthTime(t *testing.T) {
 	}
 	_ = f.Close()
 	spoilLineAt(t, s, last)
-	if state := syncFloor(t, l, st); state.bad != nil {
-		t.Fatalf("the same file read again: %v (the earlier line is not read again)", state.bad)
+	if state := syncFloor(t, l, st); state.bad != nil || state.damaged() != 0 {
+		t.Fatalf("the same file read again: %v, %d damaged (the earlier line is not read again)", state.bad, state.damaged())
 	}
 	st.Btim.Nsec++
-	if state := syncFloor(t, l, st); state.bad == nil {
-		t.Fatal("a file with a new birth time was not read again")
+	if state := syncFloor(t, l, st); state.damaged() != 1 {
+		t.Fatal("a file with a new birth time was not read again: the spoiled line was not seen")
 	}
 }

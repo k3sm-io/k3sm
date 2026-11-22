@@ -64,7 +64,8 @@ func spoilLineAt(t *testing.T, s *FileStore, end int64) {
 
 // An in-place change to the last line already read, in the same inode at
 // the same or a larger size, is noticed: the reader reads that line again
-// before it reads on, and on a mismatch reads the floor from the start.
+// before it reads on, and on a mismatch reads the floor from the start,
+// where it meets the spoiled line and skips it as damage.
 func TestLogSyncNoticesRewrittenLastLine(t *testing.T) {
 	ctx := context.Background()
 	for _, grow := range []bool{false, true} {
@@ -78,8 +79,11 @@ func TestLogSyncNoticesRewrittenLastLine(t *testing.T) {
 			}
 			appendLogBytes(t, s, userFloorLogName, line)
 		}
-		if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, errFloorLogMalformed) {
-			t.Fatalf("grow %v: current after the last line read was rewritten: %v, want errFloorLogMalformed", grow, err)
+		if _, _, err := u.Current(ctx, "user/1001/token"); err != nil {
+			t.Fatalf("grow %v: current after the last line read was rewritten: %v, want it served", grow, err)
+		}
+		if n := floorDamage(t, s); n != 1 {
+			t.Fatalf("grow %v: %d damaged lines after the last line read was rewritten, want 1 (read again from the start)", grow, n)
 		}
 	}
 }
@@ -95,6 +99,9 @@ func TestLogSyncForgetsOnClearFlag(t *testing.T) {
 	if _, _, err := u.Current(ctx, "user/1001/token"); err != nil {
 		t.Fatalf("current over a cached floor: %v (the earlier line is not read again)", err)
 	}
+	if n := floorDamage(t, s); n != 0 {
+		t.Fatalf("%d damaged lines over a cached floor, want 0 (the earlier line is not read again)", n)
+	}
 	s.logFlags = func(*os.File) (uint32, error) { return 0, nil }
 	if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, errLogNotAppendOnly) {
 		t.Fatalf("current over an unflagged floor: %v, want errLogNotAppendOnly", err)
@@ -103,8 +110,11 @@ func TestLogSyncForgetsOnClearFlag(t *testing.T) {
 		t.Fatalf("a clear flag kept the state: read to byte %d", st.off)
 	}
 	s.logFlags = flagged
-	if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, errFloorLogMalformed) {
-		t.Fatalf("current once the flag is back: %v, want errFloorLogMalformed", err)
+	if _, _, err := u.Current(ctx, "user/1001/token"); err != nil {
+		t.Fatalf("current once the flag is back: %v, want it served", err)
+	}
+	if n := floorDamage(t, s); n != 1 {
+		t.Fatalf("%d damaged lines once the flag is back, want 1 (read again from the start)", n)
 	}
 }
 

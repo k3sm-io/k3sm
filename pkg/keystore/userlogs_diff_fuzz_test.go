@@ -143,10 +143,12 @@ func diffClass(err error) string {
 // FuzzLogSyncDifferential checks the incremental reader against a reading
 // from scratch: after every batch of appends, sync of a log read on from
 // where it stopped must agree with sync of the same bytes by a reader that
-// has read nothing, on the floor's highest seqs, tombstones, key count and
-// verdict, and on both logs' past-cap charges per uid and the revocation
-// room they leave, under small caps, budget and key bound. The seeds are
-// committed under testdata/fuzz/FuzzLogSyncDifferential.
+// has read nothing, on the floor's highest seqs, tombstones, key count,
+// damage count and verdict, and on both logs' past-cap charges per uid and
+// the revocation room they leave, under small caps, budget and key bound.
+// Garbage, over-long and torn lines are skipped as damage, so the readers
+// are compared on the lines after them too. The seeds are committed under
+// testdata/fuzz/FuzzLogSyncDifferential.
 func FuzzLogSyncDifferential(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		d := &diffInput{data}
@@ -173,8 +175,8 @@ func FuzzLogSyncDifferential(f *testing.F) {
 				if want.bad != nil {
 					continue
 				}
-				if got.off != want.off || got.keys != want.keys {
-					t.Fatalf("%s: incremental read to %d with %d keys, from scratch to %d with %d", where, got.off, got.keys, want.off, want.keys)
+				if got.off != want.off || got.keys != want.keys || got.damaged() != want.damaged() {
+					t.Fatalf("%s: incremental read to %d with %d keys and %d damaged lines, from scratch to %d with %d and %d", where, got.off, got.keys, got.damaged(), want.off, want.keys, want.damaged())
 				}
 				if !maps.Equal(got.maxSeq, want.maxSeq) || !maps.Equal(got.buried, want.buried) {
 					t.Fatalf("%s: incremental seqs %v tombstones %v, from scratch %v %v", where, got.maxSeq, got.buried, want.maxSeq, want.buried)

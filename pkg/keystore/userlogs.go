@@ -203,10 +203,12 @@ func (logMissingScopesError) Error() string {
 
 func (logMissingScopesError) Is(target error) bool { return target == errLogMissing }
 
-// restoreRemedy is the remedy every user-scope floor error names while the
-// rebuild verb is not built: the matched-set restore, then doctor. No error
-// names a verb that does not exist yet (TestErrorsNameNoUnbuiltVerb).
-const restoreRemedy = "restore the matched set (keystore/, keystore/.user/ and both logs) from one backup and run sudo k3sm doctor (the rebuild verb is not yet available)"
+// restoreRemedy is the remedy a user-scope floor error names, while the
+// rebuild verb is not built, for damage a skipped line cannot absorb: the
+// matched-set restore, then doctor, and what the restore costs. A torn or
+// garbage line is never such damage: the reader skips it. No error names a
+// verb that does not exist yet (TestErrorsNameNoUnbuiltVerb).
+const restoreRemedy = "restore the matched set (keystore/, keystore/.user/ and both logs) from one backup, which brings back every entry deleted since the backup, and run sudo k3sm doctor (the rebuild verb is not yet available)"
 
 // ErrLogFull refuses an operation because an append-only log is past its
 // hard cap, or, for a revocation past the hard cap, because the uid's
@@ -237,17 +239,15 @@ var (
 	errFloorTooManyKeys = errors.New("the user-scope floor holds more distinct keys than its key bound")
 	// errLogTorn is a last line with no newline: damage.
 	errLogTorn = errors.New("the last line has no newline")
-	// errLogTornTail refuses an append to the floor whose last byte is not a
-	// newline: the line would complete the torn one into a line that does
-	// not parse. Nothing was written; root must run sudo k3sm keys floor
-	// --rebuild.
-	errLogTornTail = errors.New("the keystore log's last line has no newline (a torn tail), so the line was not appended; root must " + restoreRemedy)
 	// errLogLineTooLong is a line over maxLogLine, which is never written.
 	errLogLineTooLong = fmt.Errorf("a keystore log line is at most %d bytes", maxLogLine)
-	// errFloorLogMalformed is a user-scope floor whose bytes do not parse:
-	// damage, which refuses every user-scope operation that reads the floor,
-	// revocations included, until root rebuilds it.
-	errFloorLogMalformed = fmt.Errorf("%w: the user-scope floor %s does not parse; root must "+restoreRemedy, ErrCorrupt, userFloorLogName)
+	// errFloorLogMalformed is a user-scope floor past the reader's bounds
+	// (larger than logReadBound, or holding more keys than its key bound),
+	// which the server never writes: damage, which refuses every user-scope
+	// operation that reads the floor, revocations included, until root
+	// repairs it. A line that does not parse is not this: the reader skips
+	// it and counts it (FloorDamage).
+	errFloorLogMalformed = fmt.Errorf("%w: the user-scope floor %s is past the reader's bound; root must "+restoreRemedy, ErrCorrupt, userFloorLogName)
 	// errLogUnreadable is a log whose bytes could not be read: an I/O
 	// error, transient and never damage. It is never kept, matches no
 	// ErrCorrupt, and so refuses a grant or read and lets a revocation go
@@ -348,6 +348,34 @@ func (s *FileStore) LogSizes(ctx context.Context) (LogSizes, error) {
 	return out, nil
 }
 
+// FloorDamage is the count of the user-scope floor's damaged lines, which
+// the reader skips: lines that do not parse, and a last line with no
+// newline. It is root's, for doctor: a damaged line lost only what it
+// would have recorded. The floor is opened and judged as for any read; a
+// store with no file-backed floor has none.
+func (s *FileStore) FloorDamage(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	ff, ok := s.userFloor.(*fileFloorLog)
+	if !ok {
+		return 0, nil
+	}
+	f, st, err := ff.log.open(unix.O_RDONLY)
+	if err != nil {
+		ff.log.forgetUnflagged(err, false)
+		return 0, err
+	}
+	defer func() { _ = f.Close() }() // read-only
+	ff.log.mu.Lock()
+	defer ff.log.mu.Unlock()
+	state, err := ff.log.sync(f, st)
+	if err != nil {
+		return 0, err
+	}
+	return state.damaged(), nil
+}
+
 // appendLog is one append-only log and what has been read of it: the
 // sizes of the lines that start past the hard cap, per uid, which is how
 // much of each uid's revocation budget is spent, and for the floor the
@@ -424,16 +452,41 @@ type logState struct {
 	scopes   map[string]string
 	firstGen map[nameKey][generationSize]byte
 	moreGens map[nameKey][][generationSize]byte
-	// bad is the error of a line that did not parse, which sticks for this
-	// file.
+	// bad is the error of damage that refuses the whole log, which sticks
+	// for this file: a log past the reader's size bound, or a floor past its
+	// key bound. A line that does not parse is not bad: it is skipped and
+	// counted in damage.
 	bad error
-	// badAt is the byte offset bad was met at: root's, never in an error a
-	// socket caller can see.
+	// badAt is the byte offset bad, or the first damaged line, was met at:
+	// root's, never in an error a socket caller can see.
 	badAt int64
+	// damage counts the lines skipped because they do not parse (outside
+	// the grammar, or over maxLogLine): never applied to the state, so a
+	// skipped line can only lose what it would have said, never undo a
+	// tombstone already read. warned is the count last logged at Warn.
+	damage, warned int
 	// tornSize, when not 0, is the size of the file whose last line had no
-	// newline: bad then holds only for that size, since an append completes
-	// the line, and reading resumes at off, the torn line's start.
+	// newline: a pending damaged line, counted by damaged while the file
+	// keeps that size, and reading resumes at off, the torn line's start,
+	// once an append closes it.
 	tornSize int64
+}
+
+// damaged is the count of damaged lines: those skipped, and a last line
+// with no newline.
+func (s *logState) damaged() int {
+	if s.tornSize != 0 {
+		return s.damage + 1
+	}
+	return s.damage
+}
+
+// skip counts the line at off as damage, keeping the first offset.
+func (s *logState) skip(off int64) {
+	if s.damaged() == 0 {
+		s.badAt = off
+	}
+	s.damage++
 }
 
 // at records off as where the sticky error err was met, kept apart from
@@ -588,11 +641,25 @@ func (l *appendLog) forgetUnflagged(err error, held bool) {
 }
 
 // sync reads f (which st describes) on from where reading stopped, under
-// l.mu, and returns the state. A line that does not parse is state.bad,
-// which sticks; a last line with no newline is state.bad only while the
-// file keeps its size; a read I/O error is errLogUnreadable, returned and
-// not kept, and reading resumes past the last whole line read.
+// l.mu, and returns the state. A line that does not parse, over-long lines
+// included, is skipped and counted (state.damage); a last line with no
+// newline is pending damage while the file keeps its size (state.tornSize);
+// a log past the reader's size bound or a floor past its key bound is
+// state.bad, which sticks; a read I/O error is errLogUnreadable, returned
+// and not kept, and reading resumes past the last whole line read.
 func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
+	s, err := l.syncRead(f, st)
+	if err == nil && s.damaged() > s.warned {
+		// Root's figures, in the server's log: never in an error a socket
+		// caller can see.
+		slog.Warn("a keystore append-only log holds lines that do not parse; they are skipped", "log", l.name, "damaged", s.damaged(), "first", s.badAt)
+		s.warned = s.damaged()
+	}
+	return s, err
+}
+
+// syncRead is sync's reading.
+func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 	s := &l.state
 	bound := l.s.logReadBound()
 	var src io.ReaderAt = f
@@ -617,9 +684,12 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 			fresh()
 		}
 	}
-	if s.tornSize != 0 && st.Size != s.tornSize {
+	if s.tornSize != 0 {
+		if st.Size == s.tornSize {
+			return s, nil
+		}
 		// The torn line has been appended to: read it again.
-		s.bad, s.tornSize = nil, 0
+		s.tornSize = 0
 	}
 	if s.bad != nil || st.Size == s.off {
 		return s, nil
@@ -656,7 +726,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 				continue
 			case errors.Is(err, io.EOF):
 				// s.off stays before the cap, so the skip runs again.
-				s.bad, s.tornSize = s.at(off, errLogTorn), st.Size
+				s.tornSize = st.Size
 				return s, nil
 			}
 			return nil, l.unreadable(off, err)
@@ -672,33 +742,41 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 			return nil, l.unreadable(off, err)
 		}
 		if errors.Is(err, errLogTorn) {
-			s.off, s.bad, s.tornSize = off, s.at(off, err), st.Size
+			if s.damaged() == 0 {
+				s.badAt = off
+			}
+			s.off, s.tornSize = off, st.Size
 			return s, nil
 		}
-		if errors.Is(err, errLogLineTooLong) && !l.whole {
-			// The tolerant audit reader drops an over-long line, charged to
-			// no uid, as it drops any line it cannot read; only the floor
-			// is strict. It is read through to its newline.
+		if errors.Is(err, errLogLineTooLong) {
+			// An over-long line is damage, skipped and charged to no uid. It
+			// is read through to its newline.
 			n, serr := skipRestOfLine(r, line)
 			switch {
 			case errors.Is(serr, io.EOF):
-				s.off, s.bad, s.tornSize = off, s.at(off, errLogTorn), st.Size
+				if s.damaged() == 0 {
+					s.badAt = off
+				}
+				s.off, s.tornSize = off, st.Size
 				return s, nil
 			case serr != nil:
 				s.off = off
 				return nil, l.unreadable(off, serr)
 			}
+			s.skip(off)
 			off += n
 			continue
 		}
-		if err != nil {
-			s.bad = s.at(off, err)
-			return s, nil
-		}
 		uid, perr := l.lineUID(s, line[:len(line)-1])
-		if perr != nil {
+		if errors.Is(perr, errFloorTooManyKeys) {
 			s.bad = s.at(off, perr)
 			return s, nil
+		}
+		if perr != nil {
+			// A line that does not parse is skipped and changes nothing:
+			// lineUID refuses before it records anything.
+			s.skip(off)
+			uid = 0
 		}
 		if off >= s.hardCap && uid != 0 {
 			s.pastCap[uid] += int64(len(line))
@@ -910,12 +988,11 @@ func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64)
 // the hard cap only a line that may draw on uid's revocation budget
 // (budget) is written, and only while the budget has room for it. A
 // revocation's line (revoke) is held to revokeFreeSlack rather than the
-// free-space margin. It never
-// writes what the reader would refuse: a line past logReadBound, a floor
-// line that adds a key past the key bound, or a floor line after a torn
-// tail, which it would merge with. After a torn tail in the audit log it
-// writes a newline first, so the torn bytes read as a line of their own,
-// which the tolerant audit reader drops, and line reads back whole.
+// free-space margin. It never writes what the reader would refuse: a line
+// past logReadBound, or a floor line that adds a key past the key bound.
+// After a torn tail, in either log, it writes a newline first, in the same
+// write(2), so the torn bytes read as a line of their own, which the reader
+// skips as damage, and line reads back whole.
 func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) error {
 	return l.appendLineSlack(uid, line, budget, revoke, revoke)
 }
@@ -943,9 +1020,8 @@ func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, sla
 	}
 	out := line
 	if torn {
-		if l.addsKey != nil {
-			return fmt.Errorf("%w (%s)", errLogTornTail, l.name)
-		}
+		// The torn bytes become a line of their own, which the reader skips
+		// as damage, and line reads back whole.
 		out = append([]byte{'\n'}, line...)
 	}
 	if bound := l.s.logReadBound(); st.Size+int64(len(out)) > bound {
@@ -962,8 +1038,7 @@ func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, sla
 		if err != nil {
 			return err
 		}
-		// The torn verdict is the tail the newline above closes.
-		if state.bad != nil && !(torn && state.tornSize == st.Size) {
+		if state.bad != nil {
 			return fmt.Errorf("%s: %w", l.name, state.bad)
 		}
 		return nil
@@ -1005,10 +1080,10 @@ func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, sla
 		return err
 	}
 	// One write(2) of the whole line, into reserved blocks. An EIO, or a
-	// crash mid-write, can still leave a torn tail the flag keeps: damage
-	// in the floor, which only a restore repairs (docs/design/keystore.md §
-	// "The user-scope floor"), and a dropped line in the audit log once the
-	// next append closes it.
+	// crash mid-write, can still leave a torn tail the flag keeps: in
+	// either log a skipped, counted line once the next append closes it,
+	// which loses only what the torn line would have recorded
+	// (docs/design/keystore.md § "The user-scope floor").
 	_, err = f.Write(out)
 	if err == nil {
 		err = f.Sync()
@@ -1162,8 +1237,8 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 }
 
 // read opens, judges and reads the floor and runs fn on what was read,
-// under the log's lock. A floor that does not parse is
-// errFloorLogMalformed.
+// under the log's lock. A floor past the reader's size or key bound is
+// errFloorLogMalformed; a line that does not parse is skipped (sync).
 func (f *fileFloorLog) read(fn func(*logState)) error {
 	file, st, err := f.log.open(unix.O_RDONLY)
 	if err != nil {
@@ -1179,7 +1254,7 @@ func (f *fileFloorLog) read(fn func(*logState)) error {
 	}
 	if state.bad != nil {
 		// The offset is root's: the server's debug log, never the error.
-		slog.Debug("the user-scope floor does not parse", "log", f.log.name, "offset", state.badAt, "err", state.bad)
+		slog.Debug("the user-scope floor is past the reader's bound", "log", f.log.name, "offset", state.badAt, "err", state.bad)
 		return fmt.Errorf("%w (%v)", errFloorLogMalformed, state.bad)
 	}
 	fn(state)

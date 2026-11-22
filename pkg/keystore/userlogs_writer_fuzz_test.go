@@ -86,8 +86,9 @@ func rewriteLog(t *testing.T, s *FileStore, name string, b []byte, newInode bool
 // rewrites on the cached path: a shrink to a line boundary, a new inode,
 // and a same-size rewrite in place. After every step a reader from scratch
 // must never refuse what the writer produced (no key-bound or size-bound
-// damage, no torn merge; only a torn audit tail the next append has not
-// closed yet), and the writer's cached state must agree with it. The seeds
+// damage; a torn tail is skipped damage, which the next append closes with
+// a newline of its own), and the writer's cached state must agree with it,
+// on its damage count too. The seeds
 // are committed under testdata/fuzz/FuzzLogWriter.
 func FuzzLogWriter(f *testing.F) {
 	f.Add([]byte("\x02\x03\x04\x00\x01\x02\x03\x00\x01\x02\x03\x01\x02\x00\x01\x03\x00\x01"))
@@ -156,13 +157,10 @@ func FuzzLogWriter(f *testing.F) {
 				want := writerFuzzFresh(t, s, lg.floor, maxKeys)
 				where := fmt.Sprintf("step %d op %d, %s", step, op, lg.l.name)
 				if want.bad != nil {
-					size := int64(len(readLog(t, s, lg.l.name)))
-					if lg.floor || want.tornSize != size {
-						t.Fatalf("%s: a reader from scratch refuses what the writer wrote: %v", where, want.bad)
-					}
+					t.Fatalf("%s: a reader from scratch refuses what the writer wrote: %v", where, want.bad)
 				}
 				got := writerFuzzSync(t, lg.l)
-				if diffClass(got.bad) != diffClass(want.bad) || got.off != want.off || got.keys != want.keys {
+				if diffClass(got.bad) != diffClass(want.bad) || got.off != want.off || got.keys != want.keys || got.damaged() != want.damaged() {
 					t.Fatalf("%s: cached verdict %v at %d with %d keys, from scratch %v at %d with %d", where, got.bad, got.off, got.keys, want.bad, want.off, want.keys)
 				}
 				if !maps.Equal(got.maxSeq, want.maxSeq) || !maps.Equal(got.buried, want.buried) || !maps.Equal(got.pastCap, want.pastCap) {

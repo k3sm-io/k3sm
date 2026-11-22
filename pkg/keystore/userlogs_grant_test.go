@@ -57,8 +57,14 @@ func TestGrantRefusesUntrustedFloorFirst(t *testing.T) {
 			appendLogBytes(t, s, userFloorLogName, line)
 			s.userFloor.(*fileFloorLog).log.readAt = func(*os.File) io.ReaderAt { return failingReaderAt{} }
 		}, errLogUnreadable},
-		{"malformed", func(t *testing.T, s *FileStore) {
-			appendLogBytes(t, s, userFloorLogName, []byte("not a floor line\n"))
+		{"past its key bound", func(t *testing.T, s *FileStore) {
+			// token's key, the delivery record's and one more: one past two.
+			s.userFloor.(*fileFloorLog).log.maxKeys = 2
+			line, err := floorLine("user/1001", "pad", guid(9), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			appendLogBytes(t, s, userFloorLogName, line)
 		}, errFloorLogMalformed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

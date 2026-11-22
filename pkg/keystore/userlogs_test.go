@@ -182,13 +182,34 @@ func TestWithdrawAbsentFloorProceeds(t *testing.T) {
 	}
 }
 
-// A user-scope floor whose bytes do not parse refuses even a withdraw,
-// with ErrCorrupt naming floor --rebuild, and writes nothing: damage is
-// not an absent floor. A last line with no newline is damage too.
+// A user-scope floor past the reader's bound refuses even a withdraw, with
+// ErrCorrupt naming the matched-set restore and what it brings back, and
+// writes nothing: damage is not an absent floor. A line that does not
+// parse, or a last line with no newline, is not this damage: the reader
+// skips it (TestFloorGarbageTailIsSkippedDamage).
 func TestWithdrawMalformedFloorRefused(t *testing.T) {
-	for _, tc := range []struct{ name, junk string }{
-		{"a line that does not parse", "not a floor line\n"},
-		{"a torn last line", "user/1001 token"},
+	for _, tc := range []struct {
+		name  string
+		spoil func(t *testing.T, s *FileStore)
+	}{
+		{"past its key bound", func(t *testing.T, s *FileStore) {
+			// token's key, the delivery record's and one more: one past two.
+			s.userFloor.(*fileFloorLog).log.maxKeys = 2
+			line, err := floorLine("user/1001", "pad", guid(9), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			appendLogBytes(t, s, userFloorLogName, line)
+		}},
+		{"past its size bound", func(t *testing.T, s *FileStore) {
+			size := int64(len(readLog(t, s, userFloorLogName)))
+			s.logSoftCap, s.logHardCap, s.logRevokeBudget = 1, 1, 2*maxLogLine
+			line, err := floorLine("user/1001", "pad", guid(9), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			appendLogBytes(t, s, userFloorLogName, bytes.Repeat(line, int(s.logReadBound()-size)/len(line)+1))
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -196,10 +217,10 @@ func TestWithdrawMalformedFloorRefused(t *testing.T) {
 			if err := u.addDelivery(ctx, testDelivery(1)); err != nil {
 				t.Fatal(err)
 			}
-			appendLogBytes(t, s, userFloorLogName, []byte(tc.junk))
+			tc.spoil(t, s)
 			snap := treeSnapshot(t, server)
 			err := u.withdrawDelivery(ctx, testDelivery(1).uid)
-			if !errors.Is(err, ErrCorrupt) || !errors.Is(err, errFloorLogMalformed) || !strings.Contains(err.Error(), "matched set") {
+			if !errors.Is(err, ErrCorrupt) || !errors.Is(err, errFloorLogMalformed) || !strings.Contains(err.Error(), "matched set") || !strings.Contains(err.Error(), "brings back every entry deleted since the backup") {
 				t.Fatalf("withdraw over a malformed floor: %v, want ErrCorrupt naming the matched-set restore", err)
 			}
 			checkTreeUnchanged(t, snap, treeSnapshot(t, server))

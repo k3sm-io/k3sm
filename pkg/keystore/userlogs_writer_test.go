@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -228,38 +229,44 @@ func TestWithdrawUnverifiedFloorSealsNothing(t *testing.T) {
 	}
 }
 
-// U20: an rm over a floor whose last line has no newline is refused and
-// removes nothing: it buries first, and a floor that cannot be read or take
-// the tombstone refuses it before any removal. The floor is unchanged, so
-// the next read refuses it as damage, and a grant over it is refused before
-// any write.
-func TestRmOverTornFloorTailRemovesNothing(t *testing.T) {
+// U20: an rm over a floor whose last line has no newline buries and
+// removes: its burial writes a newline first, so the torn bytes are a line
+// of their own, which the reader skips as damage, and the tombstone reads
+// back whole. The next read and a grant over it are served.
+func TestRmOverTornFloorTailBuries(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
 	userPut(t, u, "user/1001/keep", "kept")
-	appendLogBytes(t, s, userFloorLogName, []byte("user/1001 tok"))
+	torn := []byte("user/1001 tok")
+	appendLogBytes(t, s, userFloorLogName, torn)
 	before := readLog(t, s, userFloorLogName)
 	tokenDir := filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "token")
-	err := u.Delete(ctx, "user/1001/token")
-	if err == nil || errors.Is(err, errCommitted) || !errors.Is(err, errFloorLogMalformed) || !strings.Contains(err.Error(), "nothing removed") {
-		t.Fatalf("rm over a torn floor tail: %v, want a refusal naming the malformed floor, with nothing removed", err)
+	gen := entryGeneration(t, server, "token")
+	if err := u.Delete(ctx, "user/1001/token"); err != nil {
+		t.Fatalf("rm over a torn floor tail: %v, want it to bury and remove", err)
 	}
-	if _, err := os.Lstat(filepath.Join(tokenDir, currentName)); err != nil {
-		t.Fatalf("the entry's pointer after a refused rm: %v, want it kept", err)
+	if _, err := os.Lstat(tokenDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the entry's tree after rm: %v, want it removed", err)
 	}
-	if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
-		t.Fatal("rm appended to a floor with a torn tail")
+	tomb, err := tombLine("user/1001", "token", gen)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, _, err := u.Current(ctx, "user/1001/keep"); !errors.Is(err, errFloorLogMalformed) {
-		t.Fatalf("the next read over the torn floor: %v, want errFloorLogMalformed", err)
+	after := readLog(t, s, userFloorLogName)
+	if !bytes.HasPrefix(after, before) || !bytes.HasPrefix(after[len(before):], append([]byte{'\n'}, tomb...)) {
+		t.Fatalf("rm over a torn tail appended %q, want a newline and then the tombstone", after[len(before):])
 	}
-	snap := treeSnapshot(t, server)
-	if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v")); !errors.Is(err, errFloorLogMalformed) {
-		t.Fatalf("a grant over the torn floor: %v, want errFloorLogMalformed", err)
+	if _, err := s.userFloor.floor("user/1001", "token", gen); !errors.Is(err, errFloorBuried) {
+		t.Fatalf("the floor after rm over a torn tail: %v, want the generation buried", err)
 	}
-	checkTreeUnchanged(t, snap, treeSnapshot(t, server))
-	if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
-		t.Fatal("a grant appended to a floor with a torn tail")
+	if _, _, err := u.Current(ctx, "user/1001/keep"); err != nil {
+		t.Fatalf("the next read over the closed torn line: %v", err)
+	}
+	if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v")); err != nil {
+		t.Fatalf("a grant over the closed torn line: %v", err)
+	}
+	if n := floorDamage(t, s); n != 1 {
+		t.Fatalf("%d damaged lines, want 1", n)
 	}
 }
 
