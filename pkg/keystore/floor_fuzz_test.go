@@ -74,6 +74,77 @@ func FuzzParseFloor(f *testing.F) {
 	})
 }
 
+// FuzzMergeFloor drives merge over any two floors parseFloor accepts (the
+// restored one and the moved-aside one) and any keep name, followed by the
+// prune its write makes, and checks: it never panics; it never un-buries,
+// so each of the restored floor's burials is still buried or reported
+// dropped; every burial it adds names a generation the moved-aside floor
+// buries or holds live; a live record is buried only when the moved-aside
+// floor buries its generation and keep does not name it; its counts add up;
+// and the result encodes to bytes that parse back to it. The seeds are
+// committed under testdata/fuzz/FuzzMergeFloor.
+func FuzzMergeFloor(f *testing.F) {
+	type key struct{ name, gen string }
+	f.Fuzz(func(t *testing.T, restoredB, asideB []byte, keep string) {
+		restored, err := parseFloor(restoredB)
+		if err != nil {
+			return
+		}
+		aside, err := parseFloor(asideB)
+		if err != nil {
+			return
+		}
+		before := maps.Clone(restored)
+		r, d := restored.merge(aside, map[string]bool{keep: true})
+		d = append(d, restored.prune()...)
+		dropped := map[key]bool{}
+		for _, x := range d {
+			dropped[key{x.name, x.generation}] = true
+		}
+		for name, e := range before {
+			for _, b := range e.burials() {
+				if !restored[name].buries(b.Generation) && !dropped[key{name, b.Generation}] {
+					t.Fatalf("merge un-buried %s %s without reporting it", name, b.Generation)
+				}
+			}
+			if !e.live() || restored[name].Generation == e.Generation {
+				continue
+			}
+			if name == keep || !aside[name].buries(e.Generation) {
+				t.Fatalf("merge cleared %s's live record %+v, which the moved-aside floor does not bury or keep names", name, e)
+			}
+		}
+		added := 0
+		for name, e := range restored {
+			for _, b := range e.burials() {
+				if before[name].buries(b.Generation) {
+					continue
+				}
+				if !aside[name].buries(b.Generation) && aside[name].Generation != b.Generation {
+					t.Fatalf("merge buried %s %s, which the moved-aside floor does not name", name, b.Generation)
+				}
+				added++
+			}
+		}
+		for k := range dropped {
+			if !before[k.name].buries(k.gen) {
+				added++ // added by the merge, then dropped
+			}
+		}
+		if added != r.Merged+r.Retired {
+			t.Fatalf("merge reports %d merged and %d retired, and added %d burials", r.Merged, r.Retired, added)
+		}
+		b, err := marshalFloor(restored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		back, err := parseFloor(b)
+		if err != nil || !floorsEqual(back, restored) {
+			t.Fatalf("the merged floor does not parse back: %v", err)
+		}
+	})
+}
+
 // TestParseFloorStrict: parseFloor accepts only the bytes marshalFloor
 // writes, with or without its trailing newline. encoding/json alone would
 // take a duplicate key's last value and match a field name in any case, so
@@ -154,13 +225,16 @@ func checkFloorEntry(t *testing.T, name string, e floorEntry) {
 	}
 }
 
-// TestFloorOpsProperty drives random sequences of set, raise, bury, prune
-// and a lift of every delete sequence to end at maxDeleteSeq (so the next
-// bury renumbers), each followed by the prune every floor write makes, and checks
+// TestFloorOpsProperty drives random sequences of set, raise, bury, prune,
+// merge of a random moved-aside floor with a random keep set, and a lift of
+// every delete sequence to end at maxDeleteSeq (so the next bury or merge
+// renumbers), each followed by the prune every floor write makes, and checks
 // after every step: no record has sequence 0 without a burial; a buried
-// generation leaves only by a drop bury, set or prune reports; no burial
-// appears but by bury or set; and the floor encodes to bytes that parse back to it, within
-// the caps. The "full" runs start from live entries that leave the
+// generation leaves only by a drop bury, set, merge or prune reports, so a
+// merge never un-buries and every drop is reported; no burial appears but by
+// bury, set or a merge naming it; a kept name's live record survives the
+// merge; and the floor encodes to bytes that parse back to it, within the
+// caps. The "full" runs start from live entries that leave the
 // tombstones about 1 KiB, so the prune drops burials too. It lowers the
 // floor's limits (setSmallFloorLimits), so a full floor is a few dozen
 // entries.
@@ -197,7 +271,7 @@ func TestFloorOpsProperty(t *testing.T) {
 			gen := gens[rng.IntN(len(gens))]
 			var dropped []pruned
 			op := ""
-			switch rng.IntN(5) {
+			switch rng.IntN(6) {
 			case 0:
 				op = "set"
 				_, g, d := fl.set(name, gen)
@@ -235,6 +309,56 @@ func TestFloorOpsProperty(t *testing.T) {
 						fl[n] = e
 					}
 				}
+			case 5:
+				// Merge a random moved-aside floor, keeping a random name:
+				// every burial it adds names a generation the moved-aside
+				// floor buries or holds live, a kept name's live record is
+				// never buried, and what it drops is reported with the
+				// prune's below.
+				op = "merge"
+				from := floor{}
+				for range rng.IntN(4) + 1 {
+					n := names[rng.IntN(len(names))]
+					g := gens[rng.IntN(len(gens))]
+					gh := hex.EncodeToString(g[:])
+					e := from[n]
+					switch {
+					case e.Generation == gh || e.buries(gh):
+					case rng.IntN(3) == 0:
+						e.Generation, e.Seq = gh, uint64(rng.IntN(5)+1)
+					case len(e.burials()) < buriedPerNameLimit:
+						e.Buried = append(slices.Clone(e.burials()), burial{Generation: gh, Deleted: uint64(rng.IntN(50) + 1)})
+					}
+					if e.live() || len(e.burials()) > 0 {
+						from[n] = e
+					}
+				}
+				keep := map[string]bool{names[rng.IntN(len(names))]: rng.IntN(2) == 0}
+				before := maps.Clone(fl)
+				_, d := fl.merge(from, keep)
+				named := func(name, g string) bool { return from[name].buries(g) || from[name].Generation == g }
+				for name, e := range fl {
+					for _, b := range e.burials() {
+						if k := (key{name, b.Generation}); !want[k] {
+							if !named(name, b.Generation) {
+								t.Fatalf("run %d step %d (merge): buried %s %s, which the moved-aside floor does not name", run, step, name, b.Generation)
+							}
+							want[k] = true
+						}
+					}
+				}
+				for _, x := range d {
+					// A burial the merge added and then dropped at the cap.
+					if k := (key{x.name, x.generation}); !want[k] && named(x.name, x.generation) {
+						want[k] = true
+					}
+				}
+				for name := range keep {
+					if b := before[name]; keep[name] && b.live() && fl[name].Generation != b.Generation {
+						t.Fatalf("run %d step %d (merge): kept %s's live record %+v is now %+v", run, step, name, b, fl[name])
+					}
+				}
+				dropped = d
 			}
 			more := fl.prune()
 			prunes += len(more)
