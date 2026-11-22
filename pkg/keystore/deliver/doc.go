@@ -42,7 +42,8 @@ limitations under the License.
 //     annotated with the version and fingerprint, holding the entry's current
 //     value under the data key (an Ed25519 entry's stored seed or key bytes,
 //     with no PEM), and records the UID the apiserver gave it in the state
-//     file (StateFileName, root:wheel 0600, beside the declaration);
+//     file (StateFileName, 0600, in the server's work dir and owned by the
+//     server's euid; see StateFileName for why that owner adds no trust);
 //   - present, labelled for this entry and with the recorded UID: updates it
 //     only when its VersionAnnotation or FingerprintAnnotation differs from
 //     Store.Current's version or fingerprint, or its data is not exactly the

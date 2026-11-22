@@ -141,29 +141,32 @@ func newHarness(t *testing.T, encryptionOn, allowPlaintext bool, objs ...runtime
 func (h *harness) reconciler(encryptionOn, allowPlaintext bool) *Reconciler {
 	r := New(Config{
 		Path:           h.path,
+		StatePath:      filepath.Join(h.dir, StateFileName),
+		StateOwner:     uint32(os.Geteuid()),
 		Client:         h.client,
 		Store:          h.store,
 		EncryptionOn:   encryptionOn,
 		AllowPlaintext: allowPlaintext,
 		Logger:         slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
+	// The declaration stands the test user in for root; the state file's
+	// checks are production's, since the server's euid owns it.
 	r.check = testCheck
-	// Non-root, a test cannot hand the state file to root.
-	r.chown = func(*os.File) error { return nil }
 	return r
 }
 
 // own records obj as created by the reconciler, as a create would have.
 func (h *harness) own(t *testing.T, objs ...*corev1.Secret) {
 	t.Helper()
-	st, err := ReadState(filepath.Join(h.dir, StateFileName), OpenNoFollow, testCheck)
+	euid := uint32(os.Geteuid())
+	st, err := ReadState(filepath.Join(h.dir, StateFileName), OpenNoFollow, StateDirCheck(euid), StateFileCheck(euid))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, o := range objs {
 		st.Set(o.Namespace, o.Name, string(o.UID))
 	}
-	if err := WriteState(filepath.Join(h.dir, StateFileName), st, testCheck, func(*os.File) error { return nil }); err != nil {
+	if err := WriteState(filepath.Join(h.dir, StateFileName), st, StateDirCheck(euid), chownNone); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -997,8 +1000,7 @@ func TestReconcilerImmutableOwned(t *testing.T) {
 
 // TestNewDefaultsBindRoot: New's own seams, untouched, refuse what
 // production must: a declaration the test user owns is refused before any
-// apiserver call, a symlink is not followed, and a new state file is handed
-// to root or the hand-over fails (G19).
+// apiserver call, and a symlink is not followed (G19).
 func TestNewDefaultsBindRoot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, FileName)
@@ -1035,19 +1037,6 @@ func TestNewDefaultsBindRoot(t *testing.T) {
 		t.Fatalf("New's default opener followed a symlink: %v", err)
 	}
 
-	f, err := os.CreateTemp(dir, "state")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = f.Close() }() // nothing written
-	cerr := r.chown(f)
-	fi, err := f.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || (cerr == nil && st.Uid != 0) {
-		t.Fatalf("New's default chown succeeded without making the file root's (%v)", cerr)
-	}
 }
 
 // TestReconcilerLogsNoValue: across a full sweep history (create, update on
@@ -1241,7 +1230,7 @@ func TestDataRootDirectoryChecked(t *testing.T) {
 			if _, _, _, err := Read(path, OpenNoFollow, dirOnly(check, fileCheck)); !errors.Is(err, ErrRefused) {
 				t.Errorf("Read: %v, want ErrRefused", err)
 			}
-			if _, err := ReadState(filepath.Join(dir, StateFileName), OpenNoFollow, dirOnly(check, fileCheck)); !errors.Is(err, ErrRefused) {
+			if _, err := ReadState(filepath.Join(dir, StateFileName), OpenNoFollow, check, fileCheck); !errors.Is(err, ErrRefused) {
 				t.Errorf("ReadState: %v, want ErrRefused", err)
 			}
 			noChown := func(*os.File) error { return nil }
@@ -1269,5 +1258,74 @@ func dirOnly(dir, file FileCheck) FileCheck {
 			return dir(fi)
 		}
 		return file(fi)
+	}
+}
+
+// TestStateStockInstallShape: on an install the server runs as a non-root
+// uid that owns its work dir; delivery there creates the Secret and records
+// its UID in <work dir>/keystore-delivery-state.json, owned by that uid,
+// 0600, through New's own state checks (G20).
+func TestStateStockInstallShape(t *testing.T) {
+	euid := os.Geteuid()
+	if euid == 0 {
+		t.Skip("the stock install's server is not root")
+	}
+	dataRoot := t.TempDir()
+	work := filepath.Join(dataRoot, "server")
+	if err := os.Mkdir(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dataRoot, FileName)
+	if err := os.WriteFile(path, []byte(`{"version":1,"targets":[{"name":"api-token","namespace":"payments"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("tok"))
+	statePath := filepath.Join(work, StateFileName)
+	r := New(Config{Path: path, StatePath: statePath, StateOwner: uint32(euid), Client: h.client, Store: h.store, EncryptionOn: true,
+		Logger: slog.New(slog.NewTextHandler(h.logs, nil))})
+	r.check = testCheck // the declaration is root's on an install; a test cannot make it so
+	r.Sweep(context.Background())
+	s := h.secret(t, "payments", "api-token")
+	fi, err := os.Lstat(statePath)
+	if err != nil {
+		t.Fatalf("no state file in the work dir: %v\n%s", err, h.logs.String())
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || int(st.Uid) != euid || fi.Mode() != StateFileMode {
+		t.Fatalf("state file %v uid %d, want %v owned by the server's uid %d", fi.Mode(), st.Uid, StateFileMode, euid)
+	}
+	got, err := ReadState(statePath, OpenNoFollow, StateDirCheck(uint32(euid)), StateFileCheck(uint32(euid)))
+	if err != nil || got.UID("payments", "api-token") != string(s.UID) || s.UID == "" {
+		t.Fatalf("recorded UID %q (%v), want the created Secret's %q", got.UID("payments", "api-token"), err, s.UID)
+	}
+}
+
+// TestStateFileOtherOwnerRefused: a state file, or the directory holding it,
+// owned by a uid other than the server's (and, for the directory, not root)
+// is refused, and the sweep delivers nothing (G19).
+func TestStateFileOtherOwnerRefused(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.own(t) // an empty state file, owned by the test user
+	other := uint32(os.Geteuid() + 1)
+	h.r.stateCheck = StateFileCheck(other)
+	h.r.Sweep(context.Background())
+	if n := len(h.client.Actions()); n != 0 {
+		t.Fatalf("a state file the server's uid does not own let the sweep through: %d calls", n)
+	}
+	if !strings.Contains(h.logs.String(), "state file refused") || !strings.Contains(h.logs.String(), "not the server's uid") {
+		t.Fatalf("the refusal is not logged with its reason\n%s", h.logs.String())
+	}
+	path := filepath.Join(h.dir, StateFileName)
+	if _, err := ReadState(path, OpenNoFollow, StateDirCheck(other), StateFileCheck(uint32(os.Geteuid()))); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a directory owned by neither the server's uid nor root: %v, want ErrRefused", err)
+	}
+	if err := os.Chmod(path, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadState(path, OpenNoFollow, StateDirCheck(uint32(os.Geteuid())), StateFileCheck(uint32(os.Geteuid()))); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a group-writable state file: %v, want ErrRefused", err)
 	}
 }

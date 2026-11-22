@@ -60,6 +60,8 @@ func keystoreDeliveryConfig(workDir string, encryptionOn, allowPlaintext bool, c
 	}
 	cfg := keydeliver.Config{
 		Path:           filepath.Join(executor.RuntimeRoot(work), keydeliver.FileName),
+		StatePath:      filepath.Join(work, keydeliver.StateFileName),
+		StateOwner:     uint32(ids.euid()),
 		Client:         cs,
 		Store:          keystore.New(storeCfg),
 		EncryptionOn:   encryptionOn,

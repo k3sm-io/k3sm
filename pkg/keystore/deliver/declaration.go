@@ -218,7 +218,7 @@ var ErrRefused = errors.New("delivery declaration refused")
 // logs a refusal once per file state; it is nil when the file is absent or
 // could not be opened.
 func Read(path string, open Opener, check FileCheck) (d Declaration, fi fs.FileInfo, exists bool, err error) {
-	data, fi, exists, err := readChecked(path, open, check)
+	data, fi, exists, err := readChecked(path, open, check, check)
 	if err != nil {
 		return Declaration{}, fi, exists, err
 	}
@@ -232,11 +232,12 @@ func Read(path string, open Opener, check FileCheck) (d Declaration, fi fs.FileI
 	return d, fi, true, nil
 }
 
-// readChecked reads the file at path through open, judging the opened
-// descriptor with check: a regular file, passing check, at most MaxFileBytes.
-// A missing file is exists false and no error.
-func readChecked(path string, open Opener, check FileCheck) (data []byte, fi fs.FileInfo, exists bool, err error) {
-	if err := checkDir(filepath.Dir(path), check); errors.Is(err, fs.ErrNotExist) {
+// readChecked reads the file at path through open, judging its directory's
+// descriptor with dirCheck (checkDir) and the opened file's with check: a
+// regular file, passing check, at most MaxFileBytes. A missing file is
+// exists false and no error.
+func readChecked(path string, open Opener, dirCheck, check FileCheck) (data []byte, fi fs.FileInfo, exists bool, err error) {
+	if err := checkDir(filepath.Dir(path), dirCheck); errors.Is(err, fs.ErrNotExist) {
 		return nil, nil, false, nil
 	} else if err != nil {
 		return nil, nil, true, err
@@ -288,10 +289,11 @@ func Write(path string, d Declaration, check FileCheck, chown func(f *os.File) e
 	return writeAtomic(path, data, FileMode, check, chown)
 }
 
-// writeAtomic installs data at path with mode, as Write describes.
-func writeAtomic(path string, data []byte, mode os.FileMode, check FileCheck, chown func(f *os.File) error) (err error) {
+// writeAtomic installs data at path with mode, as Write describes, once
+// dirCheck accepts path's directory (checkDir).
+func writeAtomic(path string, data []byte, mode os.FileMode, dirCheck FileCheck, chown func(f *os.File) error) (err error) {
 	dir := filepath.Dir(path)
-	if err := checkDir(dir, check); err != nil {
+	if err := checkDir(dir, dirCheck); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
@@ -321,8 +323,9 @@ func writeAtomic(path string, data []byte, mode os.FileMode, check FileCheck, ch
 	return nil
 }
 
-// checkDir judges the data root at dir, which holds the declaration, the
-// state file and the lock: opened O_NOFOLLOW|O_DIRECTORY, so a symlink is
+// checkDir judges the directory at dir: the data root, which holds the
+// declaration and the lock, or the work dir, which holds the state file. It is
+// opened O_NOFOLLOW|O_DIRECTORY, so a symlink is
 // refused, and judged with check on that descriptor (production: owned by
 // root and not group- or other-writable), so no one but root can swap a file
 // in it. It is the keystore floor's data-root check (pkg/keystore), without
@@ -372,8 +375,7 @@ func writeSynced(f *os.File, data []byte, mode os.FileMode, chown func(*os.File)
 	return nil
 }
 
-// ChownRoot hands f to root:wheel, the declaration's and the state file's
-// owner.
+// ChownRoot hands f to root:wheel, the declaration's owner.
 func ChownRoot(f *os.File) error { return f.Chown(0, 0) }
 
 // RootCheck is the production FileCheck, the manifest directory's.

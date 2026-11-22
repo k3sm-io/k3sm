@@ -79,6 +79,10 @@ type ValueSource interface {
 type Config struct {
 	// Path is the declaration, <data root>/FileName.
 	Path string
+	// StatePath is the state file, <server work dir>/StateFileName, and
+	// StateOwner the server's euid, which owns it.
+	StatePath  string
+	StateOwner uint32
 	// Client is the server's admin client, the one the embedded add-on
 	// reconciler uses. The reconciler only Gets, creates and updates Secrets
 	// through it.
@@ -106,15 +110,20 @@ type Reconciler struct {
 	allowPlaintext bool
 	logger         *slog.Logger
 
-	// statePath is the state file beside the declaration (StateFileName).
+	// statePath is the state file in the server's work dir (StateFileName).
 	statePath string
 
 	// Seams, fixed by New; tests replace them.
 	open  Opener
 	check FileCheck
-	// chown hands a new state file to its owner (production: ChownRoot).
-	chown    func(f *os.File) error
-	interval time.Duration
+	// stateCheck and stateDirCheck judge the state file and its directory
+	// (production: StateFileCheck and StateDirCheck of Config.StateOwner);
+	// chown hands a new state file to its owner (production: none, since the
+	// server creates it as itself).
+	stateCheck    FileCheck
+	stateDirCheck FileCheck
+	chown         func(f *os.File) error
+	interval      time.Duration
 	// targetTimeout bounds each target's apiserver and store calls.
 	targetTimeout time.Duration
 	// newTicker returns the periodic sweep's channel and its stop.
@@ -145,7 +154,7 @@ func New(cfg Config) *Reconciler {
 	}
 	return &Reconciler{
 		path:           cfg.Path,
-		statePath:      filepath.Join(filepath.Dir(cfg.Path), StateFileName),
+		statePath:      cfg.StatePath,
 		client:         cfg.Client,
 		store:          cfg.Store,
 		encryptionOn:   cfg.EncryptionOn,
@@ -153,7 +162,9 @@ func New(cfg Config) *Reconciler {
 		logger:         logger,
 		open:           OpenNoFollow,
 		check:          RootCheck,
-		chown:          ChownRoot,
+		stateCheck:     StateFileCheck(cfg.StateOwner),
+		stateDirCheck:  StateDirCheck(cfg.StateOwner),
+		chown:          chownNone,
 		interval:       addons.ManifestSweepInterval,
 		targetTimeout:  targetTimeout,
 		newTicker: func(d time.Duration) (<-chan time.Time, func()) {
@@ -277,7 +288,7 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 	}
 	// Ownership rests on the state file, so one that cannot be trusted
 	// delivers nothing: without it, no Secret is known to be ours.
-	st, err := ReadState(r.statePath, r.open, r.check)
+	st, err := ReadState(r.statePath, r.open, r.stateDirCheck, r.stateCheck)
 	if err != nil {
 		if sig := err.Error(); r.stateFileState != sig {
 			r.stateFileState = sig
@@ -307,7 +318,7 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 		}
 	}
 	if sw.state.Retain(func(ns, name string) bool { return declared[stateKey(ns, name)] }) {
-		if err := WriteState(r.statePath, sw.state, r.check, r.chown); err != nil {
+		if err := WriteState(r.statePath, sw.state, r.stateDirCheck, r.chown); err != nil {
 			r.logger.Warn("keystore delivery: cannot drop withdrawn targets from the state file; will retry", "file", r.statePath, "err", err)
 		}
 	}
@@ -445,7 +456,7 @@ func (r *Reconciler) notOurs(sw *sweep, t Target, cur *corev1.Secret) string {
 // could not then be recorded, and again after the create with the new UID.
 func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keystore.Version, want string, value []byte) {
 	if !sw.recorded {
-		if err := WriteState(r.statePath, sw.state, r.check, r.chown); err != nil {
+		if err := WriteState(r.statePath, sw.state, r.stateDirCheck, r.chown); err != nil {
 			r.note(t, "error:state:"+err.Error(), slog.LevelWarn, "cannot write the state file, so the Secret is not created; will retry", "file", r.statePath, "err", err)
 			return
 		}
@@ -472,7 +483,7 @@ func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keysto
 		return
 	}
 	sw.state.Set(t.Namespace, t.Secret(), string(created.UID))
-	if err := WriteState(r.statePath, sw.state, r.check, r.chown); err != nil {
+	if err := WriteState(r.statePath, sw.state, r.stateDirCheck, r.chown); err != nil {
 		r.note(t, "error:record:"+err.Error(), slog.LevelError, "created the Secret but cannot record it, so later sweeps leave it alone; delete it to have it created again", "file", r.statePath, "err", err)
 		return
 	}
@@ -519,6 +530,8 @@ func (c Config) Validate() error {
 	switch {
 	case c.Path == "" || !filepath.IsAbs(c.Path):
 		return errors.New("keystore delivery: the declaration path is not absolute")
+	case c.StatePath == "" || !filepath.IsAbs(c.StatePath):
+		return errors.New("keystore delivery: the state file path is not absolute")
 	case c.Client == nil:
 		return errors.New("keystore delivery: no client")
 	case c.Store == nil:

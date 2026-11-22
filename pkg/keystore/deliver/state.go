@@ -22,18 +22,64 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"slices"
 	"strings"
+	"syscall"
+
+	"k3sm.io/k3sm/pkg/addons"
 )
 
-// StateFileName is the reconciler's record of the Secrets it created, beside
-// the declaration in the data root (/var/lib/k3sm/keystore-delivery-state.json).
+// StateFileName is the reconciler's record of the Secrets it created, in the
+// server's work dir (/var/lib/k3sm/server/keystore-delivery-state.json on an
+// install). The keystore- prefix puts it under the runtime's pod deny for
+// keystore-* names in the work dir.
+//
+// The server writes it, so it is owned by the server's euid (_k3sm on an
+// install, root on a root server), not by root. That adds no trust: a
+// process running as the server's uid already holds the admin kubeconfig,
+// and so can write any Secret without forging this file; pods running as
+// that uid are kept off the file by the Seatbelt profile.
 const StateFileName = "keystore-delivery-state.json"
 
-// StateFileMode is the state file's mode: root:wheel 0600. It names no value,
-// but it is what ownership rests on, so only root reads or writes it.
+// StateFileMode is the state file's mode, 0600: it names no value, but it is
+// what ownership rests on, so only its owner reads or writes it.
 const StateFileMode os.FileMode = 0o600
+
+// StateFileCheck is the state file's check: owned by uid (the server's euid)
+// and not group- or other-writable.
+func StateFileCheck(uid uint32) FileCheck {
+	return func(fi fs.FileInfo) error {
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok || st == nil {
+			return errors.New("owner unknown")
+		}
+		if st.Uid != uid {
+			return fmt.Errorf("owned by uid %d, not the server's uid %d", st.Uid, uid)
+		}
+		return addons.NotShared(fi)
+	}
+}
+
+// StateDirCheck is the check on the directory holding the state file: owned
+// by uid (the server's euid) or by root, and not group- or other-writable.
+func StateDirCheck(uid uint32) FileCheck {
+	return func(fi fs.FileInfo) error {
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok || st == nil {
+			return errors.New("owner unknown")
+		}
+		if st.Uid != uid && st.Uid != 0 {
+			return fmt.Errorf("owned by uid %d, neither the server's uid %d nor root", st.Uid, uid)
+		}
+		return addons.NotShared(fi)
+	}
+}
+
+// chownNone leaves a new state file as it is: the server creates it, so it
+// is already the server's own.
+func chownNone(*os.File) error { return nil }
 
 // Owned is one Secret the reconciler created: its namespace, name and the UID
 // the apiserver gave it. The label on a Secret is forgeable by anyone who can
@@ -132,10 +178,11 @@ func (s State) Marshal() ([]byte, error) {
 	return append(b, '\n'), nil
 }
 
-// ReadState reads the state file at path with the declaration's descriptor
-// checks (Read). A missing file is an empty state.
-func ReadState(path string, open Opener, check FileCheck) (State, error) {
-	data, _, exists, err := readChecked(path, open, check)
+// ReadState reads the state file at path as Read reads the declaration, with
+// dirCheck on its directory's descriptor and check on the opened file's. A
+// missing file is an empty state.
+func ReadState(path string, open Opener, dirCheck, check FileCheck) (State, error) {
+	data, _, exists, err := readChecked(path, open, dirCheck, check)
 	if err != nil {
 		return State{}, err
 	}
@@ -150,11 +197,11 @@ func ReadState(path string, open Opener, check FileCheck) (State, error) {
 }
 
 // WriteState installs s at path, mode StateFileMode, atomically, as Write
-// installs a declaration.
-func WriteState(path string, s State, check FileCheck, chown func(f *os.File) error) error {
+// installs a declaration, once dirCheck accepts path's directory.
+func WriteState(path string, s State, dirCheck FileCheck, chown func(f *os.File) error) error {
 	data, err := s.Marshal()
 	if err != nil {
 		return fmt.Errorf("encode the delivery state: %w", err)
 	}
-	return writeAtomic(path, data, StateFileMode, check, chown)
+	return writeAtomic(path, data, StateFileMode, dirCheck, chown)
 }

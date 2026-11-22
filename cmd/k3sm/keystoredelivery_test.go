@@ -75,6 +75,9 @@ func TestKeysDeliveryServerConfig(t *testing.T) {
 	if cfg.Path != "/var/lib/k3sm/keystore-delivery.json" {
 		t.Errorf("path %q, want the data root's keystore-delivery.json", cfg.Path)
 	}
+	if cfg.StatePath != "/var/lib/k3sm/server/keystore-delivery-state.json" || cfg.StateOwner != 501 {
+		t.Errorf("state file %q owner %d, want the work dir's keystore-delivery-state.json owned by the server's euid 501", cfg.StatePath, cfg.StateOwner)
+	}
 	if cfg.EncryptionOn || !cfg.AllowPlaintext {
 		t.Errorf("EncryptionOn %v AllowPlaintext %v, want false and true as given", cfg.EncryptionOn, cfg.AllowPlaintext)
 	}

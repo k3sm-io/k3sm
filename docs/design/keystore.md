@@ -771,8 +771,15 @@ indistinguishable from the embedded add-on set's objects for "which reconciler m
 this," the exact hazard `pkg/addons/doc.go` warns a label-selector prune into). The label
 is not proof of ownership: anyone who can write Secrets in the namespace can set it on a
 Secret they create first. So on create the reconciler records the UID the apiserver gave
-the Secret in `/var/lib/k3sm/keystore-delivery-state.json`, root:wheel 0600, written
-atomically and read with the declaration's descriptor checks. Ownership is checked by
+the Secret in `<server work dir>/keystore-delivery-state.json`
+(`/var/lib/k3sm/server/keystore-delivery-state.json` on an install), mode 0600, written
+atomically by the server and so owned by the server's euid (`_k3sm` on an install, root on a
+root server). It is read on the opened descriptor, O_NOFOLLOW: the file must be owned by
+the server's euid and not group- or other-writable, and the directory owned by that euid or
+by root and not group- or other-writable. That owner adds no trust: a process running as
+the server's uid already holds the admin kubeconfig and can write any Secret without forging
+the file, and pods running as that uid are kept off it by Seatbelt (the `keystore-` prefix
+puts it under the runtime's pod deny for `keystore-*` names in the work dir). Ownership is checked by
 reading the existing Secret first: present, labelled for this entry name **and** carrying
 the recorded UID → update; anything else (no label, another entry's label, no recorded
 UID, a different UID because the Secret was deleted and recreated) → "not created by this
