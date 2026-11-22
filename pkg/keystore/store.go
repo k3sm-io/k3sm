@@ -1078,7 +1078,7 @@ func committedBefore(dir *os.Root, name string, fl floor) (bool, error) {
 		return false, err
 	}
 	if f.buries(hex.EncodeToString(gen[:])) {
-		return false, buriedShapeError{&staleError{name: name, deleted: true}}
+		return false, buriedShapeError{&staleError{name: name, deleted: true, liveOther: f.live()}}
 	}
 	if !f.live() {
 		return false, nil

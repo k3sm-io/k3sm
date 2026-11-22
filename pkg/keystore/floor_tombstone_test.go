@@ -438,7 +438,7 @@ func TestBuriedErrorPointsToRestore(t *testing.T) {
 	putBack(t, server, old, "k")
 	_, _, rerr := s.Current(ctx, "k")
 	_, perr := s.Put(ctx, "k", KindOpaque, []byte("new"))
-	const want = `keystore entry "k": the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back. Do not restore from backup. If you did not put this directory back, remove it with sudo k3sm keys rm system/k --yes: the floor stays as it is and keeps the entry deleted. Only to bring the deleted entry back on purpose, restore that backup together with the keystore-floor.json saved with it, as "Backing Up and Restoring" in docs/user/keys.md describes; that brings back every key deleted since the backup, not only this one`
+	const want = `keystore entry "k": the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back. If you did not put this directory back, remove it with sudo k3sm keys rm system/k --yes: the floor stays as it is and keeps the entry deleted. Do not restore from backup. Only to bring the deleted entry back on purpose, restore that backup together with the keystore-floor.json saved with it, as "Backing Up and Restoring" in docs/user/keys.md describes; that brings back every key deleted since the backup, not only this one`
 	for what, err := range map[string]error{"Current": rerr, "Put": perr} {
 		if err == nil {
 			t.Fatalf("%s of the put-back copy succeeded", what)
@@ -651,4 +651,67 @@ func TestDeleteIgnoresPlantedGeneration(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRefusalLeadsWithSafeAction (G23): every refusal of a put-back copy
+// leads its advice with a safe action. When the name has a live record of
+// another generation, the refusal of a deleted copy says the live entry's
+// directory is missing and should be put back (that copy is accepted) and
+// that rm would delete the live entry, and never that the floor stays as it
+// is. The older-sequence and other-generation refusals lead with putting the
+// copy the floor records back.
+func TestRefusalLeadsWithSafeAction(t *testing.T) {
+	ctx := context.Background()
+	before := func(t *testing.T, msg, first, then string) {
+		t.Helper()
+		i, j := strings.Index(msg, first), strings.Index(msg, then)
+		if i < 0 || j < 0 || i > j {
+			t.Errorf("%q: want %q before %q", msg, first, then)
+		}
+	}
+	t.Run("a deleted copy over a live entry of another generation", func(t *testing.T) {
+		s, server := newTestStore(t)
+		files := []string{generationName, "v1", currentName}
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		g1 := saveEntry(t, server, "k", files...)
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatal(err)
+		}
+		mustPut(t, s, "k", KindOpaque, []byte("two"))
+		live := filepath.Join(server, "live-k")
+		if err := os.Rename(filepath.Join(server, "keystore", "k"), live); err != nil {
+			t.Fatal(err)
+		}
+		putBack(t, server, g1, "k")
+		_, _, err := s.Current(ctx, "k")
+		refusedAsDeleted(t, "Current of G1 with G2's directory missing", err)
+		msg := err.Error()
+		for _, want := range []string{"a live entry of this name under another generation, whose directory is missing", "Put the live entry's directory back as keystore/k", "that copy is accepted", "it would delete the live entry"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("%q: want it to say %q", msg, want)
+			}
+		}
+		if strings.Contains(msg, "floor stays as it is") || strings.Contains(msg, "remove it with") {
+			t.Errorf("%q: offers rm as safe while a live entry stands", msg)
+		}
+		before(t, msg, "Put the live entry's directory back", "Do not run k3sm keys rm")
+		// The advice holds: the live entry's directory put back is accepted.
+		if err := os.RemoveAll(filepath.Join(server, "keystore", "k")); err != nil {
+			t.Fatal(err)
+		}
+		putBack(t, server, live, "k")
+		mustCurrent(t, s, "k", "two")
+	})
+	t.Run("a deleted copy with no live entry", func(t *testing.T) {
+		msg := (&staleError{name: "k", deleted: true}).Error()
+		before(t, msg, "remove it with sudo k3sm keys rm system/k --yes", "Do not restore from backup")
+	})
+	t.Run("an older sequence", func(t *testing.T) {
+		msg := (&staleError{name: "k", seq: 1, floor: 2}).Error()
+		before(t, msg, "Put the newer copy of keystore/k back", "Do not restore from backup")
+	})
+	t.Run("another generation", func(t *testing.T) {
+		msg := (&staleError{name: "k", generation: true}).Error()
+		before(t, msg, "Put the directory of the generation the floor records back as keystore/k", "Do not restore from backup")
+	})
 }

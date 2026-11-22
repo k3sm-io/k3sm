@@ -423,22 +423,28 @@ type staleError struct {
 	seq, floor uint64
 	generation bool
 	deleted    bool
+	// liveOther is set with deleted when the floor also records a live
+	// entry of the name under another generation: that entry's directory
+	// is missing, and rm would delete it.
+	liveOther bool
 }
 
 func (e *staleError) Error() string {
-	if e.deleted {
+	switch {
+	case e.deleted && e.liveOther:
+		// The safe action first: the live entry's directory put back is
+		// accepted. rm is not safe here: it buries the live record.
+		return fmt.Sprintf("keystore entry %q: the entry directory belongs to a generation of this entry that the floor records as deleted, and the floor records a live entry of this name under another generation, whose directory is missing; an older copy of a deleted entry was put back in its place. Put the live entry's directory back as keystore/%s in place of this one: that copy is accepted. Do not run k3sm keys rm system/%s: it would delete the live entry, and its key with it. Do not restore from backup", e.name, e.name, e.name)
+	case e.deleted:
 		// The safe default first: rm removes the copy and keeps the burial.
 		// The restore with the floor saved beside the backup is only the
 		// deliberate case, and it revives every deletion since. Never
 		// removing the floor, which discards every burial.
-		return fmt.Sprintf("keystore entry %q: the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back. Do not restore from backup. If you did not put this directory back, remove it with sudo k3sm keys rm system/%s --yes: the floor stays as it is and keeps the entry deleted. Only to bring the deleted entry back on purpose, restore that backup together with the keystore-floor.json saved with it, as \"Backing Up and Restoring\" in docs/user/keys.md describes; that brings back every key deleted since the backup, not only this one", e.name, e.name)
-	}
-	what := fmt.Sprintf("the current pointer (sequence %d) is older than the recorded floor (sequence %d); an older copy of this entry was put back", e.seq, e.floor)
-	switch {
+		return fmt.Sprintf("keystore entry %q: the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back. If you did not put this directory back, remove it with sudo k3sm keys rm system/%s --yes: the floor stays as it is and keeps the entry deleted. Do not restore from backup. Only to bring the deleted entry back on purpose, restore that backup together with the keystore-floor.json saved with it, as \"Backing Up and Restoring\" in docs/user/keys.md describes; that brings back every key deleted since the backup, not only this one", e.name, e.name)
 	case e.generation:
-		what = "the current pointer belongs to another generation of this entry than the recorded floor; an older copy of a deleted entry was put back after a newer put of the name, or a delete and the put after it were both interrupted"
+		return fmt.Sprintf("keystore entry %q: the current pointer belongs to another generation of this entry than the recorded floor; an older copy of a deleted entry was put back after a newer put of the name, or a delete and the put after it were both interrupted. Put the directory of the generation the floor records back as keystore/%s if you still have it: that copy is accepted. Do not restore from backup. If the older copy was deliberate, follow \"Restoring an older keystore/\" in docs/user/backup-restore.md", e.name, e.name)
 	}
-	return fmt.Sprintf("keystore entry %q: %s. Do not restore from backup. If that was deliberate, follow \"Restoring an older keystore/\" in docs/user/backup-restore.md", e.name, what)
+	return fmt.Sprintf("keystore entry %q: the current pointer (sequence %d) is older than the recorded floor (sequence %d); an older copy of this entry was put back. Put the newer copy of keystore/%s back if you still have it: that copy is accepted. Do not restore from backup. If the older copy was deliberate, follow \"Restoring an older keystore/\" in docs/user/backup-restore.md", e.name, e.seq, e.floor, e.name)
 }
 
 func (e *staleError) Unwrap() error { return ErrCorrupt }
@@ -467,8 +473,10 @@ func (fl floor) check(name string, gen [generationSize]byte, seq uint64) error {
 // name at generation gen when the floor buries gen for name: an older copy
 // of a deleted entry put back.
 func (fl floor) buried(name string, gen [generationSize]byte) error {
-	if fl[name].buries(hex.EncodeToString(gen[:])) {
-		return &staleError{name: name, deleted: true}
+	if f := fl[name]; f.buries(hex.EncodeToString(gen[:])) {
+		// A live generation is never also buried, so a live record is of
+		// another generation.
+		return &staleError{name: name, deleted: true, liveOther: f.live()}
 	}
 	return nil
 }
