@@ -277,15 +277,23 @@ sudo cp -p /var/lib/k3sm/keystore-floor.json /path/to/backup/
 ```
 
 To restore the same backup, for example after deleting an entry by mistake, move the live copy
-aside rather than deleting it, so a bad restore can be undone:
+aside rather than deleting it, so a bad restore can be undone, and put back the
+`keystore-floor.json` you saved with that backup, as root:
 
 ```
 sudo k3sm stop
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore
 sudo ditto /path/to/backup/keystore /var/lib/k3sm/server/keystore
+sudo cp -p /path/to/backup/keystore-floor.json /var/lib/k3sm/keystore-floor.json
 sudo k3sm start
 sudo k3sm keys list
 ```
+
+Restore the floor file too, or the entry stays refused. When you delete an entry, root's record
+notes the deletion, and any copy of that entry put back later is refused with a message saying
+the floor records it as deleted, because the check cannot tell your restore from someone
+putting a deleted key back. The floor file saved with the backup still lists the entry as live,
+so restoring it with `keystore/` brings the entry back.
 
 Only when `list` shows every entry `ok`, delete the copy you moved aside:
 
