@@ -1294,11 +1294,18 @@ the data root's live floor by inode is refused outright
 (`TestMergeFloorCommittedRerun`, `TestKeysFloorMergeCommittedRerun`). `k3sm start` is not hooked: its start path has no cheap synchronous
 check of the keystore, and it writes no floor. The delivery reconciler, the server's one reader
 that publishes a value, is: each sweep first asks `FileStore.MergePending` (a Lstat of
-`keystore-floor.json.pre-restore`, any answer but not found counting as pending), and while it is
-set the sweep delivers nothing, reads no entry and makes no apiserver call, logs at Error and
+`keystore-floor.json.pre-restore`, any answer but not found counting as pending; a store
+configured with an empty data root has no floor, so no restore can be pending and it is nil, no
+hold), and while it is set the sweep delivers nothing, reads no entry and makes no apiserver call, logs at Error and
 tries again on the next sweep (`TestDeliveryRefusedWhileMergePending`). `list` and `show` still
 read, and print a warning on stderr; until the merge they find no entry, since the restored tree
-is staged. The
+is staged. Before
+anything moves, the recipe checks that nothing runs as the service user (`! pgrep -u _k3sm`),
+that the backup's directory and its parent are owned by root with no group or other write (a
+`find -maxdepth 0 -user root ! -perm +022` that must match both), so the service user cannot swap
+the source between the checks and the copy, and, just before `ditto`, `test ! -L` on its source,
+which `ditto` would follow (`TestKeysRollbackRoundTrip`, the recipe-steps subtest). The save
+recipe makes those directories so (`install -d -o root -g wheel -m 0755`). The
 recipe moves the live `keystore/` into `pre-restore.d/` in the data root, a directory it creates
 root:wheel 0700 with `mkdir` (which fails on an existing name) under a parent only root can
 write, so the service user cannot reach the moved-aside entries to copy one back, nor rename the

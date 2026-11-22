@@ -280,6 +280,7 @@ name, here `2026-11-22`, and save its floor under that name:
 
 ```
 B=2026-11-22
+sudo install -d -o root -g wheel -m 0755 /path/to/backup /path/to/backup/$B
 sudo ditto /var/lib/k3sm/server/keystore /path/to/backup/$B/keystore
 sudo ditto /var/lib/k3sm/server/cred/keystore-master /other/place/keystore-master
 sudo install -d -o root -g wheel -m 0700 /var/root/keystore-floor-backup/$B
@@ -287,7 +288,9 @@ sudo install -o root -g wheel -m 0644 /var/lib/k3sm/keystore-floor.json /var/roo
 sudo shasum -a 256 /var/root/keystore-floor-backup/$B/keystore-floor.json | sudo tee /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256
 ```
 
-Save `keystore/` and the floor file in the same run, and keep them as a pair. A floor file saved
+Keep `/path/to/backup` and each backup's directory in it owned by root, with no write access for
+group or others, as the `install -d` line makes them: the restore copies from there as root, and
+checks it first. Save `keystore/` and the floor file in the same run, and keep them as a pair. A floor file saved
 at another moment does not describe the saved entries: some of them are refused, or deletions
 recorded after it are lost. Each backup keeps its own floor, in the directory named after it, so
 an older backup still has the floor that matches it. Never save every backup's floor to one
@@ -341,14 +344,23 @@ directory or link the service user made, the merge moves it into `pre-restore.d`
 so on stderr and in a `moved aside` line of its report, then goes on. With `--dry-run` it prints
 where it would move it and moves nothing. Every line ends in
 `|| exit 1`, so the first one that fails stops the steps (and closes the shell), and no later
-line moves a copy into or over one that is set aside:
+line moves a copy into or over one that is set aside. Before anything moves, the first two
+lines check that nothing runs as the service user and that the backup's directories are owned by
+root with no write access for group or others.
+If `pgrep` prints process IDs, the server has not stopped yet: wait for it and start the steps
+again. If the second check fails, fix the owner or mode of `/path/to/backup` and
+`/path/to/backup/$B` (`sudo chown root:wheel` and `sudo chmod go-w` on each) and start again. The
+`test ! -L` before `ditto` stops if the backup's `keystore` is a link, which `ditto` would follow:
 
 ```
+! pgrep -u _k3sm || exit 1
+test "$(sudo find /path/to/backup /path/to/backup/$B -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 2 || exit 1
 sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
 test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo test ! -L /path/to/backup/$B/keystore || exit 1
 sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
 sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json || exit 1
 ```
@@ -489,10 +501,12 @@ the merge, the floor you moved aside is now `keystore-floor.json.merged-<time>`:
 in the first floor `mv` instead. `--undo` tells the reverse merge to read the record the first
 merge left beside that file, `keystore-floor.json.merged-<time>.retired`, which lists what the
 first merge retired; leave that record in place. If you never ran the first merge there is no
-record and `--undo` refuses: run the two merge lines without `--undo`.
+record and `--undo` refuses: run the two merge lines without `--undo`. The `pgrep` line stops
+the steps while anything still runs as the service user, as in the restore.
 
 ```
 sudo k3sm stop
+! pgrep -u _k3sm || exit 1
 sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
 sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1

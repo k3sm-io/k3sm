@@ -852,17 +852,24 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		}
 		doc := strings.Join(strings.Fields(string(raw)), " ")
 		steps := []string{
+			"sudo install -d -o root -g wheel -m 0755 /path/to/backup /path/to/backup/$B",
+			"sudo ditto /var/lib/k3sm/server/keystore /path/to/backup/$B/keystore",
 			"sudo install -o root -g wheel -m 0644 /var/lib/k3sm/keystore-floor.json /var/root/keystore-floor-backup/$B/keystore-floor.json",
 			"sudo shasum -a 256 /var/root/keystore-floor-backup/$B/keystore-floor.json | sudo tee /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
 			"Never keep the saved floor on a volume that ignores ownership",
 			"sudo k3sm stop",
 			"sudo ls -d /var/lib/k3sm/pre-restore.d /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
+			// Before anything moves: the service is down, and the backup's
+			// directories are root's with no group or other write.
+			"! pgrep -u _k3sm || exit 1",
+			`test "$(sudo find /path/to/backup /path/to/backup/$B -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 2 || exit 1`,
 			"sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1",
 			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
 			"test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
 			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo test ! -L /path/to/backup/$B/keystore || exit 1",
 			"sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
 			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json || exit 1",
 			"sudo k3sm keys floor merge",
@@ -872,6 +879,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			// restored floor as the input, so a deletion made after the
 			// restore survives the undo.
 			"sudo k3sm stop",
+			"! pgrep -u _k3sm || exit 1",
 			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
 			"sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
 			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
