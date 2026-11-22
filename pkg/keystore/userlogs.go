@@ -98,10 +98,15 @@ const (
 	// 1<<20 the long-name case held about 494 MiB, so the ceiling was
 	// lowered to stay under 200 MiB (docs/design/keystore.md § "Size caps").
 	maxFloorKeysCeiling = 1 << 18
-	// maxKeyShareDivisor bounds one uid's floor keys: a grant line that adds
-	// a key is refused once its scope's uid holds keyBound/maxKeyShareDivisor
-	// keys (docs/design/keystore.md § "Per-uid fairness").
-	maxKeyShareDivisor = 16
+	// uidKeyShare is one uid's lifetime share of floor keys: a grant line
+	// that adds a key is refused once its scope's uid has added uidKeyShare
+	// keys, buried or live, since a buried key stays in the floor for good
+	// (docs/design/keystore.md § "Per-uid fairness"). A scope holds at most
+	// maxScopeEntries live entries plus its delivery record, 257 live keys,
+	// and the share is 16 times that, 4,112 keys: 63 uids at their shares
+	// hold 259,056 keys, under the 2^18 ceiling, so filling the global key
+	// bound takes at least 64 uids.
+	uidKeyShare = 16 * (maxScopeEntries + 1)
 	// revokeHeadroomDivisor sizes the revocation headroom, keyBound /
 	// revokeHeadroomDivisor keys past the key bound that only a revocation's
 	// line (a tombstone or a catch-up line) may add; the reader's key bound
@@ -138,10 +143,11 @@ func (l *appendLog) keyBound() int {
 	return int(min(l.s.logReadBound()/int64(minFloorLine)+1, maxFloorKeysCeiling))
 }
 
-// keyShare is the most live keys one uid's grant lines may hold in the
-// floor: keyBound/maxKeyShareDivisor. A key a tombstone buries no longer
-// counts against it, though it still counts against keyBound. A
-// revocation's line is never held to it.
+// keyShare is the most keys one uid's lines may add to the floor in its
+// lifetime: uidKeyShare, held to keyBound. Every key a uid adds is charged
+// to it, buried or live, since no server write frees a key. Only a grant's
+// line is held to it: a tombstone for a key the floor holds adds no key, and
+// a revocation's line that adds one is charged but never refused here.
 func (l *appendLog) keyShare() int {
 	if l.maxKeys != 0 {
 		if l.maxShare != 0 {
@@ -149,7 +155,7 @@ func (l *appendLog) keyShare() int {
 		}
 		return l.maxKeys
 	}
-	return l.keyBound() / maxKeyShareDivisor
+	return min(uidKeyShare, l.keyBound())
 }
 
 // keyHeadroom is the revocation headroom: the keys past keyBound that only
@@ -356,8 +362,8 @@ type logState struct {
 	hardCap, bound int64
 	// keys is the floor's count of distinct keys, buried ones included,
 	// which bounds the reader's memory; uidKeys is, per uid, the count of
-	// its keys whose latest line is live (no tombstone buries them), each
-	// key charged to its scope's uid, which the key share holds.
+	// keys its scope's lines added, buried or live, which the lifetime key
+	// share holds.
 	keys    int
 	uidKeys map[uint32]int
 	// off is where reading stopped: just past the last whole line read.
@@ -1028,9 +1034,7 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 				return 0, errFloorTooManyKeys
 			}
 			st.keys++
-			if !r.tomb {
-				st.uidKeys[uid]++
-			}
+			st.uidKeys[uid]++
 			nk := nameKey{r.key.scope, r.key.name}
 			if _, ok := st.firstGen[nk]; ok {
 				st.moreGens[nk] = append(st.moreGens[nk], r.key.gen)
@@ -1040,10 +1044,6 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		}
 		switch {
 		case r.tomb:
-			if inSeq && !st.buried[r.key] {
-				// A live key buried: it no longer holds its uid's share.
-				st.uidKeys[uid]--
-			}
 			st.buried[r.key] = true
 		case !inSeq || r.seq > seq:
 			st.maxSeq[r.key] = r.seq
@@ -1352,7 +1352,7 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 // errLogBoundsBelowLog refuses, at store open, a configuration whose
 // reader's bounds sit below what an existing log already holds: under it the
 // log would read as damage and refuse every user-scope operation.
-var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's bounds below what an existing append-only log already holds, so it would read as damage; raise the caps back, or run sudo k3sm keys floor --rebuild or sudo k3sm keys audit --rotate")
+var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's bounds below what an existing append-only log already holds, so it would read as damage; configure the caps the log was written under, or run sudo k3sm keys floor --rebuild or sudo k3sm keys audit --rotate")
 
 // CheckLogBounds refuses, as errInvalidConfig and errLogBoundsBelowLog, a
 // configuration whose reader's bounds sit below what an existing log

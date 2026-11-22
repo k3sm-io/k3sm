@@ -47,14 +47,14 @@ func plantFloorKeys(t *testing.T, s *FileStore, scope, prefix string, n int) {
 	appendLogBytes(t, s, userFloorLogName, b)
 }
 
-// One uid at its share of the floor's key bound (keyBound/16 at the default
-// caps) is refused a grant that adds a key, before its first write, while
+// One uid at its lifetime key share (uidKeyShare at the default caps) is
+// refused a grant that adds a key, before its first write, while
 // another uid's grant still succeeds.
 func TestFloorKeyShareRefusesOneUID(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
 	l := syncedFloor(t, s)
-	share := l.keyBound() / maxKeyShareDivisor
+	share := l.keyShare()
 	l.mu.Lock()
 	held := l.state.uidKeys[1001]
 	l.mu.Unlock()

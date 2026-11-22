@@ -4,7 +4,7 @@
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
 # rows G1 to G22, the user-scope rows U1 to U137 (U15, U39 and U117 are unused),
-# the typed-credential rows U138 to U191, the rebuild row U193, and the rig legs E1 to E36. Every row
+# the typed-credential rows U138 to U191, the rebuild rows U193 and U194, and the rig legs E1 to E36. Every row
 # is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -41,7 +41,7 @@
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66, U108, U127, U129, U132.
 #   --scope-store   the user-scope store: U12 to U14, U63, U97, U101, U128.
 #   --files         the append-only files: U20, U21, U23 to U25, U50, U52, U60, U61,
-#                   U68, U80, U88, U90, U91, U105, U118, U119, U193, and in the helper variant
+#                   U68, U80, U88, U90, U91, U105, U118, U119, U193, U194, and in the helper variant
 #                   only U70, U71.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54, U82, U99, U104, U113,
 #                   U120, U121, U122, U131, U137.
@@ -159,8 +159,8 @@ EXPECTED_ROWS="$EXPECTED_ROWS U150 U151 U152 U153 U154 U155 U156 U157 U158 U159 
 EXPECTED_ROWS="$EXPECTED_ROWS U162 U163 U164 U165 U166 U167 U168 U169 U170 U171 U172 U173"
 EXPECTED_ROWS="$EXPECTED_ROWS U174 U175 U176 U177 U178 U179 U180 U181 U182 U183 U184 U185"
 EXPECTED_ROWS="$EXPECTED_ROWS U186 U187 U188 U189 U190 U191"
-EXPECTED_ROWS="$EXPECTED_ROWS U193"
-# >>> ADD NEW U ROWS (U194 upward) HERE <<<
+EXPECTED_ROWS="$EXPECTED_ROWS U193 U194"
+# >>> ADD NEW U ROWS (U195 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25 E26 E27"
 EXPECTED_ROWS="$EXPECTED_ROWS E28 E29 E30 E31 E32 E33 E34 E35 E36"
@@ -192,7 +192,7 @@ mode_rows() {
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66 U108 U127 U129 U132" ;;
 	scope-store) echo "U12 U13 U14 U63 U97 U101 U128" ;;
-	files) echo "U20 U21 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U105 U118 U119 U193" ;;
+	files) echo "U20 U21 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U105 U118 U119 U193 U194" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82 U99 U104 U113 U120 U121 U122 U131 U137" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84 U112 U136" ;;
 	exec) echo "U36 U37 U38 U69 U92" ;;
@@ -558,7 +558,7 @@ pend U22 "floor --rebuild and audit --rotate mark and stage under keystore- name
 check U23 "every audited operation writes one v:1 line; no line carries a value or its length; readers ignore unknown fields; an append after a torn tail writes a newline first, so the torn bytes are a dropped line of their own and the new line parses" \
 	TestAuditLineNeverCarriesValue TestAuditReaderIgnoresUnknownFields TestAuditTornTailAppendParses FuzzParseAuditLine
 check U24 "the logs' sizes and soft cap are exposed for doctor (LogSizes); past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on its uid's revocation budget; a line over 1 KiB is refused, and one found past the hard cap in the audit log is skipped and charged to no uid, while in the floor it is damage; the reader is bounded in size and floor keys, and the writer never appends past either bound: a floor line adding a key past the key bound is ErrLogFull, a grant without room for its keys is refused before its first write naming floor --rebuild and audit --rotate, and a revocation of a key the floor holds still goes through, so put/rm churn never makes the floor damage; the reader reads through a line straddling the cap, and never blocks on a FIFO; a log or data root carrying a file flag beside SF_APPEND or a non-empty extended ACL is refused as untrusted; an append preflights free space and refuses, retryably, below 1 MiB plus the line, except a revocation's line, which keeps only a minimal check of the line plus 4 KiB; a put whose floor line would be refused after its commit (at the key bound, at a cap straddle where a minting put's second line would start past the hard cap, or below the free-space margin) is refused before its first write" \
-	TestLogHardCapRefusesMutations TestAuditLineBoundedAtOneKiB TestLogReaderSizeBound TestFloorKeyBound TestFloorKeyBoundChurnRefusesGrants TestFloorWriterRefusesKeyPastBound TestFloorKeyBoundDerivedFromCaps TestAuditStraddlingLineCharged TestLogOpenFIFORefused TestLogAppendPreflightsFreeSpace TestRevocationLinesSkipFreeMargin TestRevocationLineAtKeyBound TestLogRefusesExtraFlags TestLogDataRootRefusesExtraFlags TestLogRefusesExtendedACL TestAuditOverlongLineSkipped TestPutRefusedFirstBelowFloorMargin TestPutRefusedFirstAtKeyBound TestPutRefusedFirstAtCapStraddle TestDeliverRefusedFirstBelowFloorMargin TestPutFloorLineSurvivesVolumeFiller TestPutPreflightReservesValueRoom TestFloorLineBudgetFollowsClass TestLogFullTextNamesNoNumbers TestLogErrorsNameNoFigures TestFloorSeqZeroLineIsPresent TestFloorKeyShareRefusesOneUID TestFloorKeyShareCountsLiveKeys TestFloorKeyShareCountsLiveKeys TestFloorDeliverRoomExistingKeyPastBound TestFloorTombstoneLandsInHeadroom TestFloorReaderAcceptsHeadroom TestCheckLogBoundsRefusesShrunkCaps TestCheckLogBoundsRefusesKeysPastBound
+	TestLogHardCapRefusesMutations TestAuditLineBoundedAtOneKiB TestLogReaderSizeBound TestFloorKeyBound TestFloorKeyBoundChurnRefusesGrants TestFloorWriterRefusesKeyPastBound TestFloorKeyBoundDerivedFromCaps TestAuditStraddlingLineCharged TestLogOpenFIFORefused TestLogAppendPreflightsFreeSpace TestRevocationLinesSkipFreeMargin TestRevocationLineAtKeyBound TestLogRefusesExtraFlags TestLogDataRootRefusesExtraFlags TestLogRefusesExtendedACL TestAuditOverlongLineSkipped TestPutRefusedFirstBelowFloorMargin TestPutRefusedFirstAtKeyBound TestPutRefusedFirstAtCapStraddle TestDeliverRefusedFirstBelowFloorMargin TestPutFloorLineSurvivesVolumeFiller TestPutPreflightReservesValueRoom TestFloorLineBudgetFollowsClass TestLogFullTextNamesNoNumbers TestLogErrorsNameNoFigures TestFloorSeqZeroLineIsPresent TestFloorKeyShareRefusesOneUID TestFloorKeyShareChargesBuriedKeys TestFloorKeyShareLifetimeArithmetic TestFloorDeliverRoomExistingKeyPastBound TestFloorTombstoneLandsInHeadroom TestFloorReaderAcceptsHeadroom TestCheckLogBoundsRefusesShrunkCaps TestCheckLogBoundsRefusesKeysPastBound
 pend U25 "backup and restore round trip: a restored tree with cleared flags is refused until floor --rebuild, then opens; the rebuild writes a line for every entry directory holding a generation file, sequence 0 without an authenticated pointer, so a damaged entry stays ErrCorrupt and never becomes ErrNotFound; rig leg E17 (append-only files)" \
 	TestBackupRestoreRoundTripRebuild TestRebuildKeepsDamagedEntryCorrupt
 pend U26 "peers uid 0, the service uid and uid < 501 are refused before any frame is read (socket listener)" \
@@ -893,7 +893,9 @@ pend U191 "examples/keydelivery-github.yaml validates against the apis CRD schem
 	k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD TestLimitationsListTypedResiduals
 pend U193 "floor --rebuild carries the old floor forward: over an old floor holding tombstones, sequence lines and a torn last line, it keeps every tombstone and every key's highest sequence that parses, writes the higher of that and the sequence on disk, drops only the lines that do not parse and names their count; a tree copied back after an rm, a crash and a rebuild is refused as deleted, and a copied-back older record is refused; a floor that cannot be read refuses the rebuild, changing nothing (append-only files: the rebuild verb)" \
 	k3sm/cmd/k3sm::TestRebuildCarriesTombstonesForward
-# >>> ADD NEW U ROWS (U194 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
+pend U194 "once root removes a user scope (rm-scope), floor --rebuild drops every key of that scope, live or buried; a re-minted scope gets a fresh K_u, so no old tree authenticates under it; the rebuild frees the uid's lifetime key share and its keys in the global key bound (append-only files: the rebuild verb, after rm-scope)" \
+	k3sm/cmd/k3sm::TestRebuildDropsRemovedScopeKeys
+# >>> ADD NEW U ROWS (U195 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
 leg E2 "socket-ops" "the user, no sudo, puts user/<me>/e2e-token (short-name form): exit 0; the CLI prints the resolved user/<uid>; k3sm keys list shows it; the audit log has a put line with no value" "the socket operations"
@@ -1029,6 +1031,8 @@ U67|one uid's revocations are never refused because of another uid
 U73|an indeterminate sweep keeps the claim
 U25|a damaged entry stays ErrCorrupt
 U193|it keeps every tombstone and every key's highest sequence that parses
+U194|drops every key of that scope, live or buried
+U194|a re-minted scope gets a fresh K_u
 U81|keydelivery
 U81|k3sm.io/keystore-entry
 U77|only then removes the scope

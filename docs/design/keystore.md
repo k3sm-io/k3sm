@@ -1681,6 +1681,14 @@ That wait is the store `.lock`
   restore that lowers is the matched-set restore ("Backup and snapshots"): the restored floor
   log is the old floor rebuild carries forward, so the floor lowers to the backup's. A floor
   that cannot be opened or read at all refuses the rebuild, which changes nothing (U193).
+- **Rebuild drops a removed scope's keys.** Once root has removed a user scope (the coming
+  `rm-scope`, which deletes the scope directory and with it `scope.key`), `floor --rebuild`
+  carries none of that scope's keys forward, live or buried: no line of `user/<uid>` whose
+  scope directory is gone reaches the new floor. That is safe because the removed scope's
+  K_u is gone: a re-minted scope for the same uid gets a fresh K_u, so no old tree, record or
+  copied-back entry authenticates under it, and none needs a tombstone to be refused. It is
+  what frees the uid's lifetime key share and those keys in the global key bound ("Per-uid
+  fairness", residual self-lockout) (U194, pending).
 - **Rebuild never lowers.** Rebuild opens every scope under `.user/` before it writes the new
   file's first line, and a line it cannot write is a floor it would lower:
   - *Rebuild skips the owner check.* Rebuild reads every scope whose `scope.key` opens under
@@ -1832,7 +1840,7 @@ That wait is the store `.lock`
   (321 MiB at the defaults) is damage, and so is a floor holding more distinct
   `(scope, name, generation)` keys than its key bound: that size bound over the shortest line
   that adds a key (46 bytes), held to a ceiling of 2^18 (262,144) keys whatever the caps are
-  configured to, plus the revocation headroom of 1/16 of that ("Per-uid fairness"): 278,528
+  configured to (larger caps do not raise it), plus the revocation headroom of 1/16 of that ("Per-uid fairness"): 278,528
   keys for the reader. The size alone would allow about 7.3 million keys at the defaults, so
   the ceiling is met first there, and it is what bounds the reader's memory. The reader
   interns scope strings and indexes each key's generations by `(scope, name)`, so `rm`'s
@@ -1969,27 +1977,36 @@ That wait is the store `.lock`
     size is past the hard cap at all, `doctor` shows a Warn with the overshoot in bytes and the
     `audit --rotate` or `floor --rebuild` hint (U84, residual 5).
   - *The floor's keys are shared per uid too.* Besides the byte shares, each floor key is
-    charged to its scope's uid, counted by the reader on every read and append. A grant line
-    that adds a key is refused (`ErrLogFull`, the caller's key share) once its uid holds
-    `keyBound / maxKeyShareDivisor` live keys, `maxKeyShareDivisor` being 16, as the byte share
-    is 1/16 of the hard cap. Only a key whose latest line is live counts against the share: a
-    key a tombstone buries stops counting there, so a uid's `put`/`rm` churn costs it no share
-    once its keys are buried. Every key, buried or live, still counts against `keyBound`, which
-    bounds the reader's memory. Past the key bound sits a **revocation headroom** of
-    `keyBound / 16` keys that only revocation lines (tombstones, withdrawal lines and catch-up
-    lines) may add: such a line is refused only past `keyBound` plus the headroom, and the
-    reader's key bound includes the headroom, so a floor the server filled to it still reads.
-    The fairness argument carries over for live keys: N uids at their key shares hold at most
-    N × keyBound/16 live keys, so fewer than 16 cannot by holding keys bring the floor to its
-    key bound. *Residual (churn).* Buried keys count against `keyBound` and not the share, so
-    one uid's `put`/`rm` churn can still bring the floor to its key bound and refuse every
-    uid's grants until root raises the caps (`floor --rebuild` carries the tombstones forward,
-    so it frees no buried key); that is the churn stop below, accepted. However many
-    grant keys stand, they stop at `keyBound`, which no
-    revocation line is held to: no uid's grants can refuse any uid's revocation short of the
-    headroom, which only revocations spend. No server write frees a key, and `floor --rebuild`
-    carries every key that parses forward ("Rebuild carries the old floor forward"), so a floor
-    at its key bound is freed only by larger caps; compacting buried keys is an open question.
+    charged to its scope's uid, counted by the reader on every read and append. The key share
+    is a **lifetime share**: every key a uid's lines add is charged to it, buried or live,
+    because a buried key stays in the floor for good (no server write frees one, and
+    `floor --rebuild` carries every tombstone forward), so it holds `keyBound` for good too. A
+    grant line that adds a key is refused (`ErrLogFull`, the caller's key share) once its uid
+    has added `uidKeyShare` keys. A tombstone for a key the floor already holds adds no key, so
+    `rm` is never refused by the share; a revocation line that adds a key is charged but never
+    refused by it. *The arithmetic.* A scope holds at most `maxScopeEntries` (256) live entries
+    and one delivery record, 257 live keys (`put` over an existing name keeps its generation,
+    so only a new name, or a name re-created after `rm`, adds a key). `uidKeyShare` is 16 times
+    that, 16 × 257 = 4,112 keys, so a uid can replace its whole live quota about 15 times
+    before its share is spent, well above honest churn. The global key bound is the 2^18
+    (262,144) ceiling, met first at every cap setting the server accepts, and it is not
+    configurable: 63 uids at their shares hold 63 × 4,112 = 259,056 keys, under it, so filling
+    the global key bound takes at least 64 uids (262,144 / 4,112 ≈ 63.8). Past the key bound
+    sits a **revocation headroom** of `keyBound / 16` keys that only revocation lines
+    (tombstones, withdrawal lines and catch-up lines) may add: such a line is refused only past
+    `keyBound` plus the headroom, and the reader's key bound includes the headroom, so a floor
+    the server filled to it still reads. However many grant keys stand, they stop at
+    `keyBound`, which no revocation line is held to: no uid's grants can refuse any uid's
+    revocation short of the headroom, which only revocations spend.
+    *Residual (self-lockout), accepted.* A uid whose churn spends its lifetime share is refused
+    every further grant that adds a key, though its `rm` still succeeds. Larger caps do not
+    help, since the ceiling is fixed. The remedy is root's: once root removes that user scope
+    (the coming `rm-scope`), `floor --rebuild` drops every key of that scope, live or buried.
+    The scope's K_u is gone with it, and a re-minted scope gets a fresh K_u, so no old tree,
+    record or copied-back entry can authenticate under it and no tombstone of the old scope
+    is needed to refuse it. That frees the uid's share and its keys in the global bound (U194,
+    pending). Short of that, no server write frees a key; compacting buried keys of a scope
+    that still stands is an open question.
   - The hard cap and the per-uid budgets bound the whole log (U51, U62, U67).
 - **Backup and restore.** The flag does not survive `cp`, rsync or Time Machine, so a restore
   always ends with `floor --rebuild`, and `audit --rotate` re-flags the audit log. Until then
@@ -4398,7 +4415,7 @@ carried by the unit rows.
 | U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear or a log is not the service user's (seams: chflags flag source, file-attribute writer, euid source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
 | U22 | `floor --rebuild` and `audit --rotate` write the marker `keystore-maintenance` and stage `keystore-user-floor.log.new` and `keystore-audit.log.new` in the root-owned data root, stop the listener, hold the lock, write the new file before touching the old, clear the old file's flag before any rename, and flag the new file on its held descriptor after the rename; a crash at each step leaves the marker, so the listener stays down until a rerun leaves a flagged file; every audit and floor append, the reconciler's and the pre-frame lines included, takes the store lock that maintenance holds exclusively, so a reconciler append during an `audit --rotate` waits and lands in the new log; after maintenance, under the exclusive lock, the server reopens its audit and floor append descriptors and recounts the per-uid shares before releasing it, and the counts reset (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`, `k3sm/pkg/keystore/reconcile::TestReconcilerAppendWaitsForAuditRotate`, `k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares`; rig leg E17 | pending: the append-only files, the socket listener and the KeyDelivery reconciler (lifecycle), run in the lifecycle's mode, the last to land |
 | U23 | every audited operation writes one `v:1` line; no line carries a value or its length; readers ignore unknown fields; an append after a torn tail writes a newline first, so the torn bytes are a dropped line of their own and the new line parses | `k3sm/pkg/keystore::TestAuditLineNeverCarriesValue`, `TestAuditReaderIgnoresUnknownFields`, `TestAuditTornTailAppendParses`, `FuzzParseAuditLine` | checked: the append-only files (the store side) |
-| U24 | the logs' sizes and soft cap are exposed for `doctor` (`LogSizes`); past the hard cap every mutating user op is `ErrLogFull`, except the revocation class, which draws on its uid's revocation budget; a line over 1 KiB is refused, and one found past the hard cap in the audit log is skipped and charged to no uid, while in the floor it is damage; the reader is bounded in size and floor keys, and the writer never appends past either bound: a floor line adding a key past the key bound is ErrLogFull, a grant without room for its keys is refused before its first write naming floor --rebuild and audit --rotate, and a revocation of a key the floor holds still goes through, so put/rm churn never makes the floor damage; the reader reads through a line straddling the cap, and never blocks on a FIFO; a log or data root carrying a file flag beside `SF_APPEND` or a non-empty extended ACL is refused as untrusted; an append preflights free space and refuses, retryably, below 1 MiB plus the line, except a revocation's line, which keeps only a minimal check of the line plus 4 KiB; a put whose floor line would be refused after its commit (at the key bound, at a cap straddle where a minting put's second line would start past the hard cap, or below the free-space margin) is refused before its first write, and so is a deliver's; a grant line adding a key is refused once its uid holds 1/16 of the key bound while another uid's grant succeeds, and a revocation line adding a key lands in a revocation headroom past the key bound, which the reader's bound includes; a configuration whose bounds sit below what an existing log holds is refused at store open | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations`, `TestAuditLineBoundedAtOneKiB`, `TestLogReaderSizeBound`, `TestFloorKeyBound`, `TestFloorKeyBoundChurnRefusesGrants`, `TestFloorWriterRefusesKeyPastBound`, `TestFloorKeyBoundDerivedFromCaps`, `TestAuditStraddlingLineCharged`, `TestLogOpenFIFORefused`, `TestLogAppendPreflightsFreeSpace`, `TestRevocationLinesSkipFreeMargin`, `TestRevocationLineAtKeyBound`, `TestLogRefusesExtraFlags`, `TestLogDataRootRefusesExtraFlags`, `TestLogRefusesExtendedACL`, `TestAuditOverlongLineSkipped`, `TestPutRefusedFirstBelowFloorMargin`, `TestPutRefusedFirstAtKeyBound`, `TestPutRefusedFirstAtCapStraddle`, `TestDeliverRefusedFirstBelowFloorMargin`, `TestPutFloorLineSurvivesVolumeFiller`, `TestPutPreflightReservesValueRoom`, `TestFloorLineBudgetFollowsClass`, `TestLogFullTextNamesNoNumbers`, `TestLogErrorsNameNoFigures`, `TestFloorSeqZeroLineIsPresent`, `TestFloorKeyShareRefusesOneUID`, `TestFloorKeyShareCountsLiveKeys`, `TestFloorKeyShareCountsLiveKeys`, `TestFloorDeliverRoomExistingKeyPastBound`, `TestFloorTombstoneLandsInHeadroom`, `TestFloorReaderAcceptsHeadroom`, `TestCheckLogBoundsRefusesShrunkCaps`, `TestCheckLogBoundsRefusesKeysPastBound` | checked: the append-only files (the store side) |
+| U24 | the logs' sizes and soft cap are exposed for `doctor` (`LogSizes`); past the hard cap every mutating user op is `ErrLogFull`, except the revocation class, which draws on its uid's revocation budget; a line over 1 KiB is refused, and one found past the hard cap in the audit log is skipped and charged to no uid, while in the floor it is damage; the reader is bounded in size and floor keys, and the writer never appends past either bound: a floor line adding a key past the key bound is ErrLogFull, a grant without room for its keys is refused before its first write naming floor --rebuild and audit --rotate, and a revocation of a key the floor holds still goes through, so put/rm churn never makes the floor damage; the reader reads through a line straddling the cap, and never blocks on a FIFO; a log or data root carrying a file flag beside `SF_APPEND` or a non-empty extended ACL is refused as untrusted; an append preflights free space and refuses, retryably, below 1 MiB plus the line, except a revocation's line, which keeps only a minimal check of the line plus 4 KiB; a put whose floor line would be refused after its commit (at the key bound, at a cap straddle where a minting put's second line would start past the hard cap, or below the free-space margin) is refused before its first write, and so is a deliver's; a grant line adding a key is refused once its uid has added its lifetime share of keys, buried or live (uidKeyShare, 4,112), while its rm still succeeds and another uid's grant succeeds, and a revocation line adding a key lands in a revocation headroom past the key bound, which the reader's bound includes; a configuration whose bounds sit below what an existing log holds is refused at store open | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations`, `TestAuditLineBoundedAtOneKiB`, `TestLogReaderSizeBound`, `TestFloorKeyBound`, `TestFloorKeyBoundChurnRefusesGrants`, `TestFloorWriterRefusesKeyPastBound`, `TestFloorKeyBoundDerivedFromCaps`, `TestAuditStraddlingLineCharged`, `TestLogOpenFIFORefused`, `TestLogAppendPreflightsFreeSpace`, `TestRevocationLinesSkipFreeMargin`, `TestRevocationLineAtKeyBound`, `TestLogRefusesExtraFlags`, `TestLogDataRootRefusesExtraFlags`, `TestLogRefusesExtendedACL`, `TestAuditOverlongLineSkipped`, `TestPutRefusedFirstBelowFloorMargin`, `TestPutRefusedFirstAtKeyBound`, `TestPutRefusedFirstAtCapStraddle`, `TestDeliverRefusedFirstBelowFloorMargin`, `TestPutFloorLineSurvivesVolumeFiller`, `TestPutPreflightReservesValueRoom`, `TestFloorLineBudgetFollowsClass`, `TestLogFullTextNamesNoNumbers`, `TestLogErrorsNameNoFigures`, `TestFloorSeqZeroLineIsPresent`, `TestFloorKeyShareRefusesOneUID`, `TestFloorKeyShareChargesBuriedKeys`, `TestFloorKeyShareLifetimeArithmetic`, `TestFloorDeliverRoomExistingKeyPastBound`, `TestFloorTombstoneLandsInHeadroom`, `TestFloorReaderAcceptsHeadroom`, `TestCheckLogBoundsRefusesShrunkCaps`, `TestCheckLogBoundsRefusesKeysPastBound` | checked: the append-only files (the store side) |
 | U25 | backup and restore round trip: a restored tree with cleared flags is refused until `floor --rebuild`, then opens; the rebuild writes a line for every entry directory holding a `generation` file, an authenticated pointer's sequence or, with none, sequence 0, so a damaged entry stays `ErrCorrupt` and never becomes `ErrNotFound` | `k3sm/pkg/keystore::TestBackupRestoreRoundTripRebuild`, `TestRebuildKeepsDamagedEntryCorrupt`; rig leg E17 | pending: the append-only files |
 | U26 | peers uid 0, the service uid and uid < 501 are refused before any frame is read (seam: peer-credential source) | `k3sm/pkg/keystore/socket::TestPeerEligibility` | pending: the socket listener |
 | U27 | framing: an oversize frame, unknown type, a sub-length past the frame length or missing `HELLO` closes; `HELLO` past the 10-second bound closes; an unknown header field is ignored; `HELLO` picks the highest common version and the reply carries it and the server's frame cap; no common version sends `unsupported-version` then closes; an unknown `op` answers `unknown-op` and keeps the connection; the frame cap covers the largest value, header and framing | `k3sm/pkg/keystore/socket::FuzzFrameReader` (committed seeds), `TestFramingBounds`, `TestSubLengthsWithinFrame`, `TestHelloReadDeadline`, `TestUnknownHeaderFieldsIgnored`, `TestHelloVersionRange`, `TestHelloReplyCarriesVersionAndMaxFrame`, `TestHelloNoOverlapSendsUnsupportedVersion`, `TestUnknownOpKeepsConnection`, `TestFrameCapCoversMaxValue` | pending: the socket listener |
@@ -4566,6 +4583,7 @@ carried by the unit rows.
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
 | U193 | `floor --rebuild` carries the old floor forward: over an old floor holding tombstones, sequence lines and a torn last line, it keeps every tombstone and every key's highest sequence that parses, writes the higher of that and the sequence on disk, drops only the lines that do not parse and names their count; a tree copied back after an `rm`, a crash and a rebuild is refused as deleted, and a copied-back older record is refused; a floor that cannot be read refuses the rebuild, changing nothing | `k3sm/cmd/k3sm::TestRebuildCarriesTombstonesForward` | pending: the append-only files (the rebuild verb) |
+| U194 | once root removes a user scope (`rm-scope`), `floor --rebuild` drops every key of that scope, live or buried; a re-minted scope gets a fresh K_u, so no old tree authenticates under it; the rebuild frees the uid's lifetime key share and its keys in the global key bound | `k3sm/cmd/k3sm::TestRebuildDropsRemovedScopeKeys` | pending: the append-only files (the rebuild verb, after rm-scope) |
 
 ### Rig legs
 
