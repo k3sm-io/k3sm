@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U116 (U15 and U39 are unused) and
-# the rig legs E1 to E25. Every row is listed, on exactly one line. A row runs
+# rows G1 to G22, the user-scope rows U1 to U137 (U15, U39 and U117 are unused)
+# and the rig legs E1 to E27. Every row is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
 # never PASS. A row delivered in part prints PENDING when its delivered part
@@ -33,23 +33,26 @@
 #   --delivery      the system delivery: G18 to G20.
 #   --sandbox       the pod denies and the shared path names: U16, U17, U49, U116.
 #   --api           the KeyDelivery API types: U18, U19.
-#   --scope         user scopes: U6 to U11, U47, U58, U64, U66, U108.
-#   --scope-store   the user-scope store: U12 to U14, U63, U97, U101.
+#   --scope         user scopes: U6 to U11, U47, U58, U64, U66, U108, U127, U129, U132.
+#   --scope-store   the user-scope store: U12 to U14, U63, U97, U101, U128.
 #   --files         the append-only files: U20 to U25, U50, U52, U60, U61, U68,
-#                   U80, U88, U90, U91, U99, U105, and in the helper variant only U70, U71.
-#   --socket        the socket listener: U26 to U31, U46, U48, U54, U82, U104, U113.
-#   --socket-ops    the socket operations: U32 to U35, U45, U51, U67, U84, U112.
+#                   U80, U88, U90, U91, U99, U105, U118, U119, and in the helper variant
+#                   only U70, U71.
+#   --socket        the socket listener: U26 to U31, U46, U48, U54, U82, U104, U113,
+#                   U120, U121, U122, U131, U137.
+#   --socket-ops    the socket operations: U32 to U35, U45, U51, U67, U84, U112, U136.
 #   --exec          the non-root CLI and exec: U36 to U38, U69, U92.
-#   --kd-author     KeyDelivery authoring: U40, U41, U74, U76, U87, U94.
+#   --kd-author     KeyDelivery authoring: U40, U41, U74, U76, U87, U94, U135.
 #   --kd-reconcile  the KeyDelivery reconciler: U42, U43, U59, U73, U78, U81, U111.
 #   --kd-lifecycle  the KeyDelivery lifecycle: U44, U53, U55, U56, U62, U65,
-#                   U72, U75, U77, U79, U83, U85, U86, U89, U93, U95, U96, U98, U100, U102, U103, U106, U107, U109, U110, U114, U115.
+#                   U72, U75, U77, U79, U83, U85, U86, U89, U93, U95, U96, U98, U100, U102, U103, U106, U107, U109, U110, U114, U115,
+#                   U123 to U126, U130, U133, U134, U136.
 #   --grammar       the entry grammar in apis: U57.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
 # status: it exits 0 only when every row it names passes.
 #
-# --lab runs the rig legs E1 to E25, and nothing else, as an explicit, recorded
+# --lab runs the rig legs E1 to E27, and nothing else, as an explicit, recorded
 # step. --<unit mode> --lab runs that mode's unit rows and then only the legs
 # mapped to that mode (the leg's last feature to land, see the leg table); a
 # leg mapped to no mode runs only under plain --lab. Each leg's description
@@ -128,9 +131,11 @@ EXPECTED_ROWS="$EXPECTED_ROWS U113"
 EXPECTED_ROWS="$EXPECTED_ROWS U114"
 EXPECTED_ROWS="$EXPECTED_ROWS U115"
 EXPECTED_ROWS="$EXPECTED_ROWS U116"
+EXPECTED_ROWS="$EXPECTED_ROWS U118 U119 U120 U121 U122 U123 U124 U125 U126 U127"
+EXPECTED_ROWS="$EXPECTED_ROWS U128 U129 U130 U131 U132 U133 U134 U135 U136 U137"
 # >>> ADD NEW U ROWS (U64 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
-EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25"
+EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25 E26 E27"
 # >>> ADD NEW E LEGS (E24 upward) HERE <<<
 
 MODES="check rewrap verbs delivery sandbox api scope scope-store files socket socket-ops exec"
@@ -156,15 +161,15 @@ mode_rows() {
 	delivery) echo "G18 G19 G20" ;;
 	sandbox) echo "U16 U17 U49 U116" ;;
 	api) echo "U18 U19" ;;
-	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66 U108" ;;
-	scope-store) echo "U12 U13 U14 U63 U97 U101" ;;
-	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U99 U105" ;;
-	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82 U104 U113" ;;
-	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84 U112" ;;
+	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66 U108 U127 U129 U132" ;;
+	scope-store) echo "U12 U13 U14 U63 U97 U101 U128" ;;
+	files) echo "U20 U21 U22 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U99 U105 U118 U119" ;;
+	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82 U104 U113 U120 U121 U122 U131 U137" ;;
+	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84 U112 U136" ;;
 	exec) echo "U36 U37 U38 U69 U92" ;;
-	kd-author) echo "U40 U41 U74 U76 U87 U94" ;;
+	kd-author) echo "U40 U41 U74 U76 U87 U94 U135" ;;
 	kd-reconcile) echo "U42 U43 U59 U73 U78 U81 U111" ;;
-	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85 U86 U89 U93 U95 U96 U98 U100 U102 U103 U106 U107 U109 U110 U114 U115" ;;
+	kd-lifecycle) echo "U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85 U86 U89 U93 U95 U96 U98 U100 U102 U103 U106 U107 U109 U110 U114 U115 U123 U124 U125 U126 U130 U133 U134 U136" ;;
 	grammar) echo "U57" ;;
 	*) echo "" ;;
 	esac
@@ -504,9 +509,9 @@ pend U53 "every reconciler Secret write and delete, and every record withdrawal,
 	k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited
 pend U54 "a pre-frame refusal writes a refused line with the peer uid, rate-limited per uid, drawing on the reconciler budget with its once-a-minute dropped-count summary (socket listener)" \
 	k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited TestPreFrameRefusalLinesRateLimited
-pend U55 "a transient lookup, SAR or apiserver error leaves the Secret, the record entry and the finalizer, sets Authorized=Unknown with reason Indeterminate, and retries with backoff; a SAR with allowed=false and no evaluation error is a definitive denial whatever denied says, and an evaluation error or a failed call is Indeterminate; no sweep before readyz and the RBAC, KeyDelivery and Secret informers sync; every deleting outcome deletes only on two consecutive sweeps; only the allow-list of definitive outcomes deletes (ErrNotFound in a scope that opened and ErrScopeOwnerChanged among them), and every other sentinel, ErrScopeAbsent included, is Indeterminate; against the real store, on ErrScopeOwnerChanged the reconciler reads the deliveries record under W without the GeneratedUID check only to find recorded targets, deletes them by the target-matching rule, and never delivers, rotates or opens an entry (KeyDelivery lifecycle)" \
-	k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown TestSAREvaluationErrorIsIndeterminate TestSARAllowedFalseWithoutErrorIsDenial TestNoSweepBeforeReady TestDenialNeedsTwoSweeps TestScopeOwnerChangedDeletes TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate \
-	TestScopeOwnerChangedDeletesAgainstRealStore
+pend U55 "a transient lookup, SAR or apiserver error leaves the Secret, the record entry and the finalizer, sets Authorized=Unknown with reason Indeterminate, and retries with backoff; a SAR with allowed=false and no evaluation error is a definitive denial whatever denied says, and an evaluation error or a failed call is Indeterminate; no sweep before readyz and the RBAC, KeyDelivery and Secret informers sync; every deleting outcome deletes only on two consecutive sweeps; only the allow-list of definitive outcomes deletes (ErrNotFound in a scope that opened among them), and every other sentinel, ErrScopeAbsent and, until a K7a amendment (U127), ErrScopeOwnerChanged included, is Indeterminate; against the real store, on ErrScopeOwnerChanged the reconciler reads the deliveries record under W without the GeneratedUID check only to find recorded targets for a lifecycle delete, deletes them by the target-matching rule, and never delivers, rotates or opens an entry (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown TestSAREvaluationErrorIsIndeterminate TestSARAllowedFalseWithoutErrorIsDenial TestNoSweepBeforeReady TestDenialNeedsTwoSweeps TestEverySentinelBesidesNotFoundIsIndeterminate \
+	TestOwnerChangedRecordReadFindsTargetsAgainstRealStore
 pend U56 "a delivery record with an unknown format version is refused by the store and read by the reconciler as Indeterminate, never as a denial (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate
 pend U57 "the entry grammar package imports only the standard library, exports the pattern, the maxLength and the parse, and passes the shared vector table (entry grammar)" \
@@ -556,7 +561,7 @@ pend U78 "SecretRetained is True whenever a labelled Secret stays while Authoriz
 	k3sm/pkg/keystore/reconcile::TestSecretRetainedTrueUnderUnknown
 pend U79 "the rotation write that follows a rotate is in the revocation class: past the owner's share it draws on the owner's reconciler allowance, once per live delivery per log; the reconciler's need for one uid, 64 deliveries x 4 lines x 1 KiB, is 256 KiB, the whole allowance (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestRotationWriteUsesReserve
-rootpend U80 "root-run: rm-scope and floor --rebuild walk .user/<uid>/ by descriptor with openat, unlinkat and O_NOFOLLOW, refuse a planted symlink, FIFO or other non-regular file, read with a bounded size, re-check SameFile after each open and never follow a swapped directory (append-only files)" \
+rootpend U80 "root-run: rm-scope, floor --rebuild and Rewrap of each scope.key (U128) walk .user/<uid>/ by descriptor with openat, unlinkat and O_NOFOLLOW, refuse a planted symlink, FIFO or other non-regular file, read with a bounded size, re-check SameFile after each open and never follow a swapped directory (append-only files)" \
 	k3sm/cmd/k3sm::TestRootWalksRefusePlantedNames
 pend U81 "a KeyDelivery never touches a Phase A Secret: the label value is the constant keydelivery and the entry is in the annotation k3sm.io/keystore-entry; a target present and not claimed by a KeyDelivery is SecretExists, never overwritten or deleted (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestKeyDeliveryNeverTouchesPhaseASecret
@@ -572,7 +577,7 @@ pend U86 "a drift repair (the reconciler re-creating or repairing a delivered Se
 	k3sm/pkg/keystore/reconcile::TestDriftRepairNotChargedToOwner TestSubstitutedDataIsDrift
 pend U87 "the admission policy also matches UPDATE and DELETE of keydeliveries and admits one only when the requester equals oldObject.spec.requestedBy, is the k3sm server's identity, or is in system:masters (and, for DELETE only, the namespace controller's ServiceAccount); a finalizer edit is an UPDATE, so another author can neither delete the object nor strip its finalizer; the reconciler's and withdraw's own writes pass; on a DELETE object is null and only oldObject is read; failurePolicy is Fail; rig leg E23 (KeyDelivery authoring)" \
 	k3sm/pkg/policy::TestVAPRefusesDeleteByOtherAuthor TestVAPRefusesFinalizerStripByOtherAuthor
-pend U88 "floor --rebuild never lowers: if any scope fails to open for a non-definitive reason (ErrScopeOwnerUnknown, a lookup past its deadline, ErrBusy) or any error but an owner change, it refuses to finish, names the scope and changes nothing; an owner-changed scope is rebuilt from its pointers read under W without the GeneratedUID check; the deliveries record's AAD is scope, kind 0xFD, name deliveries, generation and sequence, its floor key is (user/<uid>, .deliveries, generation, seq), and the rebuild writes that key's line; a copied-back older deliveries record is refused against the floor, before and after a rebuild (append-only files)" \
+pend U88 "floor --rebuild never lowers: it reads every scope whose scope.key opens under W without the GeneratedUID check, so an owner change or a departed account is rebuilt from its pointers (U129); if any scope's scope.key does not open under W or any other error stops it (ErrBusy included), it refuses to finish, names the scope and changes nothing; the deliveries record's AAD is scope, kind 0xFD, name deliveries, generation and sequence, its floor key is (user/<uid>, .deliveries, generation, seq), and the rebuild writes that key's line; a copied-back older deliveries record is refused against the floor, before and after a rebuild (append-only files)" \
 	k3sm/cmd/k3sm::TestRebuildRefusesOnUnopenableScope k3sm/pkg/keystore::TestCopiedBackDeliveriesRecordRefused
 pend U89 "reads take the store lock shared and mutations exclusive, through a writer-preferring in-process lock; a server exclusive hold does at most 50 ms of work per operation, larger work chunked, no hold across an API call (the bound measured in K7a); a reconciler revocation that gets ErrBusy retries up to 3 times with jitter in the same sweep before it is Indeterminate; under a sustained read load from other uids a revocation completes (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestRevocationCompletesUnderOtherUIDReadLoad
@@ -610,7 +615,7 @@ rootpend U105 "root-run: every root path walks the keystore trees by descriptor:
 	k3sm/pkg/install::TestInstallOverExistingTreeWalksByDescriptor TestPurgeWalksKeystoreByDescriptor k3sm/cmd/k3sm::TestDoctorWalksKeystoreByDescriptor
 pend U106 "every root verb refuses a non-root caller: one table test runs rm-scope, floor --rebuild, audit --rotate, rewrap and deliver system/... with a non-root euid through the euid source; each is refused, changing nothing (KeyDelivery lifecycle)" \
 	k3sm/cmd/k3sm::TestRootVerbsRefuseNonRootEUID
-pend U107 "with the user floor missing or unflagged, an absence-driven delete (ErrNotFound) is Indeterminate and deletes nothing, while a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial, an owner change) deletes the Secret after its two spaced observations (KeyDelivery lifecycle)" \
+pend U107 "with the user floor missing or unflagged, an absence-driven delete (ErrNotFound) is Indeterminate and deletes nothing, while a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial) deletes the Secret after its two spaced observations (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestNotFoundDeleteWaitsForFloor TestRevocationDeleteProceedsWithoutFloor
 pend U108 "the exclusive hold bound on a fake clock: no server exclusive hold does more than 50 ms of work; the GeneratedUID lookup runs before the lock is taken and is cached for the hold (user scopes)" \
 	k3sm/pkg/keystore::TestExclusiveHoldBound
@@ -630,6 +635,46 @@ pend U115 "rm-scope names each blocking binding, a RoleBinding with its namespac
 	k3sm/cmd/k3sm::TestRmScopeNamesBindingsAndRemovesThem
 pend U116 "the Pod uid refusal applies to native Pods only: a vm Pod with runAsUser: 1000 is allowed, since a guest uid has no host meaning, while a native Pod with the same drop target is refused (sandbox change)" \
 	runtimed/pkg/runtime::TestVMPodGuestUIDNotRefused
+rootpend U118 "root-run: the old log is never service-user-owned while unflagged: in audit --rotate and floor --rebuild the step that clears sappnd on the old file, and on each archive rotate shifts, also fchowns it to root and fchmods it 0600 on the verb's descriptor; the service user's open(O_WRONLY|O_TRUNC) of each, between the clear and the re-flag, gets EACCES and changes no byte (append-only files)" \
+	k3sm/cmd/k3sm::TestMaintenanceOldFileRootOwnedWhileUnflagged
+rootpend U119 "root-run: the floor lock is keystore-lock, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root, rm-scope, floor --rebuild and audit --rotate included; a non-root process holding the old data-root flock blocks none of them (append-only files)" \
+	k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb
+pend U120 "the activated listening descriptor reaches no child (integration): an exec.Command child, the runtimed helper and a Pod through the exec shim each list their open descriptors, and the listening socket is among none of them (socket listener)" \
+	k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild
+pend U121 "under activation, a client whose connected peer reads as uid 0 or as launchd's code refuses and writes nothing; U36 is never relaxed to accept uid 0, and if K7a finds the client-side peer names launchd the self-bind form ships (socket listener)" \
+	k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer
+pend U122 "when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup; rig leg E27 (socket listener)" \
+	k3sm/pkg/provider::TestPodProfileDeniesLaunchdSocketActivation
+pend U123 "same-target cross-record deletion: the orphan sweep, a lost-authority delete and rm-scope never delete a Secret that another honoured record claims at the same (namespace, secretName); a forged owner annotation naming one uid's tombstone on another uid's live Secret deletes nothing; the owner annotation never selects which record's tombstone governs a delete; nothing is charged to the victim (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestForgedTombstoneAnnotationOnOtherUsersLiveSecretIsNotDeleted
+pend U124 "a tombstone is pruned when its target is not this UID's owned Secret on two observations at least 60 s apart, not only on a Get that answers not found: a target occupied by another Secret still prunes; a failed Get keeps it (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestTombstonePrunesWhenTargetOccupied
+pend U125 "every reconciler Secret delete or update and every rm-scope delete passes Preconditions{UID, ResourceVersion} from the ownership read: a fake client swaps the Secret between the read and the delete, the delete is refused, and the outcome is Indeterminate (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestDeleteRefusedWhenSecretSwappedAfterRead
+pend U126 "the reconciler budget is split by source, 384 KiB for forged-Secret lines, 384 KiB for repairs, 256 KiB for pre-frame refusals, the forged and repair parts capped at 64 KiB per namespace; one source or namespace spending its part leaves every other part whole; the dropped count is persisted in the next summary line written for that source, not kept only in memory (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestReconcilerBudgetSplitBySource TestDroppedCountPersistedInNextSummary
+pend U127 "ErrScopeOwnerChanged is Indeterminate plus a doctor report, not a deleting outcome, until a K7a amendment records GeneratedUID stability across Migration Assistant, a macOS upgrade and a directory rebind: no Secret is deleted on it, and doctor names the scope (user scopes)" \
+	k3sm/pkg/keystore/reconcile::TestScopeOwnerChangedIsIndeterminate k3sm/cmd/k3sm::TestDoctorReportsOwnerChangedScope
+rootpend U128 "root-run: Rewrap of each scope.key, and every root write under server/keystore/, walks by descriptor: a planted symlink, FIFO or swapped directory under .user/ refuses Rewrap and changes no record (user-scope store)" \
+	k3sm/pkg/keystore::TestRewrapWalksScopeKeysByDescriptor
+pend U129 "floor --rebuild reads every scope whose scope.key opens under W without the GeneratedUID check: a departed account (ErrScopeOwnerUnknown) and an owner change each get their lines and block nothing (user scopes)" \
+	k3sm/cmd/k3sm::TestRebuildReadsScopeWithoutOwnerCheck
+pend U130 "a scope listed in keystore-removed-scopes.json for its bound GeneratedUID is definitive for claims, so its stale objects lose their claim; rm-scope deletes that scope's KeyDeliveries, each by its recorded namespace and name with a UID precondition (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestRemovedScopeLosesClaim k3sm/cmd/k3sm::TestRmScopeDeletesScopeKeyDeliveries
+pend U131 "the listener refuses to start on a data root mounted with MNT_IGNORE_OWNERSHIP, read with fstatfs on the data-root descriptor (socket listener)" \
+	k3sm/pkg/keystore/socket::TestStartRefusesIgnoreOwnershipMount
+pend U132 ".user/<uid>/ is 0700 and scope.key and deliveries are 0600, all the service user's; a scope whose directory or files have another owner or a wider mode is refused (user scopes)" \
+	k3sm/pkg/keystore::TestUserScopeFileModes
+pend U133 "keystore-removed-scopes.json is root-owned 0644, under the keystore- prefix the Pod denies cover; a file that is not root's or is group- or other-writable is refused, and the parse is strict, a refused file counting as no listing (KeyDelivery lifecycle)" \
+	k3sm/cmd/k3sm::TestRemovedScopesFileRootOwnedAndMode TestRemovedScopesFileStrictParse
+pend U134 "the reconciler's store interface reads a value only for an authorised delivery: its value read takes the authorisation the checks produced, and no other method returns a value (KeyDelivery lifecycle)" \
+	k3sm/pkg/keystore/reconcile::TestStoreInterfaceReadsValueOnlyForAuthorisedDelivery
+pend U135 "the KeyDelivery admission policy's failurePolicy is Fail, and the namespace-controller exemption admits DELETE only: the namespace controller's UPDATE of another author's object is refused (KeyDelivery authoring)" \
+	k3sm/pkg/policy::TestKeyDeliveryVAPFailurePolicyFail TestNamespaceControllerExemptOnlyForDelete
+pend U136 "every root verb and doctor line that prints annotation text strips control characters first: an owner or entry annotation carrying terminal escapes prints without them (socket operations, KeyDelivery lifecycle)" \
+	k3sm/cmd/k3sm::TestRootVerbsStripAnnotationControlChars
+pend U137 "the listener refuses a sandboxed peer before the first frame: it calls sandbox_check on the peer's audit token through the peer-sandbox source, a constructor parameter that refuses nil, so a Pod process is refused whatever its uid; rig leg E26 (socket listener)" \
+	k3sm/pkg/keystore/socket::TestListenerRefusesSandboxedPeer
 # >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
@@ -657,6 +702,8 @@ leg E22 "socket" "a native pod with runAsUser 0 on a root runtimed runs (no drop
 leg E23 "kd-reconcile" "against the real authorizer, a role with create on secrets and update and delete on one named secret: delivery as that name is Ready, Delivered; delivery as another name is Authorized=False, NotAuthorized, with no Secret; then another principal (kubectl --as, with edit in the namespace) deletes the KeyDelivery and patches its finalizer away: each refused at admission, the object, its finalizer and the Secret stay" "the KeyDelivery reconciler; KeyDelivery authoring"
 leg E24 "exec" "with the server running, a non-k3sm program run as the service user tries to unlink keystore-sock/keys.sock and bind that path: EACCES for each, keys.sock still launchd's; with the listener stopped by the maintenance marker, the real installed k3sm binary, exec'd inside a native pod, tries the same bind and gets EPERM; in the deny-plus-pin fallback only, the service-user program binds keys.sock and the user's k3sm keys list and put refuse before any frame, naming the server pin; the real server is accepted afterwards" "the root-owned socket directory; the server pin; the pod bind deny"
 leg E25 "files" "helper variant only: a native pod tries connect(2) to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an append: EPERM for the pod, both refused, no line appended" "the helper pin"
+leg E26 "socket" "a native pod on a test build whose pod profile omits the keystore deny stanza (restored at the end) tries connect(2) to keys.sock: the listener refuses it before any frame, since the peer is sandboxed, and writes a refused line" "the sandboxed-peer refusal"
+leg E27 "socket" "a native pod calls launch_activate_socket for the server's socket name: no descriptor is returned, and nothing in the pod can accept on keys.sock" "the launchd lookup deny"
 # >>> ADD NEW E LEGS (E24 upward) HERE, with the unit mode that delivers the last feature <<<
 
 nrows=${#R_ID[@]}
@@ -847,7 +894,22 @@ U114|keystore-removed-scopes.json
 U114|a plain ErrScopeAbsent stays non-definitive
 U115|--remove-bindings deletes each listed binding through the admin client
 U116|a vm Pod with runAsUser: 1000 is allowed
-U97|rm then put"
+U97|rm then put
+U118|EACCES
+U118|fchmods it 0600 on the verb's descriptor
+U119|keystore-lock
+U119|blocks none of them
+U120|among none of them
+U121|never relaxed to accept uid 0
+U123|another honoured record claims at the same (namespace, secretName)
+U124|a target occupied by another Secret still prunes
+U125|Preconditions{UID, ResourceVersion}
+U126|persisted in the next summary line
+U127|not a deleting outcome
+U129|without the GeneratedUID check
+U133|the parse is strict
+U135|admits DELETE only
+U137|sandbox_check"
 
 # --listed: the row-presence lint.
 if [ "$mode" = listed ]; then

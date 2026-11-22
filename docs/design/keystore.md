@@ -1086,7 +1086,9 @@ Phase A's paths are unchanged. Added:
   keystore-delivery.json                Phase A: root 0644, root-declared deliveries; now Pod-denied
   keystore-user-floor.log               NEW: the user-scope floor, append-only
   keystore-audit.log                    NEW: the audit log, append-only
-  keystore-audit.log.1 … .4             NEW: the previous audit logs after `audit --rotate`, `.1` the newest
+  keystore-audit.log.1 … .4             NEW: the previous audit logs after `audit --rotate`, `.1` the newest; root 0600, flagged (Open requirement 1)
+  keystore-lock                         NEW: root 0600, the floor lock only root can open (Open requirement 2)
+  keystore-removed-scopes.json          NEW: root 0644, written by `rm-scope`, parsed strictly; Pod-denied (Open requirement 13)
   keystore-maintenance                  NEW: root 0644, present only while a maintenance verb runs
   keystore-user-floor.log.new           NEW: staging file of `floor --rebuild`, present only during it
   keystore-audit.log.new                NEW: staging file of `audit --rotate`, present only during it
@@ -1099,8 +1101,8 @@ Phase A's paths are unchanged. Added:
       <name>/ generation v1 … current   Phase A: system entries, unchanged
       .user/                            NEW: 0700, service user (the reserved name)
         <uid>/                          NEW: 0700, service user, one per user who has stored anything
-          scope.key                     sealed record, kind 0xFE: the user's scope key, wrapped
-          deliveries                    sealed record, kind 0xFD: per delivery, its UID, object name, target tuple, target digest and last delivered version
+          scope.key                     0600, service user; sealed record, kind 0xFE: the user's scope key, wrapped
+          deliveries                    0600, service user; sealed record, kind 0xFD: per delivery, its UID, object name, target tuple, target digest and last delivered version
           entries/                      NEW: 0700, service user, the scope's entries and nothing else
             <name>/ generation v1 … current  same shape as a system entry, sealed under the scope key
 ```
@@ -1108,7 +1110,11 @@ Phase A's paths are unchanged. Added:
 A user's entries live under `.user/<uid>/entries/<name>/`, apart from the scope's own files
 `scope.key` and `deliveries`. Both are valid entry names (`scope.key` is a dotted name), so with
 entries beside them a user who stored an entry named `deliveries` or `scope.key` would collide
-with the scope's record; under `entries/` they are ordinary names (U63).
+with the scope's record; under `entries/` they are ordinary names (U63). The modes of
+`.user/<uid>/`, `scope.key` and `deliveries` are checked by U132.
+`keystore-removed-scopes.json` is root-owned 0644, refused if group- or other-writable or not
+root's, and parsed strictly: an unknown field, a duplicate uid or trailing data refuses it,
+and a refused file counts as no listing (U133).
 
 The owner and mode of the two logs depend on the floor variant ("The user-scope floor"): with
 the append-only flag they are the service user's, mode 0600, flagged `sappnd`; with the floor
@@ -1126,7 +1132,7 @@ one listener, `SockPathName` `/var/lib/k3sm/keystore-sock/keys.sock` and `SockPa
 rendered by `renderPlist` (`pkg/install/plist.go:609`) from a new field of `launchdPlist`
 (`pkg/install/plist.go:573`). launchd creates and binds the socket as root before it starts the
 job, and the server takes the listening descriptor with `launch_activate_socket`, sets
-`FD_CLOEXEC` on it and passes it to no child. No service-uid process can create, unlink or
+`FD_CLOEXEC` on it and passes it to no child (Open requirement 3, U120). No service-uid process can create, unlink or
 replace a name in a root-owned 0755 directory, so no service-uid process, the server's
 children and a Pod's processes included, can bind `keys.sock`, whether or not the server is
 running (U104, E24). That launchd activates a `Sockets` socket for a job with `UserName` set,
@@ -1134,7 +1140,9 @@ and that the server, as the service user, receives it, is a K7a measurement. **I
 the fallback is deny plus pin**: install makes `keystore-sock/` the service user's, 0755, the
 server binds `keys.sock` itself, and the bind is kept from Pods by the Seatbelt deny and from
 other service-uid code by the client's server pin ("The client pins the server"), as before;
-the K7a amendment records which form ships.
+the K7a amendment records which form ships. Two more K7a outcomes select the fallback: a
+client-side peer that names launchd (Open requirement 4), and a Pod that can obtain the
+listener from launchd itself (Open requirement 5).
 
 ### Key hierarchy
 
@@ -1185,10 +1193,13 @@ record at the previous sequence plus 1; the empty record the mint writes is sequ
   2026-11-21, `leg3b-unresolved-uid.txt`). So
   the prefix rule is required: without it, a uid whose record is gone would read as a real,
   changed owner.
-- **`ErrScopeOwnerChanged` is definitive only on a real answer.** It is answered only when the
-  lookup returns a real, non-synthesized GeneratedUID that differs from the bound one. As a
-  deleting outcome it deletes only on two consecutive sweeps ("Every deleting outcome counts
-  only twice in a row"), like every other.
+- **`ErrScopeOwnerChanged` is answered only on a real answer.** It is answered only when the
+  lookup returns a real, non-synthesized GeneratedUID that differs from the bound one. It is
+  not a deleting outcome in this release: until K7a measures GeneratedUID stability across
+  Migration Assistant, a macOS upgrade and a directory rebind, the reconciler reads it as
+  `Indeterminate` and `doctor` names the scope (Open requirement 10). Only a dated amendment
+  can put it on the allow-list, and then it deletes only on two consecutive sweeps ("Every
+  deleting outcome counts only twice in a row"), like every other.
 - **The lookup has a deadline.** It goes through the GeneratedUID-lookup seam with a deadline
   of 250 ms, the one value every caller uses (the store, the socket, the reconciler and the
   root verbs); a timeout or an error fails closed with `ErrScopeOwnerUnknown`, and nothing in
@@ -1268,9 +1279,11 @@ store refuses to read or write a sealed record over 416 KiB.
   has 64 live entries or 320 in all.
 - *Revocation always succeeds.* A withdrawal turns a live entry into a tombstone in place, so
   it never adds an entry, never grows the record and is never refused for the bound.
-- *A tombstone is pruned only once its Secret is gone.* The reconciler removes a withdrawn
-  entry only after a Get of its recorded target has answered not found on two sweeps at least
-  60 s apart ("Deleting observations are spaced in time"); any other answer keeps it. A
+- *A tombstone is pruned once its target is no longer its Secret.* The reconciler removes a
+  withdrawn entry when its recorded target is not this UID's owned Secret, gone or held by a
+  Secret that fails the ownership test for this UID, on two observations at least 60 s apart
+  ("Deleting observations are spaced in time"), so a target someone else reuses still prunes
+  (Open requirement 7); a failed Get keeps it. A
   tombstone is what lets the orphan sweep and `rm-scope` still find a withdrawn delivery's
   Secret (U96). The delivery bound is what bounds the
 reconciler's revocation allowance of each uid ("The user-scope floor", per-uid fairness). Phase A's unbounded retention stays
@@ -1339,7 +1352,8 @@ service user can only add to.
   the marker (it closes its connections and stops accepting; launchd keeps the socket bound).
 That wait is the store `.lock`
   taken exclusively, bounded at 30 s: the verb gets the lock once no server operation holds
-  it, and past 30 s it removes its marker and refuses, changing nothing. Holding the lock, it
+  it, and past 30 s it removes its marker and refuses, changing nothing. It then takes the
+  floor lock `keystore-lock`, which only root can open (Open requirement 2). Holding both, it
   **writes and fsyncs the new file before it touches the old one**. Rebuild writes
   `keystore-user-floor.log.new` from the scopes' entries, walking `.user/` by descriptor ("Root
   walks service-user trees by descriptor"); rotate writes an empty
@@ -1357,15 +1371,17 @@ That wait is the store `.lock`
   its first step and gets no line (U25).
 - **Rebuild never lowers.** Rebuild opens every scope under `.user/` before it writes the new
   file's first line, and a line it cannot write is a floor it would lower:
-  - *An unopenable scope refuses the rebuild.* If any scope fails to open for a reason that is
-    not definitive (`ErrScopeOwnerUnknown`, a GeneratedUID lookup past its deadline, `ErrBusy`)
-    or for any other error but an owner change, rebuild refuses to finish and names the scope.
-    It refuses before it touches the old file, so it changes nothing: it unlinks its staging
-    file, leaves the old log as it was and removes the marker.
-  - *An owner-changed scope is still rebuilt.* On `ErrScopeOwnerChanged` rebuild reads the
-    scope's pointers and its `deliveries` record under `W` without the GeneratedUID check, as
-    the reconciler reads such a record ("An owner change still finds its targets"), and writes
-    their lines, so its floor is kept until root removes the scope.
+  - *Rebuild skips the owner check.* Rebuild reads every scope whose `scope.key` opens under
+    `W` without the GeneratedUID check, as the reconciler reads an owner-changed record ("An
+    owner change still finds its targets"), and writes its pointers' and its `deliveries`
+    record's lines. So neither an owner change nor a departed account
+    (`ErrScopeOwnerUnknown`, a lookup past its deadline) blocks a rebuild, and each such
+    scope's floor is kept until root removes the scope (Open requirement 12, U129).
+  - *An unopenable scope refuses the rebuild.* If any scope's `scope.key` does not open under
+    `W`, or any of its files fails to open or authenticate for any other reason (`ErrBusy`
+    included), rebuild refuses to finish and names the scope. It refuses before it touches the
+    old file, so it changes nothing: it unlinks its staging file, leaves the old log as it was
+    and removes the marker.
   - *The `deliveries` record gets its line.* For each scope rebuild writes the line for the key
     `(user/<uid>, .deliveries, generation, seq)` with the record's authenticated sequence ("Key
     hierarchy"), so a copied-back older record is refused after a rebuild as before it (U88).
@@ -1376,7 +1392,8 @@ That wait is the store `.lock`
   `status.txt`, leg 1, and `leg1.txt`, the `rename-away`, `rename-over` and `ROOTRENAME` lines). Root renaming a
   flagged source was not measured, so the order below does not depend on it. The steps, after
   the new file is written and fsynced:
-  1. clear the old file's flag, on its own descriptor;
+  1. clear the old file's flag, on its own descriptor, and in the same step `fchown` it to root
+     and `fchmod` it 0600 on that descriptor (Open requirement 1);
   2. rotate only: shift the archives and rename the old log to `keystore-audit.log.1`
      (below);
   3. rename the new file over the canonical name;
@@ -1393,7 +1410,8 @@ That wait is the store `.lock`
 - **No unflagged window for the new file.** The new file is root-owned 0600 from its create
   until step 5, after its flag is set, so no service-user process can open it before the flag,
   and the service user never holds a descriptor on it from before the flag (U90, run as
-  root). The server opens it only after the marker is gone ("The server reopens after
+  root). The old file gets the same protection the other way round: it becomes root 0600 in
+  the step that clears its flag (Open requirement 1, U118). The server opens it only after the marker is gone ("The server reopens after
   maintenance"). A crash that leaves the canonical file unflagged or root-owned keeps the
   listener down: the server's check refuses either (U21), and the marker stays until a rerun
   of the verb finishes the steps.
@@ -1402,8 +1420,10 @@ That wait is the store `.lock`
   `--discard-oldest` is given, so evidence is never discarded without root saying so; the
   `doctor` hint past the soft cap says to export the archives first (copy them off the Mac),
   then rotate. Step 2 opens each archive from `.3` down to `.1`, clears its flag on its
-  descriptor, renames it one number up and sets the flag again on the same descriptor; with
-  `--discard-oldest`, `.4` is first opened, its flag cleared on its descriptor, and unlinked.
+  descriptor, `fchown`s it to root 0600 in the same step (a no-op for an archive already
+  root's, Open requirement 1), renames it one number up and sets the flag again on the same
+  descriptor; with `--discard-oldest`, `.4` is first opened, its flag cleared on its
+  descriptor, and unlinked.
   Rotation resets every uid's audit share and budgets to 0 (below). That is deliberate: only
   root rotates, and what a uid wrote before is kept in the archives, so the evidence a reset
   share can push out of the live log is bounded by the four archives (U91).
@@ -1428,7 +1448,8 @@ That wait is the store `.lock`
   A planted symlink or a swapped file at any of these names refuses the verb and changes no
   byte of either log (U68, run as root). The old file and each shifted archive are unflagged
   between their flag clear and their next flag set, under the exclusive lock with the listener
-  stopped (residual 12). A crash there can leave an unflagged file; the marker is still
+  stopped, and root 0600 for that whole interval, since the clear and the `fchown` are one step
+  (Open requirement 1, U118; residual 12). A crash there can leave an unflagged file; the marker is still
   present, so the listener stays down, and rerunning the verb finishes the steps. The verb
   removes the marker last (U22). Rebuild is
   the user-scope twin of Phase A's "remove `keystore-floor.json`, then run any root verb".
@@ -1481,11 +1502,15 @@ That wait is the store `.lock`
     to the victim"), the drift repairs ("Repairs are not charged to the owner") and their
     summaries, and the pre-frame `refused` lines of ineligible peers (uid 0, the service uid,
     a uid below 501 or at 2^31 and above), which have no share to charge and draw on this
-    budget with its once-a-minute dropped-count summary. Each carries `"charge":"reconciler"`, so the server recounts the budget from the
-    log at start, on every append and after maintenance, like the shares. Once the budget is
-    spent the reconciler writes none of these lines: it counts the dropped lines in memory,
-    `doctor` shows a Warn with the count, and root's next `audit --rotate` writes the count as
-    one line charged to no uid (U85).
+    budget with its once-a-minute dropped-count summary. The budget is split by source, and by
+    namespace within two of them (Open requirement 9): 384 KiB for forged-Secret lines, 384 KiB
+    for repairs and their summaries, each capped at 64 KiB per namespace, and 256 KiB for
+    pre-frame refusals. Each carries `"charge":"reconciler"` and its source, so the server
+    recounts every part from the log at start, on every append and after maintenance, like the
+    shares. Once a part is spent the reconciler writes none of its lines; `doctor` shows a Warn
+    with the count, and the count is persisted, not kept only in memory: the next summary line
+    written for that source carries it, and root's next `audit --rotate` writes any count still
+    unwritten as one line charged to no uid (U85, U126).
   - *Past the share, reads are refused too.* A uid past its share has its own mutations and
     its own reads refused with `ErrLogFull` (code `log-full`) before any line is written, so
     no read is a way around the share. Its `refused` lines and their summaries are not written
@@ -1650,7 +1675,9 @@ refused before its first frame:
   Pre-frame refusals are rate-limited the same way, per peer uid, with their own dropped-count
   summary (U54).
 - **What it claims.** The log is append-only against truncation and deletion by the service
-  user. A service-user process outside Seatbelt can append forged lines, because it shares the
+  user, except through a descriptor it opened before a maintenance verb's flag clear (residual
+  12); by path it cannot open the old file or an archive while unflagged, since both are root
+  0600 by then (Open requirement 1). A service-user process outside Seatbelt can append forged lines, because it shares the
   trust domain with the master; a hash chain would not stop that writer, so there is none.
 - `audit --rotate` moves the log aside under the maintenance procedure above.
 
@@ -1678,7 +1705,7 @@ directory is root's"). A worker node runs no listener (E18).
   (`ErrBusy`), not the server.
 - The start check also refuses a data root on a file system mounted with
   `MNT_IGNORE_OWNERSHIP` (read with `fstatfs` on the data-root descriptor, `f_flags`), since
-  every owner check in this design means nothing there.
+  every owner check in this design means nothing there (U131).
 - While the maintenance marker `keystore-maintenance` exists in the data root the listener
   stays down: it accepts nothing, and a client that connects meanwhile waits in launchd's
   backlog until its 10-second `HELLO` wait ends and it reports the server unavailable.
@@ -1701,7 +1728,10 @@ in their repos and `apis` cannot import `x/sys`, and the file cites both. That
 `LOCAL_PEERCRED` reports a non-root login uid on the server side, for a socket in a service-user
 0755 directory under the root-owned data root, is measured (K0 amendment 2026-11-21).
 
-**Eligible peers** are uids from 501 to 2147483647 that are not the service uid. Refused before any
+**Eligible peers** are uids from 501 to 2147483647 that are not the service uid, whose
+process is not sandboxed: before the first frame the listener also asks `sandbox_check`, on
+the peer's audit token, through its peer-sandbox source, and refuses a sandboxed peer, so a Pod
+process is refused by a check that does not rest on its uid (Open requirement 15, U137). Refused before any
 frame is read: uid 0 (root uses the direct-file verbs, as in Phase A), the service uid (every
 native Pod shares it), every uid below 501 (system accounts) (U26, E6), and every uid at
 2^31 (2147483648) or above, `nobody` (4294967294) among them, which is no login user and
@@ -1713,7 +1743,8 @@ such a name is well formed and simply has no scope.
 data root, checks by realpath that `keystore-sock/` is root's, mode 0755, under the root-owned
 data root, and that `keys.sock` is a socket (the service user's directory in the fallback), then reads the server's uid off the connected descriptor (`LOCAL_PEERCRED` from the
 client side; under socket activation, whether that names the server or launchd, the process
-that listened, is measured in K7a with the token below). **The connected-descriptor peer uid is
+that listened, is measured in K7a with the token below, and if it names launchd the self-bind
+form ships, Open requirement 4). **The connected-descriptor peer uid is
 the authority in both directions**: a
 value is never written to a socket whose peer is not the service user, whatever the path
 checks said (U36). That `LOCAL_PEERCRED` reports the service uid on the client side
@@ -1775,7 +1806,9 @@ socket before both checks pass (U69, E24).
   client-side `LOCAL_PEERTOKEN` names the accepting process or the process that listened is a
   K7a measurement. U69 holds the case either way: a listener inherited or passed to another
   process must not let that process pass the pin, and the server sets `FD_CLOEXEC` on the
-  activated descriptor and passes it to no one.
+  activated descriptor and passes it to no one (Open requirement 3, U120). If the token names
+  launchd, the self-bind form ships, and U36 is never relaxed to accept uid 0 (Open
+  requirement 4).
 - This pins the server for the client; it does not pin the client for the server, which stays
   unpinned by ruling (residual 1). That `LOCAL_PEERTOKEN` is readable on the client side and
   that `SecCodeCopyGuestWithAttributes` resolves a service-user process from a login user's
@@ -1854,13 +1887,16 @@ user's `list` shows only its own scope (U45, E12).
 
 ### Pod denies
 
-Pods cannot reach the socket or the keystore's files, in two layers. **The peer check is never
-the first layer.**
+Pods cannot reach the socket or the keystore's files, in two layers, with the listener's
+sandboxed-peer refusal behind both (Open requirement 15). **The peer check is never the first
+layer.**
 
 1. **Seatbelt.** The data-root denies cover two things, by prefix rather than by a list: every
    name in the data root that begins `keystore-` (today `keystore-floor.json`,
    `keystore-delivery.json`, `keystore-user-floor.log`, `keystore-audit.log`,
-   the archives `keystore-audit.log.1` to `.4`, the maintenance marker `keystore-maintenance` and the staging files
+   the archives `keystore-audit.log.1` to `.4`, the floor lock `keystore-lock`, the removal
+   record `keystore-removed-scopes.json` (Open requirement 13), the maintenance marker
+   `keystore-maintenance` and the staging files
    `keystore-user-floor.log.new` and `keystore-audit.log.new`), and the whole `keystore-sock/`
    tree, which the prefix also covers. A prefix means a keystore file a later change adds is
    denied without a runtimed change. The keystore names join `DataRootDenyTrees`, the list of
@@ -2014,7 +2050,10 @@ it may change and that a conversion is owed if it does.
   check is `Indeterminate` counts as honoured for precedence, so it keeps the claim until a
   definitive deleting outcome for it (on two consecutive sweeps, "Every deleting outcome counts
   only twice in a row"), and an outage never hands the target to another object, however old
-  (U73). **The annotation never decides.** The Secret's owner annotation is read only to test
+  (U73). The one exception is a scope listed in `keystore-removed-scopes.json` for the
+GeneratedUID it was bound to: that listing is root's own definitive record, so the scope's
+objects lose their claim at once, whatever their check reads (Open requirement 12, U130).
+**The annotation never decides.** The Secret's owner annotation is read only to test
   ownership against the record; it is never an input to precedence, so a writer who rewrites it
   to name another recorded UID cannot move the target to that object (U111). The set
   is closed per condition: a condition carries only the reasons its own rows below give, with
@@ -2046,7 +2085,9 @@ it may change and that a conversion is owed if it does.
   action, and the status says which:
 
   - `EntryUnavailable`: the Secret this object owns is **deleted** (on two consecutive
-    sweeps), since the entry is gone from a scope that opened, or its owner changed.
+    sweeps), since the entry is gone from a scope that opened. An owner change gives this
+    reason only once a K7a amendment puts `ErrScopeOwnerChanged` on the allow-list; until then
+    it is `Indeterminate` (Open requirement 10).
   - `NotRecorded`, for a UID the record names withdrawn or a digest mismatch: **deleted** (on
     two consecutive sweeps).
   - `NotRecorded`, for a UID never recorded: **retained**. No Secret is written, and since
@@ -2104,7 +2145,9 @@ can neither delete the object nor change it (U87, E23).
   until the reconciler has deleted its Secret.
 - *The policy fails closed.* Its `failurePolicy` is `Fail`, unlike the advisory policies'
   `Ignore` (`pkg/policy/admission.go:260`): an evaluation error must not admit a delete by
-  another author. That is why the expressions must never read `object` on a DELETE.
+  another author. That is why the expressions must never read `object` on a DELETE. U135
+  checks `failurePolicy: Fail` and that the namespace controller's exemption admits DELETE
+  only, never an UPDATE (Open requirement 13).
 
 **What the policy sees on a DELETE.** The API server runs validating admission for a DELETE with
 `object` null and `oldObject` set to the stored object. This is checked against the version
@@ -2238,13 +2281,16 @@ list is closed:
    exists, opened and authenticated;
 3. a digest mismatch: the digest recomputed from the live object differs from the one in a
    record that opened and authenticated;
-4. a definitive SubjectAccessReview denial, as defined above, on two consecutive sweeps;
-5. the store's typed `ErrScopeOwnerChanged` (`errors.Is(err, keystore.ErrScopeOwnerChanged)`):
-   the account is deleted or its uid reused, as the GeneratedUID binding shows: the lookup
-   returned a real, non-synthesized GeneratedUID that differs from the bound one. A
-   synthesized compatibility UUID is `ErrScopeOwnerUnknown`, which is `Indeterminate`.
+4. a definitive SubjectAccessReview denial, as defined above, on two consecutive sweeps.
 
-**Every other outcome is `Indeterminate`**, whatever it is: `ErrScopeAbsent` (a missing
+The store's typed `ErrScopeOwnerChanged` is not on the list in this release (Open requirement
+10): it is `Indeterminate`, and `doctor` names the scope. A dated K7a amendment that measures
+GeneratedUID stability across Migration Assistant, a macOS upgrade and a directory rebind may add
+it as item 5, and only for a real, non-synthesized GeneratedUID that differs from the bound one;
+a synthesized compatibility UUID is `ErrScopeOwnerUnknown`, which is `Indeterminate` either way.
+
+**Every other outcome is `Indeterminate`**, whatever it is: `ErrScopeOwnerChanged` (Open
+requirement 10), `ErrScopeAbsent` (a missing
 `.user/<uid>/` or `scope.key`, or, in a scope whose `scope.key` opened, a missing `entries/`
 directory or `deliveries` record), `ErrCorrupt` (the floor refusal
 included, which wraps it), `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`,
@@ -2255,19 +2301,21 @@ delivery record whose version it does not know, a SubjectAccessReview call that 
 answer that is not a definitive denial, a denial seen on one sweep only, any other API server
 error, and any error this list does not name, including one a later change adds. The rule is
 written as an allow-list so that a new sentinel is safe by default: it deletes nothing until a
-change adds it here. `ErrScopeOwnerChanged` is a definitive outcome, not a read failure: a
-new person holds the uid, and the old owner's credential must not stay delivered to them, so it
-deletes beside `ErrNotFound`. That removal is automatic only for uid reuse. A departed account
-whose uid is not reused has no directory record, so the lookup answers a synthesized value,
+change adds it here. `ErrScopeOwnerChanged` would be the outcome for uid reuse, where a new
+person holds the uid and the old owner's credential must not stay delivered to them; it is
+held back from the list until K7a's measurement (Open requirement 10), so in this release uid
+reuse is reported by `doctor` and cleared by root with `rm-scope`, and no Secret is deleted
+for it automatically. A departed account whose uid is not reused has no directory record, so the lookup answers a synthesized value,
 which is `ErrScopeOwnerUnknown` and stays `Indeterminate`: the reconciler cannot tell it from a
 directory service that is not up yet. Such a scope is reported, not acted on: `doctor` lists
 it, each of its deliveries gets `SecretRetained=True` with reason `OwnerUnresolvable`, and its
 removal is left to root ("A departed account is left to root"). A UID absent from a readable record is `NotRecorded` and gets no Secret written,
 but it is not on the list, so it deletes nothing.
 
-**An owner change still finds its targets.** Deleting under `ErrScopeOwnerChanged` needs the
-record's targets, and the scope no longer opens through the normal path. So on
-`ErrScopeOwnerChanged` the reconciler opens that scope's `scope.key` under `W` without the
+**An owner change still finds its targets.** A delete of an owner-changed scope's Secret (the
+object's deletion, the orphan sweep, `rm-scope`, and the owner-change delete itself only once a
+K7a amendment allows it, Open requirement 10) needs the record's targets, and the scope no
+longer opens through the normal path. So on `ErrScopeOwnerChanged` the reconciler opens that scope's `scope.key` under `W` without the
 GeneratedUID check (the bound value is the record's own generation field, "Record encoding"),
 and through it reads only the `deliveries` record, which must still authenticate. That read is
 used for one thing: finding each recorded target, recorded or withdrawn, to delete under the
@@ -2289,8 +2337,8 @@ what drives them:
   older tree that lacks an entry reads as an absent entry, since the floor line is what marks a
   missing entry as damage rather than removal, so absence is not definitive then.
 - *A revocation-driven delete goes ahead.* A delete driven by a withdrawn record entry, a
-  digest mismatch, a definitive SubjectAccessReview denial or an owner change
-  (`ErrScopeOwnerChanged`) never depends on the floor check: each is decided by the allow-list
+  digest mismatch or a definitive SubjectAccessReview denial (and an owner change, once a K7a
+  amendment allows it, Open requirement 10) never depends on the floor check: each is decided by the allow-list
   above and the two spaced observations, and none reads a pointer the floor guards.
 
 The record withdrawal that follows a delete writes the `deliveries` record and its floor line,
@@ -2389,6 +2437,11 @@ can set both; the sealed record is what neither that writer nor an admin can for
   UID check alone would then delete that Secret as the owner's. The target check refuses it:
   the Secret is not the recorded target, so neither the orphan sweep nor a lost-authority
   delete touches it, and it is left alone (U44).
+- **Another honoured record's target is never deleted.** Two uids' honoured records can name
+  the same `(namespace, secretName)`. The orphan sweep, a lost-authority delete and `rm-scope`
+  never delete a Secret that another honoured record claims at that target, and the owner
+  annotation never selects which record's tombstone governs a delete; nothing is charged to
+  the victim (Open requirement 6, U123).
 - **A stripped label is reported, never acted on.** A Secret at a recorded target whose label
   or owner annotation was removed no longer passes the ownership test, and the reconciler
   cannot tell that from a Secret someone else put at that name. So it never overwrites or
@@ -2415,7 +2468,9 @@ can set both; the sealed record is what neither that writer nor an admin can for
 `keystore.k3sm.io/delivery`. On deletion of the object, or when authority is lost (a definitive
 denial, an outcome on the allow-list above), the reconciler deletes the Secret it owns (the label and the owner annotation
 matching, the annotation's UID in the sealed record, and the Secret being that UID's recorded
-target) and sets `Authorized=False`. The crash order is fixed: **delete the
+target) and sets `Authorized=False`. Every reconciler Secret delete or update, and every
+`rm-scope` delete, passes `Preconditions{UID, ResourceVersion}` from the ownership read, so a
+Secret replaced in between is not touched (Open requirement 8, U125). The crash order is fixed: **delete the
 Secret, then withdraw the sealed record entry, then drop the finalizer**, so a crash at any
 point leaves a state the next sweep finishes. An **orphan sweep** deletes a labelled Secret
 only if its owner annotation names a KeyDelivery UID that the sealed record holds, the
@@ -2460,8 +2515,8 @@ revocation that leaves a long-lived token in place is not a revocation.
 
 **`rm-scope` revokes first.** Removing a scope must not leave its delivered Secrets in place
 with no record left to find them by. `sudo k3sm keys rm-scope user/<uid> --yes` holds the store
-lock exclusively for its whole run, so no reconciler write from that scope lands in between,
-and runs in this order:
+lock exclusively, and the floor lock `keystore-lock` (Open requirement 2), for its whole run,
+so no reconciler write from that scope lands in between, and runs in this order:
 
 0. **List the uid's bindings.** It lists every RoleBinding and ClusterRoleBinding with a
    subject `k3sm:local:<uid>` and prints each, a RoleBinding with its namespace. Unless none
@@ -2479,6 +2534,10 @@ and runs in this order:
    UID's recorded target, carrying the label and an owner annotation naming that UID and the
    recorded entry. A Secret already gone counts as done; any other Secret is left alone. Each
    delete writes a `deliver-delete` line, `via` `root`, charged to no uid.
+   Then it records the scope in `keystore-removed-scopes.json` ("An unopenable or removed scope
+   counts as withdrawn for the finalizer") and deletes the scope's KeyDeliveries, each recorded
+   UID's object by its recorded namespace and name with a UID precondition, so a stale object
+   holds no claim (Open requirement 12, U130).
 3. **Then remove the scope**, walking `.user/<uid>/` by descriptor ("Root walks service-user
    trees by descriptor").
 
@@ -2489,7 +2548,9 @@ record intact and resumes. If the record cannot be opened (missing, corrupt, or 
 given. An owner change is not such a case: step 1 reads the record without the GeneratedUID
 check, as the reconciler does on `ErrScopeOwnerChanged`, and deletes by its targets. With
 that flag it lists every Secret labelled for KeyDelivery whose owner annotation names an
-entry of this scope, marking each match `unauthenticated (annotation only)`, since nothing
+entry of this scope, marking each match `unauthenticated (annotation only)`, with every control character stripped
+from the annotation text it prints, as every root verb and `doctor` strip it (Open requirement
+14, U136), since nothing
 sealed ties it to the scope, deletes none of them, leaves them for root to judge, and then removes the
 scope; it still refuses when the API server is unreachable, since it cannot list (U77). The
 KeyDeliveries that named the scope then drop their finalizers as for a removed scope (U75).
@@ -2497,7 +2558,8 @@ KeyDeliveries that named the scope then drop their finalizers as for a removed s
 **Root walks service-user trees by descriptor.** `.user/<uid>/` is the service user's, so
 every name in it may be a symlink, a FIFO or a directory swapped mid-walk. Every root path that
 reads or changes a keystore tree therefore walks it by descriptor: `rm-scope`, `floor
---rebuild`, `sudo k3sm install` over an existing tree (which judges and keeps what it finds),
+--rebuild`, Rewrap of each `scope.key` and every other root write under `server/keystore/`
+(Open requirement 11, U128), `sudo k3sm install` over an existing tree (which judges and keeps what it finds),
 `uninstall --purge` (which clears the logs' flags and removes the trees) and `doctor` (which
 reads sizes, flags and scopes). The purge already walks the data root off one descriptor with a
 device and inode check (`purgeTree`, `pkg/install/install_darwin.go:2542`); the keystore trees
@@ -2593,7 +2655,8 @@ limitations page says so. Replicating the keystore across servers is a later des
   `pkg/keystore/reconcile`, siblings that import `pkg/keystore`, never the reverse.
 - Each consumer declares the small interface it needs at its own site. The socket server's has
   no reveal, show or rewrap method; the reconciler's reads a value only for a delivery it has
-  authorised.
+  authorised, and its value read takes that authorisation as an argument it cannot build
+  itself (U134).
 - The entry grammar lives once, in `apis/keystore/entry`, which imports only the standard
   library.
 
@@ -2620,7 +2683,7 @@ adds a seam package adds it to the list in the same change.
 | package | its seams | guard row |
 |---|---|---|
 | `pkg/keystore` | clock, uid resolver, chflags flag source, GeneratedUID lookup | U47 |
-| `pkg/keystore/socket` | clock, chflags flag source, euid source (the listener's service-uid check); the server-side peer-credential source is a constructor parameter of the listener, not a package variable | U48 |
+| `pkg/keystore/socket` | clock, chflags flag source, euid source (the listener's service-uid check); the server-side peer-credential source and the peer-sandbox source (`sandbox_check` on the peer's audit token, Open requirement 15) are constructor parameters of the listener, not package variables | U48 |
 | `pkg/keystore/reconcile` | clock (sweep interval, backoff, the two-sweep count) | U59 |
 | `cmd/k3sm` | clock, uid resolver, peer-credential source (client side), server code identity, exec, euid source, file-attribute writer (the maintenance verbs) | U60 |
 | `pkg/install` | euid source, file-attribute writer | U61 |
@@ -2633,6 +2696,7 @@ adds a seam package adds it to the list in the same change.
 | peer-credential source | `getsockopt(SOL_LOCAL, LOCAL_PEERCRED)` and `LOCAL_PEERPID` on the connected descriptor, both sides | any uid and pid per connection, which is how cross-user refusal is tested (U45) | client side: a panicking stub; server side: none, since it is the listener's constructor parameter and a test passes its fake there, and the constructor refuses nil (U48) |
 | chflags flag source | `fstat` `st_flags & SF_APPEND` on the two logs, and `chflags` in the maintenance verbs | a flag set or clear per file | a panicking stub |
 | GeneratedUID lookup | `mbr_uid_to_uuid`, with its deadline | a fixed GeneratedUID, a changed one, an error, or a lookup past the deadline | a panicking stub |
+| peer-sandbox source | `sandbox_check` on the peer's audit token (`LOCAL_PEERTOKEN`) on the connected descriptor, server side (Open requirement 15) | sandboxed or not per connection, or a lookup error, which refuses (U137) | none: it is the listener's constructor parameter, and the constructor refuses nil |
 | audit sink | the append to `keystore-audit.log` | an in-memory log, and one whose append fails | none: it writes a file under the test's own directory, not a host primitive |
 | server code identity | `LOCAL_PEERTOKEN` on the client's connected descriptor, `SecCodeCopyGuestWithAttributes` and the cdhash of the installed binary | a peer cdhash and an installed cdhash, equal or not, or a lookup error | a panicking stub |
 | exec | `syscall.Exec` in `k3sm keys exec` | a recorder of the path, argv and environment it was given, which returns instead of replacing the process (U37) | a panicking stub |
@@ -2690,7 +2754,7 @@ the uid throughout.
 | principal | can | cannot |
 |---|---|---|
 | root | everything: every scope's values (through `M`), the floors, the audit log; the only principal that delivers or reads a system entry | (not defended against) |
-| the service user (the server, runtimed, kine, the control plane, and any of its processes outside Seatbelt) | read `M` and every `K_u`, hence every value; append to the floor log and the audit log, including forged audit lines | lower the user floor, truncate or delete audit lines, write the system floor |
+| the service user (the server, runtimed, kine, the control plane, and any of its processes outside Seatbelt) | read `M` and every `K_u`, hence every value; append to the floor log and the audit log, including forged audit lines | lower the user floor, truncate or delete audit lines (outside residual 12: a descriptor opened before a maintenance verb's flag clear, Open requirement 1), write the system floor |
 | a native Pod (the service uid, under Seatbelt) | read a Secret delivered into a namespace it may read, like any Secret | reach `keys.sock`, `keystore-sock/`, `server/`, the logs or Phase A's files (Seatbelt first); run under an explicit drop target of 501 or above, which is the second layer the sandbox change adds ("Pod denies"); a root Pod is outside this model (residual 17) |
 | the entry's owner (a login uid of 501 or above) | put, rotate (including from a version), list, rm and exec its own entries; declare deliveries where RBAC lets `k3sm:local:<uid>` write keydeliveries and that Secret | reveal a value through any verb but exec; touch another uid's scope or any system entry; see another user's names through any verb |
 | another login user | the same for its own scope | list, read, rotate, delete or deliver the owner's entries; learn their names |
@@ -2734,7 +2798,8 @@ the uid throughout.
    host's eligible local accounts, and `doctor` warns when it is non-zero. A namespace writer
    who plants forged Secrets spends only the reconciler budget, never a uid's share.
 6. A user account deleted and recreated under the same uid loses its old scope, by design
-   (U6), and root must clear it. A user account deleted with its uid not reused keeps its
+   (U6), and root must clear it; its delivered Secrets stay until root runs `rm-scope` (Open
+   requirement 10, residual 13). A user account deleted with its uid not reused keeps its
    delivered Secrets until root runs `rm-scope`: the reconciler cannot tell a missing
    directory record from a directory service that is not up, so it reports the scope
    (`doctor`, `OwnerUnresolvable`) and deletes nothing.
@@ -2749,15 +2814,21 @@ the uid throughout.
     accepted: the service user must read the floor, and neither file holds a value. Pods are
     covered by the data-root denies ("Pod denies"). What a login user cannot do with a system
     entry is read or deliver it (E12).
-12. During `audit --rotate`, the old log and each archive it shifts are unflagged between
-    their flag clear and their next flag set, with the listener stopped and the lock held. A
-    service-user process that already held an append descriptor on one of them could truncate
-    it in that window. The new file has no such window ("No unflagged window for the new
-    file").
+12. During `audit --rotate` and `floor --rebuild`, the old log and each archive rotate shifts
+    are unflagged between their flag clear and their next flag set, with the listener stopped
+    and the lock held. They are root 0600 from the clear's own step (Open requirement 1), so no
+    service-user process can open one by path in that interval. What stays: a service-user
+    process that opened a writable descriptor on one before the clear could truncate it through
+    that descriptor in the interval, and so could an open landing between the two consecutive
+    calls of the clear's step. The new file has no such window ("No unflagged window for the
+    new file").
 13. The GeneratedUID's stability across a macOS upgrade, a Migration Assistant transfer or a
     directory rebind is not measured; K0 measured it only across processes and a restart. A
-    change there reads as `ErrScopeOwnerChanged`, which deletes the account's delivered Secrets
-    on two spaced observations, and the user must store and deliver again.
+    change there reads as `ErrScopeOwnerChanged`, which in this release is `Indeterminate` and
+    a `doctor` report, never a deletion (Open requirement 10): the account's scope no longer
+    opens, its delivered Secrets stay at their last versions, and root judges it. So does a
+    real uid reuse, whose new account keeps the old account's delivered Secrets in place until
+    root runs `rm-scope`.
 14. macOS can give a deleted account's uid to a new account. The GeneratedUID binding keeps
     the new account out of the old scope (`withdraw` included), but RoleBindings and
     ClusterRoleBindings naming `k3sm:local:<uid>` stay and grant the new account what the old
@@ -2791,8 +2862,115 @@ rows are not a contract).
 
 A finding from the design's last review round that is not closed here is a binding
 requirement on the slice named beside it, re-checked by that slice's own security review.
+Each entry names the defect, the required fix, the owning slice and the row whose test fails
+without the fix. Where the design's text above states the behaviour an entry changes, that
+text points here.
 
-None yet.
+1. **The old log is service-user-owned while unflagged (K8).** During `audit --rotate` and
+   `floor --rebuild` the old file, and every archive `audit --rotate` shifts, is unflagged
+   between its flag clear and its next flag set while still owned by the service user, so a
+   service-user process can open it by path with `O_TRUNC` and truncate it. *Fix:* the step
+   that clears `sappnd` also `fchown`s the file to root and `fchmod`s it 0600, both on the
+   verb's own descriptor, as consecutive calls with nothing between them; no later step runs
+   until both succeed, and the archives stay root 0600 from then on. *Test:* U118, root-run: the
+   service user's `open(O_WRONLY|O_TRUNC)` of the old file and of each shifted archive, between
+   the clear and the re-flag, gets `EACCES`.
+2. **Any local user can hold the floor lock (K8, and merged Phase A code).** Phase A's floor
+   writers take `flock(2)` on the data-root directory itself (`pkg/keystore/floor.go:368` to
+   `:375`); the data root is root:wheel 0755, so any local user can open it, take the lock and
+   hold it, and every root verb that writes the floor, the revocation and recovery verbs
+   included, then fails with the lock timeout. *Fix:* the floor lock moves to a file
+   `keystore-lock` in the data root, root-owned 0600, created by the first root verb through
+   the data-root descriptor rules ("Root never acts by path where the service user can write"),
+   which only root can open. Every root verb that writes the system floor or a keystore file in
+   the data root takes it, after the store `.lock` and with the same bounded wait: `put`,
+   `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise at the start of `list` and
+   `show`, `rm-scope`, `floor --rebuild` and `audit --rotate`. The server never takes it. This
+   changes Phase A code already merged and Phase A's "Concurrency" text, so it is also filed as
+   its own change. *Test:* U119, root-run: a non-root process holding the old data-root flock
+   blocks none of those verbs.
+3. **The activated listener must reach no child (K9a).** The listening descriptor launchd
+   passes to the server must not be inherited by any process the server starts. *Fix:* the
+   server sets `FD_CLOEXEC` on it before any other work, and no spawn path passes it on.
+   *Test:* U120, server-side integration: spawn each child type (an `exec.Command` child, the
+   runtimed helper, a Pod through the exec shim), list each one's open descriptors, and fail if
+   the listening socket is among them.
+4. **Under activation the client may see launchd as the peer (K9a, measured in K7a).** The
+   client-side `LOCAL_PEERCRED` and `LOCAL_PEERTOKEN` may name launchd (uid 0), the process
+   that listened, not the accepting server. *Binding rule, a K7a outcome:* K7a measures both
+   from a login user's process. If either names launchd, or names anything but the accepting
+   server, the build ships the deny-plus-pin self-bind form ("The socket's directory is
+   root's"). U36's rule is never relaxed to accept uid 0. *Test:* U121: a client whose peer
+   reads as uid 0 or as launchd's code refuses and writes nothing.
+5. **A Pod might obtain the listener from launchd (K9a, measured in K7a).** A process
+   descended from the server's job can ask launchd for the job's sockets with
+   `launch_activate_socket`, and Pods descend from it (`runtimed/pkg/runtime/podreap.go:40`).
+   *Fix:* K7a measures this from a Pod. If a Pod can obtain the listener, the build ships the
+   self-bind form, and the Pod profile denies the launchd socket-activation lookup in either
+   form. *Test:* U122 (the rendered Pod profile carries the deny) and rig leg E27 (a Pod's
+   `launch_activate_socket` for the server's socket name gets no descriptor).
+6. **Same-target cross-record deletion (K13b).** Two honoured records, of two uids, can name
+   the same `(namespace, secretName)`. The orphan sweep, the lost-authority delete and
+   `rm-scope` match a Secret against one record's target, so one uid's tombstone, or a forged
+   owner annotation naming it, could delete the Secret another uid's live delivery owns.
+   *Fix:* none of the three deletes a Secret that another honoured record claims at the same
+   `(namespace, secretName)`; the owner annotation never selects which record's tombstone
+   governs a delete; and no line is charged to the victim. *Test:* U123,
+   `TestForgedTombstoneAnnotationOnOtherUsersLiveSecretIsNotDeleted`, which drives the
+   target-matching decision the reconciler and `rm-scope` share.
+7. **A tombstone whose target is reused never prunes (K13b).** Pruning only on a Get that
+   answers not found keeps a tombstone forever once someone else's Secret stands at its target.
+   *Fix:* a tombstone is pruned when its target is not this UID's owned Secret (gone, or held
+   by anything that fails the ownership test for this UID) on two observations at least 60 s
+   apart. *Test:* U124: an occupied target still prunes.
+8. **A delete can land on a replaced Secret (K13b).** A Secret can be deleted and re-created
+   under the same name between the ownership read and the delete. *Fix:* every reconciler
+   Secret delete or update and every `rm-scope` delete passes `Preconditions{UID,
+   ResourceVersion}` from the ownership read, and a precondition failure is `Indeterminate`.
+   *Test:* U125: a fake client swaps the Secret between the read and the delete, and the delete
+   is refused.
+9. **One source can spend the whole reconciler budget (K13b).** *Fix:* the 1 MiB reconciler
+   budget is split by source: 384 KiB for forged-Secret `refused` lines, 384 KiB for drift
+   repairs and their summaries, 256 KiB for pre-frame refusals; the forged and repair budgets
+   are also capped at 64 KiB per namespace. Dropped counts are persisted: each summary line
+   carries the count dropped since the last summary line written for that source, so the count
+   reaches the log with the next line written, not only memory. *Test:* U126.
+10. **`ErrScopeOwnerChanged` is not yet a deleting outcome (K7a).** GeneratedUID stability
+    across Migration Assistant, a macOS upgrade and a directory rebind is not measured, so a
+    change there could delete every delivered Secret of a user who still owns them. *Fix:*
+    until a K7a amendment records that measurement, `ErrScopeOwnerChanged` is `Indeterminate`
+    plus a `doctor` report naming the scope; it is not on the allow-list, and the Secrets stay.
+    *Test:* U127.
+11. **Rewrap writes under the service user's tree by path (K7b).** *Fix:* Rewrap of each
+    `scope.key`, and every root write under `server/keystore/`, walks by descriptor and joins
+    the list in "Root walks service-user trees by descriptor". *Test:* U128, root-run, and a
+    Rewrap case in U80.
+12. **A departed account blocks a rebuild, and a removed scope keeps its claims (K7a and
+    K13b).** *Fix:* `floor --rebuild` reads any scope whose `scope.key` opens under `W`
+    without the GeneratedUID check, so `ErrScopeOwnerUnknown` blocks nothing (K7a; U129). A scope
+    listed in `keystore-removed-scopes.json` counts as definitive for claims, so its stale
+    objects lose their claim, and `rm-scope` also deletes that scope's KeyDeliveries (K13b;
+    U130).
+13. **Missing rows (K9a, K7a, K13b; the policy's row K12).** *Fix:* rows for the
+    `MNT_IGNORE_OWNERSHIP` start refusal (K9a; U131); the modes of `.user/<uid>/`, `scope.key`
+    and `deliveries` (K7a; U132); `keystore-removed-scopes.json`, added to the on-disk layout and
+    the Pod-deny list, root-owned, its mode and a strict parse (K13b; U133); the reconciler's
+    store interface reading a value only for an authorised delivery (K13b; U134); and the
+    policy's `failurePolicy: Fail` with the namespace-controller exemption covering DELETE only
+    (K12, which ships the policy; U135).
+14. **Annotation text reaches root's terminal (K9b, K13b).** A namespace writer controls
+    Secret annotations. *Fix:* every root verb and `doctor` line that prints annotation text
+    strips control characters first. *Test:* U136.
+15. **A Pod at the service uid relies on the uid check alone behind Seatbelt (K9a, measured
+    in K7a).** In the shipped posture Pods and the listener share the service uid; the
+    eligibility rule refuses that uid, but nothing independent of the uid refuses a Pod process
+    that passed a Seatbelt miss. *Fix:* the listener refuses, before the first frame, any peer
+    that is sandboxed: it calls `sandbox_check` on the peer's audit token (`LOCAL_PEERTOKEN`)
+    through a cgo seam behind an interface, the listener's peer-sandbox source, a constructor
+    parameter like the peer-credential source. K7a measures that `sandbox_check` on a peer token
+    reports a Seatbelt-confined Pod process as sandboxed and an unconfined login shell as not.
+    *Test:* U137 with a fake token source, and rig leg E26: a real Pod's connect is refused with
+    the keystore deny stanza removed.
 
 ### Facts from the rig spike
 
@@ -2818,10 +2996,13 @@ as a dated amendment like K0's. It measures: `LOCAL_PEERTOKEN` and the code look
 the client side (leg 2's pending half); root's `fchown` of a file it has just flagged `sappnd`;
 the 50 ms exclusive hold bound ("The audit log", lock modes); whether the client-side
 `LOCAL_PEERCRED` and `LOCAL_PEERTOKEN` name the accepting process or the one that listened
-("The client pins the server"); and whether launchd activates a
+("The client pins the server", Open requirement 4); and whether launchd activates a
 `Sockets` socket for a job with `UserName` set, root-owned in a root-owned directory, with the
 server receiving it through `launch_activate_socket` ("The socket's directory is root's"). If
-that last one fails, the deny-plus-pin fallback ships.
+that one fails, the deny-plus-pin fallback ships. It also measures: whether a Pod can obtain the listener from launchd
+(Open requirement 5); GeneratedUID stability across Migration Assistant, a macOS upgrade and a
+directory rebind (Open requirement 10); and `sandbox_check` on a peer's audit token for a
+confined Pod process and an unconfined login shell (Open requirement 15).
 
 Two facts are open but are not spike legs: whether the admission policy sees the impersonated
 user in `request.userInfo.username` (U40 and E3), and whether the rig runs with
@@ -2892,7 +3073,7 @@ rig rows as an explicit, recorded step. Every row below is pending until the cha
 its last column lands; a pending row fails its mode. A row whose change has landed says
 `checked`, or `partial` with the part still pending. G1 holds for the Phase A changes; the user
 scope's only module changes are k3sm's requirements on its own `apis` and `runtimed` modules,
-each stated in the change that makes it. U15 is held for a K0 amendment and U39 is unused.
+each stated in the change that makes it. U15 is held for a K0 amendment, and U39 and U117 are unused.
 
 **When the user scope is complete.** Every U row passes under `--check` with none pending,
 and `--root` passes with no SKIP, every root-run row included; the gate checks both. Every U
@@ -2958,7 +3139,7 @@ carried by the unit rows.
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine` | pending: the append-only files |
 | U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler`, except drift repairs, coalesced to one line per delivery per 10 minutes (U86) | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid, drawing on the reconciler budget with its once-a-minute dropped-count summary | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited` | pending: the socket listener |
-| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial when the call succeeded, `allowed=false` and `evaluationError` is empty, whatever `denied` says (the RBAC authorizer refuses with no opinion, reported as `allowed=false`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the sync of the RBAC, KeyDelivery and Secret informers; every deleting outcome, not only a denial, deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for an entry missing from a scope that opened, `ErrScopeOwnerChanged`, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrScopeAbsent`, `ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate`; against the real store, on `ErrScopeOwnerChanged` the reconciler reads the `deliveries` record under `W` without the GeneratedUID check only to find recorded targets, deletes them by the target-matching rule, and never delivers, rotates or opens an entry | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSAREvaluationErrorIsIndeterminate`, `TestSARAllowedFalseWithoutErrorIsDenial`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestScopeOwnerChangedDeletes`, `TestEverySentinelBesidesNotFoundAndOwnerChangedIsIndeterminate`, `TestScopeOwnerChangedDeletesAgainstRealStore` | pending: the KeyDelivery reconciler (lifecycle) |
+| U55 | a transient lookup, SAR or apiserver error leaves the Secret and sets Unknown: a failed SAR call, an API server error, `ErrScopeOwnerUnknown`, `ErrBusy` and `ErrLogFull` each leave the Secret, the record entry and the finalizer, set `Authorized=Unknown` with reason `Indeterminate`, and retry with backoff; a SAR answer is a definitive denial when the call succeeded, `allowed=false` and `evaluationError` is empty, whatever `denied` says (the RBAC authorizer refuses with no opinion, reported as `allowed=false`), and each other answer is `Indeterminate`; no sweep runs before `readyz` and the sync of the RBAC, KeyDelivery and Secret informers; every deleting outcome, not only a denial, deletes only when two consecutive sweeps see it for the same generation; only the allow-list (`ErrNotFound` for an entry missing from a scope that opened, a withdrawn record, a digest mismatch on a readable record, a definitive SAR denial) deletes, and a table over every store sentinel (`ErrScopeOwnerChanged` until a K7a amendment (U127), `ErrScopeAbsent`, `ErrCorrupt`, the floor refusal, `ErrMasterMissing`, `ErrScopeUnsupported`, `ErrBusy`, `ErrLogFull`, `ErrScopeOwnerUnknown`), a cancelled ctx, the audit read refusal, an unknown record version and an unlisted error finds each `Indeterminate`; against the real store, on `ErrScopeOwnerChanged` the reconciler reads the `deliveries` record under `W` without the GeneratedUID check only to find recorded targets for a lifecycle delete (the object's deletion, the orphan sweep), deletes them by the target-matching rule, and never delivers, rotates or opens an entry | `k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown`, `TestSAREvaluationErrorIsIndeterminate`, `TestSARAllowedFalseWithoutErrorIsDenial`, `TestNoSweepBeforeReady`, `TestDenialNeedsTwoSweeps`, `TestEverySentinelBesidesNotFoundIsIndeterminate`, `TestOwnerChangedRecordReadFindsTargetsAgainstRealStore` | pending: the KeyDelivery reconciler (lifecycle) |
 | U56 | a delivery record with an unknown format version is refused by the store and read by the reconciler as `Indeterminate`, never as a denial: no Secret is deleted | `k3sm/pkg/keystore::TestDeliveryRecordUnknownVersionRefused`, `k3sm/pkg/keystore/reconcile::TestUnknownRecordVersionIsIndeterminate` | pending: the KeyDelivery reconciler (lifecycle) |
 | U57 | `apis/keystore/entry` imports only the standard library, exports the pattern, the `maxLength` and the parse, and holds the shared vector table, which it passes | `apis/keystore/entry::TestGrammarVectors`, `TestImportsStdlibOnly` | pending: the entry grammar in `apis` |
 | U58 | seam guard, repo level: the seam-bearing packages are a closed list (`pkg/keystore`, `pkg/keystore/socket`, `pkg/keystore/reconcile`, `cmd/k3sm`, `pkg/install`); each listed package has its `TestMain` stub install and its `TestRealPrimitivesUnreachable`, a missing guard fails, and a package outside the list that declares a seam fails; fakes restore through `t.Cleanup` | `k3sm/pkg/keystore::TestEverySeamPackageHasAGuard` | pending: the user-scope store, its list extended by each change that adds a seam package |
@@ -2983,15 +3164,15 @@ carried by the unit rows.
 | U77 | `rm-scope` revokes first: under the exclusive store lock it reads the sealed `deliveries` record, deletes each recorded delivery's Secret through the reconciler's admin client by the target-matching rule (namespace, name, label, owner annotation and recorded entry), and only then removes the scope; with the API server unreachable it refuses and changes nothing, no Secret and no file; with the record unopenable it refuses unless `--orphan-secrets`, which lists the labelled Secrets naming this scope's entries, each marked `unauthenticated (annotation only)`, deletes none and then removes the scope (seams: euid source) | `k3sm/cmd/k3sm::TestRmScopeDeletesDeliveredSecretsFirst`, `TestRmScopeRefusesWithoutAPI`, `TestRmScopeOrphanSecretsListsAndLeaves` | pending: the KeyDelivery reconciler (lifecycle) |
 | U78 | `SecretRetained` is `True` whenever a labelled Secret stays while `Authorized` is `Unknown` or `False`: under `Unknown` with reason `Indeterminate`, the Secret at its last version; `NoneRetained` only when none stays or `Authorized` is `True` | `k3sm/pkg/keystore/reconcile::TestSecretRetainedTrueUnderUnknown` | pending: the KeyDelivery reconciler (authority) |
 | U79 | the rotation write, the `deliver-write` that follows a `rotate`, is in the revocation class: past the owner's share it draws on the owner's reconciler allowance, once per live delivery per log, and reaches the Secret; a further rotation write for that delivery past the share is `Indeterminate`; the reconciler's need for one uid, 64 deliveries × 4 lines × 1 KiB, is 256 KiB, the whole allowance | `k3sm/pkg/keystore/reconcile::TestRotationWriteUsesReserve` | pending: the KeyDelivery reconciler (lifecycle) |
-| U80 | root walks service-user trees by descriptor: run as root (a root-run row, `--root`), `rm-scope` and `floor --rebuild` walk `.user/<uid>/` with `openat` and `unlinkat` and `O_NOFOLLOW`, refuse a planted symlink, FIFO or other non-regular file and a directory where the layout has none, read with a bounded size, re-check `SameFile` after each open and never follow a swapped directory | `k3sm/cmd/k3sm::TestRootWalksRefusePlantedNames` (integration, root-run) | pending: the append-only files |
+| U80 | root walks service-user trees by descriptor: run as root (a root-run row, `--root`), `rm-scope`, `floor --rebuild` and Rewrap of each `scope.key` (U128) walk `.user/<uid>/` with `openat` and `unlinkat` and `O_NOFOLLOW`, refuse a planted symlink, FIFO or other non-regular file and a directory where the layout has none, read with a bounded size, re-check `SameFile` after each open and never follow a swapped directory | `k3sm/cmd/k3sm::TestRootWalksRefusePlantedNames` (integration, root-run) | pending: the append-only files |
 | U81 | a KeyDelivery never touches a Phase A Secret: the user-scope label value is the constant `keydelivery` and the entry is in the annotation `k3sm.io/keystore-entry`; a target that is present and not claimed by a KeyDelivery, unlabelled or delivered by Phase A, is `SecretExists` and is never overwritten or deleted; the Phase A reconciler leaves alone a Secret carrying `k3sm.io/keystore-entry` | `k3sm/pkg/keystore/reconcile::TestKeyDeliveryNeverTouchesPhaseASecret` | pending: the KeyDelivery reconciler (authority) |
 | U82 | eligible peer uids are 501 to 2147483647: `nobody` (4294967294), 2147483648 and every uid at 2^31 or above are refused before any frame, with a `refused` line, as uid 500 is; 501 and 2147483647 are admitted; no scope is minted outside the range (seam: peer-credential source) | `k3sm/pkg/keystore/socket::TestPeerUIDRangeRefusesNobodyAndHighUIDs` | pending: the socket listener |
-| U83 | the reconciler checks the user-scope floor log: a missing or unflagged floor log is `Indeterminate` for writes, so no `deliver-write` runs until `floor --rebuild`; the floor holds writes and absence-driven deletes: an `ErrNotFound` delete is `Indeterminate` while the floor is missing or unflagged, a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial, an owner change) still deletes the Secret without the floor, and only the record withdrawal waits for it (U107; the store's flag check, faked at the reconciler's store interface) | `k3sm/pkg/keystore/reconcile::TestReconcilerHoldsWritesWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
+| U83 | the reconciler checks the user-scope floor log: a missing or unflagged floor log is `Indeterminate` for writes, so no `deliver-write` runs until `floor --rebuild`; the floor holds writes and absence-driven deletes: an `ErrNotFound` delete is `Indeterminate` while the floor is missing or unflagged, a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial) still deletes the Secret without the floor, and only the record withdrawal waits for it (U107; the store's flag check, faked at the reconciler's store interface) | `k3sm/pkg/keystore/reconcile::TestReconcilerHoldsWritesWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
 | U84 | when a log's size is past the hard cap, `doctor` shows a Warn with the overshoot in bytes and the `audit --rotate` or `floor --rebuild` hint, and none at or below it; the overshoot is at most 320 KiB per user scope, plus the 1 MiB reconciler budget | `k3sm/cmd/k3sm::TestDoctorWarnsOnLogOvershoot` | pending: the socket operations |
 | U85 | a reconciler line charged to no uid (a forged-Secret `refused` line, a drift repair, their summaries) draws on the reconciler budget, 1 MiB per log, separate from every uid and excluded from the hard-cap test; forged Secrets are counted in a bounded LRU of 1024 (namespace, name) pairs with no per-`resourceVersion` set, new pairs' lines at most 10 a minute and at most one summary `refused` line a minute carrying the dropped count; past the budget the lines are dropped and counted and `doctor` warns; N forged updates leave every uid able to read and mutate | `k3sm/pkg/keystore/reconcile::TestForgedSecretFloodLeavesEveryUIDServed`, `TestUnchargedLinesHaveOwnBudget` | pending: the KeyDelivery reconciler (lifecycle) |
 | U86 | a drift repair (the reconciler re-creating or repairing a delivered Secret that someone other than the reconciler edited or deleted, at the version already delivered) is reconciler-class: it draws on the reconciler budget and is never charged to the owner's share or budgets; repairs are coalesced to one audit line per delivery per 10 minutes with a count, and rate-limited per delivery with exponential backoff capped at 10 minutes; a write of a new version after the owner's own `rotate` or `put` stays charged to the owner; `Ready=Delivered` compares `k3sm.io/keystore-digest`, the sha256 of the Secret's `data`, each sweep, so a substituted `data` under an intact version annotation is drift | `k3sm/pkg/keystore/reconcile::TestDriftRepairNotChargedToOwner`, `TestSubstitutedDataIsDrift` | pending: the KeyDelivery reconciler (lifecycle) |
 | U87 | the admission policy also matches UPDATE and DELETE of `keydeliveries` and admits one only when the requester equals `oldObject.spec.requestedBy`, is the k3sm server's identity, or is in `system:masters` (and, for DELETE only, the namespace controller's ServiceAccount); a finalizer edit is an UPDATE, so another author can neither delete the object nor strip its finalizer; the reconciler's and `withdraw`'s own writes pass; on a DELETE `object` is null and only `oldObject` is read; `failurePolicy` is `Fail` | `k3sm/pkg/policy::TestVAPRefusesDeleteByOtherAuthor`, `TestVAPRefusesFinalizerStripByOtherAuthor`; rig leg E23 | pending: KeyDelivery authoring |
-| U88 | `floor --rebuild` never lowers: if any scope fails to open for a non-definitive reason (`ErrScopeOwnerUnknown`, a lookup past its deadline, `ErrBusy`) or any error but an owner change, it refuses to finish, names the scope and changes nothing; an owner-changed scope is rebuilt from its pointers read under `W` without the GeneratedUID check; the `deliveries` record's AAD is scope, kind 0xFD, name `deliveries`, generation and sequence, its floor key is `(user/<uid>, .deliveries, generation, seq)`, and the rebuild writes that key's line; a copied-back older `deliveries` record is refused against the floor, before and after a rebuild | `k3sm/cmd/k3sm::TestRebuildRefusesOnUnopenableScope`, `k3sm/pkg/keystore::TestCopiedBackDeliveriesRecordRefused` | pending: the append-only files |
+| U88 | `floor --rebuild` never lowers: it reads every scope whose `scope.key` opens under `W` without the GeneratedUID check, so an owner change or a departed account is rebuilt from its pointers (U129); if any scope's `scope.key` does not open under `W` or any other error stops it (`ErrBusy` included), it refuses to finish, names the scope and changes nothing; the `deliveries` record's AAD is scope, kind 0xFD, name `deliveries`, generation and sequence, its floor key is `(user/<uid>, .deliveries, generation, seq)`, and the rebuild writes that key's line; a copied-back older `deliveries` record is refused against the floor, before and after a rebuild | `k3sm/cmd/k3sm::TestRebuildRefusesOnUnopenableScope`, `k3sm/pkg/keystore::TestCopiedBackDeliveriesRecordRefused` | pending: the append-only files |
 | U89 | reads take the store lock shared and mutations exclusive, through a writer-preferring in-process lock; a server exclusive hold does at most 50 ms of work per operation, larger work chunked, no hold across an API call (the bound measured in K7a); a reconciler revocation that gets `ErrBusy` retries up to 3 times with jitter in the same sweep before it is `Indeterminate`; under a sustained read load from other uids a revocation completes | `k3sm/pkg/keystore/reconcile::TestRevocationCompletesUnderOtherUIDReadLoad` | pending: the KeyDelivery reconciler (lifecycle) |
 | U90 | no unflagged window for the new file (integration, a root-run row: `--root`): it stays root-owned 0600 while written, and the order is write, fsync, clear the old file's flag, rename, set `sappnd` on the held descriptor, then `fchown` to the service user, so the service user never holds a descriptor from before the flag; a crash that leaves the canonical file unflagged or root-owned keeps the listener refused until the verb is rerun; the maintenance wait is the exclusive `.lock`, bounded at 30 s | `k3sm/cmd/k3sm::TestMaintenanceHandsOverOnlyAfterFlag` (integration, root-run) | pending: the append-only files |
 | U91 | `audit --rotate` keeps four archives, `.1` to `.4`, and refuses, changing nothing, when `.4` exists unless `--discard-oldest`; each shifted archive is re-flagged on its own descriptor; the `doctor` hint says to export first; rotation resets the shares, bounded by the archive count | `k3sm/cmd/k3sm::TestAuditRotateKeepsFourArchives` | pending: the append-only files |
@@ -3010,7 +3191,7 @@ carried by the unit rows.
 | U104 | the socket's directory is root's: run as root (a root-run row, `--root`), install creates `keystore-sock/` root:wheel 0755 and the server plist carries a `Sockets` listener for `keystore-sock/keys.sock`; a process running as the service uid cannot unlink, replace or bind `keys.sock`, whether or not the server runs, and gets `EACCES` | `k3sm/pkg/install::TestSocketDirRootOwnedServiceUIDCannotBind` (integration, root-run); rig leg E24 | pending: the socket listener |
 | U105 | every root path walks the keystore trees by descriptor: run as root (a root-run row, `--root`), `sudo k3sm install` over an existing tree, `uninstall --purge` and `doctor` each refuse a planted symlink, FIFO or swapped directory under `.user/` and at every `keystore-*` name, with `openat`, `O_NOFOLLOW`, bounded reads and a `SameFile` re-check, and change nothing they were not meant to | `k3sm/pkg/install::TestInstallOverExistingTreeWalksByDescriptor`, `TestPurgeWalksKeystoreByDescriptor`, `k3sm/cmd/k3sm::TestDoctorWalksKeystoreByDescriptor` (integration, root-run) | pending: the append-only files |
 | U106 | every root verb refuses a non-root caller: one table test runs `rm-scope`, `floor --rebuild`, `audit --rotate`, `rewrap` and `deliver system/…` with a non-root euid through the euid source, and each is refused with the same message and exit code, changing nothing (seam: euid source) | `k3sm/cmd/k3sm::TestRootVerbsRefuseNonRootEUID` | pending: the KeyDelivery reconciler (lifecycle), each verb's case added by the change that adds the verb |
-| U107 | with the user floor missing or unflagged, an absence-driven delete (`ErrNotFound`) is `Indeterminate` and deletes nothing, while a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial, an owner change) deletes the Secret after its two spaced observations | `k3sm/pkg/keystore/reconcile::TestNotFoundDeleteWaitsForFloor`, `TestRevocationDeleteProceedsWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
+| U107 | with the user floor missing or unflagged, an absence-driven delete (`ErrNotFound`) is `Indeterminate` and deletes nothing, while a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial) deletes the Secret after its two spaced observations | `k3sm/pkg/keystore/reconcile::TestNotFoundDeleteWaitsForFloor`, `TestRevocationDeleteProceedsWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
 | U108 | the exclusive hold bound on a fake clock: no server exclusive hold does more than 50 ms of work; the GeneratedUID lookup runs before the lock is taken and its answer is cached for the hold, so a lookup that takes its whole 250 ms deadline adds nothing to the hold (seams: clock, GeneratedUID lookup) | `k3sm/pkg/keystore::TestExclusiveHoldBound` | pending: the user-scope store |
 | U109 | with every audit append failing (a full disk), revocation deletes go ahead: the reconciler's `deliver-delete` and a socket `withdraw`, `rm` or `rotate` still act, their lines dropped and counted in memory and shown by `doctor`, while user mutations and reads stay refused | `k3sm/pkg/keystore/reconcile::TestRevocationDeleteProceedsOnAppendFailure` | pending: the KeyDelivery reconciler (lifecycle) |
 | U110 | when a second server registers at runtime, the next single-server check stops the listener, closing its connections, and each KeyDelivery gets `Ready=False` and `SecretRetained=True` with reason `UserScopeOff`; the delivered Secrets stay, nothing rotates or deletes them, and `doctor` says they must be deleted by hand | `k3sm/pkg/keystore/reconcile::TestSecondServerAtRuntimeStopsListenerAndReports` | pending: the KeyDelivery reconciler (lifecycle) |
@@ -3020,6 +3201,26 @@ carried by the unit rows.
 | U114 | `rm-scope` writes `keystore-removed-scopes.json` in the data root, root-owned, through the data-root descriptor rules, listing the removed scope's uid and bound GeneratedUID before it removes the scope; only a scope listed there counts as removed for the finalizer, and a plain `ErrScopeAbsent` stays non-definitive and keeps the finalizer (seam: euid source) | `k3sm/cmd/k3sm::TestRmScopeRecordsRemovedScope`, `k3sm/pkg/keystore/reconcile::TestOnlyRecordedRemovalCountsAsWithdrawn` | pending: the KeyDelivery reconciler (lifecycle) |
 | U115 | `rm-scope` names each blocking binding, a RoleBinding with its namespace; `--remove-bindings` deletes each listed binding through the admin client before anything else changes, and a failed delete stops the verb, changing nothing further | `k3sm/cmd/k3sm::TestRmScopeNamesBindingsAndRemovesThem` | pending: the KeyDelivery reconciler (lifecycle) |
 | U116 | the Pod uid refusal applies to native Pods only: a vm Pod with `runAsUser: 1000` is allowed, since a guest uid has no host meaning, while a native Pod with the same drop target is refused | `runtimed/pkg/runtime::TestVMPodGuestUIDNotRefused` | pending: runtimed's sandbox change |
+| U118 | the old log is never service-user-owned while unflagged (integration, a root-run row: `--root`): in `audit --rotate` and `floor --rebuild` the step that clears `sappnd` on the old file, and on each archive rotate shifts, also `fchown`s it to root and `fchmod`s it 0600 on the verb's descriptor; the service user's `open(O_WRONLY\|O_TRUNC)` of each, between the clear and the re-flag, gets EACCES and changes no byte | `k3sm/cmd/k3sm::TestMaintenanceOldFileRootOwnedWhileUnflagged` (integration, root-run) | pending: the append-only files |
+| U119 | the floor lock is `keystore-lock`, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root (`put`, `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise of `list` and `show`, `rm-scope`, `floor --rebuild`, `audit --rotate`); run as root (a root-run row, `--root`), a non-root process holding the old data-root flock blocks none of them | `k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb` (integration, root-run) | pending: the append-only files |
+| U120 | the activated listening descriptor reaches no child (integration): the server spawns each child type, an `exec.Command` child, the runtimed helper and a Pod through the exec shim, lists each one's open descriptors, and the listening socket is among none of them | `k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild` (integration) | pending: the socket listener |
+| U121 | under activation, a client whose connected peer reads as uid 0 or as launchd's code refuses and writes nothing; U36 is never relaxed to accept uid 0, and if K7a finds the client-side peer names launchd the self-bind form ships (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer` | pending: the socket listener |
+| U122 | when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup | `k3sm/pkg/provider::TestPodProfileDeniesLaunchdSocketActivation`; rig leg E27 | pending: the socket listener |
+| U123 | same-target cross-record deletion: the orphan sweep, a lost-authority delete and `rm-scope` never delete a Secret that another honoured record claims at the same `(namespace, secretName)`; a forged owner annotation naming one uid's tombstone on another uid's live Secret deletes nothing; the owner annotation never selects which record's tombstone governs a delete; nothing is charged to the victim | `k3sm/pkg/keystore/reconcile::TestForgedTombstoneAnnotationOnOtherUsersLiveSecretIsNotDeleted` | pending: the KeyDelivery reconciler (lifecycle) |
+| U124 | a tombstone is pruned when its target is not this UID's owned Secret on two observations at least 60 s apart, not only on a Get that answers not found: a target occupied by another Secret still prunes; a failed Get keeps it | `k3sm/pkg/keystore/reconcile::TestTombstonePrunesWhenTargetOccupied` | pending: the KeyDelivery reconciler (lifecycle) |
+| U125 | every reconciler Secret delete or update and every `rm-scope` delete passes `Preconditions{UID, ResourceVersion}` from the ownership read: a fake client swaps the Secret between the read and the delete, the delete is refused, and the outcome is `Indeterminate` | `k3sm/pkg/keystore/reconcile::TestDeleteRefusedWhenSecretSwappedAfterRead` | pending: the KeyDelivery reconciler (lifecycle) |
+| U126 | the reconciler budget is split by source, 384 KiB for forged-Secret lines, 384 KiB for repairs, 256 KiB for pre-frame refusals, the forged and repair parts capped at 64 KiB per namespace; one source or one namespace spending its part leaves every other part whole; the dropped count is persisted in the next summary line written for that source, not kept only in memory | `k3sm/pkg/keystore/reconcile::TestReconcilerBudgetSplitBySource`, `TestDroppedCountPersistedInNextSummary` | pending: the KeyDelivery reconciler (lifecycle) |
+| U127 | `ErrScopeOwnerChanged` is Indeterminate plus a `doctor` report, not a deleting outcome, until a K7a amendment records GeneratedUID stability across Migration Assistant, a macOS upgrade and a directory rebind: no Secret is deleted on it, however many spaced observations see it, and `doctor` names the scope (seam: GeneratedUID lookup) | `k3sm/pkg/keystore/reconcile::TestScopeOwnerChangedIsIndeterminate`, `k3sm/cmd/k3sm::TestDoctorReportsOwnerChangedScope` | pending: the user-scope store |
+| U128 | Rewrap of each `scope.key`, and every root write under `server/keystore/`, walks by descriptor (integration, a root-run row: `--root`): a planted symlink, FIFO or swapped directory under `.user/` refuses Rewrap and changes no record | `k3sm/pkg/keystore::TestRewrapWalksScopeKeysByDescriptor` (integration, root-run) | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U129 | `floor --rebuild` reads every scope whose `scope.key` opens under `W` without the GeneratedUID check: a departed account (`ErrScopeOwnerUnknown`) and an owner change each get their lines and block nothing (seam: GeneratedUID lookup) | `k3sm/cmd/k3sm::TestRebuildReadsScopeWithoutOwnerCheck` | pending: the user-scope store |
+| U130 | a scope listed in `keystore-removed-scopes.json` for its bound GeneratedUID is definitive for claims, so its stale objects lose their claim; `rm-scope` deletes that scope's KeyDeliveries, each by its recorded namespace and name with a UID precondition | `k3sm/pkg/keystore/reconcile::TestRemovedScopeLosesClaim`, `k3sm/cmd/k3sm::TestRmScopeDeletesScopeKeyDeliveries` | pending: the KeyDelivery reconciler (lifecycle) |
+| U131 | the listener refuses to start on a data root mounted with `MNT_IGNORE_OWNERSHIP`, read with `fstatfs` on the data-root descriptor | `k3sm/pkg/keystore/socket::TestStartRefusesIgnoreOwnershipMount` | pending: the socket listener |
+| U132 | `.user/<uid>/` is 0700 and `scope.key` and `deliveries` are 0600, all the service user's; a scope whose directory or files have another owner or a wider mode is refused | `k3sm/pkg/keystore::TestUserScopeFileModes` | pending: the user-scope store |
+| U133 | `keystore-removed-scopes.json` is root-owned 0644, under the `keystore-` prefix the Pod denies cover; a file that is not root's or is group- or other-writable is refused, and the parse is strict (an unknown field, a duplicate uid or trailing data refuses it, and a refused file counts as no listing) | `k3sm/cmd/k3sm::TestRemovedScopesFileRootOwnedAndMode`, `TestRemovedScopesFileStrictParse` | pending: the KeyDelivery reconciler (lifecycle) |
+| U134 | the reconciler's store interface reads a value only for an authorised delivery: its value read takes the authorisation the checks produced, and no other method returns a value | `k3sm/pkg/keystore/reconcile::TestStoreInterfaceReadsValueOnlyForAuthorisedDelivery` | pending: the KeyDelivery reconciler (lifecycle) |
+| U135 | the KeyDelivery admission policy's `failurePolicy` is `Fail`, and the namespace-controller exemption admits DELETE only: the namespace controller's UPDATE of another author's object is refused | `k3sm/pkg/policy::TestKeyDeliveryVAPFailurePolicyFail`, `TestNamespaceControllerExemptOnlyForDelete` | pending: KeyDelivery authoring |
+| U136 | every root verb and `doctor` line that prints annotation text strips control characters first: an owner or entry annotation carrying terminal escapes prints without them | `k3sm/cmd/k3sm::TestRootVerbsStripAnnotationControlChars` | pending: the socket operations, the KeyDelivery reconciler (lifecycle) |
+| U137 | the listener refuses a sandboxed peer before the first frame: it calls `sandbox_check` on the peer's audit token through the peer-sandbox source, a constructor parameter that refuses nil, so a Pod process is refused whatever its uid (seam: peer-sandbox source) | `k3sm/pkg/keystore/socket::TestListenerRefusesSandboxedPeer`; rig leg E26 | pending: the socket listener |
 
 ### Rig legs
 
@@ -3062,6 +3263,8 @@ E20 attended.
 | E23 | against the real authorizer: an admin binds, for `k3sm:local:<uid>` in `ks-e2e-3`, `k3sm:keystore-delivery-author` and a Role with `create` on `secrets` and `update` and `delete` on `secrets` with `resourceNames: [e2e-named]`; the user delivers `user/<uid>/e2e-token` as `e2e-named`, then as `e2e-other`; then an admin, impersonating another principal (`kubectl --as k3sm-e2e-other`, bound to the built-in `edit` ClusterRole in `ks-e2e-3`), deletes `e2e-named`'s KeyDelivery and, separately, patches its finalizer away | `e2e-named`: `Ready`, `Delivered`; `e2e-other`: `Authorized=False`, `NotAuthorized`, no Secret: the reconciler allows exactly what the API server allows the user; the other principal's delete and finalizer patch are each refused at admission, and the object, its finalizer and the Secret stay | yes | the KeyDelivery reconciler (authority): `e2e-other` is delivered, or `e2e-named` is refused; KeyDelivery authoring: another principal deletes the object or strips its finalizer |
 | E24 | first, with the server running, the operator, as the service user (`sudo -u _k3sm`), runs a program that is not k3sm and tries to unlink `keystore-sock/keys.sock` and to bind a socket at that path; then, with the listener stopped by the maintenance marker, a native Pod execs the real installed `/Library/k3sm/k3sm` and that process tries the same bind; in the deny-plus-pin fallback only, the service-user program binds `keys.sock` while the listener is stopped and the user runs `k3sm keys list` and `k3sm keys put user/<me>/e2e-pin` | the service-user unlink and bind each fail with `EACCES` and `keys.sock` is still launchd's; the bind from the Pod gets `EPERM` and no socket appears; in the fallback, the CLI refuses each before writing a frame, naming the server pin, and the stand-in receives no bytes past the connect; after the marker goes, the real server is accepted | yes | the root-owned socket directory (U104): the service-user program replaces `keys.sock`; the server pin (U69): the CLI talks to the stand-in; the Pod bind deny (U16): the installed binary in a Pod binds `keys.sock` |
 | E25 | (helper variant only) a native Pod tries `connect(2)` to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an `append` | `EPERM` for the Pod; the helper refuses the user by uid and the program by the pin, and no line is appended | yes | the helper pin (U70): a line from an unpinned peer is appended |
+| E26 | a native Pod on a test build whose Pod profile omits the keystore deny stanza (restored at the end) tries `connect(2)` to `keys.sock` | the listener refuses the connection before any frame, since the peer is sandboxed, and writes a `refused` line | yes | the sandboxed-peer refusal (U137): the Pod's connection reaches the frame reader |
+| E27 | a native Pod calls `launch_activate_socket` for the server's socket name | no descriptor is returned, and nothing in the Pod can accept on `keys.sock` | yes | the launchd lookup deny (U122): the Pod obtains the server's listener |
 
 ## Open questions
 
