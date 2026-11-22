@@ -75,6 +75,9 @@ func fdHasACL(fd int) (bool, error) {
 		Commonattr:  unix.ATTR_CMN_RETURNED_ATTRS | unix.ATTR_CMN_EXTENDED_SECURITY,
 	}
 	buf := make([]byte, aclReplySize)
+	// x/sys/unix wraps no fgetattrlist; Syscall6 reaches it through libc's
+	// syscall(2) entry, which is the path the deprecation names.
+	//lint:ignore SA1019 x/sys/unix has no fgetattrlist wrapper, and this package uses no cgo.
 	_, _, errno := unix.Syscall6(unix.SYS_FGETATTRLIST, uintptr(fd), uintptr(unsafe.Pointer(&al)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), fsoptPackInvalAttrs, 0)
 	if errno != 0 {
 		return false, errno
