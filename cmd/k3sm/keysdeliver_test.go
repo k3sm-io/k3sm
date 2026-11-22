@@ -313,3 +313,34 @@ func TestKeysRmWarnsDeclared(t *testing.T) {
 		t.Fatalf("rm of an undeclared entry warned: %s", h.stderr.String())
 	}
 }
+
+// TestKeysDeliveryPrintsNoValue: the delivery verbs, and rm of a declared
+// entry, print no stored value on stdout or stderr, with encryption on or
+// off.
+func TestKeysDeliveryPrintsNoValue(t *testing.T) {
+	h := newKeysHarness(t)
+	value := []byte("delivery-cli-secret-value")
+	h.put("system/api-token", value)
+	var out strings.Builder
+	runs := [][]string{
+		{"deliver", "system/api-token", "--namespace", "payments"},
+		{"deliver", "system/api-token", "--namespace", "payments", "--data-key", "token"},
+		{"undeliver", "system/api-token", "--namespace", "payments"},
+		{"undeliver", "system/api-token", "--namespace", "payments"},
+		{"deliver", "system/api-token", "--namespace", "Bad_NS"},
+		{"deliver", "system/api-token", "--namespace", "ops"},
+		{"rm", "system/api-token", "--yes"},
+	}
+	for i, args := range runs {
+		h.encryptionOff = i%2 == 1
+		h.run(args...)
+		out.WriteString(h.stdout.String())
+		out.WriteString(h.stderr.String())
+	}
+	if !strings.Contains(out.String(), "still declared for delivery") {
+		t.Fatalf("the runs did not reach rm's warning:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), string(value)) {
+		t.Fatalf("a delivery verb printed the value:\n%s", out.String())
+	}
+}

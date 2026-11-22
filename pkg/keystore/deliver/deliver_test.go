@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -1043,5 +1044,60 @@ func TestNewDefaultsBindRoot(t *testing.T) {
 	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || (cerr == nil && st.Uid != 0) {
 		t.Fatalf("New's default chown succeeded without making the file root's (%v)", cerr)
+	}
+}
+
+// TestReconcilerLogsNoValue: across a full sweep history (create, update on
+// rotation, drift, and failing get, create and update calls) no stored value appears in the log, raw, base64 or hex (G20).
+func TestReconcilerLogsNoValue(t *testing.T) {
+	h := newHarness(t, true, false)
+	values := [][]byte{[]byte("first-stored-value"), []byte("second-stored-value"), []byte("drifted-hand-value"), []byte("third-stored-value")}
+	h.store.set("api-token", 1, values[0])
+	h.store.set("other", 1, values[0])
+	h.declare(t, Target{Name: "api-token", Namespace: "payments"}, Target{Name: "other", Namespace: "failing"})
+	failing := true
+	for _, verb := range []string{"get", "create", "update"} {
+		h.client.PrependReactor(verb, "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			if failing && a.GetNamespace() == "failing" {
+				return true, nil, apierrors.NewInternalError(errors.New(a.GetVerb() + " refused"))
+			}
+			return false, nil, nil
+		})
+	}
+	ctx := context.Background()
+	h.r.Sweep(ctx) // create; the failing target's get fails
+	failing = false
+	h.client.PrependReactor("create", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if a.GetNamespace() == "failing" {
+			return true, nil, apierrors.NewInternalError(errors.New("create refused"))
+		}
+		return false, nil, nil
+	})
+	h.r.Sweep(ctx) // the failing target's create fails
+	h.store.set("api-token", 2, values[1])
+	h.r.Sweep(ctx) // update on rotation
+	s := h.secret(t, "payments", "api-token")
+	s.Data[DefaultDataKey] = values[2]
+	if _, err := h.client.CoreV1().Secrets("payments").Update(ctx, s, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h.r.Sweep(ctx) // drift
+	h.client.PrependReactor("update", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInternalError(errors.New("update refused"))
+	})
+	h.store.set("api-token", 3, values[3])
+	h.r.Sweep(ctx) // the update fails
+	logs := h.logs.String()
+	for _, want := range []string{"delivered", "re-delivered", "drifted", "cannot read the Secret", "cannot create the Secret", "cannot update the Secret"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("the sweep history did not reach %q\n%s", want, logs)
+		}
+	}
+	for _, v := range values {
+		for _, form := range []string{string(v), hex.EncodeToString(v), base64.StdEncoding.EncodeToString(v), fmt.Sprint(v)} {
+			if strings.Contains(logs, form) {
+				t.Fatalf("the log carries a stored value (%q)\n%s", form, logs)
+			}
+		}
 	}
 }
