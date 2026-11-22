@@ -26,6 +26,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"os"
@@ -218,6 +219,83 @@ func TestSSHAuthorizedKeyComment(t *testing.T) {
 	}
 }
 
+// opensshKey is an OpenSSH private-key file built field by field
+// (openssh-key-v1, PROTOCOL.key), so a test can make the malformed shapes no
+// encoder writes. Each of keys is a seed; check2 is XORed into the second
+// check int; pad replaces the padding when it is not nil.
+type opensshKey struct {
+	cipher, kdf string
+	kdfOpts     []byte
+	keys        [][32]byte
+	check2      uint32
+	comment     string
+	pad         []byte
+}
+
+// pem returns k encoded, the PEM header built from the block type rather
+// than written out, so no private-key header is a literal in the source.
+func (k opensshKey) pem() []byte {
+	str := func(b []byte) []byte { return append(binary.BigEndian.AppendUint32(nil, uint32(len(b))), b...) }
+	u32 := func(v uint32) []byte { return binary.BigEndian.AppendUint32(nil, v) }
+	var pub, priv []byte
+	priv = append(priv, u32(0x5eed1234)...)
+	priv = append(priv, u32(0x5eed1234^k.check2)...)
+	for _, seed := range k.keys {
+		sk := ed25519.NewKeyFromSeed(seed[:])
+		pk := sk.Public().(ed25519.PublicKey)
+		blob := append(str([]byte(ssh.KeyAlgoED25519)), str(pk)...)
+		pub = append(pub, str(blob)...)
+		priv = append(priv, str([]byte(ssh.KeyAlgoED25519))...)
+		priv = append(priv, str(pk)...)
+		priv = append(priv, str(sk)...)
+		priv = append(priv, str([]byte(k.comment))...)
+	}
+	pad := k.pad
+	if pad == nil {
+		for i := 1; (len(priv)+len(pad))%8 != 0; i++ {
+			pad = append(pad, byte(i))
+		}
+	}
+	priv = append(priv, pad...)
+	body := []byte("openssh-key-v1\x00")
+	body = append(body, str([]byte(k.cipher))...)
+	body = append(body, str([]byte(k.kdf))...)
+	body = append(body, str(k.kdfOpts)...)
+	body = append(body, u32(uint32(len(k.keys)))...)
+	body = append(body, pub...)
+	body = append(body, str(priv)...)
+	return pem.EncodeToMemory(&pem.Block{Type: openSSHBlockType, Bytes: body})
+}
+
+// malformedSSH are the shapes ImportSSH must refuse, built in the test.
+func malformedSSH() map[string][]byte {
+	one := [][32]byte{fixtureSeed}
+	return map[string][]byte{
+		"two keys in one file":    opensshKey{cipher: "none", kdf: "none", keys: [][32]byte{fixtureSeed, sha256.Sum256([]byte("second"))}}.pem(),
+		"mismatched check ints":   opensshKey{cipher: "none", kdf: "none", keys: one, check2: 1}.pem(),
+		"kdf bcrypt, cipher none": opensshKey{cipher: "none", kdf: "bcrypt", kdfOpts: append(binary.BigEndian.AppendUint32(nil, 16), make([]byte, 20)...), keys: one}.pem(),
+		"bad padding":             opensshKey{cipher: "none", kdf: "none", keys: one, pad: []byte{1, 2, 4, 4, 5, 6, 7}}.pem(),
+		"no keys":                 opensshKey{cipher: "none", kdf: "none"}.pem(),
+	}
+}
+
+// TestSSHImportRefusesMalformed: each malformed shape is refused with the
+// one fixed reason, and the builder itself is sound: its well-formed key,
+// with an oversized comment, imports as the seed (the comment is not
+// imported).
+func TestSSHImportRefusesMalformed(t *testing.T) {
+	for name, b := range malformedSSH() {
+		if _, err := ImportSSH(b); err != errSSHRefused {
+			t.Errorf("%s: %v, want the fixed refusal", name, err)
+		}
+	}
+	good := opensshKey{cipher: "none", kdf: "none", keys: [][32]byte{fixtureSeed}, comment: strings.Repeat("c", 4*MaxComment)}.pem()
+	seed, err := ImportSSH(good)
+	if err != nil || !bytes.Equal(seed, fixtureSeed[:]) {
+		t.Fatalf("the builder's well-formed key with an oversized comment: %x, %v", seed, err)
+	}
+}
+
 // FuzzSSHImport: the import never panics, refuses with the one fixed reason
 // (so no input byte reaches a message), and what it accepts is a seed whose
 // key round-trips through OpenSSH's encoding to the same seed.
@@ -226,6 +304,10 @@ func FuzzSSHImport(f *testing.F) {
 	for _, b := range [][]byte{ed, encrypted, rsaKey, ecdsaKey, readSSH(f, "ed25519-cert.pub")} {
 		f.Add(b)
 	}
+	for _, b := range malformedSSH() {
+		f.Add(b)
+	}
+	f.Add(opensshKey{cipher: "none", kdf: "none", keys: [][32]byte{fixtureSeed}, comment: strings.Repeat("c", 4*MaxComment)}.pem())
 	f.Fuzz(func(t *testing.T, b []byte) {
 		seed, err := ImportSSH(b)
 		if err != nil {
