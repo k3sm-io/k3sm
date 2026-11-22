@@ -3655,6 +3655,14 @@ Two observers; the server holds the durable record.
 - **Who holds the refresh token:** only the keystore, sealed under the owner's scope key. Only the
   refresher reads it, through the opener, in the server process, as the service user. It never
   reaches the socket, a Secret, `exec`, `show`, a log, an Event or an audit line.
+- **The owner is fixed per entry**, like the kind. `rotate`, `RotateIf` and the refresher's
+  write refuse a pair naming another owner with `ErrRefreshOwnerFixed`, which the socket answers
+  as `invalid-value` (the wire set does not grow); `local` to `server/<p>`, `server/<p>` to
+  `local` and one profile to another are all refused. `rotate --from-version` is refused for
+  `oauth` before any owner is compared. Changing owner is `rm` and `put` again, so a rotation can
+  neither hand a `local` pair to the server nor take a `server/` pair away from it. `pkg/keystore`
+  names the error itself rather than reusing `ErrKindMismatch`, whose text tells the operator the
+  entry holds another kind.
 - **A pod is never a refresh owner in this release.** Pods cannot reach the socket, and a
   pod-reachable write endpoint is deferred.
 - **No exec hooks.** The only refresh procedure built in is RFC 6749 §6, the `refresh_token`
@@ -4269,7 +4277,7 @@ carried by the unit rows.
 | U147 | token needs `expiresAt`; oauth needs access token, access expiry, refresh token and an owner in the grammar | `k3sm/pkg/keystore::TestTypedPutValidation` | checked: the typed store |
 | U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH`, `k3sm/pkg/keystore::TestStoreGenerateSSHUsesRandomSeam` | checked: the typed envelope and the typed store |
 | U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential` | partial: every exported method of `pkg/keystore` and the typed reads checked (the typed store); pending: the consumer interfaces and `internal/refreshopen`'s import graph, `TestRefreshOpenerImportGraph` (the refresher) |
-| U150 | `RotateIf` refuses a stale version, and a version read from an entry since deleted and put again | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused`, `TestRotateIfRefusesRecreatedEntry` | checked: the typed store |
+| U150 | `RotateIf` refuses a stale version, and a version read from an entry since deleted and put again; a rotation never changes an oauth entry's refresh owner | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused`, `TestRotateIfRefusesRecreatedEntry`, `TestRefreshOwnerFixedPerEntry` | checked: the typed store |
 | U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test) | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep` | checked: the typed store |
 | U152 | a pruned oauth entry: List shows it healthy, Rewrap re-seals `low..current`, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught | `k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt`, `TestRewrapHandlesPrunedOAuth`, `TestDeletePrunedOAuthEntry`, `TestGapInsideCommittedRangeIsCorrupt`, `TestCopyBackAcrossPruneCaught` | checked: the typed store |
 | U153 | `--from-version` is refused for oauth | `k3sm/pkg/keystore::TestFromVersionRefusedForOAuth` | checked: the typed store |

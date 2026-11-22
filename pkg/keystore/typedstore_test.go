@@ -691,3 +691,39 @@ func TestFromVersionRefusedForOAuth(t *testing.T) {
 		t.Fatalf("RotateFrom an uncommitted version: %v", err)
 	}
 }
+
+// TestRefreshOwnerFixedPerEntry: an oauth entry's refresh owner is fixed
+// when it is put. RotateCredential and RotateIf refuse an envelope naming
+// another owner, in both directions, with ErrRefreshOwnerFixed, and write
+// nothing. RotateFrom is refused for oauth before any owner is compared.
+func TestRefreshOwnerFixedPerEntry(t *testing.T) {
+	ctx := context.Background()
+	owned := func(access, owner string) typed.Envelope {
+		e := oauthEnvelope(access, "r-"+access)
+		e.Credential.RefreshOwner = owner
+		return e
+	}
+	for _, flip := range [][2]string{{"local", "server/x"}, {"server/x", "local"}, {"server/x", "server/y"}} {
+		t.Run(flip[0]+" to "+flip[1], func(t *testing.T) {
+			s, _ := newTypedStore(t)
+			mustPutCredential(t, s, "pair", KindOAuth, owned("a1", flip[0]))
+			read, _ := mustCredential(t, s, "pair")
+			if _, err := s.RotateCredential(ctx, "pair", KindOAuth, owned("a2", flip[1])); !errors.Is(err, ErrRefreshOwnerFixed) {
+				t.Errorf("RotateCredential to owner %s: %v, want ErrRefreshOwnerFixed", flip[1], err)
+			}
+			if _, err := s.RotateIf(ctx, "pair", KindOAuth, read, owned("a2", flip[1])); !errors.Is(err, ErrRefreshOwnerFixed) {
+				t.Errorf("RotateIf to owner %s: %v, want ErrRefreshOwnerFixed", flip[1], err)
+			}
+			if v, c := mustCredential(t, s, "pair"); v.Version != 1 || c.RefreshOwner != flip[0] {
+				t.Fatalf("a refused owner change wrote: %+v %q", v, c.RefreshOwner)
+			}
+			if _, err := s.RotateFrom(ctx, "pair", 1); !errors.Is(err, ErrFromVersionOAuth) {
+				t.Errorf("RotateFrom: %v, want ErrFromVersionOAuth", err)
+			}
+			// The same owner still rotates.
+			if v, err := s.RotateIf(ctx, "pair", KindOAuth, read, owned("a2", flip[0])); err != nil || v.Version != 2 {
+				t.Fatalf("RotateIf keeping owner %s: %+v, %v", flip[0], v, err)
+			}
+		})
+	}
+}

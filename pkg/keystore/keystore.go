@@ -204,6 +204,12 @@ var (
 	// entry was deleted and put again since the expected version was read,
 	// or the expected Version was not read from the store.
 	ErrVersionStale = errors.New("the keystore entry's current version is not the one expected: another write came first; read it again")
+	// ErrRefreshOwnerFixed reports a rotation of an oauth entry whose new
+	// pair names another refresh owner: the owner is fixed when the entry
+	// is put, so the server never starts or stops refreshing a pair because
+	// a rotation said so. Changing owner means rm and put again. The socket
+	// answers it as invalid-value.
+	ErrRefreshOwnerFixed = errors.New("the oauth entry's refresh owner is fixed when it is put: a rotation must name the same owner; to change it, rm the entry and put it again")
 	// ErrFromVersionOAuth reports a rotate from an earlier version of an
 	// oauth entry: resurrecting a rotated refresh token can trip the
 	// provider's reuse detection and revoke the whole grant.

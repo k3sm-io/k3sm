@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	"k3sm.io/apis/keystore/credential"
 	"k3sm.io/k3sm/pkg/keystore/typed"
 )
 
@@ -87,7 +88,8 @@ func (s *FileStore) GenerateSSH(ctx context.Context, name, comment string) (Vers
 
 // RotateCredential writes e as the next version of the typed entry name,
 // stamping its issue time as PutCredential does. kind must be the entry's
-// (ErrKindMismatch otherwise). An oauth entry keeps its current version and
+// (ErrKindMismatch otherwise), and an oauth envelope must name the entry's
+// refresh owner (ErrRefreshOwnerFixed otherwise). An oauth entry keeps its current version and
 // one previous: the rotation records the oldest retained version in the
 // pointer and unlinks the versions below it.
 func (s *FileStore) RotateCredential(ctx context.Context, name string, kind Kind, e typed.Envelope) (Version, error) {
@@ -115,12 +117,17 @@ func (s *FileStore) rotateCredential(ctx context.Context, name string, kind Kind
 		if _, err := s.envelope(kind, e); err != nil {
 			return Version{}, err
 		}
-		return s.rotate(ctx, name, func(_ *entry, _ keys, old Version) ([]byte, error) {
+		return s.rotate(ctx, name, func(en *entry, k keys, old Version) ([]byte, error) {
 			if old.Kind != kind {
 				return nil, fmt.Errorf("%w: %s is %s, not %s", ErrKindMismatch, name, old.Kind, kind)
 			}
 			if read != nil && (old.Version != read.Version || old.identity != read.identity) {
 				return nil, fmt.Errorf("%w: the current version is not the one read (version %d is current, version %d was read)", ErrVersionStale, old.Version, read.Version)
+			}
+			if kind == KindOAuth {
+				if err := sameRefreshOwner(en, k, old, e.Credential.RefreshOwner); err != nil {
+					return nil, err
+				}
 			}
 			return s.envelope(kind, e)
 		})
@@ -131,9 +138,31 @@ func (s *FileStore) rotateCredential(ctx context.Context, name string, kind Kind
 	return v, nil
 }
 
+// sameRefreshOwner refuses, with ErrRefreshOwnerFixed, an oauth rotation
+// whose envelope names a refresh owner other than old's, the current version
+// of en: the owner is fixed when the entry is put.
+func sameRefreshOwner(en *entry, k keys, old Version, owner string) error {
+	_, val, err := en.version(k, old.Version)
+	defer clear(val)
+	if err != nil {
+		return err
+	}
+	env, err := typed.Decode(credential.KindOAuth, val)
+	clear(env.RefreshToken)
+	if err != nil {
+		return fmt.Errorf("%w: version %d: %w", ErrCorrupt, old.Version, err)
+	}
+	if env.Credential.RefreshOwner != owner {
+		return fmt.Errorf("%w: the entry's refresh owner is %s, not %s", ErrRefreshOwnerFixed, env.Credential.RefreshOwner, owner)
+	}
+	return nil
+}
+
 // RotateFrom writes the value of version from of name as its next version:
 // the rollback rotate --from-version names. It is refused for oauth with
-// ErrFromVersionOAuth: a rotated refresh token is never written back. A
+// ErrFromVersionOAuth: a rotated refresh token is never written back. Only
+// an oauth entry has a refresh owner, so that refusal also keeps RotateFrom
+// from changing one. A
 // typed value keeps the issue time it was sealed with.
 func (s *FileStore) RotateFrom(ctx context.Context, name string, from uint64) (Version, error) {
 	v, err := s.rotate(ctx, name, func(e *entry, k keys, old Version) ([]byte, error) {
