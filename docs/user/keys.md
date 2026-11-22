@@ -59,7 +59,7 @@ name.
 | `sudo k3sm keys rm system/NAME --yes` | Deletes the entry and every version. This cannot be undone, so it needs `--yes`. It also removes an entry `list` reports as corrupt. |
 | `sudo k3sm keys rewrap --key-out FILE` | Re-seals every entry under a new master key (see [Changing the master key](#changing-the-master-key)). |
 | `sudo k3sm keys deliver system/NAME --namespace NS` | Declares that the server delivers the entry's current version into the cluster as a Secret (see [Delivering an entry as a Secret](#delivering-an-entry-as-a-secret)). |
-| `sudo k3sm keys undeliver system/NAME --namespace NS` | Withdraws that declaration. The Secret stays. |
+| `sudo k3sm keys undeliver system/NAME --namespace NS [--secret S]` | Withdraws that declaration. The Secret stays. |
 
 `--work-dir DIR` points every verb at a server work dir other than the default
 `/var/lib/k3sm/server`. The data root is its parent.
@@ -175,13 +175,13 @@ goes into which Secret:
 
 ```
 sudo k3sm keys deliver system/signer-key --namespace payments
-sudo k3sm keys deliver system/signer-key --namespace payments --secret-name signer --data-key private.key
+sudo k3sm keys deliver system/signer-key --namespace payments --secret signer --data-key private.key
 ```
 
 The server then keeps an `Opaque` Secret in that namespace holding the entry's current version.
-The Secret is named after the entry unless you pass `--secret-name`, and the value is under the
-data key `value` unless you pass `--data-key`. An `ed25519` entry is delivered as the stored
-32-byte seed or 64-byte key, with no PEM wrapping. The entry must exist when you run `deliver`.
+The Secret is named after the entry, without `system/`, unless you pass `--secret`, and the
+value is under the data key `value` unless you pass `--data-key`. An `ed25519` entry is
+delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The entry must exist when you run `deliver`.
 
 - **Rotation reaches the Secret.** After a `rotate`, the server updates the Secret within a
   minute. The Secret's `k3sm.io/keystore-version` annotation says which version it holds.
@@ -197,9 +197,9 @@ data key `value` unless you pass `--data-key`. An `ed25519` entry is delivered a
   Anyone who can write Secrets in the namespace can set the label, so the label alone does not
   count: a Secret of that name that someone else created first, or that was deleted and created
   again, is "not created by this server". The server leaves it alone and logs why: delete it, or
-  pick another `--secret-name`. The server never lists Secrets and never deletes one.
+  pick another `--secret`. The server never lists Secrets and never deletes one.
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
-  declaration, and prints: the Secret stays; delete it with kubectl, and rotate the entry to
+  declaration (with `--secret S`, only the one into Secret `S`), and prints: the Secret stays; delete it with kubectl, and rotate the entry to
   revoke. A Pod that read the value still has it, which is why revoking it means rotating.
 - **Deleting a delivered entry.** `rm` does not withdraw its deliveries. For each one still
   declared, it warns: still declared for delivery to `<namespace>/<secret>`; the Secret keeps its

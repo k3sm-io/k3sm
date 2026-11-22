@@ -253,7 +253,7 @@ func TestDeliveryRefusedWhileEncryptionOff(t *testing.T) {
 	h := newHarness(t, false, false)
 	h.store.set("api-token", 1, []byte("tok"))
 	h.store.set("signer", 1, []byte("sig"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"}, Target{Name: "signer", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"}, Target{Entry: "system/signer", Namespace: "payments"})
 	ctx := context.Background()
 	for range 3 {
 		h.r.Sweep(ctx)
@@ -278,7 +278,7 @@ func TestDeliveryRefusedWhileEncryptionOff(t *testing.T) {
 func TestDeliveryOverrideAllowsPlaintext(t *testing.T) {
 	h := newHarness(t, false, true)
 	h.store.set("api-token", 2, []byte("tok"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	h.r.Sweep(context.Background())
 	s := h.secret(t, "payments", "api-token")
 	if got := string(s.Data[DefaultDataKey]); got != "tok" {
@@ -295,7 +295,7 @@ func TestDeliveryOverrideAllowsPlaintext(t *testing.T) {
 func TestDeliveredTargetStaysWhenOverrideRemoved(t *testing.T) {
 	h := newHarness(t, false, true)
 	h.store.set("api-token", 1, []byte("tok"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	ctx := context.Background()
 	h.r.Sweep(ctx)
 	h.client.ClearActions()
@@ -317,7 +317,7 @@ func TestDeliveredTargetStaysWhenOverrideRemoved(t *testing.T) {
 // many targets) is refused whole: nothing reaches the apiserver, and the
 // refusal is logged once per file state (G19).
 func TestDeclarationRootOwned(t *testing.T) {
-	valid := `{"version":1,"targets":[{"name":"api-token","namespace":"payments"}]}`
+	valid := `{"version":1,"targets":[{"entry":"system/api-token","namespace":"payments"}]}`
 	many := func() string {
 		var b strings.Builder
 		b.WriteString(`{"version":1,"targets":[`)
@@ -325,7 +325,7 @@ func TestDeclarationRootOwned(t *testing.T) {
 			if i > 0 {
 				b.WriteString(",")
 			}
-			fmt.Fprintf(&b, `{"name":"e%d","namespace":"payments"}`, i)
+			fmt.Fprintf(&b, `{"entry":"system/e%d","namespace":"payments"}`, i)
 		}
 		b.WriteString("]}")
 		return b.String()
@@ -371,21 +371,21 @@ func TestDeclarationRootOwned(t *testing.T) {
 			h.writeRaw(t, []byte(valid+pad), 0o644)
 		}, false, "larger than"},
 		{"unknown field", func(t *testing.T, h *harness) {
-			h.writeRaw(t, []byte(`{"version":1,"targets":[{"name":"api-token","namespace":"payments","kind":"Role"}]}`), 0o644)
+			h.writeRaw(t, []byte(`{"version":1,"targets":[{"entry":"system/api-token","namespace":"payments","kind":"Role"}]}`), 0o644)
 		}, false, "unknown field"},
 		{"unknown top-level field", func(t *testing.T, h *harness) {
 			h.writeRaw(t, []byte(`{"version":1,"targets":[],"extra":true}`), 0o644)
 		}, false, "unknown field"},
 		{"wrong version", func(t *testing.T, h *harness) {
-			h.writeRaw(t, []byte(`{"version":2,"targets":[{"name":"api-token","namespace":"payments"}]}`), 0o644)
+			h.writeRaw(t, []byte(`{"version":2,"targets":[{"entry":"system/api-token","namespace":"payments"}]}`), 0o644)
 		}, false, "version 2"},
 		{"trailing data", func(t *testing.T, h *harness) { h.writeRaw(t, []byte(valid+valid), 0o644) }, false, "trailing data"},
 		{"too many targets", func(t *testing.T, h *harness) { h.writeRaw(t, []byte(many), 0o644) }, false, "the limit is"},
 		{"invalid namespace", func(t *testing.T, h *harness) {
-			h.writeRaw(t, []byte(`{"version":1,"targets":[{"name":"api-token","namespace":"Bad_NS"}]}`), 0o644)
+			h.writeRaw(t, []byte(`{"version":1,"targets":[{"entry":"system/api-token","namespace":"Bad_NS"}]}`), 0o644)
 		}, false, "namespace is not a valid"},
 		{"duplicate Secret", func(t *testing.T, h *harness) {
-			h.writeRaw(t, []byte(`{"version":1,"targets":[{"name":"a","namespace":"p","secretName":"s"},{"name":"b","namespace":"p","secretName":"s"}]}`), 0o644)
+			h.writeRaw(t, []byte(`{"version":1,"targets":[{"entry":"system/a","namespace":"p","secretName":"s"},{"entry":"system/b","namespace":"p","secretName":"s"}]}`), 0o644)
 		}, false, "the same Secret"},
 	}
 	for _, tc := range cases {
@@ -459,10 +459,10 @@ func TestReconcilerTouchesOnlyLabelledSecrets(t *testing.T) {
 	h.own(t, ours)
 	h.store.set("api-token", 2, []byte("new"))
 	h.declare(t,
-		Target{Name: "api-token", Namespace: "payments", SecretName: "plain"},
-		Target{Name: "api-token", Namespace: "payments", SecretName: "foreign"},
-		Target{Name: "api-token", Namespace: "payments", SecretName: "ours"},
-		Target{Name: "api-token", Namespace: "payments", SecretName: "fresh", DataKey: "token"},
+		Target{Entry: "system/api-token", Namespace: "payments", SecretName: "plain"},
+		Target{Entry: "system/api-token", Namespace: "payments", SecretName: "foreign"},
+		Target{Entry: "system/api-token", Namespace: "payments", SecretName: "ours"},
+		Target{Entry: "system/api-token", Namespace: "payments", SecretName: "fresh", DataKey: "token"},
 	)
 	ctx := context.Background()
 	h.r.Sweep(ctx)
@@ -516,7 +516,7 @@ func TestReconcilerTouchesOnlyLabelledSecrets(t *testing.T) {
 func TestReconcilerRedeliversOnRotation(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("one"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	ctx := context.Background()
 	h.r.Sweep(ctx)
 	h.store.set("api-token", 2, []byte("two"))
@@ -537,7 +537,7 @@ func TestReconcilerSkipsLabelledNonOpaque(t *testing.T) {
 	h := newHarness(t, true, false, tls)
 	h.own(t, tls)
 	h.store.set("api-token", 1, []byte("one"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	h.r.Sweep(context.Background())
 	for _, v := range h.verbs() {
 		if v != "get/secrets" {
@@ -558,9 +558,9 @@ func TestReconcilerContinuesAfterTargetFailure(t *testing.T) {
 	})
 	h.store.set("api-token", 1, []byte("tok"))
 	h.declare(t,
-		Target{Name: "api-token", Namespace: "broken"},
-		Target{Name: "missing", Namespace: "payments"},
-		Target{Name: "api-token", Namespace: "payments"},
+		Target{Entry: "system/api-token", Namespace: "broken"},
+		Target{Entry: "system/missing", Namespace: "payments"},
+		Target{Entry: "system/api-token", Namespace: "payments"},
 	)
 	h.r.Sweep(context.Background())
 	if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "tok" {
@@ -578,7 +578,7 @@ func TestReconcilerEd25519RawBytes(t *testing.T) {
 	h := newHarness(t, true, false)
 	seed := bytes.Repeat([]byte{0x42}, 32)
 	h.store.set("signer", 1, seed)
-	h.declare(t, Target{Name: "signer", Namespace: "payments", DataKey: "private.key"})
+	h.declare(t, Target{Entry: "system/signer", Namespace: "payments", DataKey: "private.key"})
 	h.r.Sweep(context.Background())
 	if got := h.secret(t, "payments", "signer").Data["private.key"]; !bytes.Equal(got, seed) {
 		t.Fatalf("data = %x, want the 32 stored bytes %x", got, seed)
@@ -591,7 +591,7 @@ func TestReconcilerEd25519RawBytes(t *testing.T) {
 func TestRunSweepsOnStartChangeAndInterval(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("tok"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	ticks := make(chan time.Time)
 	changes := make(chan struct{})
 	debounce := make(chan time.Time)
@@ -648,7 +648,7 @@ func TestRunSweepsOnStartChangeAndInterval(t *testing.T) {
 func TestRunWithoutWatchUsesInterval(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("tok"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	ticks := make(chan time.Time)
 	h.r.newTicker = func(time.Duration) (<-chan time.Time, func()) { return ticks, func() {} }
 	h.r.watch = func(string, string) (<-chan struct{}, func(), error) { return nil, nil, errors.New("no kqueue") }
@@ -672,17 +672,17 @@ func TestRunWithoutWatchUsesInterval(t *testing.T) {
 // Marshal; Upsert replaces by Secret and Remove withdraws by entry and
 // namespace.
 func TestDeclarationParseDefaults(t *testing.T) {
-	d, err := Parse([]byte(`{"version":1,"targets":[{"name":"signer-key","namespace":"payments"}]}`))
+	d, err := Parse([]byte(`{"version":1,"targets":[{"entry":"system/signer-key","namespace":"payments"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := d.Targets[0]; got.Secret() != "signer-key" || got.Key() != "value" {
 		t.Fatalf("defaults: secret %q key %q", got.Secret(), got.Key())
 	}
-	if d.Upsert(Target{Name: "other", Namespace: "payments", SecretName: "signer-key"}) != true {
+	if d.Upsert(Target{Entry: "system/other", Namespace: "payments", SecretName: "signer-key"}) != true {
 		t.Fatal("Upsert did not replace the target naming the same Secret")
 	}
-	d.Upsert(Target{Name: "signer-key", Namespace: "ops"})
+	d.Upsert(Target{Entry: "system/signer-key", Namespace: "ops"})
 	b, err := d.Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -691,10 +691,10 @@ func TestDeclarationParseDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal's output does not parse: %v\n%s", err, b)
 	}
-	if n := back.Remove("signer-key", "ops"); n != 1 || len(back.Targets) != 1 {
+	if n := back.Remove("system/signer-key", "ops", ""); n != 1 || len(back.Targets) != 1 {
 		t.Fatalf("Remove removed %d, left %d", n, len(back.Targets))
 	}
-	if _, err := Parse([]byte(`{"version":1,"targets":[{"name":"` + strings.Repeat("a", 64) + `","namespace":"p"}]}`)); err == nil {
+	if _, err := Parse([]byte(`{"version":1,"targets":[{"entry":"system/` + strings.Repeat("a", 64) + `","namespace":"p"}]}`)); err == nil {
 		t.Fatal("an entry name too long for a label value parsed")
 	}
 }
@@ -706,7 +706,7 @@ func TestWriteAtomic(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, FileName)
 	var chowned string
-	d := Declaration{Version: SchemaVersion, Targets: []Target{{Name: "a", Namespace: "p"}}}
+	d := Declaration{Version: SchemaVersion, Targets: []Target{{Entry: "system/a", Namespace: "p"}}}
 	if err := Write(path, d, testCheck, func(f *os.File) error { chowned = f.Name(); return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -738,7 +738,7 @@ func TestWriteAtomic(t *testing.T) {
 func TestReconcilerRedeliversAfterRmPut(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("one"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	ctx := context.Background()
 	h.r.Sweep(ctx)
 	h.store.set("api-token", 1, []byte("replaced"))
@@ -754,10 +754,10 @@ func TestReconcilerRedeliversAfterRmPut(t *testing.T) {
 func TestReconcilerReappliesChangedDataKey(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("tok"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments", DataKey: "old"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments", DataKey: "old"})
 	ctx := context.Background()
 	h.r.Sweep(ctx)
-	h.declare(t, Target{Name: "api-token", Namespace: "payments", DataKey: "new"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments", DataKey: "new"})
 	h.r.Sweep(ctx)
 	got := h.secret(t, "payments", "api-token").Data
 	if len(got) != 1 || string(got["new"]) != "tok" {
@@ -859,7 +859,7 @@ func TestReconcilerNeverWritesTenantPrecreated(t *testing.T) {
 	planted.UID = "tenant-1"
 	h := newHarness(t, true, false, planted)
 	h.store.set("api-token", 1, []byte("the-stored-value"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	ctx := context.Background()
 	h.r.Sweep(ctx)
 	h.r.Sweep(ctx)
@@ -881,7 +881,7 @@ func TestReconcilerNeverWritesTenantPrecreated(t *testing.T) {
 func TestReconcilerDoesNotAdoptRecreated(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("one"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	ctx := context.Background()
 	h.r.Sweep(ctx)
 	if err := h.client.CoreV1().Secrets("payments").Delete(ctx, "api-token", metav1.DeleteOptions{}); err != nil {
@@ -912,7 +912,7 @@ func TestReconcilerDoesNotAdoptRecreated(t *testing.T) {
 func TestReconcilerRecordsCreatedUID(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("one"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	ctx := context.Background()
 	h.r.Sweep(ctx)
 	statePath := filepath.Join(h.dir, "keystore-delivery-state.json")
@@ -944,7 +944,7 @@ func TestReconcilerRecordsCreatedUID(t *testing.T) {
 func TestReconcilerReappliesDrift(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("the-stored-value"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	ctx := context.Background()
 	h.r.Sweep(ctx)
 	edited := h.secret(t, "payments", "api-token")
@@ -973,7 +973,7 @@ func TestReconcilerReappliesDrift(t *testing.T) {
 func TestReconcilerImmutableOwned(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("one"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	ctx := context.Background()
 	h.r.Sweep(ctx)
 	s := h.secret(t, "payments", "api-token")
@@ -1004,7 +1004,7 @@ func TestReconcilerImmutableOwned(t *testing.T) {
 func TestNewDefaultsBindRoot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, FileName)
-	if err := os.WriteFile(path, []byte(`{"version":1,"targets":[{"name":"api-token","namespace":"payments"}]}`), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":1,"targets":[{"entry":"system/api-token","namespace":"payments"}]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if os.Geteuid() == 0 {
@@ -1046,7 +1046,7 @@ func TestReconcilerLogsNoValue(t *testing.T) {
 	values := [][]byte{[]byte("first-stored-value"), []byte("second-stored-value"), []byte("drifted-hand-value"), []byte("third-stored-value")}
 	h.store.set("api-token", 1, values[0])
 	h.store.set("other", 1, values[0])
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"}, Target{Name: "other", Namespace: "failing"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"}, Target{Entry: "system/other", Namespace: "failing"})
 	failing := true
 	for _, verb := range []string{"get", "create", "update"} {
 		h.client.PrependReactor(verb, "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
@@ -1133,7 +1133,7 @@ func (s hangingSecrets) Get(ctx context.Context, name string, opts metav1.GetOpt
 func TestReconcilerTargetTimeout(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("tok"))
-	h.declare(t, Target{Name: "api-token", Namespace: "hung"}, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "hung"}, Target{Entry: "system/api-token", Namespace: "payments"})
 	h.r.client = hangingClient{h.client, "hung"}
 	h.r.targetTimeout = time.Millisecond
 	h.r.Sweep(context.Background())
@@ -1276,7 +1276,7 @@ func TestStateStockInstallShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dataRoot, FileName)
-	if err := os.WriteFile(path, []byte(`{"version":1,"targets":[{"name":"api-token","namespace":"payments"}]}`), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":1,"targets":[{"entry":"system/api-token","namespace":"payments"}]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	h := newHarness(t, true, false)
@@ -1307,7 +1307,7 @@ func TestStateStockInstallShape(t *testing.T) {
 func TestStateFileOtherOwnerRefused(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("tok"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	h.own(t) // an empty state file, owned by the test user
 	other := uint32(os.Geteuid() + 1)
 	h.r.stateCheck = StateFileCheck(other)
@@ -1337,7 +1337,7 @@ func TestStateFileOtherOwnerRefused(t *testing.T) {
 func TestStateDirServiceUserOwner(t *testing.T) {
 	h := newHarness(t, true, false)
 	h.store.set("api-token", 1, []byte("tok"))
-	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
 	euid := uint32(os.Geteuid())
 	// The test user stands in for the service user owning the work dir;
 	// another uid stands in for the server's euid.
@@ -1368,4 +1368,52 @@ func mustStat(t *testing.T, path string) fs.FileInfo {
 		t.Fatal(err)
 	}
 	return fi
+}
+
+// TestDeclarationEntryField: a target names its entry scope-qualified, as
+// "entry": "system/<name>". A file in the old "name" shape is refused as an
+// unknown field, a user/ entry or an unqualified one is refused (a user entry
+// is a KeyDelivery's), the name after the prefix gets the keystore's name
+// check, and the file keeps the key order entry, namespace, secretName,
+// dataKey (G19).
+func TestDeclarationEntryField(t *testing.T) {
+	for _, tc := range []struct {
+		name, doc, reason string
+	}{
+		{"old name field", `{"version":1,"targets":[{"name":"api-token","namespace":"payments"}]}`, "unknown field"},
+		{"user entry", `{"version":1,"targets":[{"entry":"user/501/api-token","namespace":"payments"}]}`, "not a system/<name> entry"},
+		{"unqualified", `{"version":1,"targets":[{"entry":"api-token","namespace":"payments"}]}`, "not a system/<name> entry"},
+		{"bad name", `{"version":1,"targets":[{"entry":"system/Bad_Name","namespace":"payments"}]}`, "not a valid keystore entry name"},
+		{"nested", `{"version":1,"targets":[{"entry":"system/a/b","namespace":"payments"}]}`, "not a valid keystore entry name"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, true, false)
+			h.store.set("api-token", 1, []byte("tok"))
+			h.writeRaw(t, []byte(tc.doc), FileMode)
+			h.r.Sweep(context.Background())
+			if n := len(h.client.Actions()); n != 0 {
+				t.Fatalf("a refused declaration reached the apiserver: %v", h.verbs())
+			}
+			if !strings.Contains(h.logs.String(), tc.reason) {
+				t.Fatalf("the refusal does not say %q\n%s", tc.reason, h.logs.String())
+			}
+		})
+	}
+	b, err := Declaration{Version: SchemaVersion, Targets: []Target{{Entry: "system/signer-key", Namespace: "payments", SecretName: "signer", DataKey: "private.key"}}}.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	order := []string{`"entry": "system/signer-key"`, `"namespace"`, `"secretName"`, `"dataKey"`}
+	last := -1
+	for _, k := range order {
+		i := strings.Index(got, k)
+		if i <= last {
+			t.Fatalf("key %s out of order (want entry, namespace, secretName, dataKey):\n%s", k, got)
+		}
+		last = i
+	}
+	if tg := (Target{Entry: "system/signer-key"}); tg.Secret() != "signer-key" || tg.Key() != DefaultDataKey {
+		t.Fatalf("defaults: secret %q key %q, want the name without system/ and %q", tg.Secret(), tg.Key(), DefaultDataKey)
+	}
 }

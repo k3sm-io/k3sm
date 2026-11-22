@@ -336,7 +336,7 @@ type sweep struct {
 
 // targetKey identifies a target for the once-per-state log.
 func targetKey(t Target) string {
-	return t.Name + "\x00" + t.Namespace + "\x00" + t.Secret() + "\x00" + t.Key()
+	return t.Entry + "\x00" + t.Namespace + "\x00" + t.Secret() + "\x00" + t.Key()
 }
 
 // note logs msg at level for t once per distinct state.
@@ -346,7 +346,7 @@ func (r *Reconciler) note(t Target, state string, level slog.Level, msg string, 
 		return
 	}
 	r.targetState[k] = state
-	attrs = append([]any{"entry", "system/" + t.Name, "namespace", t.Namespace, "secret", t.Secret()}, attrs...)
+	attrs = append([]any{"entry", t.Entry, "namespace", t.Namespace, "secret", t.Secret()}, attrs...)
 	r.logger.Log(context.Background(), level, "keystore delivery: "+msg, attrs...)
 }
 
@@ -374,7 +374,7 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 	default:
 		if reason := r.notOurs(sw, t, cur); reason != "" {
 			r.note(t, "skipped:foreign:"+reason, slog.LevelWarn,
-				"Secret left alone, not created by this server; delete it or pick another --secret-name", "reason", reason)
+				"Secret left alone, not created by this server; delete it or pick another --secret", "reason", reason)
 			return
 		}
 		if cur.Type != corev1.SecretTypeOpaque {
@@ -383,7 +383,7 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 		}
 	}
 
-	ver, value, err := r.store.Current(ctx, t.Name)
+	ver, value, err := r.store.Current(ctx, t.Name())
 	defer clear(value)
 	if err != nil {
 		r.note(t, "error:store:"+err.Error(), slog.LevelWarn, "cannot read the entry; will retry", "err", err)
@@ -411,7 +411,7 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 		// it. Logged every time, since each edit is its own event; the value
 		// is never logged.
 		r.logger.Warn("keystore delivery: Secret drifted from the stored value; re-applying",
-			"entry", "system/"+t.Name, "namespace", t.Namespace, "secret", t.Secret(), "version", ver.Version)
+			"entry", t.Entry, "namespace", t.Namespace, "secret", t.Secret(), "version", ver.Version)
 	}
 	next := cur.DeepCopy()
 	if next.Annotations == nil {
@@ -420,7 +420,7 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 	if next.Labels == nil {
 		next.Labels = map[string]string{}
 	}
-	next.Labels[LabelKey] = t.Name
+	next.Labels[LabelKey] = t.Name()
 	next.Annotations[VersionAnnotation] = want
 	next.Annotations[FingerprintAnnotation] = ver.Fingerprint
 	next.Type = corev1.SecretTypeOpaque
@@ -442,7 +442,7 @@ func (r *Reconciler) notOurs(sw *sweep, t Target, cur *corev1.Secret) string {
 	switch {
 	case !ok:
 		return "it has no " + LabelKey + " label"
-	case owner != t.Name:
+	case owner != t.Name():
 		return "its " + LabelKey + " label names another entry"
 	}
 	switch uid := sw.state.UID(t.Namespace, t.Secret()); {
@@ -470,7 +470,7 @@ func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keysto
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        t.Secret(),
 			Namespace:   t.Namespace,
-			Labels:      map[string]string{LabelKey: t.Name},
+			Labels:      map[string]string{LabelKey: t.Name()},
 			Annotations: map[string]string{VersionAnnotation: want, FingerprintAnnotation: ver.Fingerprint},
 		},
 		Type: corev1.SecretTypeOpaque,

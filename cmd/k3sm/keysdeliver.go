@@ -91,7 +91,7 @@ func (v *keysVerb) warnDeclared(name string) {
 		var d keydeliver.Declaration
 		if d, _, _, err = keydeliver.Read(path, keydeliver.OpenNoFollow, v.env.deliveryCheck); err == nil {
 			for _, t := range d.Targets {
-				if t.Name == name {
+				if t.Entry == qualify(name) {
 					fmt.Fprintf(v.env.stderr, "k3sm keys rm: warning: %s is still declared for delivery to %s/%s; "+
 						"the Secret keeps its value: run `k3sm keys undeliver` and delete the Secret\n",
 						qualify(name), t.Namespace, t.Secret())
@@ -106,7 +106,7 @@ func (v *keysVerb) warnDeclared(name string) {
 func keysDeliver(ctx context.Context, args []string, env keysEnv) int {
 	v := newKeysVerb("deliver", env)
 	ns := v.fs.String("namespace", "", "the namespace the Secret is delivered into (required)")
-	secretName := v.fs.String("secret-name", "", "the Secret's name (default: the entry name)")
+	secretName := v.fs.String("secret", "", "the Secret's name (default: the entry name without system/)")
 	dataKey := v.fs.String("data-key", "", "the Secret data key the value is delivered under (default: "+keydeliver.DefaultDataKey+")")
 	pos, err := v.parse(args)
 	if err != nil {
@@ -119,7 +119,7 @@ func keysDeliver(ctx context.Context, args []string, env keysEnv) int {
 	if *ns == "" {
 		return v.failf(keysBadUsage, "--namespace is required")
 	}
-	t := keydeliver.Target{Name: name, Namespace: *ns, SecretName: *secretName, DataKey: *dataKey}
+	t := keydeliver.Target{Entry: qualify(name), Namespace: *ns, SecretName: *secretName, DataKey: *dataKey}
 	if err := t.Check(); err != nil {
 		return v.failf(keysBadUsage, "%v (the value given is not echoed)", err)
 	}
@@ -169,6 +169,7 @@ func keysDeliver(ctx context.Context, args []string, env keysEnv) int {
 func keysUndeliver(ctx context.Context, args []string, env keysEnv) int {
 	v := newKeysVerb("undeliver", env)
 	ns := v.fs.String("namespace", "", "the namespace the delivery is withdrawn from (required)")
+	secret := v.fs.String("secret", "", "withdraw only the delivery into this Secret (default: every one in the namespace)")
 	pos, err := v.parse(args)
 	if err != nil {
 		return keysBadUsage
@@ -196,11 +197,11 @@ func keysUndeliver(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	n := d.Remove(name, *ns)
+	n := d.Remove(qualify(name), *ns, *secret)
 	if n == 0 {
-		// The namespace is not echoed: it was not found, so it was never
-		// checked as a name.
-		return v.failf(keysRefused, "no delivery of %s is declared in that namespace", qualify(name))
+		// The namespace and Secret are not echoed: they were not found, so
+		// they were never checked as names.
+		return v.failf(keysRefused, "no delivery of %s is declared in that namespace (and Secret, with --secret)", qualify(name))
 	}
 	if err := keydeliver.Write(path, d, env.deliveryCheck, env.deliveryChown); err != nil {
 		return v.failf(keysRefused, "write the delivery declaration: %v", err)

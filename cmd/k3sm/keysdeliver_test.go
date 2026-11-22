@@ -79,19 +79,19 @@ func TestKeysDeliverWritesDeclaration(t *testing.T) {
 	if fi.Mode() != keydeliver.FileMode {
 		t.Fatalf("declaration mode %v, want %v", fi.Mode(), keydeliver.FileMode)
 	}
-	want := []keydeliver.Target{{Name: "signer-key", Namespace: "payments", SecretName: "signer-key", DataKey: "value"}}
+	want := []keydeliver.Target{{Entry: "system/signer-key", Namespace: "payments", SecretName: "signer-key", DataKey: "value"}}
 	if got := h.declaration().Targets; !slices.Equal(got, want) {
 		t.Fatalf("targets %+v, want %+v", got, want)
 	}
 
-	h.mustRun(keysOK, "deliver", "system/signer-key", "--namespace", "ops", "--secret-name", "signer", "--data-key", "private.key")
+	h.mustRun(keysOK, "deliver", "system/signer-key", "--namespace", "ops", "--secret", "signer", "--data-key", "private.key")
 	h.mustRun(keysOK, "deliver", "system/signer-key", "--namespace", "payments", "--data-key", "key")
 	if !strings.Contains(h.stdout.String(), "replaced the declaration for") {
 		t.Fatalf("a second deliver to the same Secret did not say it replaced: %s", h.stdout.String())
 	}
 	want = []keydeliver.Target{
-		{Name: "signer-key", Namespace: "payments", SecretName: "signer-key", DataKey: "key"},
-		{Name: "signer-key", Namespace: "ops", SecretName: "signer", DataKey: "private.key"},
+		{Entry: "system/signer-key", Namespace: "payments", SecretName: "signer-key", DataKey: "key"},
+		{Entry: "system/signer-key", Namespace: "ops", SecretName: "signer", DataKey: "private.key"},
 	}
 	if got := h.declaration().Targets; !slices.Equal(got, want) {
 		t.Fatalf("targets %+v, want %+v", got, want)
@@ -133,7 +133,7 @@ func TestKeysUndeliver(t *testing.T) {
 	if !strings.Contains(h.stdout.String(), keysUndeliverHint) {
 		t.Fatalf("undeliver does not print %q: %s", keysUndeliverHint, h.stdout.String())
 	}
-	want := []keydeliver.Target{{Name: "api-token", Namespace: "ops", SecretName: "api-token", DataKey: "value"}}
+	want := []keydeliver.Target{{Entry: "system/api-token", Namespace: "ops", SecretName: "api-token", DataKey: "value"}}
 	if got := h.declaration().Targets; !slices.Equal(got, want) {
 		t.Fatalf("targets %+v, want %+v", got, want)
 	}
@@ -162,7 +162,7 @@ func TestKeysDeliverRefusals(t *testing.T) {
 		{"no namespace", 0, []string{"deliver", "system/api-token"}, keysBadUsage, "--namespace is required"},
 		{"undeliver no namespace", 0, []string{"undeliver", "system/api-token"}, keysBadUsage, "--namespace is required"},
 		{"bad namespace", 0, []string{"deliver", "system/api-token", "--namespace", "SECRET_VALUE"}, keysBadUsage, "namespace is not a valid"},
-		{"bad secret name", 0, []string{"deliver", "system/api-token", "--namespace", "p", "--secret-name", "SECRET_VALUE"}, keysBadUsage, "secretName is not a valid"},
+		{"bad secret name", 0, []string{"deliver", "system/api-token", "--namespace", "p", "--secret", "SECRET_VALUE"}, keysBadUsage, "secretName is not a valid"},
 		{"bad data key", 0, []string{"deliver", "system/api-token", "--namespace", "p", "--data-key", "SECRET/VALUE"}, keysBadUsage, "dataKey is not a valid"},
 		{"missing entry", 0, []string{"deliver", "system/absent", "--namespace", "p"}, keysRefused, "deliver only an existing entry"},
 		{"user scope", 0, []string{"deliver", "user/x", "--namespace", "p"}, keysRefused, "user scopes are not supported"},
@@ -286,7 +286,7 @@ func TestKeysRmWarnsDeclared(t *testing.T) {
 	h.put("system/api-token", value)
 	h.put("system/other", []byte("other-secret-value"))
 	h.mustRun(keysOK, "deliver", "system/api-token", "--namespace", "payments")
-	h.mustRun(keysOK, "deliver", "system/api-token", "--namespace", "ops", "--secret-name", "tok")
+	h.mustRun(keysOK, "deliver", "system/api-token", "--namespace", "ops", "--secret", "tok")
 	h.mustRun(keysOK, "deliver", "system/other", "--namespace", "payments")
 	h.mustRun(keysOK, "rm", "system/api-token", "--yes")
 	errOut := h.stderr.String()
@@ -343,4 +343,20 @@ func TestKeysDeliveryPrintsNoValue(t *testing.T) {
 	if strings.Contains(out.String(), string(value)) {
 		t.Fatalf("a delivery verb printed the value:\n%s", out.String())
 	}
+}
+
+// TestKeysUndeliverSecret: undeliver --secret withdraws only the delivery
+// into that Secret, and the old --secret-name flag is gone.
+func TestKeysUndeliverSecret(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/api-token", []byte("tok"))
+	h.mustRun(keysOK, "deliver", "system/api-token", "--namespace", "payments")
+	h.mustRun(keysOK, "deliver", "system/api-token", "--namespace", "payments", "--secret", "tok")
+	h.mustRun(keysOK, "undeliver", "system/api-token", "--namespace", "payments", "--secret", "tok")
+	want := []keydeliver.Target{{Entry: "system/api-token", Namespace: "payments", SecretName: "api-token", DataKey: "value"}}
+	if got := h.declaration().Targets; !slices.Equal(got, want) {
+		t.Fatalf("targets %+v, want %+v", got, want)
+	}
+	h.mustRun(keysRefused, "undeliver", "system/api-token", "--namespace", "payments", "--secret", "tok")
+	h.mustRun(keysBadUsage, "deliver", "system/api-token", "--namespace", "payments", "--secret-name", "x")
 }

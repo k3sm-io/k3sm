@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -61,21 +62,30 @@ const (
 	MaxTargets   = 256
 )
 
+// EntryPrefix is the scope every declared entry is in. A user entry reaches a
+// namespace only through a KeyDelivery, never through this file.
+const EntryPrefix = "system/"
+
 // Target is one declared delivery: the current version of keystore entry
-// Name, as Secret SecretName in Namespace, under data key DataKey.
+// Entry (scope-qualified, system/<name>), as Secret SecretName in Namespace,
+// under data key DataKey.
 type Target struct {
-	Name       string `json:"name"`
+	Entry      string `json:"entry"`
 	Namespace  string `json:"namespace"`
 	SecretName string `json:"secretName,omitempty"`
 	DataKey    string `json:"dataKey,omitempty"`
 }
 
-// Secret is the Secret's name: SecretName, or the entry name by default.
+// Name is the entry's name in the system scope: Entry without EntryPrefix.
+// It is what the store is asked for and what the ownership label carries.
+func (t Target) Name() string { return strings.TrimPrefix(t.Entry, EntryPrefix) }
+
+// Secret is the Secret's name: SecretName, or the entry's Name by default.
 func (t Target) Secret() string {
 	if t.SecretName != "" {
 		return t.SecretName
 	}
-	return t.Name
+	return t.Name()
 }
 
 // Key is the data key: DataKey, or DefaultDataKey by default.
@@ -90,13 +100,16 @@ func (t Target) Key() string {
 // field, never its value: a declaration is root's, but the CLI that builds a
 // target from flags must not echo a value typed in the wrong place.
 func (t Target) Check() error {
-	if keystore.CheckName(t.Name) != nil {
-		return errors.New("name is not a valid keystore entry name")
+	if !strings.HasPrefix(t.Entry, EntryPrefix) {
+		return errors.New("entry is not a system/<name> entry; a user entry is delivered by a KeyDelivery, not this file")
+	}
+	if keystore.CheckName(t.Name()) != nil {
+		return errors.New("entry is not a valid keystore entry name")
 	}
 	// The ownership label carries the entry name, and a label value is at most
 	// 63 bytes, so a longer entry name cannot be delivered.
-	if len(validation.IsValidLabelValue(t.Name)) != 0 {
-		return fmt.Errorf("name is longer than the %d bytes a label value holds, so it cannot be delivered", validation.LabelValueMaxLength)
+	if len(validation.IsValidLabelValue(t.Name())) != 0 {
+		return fmt.Errorf("entry name is longer than the %d bytes a label value holds, so it cannot be delivered", validation.LabelValueMaxLength)
 	}
 	if len(validation.IsDNS1123Label(t.Namespace)) != 0 {
 		return errors.New("namespace is not a valid namespace name (DNS-1123 label)")
@@ -178,12 +191,13 @@ func (d *Declaration) Upsert(t Target) bool {
 	return false
 }
 
-// Remove withdraws every target delivering entry name into namespace, and
+// Remove withdraws every target delivering entry (system/<name>) into
+// namespace, only the one naming Secret secret when secret is not empty, and
 // returns how many it removed.
-func (d *Declaration) Remove(name, namespace string) int {
+func (d *Declaration) Remove(entry, namespace, secret string) int {
 	kept := d.Targets[:0]
 	for _, x := range d.Targets {
-		if x.Name != name || x.Namespace != namespace {
+		if x.Entry != entry || x.Namespace != namespace || (secret != "" && x.Secret() != secret) {
 			kept = append(kept, x)
 		}
 	}

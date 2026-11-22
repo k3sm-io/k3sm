@@ -73,15 +73,16 @@ const keysUsage = `Usage:
         --key-in FILE only finishes an interrupted rewrap, with the key its
         --key-out saved: the recorded master.next.sha256, or a key some
         record already opens under; any other key is refused
-  sudo k3sm keys deliver system/<name> --namespace NS [--secret-name S] [--data-key K]
+  sudo k3sm keys deliver system/<name> --namespace NS [--secret S] [--data-key K]
         declare that the server delivers the entry's current version as an
-        Opaque Secret S (default: the entry name) in NS, under data key K
+        Opaque Secret S (default: <name>) in NS, under data key K
         (default: value); the entry must exist. While secrets encryption is
         off the server refuses delivery unless it was started with
         --allow-plaintext-secrets-delivery
-  sudo k3sm keys undeliver system/<name> --namespace NS
-        withdraw the entry's delivery into NS. The Secret stays; delete it
-        with kubectl, and rotate the entry to revoke
+  sudo k3sm keys undeliver system/<name> --namespace NS [--secret S]
+        withdraw the entry's delivery into NS (only into Secret S, with
+        --secret). The Secret stays; delete it with kubectl, and rotate the
+        entry to revoke
 
 Names are scope-qualified: system/<name>, where <name> is 1 to 253 bytes of
 dot-separated labels of lowercase letters, digits and '-'. This build

@@ -757,10 +757,13 @@ rewrap --key-out FILE | --key-in FILE
       under, and refuses any other. Takes no value.
       Prints that entry backups taken earlier no longer open.
 
-deliver system/<name> --namespace NS [--secret NAME] [--data-key KEY] [--remove]
-      Root delivery: declare (or, with --remove, withdraw) delivery of an
-      existing system entry as a Secret. Refuses a name that does not exist.
-      Warns when secrets encryption is off on this data root.
+deliver system/<name> --namespace NS [--secret NAME] [--data-key KEY]
+      Root delivery: declare delivery of an existing system entry as a
+      Secret. Refuses a name that does not exist. Warns when secrets
+      encryption is off on this data root.
+undeliver system/<name> --namespace NS [--secret NAME]
+      Withdraw the entry's root delivery into NS (only into Secret NAME,
+      with --secret). The Secret stays.
 ```
 
 Exit codes: 0 success, 1 refused (the sentinel's message), 2 bad usage, the three-value shape

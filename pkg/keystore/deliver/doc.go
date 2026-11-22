@@ -21,7 +21,8 @@ limitations under the License.
 // # The declaration
 //
 // /var/lib/k3sm/keystore-delivery.json (FileName in the data root) lists the
-// targets, {"version":1,"targets":[{"name","namespace","secretName","dataKey"}]}.
+// targets, {"version":1,"targets":[{"entry","namespace","secretName","dataKey"}]},
+// entry being system/<name>; a user/ entry is refused.
 // Only `sudo k3sm keys deliver|undeliver` writes it, root:wheel 0644, by
 // temp-and-rename with the directory fsynced. It decides which namespace the
 // server's admin client writes a Secret into, so it is read the way the
