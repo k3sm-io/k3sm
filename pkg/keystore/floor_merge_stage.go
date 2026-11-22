@@ -54,6 +54,11 @@ const (
 	unknownUID = 99
 )
 
+// syncStaged fsyncs one node of the staged tree as the merge hands it
+// over, before the tree's rename. It is a variable so a test can observe
+// each fsync.
+var syncStaged = func(f *os.File) error { return f.Sync() }
+
 // stagedNameLimit bounds how many names the staged-tree walk accepts in one
 // directory: maxDirNames, which tests lower.
 var stagedNameLimit = maxDirNames
@@ -370,7 +375,7 @@ func (s *FileStore) checkStaged(st *mergeStaging) error {
 
 // chownStaged hands pre-restore.d/restored and everything in it to the
 // service user, at the modes Put writes (dirMode, fileMode), after
-// checkStaged. Each node is opened by descriptor, never followed
+// checkStaged, and fsyncs each node (syncStaged) before the tree's rename. Each node is opened by descriptor, never followed
 // (O_NOFOLLOW, O_NONBLOCK so a FIFO cannot block), judged again on that
 // descriptor, and changed through it (fchmod, fchown); an fstat after
 // confirms a file still has one link, or its owner and mode are put back
@@ -441,7 +446,7 @@ func (s *FileStore) stagedNode(dirfd int, name, rel string, k stagedKind, maxSiz
 		return errStagedShape(rel, "does not open without following it: %v", err)
 	}
 	f := os.NewFile(uintptr(fd), rel)
-	defer func() { _ = f.Close() }() // changes are made through fchown and fchmod; the move fsyncs
+	defer func() { _ = f.Close() }() // changes are made through fchown and fchmod, and fsynced (syncNode)
 	var opened unix.Stat_t
 	if err := unix.Fstat(fd, &opened); err != nil {
 		return fmt.Errorf("stat %s/%s/%s: %w", preRestoreDirName, stagedTreeName, rel, err)
@@ -460,8 +465,20 @@ func (s *FileStore) stagedNode(dirfd int, name, rel string, k stagedKind, maxSiz
 			return err
 		}
 	}
-	if k == stagedFile {
+	// A crash after the tree's rename must not leave a key file truncated
+	// or a directory without its names: each node handed over is fsynced
+	// before the rename, a file here, a directory once its children are.
+	syncNode := func() error {
+		if !hand {
+			return nil
+		}
+		if err := syncStaged(f); err != nil {
+			return fmt.Errorf("fsync %s/%s/%s: %w", preRestoreDirName, stagedTreeName, rel, err)
+		}
 		return nil
+	}
+	if k == stagedFile {
+		return syncNode()
 	}
 	names, err := f.Readdirnames(stagedNameLimit + 1)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -484,7 +501,7 @@ func (s *FileStore) stagedNode(dirfd int, name, rel string, k stagedKind, maxSiz
 			return err
 		}
 	}
-	return nil
+	return syncNode()
 }
 
 // judgeStagedType refuses a node whose type is not the one its place holds:

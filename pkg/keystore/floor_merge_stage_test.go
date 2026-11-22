@@ -367,3 +367,48 @@ func TestFloorMergeAsideUnverified(t *testing.T) {
 		})
 	}
 }
+
+// TestFloorMergeSyncsStagedTree (U192): the merge fsyncs every file and
+// directory of the staged tree before it renames the tree into place, so a
+// crash after the rename leaves no truncated key file.
+func TestFloorMergeSyncsStagedTree(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	stageRecipe(t, s, server, 0)
+	want := map[string]bool{}
+	root := stagePath(s, stagedTreeName)
+	if err := filepath.WalkDir(root, func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, p)
+		want[rel] = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	synced, renamed := map[string]bool{}, false
+	old := syncStaged
+	t.Cleanup(func() { syncStaged = old })
+	syncStaged = func(f *os.File) error {
+		if renamed {
+			t.Errorf("%s fsynced after the tree's rename", f.Name())
+		}
+		synced[f.Name()] = true
+		return old(f)
+	}
+	s.step = func(name string) error {
+		if name == "merge tree rename" {
+			renamed = true
+		}
+		return nil
+	}
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for rel := range want {
+		if !synced[rel] {
+			t.Errorf("%s was not fsynced before the rename (synced %v)", rel, synced)
+		}
+	}
+}
