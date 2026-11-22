@@ -118,8 +118,13 @@ func TestFloorMergeCapsAndPrune(t *testing.T) {
 	// The moved-aside floor fits the budget alone; with the restored
 	// floor's own burials it does not.
 	setFloorLimits(t, smallFloorSize, 3100)
+	// Any drop refuses without --accept-drops, the restored floor's own
+	// burials included (TestMergeFloorRefusesDroppingRestoredBurials).
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); !errors.Is(err, errFloorFull) {
+		t.Fatalf("MergeFloor dropping the restored floor's own burials: %v, want errFloorFull", err)
+	}
 	buf := captureWarn(t)
-	got, err := mergeStaged(t, s, ctx, MergeOptions{})
+	got, err := mergeStaged(t, s, ctx, MergeOptions{AcceptDrops: true})
 	if err != nil {
 		t.Fatal(err)
 	}

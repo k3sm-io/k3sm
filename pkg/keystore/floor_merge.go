@@ -237,16 +237,16 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if err != nil {
 		return r, err
 	}
-	// A dry run on a copy: an input whose every burial and fence the live
-	// floor already holds (a rerun after a failed rename) writes nothing
-	// and is only renamed, whatever its newest deletion.
-	probe := maps.Clone(live)
-	pr, probeDropped := probe.mergeFenced(from, kept, ptrs, aside)
+	// A dry run on a copy (planMerge): an input whose every burial and fence
+	// the live floor already holds (a rerun after a failed rename) writes
+	// nothing and is only renamed, whatever its newest deletion.
+	plan := planMerge(live, from, kept, ptrs, aside)
+	pr := plan.r
 	if unmatched := unmatchedKeep(kept, pr.Kept); len(unmatched) > 0 {
 		return MergeReport{}, fmt.Errorf("--keep names %s, which the merge would not delete: it keeps an entry only when the floor moved aside records its restored generation as deleted, or holds a newer generation of a name the restored floor does not record. Nothing is written; check the names and run the merge again without them", strings.Join(unmatched, ", "))
 	}
 	if !pr.changes() {
-		pr.AlreadyMerged, pr.Unverified = true, unionNames(unverified, pr.Unverified)
+		pr.AlreadyMerged, pr.Unverified, pr.Dropped = true, unionNames(unverified, pr.Unverified), nil
 		if opts.DryRun {
 			return pr, nil
 		}
@@ -272,24 +272,17 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		return r, err
 	}
 	// As Put and Rotate ask room before they write: a merge whose write
-	// would drop a burial it adds is refused, with nothing written and the
-	// input left where it is, so the guard stays.
-	// A guard-era burial (rm run under the guard) is never dropped either,
-	// unless opts.AcceptDrops says so: the exit when rm cannot make room.
-	l := mergeLoses(live, probe, probeDropped)
+	// would drop any burial is refused, with nothing written and the input
+	// left where it is, so the guard stays, unless opts.AcceptDrops says
+	// so; and a write that would drop the burial of a generation it buries
+	// live is refused whatever opts says (planMerge, mergeLoss.refusal).
+	refused := plan.loss.refusal(opts.AcceptDrops)
 	if opts.DryRun {
 		pr.Unverified = unionNames(unverified, pr.Unverified)
-		for _, p := range append(slices.Clone(probeDropped), maps.Clone(probe).prune()...) {
-			pr.Dropped = append(pr.Dropped, p.name)
-		}
-		sort.Strings(pr.Dropped)
-		if len(l.names) > 0 && !opts.AcceptDrops {
-			return pr, l.err()
-		}
-		return pr, nil
+		return pr, refused
 	}
-	if len(l.names) > 0 && !opts.AcceptDrops {
-		return r, l.err()
+	if refused != nil {
+		return r, refused
 	}
 	// The guard file must still be the file read: one replaced since is
 	// not merged.
@@ -400,6 +393,33 @@ func (fl floor) renumberGuard(guarded map[floorBurial]bool) uint64 {
 	return below
 }
 
+// mergePlan is a merge decided on in-memory floors, before anything is
+// written: its report (Dropped included), the floor the write would hold
+// after its prune, every burial the write would drop, at the per-name cap
+// and in the prune, and what those drops lose.
+type mergePlan struct {
+	r       MergeReport
+	merged  floor
+	dropped []pruned
+	loss    mergeLoss
+}
+
+// planMerge is mergeFloor's decision logic, on a copy of live: mergeFenced
+// of from into it, then the prune every floor write makes. It writes
+// nothing and reads nothing but its arguments.
+func planMerge(live, from floor, keep map[string]bool, ptrs, aside map[string]uint64) mergePlan {
+	merged := maps.Clone(live)
+	r, capDropped := merged.mergeFenced(from, keep, ptrs, aside)
+	l := mergeLoses(live, merged, capDropped, r.BuriedLive)
+	dropped := append(slices.Clone(capDropped), merged.prune()...)
+	r.Dropped = nil
+	for _, p := range dropped {
+		r.Dropped = append(r.Dropped, p.name)
+	}
+	sort.Strings(r.Dropped)
+	return mergePlan{r: r, merged: merged, dropped: dropped, loss: l}
+}
+
 // mergeLoss is what mergeLoses found: the names whose burial the write
 // would drop, and which of the floor's caps drops them.
 type mergeLoss struct {
@@ -407,6 +427,11 @@ type mergeLoss struct {
 	names []string
 	// capNames is each of them whose burial the per-name cap drops.
 	capNames []string
+	// buriedLive is each entry whose restored generation the merge buried
+	// live and whose burial of it the write would drop: the name would end
+	// with neither a live record nor that burial, so the restored copy
+	// would be live again with nothing refusing it.
+	buriedLive []string
 	// tombstones is the size the merged floor's tombstones would take before
 	// the prune, when it is over the tombstone budget, or 0.
 	tombstones int
@@ -414,34 +439,49 @@ type mergeLoss struct {
 
 // mergeLoses finds each burial of the merge that took live to merged that
 // the write would drop: at the per-name cap (capDropped, what merge
-// returned) or in the write's prune, run here on a copy. A lost burial is
-// one the merge added (BuriedLive, a merged or a retired burial), or a
-// guard-era one live holds (rm run under the guard, guardEra): both are
-// deletions since the backup. Another burial live already held is the
-// restored floor's own, and dropping it is reported, not refused. A fence
-// is a high-water mark on a live record, which no prune removes.
-func mergeLoses(live, merged floor, capDropped []pruned) mergeLoss {
-	guarded := live.guardEra()
-	lost := func(p pruned) bool {
-		return !live[p.name].buries(p.generation) || guarded[floorBurial(p)]
+// returned) or in the write's prune, run here on a copy. Every drop counts,
+// a burial the restored floor held included: each is a recorded deletion
+// whose copy put back would be accepted again. buriedLive names the entries
+// the merge cleared to no live record (BuriedLive): a drop of that burial
+// is one no --accept-drops makes. A fence is a high-water mark on a live
+// record, which no prune removes.
+func mergeLoses(live, merged floor, capDropped []pruned, buriedLive []string) mergeLoss {
+	cleared := func(p pruned) bool {
+		f := live[p.name]
+		return slices.Contains(buriedLive, p.name) && f.live() && f.Generation == p.generation
 	}
 	var l mergeLoss
-	names, capNames := map[string]bool{}, map[string]bool{}
+	names, capNames, lost := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, p := range capDropped {
-		if lost(p) {
-			names[p.name], capNames[p.name] = true, true
+		names[p.name], capNames[p.name] = true, true
+		if cleared(p) {
+			lost[p.name] = true
 		}
 	}
 	for _, p := range maps.Clone(merged).prune() {
-		if lost(p) {
-			names[p.name] = true
+		names[p.name] = true
+		if cleared(p) {
+			lost[p.name] = true
 		}
 	}
-	l.names, l.capNames = sortedNames(names), sortedNames(capNames)
+	l.names, l.capNames, l.buriedLive = sortedNames(names), sortedNames(capNames), sortedNames(lost)
 	if t := merged.deadSize(); t > tombstoneSizeLimit {
 		l.tombstones = t
 	}
 	return l
+}
+
+// refusal is the error refusing a merge that would lose l, or nil: a
+// buried-live burial lost refuses whatever acceptDrops says; any other drop
+// refuses unless acceptDrops.
+func (l mergeLoss) refusal(acceptDrops bool) error {
+	if len(l.buriedLive) > 0 {
+		return fmt.Errorf("%w: the keystore floor cannot hold the merge without dropping the deletion recorded for %s, an entry the backup holds that was deleted since: the merge clears its restored record, so with the deletion dropped the restored copy would be accepted again with nothing refusing it, and --accept-drops never drops that one. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished. Delete each of those entries first with sudo k3sm keys rm system/<name> --yes, which runs while the merge is pending and records its own deletion, then run the merge again", errFloorFull, strings.Join(l.buriedLive, ", ")+",")
+	}
+	if len(l.names) > 0 && !acceptDrops {
+		return l.err()
+	}
+	return nil
 }
 
 // err is the refusal of a merge that would lose l, naming what binds: when
@@ -451,7 +491,7 @@ func mergeLoses(live, merged floor, capDropped []pruned) mergeLoss {
 func (l mergeLoss) err() error {
 	lost := strings.Join(l.names, ", ")
 	if len(l.capNames) == 0 && l.tombstones == 0 {
-		return fmt.Errorf("%w: the merge would drop the deletions it carries over for %s to keep keystore-floor.json within its %d-byte size, so a copy of each would be accepted again. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished. To make room, delete each entry that is no longer needed with sudo k3sm keys rm system/<name> --yes, which runs while the merge is pending, then run the merge again", errFloorFull, lost, floorSizeLimit)
+		return fmt.Errorf("%w: the merge would drop the deletions recorded for %s to keep keystore-floor.json within its %d-byte size, so a copy of each would be accepted again. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished. To make room, delete each entry that is no longer needed with sudo k3sm keys rm system/<name> --yes, which runs while the merge is pending, then run the merge again", errFloorFull, lost, floorSizeLimit)
 	}
 	var why []string
 	if l.tombstones > 0 {
@@ -460,7 +500,7 @@ func (l mergeLoss) err() error {
 	if len(l.capNames) > 0 {
 		why = append(why, fmt.Sprintf("the per-name cap of %d deletions binds for %s", buriedPerNameLimit, strings.Join(l.capNames, ", ")))
 	}
-	return &mergeFullError{msg: fmt.Sprintf("the keystore floor cannot hold the merge: it would drop the deletions since the backup recorded for %s, so a copy of each would be accepted again: %s. Deleting more entries cannot make room, since each deletion records one more. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished. To finish it anyway, run sudo k3sm keys floor merge --accept-drops: it drops the oldest deletions to fit, those among them, prints each one it drops, exits 4 and finishes the restore; a copy of each dropped entry put back is accepted again", lost, strings.Join(why, "; and "))}
+	return &mergeFullError{msg: fmt.Sprintf("the keystore floor cannot hold the merge: it would drop the deletions recorded for %s, so a copy of each would be accepted again: %s. Deleting more entries cannot make room, since each deletion records one more. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished. To finish it anyway, run sudo k3sm keys floor merge --accept-drops: it drops the oldest deletions to fit, those among them, prints each one it drops, exits 4 and finishes the restore; a copy of each dropped entry put back is accepted again", lost, strings.Join(why, "; and "))}
 }
 
 // mergeFullError is a merge refused because the tombstone budget or the
