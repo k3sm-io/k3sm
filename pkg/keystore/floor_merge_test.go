@@ -276,8 +276,8 @@ func TestFloorMergeRetiresAsideLive(t *testing.T) {
 	if e := restored["new"]; e.live() || !e.buries(mgen(4)) {
 		t.Errorf("new after the merge = %+v, want the aside's generation buried", e)
 	}
-	if e := restored["same"]; e.Generation != mgen(3) || e.Seq != 1 || e.HighWater != 2 || len(e.burials()) != 0 || !slices.Equal(r.Fenced, []string{"same"}) {
-		t.Errorf("same after the merge = %+v (fenced %v), want it live at seq 1 with high-water 2, nothing buried", e, r.Fenced)
+	if e := restored["same"]; e.Generation != mgen(3) || e.Seq != 1 || e.HighWater != 3 || len(e.burials()) != 0 || !slices.Equal(r.Fenced, []string{"same"}) {
+		t.Errorf("same after the merge = %+v (fenced %v), want it live at seq 1 with high-water 3 (one past the moved-aside seq 2), nothing buried", e, r.Fenced)
 	}
 	if e := restored["kept"]; e.Generation != mgen(5) || !e.buries(mgen(6)) || len(e.burials()) != 1 {
 		t.Errorf("kept after the merge = %+v, want its restored generation live and the aside's buried", e)

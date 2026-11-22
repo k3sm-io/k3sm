@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -177,8 +178,8 @@ func TestFloorMergeFencesAbandonedHistory(t *testing.T) {
 	if len(r.Fenced) != 1 || r.Fenced[0] != "k" {
 		t.Fatalf("MergeFloor = %+v, want k fenced", r)
 	}
-	if e := floorOf(t, server)["k"]; e.Seq != 5 || e.HighWater != 9 {
-		t.Fatalf("floor after the merge = %+v, want seq 5 and high-water 9", e)
+	if e := floorOf(t, server)["k"]; e.Seq != 5 || e.HighWater != 10 {
+		t.Fatalf("floor after the merge = %+v, want seq 5 and high-water 10 (one past the moved-aside seq 9)", e)
 	}
 	mustCurrent(t, s, "k", "v5")
 
@@ -199,9 +200,137 @@ func TestFloorMergeFencesAbandonedHistory(t *testing.T) {
 	t.Run("before the rotate", func(t *testing.T) { refused(t, true) })
 	replaceEntryDir(t, server, "k", backup)
 	mustRotate(t, s, "k", "after")
-	if e := floorOf(t, server)["k"]; e.Seq != 10 || e.HighWater != 0 {
-		t.Fatalf("floor after the rotate = %+v, want seq 10 and no mark", e)
+	if e := floorOf(t, server)["k"]; e.Seq != 11 || e.HighWater != 0 {
+		t.Fatalf("floor after the rotate = %+v, want seq 11 and no mark", e)
 	}
 	mustCurrent(t, s, "k", "after")
 	t.Run("after the rotate", func(t *testing.T) { refused(t, false) })
+}
+
+// writeFloorAt writes fl to path as the floor is written, mode 0644.
+func writeFloorAt(t *testing.T, path string, fl floor) {
+	t.Helper()
+	b, err := marshalFloor(fl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFloorMergeFenceLaggingFloors: either floor can lag its pointer by one
+// (a crash between the pointer flip and the floor write). A moved-aside
+// floor one behind its pointer still fences that pointer: the mark is one
+// past the moved-aside floor's record. A restored floor one behind its
+// pointer has the restored pointer, authenticated under the master,
+// recorded before the fence, so the restored entry is never inside it; one
+// that does not authenticate is left as it is and reported.
+func TestFloorMergeFenceLaggingFloors(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a moved-aside floor one behind its pointer", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("v1"))
+		for i := 2; i <= 5; i++ {
+			mustRotate(t, s, "k", fmt.Sprintf("v%d", i))
+		}
+		tmp := t.TempDir()
+		backup := filepath.Join(tmp, "backup")
+		copyEntryDir(t, filepath.Join(server, "keystore", "k"), backup)
+		backupFloor, err := os.ReadFile(floorPath(server))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 6; i <= 10; i++ {
+			mustRotate(t, s, "k", fmt.Sprintf("v%d", i))
+		}
+		late := filepath.Join(tmp, "late")
+		copyEntryDir(t, filepath.Join(server, "keystore", "k"), late)
+		// The floor write after the pointer flip to 10 never landed.
+		fl := floorOf(t, server)
+		e := fl["k"]
+		e.Seq = 9
+		fl["k"] = e
+		aside := floorPath(server) + ".pre-restore"
+		writeFloorAt(t, aside, fl)
+		if err := os.Remove(floorPath(server)); err != nil {
+			t.Fatal(err)
+		}
+		replaceEntryDir(t, server, "k", backup)
+		if err := os.WriteFile(floorPath(server), backupFloor, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.MergeFloor(ctx, aside, nil); err != nil {
+			t.Fatal(err)
+		}
+		if e := floorOf(t, server)["k"]; e.Seq != 5 || e.HighWater != 10 {
+			t.Fatalf("floor after the merge = %+v, want seq 5 and high-water 10", e)
+		}
+		mustCurrent(t, s, "k", "v5")
+		replaceEntryDir(t, server, "k", late)
+		var stale *staleError
+		if _, _, err := s.Current(ctx, "k"); !errors.As(err, &stale) || !stale.abandoned {
+			t.Fatalf("Current over the pre-restore seq-10 copy: %v, want it refused as abandoned", err)
+		}
+	})
+	restoreLagging := func(t *testing.T, master bool) (*FileStore, string, MergeReport) {
+		t.Helper()
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("v1"))
+		for i := 2; i <= 5; i++ {
+			mustRotate(t, s, "k", fmt.Sprintf("v%d", i))
+		}
+		backupFloor, err := os.ReadFile(floorPath(server))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The backup's entry is one rotate past the floor saved with it.
+		mustRotate(t, s, "k", "v6")
+		tmp := t.TempDir()
+		backup := filepath.Join(tmp, "backup")
+		copyEntryDir(t, filepath.Join(server, "keystore", "k"), backup)
+		for i := 7; i <= 9; i++ {
+			mustRotate(t, s, "k", fmt.Sprintf("v%d", i))
+		}
+		aside := floorPath(server) + ".pre-restore"
+		if err := os.Rename(floorPath(server), aside); err != nil {
+			t.Fatal(err)
+		}
+		replaceEntryDir(t, server, "k", backup)
+		if err := os.WriteFile(floorPath(server), backupFloor, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !master {
+			if err := os.WriteFile(filepath.Join(s.masterDir, masterName), make([]byte, 32), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r, err := s.MergeFloor(ctx, aside, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s, server, r
+	}
+	t.Run("a restored floor one behind its pointer", func(t *testing.T) {
+		s, server, r := restoreLagging(t, true)
+		if e := floorOf(t, server)["k"]; e.Seq != 6 || e.HighWater != 10 {
+			t.Fatalf("floor after the merge = %+v, want seq 6 (the restored pointer) and high-water 10", e)
+		}
+		if len(r.Unverified) != 0 {
+			t.Fatalf("MergeFloor = %+v, want nothing unverified", r)
+		}
+		mustCurrent(t, s, "k", "v6")
+	})
+	t.Run("a restored pointer that does not authenticate", func(t *testing.T) {
+		_, server, r := restoreLagging(t, false)
+		if e := floorOf(t, server)["k"]; e.Seq != 5 || e.HighWater != 10 {
+			t.Fatalf("floor after the merge = %+v, want seq 5 left as is and high-water 10", e)
+		}
+		if !slices.Equal(r.Unverified, []string{"k"}) {
+			t.Fatalf("MergeFloor = %+v, want k reported unverified", r)
+		}
+	})
 }

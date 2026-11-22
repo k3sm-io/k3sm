@@ -381,7 +381,10 @@ system/<name>`, and warns on stderr about each kept entry, since keeping it brin
 that may have been deleted to revoke it. A `--keep` name the merge would not delete, such as a
 typo, makes it refuse and change nothing. Remove each deleted entry's files with `sudo k3sm keys rm system/<name> --yes`.
 A line starting `dropped` names a deletion the floor could not keep: a copy of that entry put
-back is accepted. Then start the server and check the entries:
+back is accepted. A line starting `unverified` names a restored entry whose current version the
+merge could not check with the master key, most often because the master key is missing. The
+merge then trusts the restored floor's record of that entry, so if the backup's copy is newer
+than the floor saved with it, `show` refuses the entry as a copy from before the restore. Then start the server and check the entries:
 
 ```
 sudo k3sm start

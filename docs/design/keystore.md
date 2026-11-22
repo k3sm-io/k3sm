@@ -1234,8 +1234,18 @@ G2 retired, so neither directory put back is accepted. When the restored floor h
 moved-aside live generation itself at a lower sequence (the entry rotated since the backup),
 the moved-aside history would otherwise outrank the restored one: a pre-restore copy at seq 9
 passes a floor at seq 5, and the next Rotate, sealing seq 6, would leave it passing. So the
-merge gives that live record a high-water mark, the moved-aside sequence (or the moved-aside
-record's own mark, if higher), written as an optional `"highwater":N` after `"seq"` in the
+merge gives that live record a high-water mark, one above the higher of the moved-aside
+sequence and the moved-aside record's own mark. Either floor can lag its pointer by one, from a
+crash between the pointer flip and the floor write. The `+1` covers a moved-aside floor at seq 9
+whose pointer reached 10: that copy is refused too. For the restored side, the merge, which runs
+as root, authenticates each fenced entry's restored pointer under the master first, and when
+that sequence is above the restored record (and above its own mark) it raises the record to it,
+so a restored pointer one past its saved floor is never inside the fence. A pointer that does
+not authenticate (no master, a missing or replaced directory, another generation) leaves the
+record as the restored floor holds it, logged at Warn and reported as `unverified
+system/<name>` (`MergeReport.Unverified`). At the sequence limit the mark saturates there
+(`TestFloorMergeFenceLaggingFloors`, and `FuzzMergeFloor`'s fence oracle: the result's
+`max(seq, highwater)` is at least the moved-aside record's plus one). The mark is written as an optional `"highwater":N` after `"seq"` in the
 entry and left out when 0, so the parser's canonical round trip and every earlier floor are
 unchanged; the parser refuses a mark at or below `seq`. Readers refuse a pointer of that
 generation above `seq` and at or below the mark, the raise never raises into it, and Rotate

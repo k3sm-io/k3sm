@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"strings"
@@ -171,6 +172,23 @@ func FuzzMergeFloor(f *testing.F) {
 			}
 			if !keepSet[name] || was.live() || !slices.Contains(r.Kept, name) {
 				t.Fatalf("merge left the moved-aside live generation %s %s neither buried, dropped, kept nor live: %+v", name, a.Generation, now)
+			}
+		}
+		// The fence: a restored live record of the moved-aside floor's live
+		// generation ends at or past one above the moved-aside record, so a
+		// pre-restore pointer one past a lagging moved-aside floor is
+		// refused. A record at the sequence limit saturates there.
+		for name, a := range aside {
+			now := restored[name]
+			if !a.live() || !now.live() || now.Generation != a.Generation {
+				continue
+			}
+			want := max(a.Seq, a.HighWater)
+			if want < math.MaxUint64 {
+				want++
+			}
+			if got := max(now.Seq, now.HighWater); got < want {
+				t.Fatalf("merge left %s at seq %d, high-water %d; the moved-aside record %+v wants at least %d", name, now.Seq, now.HighWater, a, want)
 			}
 		}
 		if len(d) == 0 {

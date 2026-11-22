@@ -19,10 +19,12 @@ package keystore
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -69,10 +71,19 @@ type MergeReport struct {
 	// sequence, so a copy of the abandoned history, which would otherwise
 	// outrank the restored entry, is refused until a Rotate seals above it.
 	Fenced []string
+	// Unverified names, sorted, each entry the restored floor holds live
+	// under the moved-aside floor's live generation whose restored pointer
+	// did not authenticate under the master: its sequence is left as the
+	// restored floor records it, so a restored pointer above that record is
+	// inside the fence.
+	Unverified []string
 	// Dropped names, sorted and with repeats, each burial the write dropped
 	// to stay within the floor's caps (the per-name cap and the tombstone
 	// budget): a copy of it put back is accepted again.
 	Dropped []string
+	// raised is how many restored live records the merge raised to their
+	// authenticated restored pointer before fencing.
+	raised int
 }
 
 // MergeFloor merges every burial the floor file at path records (the live
@@ -139,6 +150,10 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	if err := checkMergeInput(live, from); err != nil {
 		return r, err
 	}
+	ptrs, unverified, err := s.restoredPointers(ctx, live, from)
+	if err != nil {
+		return r, err
+	}
 	// Only keystore-lock: the merge writes the root-owned floor and nothing
 	// under keystore/, so it takes no keystore/.lock, which the service user
 	// can hold or replace to stop it. Readers need no .lock against it
@@ -146,12 +161,12 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	var capDropped []pruned
 	var unmatched []string
 	_, dropped, err := fdir.updatePruned(func(fl floor) bool {
-		r, capDropped = fl.merge(from, kept)
+		r, capDropped = fl.mergeAt(from, kept, ptrs)
 		unmatched = unmatchedKeep(kept, r.Kept)
 		if len(unmatched) > 0 {
 			return false // refused below; nothing written
 		}
-		return r.Merged > 0 || r.Retired > 0 || len(r.Fenced) > 0
+		return r.Merged > 0 || r.Retired > 0 || len(r.Fenced) > 0 || r.raised > 0
 	})
 	if err != nil {
 		return MergeReport{}, err
@@ -164,6 +179,10 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	}
 	sort.Strings(r.Dropped)
 	logPruned(capDropped)
+	r.Unverified = unverified
+	for _, name := range r.Unverified {
+		slog.Warn("keystore floor: the restored pointer of this entry did not authenticate under the master, so the merge left its recorded sequence as the restored floor holds it; a restored pointer above that is refused until a Rotate", "name", name)
+	}
 	for _, name := range r.BuriedLive {
 		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and the restored entry is refused; rm removes its directory", "name", name)
 	}
@@ -293,6 +312,17 @@ func (s *FileStore) readFloorAt(path string) (floor, fs.FileInfo, error) {
 // (Fenced). At maxBuriedPerName, add drops the name's oldest, returned. It
 // does not prune: update does.
 func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) {
+	return fl.mergeAt(from, keep, nil)
+}
+
+// mergeAt is merge, given ptrs, the authenticated restored pointer sequence
+// of each name it fences (restoredPointers). A restored live record below
+// its pointer, and not at or below its own high-water mark, is raised to the
+// pointer first (counted in raised), so the restored entry is never inside
+// the fence. The fence mark is one above the higher of the moved-aside
+// record's sequence and mark, so a pre-restore pointer one past a moved-aside
+// floor that lagged it is refused too; at the sequence limit it saturates.
+func (fl floor) mergeAt(from floor, keep map[string]bool, ptrs map[string]uint64) (MergeReport, []pruned) {
 	type at struct {
 		name string
 		b    burial
@@ -355,8 +385,18 @@ func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) 
 		switch {
 		case a.live() && f.live() && f.Generation == a.Generation:
 			// The same generation, restored at an older sequence: the
-			// moved-aside history above it must never outrank it.
-			if hw := max(a.Seq, a.HighWater); hw > f.Seq && hw > f.HighWater {
+			// moved-aside history above it, and one past it, must never
+			// outrank it.
+			if p := ptrs[name]; p > f.Seq && p > f.HighWater {
+				f.Seq, f.HighWater = p, 0
+				fl[name] = f
+				r.raised++
+			}
+			hw := max(a.Seq, a.HighWater)
+			if hw < math.MaxUint64 {
+				hw++
+			}
+			if hw > f.Seq && hw > f.HighWater {
 				f.HighWater = hw
 				fl[name] = f
 				fenced[name] = true
@@ -389,6 +429,57 @@ func unmatchedKeep(keep map[string]bool, kept []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// restoredPointers authenticates, under the master, the current pointer of
+// each entry live (the floor read under keystore-lock) holds live under the
+// generation from holds live too: the names a fence can apply to. It returns
+// each authenticated pointer's sequence by name, and, sorted, each candidate
+// whose pointer did not authenticate (no master, no entry, another
+// generation, or a refused record). It takes no keystore/.lock (see
+// mergeFloor) and writes nothing; it stops with ctx's error.
+func (s *FileStore) restoredPointers(ctx context.Context, live, from floor) (map[string]uint64, []string, error) {
+	var names []string
+	for name, a := range from {
+		if f := live[name]; a.live() && f.live() && f.Generation == a.Generation {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil, nil
+	}
+	sort.Strings(names)
+	entries, err := s.openDir(s.dir, false)
+	if err != nil {
+		return nil, names, nil
+	}
+	defer func() { _ = entries.Close() }() // read-only
+	k, err := s.loadMaster()
+	if err != nil {
+		return nil, names, nil
+	}
+	defer k.wipe()
+	ptrs := map[string]uint64{}
+	var unverified []string
+	for i, name := range names {
+		if err := loopCtx(ctx, i); err != nil {
+			return nil, nil, err
+		}
+		e, err := openEntry(entries, name, live)
+		if err != nil {
+			unverified = append(unverified, name)
+			continue
+		}
+		_, seq, perr := e.pointer(k)
+		same := hex.EncodeToString(e.generation[:]) == live[name].Generation
+		e.close()
+		if perr != nil || !same {
+			unverified = append(unverified, name)
+			continue
+		}
+		ptrs[name] = seq
+	}
+	return ptrs, unverified, nil
 }
 
 // sortedNames is set's names, sorted, or nil for none.

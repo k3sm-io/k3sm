@@ -999,6 +999,9 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		// A downgrade of what the floor refuses, so on stderr too.
 		fmt.Fprintf(env.stderr, "k3sm keys floor merge: warning: %s is kept live as --keep asked, though the floor moved aside records it as deleted since the backup; if that deletion revoked the key, the revoked key is live again\n", qualify(name))
 	}
+	for _, name := range r.Unverified {
+		fmt.Fprintf(env.stdout, "unverified %s: the restored pointer did not authenticate under the master, so its recorded sequence is left as the restored floor holds it\n", qualify(name))
+	}
 	for _, name := range r.Dropped {
 		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
 	}
