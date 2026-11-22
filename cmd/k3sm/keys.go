@@ -115,10 +115,12 @@ Flags:
 
 Exit codes: 0 done; 1 refused or failed; 2 usage; 3 rewrap completed an
 earlier interrupted rewrap instead (run it again with a new key); 4 the verb
-(put, rotate, rm, list, show or floor merge) is done, but the floor dropped a
-recorded deletion to stay within its limits, so a copy of that deleted entry
-put back is accepted; 5 floor merge written, input not renamed: rerun to
-clear the guard (it wins over 4, and the report lists any drops).
+(put, rotate, rm or floor merge) is done, but the floor dropped a recorded
+deletion to stay within its limits, so a copy of that deleted entry put back
+is accepted, or floor merge kept an entry with --keep or left one
+unverified (read its report); 5 floor merge written, input not renamed:
+rerun to clear the guard (it wins over 4, and the report lists any drops).
+floor merge --dry-run exits as the merge itself would.
 `
 
 // Exit codes of `k3sm keys`.
@@ -133,8 +135,10 @@ const (
 	// dropped a recorded deletion to stay within the floor's limits: a
 	// committed keystore.ErrTombstoneEvicted from put, rotate or rm (its
 	// tree left behind, or nothing found after a raise that pruned,
-	// included), or a floor merge that reports a drop. list and show warn
-	// of their floor raise's eviction on stderr and exit 0.
+	// included), or a floor merge that reports a drop; and a floor merge
+	// (or its dry run) that keeps an entry with --keep or leaves one
+	// unverified. list and show warn of their floor raise's eviction on
+	// stderr and exit 0.
 	keysCommitted = 4
 	// keysNotRenamed is a floor merge that was written but whose input,
 	// keystore-floor.json.pre-restore, was not renamed: the guard stays,
@@ -1007,6 +1011,8 @@ func (k *keepFlag) Set(q string) error {
 // keysCommitted, the report printed, when it is written but dropped a
 // burial, and keysNotRenamed, the report printed, when it is written but
 // its input could not be renamed (keystore.Committed), which wins.
+// keysCommitted also marks a merge that kept an entry (--keep) or left one
+// unverified; --dry-run exits as the merge itself would.
 func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if len(args) == 0 || args[0] != "merge" {
 		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run]")
@@ -1045,10 +1051,18 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	}
 	fmt.Fprintf(env.stdout, "merged %d\nalready present %d\nburied live %d\nkept %d\nretired %d\ndropped %d\nfenced %d\n", r.Merged, r.AlreadyPresent, len(r.BuriedLive), len(r.Kept), len(r.Retired), len(r.Dropped), len(r.Fenced))
 	for _, name := range r.BuriedLive {
-		fmt.Fprintf(env.stdout, "buried live %s: deleted since the backup, so the restored entry is deleted again and refused; run sudo k3sm keys rm %s --yes to remove it\n", qualify(name), qualify(name))
+		// The floors cannot tell an undo from a restore: in an undo a
+		// buried-live entry may be one the undo brings back.
+		fmt.Fprintf(env.stdout, "buried live %s: the floor moved aside records this version as deleted, so the merge buries it and it is refused. In an undo, a version the first merge retired is buried by the reverse merge: pass --keep %s to bring it back. An entry deleted since the restore stays deleted: remove its files with sudo k3sm keys rm %s --yes\n", qualify(name), qualify(name), qualify(name))
 	}
+	revoked := 0
 	for _, name := range r.Kept {
-		fmt.Fprintf(env.stdout, "kept %s: deleted since the backup, and kept live as --keep asked\n", qualify(name))
+		if slices.Contains(r.Recorded, name) {
+			fmt.Fprintf(env.stdout, "kept %s: recorded the moved-aside version as current, as --keep asked: the restored floor holds no record of this entry\n", qualify(name))
+			continue
+		}
+		revoked++
+		fmt.Fprintf(env.stdout, "kept %s: revoked, kept live: the floor moved aside records it as deleted since the backup, and --keep keeps the restored version live; if that deletion revoked the key, the revoked key is live again\n", qualify(name))
 		// A downgrade of what the floor refuses, so on stderr too.
 		fmt.Fprintf(env.stderr, "k3sm keys floor merge: warning: %s is kept live as --keep asked, though the floor moved aside records it as deleted since the backup; if that deletion revoked the key, the revoked key is live again\n", qualify(name))
 	}
@@ -1056,28 +1070,37 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		fmt.Fprintf(env.stdout, "retired %s: its version current before the restore is not the restored one, so a copy of it put back is refused\n", qualify(name))
 	}
 	for _, name := range r.Unverified {
-		fmt.Fprintf(env.stdout, "unverified %s: the restored pointer did not authenticate under the master, or is more than one version past the restored floor's record, so its recorded sequence is left as the restored floor holds it and a copy past it is refused\n", qualify(name))
+		fmt.Fprintf(env.stdout, "unverified %s: the restored pointer did not authenticate under the master, or is more than one version past the restored floor's record, so the merge leaves that record as the restored floor holds it: a copy below the recorded version is refused; one at it is accepted; one past it is accepted unless the merge fenced the entry, when one past it and at or below the fence is refused until a rotate numbers past the fence\n", qualify(name))
 	}
 	for _, name := range r.Dropped {
 		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
 	}
-	if *dryRun {
-		// The code the real run would exit with.
-		if err != nil {
-			return v.failf(keysRefused, "%v", err)
-		}
-		if len(r.Dropped) > 0 {
-			return v.failf(keysCommitted, "dry run: the merge would drop %d deleted generation(s) to keep the floor within its caps", len(r.Dropped))
-		}
-		return keysOK
+	if *dryRun && err != nil {
+		return v.failf(keysRefused, "%v", err)
 	}
 	if err != nil {
 		// Written, but the input was not renamed: the report above stands,
 		// drops included, and a rerun renames it.
 		return v.failf(keysNotRenamed, "%v", err)
 	}
-	if len(r.Dropped) > 0 {
-		return v.failf(keysCommitted, "the merge is written, but it dropped %d deleted generation(s) to keep the floor within its caps", len(r.Dropped))
+	// Done, but what the floor refuses changed in a way to read: a drop, a
+	// kept entry or an unverified one. A dry run exits as the merge would.
+	var why []string
+	if n := len(r.Dropped); n > 0 {
+		why = append(why, fmt.Sprintf("dropped %d deleted generation(s) to keep the floor within its caps", n))
+	}
+	if n := len(r.Kept); n > 0 {
+		why = append(why, fmt.Sprintf("kept %d entr(y/ies) with --keep (%d revoked since the backup)", n, revoked))
+	}
+	if n := len(r.Unverified); n > 0 {
+		why = append(why, fmt.Sprintf("left %d entr(y/ies) unverified", n))
+	}
+	if len(why) > 0 {
+		lead := "the merge is written, but it"
+		if *dryRun {
+			lead = "dry run: the merge would be written, but it"
+		}
+		return v.failf(keysCommitted, "%s %s; read the report above", lead, strings.Join(why, "; "))
 	}
 	return keysOK
 }

@@ -909,7 +909,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if _, err := os.Lstat(h.keystoreDir()); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("keystore/ before the merge: %v, want it absent, the restored tree staged", err)
 		}
-		h.mustRun(0, "floor", "merge", "--keep", "system/rb")
+		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/rb")
 		h.mustRun(0, "list")
 		h.mustRun(0, "show", "system/rb", "--reveal")
 		if !bytes.Equal(h.stdout.Bytes(), value) {
@@ -965,7 +965,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if after, err := os.ReadFile(recipeFloor(h)); err != nil || !bytes.Equal(after, before) {
 			t.Fatalf("live floor after the refused merge = %s, %v; want it unchanged", after, err)
 		}
-		h.mustRun(0, "floor", "merge", "--keep", "system/rb")
+		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/rb")
 		if got := h.stdout.String(); !strings.Contains(got, "merged 0\nalready present 0\nburied live 0\nkept 1\nretired 0\ndropped 0\n") || !strings.Contains(got, "kept system/rb:") {
 			t.Fatalf("floor merge --keep printed %q, want rb kept", got)
 		}
@@ -1037,7 +1037,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
 			t.Fatalf("restore: %v", err)
 		}
-		h.mustRun(0, "floor", "merge", "--keep", "system/n")
+		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/n")
 		if got := h.stdout.String(); !strings.Contains(got, "kept 1\nretired 1\n") || !strings.Contains(got, "\nretired system/n:") {
 			t.Fatalf("floor merge --keep printed %q, want n kept and G2 retired", got)
 		}
@@ -1148,7 +1148,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if _, err := restoreRecipeBackup(t, h, older, true); err != nil {
 			t.Fatalf("restore of the older backup: %v", err)
 		}
-		h.mustRun(0, "floor", "merge", "--keep", "system/rb")
+		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/rb")
 		h.mustRun(0, "list")
 		h.mustRun(0, "show", "system/rb", "--reveal")
 		if got := h.stdout.String(); got != "old" {
@@ -1165,7 +1165,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		h := newKeysHarness(t)
 		h.put("system/other", []byte("o"))
 		_, aside := saveRmRestore(t, h, true)
-		h.mustRun(0, "floor", "merge", "--keep", "system/rb")
+		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/rb")
 		h.mustRun(0, "rm", "system/other", "--yes")
 		floor := recipeFloor(h)
 		merged, err := filepath.Glob(floor + ".merged-*")
@@ -2596,7 +2596,7 @@ func TestKeysPendingMergeGuard(t *testing.T) {
 	if !strings.Contains(h.stderr.String(), "warning: a restore is unfinished") {
 		t.Fatalf("rm with a merge pending: stderr %q; want the warning", h.stderr.String())
 	}
-	h.mustRun(0, "floor", "merge", "--keep", "system/k")
+	h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/k")
 	matches, err := filepath.Glob(recipeFloor(h) + ".merged-*")
 	if err != nil || len(matches) != 1 {
 		t.Fatalf("renamed merge input = %v, %v; want one keystore-floor.json.merged-<unix>", matches, err)
@@ -2793,4 +2793,81 @@ func TestKeysFloorMergeDryRun(t *testing.T) {
 	if out := h.stdout.String(); !strings.Contains(out, "buried live system/k:") {
 		t.Fatalf("floor merge after --dry-run printed %q, want k buried live", out)
 	}
+}
+
+// TestKeysFloorMergeReportCodes (U192): floor merge exits 4 when it keeps an
+// entry with --keep or leaves one unverified, as for a drop, and its dry run
+// exits as it would. A kept entry the moved-aside floor records as deleted
+// is reported "revoked, kept live" and warned of on stderr; one the restored
+// floor does not record is reported as the moved-aside version recorded,
+// with no warning. A buried-live line names --keep for an undo.
+func TestKeysFloorMergeReportCodes(t *testing.T) {
+	restore := func(t *testing.T, h *keysHarness, b recipeBackup) {
+		t.Helper()
+		if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+	}
+	backup := func(t *testing.T, h *keysHarness) recipeBackup {
+		return saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	}
+	t.Run("revoked kept", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/rb", []byte("v"))
+		b := backup(t, h)
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		restore(t, h, b)
+		for _, args := range [][]string{{"floor", "merge", "--keep", "system/rb", "--dry-run"}, {"floor", "merge", "--keep", "system/rb"}} {
+			if code := h.run(args...); code != keysCommitted {
+				t.Fatalf("%v: exit %d, stderr %q; want %d", args, code, h.stderr.String(), keysCommitted)
+			}
+			if !strings.Contains(h.stdout.String(), "kept system/rb: revoked, kept live") || !strings.Contains(h.stderr.String(), "warning: system/rb is kept live") {
+				t.Fatalf("%v printed %q, %q; want rb reported revoked and kept live, and warned of", args, h.stdout.String(), h.stderr.String())
+			}
+		}
+	})
+	t.Run("recorded", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/base", []byte("base"))
+		b := backup(t, h)
+		h.put("system/late", []byte("late"))
+		restore(t, h, b)
+		if code := h.run("floor", "merge", "--keep", "system/late"); code != keysCommitted {
+			t.Fatalf("merge --keep of a name the backup lacks: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		}
+		if !strings.Contains(h.stdout.String(), "kept system/late: recorded the moved-aside version") || strings.Contains(h.stdout.String(), "revoked, kept live") || strings.Contains(h.stderr.String(), "warning: system/late") {
+			t.Fatalf("merge --keep printed %q, %q; want late reported as recorded, not revoked, and no warning", h.stdout.String(), h.stderr.String())
+		}
+	})
+	t.Run("unverified", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		b := backup(t, h)
+		h.put("system/x", []byte("x"))
+		h.mustRun(0, "rm", "system/x", "--yes")
+		restore(t, h, b)
+		master := filepath.Join(h.work, "cred", "keystore-master", "master")
+		if err := os.Rename(master, master+".aside"); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"floor", "merge", "--dry-run"}, {"floor", "merge"}} {
+			if code := h.run(args...); code != keysCommitted {
+				t.Fatalf("%v with no master: exit %d, stderr %q; want %d", args, code, h.stderr.String(), keysCommitted)
+			}
+			if out := h.stdout.String(); !strings.Contains(out, "unverified system/k:") || !strings.Contains(out, "refused until a rotate numbers past the fence") {
+				t.Fatalf("%v printed %q; want k unverified, saying what is refused", args, out)
+			}
+		}
+	})
+	t.Run("buried live", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/rb", []byte("v"))
+		b := backup(t, h)
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		restore(t, h, b)
+		h.mustRun(0, "floor", "merge")
+		if out := h.stdout.String(); !strings.Contains(out, "buried by the reverse merge: pass --keep system/rb to bring it back") {
+			t.Fatalf("merge printed %q; want the buried-live line to name --keep for an undo", out)
+		}
+	})
 }
