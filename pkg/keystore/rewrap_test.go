@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -1102,4 +1103,330 @@ func TestRewrapUserScopesUnderLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkRewrapValues(t, s, vals)
+}
+
+// TestInterruptedRewrap: InterruptedRewrap reports the fingerprint a crashed
+// Rewrap recorded, SHA-256 of its key, from a crash after master.next.sha256
+// lands through one between the two master renames, and nothing for a store
+// with no Rewrap pending. A fingerprint file it cannot trust is
+// ErrMasterUntrusted. It writes nothing.
+func TestInterruptedRewrap(t *testing.T) {
+	ctx := context.Background()
+	want := sha256.Sum256(rewrapKey(1))
+	crashed := func(t *testing.T, at string) (*FileStore, string) {
+		t.Helper()
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		s.step = failAt(at)
+		if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+			t.Fatal("Rewrap succeeded through a crash")
+		}
+		s.step = func(string) error { return nil }
+		return s, server
+	}
+	for _, at := range []string{
+		"write v1.new",
+		"rename a/v1",
+		"rename b/current",
+		"rename " + masterNextName,
+	} {
+		t.Run("crash at "+at, func(t *testing.T) {
+			s, server := crashed(t, at)
+			snap := treeSnapshot(t, filepath.Dir(server))
+			fp, ok, err := s.InterruptedRewrap(ctx)
+			if err != nil || !ok || fp != want {
+				t.Fatalf("InterruptedRewrap = %x, %v, %v; want %x, true, nil", fp, ok, err, want)
+			}
+			checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
+		})
+	}
+	none := map[string]func(t *testing.T) *FileStore{
+		"no keystore": func(t *testing.T) *FileStore { s, _ := newTestStore(t); return s },
+		"entries, no rewrap": func(t *testing.T) *FileStore {
+			s, _ := newTestStore(t)
+			seedRewrap(t, s)
+			return s
+		},
+		"a completed rewrap": func(t *testing.T) *FileStore {
+			s, _ := newTestStore(t)
+			seedRewrap(t, s)
+			if err := s.Rewrap(ctx, rewrapKey(1)); err != nil {
+				t.Fatal(err)
+			}
+			return s
+		},
+		"a crash before master.next.sha256 lands": func(t *testing.T) *FileStore {
+			s, _ := crashed(t, "write "+masterNextFingerprintName)
+			return s
+		},
+	}
+	for name, mk := range none {
+		t.Run(name, func(t *testing.T) {
+			fp, ok, err := mk(t).InterruptedRewrap(ctx)
+			if err != nil || ok || fp != ([sha256.Size]byte{}) {
+				t.Fatalf("InterruptedRewrap = %x, %v, %v; want zero, false, nil", fp, ok, err)
+			}
+		})
+	}
+	for name, damage := range map[string]func(t *testing.T, p string){
+		"not hex": func(t *testing.T, p string) {
+			writeFile(t, p, strings.Repeat("z", 2*sha256.Size)+"\n")
+		},
+		"no newline": func(t *testing.T, p string) {
+			writeFile(t, p, hex.EncodeToString(want[:])+"0")
+		},
+		"group readable": func(t *testing.T, p string) {
+			if err := os.Chmod(p, 0o640); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run("refuses "+name, func(t *testing.T) {
+			s, server := crashed(t, "write v1.new")
+			p := masterPath(server, masterNextFingerprintName)
+			damage(t, p)
+			giveToService(t, p)
+			if _, ok, err := s.InterruptedRewrap(ctx); !errors.Is(err, ErrMasterUntrusted) || ok {
+				t.Fatalf("InterruptedRewrap: ok %v, %v; want ErrMasterUntrusted", ok, err)
+			}
+		})
+	}
+}
+
+// TestRewrapNotStarted: Rewrap marks with ErrRewrapNotStarted exactly the
+// errors it returns before it first writes master.next from the key it was
+// given: the early refusals and a resume of another key match it; a crash
+// after that write, at any later step, does not.
+func TestRewrapNotStarted(t *testing.T) {
+	ctx := context.Background()
+	before := map[string]func(t *testing.T) (*FileStore, []byte){
+		"no keystore": func(t *testing.T) (*FileStore, []byte) { s, _ := newTestStore(t); return s, rewrapKey(1) },
+		"short key": func(t *testing.T) (*FileStore, []byte) {
+			s, _ := newTestStore(t)
+			seedRewrap(t, s)
+			return s, rewrapKey(1)[:31]
+		},
+		"the live master": func(t *testing.T) (*FileStore, []byte) {
+			s, server := newTestStore(t)
+			seedRewrap(t, s)
+			live, err := os.ReadFile(masterPath(server, masterName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s, live
+		},
+		"user scopes": func(t *testing.T) (*FileStore, []byte) {
+			s, server := newTestStore(t)
+			seedRewrap(t, s)
+			if err := os.Mkdir(filepath.Join(server, "keystore", userScopesName), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return s, rewrapKey(1)
+		},
+		"an entry that does not open": func(t *testing.T) (*FileStore, []byte) {
+			s, server := newTestStore(t)
+			seedRewrap(t, s)
+			writeFile(t, filepath.Join(server, "keystore", "a", "v1"), "garbage")
+			return s, rewrapKey(1)
+		},
+		"a resume of another key": func(t *testing.T) (*FileStore, []byte) {
+			s, _ := newTestStore(t)
+			seedRewrap(t, s)
+			s.step = failAt("rename a/v1")
+			if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+				t.Fatal("Rewrap succeeded through a crash")
+			}
+			s.step = func(string) error { return nil }
+			return s, rewrapKey(2)
+		},
+	}
+	for name, mk := range before {
+		t.Run(name, func(t *testing.T) {
+			s, key := mk(t)
+			if err := s.Rewrap(ctx, key); !errors.Is(err, ErrRewrapNotStarted) {
+				t.Fatalf("Rewrap = %v, want ErrRewrapNotStarted", err)
+			}
+		})
+	}
+	for _, at := range []string{"write " + masterNextName, "write v1.new", "rename a/v1", "rename " + masterNextName} {
+		t.Run("crash at "+at, func(t *testing.T) {
+			s, _ := newTestStore(t)
+			seedRewrap(t, s)
+			s.step = failAt(at)
+			err := s.Rewrap(ctx, rewrapKey(1))
+			if err == nil || errors.Is(err, ErrRewrapNotStarted) {
+				t.Fatalf("Rewrap = %v, want an error that is not ErrRewrapNotStarted", err)
+			}
+		})
+	}
+}
+
+// TestRewrapResumeFailed: a Rewrap that is completing an earlier rewrap
+// under that rewrap's key (one interrupted at rename a/v1, or between the
+// master renames), and fails once it has advanced it, matches
+// ErrRewrapResumeFailed and never ErrRewrapNotStarted, at each step of the
+// resume: the records it renamed in, and a half-done master swap it moved,
+// are the earlier key's, which a rerun with that key's file finishes.
+func TestRewrapResumeFailed(t *testing.T) {
+	ctx := context.Background()
+	// interrupted leaves a Rewrap to key 1 crashed at step at.
+	interrupted := func(t *testing.T, at string) (*FileStore, string) {
+		t.Helper()
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		s.step = failAt(at)
+		if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+			t.Fatal("Rewrap succeeded through a crash")
+		}
+		s.step = func(string) error { return nil }
+		return s, server
+	}
+	for _, tc := range []struct{ first, resume string }{
+		// a/v1 is live under key 1; the resume fails at its own steps.
+		{"rename a/v1", "write v1.new"},
+		{"rename a/v1", "rename a/current"},
+		{"rename a/v1", "rename b/v2"},
+		{"rename a/v1", "rename " + masterNextName},
+		{"rename a/v1", "rename " + masterNextFingerprintName},
+		// The master swap is half done; the resume fails as it moves it on.
+		{"rename " + masterNextName, "rename " + masterNextFingerprintName},
+	} {
+		t.Run(tc.first+" then "+tc.resume, func(t *testing.T) {
+			s, server := interrupted(t, tc.first)
+			var steps []string
+			s.step = func(name string) error {
+				steps = append(steps, name)
+				if name == tc.resume {
+					return fmt.Errorf("injected crash at %s", name)
+				}
+				return nil
+			}
+			err := s.Rewrap(ctx, rewrapKey(2))
+			if err == nil || !strings.Contains(err.Error(), "injected crash at "+tc.resume) {
+				t.Fatalf("the resume did not fail at %s (steps %v): %v", tc.resume, steps, err)
+			}
+			if !errors.Is(err, ErrRewrapResumeFailed) || errors.Is(err, ErrRewrapNotStarted) {
+				t.Fatalf("Rewrap failing a resume at %s = %v, want ErrRewrapResumeFailed and not ErrRewrapNotStarted", tc.resume, err)
+			}
+			// Only a failure after the swap's last rename has completed the
+			// earlier rewrap.
+			if swap := tc.resume == "rename "+masterNextFingerprintName; errors.Is(err, ErrRewrapSwapUnsynced) != swap {
+				t.Fatalf("Rewrap failing a resume at %s = %v; ErrRewrapSwapUnsynced matches %v, want %v", tc.resume, err, !swap, swap)
+			}
+			// The earlier key finishes it: a rerun with it completes the
+			// rewrap, or, when the failed step came after the last rename,
+			// finds that key already live.
+			s.step = func(string) error { return nil }
+			if err := s.Rewrap(ctx, rewrapKey(1)); err != nil && !errors.Is(err, ErrRewrapNotStarted) {
+				t.Fatalf("Rewrap with the earlier key after the failed resume: %v", err)
+			}
+			checkMasterIs(t, server, rewrapKey(1))
+			checkUnderKey(t, server, rewrapKey(1))
+		})
+	}
+	t.Run("a resume with the caller's own key is not another key's", func(t *testing.T) {
+		s, _ := interrupted(t, "rename a/v1")
+		s.step = failAt("rename b/v1")
+		err := s.Rewrap(ctx, rewrapKey(1))
+		if err == nil || errors.Is(err, ErrRewrapResumeFailed) || errors.Is(err, ErrRewrapNotStarted) {
+			t.Fatalf("Rewrap resuming its own key, failing = %v, want neither marker", err)
+		}
+	})
+}
+
+// TestRewrapOwnSwapUnsynced: a Rewrap whose own master swap goes through
+// and then fails (the sync or step after the second rename) matches
+// ErrRewrapSwapUnsynced alone, never ErrRewrapResumeFailed or
+// ErrRewrapNotStarted, and the master is the key it was given.
+func TestRewrapOwnSwapUnsynced(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	seedRewrap(t, s)
+	s.step = failAt("rename " + masterNextFingerprintName)
+	err := s.Rewrap(ctx, rewrapKey(1))
+	if !errors.Is(err, ErrRewrapSwapUnsynced) || errors.Is(err, ErrRewrapResumeFailed) || errors.Is(err, ErrRewrapNotStarted) {
+		t.Fatalf("Rewrap failing after its own swap = %v, want ErrRewrapSwapUnsynced alone", err)
+	}
+	// The marker's text fits this run's own swap too.
+	if strings.Contains(err.Error(), "earlier") {
+		t.Fatalf("Rewrap failing after its own swap = %v: names an earlier rewrap", err)
+	}
+	checkMasterIs(t, server, rewrapKey(1))
+	checkUnderKey(t, server, rewrapKey(1))
+	// A crash before the second rename is not a completed swap.
+	s2, _ := newTestStore(t)
+	seedRewrap(t, s2)
+	s2.step = failAt("rename " + masterNextName)
+	if err := s2.Rewrap(ctx, rewrapKey(1)); err == nil || errors.Is(err, ErrRewrapSwapUnsynced) {
+		t.Fatalf("Rewrap failing between the master renames = %v, want an error that is not ErrRewrapSwapUnsynced", err)
+	}
+}
+
+// TestRecordsSealedUnder: RecordsSealedUnder reports a key that some
+// committed record opens under, beside the live master, which is how a
+// Rewrap whose master.next was replaced or removed is recognised, and
+// reports no other key: not one never used, not the live master, not the
+// key of a Rewrap that renamed nothing in. It writes nothing.
+func TestRecordsSealedUnder(t *testing.T) {
+	ctx := context.Background()
+	crashed := func(t *testing.T, at string, damage func(server string)) (*FileStore, string) {
+		t.Helper()
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		s.step = func(name string) error {
+			if name == at {
+				damage(server)
+				return fmt.Errorf("injected crash at %s", name)
+			}
+			return nil
+		}
+		if err := s.Rewrap(ctx, rewrapKey(1)); err == nil {
+			t.Fatal("Rewrap succeeded through a crash")
+		}
+		s.step = func(string) error { return nil }
+		return s, server
+	}
+	removeNext := func(server string) {
+		for _, n := range []string{masterNextName, masterNextFingerprintName} {
+			if err := os.Remove(masterPath(server, n)); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	for name, tc := range map[string]struct {
+		at     string
+		damage func(server string)
+		key    []byte
+		want   bool
+	}{
+		"removed after one record moved":   {"rename a/v1", removeNext, rewrapKey(1), true},
+		"removed after every record moved": {"rename b/current", removeNext, rewrapKey(1), true},
+		"replaced after one record moved":  {"rename a/v1", func(server string) { plantNext(t, server, rewrapKey(9)) }, rewrapKey(1), true},
+		"another key":                      {"rename a/v1", removeNext, rewrapKey(2), false},
+		"the planted key":                  {"rename a/v1", func(server string) { plantNext(t, server, rewrapKey(9)) }, rewrapKey(9), false},
+		"nothing renamed in yet":           {"write v1.new", removeNext, rewrapKey(1), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, server := crashed(t, tc.at, tc.damage)
+			snap := treeSnapshot(t, filepath.Dir(server))
+			got, err := s.RecordsSealedUnder(ctx, tc.key)
+			if err != nil || got != tc.want {
+				t.Fatalf("RecordsSealedUnder = %v, %v; want %v", got, err, tc.want)
+			}
+			checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
+		})
+	}
+	t.Run("a clean keystore and the live master", func(t *testing.T) {
+		s, server := newTestStore(t)
+		seedRewrap(t, s)
+		live, err := os.ReadFile(masterPath(server, masterName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range [][]byte{rewrapKey(1), live} {
+			if got, err := s.RecordsSealedUnder(ctx, key); err != nil || got {
+				t.Fatalf("RecordsSealedUnder(%x) = %v, %v; want false", key[:1], got, err)
+			}
+		}
+	})
 }

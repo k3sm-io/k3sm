@@ -192,7 +192,10 @@ install` ("User scope", "On-disk layout").
 ### Master key lifecycle
 
 - **Who mints it.** Only k3sm, from `crypto/rand`, 32 bytes. An operator never supplies a
-  master key, to any verb, and no verb takes one as input.
+  master key, to any verb, and no verb accepts an operator-made key. `rewrap --key-out FILE`
+  saves the key k3sm minted so a crashed rewrap can be finished; `rewrap --key-in FILE`
+  only re-reads such a key: its SHA-256 is the `master.next.sha256` an interrupted rewrap
+  recorded, or some record already opens under it and not under the live master.
 - **When it is created.** By the first root-run `k3sm keys put` that finds no master and
   an empty or absent `keystore/`. The one other state a put mints over, still only with
   `keystore/` empty, is the one an interrupted mint leaves: a master that passes every
@@ -207,10 +210,7 @@ install` ("User scope", "On-disk layout").
   everything under it. Phase A exposes it as a verb because the maintainer ruled the
   master is created and rotated only by root-run verbs. `Store.Rewrap` keeps taking the
   new key as an argument so tests can drive it; the verb is its only production caller and
-  always passes a key k3sm minted. As built, `rewrap --key-out FILE` mints the key and saves
-  it to FILE before anything changes, and `rewrap --key-in FILE` reads back only that saved
-  key, to finish an interrupted rewrap (the recovery under "Rewrap"); the key is still minted
-  by k3sm, never made by the operator.
+  passes a freshly minted key, or, with `--key-in`, the one an interrupted rewrap recorded.
 - **Who reads it.** The server process (the delivery reconciler), as the service user,
   through the same checked open as every other reader.
 
@@ -734,9 +734,9 @@ show system/<name> [--version N] [--reveal [--yes]]
       label; no metadata is printed in that mode, so a pipe sees only the
       value. An opaque value comes back at its stored length and an Ed25519
       value at exactly 32 or 64 bytes, which is what `rotate` accepts, so
-      `show --reveal` into `rotate --in -` is a byte-exact round trip. To a
-      terminal, --reveal writes the value only with --yes, and then still
-      adds no newline.
+      `show --reveal` into `rotate --in -` is a byte-exact round trip. When
+      stdout is a terminal, --reveal refuses unless --yes is also given, and
+      then writes the raw bytes; it does not add a newline for the prompt.
 
 rotate system/<name> [--in FILE|- | --from-version N]
       A new version, made current. The value comes from the same source as
@@ -748,12 +748,14 @@ rm system/<name> --yes
       Deletes every version. Irreversible; refuses without --yes.
 
 rewrap --key-out FILE | --key-in FILE
-      Mint a new master and re-seal every record under it. --key-out writes
-      the freshly minted key to FILE, a new file at mode 0600, before
-      anything changes; keep it until rewrap reports success, then delete it.
-      --key-in FILE finishes an interrupted rewrap with the key an earlier
-      --key-out saved there. Takes no value. Prints that entry backups taken
-      earlier no longer open.
+      Mint a new master and re-seal every record under it. --key-out FILE
+      first saves the minted key to FILE, a new 0600 file in a root-only
+      directory, for crash recovery; the file is deleted only when the rewrap
+      fails before sealing anything under the key. --key-in FILE only
+      finishes an interrupted rewrap: it re-reads a key whose SHA-256 matches
+      the recorded master.next.sha256, or that some record already opens
+      under, and refuses any other. Takes no value.
+      Prints that entry backups taken earlier no longer open.
 
 deliver system/<name> --namespace NS [--secret NAME] [--data-key KEY] [--remove]
       Root delivery: declare (or, with --remove, withdraw) delivery of an
@@ -3073,7 +3075,7 @@ last pull request lands and no row is pending.
 | G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock` |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
 | G9 | A Rotate retry discards an orphaned next version and seals the value it was given | unit: orphan with value A, retry with value B, expect B |
-| G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts an operator-made key; `rewrap --key-in` only re-reads a key whose SHA-256 equals the fingerprint k3sm recorded when `--key-out` saved it |
+| G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts an operator-made key: `rewrap --key-in` refuses a key that is neither the recorded `master.next.sha256` nor one some record already opens under |
 | G11 | The master is opened with O_NOFOLLOW and judged by fstat on the open descriptor; wrong mode, owner or fingerprint is `ErrMasterUntrusted` | unit: one case each |
 | G12 | Rewrap resumes after a crash at every step, trying the old then the new key, and leaves no record readable by neither; a `master.next` that disagrees with its fingerprint is discarded only when no `.new` file exists, and refused with `ErrMasterUntrusted` otherwise | unit: fault injection at each of steps 2 to 5, then rerun; a corrupted `master.next` with and without a `.new` file |
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |

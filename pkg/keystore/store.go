@@ -88,6 +88,13 @@ type Config struct {
 	// DataRoot is the data root, /var/lib/k3sm, which holds the root-owned
 	// pointer floor, keystore-floor.json.
 	DataRoot string
+	// FloorUID and FloorGID name the owner of the data root and the floor.
+	// They are for tests only: production leaves them 0 (root), and only a
+	// non-root test, which cannot make a root-owned file, sets them.
+	//
+	// A negative value, or a nonzero one in a process whose effective uid is
+	// 0, makes every operation fail: root's floor belongs to root.
+	FloorUID, FloorGID int
 }
 
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
@@ -111,10 +118,11 @@ type FileStore struct {
 	// step is called at each durable step of a write; a non-nil return aborts
 	// the write there, as a crash would.
 	step func(name string) error
-	// floorUID and floorGID own the floor and the data root: root in
-	// production, the test user in tests, which cannot create a root-owned
-	// file.
-	floorUID, floorGID uint32
+	// floorUID and floorGID own the floor and the data root, from
+	// Config.FloorUID and Config.FloorGID: root in production, the test user
+	// in a non-root test. checkConfig refuses a negative one, so the
+	// conversion to a uid_t after it is exact.
+	floorUID, floorGID int
 	// entryMade is called between a new entry directory's mkdir and its open,
 	// where a test swaps the directory.
 	entryMade func(name string)
@@ -141,6 +149,8 @@ func New(cfg Config) *FileStore {
 		dataRoot:       cfg.DataRoot,
 		uid:            cfg.UID,
 		gid:            cfg.GID,
+		floorUID:       cfg.FloorUID,
+		floorGID:       cfg.FloorGID,
 		scope:          scopeSystem,
 		rand:           rand.Reader,
 		now:            time.Now,
@@ -159,12 +169,19 @@ func New(cfg Config) *FileStore {
 // root-owned ones; a Dir, MasterDir or DataRoot that is empty or relative,
 // which would resolve against the working directory, or not equal to its own
 // filepath.Clean, whose last component (a trailing slash, a "..") would not be
-// the directory the store opens it as; or a MasterDir equal to or inside Dir,
-// which would put the master among the entries and in every backup of them.
+// the directory the store opens it as; a MasterDir equal to or inside Dir,
+// which would put the master among the entries and in every backup of them;
+// or a negative FloorUID or FloorGID, or, in a process whose effective uid
+// (the euid seam) is 0, a nonzero one, which would trust a floor root does
+// not own.
 func (s *FileStore) checkConfig() error {
 	switch {
 	case s.uid == 0:
 		return fmt.Errorf("%w: the service user's UID is 0", errInvalidConfig)
+	case s.floorUID < 0 || s.floorGID < 0:
+		return fmt.Errorf("%w: FloorUID %d or FloorGID %d is negative", errInvalidConfig, s.floorUID, s.floorGID)
+	case s.euid() == 0 && (s.floorUID != 0 || s.floorGID != 0):
+		return fmt.Errorf("%w: running as root, the floor's owner must be root, not %d:%d", errInvalidConfig, s.floorUID, s.floorGID)
 	case s.dir == "":
 		return fmt.Errorf("%w: Dir is empty", errInvalidConfig)
 	case s.masterDir == "":

@@ -30,7 +30,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "share", "expose", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "interconnect", "build", "builder", "image", "model", "registry", "kubectl", "kubeconfig", "status", "alerts", "update", "doctor", "dev" are implemented):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "start", "restart", "network", "share", "expose", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "keys", "interconnect", "build", "builder", "image", "model", "registry", "kubectl", "kubeconfig", "status", "alerts", "update", "doctor", "dev" are implemented):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -67,6 +67,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "stop", "st
               (--report writes a redacted bug-report bundle)
   snapshot    back up, restore, list and prune datastore snapshots (snapshot save|restore|ls|delete|prune)
   secrets-encrypt  report secrets encryption at rest (secrets-encrypt status)
+  keys        keep key material encrypted at rest on this server (keys put|list|show|rotate|rm|rewrap; run as root via sudo)
   interconnect     arm or disarm the Thunderbolt cable as an opt-in network (interconnect enable|disable)
   version     print version (--short: the release version alone)
 
@@ -178,6 +179,10 @@ func main() {
 		// The exit code is the verdict: a refused or unreadable state is
 		// non-zero, so a script can gate on it.
 		os.Exit(runSecretsEncrypt(os.Args[2:], os.Stdout, os.Stderr))
+	case "keys":
+		// keys returns its own exit code: list exits 1 on a corrupt entry, and
+		// rewrap 3 when it completed an earlier rewrap instead.
+		os.Exit(runKeys(os.Args[2:], os.Stdout, os.Stderr))
 	case "interconnect":
 		if err := runInterconnect(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm interconnect:", err)

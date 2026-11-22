@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -61,14 +63,48 @@ const newSuffix = ".new"
 // not re-sealed; the next Put of its name discards it. A version above the one
 // the pointer names, which a Rotate interrupted before its flip leaves, is not
 // committed and is not re-sealed either; the next Rotate discards it.
+//
+// Every error it returns before it first writes master.next from newMaster
+// also matches ErrRewrapNotStarted: nothing was then sealed under newMaster
+// by this call. That covers the config, size, floor-writable, lock, .user,
+// master and live-key refusals, an empty keystore, the floor raise, and a
+// plan refused because an entry does not open, as well as ErrRewrapResumed
+// (the run completed another key). An error after that write never matches
+// it, whatever its cause.
+//
+// An error while it completes an earlier rewrap under that rewrap's key,
+// once it has advanced it (a record renamed in, or the master swap moved),
+// matches ErrRewrapResumeFailed instead, and never ErrRewrapNotStarted: the
+// earlier key, not newMaster, finishes it.
 func (s *FileStore) Rewrap(ctx context.Context, newMaster []byte) error {
-	if err := s.rewrap(ctx, newMaster); err != nil {
+	var p rewrapProgress
+	if err := s.rewrap(ctx, newMaster, &p); err != nil {
+		switch {
+		case p.resuming && !errors.Is(err, ErrRewrapResumed):
+			return fmt.Errorf("rewrap: %w (%w)", err, ErrRewrapResumeFailed)
+		case !p.started:
+			return fmt.Errorf("rewrap: %w (%w)", err, ErrRewrapNotStarted)
+		}
 		return fmt.Errorf("rewrap: %w", err)
 	}
 	return nil
 }
 
-func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
+// rewrapProgress is how far a Rewrap got, which decides the marker its error
+// carries.
+type rewrapProgress struct {
+	// started is set just before Rewrap first writes master.next from the key
+	// it was given, or resumes a rewrap under that same key.
+	started bool
+	// resuming is set once Rewrap is completing an earlier rewrap under
+	// another key: from the plan that resumes it, or from a half-done master
+	// swap it moved on.
+	resuming bool
+}
+
+// rewrap is Rewrap. It records its progress in p.
+func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, p *rewrapProgress) error {
+	started := &p.started
 	if err := s.checkConfig(); err != nil {
 		return err
 	}
@@ -119,6 +155,11 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	// run completes it, and with it the interrupted Rewrap, and says so.
 	done, err := s.finishSwap(mroot)
 	if err != nil {
+		// done with an error: the swap moved, then its sync or step failed.
+		if done {
+			p.resuming = true
+			return fmt.Errorf("%w (%w)", err, ErrRewrapSwapUnsynced)
+		}
 		return err
 	}
 	k, err := s.loadMaster()
@@ -142,9 +183,9 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	}
 	old := k
 	old.next = nil
-	next, plan, resuming, err := s.prepareNext(ctx, root, mroot, fl, old, newMaster)
+	next, plan, resuming, err := s.prepareNext(ctx, root, mroot, fl, old, newMaster, started)
 	if errors.Is(err, ErrCorrupt) || errors.Is(err, ErrMasterUntrusted) {
-		k, p, ok, aerr := s.adoptSupplied(ctx, root, mroot, fl, old, newMaster)
+		k, p, ok, aerr := s.adoptSupplied(ctx, root, mroot, fl, old, newMaster, started)
 		if aerr != nil {
 			return aerr
 		}
@@ -156,6 +197,15 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 		return err
 	}
 	defer next.wipe()
+	if resuming {
+		// A master.next of newMaster's own is this caller's rewrap, resumed
+		// with its key; any other is an earlier rewrap's.
+		if resumed(next, newMaster) == nil {
+			*started = true
+		} else {
+			p.resuming = true
+		}
+	}
 	if err := s.sealNew(ctx, root, fl, plan, old, next); err != nil {
 		return err
 	}
@@ -169,13 +219,135 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte) error {
 	if err := refuseUserScopes(root); err != nil {
 		return fmt.Errorf("records were re-sealed under %s, but the master was not swapped: %w", masterNextName, err)
 	}
-	if err := s.swapMaster(mroot, next); err != nil {
+	if swapped, err := s.swapMaster(mroot, next); err != nil {
+		// A swap that went through and then failed (its last sync or step)
+		// left the rewrap complete: under the earlier key on a resume, under
+		// newMaster otherwise.
+		if swapped {
+			return fmt.Errorf("%w (%w)", err, ErrRewrapSwapUnsynced)
+		}
 		return err
 	}
 	if resuming {
 		return resumed(next, newMaster)
 	}
 	return nil
+}
+
+// InterruptedRewrap reports the fingerprint, SHA-256 of the key, that an
+// interrupted Rewrap recorded in master.next.sha256, with ok set, or ok unset
+// when no Rewrap left one: no entries' directory, no master directory, or no
+// master.next.sha256. It reads under the shared lock and writes nothing. A
+// fingerprint file that is not the service user's, not mode 0600 or does not
+// parse is ErrMasterUntrusted.
+//
+// The record is the only evidence of which key a crashed Rewrap was sealing
+// under, so a caller that would hand Rewrap a key it did not mint itself
+// checks that key against it first: a key no Rewrap recorded is no recovery.
+func (s *FileStore) InterruptedRewrap(ctx context.Context) (fingerprint [sha256.Size]byte, ok bool, err error) {
+	fp, ok, err := s.interruptedRewrap(ctx)
+	if err != nil {
+		return fp, false, fmt.Errorf("check for an interrupted rewrap: %w", err)
+	}
+	return fp, ok, nil
+}
+
+func (s *FileStore) interruptedRewrap(ctx context.Context) ([sha256.Size]byte, bool, error) {
+	var fp [sha256.Size]byte
+	if err := s.checkConfig(); err != nil {
+		return fp, false, err
+	}
+	_, done, err := s.openLocked(ctx, false, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fp, false, nil
+	}
+	if err != nil {
+		return fp, false, err
+	}
+	defer done()
+	mroot, err := s.openMasterDir(false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fp, false, nil
+	}
+	if err != nil {
+		return fp, false, fmt.Errorf("%w: %w", ErrMasterUntrusted, err)
+	}
+	defer func() { _ = mroot.Close() }() // read-only; nothing to flush
+	recorded, fi, err := readFile(mroot, masterNextFingerprintName, fingerprintFileSize)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fp, false, nil
+	}
+	if err != nil {
+		return fp, false, fmt.Errorf("%w: %s: %w", ErrMasterUntrusted, masterNextFingerprintName, err)
+	}
+	if err := s.checkOwned(fi, fileMode); err != nil {
+		return fp, false, fmt.Errorf("%w: %s: %w", ErrMasterUntrusted, masterNextFingerprintName, err)
+	}
+	if fi.Mode().Perm() != fileMode {
+		return fp, false, fmt.Errorf("%w: %s: mode %04o, want %04o", ErrMasterUntrusted, masterNextFingerprintName, fi.Mode().Perm(), fileMode)
+	}
+	hexFP, nl := strings.CutSuffix(string(recorded), "\n")
+	n, derr := hex.Decode(fp[:], []byte(hexFP))
+	if !nl || derr != nil || n != sha256.Size || len(hexFP) != hex.EncodedLen(sha256.Size) {
+		return [sha256.Size]byte{}, false, fmt.Errorf("%w: %s is not a hex SHA-256 and a newline", ErrMasterUntrusted, masterNextFingerprintName)
+	}
+	return fp, true, nil
+}
+
+// RecordsSealedUnder reports whether the keystore holds records a Rewrap to
+// key already committed: every record opens under the live master or under
+// key, and at least one only under key. That is the state a Rewrap leaves
+// when it is interrupted after renaming records in and its master.next is
+// then replaced or removed, and Rewrap(key) completes it. A key no Rewrap
+// sealed under, the live master included, reports false. It reads under the
+// shared lock and writes nothing.
+func (s *FileStore) RecordsSealedUnder(ctx context.Context, key []byte) (bool, error) {
+	ok, err := s.recordsSealedUnder(ctx, key)
+	if err != nil {
+		return false, fmt.Errorf("check for records sealed under the key: %w", err)
+	}
+	return ok, nil
+}
+
+func (s *FileStore) recordsSealedUnder(ctx context.Context, key []byte) (bool, error) {
+	if err := s.checkConfig(); err != nil {
+		return false, err
+	}
+	if len(key) != masterSize {
+		return false, fmt.Errorf("the key is %d bytes, want %d", len(key), masterSize)
+	}
+	root, done, err := s.openLocked(ctx, false, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer done()
+	fdir, fl, err := s.openFloor()
+	if err != nil {
+		return false, err
+	}
+	_ = fdir.Close() // read-only; nothing to flush
+	old, err := s.loadMaster()
+	if err != nil {
+		return false, err
+	}
+	old.next = nil
+	k, err := deriveKeys(key, s.scope)
+	if err != nil {
+		return false, err
+	}
+	defer k.wipe()
+	_, committed, err := rewrapPlan(ctx, root, fl, old, &k)
+	if errors.Is(err, ErrCorrupt) {
+		// Some record opens under neither key: not a Rewrap to key.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return committed, nil
 }
 
 // resumed is ErrRewrapResumed, unless the key a resumed Rewrap completed, now
@@ -245,7 +417,7 @@ func refuseUserScopes(root *os.Root) error {
 // With nothing to resume, every record must open under the live master before
 // master.next is written, so a Rewrap over an entry that does not open writes
 // nothing.
-func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte) (keys, []planned, bool, error) {
+func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte, started *bool) (keys, []planned, bool, error) {
 	raw, err := s.readNext(mroot)
 	if err == nil {
 		k, derr := deriveKeys(raw, s.scope)
@@ -290,6 +462,7 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 		}
 		return keys{}, nil, false, perr
 	}
+	*started = true
 	if err := s.writeNext(mroot, newMaster); err != nil {
 		return keys{}, nil, false, err
 	}
@@ -309,7 +482,7 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 // returns the keys to resume under, ok set. Otherwise it writes nothing and
 // reports !ok, and the caller keeps prepareNext's refusal. A record under any
 // third key fails the plan, so this never orphans one.
-func (s *FileStore) adoptSupplied(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte) (keys, []planned, bool, error) {
+func (s *FileStore) adoptSupplied(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte, started *bool) (keys, []planned, bool, error) {
 	k, err := deriveKeys(newMaster, s.scope)
 	if err != nil {
 		return keys{}, nil, false, err
@@ -326,6 +499,7 @@ func (s *FileStore) adoptSupplied(ctx context.Context, root, mroot *os.Root, fl 
 		k.wipe()
 		return keys{}, nil, false, nil
 	}
+	*started = true
 	if err := s.writeNext(mroot, newMaster); err != nil {
 		k.wipe()
 		return keys{}, nil, false, err
@@ -640,36 +814,41 @@ func (s *FileStore) commitNew(ctx context.Context, root *os.Root, fl floor, plan
 // so the key the records were sealed under is the one that becomes the
 // master; otherwise it stops with ErrMasterUntrusted before the fingerprint
 // rename.
-func (s *FileStore) swapMaster(mroot *os.Root, next keys) error {
+// It reports swapped once the second rename is made, with or without an
+// error after it.
+func (s *FileStore) swapMaster(mroot *os.Root, next keys) (swapped bool, err error) {
 	raw, err := s.readNext(mroot)
 	if err != nil {
-		return err
+		return false, err
 	}
 	k, err := deriveKeys(raw, s.scope)
 	clear(raw)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !hmac.Equal(k.seal, next.seal) {
-		return fmt.Errorf("%w: %s changed during the rewrap", ErrMasterUntrusted, masterNextName)
+		return false, fmt.Errorf("%w: %s changed during the rewrap", ErrMasterUntrusted, masterNextName)
 	}
 	for _, r := range [][2]string{{masterNextName, masterName}, {masterNextFingerprintName, masterFingerprintName}} {
 		if err := mroot.Rename(r[0], r[1]); err != nil {
-			return err
+			return false, err
 		}
+		// After the second rename the swap is complete: a later error is
+		// reported with swapped set.
+		swapped = r[1] == masterFingerprintName
 		if err := syncDir(mroot); err != nil {
-			return err
+			return swapped, err
 		}
 		if r[1] == masterName {
 			if err := s.checkMasterIs(mroot, next); err != nil {
-				return err
+				return false, err
 			}
 		}
 		if err := s.step("rename " + r[0]); err != nil {
-			return err
+			return swapped, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // checkMasterIs refuses, as ErrMasterUntrusted, a master file that is not the

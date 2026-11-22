@@ -27,7 +27,10 @@
 # exits 0 without the rig. Phase A is complete when --check exits 0.
 #
 # Modes. Neither --check nor a unit mode calls sudo.
-#   --check         every G and U row; the E rows print as RIG (run --lab).
+#   --check         every G and U row; the E rows print as RIG (run --lab). It
+#                   runs every package a row names, whole: the keystore package's
+#                   tests, and for the CLI rows (G7, G10, G16, G17, G21) the keys
+#                   verbs' tests in ./cmd/k3sm/, named k3sm/cmd/k3sm::<Test> below.
 #   --rewrap        Rewrap's rows: G3, G12, G13, G14 and U5.
 #   --verbs         the keys verbs: G16, G17, G21, U1.
 #   --delivery      the system delivery: G18 to G20.
@@ -367,20 +370,22 @@ check G3 "every seal draws a fresh nonce, Rewrap included, which changes every n
 check G4 "Delete then Put does not reopen the old v1" TestDeleteThenPutRefusesReplayedRecord
 check G5 "a copied-back current is refused against the floor, with its own message; nothing recorded for the name accepts it" \
 	TestFloorRefusesCopiedBackPointer TestFloorCheck
-check G6 "the floor and the data root are root-owned and not shared, judged on the descriptor; the floor is the system scope's, parsed strictly; a caller that cannot write it changes nothing" \
-	TestFloorTrust TestFloorScope FuzzParseFloor TestFloorNotWritableChangesNothing
-partial G7 "the floor is raised by Put, Rotate, RaiseFloor and Delete when the master opens; one behind is accepted; each write re-reads it under the data-root lock, with a bounded wait (library)" \
-	"list/show call RaiseFloor (PR 4: k3sm keys)" \
-	TestFloorRaised TestFloorWriteRereads TestFloorLockBoundedWait
+check G6 "the floor and the data root are root-owned and not shared, judged on the descriptor; the floor is the system scope's, parsed strictly; a caller that cannot write it changes nothing; no non-test file sets the floor's owner" \
+	TestFloorTrust TestFloorScope FuzzParseFloor TestFloorNotWritableChangesNothing TestFloorOwnerUnsetOutsideTests
+check G7 "the floor is raised by Put, Rotate, RaiseFloor and Delete when the master opens, and by list and show before they read; one behind is accepted; each write re-reads it under the data-root lock, with a bounded wait" \
+	TestFloorRaised TestFloorWriteRereads TestFloorLockBoundedWait k3sm/cmd/k3sm::TestKeysReadVerbsRaiseFloor
 check G8 "Rotate flips the pointer last; a crash before the flip leaves the old version current" \
 	TestRotateCrashAtEveryStep TestRotate
 check G9 "a Rotate retry discards the orphan and seals the value it was given" TestRotateRetryDiscardsOrphan TestParseVersionName
-check G10 "the master is minted only by the first put, never over entries" TestMasterMint TestMintCountsReservedUserName
+check G10 "the master is minted only by the first put, never over entries; rewrap --key-in accepts only a key an interrupted rewrap recorded or sealed records under" \
+	TestMasterMint TestMintCountsReservedUserName \
+	k3sm/cmd/k3sm::TestKeysRewrapKeyInRecoveryOnly TestKeysRewrapKeyInRecoversReplacedNext
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 check G12 "Rewrap resumes after a crash at every step, old key then new, nothing unreadable; a bad master.next is discarded only with no .new file" \
 	TestRewrapCrashAtEveryStep TestRewrapKeyReuse TestRewrapRefusesStalePointer TestRewrapVerifiesCommit TestRewrapGuards \
 	TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap TestRewrapRecoversReplacedNext \
-	TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata TestRewrapUserScopesUnderLock
+	TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata TestRewrapUserScopesUnderLock \
+	TestInterruptedRewrap TestRecordsSealedUnder TestRewrapNotStarted
 check G13 "a crash between the master renames leaves a trusted master, and the next verb completes the swap" \
 	TestRewrapMasterRenameCompleted TestFinishSwapLeavesUnmatchedFingerprint
 check G14 "one lock with a bounded wait serializes Rewrap, Rotate, Put, Delete and the reads, and no read blocks" \
@@ -388,16 +393,18 @@ check G14 "one lock with a bounded wait serializes Rewrap, Rotate, Put, Delete a
 check G15 "files a root verb writes are the service user's, at the layout's modes, inside the store" \
 	TestOwnership TestCredSymlinkRefused TestRefusesSymlinks TestMkdirRefusesSwappedDirectory \
 	TestCreateEntryRefusesSwappedDirectory TestConfigRefused
-partial G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves and with its generation not in the floor, and Delete removes it too (library)" \
-	"list exits 1 on a corrupt entry (PR 4: k3sm keys)" \
+check G16 "List marks an unreadable entry with Err, and Delete still removes it; an entry directory with no current is an interrupted put only in the shape a crashed Put leaves and with its generation not in the floor, and Delete removes it too; list exits 1 on a corrupt entry" \
 	TestListMarksCorruptEntry TestDeleteCorruptEntry TestEntryWithNoPointer TestCommittedBeforeDecodesGeneration \
 	TestDeletePlantedNonDirectory TestDeleteDirectoryAtCurrent TestPointerVersionBound TestPutCrashAtEveryStep \
-	TestMkdirSyncsParent
-pend G17 "show prints a value only with --reveal, byte-exact (PR 4)"
+	TestMkdirSyncsParent \
+	k3sm/cmd/k3sm::TestKeysListCorruptExitsOne TestKeysRmCorruptEntry
+check G17 "show prints a value only with --reveal, byte-exact for an opaque value and 32- and 64-byte Ed25519 values; no verb takes a value as an argument" \
+	k3sm/cmd/k3sm::TestKeysShowRevealByteExact TestKeysShowMetadataOnly TestKeysRefusals
 pend G18 "delivery refused while encryption is off (PR 5)"
 pend G19 "the delivery declaration is root-owned (PR 5)"
 pend G20 "the reconciler touches only its labelled Secrets (PR 5)"
-pend G21 "the rollback recipe is a byte-exact round trip (PR 4)"
+check G21 "the rollback recipe is a byte-exact round trip: show --reveal into rotate --in -, the new version compared with version N byte for byte (bytes.Equal, as cmp), opaque and Ed25519" \
+	k3sm/cmd/k3sm::TestKeysRollbackRoundTrip
 special g22 G22
 
 pend U1 "rotate --from-version N writes version N's bytes as a new version server side; no value leaves the store (keys verbs)" \

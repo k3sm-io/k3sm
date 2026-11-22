@@ -270,7 +270,18 @@ func TestFloorTrust(t *testing.T) {
 	}{
 		{"group-writable", func(t *testing.T, _ *FileStore, server string) { chmod(t, floorPath(server), 0o664) }, errFloorUntrusted},
 		{"other-writable", func(t *testing.T, _ *FileStore, server string) { chmod(t, floorPath(server), 0o646) }, errFloorUntrusted},
-		{"not owned by root", func(t *testing.T, s *FileStore, _ string) { s.floorUID++ }, errFloorUntrusted},
+		{"not owned by root", func(t *testing.T, s *FileStore, server string) {
+			// As root, the floor is handed to another user; a store run as
+			// root may name no owner but root. Non-root, the store names an
+			// owner other than the floor's.
+			if asRoot() {
+				if err := os.Lchown(floorPath(server), int(otherUID(t)), 0); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			s.floorUID++
+		}, errFloorUntrusted},
 		{"a symlink", func(t *testing.T, _ *FileStore, server string) {
 			copyFile(t, floorPath(server), floorPath(server)+".real")
 			replaceWithSymlink(t, floorPath(server), floorName+".real")
@@ -333,10 +344,10 @@ func TestFloorTrust(t *testing.T) {
 		if fi.Mode() != floorFileMode {
 			t.Errorf("floor mode %s, want %s", fi.Mode(), floorFileMode)
 		}
-		if len(owners) != 2 || owners[0] != int(s.floorUID) || owners[1] != int(s.floorGID) {
+		if len(owners) != 2 || owners[0] != s.floorUID || owners[1] != s.floorGID {
 			t.Errorf("floor chowned to %v, want %d:%d", owners, s.floorUID, s.floorGID)
 		}
-		if st := fi.Sys().(*syscall.Stat_t); st.Uid != s.floorUID {
+		if st := fi.Sys().(*syscall.Stat_t); int(st.Uid) != s.floorUID {
 			t.Errorf("floor owned by %d, want %d", st.Uid, s.floorUID)
 		}
 	})

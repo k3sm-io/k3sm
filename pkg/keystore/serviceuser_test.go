@@ -118,11 +118,11 @@ func serviceIDs(tb testing.TB) (uid, gid uint32) {
 // floorIDs returns the floor's and data root's owner: root when the tests run
 // as root, as in production, and the running user otherwise, which cannot
 // make a root-owned file.
-func floorIDs() (uid, gid uint32) {
+func floorIDs() (uid, gid int) {
 	if asRoot() {
 		return 0, 0
 	}
-	return uint32(os.Getuid()), uint32(os.Getgid())
+	return os.Getuid(), os.Getgid()
 }
 
 // otherUID returns a uid that is neither the service user's nor the running

@@ -306,7 +306,7 @@ func (s *FileStore) floorOwned(fi fs.FileInfo) error {
 	if !ok || st == nil {
 		return errors.New("owner unknown")
 	}
-	if st.Uid != s.floorUID {
+	if int64(st.Uid) != int64(s.floorUID) {
 		return fmt.Errorf("owned by uid %d, want %d", st.Uid, s.floorUID)
 	}
 	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
@@ -497,7 +497,7 @@ func (l *floorLock) update(op func(floor) bool) (floor, error) {
 	if len(b) > maxFloorSize {
 		return nil, fmt.Errorf("%w (%d bytes)", errFloorFull, len(b))
 	}
-	if err := l.s.writeFileAs(l.root, floorName, b, l.s.floorUID, l.s.floorGID, floorFileMode); err != nil {
+	if err := l.s.writeFileAs(l.root, floorName, b, uint32(l.s.floorUID), uint32(l.s.floorGID), floorFileMode); err != nil {
 		return nil, err
 	}
 	return fl, nil

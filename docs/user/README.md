@@ -67,6 +67,8 @@ run on hardware, that is an added caveat: nobody has exercised it on real Macs y
 28. [Helm charts](helm.md) covers installing releases with the `HelmChart` object.
 29. [FAQ](faq.md) gives short answers to the common questions.
 30. [Privacy](privacy.md) lists what the k3sm app's update check sends and what it still reveals.
+31. [Keys](keys.md) covers `k3sm keys`: key material kept encrypted at rest on a server, with
+    versions, rotation, rollback and a master key you can change.
 
 ## Before You Build Anything Real
 
