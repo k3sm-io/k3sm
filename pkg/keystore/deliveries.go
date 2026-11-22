@@ -731,6 +731,11 @@ func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery, g *grantA
 		sort.Slice(d.items, func(i, j int) bool { return d.items[i].Key < d.items[j].Key })
 		d.digest = deliveryDigest(d.entry, d.namespace, d.secretName, d.items)
 		d.withdrawn, d.delivered = false, 0
+		// Refuse, before the grant's first write, a deliver whose floor line
+		// would be refused after its commit, as put does.
+		if err := u.s.floorDeliverRoom(u.scope, o.gen); err != nil {
+			return err
+		}
 		if err := grant(); err != nil {
 			return err
 		}
@@ -908,6 +913,11 @@ func (u *UserScope) grantLocked(ctx context.Context, g *grantAudit, fn func(*ope
 	}
 	o, entries, err := u.openScopeFull(root, func() (keys, error) { return k, nil })
 	if errors.Is(err, errNoScopeKey) {
+		// The mint and then fn each append a floor line for the delivery
+		// record: one new key, preflighted before the mint's first write.
+		if err := u.s.floorGrantRoomKeys(u.scope, []string{deliveriesFloorName, deliveriesFloorName}, func(*logState) int { return 1 }); err != nil {
+			return err
+		}
 		_, entries, err = u.mint(root, k.wrap, grant)
 		if err == nil {
 			_ = entries.Close() // nothing written through it here

@@ -80,3 +80,20 @@ func TestPutRefusedFirstAtCapStraddle(t *testing.T) {
 	u2 := userScope(t, s, 1002)
 	checkPutRefusedFirst(t, u2, server, "user/1002/token", ErrLogFull)
 }
+
+// A deliver whose floor line the floor would refuse after its commit is
+// refused before it seals anything: the delivery record is unchanged.
+func TestDeliverRefusedFirstBelowFloorMargin(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := fileLogScope(t)
+	if err := u.addDelivery(ctx, testDelivery(1)); err != nil {
+		t.Fatal(err)
+	}
+	snap := treeSnapshot(t, server)
+	s.userFloor.(*fileFloorLog).log.freeSpace = func(int) (uint64, error) { return logFreeMargin, nil }
+	err := u.addDelivery(ctx, testDelivery(2))
+	if !errors.Is(err, errLogNoSpace) || errors.Is(err, errCommitted) {
+		t.Fatalf("deliver below the floor's free-space margin: %v, want errLogNoSpace before any write", err)
+	}
+	checkTreeUnchanged(t, snap, treeSnapshot(t, server))
+}

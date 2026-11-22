@@ -1168,6 +1168,25 @@ func (s *FileStore) admit(uid uint32, revoke bool) error {
 // committed without its floor line is left only by a crash or an I/O error
 // between this check and the append. Only the file-backed floor is held.
 func (s *FileStore) floorGrantRoom(scope string, names []string) error {
+	return s.floorGrantRoomKeys(scope, names, nil)
+}
+
+// floorDeliverRoom is floorGrantRoom for a deliver's one floor line, the
+// delivery record's at gen: a new key only when the floor lacks it.
+func (s *FileStore) floorDeliverRoom(scope string, gen [generationSize]byte) error {
+	k := floorKey{scope, deliveriesFloorName, gen}
+	return s.floorGrantRoomKeys(scope, []string{deliveriesFloorName}, func(st *logState) int {
+		if _, ok := st.maxSeq[k]; ok || st.buried[k] {
+			return 0
+		}
+		return 1
+	})
+}
+
+// floorGrantRoomKeys is floorGrantRoom with newKeys, when set, counting the
+// keys the lines add from what the floor holds; nil counts each line as a
+// new key.
+func (s *FileStore) floorGrantRoomKeys(scope string, names []string, newKeys func(*logState) int) error {
 	ff, ok := s.userFloor.(*fileFloorLog)
 	if !ok {
 		return nil
@@ -1209,7 +1228,11 @@ func (s *FileStore) floorGrantRoom(scope string, names []string) error {
 	if size > s.logReadBound() {
 		return fmt.Errorf("%w (%s would pass the reader's bound)", ErrLogFull, l.name)
 	}
-	if err := l.addKeyRoom(state, scopeUID(scope), len(lines), false); err != nil {
+	n := len(lines)
+	if newKeys != nil {
+		n = newKeys(state)
+	}
+	if err := l.addKeyRoom(state, scopeUID(scope), n, false); err != nil {
 		return err
 	}
 	return l.preflight(f, total, false)
