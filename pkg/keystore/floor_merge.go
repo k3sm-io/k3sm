@@ -193,7 +193,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	// floor already holds (a rerun after a failed rename) writes nothing
 	// and is only renamed, whatever its newest deletion.
 	probe := maps.Clone(live)
-	pr, _ := probe.mergeAt(from, kept, ptrs)
+	pr, _ := probe.merge(from, kept, ptrs)
 	if unmatched := unmatchedKeep(kept, pr.Kept); len(unmatched) > 0 {
 		return MergeReport{}, fmt.Errorf("--keep names %s, which the merge would not delete: it keeps an entry only when the floor moved aside records its restored generation as deleted, or holds a newer generation of a name the restored floor does not record. Nothing is written; check the names and run the merge again without them", strings.Join(unmatched, ", "))
 	}
@@ -213,7 +213,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	// either: the floor is replaced by an atomic rename.
 	var capDropped []pruned
 	_, dropped, err := fdir.updatePruned(func(fl floor) bool {
-		r, capDropped = fl.mergeAt(from, kept, ptrs)
+		r, capDropped = fl.merge(from, kept, ptrs)
 		return r.changes()
 	})
 	if err != nil {
@@ -375,21 +375,18 @@ func (s *FileStore) readFloorAt(path string) (*mergeInput, error) {
 // neither holds live nor buries is buried after them (Retired), unless keep
 // names the entry and fl holds no live record of it (keep keeps the restored
 // generation, never a second one). A live generation in from that fl holds
-// live at a lower sequence gets from's sequence as its high-water mark
+// live at a sequence at or below from's gets a high-water mark (below)
 // (Fenced). At maxBuriedPerName, add drops the name's oldest, returned. It
 // does not prune: update does.
-func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) {
-	return fl.mergeAt(from, keep, nil)
-}
-
-// mergeAt is merge, given ptrs, the authenticated restored pointer sequence
-// of each name it fences (restoredPointers). A restored live record below
+//
+// ptrs is the authenticated restored pointer sequence of each name it
+// fences (restoredPointers), or nil. A restored live record below
 // its pointer, and not at or below its own high-water mark, is raised to the
 // pointer first (counted in raised), so the restored entry is never inside
 // the fence. The fence mark is one above the higher of the moved-aside
 // record's sequence and mark, so a pre-restore pointer one past a moved-aside
 // floor that lagged it is refused too; at the sequence limit it saturates.
-func (fl floor) mergeAt(from floor, keep map[string]bool, ptrs map[string]uint64) (MergeReport, []pruned) {
+func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) (MergeReport, []pruned) {
 	type at struct {
 		name string
 		b    burial

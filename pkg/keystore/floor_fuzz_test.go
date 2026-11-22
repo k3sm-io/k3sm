@@ -106,7 +106,7 @@ func FuzzMergeFloor(f *testing.F) {
 		for _, k := range strings.Split(keep, ",") {
 			keepSet[k] = true
 		}
-		r, d := restored.merge(aside, keepSet)
+		r, d := restored.merge(aside, keepSet, nil)
 		d = append(d, restored.prune()...)
 		dropped := map[key]bool{}
 		for _, x := range d {
@@ -192,7 +192,7 @@ func FuzzMergeFloor(f *testing.F) {
 			}
 		}
 		if len(d) == 0 {
-			if r2, d2 := restored.merge(aside, keepSet); r2.Merged+r2.Retired != 0 || len(r2.Fenced) != 0 || len(d2) != 0 {
+			if r2, d2 := restored.merge(aside, keepSet, nil); r2.Merged+r2.Retired != 0 || len(r2.Fenced) != 0 || len(d2) != 0 {
 				t.Fatalf("a second merge of the same floors = %+v, dropped %v; want nothing added", r2, d2)
 			}
 		}
@@ -393,7 +393,7 @@ func TestFloorOpsProperty(t *testing.T) {
 				}
 				keep := map[string]bool{names[rng.IntN(len(names))]: rng.IntN(2) == 0}
 				before := maps.Clone(fl)
-				_, d := fl.merge(from, keep)
+				_, d := fl.merge(from, keep, nil)
 				named := func(name, g string) bool { return from[name].buries(g) || from[name].Generation == g }
 				for name, e := range fl {
 					for _, b := range e.burials() {

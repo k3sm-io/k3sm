@@ -55,14 +55,14 @@ func TestFloorMergeSemantics(t *testing.T) {
 	for name, e := range restored {
 		kept[name] = e
 	}
-	r, dropped := restored.merge(aside, nil)
+	r, dropped := restored.merge(aside, nil, nil)
 	if r.Merged != 4 || r.AlreadyPresent != 1 || !slices.Equal(r.BuriedLive, []string{"live"}) || len(r.Kept) != 0 || len(dropped) != 0 {
 		t.Fatalf("merge = %+v, dropped %v; want 4 merged, 1 present, live buried, none kept or dropped", r, dropped)
 	}
 	if e := restored["live"]; e.live() || !e.buries(mgen(1)) {
 		t.Errorf("live after the merge = %+v, want its live generation buried", e)
 	}
-	r, _ = kept.merge(aside, map[string]bool{"live": true})
+	r, _ = kept.merge(aside, map[string]bool{"live": true}, nil)
 	if r.Merged != 3 || len(r.BuriedLive) != 0 || !slices.Equal(r.Kept, []string{"live"}) {
 		t.Fatalf("merge keeping live = %+v; want 3 merged, live kept", r)
 	}
@@ -97,7 +97,7 @@ func TestFloorMergeCapsAndPrune(t *testing.T) {
 		bs = append(bs, burial{Generation: mgen(10 + i), Deleted: uint64(i + 1)})
 	}
 	aside["n"] = floorEntry{Buried: bs}
-	r, dropped := restored.merge(aside, nil)
+	r, dropped := restored.merge(aside, nil, nil)
 	if r.Merged != smallBuriedPerName || len(dropped) != 1 || dropped[0].generation != mgen(1) {
 		t.Fatalf("merge past the cap = %+v, dropped %v; want %d merged and the restored floor's own burial dropped", r, dropped, smallBuriedPerName)
 	}
@@ -207,7 +207,7 @@ func readFloorFile(t *testing.T, server string) floor {
 func TestFloorMergeBuriesRevokedLive(t *testing.T) {
 	restored := floor{"n": {Generation: mgen(1), Seq: 3}}
 	aside := floor{"n": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}}
-	restored.merge(aside, nil)
+	restored.merge(aside, nil, nil)
 	if e := restored["n"]; e.live() || !e.buries(mgen(1)) {
 		t.Fatalf("n after the merge = %+v, want its restored live generation buried", e)
 	}
@@ -266,7 +266,7 @@ func TestFloorMergeRetiresAsideLive(t *testing.T) {
 		"gone":  {Generation: mgen(7), Seq: 1},
 		"spare": {Generation: mgen(8), Seq: 1},
 	}
-	r, _ := restored.merge(aside, map[string]bool{"kept": true, "spare": true})
+	r, _ := restored.merge(aside, map[string]bool{"kept": true, "spare": true}, nil)
 	if r.Retired != 3 || !slices.Equal(r.Kept, []string{"spare"}) {
 		t.Fatalf("merge = %+v; want 3 retired and only spare kept", r)
 	}
