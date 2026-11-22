@@ -625,7 +625,8 @@ func (fl floor) bury(name string, dirGen *[generationSize]byte) ([]string, []pru
 // buryAbove is bury, numbering each new burial above both the floor's
 // highest delete sequence and above: guardEraSeq for a Delete run while a
 // restore is unfinished, so the merge can tell its burials from the
-// restored floor's, and 0 otherwise.
+// restored floor's, and 0 otherwise. At the sequence limit it renumbers,
+// order kept, and with above set it keeps the guard band (renumberGuard).
 func (fl floor) buryAbove(name string, dirGen *[generationSize]byte, above uint64) ([]string, []pruned) {
 	f := fl[name]
 	var gs []string
@@ -646,7 +647,15 @@ func (fl floor) buryAbove(name string, dirGen *[generationSize]byte, above uint6
 	for _, g := range gs {
 		last := max(fl.lastDeleted(), above)
 		if last >= maxDeleteSeq {
-			last = fl.renumber()
+			// Renumbered order kept; under the guard the guard band is kept
+			// too: the guard-era burials go back just above guardEraSeq, the
+			// others below it, and the new one above them all.
+			if above > 0 {
+				fl.renumberGuard(fl.guardEra())
+				last = max(fl.lastDeleted(), above)
+			} else {
+				last = fl.renumber()
+			}
 		}
 		// Read after renumber, which rewrites the name's own burials in fl.
 		f = fl[name]

@@ -648,8 +648,16 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// per-name cap; fdir.dropped holds what the writes' prunes dropped.
 	var dropped, capDropped []pruned
 	after, err := fdir.update(func(fl floor) bool {
+		// With no guard pending, a burial above guardEraSeq is a band left
+		// behind (no keystore-floor.json.pre-restore): it is renumbered back
+		// to ordinary numbering, order kept, so the next guard's burials are
+		// told apart again.
+		renorm := !pending && fl.lastDeleted() > guardEraSeq
+		if renorm {
+			fl.renumber()
+		}
 		gs, dropped = fl.buryAbove(name, nil, above)
-		return len(gs) > 0
+		return renorm || len(gs) > 0
 	})
 	if err != nil {
 		return evicted(fdir, nil, err)
