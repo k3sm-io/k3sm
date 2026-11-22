@@ -20,7 +20,10 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"maps"
+	"math/rand/v2"
+	"strings"
 	"testing"
 )
 
@@ -139,5 +142,155 @@ func checkFloorEntry(t *testing.T, name string, e floorEntry) {
 			t.Fatalf("record %q has burials %+v", name, bs)
 		}
 		prev = b.Deleted
+	}
+}
+
+// TestFloorOpsProperty drives random sequences of set, raise, bury and
+// prune, each followed by the prune every floor write makes, and checks
+// after every step: no record has sequence 0 without a burial; a buried
+// generation leaves only by a drop bury or prune reports; no burial appears
+// but by bury; and the floor encodes to bytes that parse back to it, within
+// the caps. The "full" runs start from live entries that leave the
+// tombstones about 1 KiB, so the prune drops burials too.
+func TestFloorOpsProperty(t *testing.T) {
+	names := []string{"a", "b", "c", strings.Repeat("n", maxNameLen)}
+	var gens [][generationSize]byte
+	for i := range 12 {
+		var g [generationSize]byte
+		g[0], g[15] = byte(i+1), byte(i*7)
+		gens = append(gens, g)
+	}
+	type key struct{ name, gen string }
+	for run := range 24 {
+		full := run%12 == 11
+		rng := rand.New(rand.NewPCG(uint64(run), 0x6b33736d))
+		fl := floor{}
+		if full {
+			e := floorEntry{Generation: strings.Repeat("ab", generationSize), Seq: 1}
+			for i, size := 0, fl.liveSize(); size < maxFloorSize-1024; i++ {
+				name := fmt.Sprintf("fill-%s-%06d", strings.Repeat("f", 200), i)
+				size += floorEntrySize(name, e) + 1
+				fl[name] = e
+			}
+		}
+		want := map[key]bool{}
+		prunes := 0
+		steps := 400
+		if full {
+			steps = 80
+		}
+		for step := range steps {
+			name := names[rng.IntN(len(names))]
+			gen := gens[rng.IntN(len(gens))]
+			var dropped []pruned
+			op := ""
+			switch rng.IntN(4) {
+			case 0:
+				op = "set"
+				fl.set(name, gen)
+			case 1:
+				op = "raise"
+				fl.raise(name, gen, uint64(rng.IntN(5)+1))
+			case 2:
+				op = "bury"
+				var dir *[generationSize]byte
+				if rng.IntN(2) == 0 {
+					dir = &gen
+				}
+				g, d := fl.bury(name, dir)
+				if g != "" {
+					want[key{name, g}] = true
+				}
+				dropped = d
+			case 3:
+				op = "prune"
+				dropped = fl.prune()
+			}
+			more := fl.prune()
+			prunes += len(more)
+			dropped = append(dropped, more...)
+			for _, d := range dropped {
+				if !want[key{d.name, d.generation}] {
+					t.Fatalf("run %d step %d (%s): dropped %+v, which was not buried", run, step, op, d)
+				}
+				delete(want, key{d.name, d.generation})
+			}
+			for k := range want {
+				if !fl[k.name].buries(k.gen) {
+					t.Fatalf("run %d step %d (%s): %s's buried %s is gone, and no drop reported it", run, step, op, k.name, k.gen)
+				}
+			}
+			n := 0
+			for name, e := range fl {
+				checkFloorEntry(t, name, e)
+				for _, b := range e.burials() {
+					if !want[key{name, b.Generation}] {
+						t.Fatalf("run %d step %d (%s): %s buries %s, which no bury added", run, step, op, name, b.Generation)
+					}
+					n++
+				}
+			}
+			if n != len(want) {
+				t.Fatalf("run %d step %d (%s): %d burials, want %d", run, step, op, n, len(want))
+			}
+			if fl.deadSize() > maxTombstoneSize || fl.size() > maxFloorSize {
+				t.Fatalf("run %d step %d (%s): tombstones %d bytes, floor %d", run, step, op, fl.deadSize(), fl.size())
+			}
+			if full && step%25 != 0 {
+				continue
+			}
+			b, err := marshalFloor(fl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(b) != fl.size() {
+				t.Fatalf("run %d step %d (%s): size %d, encoding %d bytes", run, step, op, fl.size(), len(b))
+			}
+			back, err := parseFloor(b)
+			if err != nil || !maps.Equal(back, fl) {
+				t.Fatalf("run %d step %d (%s): the floor does not read back: %v", run, step, op, err)
+			}
+		}
+		if full && prunes == 0 {
+			t.Fatalf("run %d: a full run pruned nothing", run)
+		}
+	}
+}
+
+// TestDeleteSequenceNeverWraps: a bury when the floor's highest delete
+// sequence is maxDeleteSeq renumbers every burial, order kept, so the new
+// one is the highest and the floor still parses; below it, nothing is
+// renumbered.
+func TestDeleteSequenceNeverWraps(t *testing.T) {
+	g := func(b byte) string { return strings.Repeat(fmt.Sprintf("%02x", b), generationSize) }
+	var a floorEntry
+	a.Buried[0] = burial{Generation: g(1), Deleted: maxDeleteSeq - 5}
+	a.Buried[1] = burial{Generation: g(2), Deleted: maxDeleteSeq}
+	fl := floor{"a": a, "b": {Generation: g(3), Seq: 2}}
+	fl["c"] = floorEntry{Buried: [maxBuriedPerName]burial{{Generation: g(4), Deleted: maxDeleteSeq - 1}}}
+	if got, _ := fl.bury("b", nil); got != g(3) {
+		t.Fatalf("bury b buried %q", got)
+	}
+	if bs := fl["a"].burials(); bs[0].Deleted != 1 || bs[1].Deleted != 3 {
+		t.Fatalf("a after the renumber = %+v, want 1 and 3", bs)
+	}
+	if bs := fl["c"].burials(); bs[0].Deleted != 2 {
+		t.Fatalf("c after the renumber = %+v, want 2", bs)
+	}
+	if bs := fl["b"].burials(); len(bs) != 1 || bs[0].Deleted != 4 || fl["b"].live() {
+		t.Fatalf("b after the bury = %+v, want buried at 4", fl["b"])
+	}
+	b, err := marshalFloor(fl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseFloor(b); err != nil {
+		t.Fatalf("the renumbered floor does not parse: %v", err)
+	}
+	// One below the cap: the new burial takes maxDeleteSeq itself.
+	fl = floor{"a": {Buried: [maxBuriedPerName]burial{{Generation: g(1), Deleted: maxDeleteSeq - 1}}}, "b": {Generation: g(3), Seq: 1}}
+	fl.bury("b", nil)
+	if fl["a"].Buried[0].Deleted != maxDeleteSeq-1 || fl["b"].Buried[0].Deleted != maxDeleteSeq {
+		t.Fatalf("floor after a bury below the cap = %+v", fl)
 	}
 }
