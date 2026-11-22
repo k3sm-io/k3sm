@@ -1338,10 +1338,10 @@ that scope's directory `.user/<uid>/` by hand recovers only a user who never del
 owner loses its values and re-puts them): for one who did, the user-scope floor records the
 `deliveries` record past its first sequence, and the owner's next put refuses to mint a fresh
 scope over it. For that user the recovery is `rm-scope`, which a later change builds. Until it
-lands, root removes `.user/<uid>/` and runs `sudo k3sm keys floor --rebuild`, and the cost is
-the whole store's: rebuild writes the floor from what is on disk, so it lowers every record's
-floor, for every user, to the sequence on disk at that moment, and a copied-back older record
-already in place is accepted from then on. Rewrap's refusal is correct either way and stays.
+lands there is no recovery for that user: `floor --rebuild` carries the old floor's lines
+forward ("Rebuild carries the old floor forward"), the removed scope's `deliveries` line
+among them, so the owner's next put still refuses to mint. Rewrap's refusal is correct either
+way and stays.
 
 **Rewrap does not re-key `K_u`.** It re-seals each `scope.key` under the new `W`, but the
 `K_u` inside is the same 32 bytes, and every user record stays sealed under it. So an old master
@@ -1567,9 +1567,11 @@ service user can only add to.
   first, in the same `write(2)`, so the torn bytes become a line of their own, which the
   tolerant audit reader drops and charges to no uid, and the new line parses (U23).
   The recovery is root's `floor --rebuild` (or `audit --rotate` for the audit log), which
-  stops the listener, rewrites the log from the entries on disk and resets every uid's share;
-  its cost is the user-scope downtime of the run and the loss of every line the rebuild cannot
-  derive, tombstones included, so an entry tree copied back after the rebuild is served.
+  stops the listener, rewrites the log from the entries on disk and the old floor's lines that
+  parse, and resets every uid's share ("Rebuild carries the old floor forward"); its cost is
+  the user-scope downtime of the run and the lines it drops because they do not parse (the
+  torn tail among them), which it counts and names, never a tombstone or a sequence that
+  parses, so a crash followed by a rebuild brings back no deleted entry (U192).
 - **Write order.** Phase A's: the record, the pointer, then the floor line. A crash between
   the last two leaves the floor one behind, which the rule accepts, and the next user-scope
   write to that entry appends the line. A `put` refuses, before its first write, a floor
@@ -1644,6 +1646,24 @@ That wait is the store `.lock`
   `ErrCorrupt` and is never turned into `ErrNotFound`, which the reconciler would read as a
   deletion. A directory with no `generation` file is the shape a crashed put leaves before
   its first step and gets no line (U25).
+- **Rebuild carries the old floor forward.** Before it writes the new file, rebuild reads the
+  old floor line by line, as root, on its own descriptor, with the reader's size bound. It
+  keeps every line that parses: every tombstone, and every key's highest sequence. It drops
+  only the lines that do not parse (a torn tail, a line over 1 KiB, a line outside the
+  grammar, a line past a bound the reader refuses), counts them, and names the count in its
+  output and in its audit line, never their bytes. The new file holds, per key, the higher of
+  the carried-forward sequence and the one on disk, and every carried tombstone, which the
+  entry lines never override, so a buried generation stays buried and a copied-back older
+  record stays refused across a rebuild. *Residual (the dropped lines).* What a dropped line
+  recorded is lost: a tombstone on a line that does not parse no longer buries its
+  generation, and a dropped sequence line lowers that key's floor to what is on disk, so a
+  tree or record copied back for that key after the rebuild is served. A server crash can
+  only tear the last line, so the loss after a crash is at most the one line a revocation or
+  a grant was appending, and that operation was not reported as done; any wider loss is
+  damage done to the file while its flag was clear, which the count names. A deliberate
+  restore that lowers is the matched-set restore ("Backup and snapshots"): the restored floor
+  log is the old floor rebuild carries forward, so the floor lowers to the backup's. A floor
+  that cannot be opened or read at all refuses the rebuild, which changes nothing (U192).
 - **Rebuild never lowers.** Rebuild opens every scope under `.user/` before it writes the new
   file's first line, and a line it cannot write is a floor it would lower:
   - *Rebuild skips the owner check.* Rebuild reads every scope whose `scope.key` opens under
@@ -4504,6 +4524,7 @@ carried by the unit rows.
 | U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
+| U192 | `floor --rebuild` carries the old floor forward: over an old floor holding tombstones, sequence lines and a torn last line, it keeps every tombstone and every key's highest sequence that parses, writes the higher of that and the sequence on disk, drops only the lines that do not parse and names their count; a tree copied back after an `rm`, a crash and a rebuild is refused as deleted, and a copied-back older record is refused; a floor that cannot be read refuses the rebuild, changing nothing | `k3sm/cmd/k3sm::TestRebuildCarriesTombstonesForward` | pending: the append-only files (the rebuild verb) |
 
 ### Rig legs
 
