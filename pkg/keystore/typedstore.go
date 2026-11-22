@@ -91,7 +91,10 @@ func (s *FileStore) GenerateSSH(ctx context.Context, name, comment string) (Vers
 // (ErrKindMismatch otherwise), and an oauth envelope must name the entry's
 // refresh owner (ErrRefreshOwnerFixed otherwise). An oauth entry keeps its current version and
 // one previous: the rotation records the oldest retained version in the
-// pointer and unlinks the versions below it.
+// pointer and unlinks the versions below it. A failure after the pointer
+// flip (the floor line, the prune) returns the new version with an error
+// matching ErrCommitted: read the entry again, and never retry from the old
+// pair.
 func (s *FileStore) RotateCredential(ctx context.Context, name string, kind Kind, e typed.Envelope) (Version, error) {
 	return s.rotateCredential(ctx, name, kind, nil, e)
 }
@@ -133,7 +136,8 @@ func (s *FileStore) rotateCredential(ctx context.Context, name string, kind Kind
 		})
 	}()
 	if err != nil {
-		return Version{}, fmt.Errorf("rotate %s: %w", name, err)
+		// v is the committed version when err is ErrCommitted.
+		return v, fmt.Errorf("rotate %s: %w", name, err)
 	}
 	return v, nil
 }
@@ -176,7 +180,8 @@ func (s *FileStore) RotateFrom(ctx context.Context, name string, from uint64) (V
 		return val, err
 	})
 	if err != nil {
-		return Version{}, fmt.Errorf("rotate %s: %w", name, err)
+		// v is the committed version when err is ErrCommitted.
+		return v, fmt.Errorf("rotate %s: %w", name, err)
 	}
 	return v, nil
 }

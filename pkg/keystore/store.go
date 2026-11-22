@@ -704,7 +704,8 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 // the floor: docs/design/keystore.md § "Rotation and rollback". A crash
 // before the flip leaves the old version current and an unreferenced next
 // version, which the next Rotate discards before sealing the value it was
-// given; it never promotes it.
+// given; it never promotes it. A failure after the flip returns the new
+// version with an error matching ErrCommitted.
 func (s *FileStore) Rotate(ctx context.Context, name string, value []byte) (Version, error) {
 	v, err := s.rotate(ctx, name, func(_ *entry, _ keys, old Version) ([]byte, error) {
 		if err := checkValue(old.Kind, value); err != nil {
@@ -713,7 +714,9 @@ func (s *FileStore) Rotate(ctx context.Context, name string, value []byte) (Vers
 		return value, nil
 	})
 	if err != nil {
-		return Version{}, fmt.Errorf("rotate %s: %w", name, err)
+		// v is the committed version when err is ErrCommitted, and zero
+		// otherwise.
+		return v, fmt.Errorf("rotate %s: %w", name, err)
 	}
 	return v, nil
 }
@@ -807,21 +810,25 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 	if err := s.writeFile(e.root, currentName, ptr.marshal()); err != nil {
 		return Version{}, err
 	}
+	// The pointer's rename was the commit point: from here a failure
+	// returns the committed version with ErrCommitted, never a zero Version
+	// that reads as nothing written.
+	committed := versionOf(rec, value, k.fingerprint)
 	if _, err := fdir.update(func(fl floor) bool { return fl.raise(name, e.generation, seq+1) }); err != nil {
-		return Version{}, fmt.Errorf("version %d is current, but recording its floor failed (the next keys verb records it): %w", next, err)
+		return committed, fmt.Errorf("%w: version %d is current, but recording its floor failed (the next keys verb records it): %w", ErrCommitted, next, err)
 	}
 	if newLow > low {
 		// A crash before or during the prune leaves versions below newLow,
 		// which are not committed: the next write, Rewrap or Delete
 		// unlinks them.
 		if err := s.step("prune " + name); err != nil {
-			return Version{}, err
+			return committed, fmt.Errorf("%w: version %d is current, but pruning the versions below %d failed (the next write prunes them): %w", ErrCommitted, next, newLow, err)
 		}
 		if err := discardOrphans(ctx, e, newLow, next); err != nil {
-			return Version{}, fmt.Errorf("version %d is current, but pruning the versions below %d failed (the next write prunes them): %w", next, newLow, err)
+			return committed, fmt.Errorf("%w: version %d is current, but pruning the versions below %d failed (the next write prunes them): %w", ErrCommitted, next, newLow, err)
 		}
 	}
-	return versionOf(rec, value, k.fingerprint), nil
+	return committed, nil
 }
 
 // discardOrphans removes every version file of e numbered above cur, or

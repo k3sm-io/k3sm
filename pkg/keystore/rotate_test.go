@@ -748,3 +748,62 @@ func TestFloorMalformedAdvice(t *testing.T) {
 		t.Errorf("malformed-floor advice %q carries ErrCorrupt's advice to restore from backup", msg)
 	}
 }
+
+// TestRotateReportsCommitAfterFlip is U151: a rotation that fails after its
+// pointer flip, at the floor write or at the oauth prune, has committed. It
+// returns the new version with an error matching ErrCommitted, never a
+// zero Version that reads as nothing written, and the new version is current.
+func TestRotateReportsCommitAfterFlip(t *testing.T) {
+	ctx := context.Background()
+	for _, step := range []string{"write " + floorName, "prune k"} {
+		for _, name := range []string{"RotateCredential", "RotateIf"} {
+			t.Run(step+" "+name, func(t *testing.T) {
+				s, _ := newTypedStore(t)
+				mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+				mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+				read, _ := mustCredential(t, s, "k")
+				s.step = failAt(step)
+				var (
+					v   Version
+					err error
+				)
+				if name == "RotateIf" {
+					v, err = s.RotateIf(ctx, "k", KindOAuth, read, oauthEnvelope("a3", "r3"))
+				} else {
+					v, err = s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a3", "r3"))
+				}
+				if !errors.Is(err, ErrCommitted) || v.Version != 3 {
+					t.Fatalf("%s failing at %s = %+v, %v; want version 3 and ErrCommitted", name, step, v, err)
+				}
+				s.step = func(string) error { return nil }
+				if cur, c := mustCredential(t, s, "k"); cur != v || string(c.AccessToken) != "a3" {
+					t.Fatalf("current %+v %q, returned %+v", cur, c.AccessToken, v)
+				}
+				// The returned Version is the one to read again from: a
+				// RotateIf holding it is current.
+				if next, err := s.RotateIf(ctx, "k", KindOAuth, v, oauthEnvelope("a4", "r4")); err != nil || next.Version != 4 {
+					t.Fatalf("RotateIf from the committed version = %+v, %v", next, err)
+				}
+			})
+		}
+	}
+	t.Run("opaque floor", func(t *testing.T) {
+		s, _ := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		s.step = failAt("write " + floorName)
+		v, err := s.Rotate(ctx, "k", []byte("two"))
+		if !errors.Is(err, ErrCommitted) || v.Version != 2 {
+			t.Fatalf("Rotate failing at the floor = %+v, %v; want version 2 and ErrCommitted", v, err)
+		}
+		s.step = func(string) error { return nil }
+		v, err = s.Rotate(ctx, "k", []byte("three"))
+		if err != nil || v.Version != 3 {
+			t.Fatalf("the next Rotate = %+v, %v", v, err)
+		}
+		s.step = failAt("write " + floorName)
+		v, err = s.RotateFrom(ctx, "k", 1)
+		if !errors.Is(err, ErrCommitted) || v.Version != 4 {
+			t.Fatalf("RotateFrom failing at the floor = %+v, %v; want version 4 and ErrCommitted", v, err)
+		}
+	})
+}

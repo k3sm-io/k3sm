@@ -82,13 +82,13 @@ func TestAuditBeforeGrant(t *testing.T) {
 			t.Fatal(err)
 		}
 		audit.fail = true
-		if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, errCommitted) {
+		if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, ErrCommitted) {
 			t.Fatalf("withdraw with a failing audit: %v, want the change made and reported", err)
 		}
 		if d, _ := recordedDelivery(t, s, server, 1); !d.withdrawn {
 			t.Fatal("the withdraw was undone")
 		}
-		if err := u.Delete(ctx, "user/1001/token"); !errors.Is(err, errCommitted) {
+		if err := u.Delete(ctx, "user/1001/token"); !errors.Is(err, ErrCommitted) {
 			t.Fatalf("rm with a failing audit: %v, want the change made and reported", err)
 		}
 		checkEntryGone(t, server, "token")

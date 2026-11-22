@@ -577,15 +577,10 @@ func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSiz
 	}
 	deliveriesSeen.note(u.s.dir, u.scope, gen, seq)
 	if err := u.s.userFloor.append(u.scope, deliveriesFloorName, gen, seq); err != nil {
-		return fmt.Errorf("%w, and its floor line was not written: %w", errCommitted, err)
+		return fmt.Errorf("%w, and its floor line was not written: %w", ErrCommitted, err)
 	}
 	return nil
 }
-
-// errCommitted marks an error after a change was committed: the change
-// stands, and what follows it (a floor line, an audit line) was not
-// written.
-var errCommitted = errors.New("the change was made")
 
 // deliveriesKey derives the delivery-record key from K_u.
 func deliveriesKey(ku []byte, scope string) []byte {
@@ -740,7 +735,7 @@ func (u *UserScope) lookupDelivery(ctx context.Context, uid string) (delivery, e
 // floor, or, with the floor unreadable, below the highest sequence this store
 // has read or written (docs/design/keystore.md § "Quotas", the residuals of
 // "Revocation always succeeds"). An already withdrawn UID is no change; an absent one is ErrNotFound. As a revocation it
-// commits first and audits after: a failed append is reported (errCommitted)
+// commits first and audits after: a failed append is reported (ErrCommitted)
 // and the tombstone stands.
 //
 // Its audit line names the delivery UID (auditPlaceholder for one outside
@@ -931,7 +926,7 @@ var errAuditRefused = errors.New("the audit line could not be written, so nothin
 // refusal's name; name and namespace must already be validated (or
 // auditPlaceholder), and never a value. It is the revocations' order:
 // commit, then audit. Its error, after a change was made, matches
-// errCommitted.
+// ErrCommitted.
 func (u *UserScope) audit(op, name, namespace string, err error) error {
 	return u.appendAudit(auditLine{op: op, name: name, namespace: namespace}, err)
 }
@@ -941,7 +936,7 @@ func (u *UserScope) audit(op, name, namespace string, err error) error {
 func (u *UserScope) appendAudit(l auditLine, err error) error {
 	l.scope, l.result = u.scope, auditResult(err)
 	if aerr := u.s.auditSink.append(l); aerr != nil {
-		return fmt.Errorf("%w, and its audit line was not written: %w", errCommitted, aerr)
+		return fmt.Errorf("%w, and its audit line was not written: %w", ErrCommitted, aerr)
 	}
 	return nil
 }
@@ -953,7 +948,7 @@ const auditPlaceholder = "-"
 // auditResult names an operation's outcome for its audit line.
 func auditResult(err error) string {
 	switch {
-	case err == nil, errors.Is(err, errCommitted):
+	case err == nil, errors.Is(err, ErrCommitted):
 		return "ok"
 	case errors.Is(err, ErrQuota):
 		return "quota"

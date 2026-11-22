@@ -204,6 +204,15 @@ var (
 	// entry was deleted and put again since the expected version was read,
 	// or the expected Version was not read from the store.
 	ErrVersionStale = errors.New("the keystore entry's current version is not the one expected: another write came first; read it again")
+	// ErrCommitted marks an error returned after a write committed: the
+	// change stands, and a step after its commit point (the floor line, the
+	// oauth prune, an audit line) failed. A rotation that returns it also
+	// returns the Version it made current. A refresher that gets it must
+	// read the entry again and work from what it reads, and never retry
+	// from the pair it held: that pair is no longer current, and its refresh
+	// token may already be rotated at the provider. The next write records
+	// the floor and prunes what was left.
+	ErrCommitted = errors.New("the change was made")
 	// ErrRefreshOwnerFixed reports a rotation of an oauth entry whose new
 	// pair names another refresh owner: the owner is fixed when the entry
 	// is put, so the server never starts or stops refreshing a pair because
