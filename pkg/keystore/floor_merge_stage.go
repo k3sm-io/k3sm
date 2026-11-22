@@ -233,6 +233,9 @@ func (s *FileStore) plantedName(st *mergeStaging) (string, error) {
 // symlink is moved itself, never followed. Something gone from Dir since
 // openStaging looked is no error. Both directories are fsynced.
 func (s *FileStore) moveTargetAside(st *mergeStaging, name string) error {
+	if err := s.step("merge move aside"); err != nil {
+		return err
+	}
 	switch err := renameExcl(int(st.parent.Fd()), st.target, int(st.dirF.Fd()), name); {
 	case errors.Is(err, syscall.ENOENT):
 		return nil
@@ -390,9 +393,31 @@ func (s *FileStore) walkStaged(st *mergeStaging, hand bool) error {
 	return s.stagedNode(int(st.dirF.Fd()), stagedTreeName, ".", stagedTree, 0, 0, hand)
 }
 
+// stagedShapeError is the refusal of the staged tree at a path inside it,
+// matching ErrCorrupt. Its text says nothing is written; once the floor is
+// written, committedShape words it as committed.
+type stagedShapeError struct{ where string }
+
+func (e *stagedShapeError) Error() string {
+	return fmt.Sprintf("%v: %s: the restored keystore/ holds only what the keystore writes, so nothing is handed to the service user and nothing is written", ErrCorrupt, e.where)
+}
+
+// Is matches ErrCorrupt.
+func (e *stagedShapeError) Is(target error) bool { return target == ErrCorrupt }
+
 // errStagedShape is the refusal of the staged tree at rel.
 func errStagedShape(rel, why string, args ...any) error {
-	return fmt.Errorf("%w: %s/%s/%s %s: the restored keystore/ holds only what the keystore writes, so nothing is handed to the service user and nothing is written", ErrCorrupt, preRestoreDirName, stagedTreeName, rel, fmt.Sprintf(why, args...))
+	return &stagedShapeError{where: fmt.Sprintf("%s/%s/%s %s", preRestoreDirName, stagedTreeName, rel, fmt.Sprintf(why, args...))}
+}
+
+// committedShape words err, a refusal of the staged tree on a merge whose
+// floor is already written, as committed: the floor stays merged, so it
+// never says nothing is written. Any other err is wrapped as committed.
+func committedShape(err error) error {
+	if se := (*stagedShapeError)(nil); errors.As(err, &se) {
+		return fmt.Errorf("%w: the merge is written, but the restored keystore/ still staged in pre-restore.d/restored is refused (%w: %s), so it is neither handed to the service user nor moved into place. The floor stays merged and keystore-floor.json.pre-restore stays in place; remove that path from pre-restore.d/restored and run the same merge again", errCommitted, ErrCorrupt, se.where)
+	}
+	return fmt.Errorf("%w: the merge is written, but the restored keystore/ is still staged in pre-restore.d/restored: %w; run the same merge again", errCommitted, err)
 }
 
 // stagedNode judges name in the directory dirfd, a node of kind k at rel

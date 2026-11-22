@@ -437,7 +437,9 @@ The merge exits 0 when it is written and there is nothing to read in the report.
 it is written but dropped a deletion, kept an entry because `--keep` named it, or left an entry
 `unverified`, so read the report. It exits 5 when it is written but the restored copy was not
 moved into place or the file was not renamed (run it again), and 1 when it refuses and changes
-nothing. With `--dry-run` it exits with the code the merge itself would return. Then start the server and check the entries:
+nothing. A run after an exit 5 finds the merge already written, so if it then refuses the
+restored copy, or cannot move aside what is at `server/keystore`, it says the merge is written
+and exits 5 again, with `--dry-run` too: fix what it names and run it once more. With `--dry-run` it exits with the code the merge itself would return. Then start the server and check the entries:
 
 ```
 sudo k3sm start

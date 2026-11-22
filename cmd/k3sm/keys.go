@@ -1010,7 +1010,9 @@ func (k *keepFlag) Set(q string) error {
 // the input is only renamed). It exits 0 when the merge is written,
 // keysCommitted, the report printed, when it is written but dropped a
 // burial, and keysNotRenamed, the report printed, when it is written but
-// its input could not be renamed (keystore.Committed), which wins.
+// its input could not be renamed or the restored tree not moved
+// (keystore.Committed), which wins, a rerun or dry run that finds the floor
+// already written and refuses what is staged included.
 // keysCommitted also marks a merge that kept an entry (--keep) or left one
 // unverified; --dry-run exits as the merge itself would.
 func keysFloor(ctx context.Context, args []string, env keysEnv) int {
@@ -1092,12 +1094,13 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	for _, name := range r.Dropped {
 		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
 	}
-	if *dryRun && err != nil {
+	if *dryRun && err != nil && !keystore.Committed(err) {
 		return v.failf(keysRefused, "%v", err)
 	}
 	if err != nil {
-		// Written, but the input was not renamed: the report above stands,
-		// drops included, and a rerun renames it.
+		// Written, but the input was not renamed or the tree not moved: the
+		// report above stands, drops included, and a rerun finishes it. A
+		// dry run that finds an earlier run's floor written exits so too.
 		return v.failf(keysNotRenamed, "%v", err)
 	}
 	// Done, but what the floor refuses changed in a way to read: a drop, a

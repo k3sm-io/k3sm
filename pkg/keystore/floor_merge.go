@@ -255,9 +255,21 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if live == nil {
 		return r, checkMergeInput(live, from, kept)
 	}
+	// written is set when the live floor already holds every burial and
+	// fence the input records, judged without the trees' pointers: a rerun
+	// after a committed merge (exit 5). A refusal of what is staged then
+	// leaves a written floor, and is worded so (committedShape), never as
+	// nothing written.
+	written := !planMerge(live, from, kept, nil, nil).r.changes()
+	finish := func(err error) error {
+		if err == nil || !written || Committed(err) {
+			return err
+		}
+		return committedShape(err)
+	}
 	st, err := s.openStaging(fdir)
 	if err != nil {
-		return r, err
+		return r, finish(err)
 	}
 	defer st.close()
 	// Something at the store's Dir while the tree is staged was planted:
@@ -267,7 +279,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	var planted string
 	if st.staged && st.targetExists {
 		if planted, err = s.plantedName(st); err != nil {
-			return r, err
+			return r, finish(err)
 		}
 	}
 	moveAside := func(r *MergeReport) error {
@@ -284,12 +296,12 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	// from it or planned, so a dry run refuses what the merge refuses.
 	if st.staged {
 		if err := s.checkStaged(st); err != nil {
-			return r, err
+			return r, finish(err)
 		}
 	}
 	ptrs, unverified, aside, err := s.stagedPointers(ctx, st, live, from)
 	if err != nil {
-		return r, err
+		return r, finish(err)
 	}
 	// A dry run on a copy (planMerge): an input whose every burial and fence
 	// the live floor already holds (a rerun after a failed rename) writes
@@ -314,13 +326,13 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 			// A rerun after the tree's move failed: the floor is written,
 			// so finish the move.
 			if err := moveAside(&pr); err != nil {
-				return pr, fmt.Errorf("%w: the merge is written, but the restored keystore/ is still staged in pre-restore.d/restored: %w; run the same merge again", errCommitted, err)
+				return pr, committedShape(err)
 			}
 			if err := s.chownStaged(st); err != nil {
-				return pr, fmt.Errorf("%w: the merge is written, but the restored keystore/ is still staged in pre-restore.d/restored: %w; run the same merge again", errCommitted, err)
+				return pr, committedShape(err)
 			}
 			if err := s.moveStaged(st); err != nil {
-				return pr, fmt.Errorf("%w: the merge is written, but the restored keystore/ is still staged in pre-restore.d/restored: %w; run the same merge again", errCommitted, err)
+				return pr, committedShape(err)
 			}
 		}
 		if err := s.renameMerged(in); err != nil {

@@ -2778,6 +2778,44 @@ func TestKeysFloorMergeMovesPlantedAside(t *testing.T) {
 	}
 }
 
+// TestKeysFloorMergeCommittedRerunRefused (U192): a rerun after exit 5
+// finds the floor already written, so a staged tree it refuses, dry run
+// included, exits 5 with committed wording, never "Nothing is written".
+func TestKeysFloorMergeCommittedRerunRefused(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	now := time.Now().Unix()
+	for at := now - 2; at <= now+60; at++ {
+		p := fmt.Sprintf("%s.merged-%d", recipeFloor(h), at)
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Remove(p) })
+	}
+	if code := h.run("floor", "merge"); code != keysNotRenamed {
+		t.Fatalf("merge with the rename failing: exit %d, stderr %q; want %d", code, h.stderr.String(), keysNotRenamed)
+	}
+	// A tree staged again, holding a file where an entry's directory goes.
+	restored := filepath.Join(recipePreRestore(h), "restored")
+	if err := os.Mkdir(restored, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(restored, "bogus"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"floor", "merge", "--dry-run"}, {"floor", "merge"}} {
+		code := h.run(args...)
+		if errOut := h.stderr.String(); code != keysNotRenamed || !strings.Contains(errOut, "the merge is written") || strings.Contains(strings.ToLower(errOut), "nothing is written") {
+			t.Fatalf("%v after exit 5 with a misshaped staged tree: exit %d, stderr %q; want %d with committed wording", args, code, errOut, keysNotRenamed)
+		}
+	}
+}
+
 // keysEvictingRaiseStore's RaiseFloor reports a floor raise whose write
 // evicted a tombstone, as the store does after making it.
 type keysEvictingRaiseStore struct{ keysStore }
