@@ -1578,3 +1578,72 @@ func TestReconcilerRelabelledOwnedSecret(t *testing.T) {
 		}
 	}
 }
+
+// TestStateWriteFailureCreatesNothing: when the state file cannot be written
+// before the first create (here its directory is not writable), nothing is
+// created, so no Secret exists that could not be recorded (G20).
+func TestStateWriteFailureCreatesNothing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only directory")
+	}
+	h := newHarness(t, true, false)
+	stateDir := filepath.Join(h.dir, "state")
+	if err := os.Mkdir(stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) }) // let TempDir's cleanup remove it
+	h.r.statePath = filepath.Join(stateDir, StateFileName)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	h.r.Sweep(context.Background())
+	for _, v := range h.verbs() {
+		if v == "create/secrets" {
+			t.Fatalf("a Secret was created though the state file could not be written: %v", h.verbs())
+		}
+	}
+	if !strings.Contains(h.logs.String(), "cannot write the state file") {
+		t.Fatalf("the refusal is not logged\n%s", h.logs.String())
+	}
+}
+
+// TestStateFileMalformedDeliversNothing: a state file owned and moded as it
+// must be but not parsing strictly (unknown field, wrong version, trailing
+// data, too many records, an empty UID, a repeated record) delivers nothing
+// (G19).
+func TestStateFileMalformedDeliversNothing(t *testing.T) {
+	rec := func(i int) string { return fmt.Sprintf(`{"namespace":"p","secretName":"s%d","uid":"u%d"}`, i, i) }
+	many := `{"version":1,"secrets":[`
+	for i := range MaxTargets + 1 {
+		if i > 0 {
+			many += ","
+		}
+		many += rec(i)
+	}
+	many += "]}"
+	for _, tc := range []struct{ name, doc string }{
+		{"unknown field", `{"version":1,"secrets":[],"extra":1}`},
+		{"unknown record field", `{"version":1,"secrets":[{"namespace":"p","secretName":"s","uid":"u","kind":"x"}]}`},
+		{"wrong version", `{"version":2,"secrets":[]}`},
+		{"trailing data", `{"version":1,"secrets":[]}{}`},
+		{"too many records", many},
+		{"empty uid", `{"version":1,"secrets":[{"namespace":"p","secretName":"s","uid":""}]}`},
+		{"duplicate record", `{"version":1,"secrets":[` + rec(1) + `,` + rec(1) + `]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, true, false)
+			h.store.set("api-token", 1, []byte("tok"))
+			h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+			path := filepath.Join(h.dir, StateFileName)
+			if err := os.WriteFile(path, []byte(tc.doc), StateFileMode); err != nil {
+				t.Fatal(err)
+			}
+			h.r.Sweep(context.Background())
+			if n := len(h.client.Actions()); n != 0 {
+				t.Fatalf("a malformed state file let the sweep through: %v", h.verbs())
+			}
+			if !strings.Contains(h.logs.String(), "state file refused") {
+				t.Fatalf("the refusal is not logged\n%s", h.logs.String())
+			}
+		})
+	}
+}
