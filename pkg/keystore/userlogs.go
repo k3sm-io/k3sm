@@ -435,6 +435,9 @@ type appendLog struct {
 	// write, when set, replaces f.Write: the test seam for a short or
 	// failed append.
 	write func(f *os.File, b []byte) (int, error)
+	// fsync, when set, replaces f.Sync: the test seam for an append whose
+	// write landed and whose fsync failed.
+	fsync func(f *os.File) error
 	// maxKeys, when not 0, replaces maxFloorKeys: the test seam for the
 	// key bound.
 	maxKeys int
@@ -1132,12 +1135,21 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 	if write == nil {
 		write = (*os.File).Write
 	}
+	fsync := l.fsync
+	if fsync == nil {
+		fsync = (*os.File).Sync
+	}
 	n, err := write(f, out)
 	if err == nil && n < len(out) {
 		err = io.ErrShortWrite
 	}
-	if err == nil {
-		err = f.Sync()
+	// An fsync that fails leaves nothing known durable: whatever the write
+	// put in the file is counted as no line landed, so the caller refuses
+	// (an rm: nothing removed, run it again) rather than report a commit
+	// that a crash could undo. Only a write that failed or landed short,
+	// followed by an fsync that succeeded, counts the whole lines it left.
+	if serr := fsync(f); serr != nil {
+		return fmt.Errorf("append to %s: fsync: %w", l.name, errors.Join(err, serr))
 	}
 	if err != nil {
 		err = fmt.Errorf("append to %s: %w", l.name, err)

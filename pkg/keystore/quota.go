@@ -559,7 +559,7 @@ func (b *burial) bury(u *UserScope) error {
 			// force, so the entry is revoked and the rm committed.
 			return fmt.Errorf("%w, but only in part: the user-scope floor took %d of the entry's %d tombstones before its write failed, so the entry is refused as deleted and its tree stays; run rm again to bury the rest: %w", errCommitted, landed.lines, len(b.gens), err)
 		}
-		return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstones: %w", err)
+		return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstones, or could not make them durable; run rm again: %w", err)
 	}
 	landed := false
 	var errs []error
