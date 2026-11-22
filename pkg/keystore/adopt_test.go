@@ -58,6 +58,16 @@ func crashAfterVersionWrite(t *testing.T, s *FileStore, server, name string, wri
 	writeFile(t, entryPath(server, name, file), string(orphan))
 }
 
+// mustOrphan is the orphan Orphan reports for name, the Version Adopt takes.
+func mustOrphan(t *testing.T, s *FileStore, name string) Version {
+	t.Helper()
+	info, err := s.Orphan(context.Background(), name)
+	if err != nil {
+		t.Fatalf("Orphan %s: %v", name, err)
+	}
+	return info.Orphan
+}
+
 // sealedRefresh opens version of the oauth entry name inside the package
 // and returns its refresh token, which no exported read returns.
 func sealedRefresh(t *testing.T, s *FileStore, name string, version uint64) string {
@@ -133,11 +143,11 @@ func TestOAuthCrashOrphanAdopted(t *testing.T) {
 	}
 
 	for _, v := range []uint64{2, 4} {
-		if _, err := s.Adopt(ctx, "k", v); !errors.Is(err, ErrVersionNotFound) {
+		if _, err := s.Adopt(ctx, "k", Version{Version: v}); !errors.Is(err, ErrVersionNotFound) {
 			t.Fatalf("Adopt version %d: %v, want ErrVersionNotFound", v, err)
 		}
 	}
-	v, err := s.Adopt(ctx, "k", 3)
+	v, err := s.Adopt(ctx, "k", info.Orphan)
 	if err != nil || v.Version != 3 || v.Kind != KindOAuth {
 		t.Fatalf("Adopt version 3 = %+v, %v", v, err)
 	}
@@ -183,7 +193,7 @@ func TestOrphanRefusalTellsCasesApart(t *testing.T) {
 		}
 		// Reads of a non-oauth entry are not refused.
 		mustCurrent(t, s, "k", "one")
-		if v, err := s.Adopt(ctx, "k", 2); err != nil || v.Version != 2 {
+		if v, err := s.Adopt(ctx, "k", mustOrphan(t, s, "k")); err != nil || v.Version != 2 {
 			t.Fatalf("Adopt the opaque orphan = %+v, %v", v, err)
 		}
 		mustCurrent(t, s, "k", "two")
@@ -210,7 +220,7 @@ func TestOrphanRefusalTellsCasesApart(t *testing.T) {
 			strings.Contains(err.Error(), "`k3sm keys adopt") {
 			t.Fatalf("refusal over version 3 above version 1: %v", err)
 		}
-		if _, err := s.Adopt(ctx, "k", 3); !errors.Is(err, ErrVersionNotFound) {
+		if _, err := s.Adopt(ctx, "k", Version{Version: 3}); !errors.Is(err, ErrVersionNotFound) {
 			t.Fatalf("Adopt version 3 over version 1: %v, want ErrVersionNotFound", err)
 		}
 	})
@@ -223,7 +233,7 @@ func TestAdoptRefuses(t *testing.T) {
 	t.Run("none", func(t *testing.T) {
 		s, _ := newTestStore(t)
 		mustPut(t, s, "k", KindOpaque, []byte("one"))
-		if _, err := s.Adopt(ctx, "k", 2); !errors.Is(err, ErrVersionNotFound) {
+		if _, err := s.Adopt(ctx, "k", Version{Version: 2}); !errors.Is(err, ErrVersionNotFound) {
 			t.Fatalf("Adopt with no orphan: %v, want ErrVersionNotFound", err)
 		}
 		if _, err := s.Orphan(ctx, "k"); !errors.Is(err, ErrVersionNotFound) {
@@ -236,7 +246,7 @@ func TestAdoptRefuses(t *testing.T) {
 		mustPut(t, s, "other", KindOpaque, []byte("x"))
 		mustRotate(t, s, "other", "y")
 		copyFile(t, entryPath(server, "other", "v2"), entryPath(server, "k", "v2"))
-		if _, err := s.Adopt(ctx, "k", 2); !errors.Is(err, ErrVersionNotFound) {
+		if _, err := s.Adopt(ctx, "k", Version{Version: 2}); !errors.Is(err, ErrVersionNotFound) {
 			t.Fatalf("Adopt another entry's version: %v, want ErrVersionNotFound", err)
 		}
 		mustCurrent(t, s, "k", "one")
@@ -260,7 +270,7 @@ func TestAdoptRefuses(t *testing.T) {
 		if err != nil || info.Orphan.Version != 2 || fmt.Sprint(info.Others) != "[3]" {
 			t.Fatalf("Orphan = %+v, %v; want 2 with 3 beyond", info, err)
 		}
-		if _, err := s.Adopt(ctx, "k", 2); !errors.Is(err, ErrCorrupt) {
+		if _, err := s.Adopt(ctx, "k", Version{Version: 2}); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("Adopt with two orphans: %v, want ErrCorrupt", err)
 		}
 		mustCurrent(t, s, "k", "one")
@@ -288,7 +298,7 @@ func TestRewrapRefusesOrphan(t *testing.T) {
 	if got := readMasterFile(t, server); string(got) != string(master) {
 		t.Fatal("the refused Rewrap changed the master")
 	}
-	if v, err := s.Adopt(ctx, "k", 2); err != nil || v.Version != 2 {
+	if v, err := s.Adopt(ctx, "k", mustOrphan(t, s, "k")); err != nil || v.Version != 2 {
 		t.Fatalf("Adopt after the refused Rewrap = %+v, %v", v, err)
 	}
 	if err := s.Rewrap(ctx, rewrapKey(1)); err != nil {

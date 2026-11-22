@@ -41,7 +41,8 @@ type OrphanInfo struct {
 	Current Version
 	Seq     uint64
 	// Orphan is the lowest version above Current that authenticates as this
-	// entry's. A version file has no pointer sequence of its own: its
+	// entry's. It carries the orphan's identity, which covers its record
+	// digest: pass it to Adopt, which refuses a file replaced since. A version file has no pointer sequence of its own: its
 	// version number is its place in the entry's history, and Adopt gives
 	// it the pointer sequence Seq+1, the one its own rotation would have.
 	Orphan Version
@@ -150,21 +151,26 @@ func (s *FileStore) Orphan(ctx context.Context, name string) (OrphanInfo, error)
 	return info, nil
 }
 
-// Adopt makes version of name, an orphan a crashed rotation left, current:
+// Adopt makes orphan, the Version Orphan reported for name (an orphan a
+// crashed rotation left), current:
 // it seals a pointer naming it at the next sequence, raises the floor, and
 // for oauth keeps the retention rule (the current version and one previous)
 // and unlinks the versions below it. It refuses unless version is exactly
 // the one after the current version, it authenticates under this entry's
 // generation, it is of the entry's kind, and no other sealed version lies
-// above the current one. It is attended and root-only, as Rotate is: the
+// above the current one. It refuses with ErrVersionStale when the file at
+// that version is no longer the record Orphan reported: its identity covers
+// the record digest, so an orphan replaced after it was inspected is never
+// adopted in its place. It is attended and root-only, as Rotate is: the
 // floor is root's. A failure after the pointer flip returns the adopted
 // version with an error matching ErrCommitted.
 //
 // Adopting is right for both causes an orphan has: after a crashed rotation
 // it completes the flip the crash interrupted, and behind a copied-back
 // pointer it rewrites the newer pointer that was replaced.
-func (s *FileStore) Adopt(ctx context.Context, name string, version uint64) (Version, error) {
-	v, err := s.adopt(ctx, name, version)
+func (s *FileStore) Adopt(ctx context.Context, name string, orphan Version) (Version, error) {
+	version := orphan.Version
+	v, err := s.adopt(ctx, name, orphan)
 	if err != nil {
 		// v is the committed version when err is ErrCommitted.
 		return v, fmt.Errorf("adopt %s version %d: %w", name, version, err)
@@ -172,7 +178,8 @@ func (s *FileStore) Adopt(ctx context.Context, name string, version uint64) (Ver
 	return v, nil
 }
 
-func (s *FileStore) adopt(ctx context.Context, name string, version uint64) (Version, error) {
+func (s *FileStore) adopt(ctx context.Context, name string, want Version) (Version, error) {
+	version := want.Version
 	if err := s.checkConfig(); err != nil {
 		return Version{}, err
 	}
@@ -233,6 +240,14 @@ func (s *FileStore) adopt(ctx context.Context, name string, version uint64) (Ver
 	clear(val)
 	if err != nil {
 		return Version{}, err
+	}
+	// The orphan must be the exact record Orphan reported, not another
+	// sealed record of the same version put there since (a failed
+	// attempt's file copied over its retry): its identity covers the
+	// record's digest.
+	if want.identity == ([identitySize]byte{}) || orphan.identity != want.identity {
+		return Version{}, fmt.Errorf("%w: the file at version %d is not the orphan that was inspected (record digest %s now); inspect it again with `k3sm keys adopt %s`",
+			ErrVersionStale, version, orphan.RecordDigest(), qualified(name))
 	}
 	if orphan.Kind != old.Kind {
 		return Version{}, fmt.Errorf("%w: version %d is %s, but %s is %s", ErrKindMismatch, version, orphan.Kind, name, old.Kind)

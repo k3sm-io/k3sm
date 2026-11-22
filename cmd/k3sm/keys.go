@@ -141,7 +141,7 @@ type keysStore interface {
 	RecordsSealedUnder(ctx context.Context, key []byte) (bool, error)
 	UserScopesExist(ctx context.Context) (bool, error)
 	Orphan(ctx context.Context, name string) (keystore.OrphanInfo, error)
-	Adopt(ctx context.Context, name string, version uint64) (keystore.Version, error)
+	Adopt(ctx context.Context, name string, orphan keystore.Version) (keystore.Version, error)
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -926,7 +926,7 @@ func keysAdopt(ctx context.Context, args []string, env keysEnv) int {
 			return v.failf(keysRefused, "not confirmed; nothing was changed")
 		}
 	}
-	ver, err := s.Adopt(ctx, name, info.Orphan.Version)
+	ver, err := s.Adopt(ctx, name, info.Orphan)
 	if errors.Is(err, keystore.ErrCommitted) {
 		fmt.Fprintf(env.stdout, "adopted %s version %d: it is current\n", qualify(name), ver.Version)
 		return v.failf(keysRefused, "%v", err)

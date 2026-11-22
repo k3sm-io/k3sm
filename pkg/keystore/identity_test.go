@@ -71,3 +71,46 @@ func TestRotateIfRefusesSameNumberDifferentRecord(t *testing.T) {
 		t.Fatalf("RotateIf across a different record at the same version: %v, want ErrVersionStale", err)
 	}
 }
+
+// TestAdoptRefusesReplacedOrphan is review round 4, item 1c: Adopt takes the
+// identity Orphan reported, and refuses when the file at cur+1 has since
+// been replaced by another sealed record of the same version.
+func TestAdoptRefusesReplacedOrphan(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+	attemptA := captureFailedVersion(t, s, server, "k", "v2", func() error {
+		_, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+		return err
+	})
+	if err := os.Remove(entryPath(server, "k", "v2")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	crashAfterVersionWrite(t, s, server, "k", func() error {
+		_, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("b2", "rb2"))
+		return err
+	})
+	info, err := s.Orphan(ctx, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, entryPath(server, "k", "v2"), string(attemptA))
+	if _, err := s.Adopt(ctx, "k", info.Orphan); !errors.Is(err, ErrVersionStale) {
+		t.Fatalf("Adopt of a replaced orphan: %v, want ErrVersionStale", err)
+	}
+	if got := sealedRefresh(t, s, "k", 1); got != "r1" {
+		t.Fatalf("version 1 refresh %q after the refused adopt, want r1", got)
+	}
+	// The orphan Orphan reports now is attempt A, and adopting that one
+	// goes through.
+	info, err = s.Orphan(ctx, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Adopt(ctx, "k", info.Orphan); err != nil {
+		t.Fatalf("Adopt of the orphan just reported: %v", err)
+	}
+	if got := sealedRefresh(t, s, "k", 2); got != "r2" {
+		t.Fatalf("adopted refresh %q, want r2", got)
+	}
+}

@@ -374,7 +374,7 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	v, err = s.Adopt(ctx, "pair", info.Orphan.Version)
+	v, err = s.Adopt(ctx, "pair", info.Orphan)
 	check("Adopt", v, err)
 	v, err = s.PutCredential(ctx, "pair", KindOAuth, oauthEnvelope("access-4", string(planted)))
 	check("PutCredential (exists)", v, err)
