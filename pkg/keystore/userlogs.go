@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"slices"
 	"strconv"
@@ -379,10 +380,20 @@ type logState struct {
 	// bad is the error of a line that did not parse, which sticks for this
 	// file.
 	bad error
+	// badAt is the byte offset bad was met at: root's, never in an error a
+	// socket caller can see.
+	badAt int64
 	// tornSize, when not 0, is the size of the file whose last line had no
 	// newline: bad then holds only for that size, since an append completes
 	// the line, and reading resumes at off, the torn line's start.
 	tornSize int64
+}
+
+// at records off as where the sticky error err was met, kept apart from
+// err's text, which a socket caller can see, and returns err.
+func (s *logState) at(off int64, err error) error {
+	s.badAt = off
+	return err
 }
 
 // floorKey is one floor line's key.
@@ -554,7 +565,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		return s, nil
 	}
 	if st.Size > bound {
-		s.bad = fmt.Errorf("%w: %s is %d bytes, over the reader's bound of %d", errLogTooLarge, l.name, st.Size, bound)
+		s.bad = fmt.Errorf("%w: %s", errLogTooLarge, l.name)
 		return s, nil
 	}
 	start := s.off
@@ -585,7 +596,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 				continue
 			case errors.Is(err, io.EOF):
 				// s.off stays before the cap, so the skip runs again.
-				s.bad, s.tornSize = fmt.Errorf("at byte %d: %w", off, errLogTorn), st.Size
+				s.bad, s.tornSize = s.at(off, errLogTorn), st.Size
 				return s, nil
 			}
 			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, err)
@@ -601,7 +612,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, err)
 		}
 		if errors.Is(err, errLogTorn) {
-			s.off, s.bad, s.tornSize = off, fmt.Errorf("at byte %d: %w", off, err), st.Size
+			s.off, s.bad, s.tornSize = off, s.at(off, err), st.Size
 			return s, nil
 		}
 		if errors.Is(err, errLogLineTooLong) && !l.whole {
@@ -611,7 +622,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 			n, serr := skipRestOfLine(r, line)
 			switch {
 			case errors.Is(serr, io.EOF):
-				s.off, s.bad, s.tornSize = off, fmt.Errorf("at byte %d: %w", off, errLogTorn), st.Size
+				s.off, s.bad, s.tornSize = off, s.at(off, errLogTorn), st.Size
 				return s, nil
 			case serr != nil:
 				s.off = off
@@ -621,12 +632,12 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 			continue
 		}
 		if err != nil {
-			s.bad = fmt.Errorf("at byte %d: %w", off, err)
+			s.bad = s.at(off, err)
 			return s, nil
 		}
 		uid, perr := l.lineUID(s, line[:len(line)-1])
 		if perr != nil {
-			s.bad = fmt.Errorf("at byte %d: %w", off, perr)
+			s.bad = s.at(off, perr)
 			return s, nil
 		}
 		if off >= s.hardCap && uid != 0 {
@@ -805,7 +816,7 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) err
 	out := line
 	if torn {
 		if l.addsKey != nil {
-			return fmt.Errorf("%w (%s, %d bytes)", errLogTornTail, l.name, st.Size)
+			return fmt.Errorf("%w (%s)", errLogTornTail, l.name)
 		}
 		out = append([]byte{'\n'}, line...)
 	}
@@ -910,7 +921,7 @@ func (l *appendLog) preflight(f *os.File, n int, revoke bool) error {
 		margin = revokeFreeSlack
 	}
 	if avail < margin+uint64(n) {
-		return fmt.Errorf("%w (%s: %d bytes free)", errLogNoSpace, l.name, avail)
+		return fmt.Errorf("%w (%s)", errLogNoSpace, l.name)
 	}
 	return nil
 }
@@ -960,8 +971,8 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		seq, inSeq := st.maxSeq[r.key]
 		uid := scopeUID(r.key.scope)
 		if !inSeq && !st.buried[r.key] {
-			if bound := l.readKeyBound(); st.keys >= bound {
-				return 0, fmt.Errorf("%w (%d)", errFloorTooManyKeys, bound)
+			if st.keys >= l.readKeyBound() {
+				return 0, errFloorTooManyKeys
 			}
 			st.keys++
 			st.uidKeys[uid]++
@@ -1008,6 +1019,8 @@ func (f *fileFloorLog) read(fn func(*logState)) error {
 		return err
 	}
 	if state.bad != nil {
+		// The offset is root's: the server's debug log, never the error.
+		slog.Debug("the user-scope floor does not parse", "log", f.log.name, "offset", state.badAt, "err", state.bad)
 		return fmt.Errorf("%w (%v)", errFloorLogMalformed, state.bad)
 	}
 	fn(state)
