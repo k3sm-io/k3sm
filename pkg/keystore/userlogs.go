@@ -1086,3 +1086,59 @@ func (s *FileStore) admit(uid uint32, revoke bool) error {
 	}
 	return nil
 }
+
+// floorGrantRoom refuses, before a grant's first write, a grant whose floor
+// lines, one per name in names in the order it appends them, the floor
+// would refuse after its commit: a line that would start at or past the
+// hard cap (a grant's line draws on no revocation budget), lines that would
+// take the floor past logReadBound or past its key bound (each counted as a
+// new key), or lines the free-space margin would not hold. So a grant
+// committed without its floor line is left only by a crash or an I/O error
+// between this check and the append. Only the file-backed floor is held.
+func (s *FileStore) floorGrantRoom(scope string, names []string) error {
+	ff, ok := s.userFloor.(*fileFloorLog)
+	if !ok {
+		return nil
+	}
+	l := ff.log
+	var lines [][]byte
+	total := 0
+	for _, n := range names {
+		// Every generation is 16 bytes, so the line's length is the real one.
+		line, err := floorLine(scope, n, [generationSize]byte{}, 1)
+		if err != nil {
+			return err
+		}
+		lines = append(lines, line)
+		total += len(line)
+	}
+	f, st, err := l.open(unix.O_RDONLY)
+	if err != nil {
+		l.forgetUnflagged(err, false)
+		return err
+	}
+	defer func() { _ = f.Close() }() // read-only
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	state, err := l.sync(f, st)
+	if err != nil {
+		return err
+	}
+	if state.bad != nil {
+		return fmt.Errorf("%w (%v)", errFloorLogMalformed, state.bad)
+	}
+	size := st.Size
+	for _, line := range lines {
+		if size >= s.logHardCap {
+			return fmt.Errorf("%w (%s would be past its hard cap before the put's last floor line)", ErrLogFull, l.name)
+		}
+		size += int64(len(line))
+	}
+	if size > s.logReadBound() {
+		return fmt.Errorf("%w (%s would pass the reader's bound)", ErrLogFull, l.name)
+	}
+	if state.keys+len(lines) > l.keyBound() {
+		return fmt.Errorf("%w (%s has no room under its key bound)", ErrLogFull, l.name)
+	}
+	return l.preflight(f, total, false)
+}
