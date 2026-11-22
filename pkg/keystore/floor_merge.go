@@ -294,6 +294,13 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if err := s.chownStaged(st); err != nil {
 		return r, err
 	}
+	// rm under the guard buried these entries while their files were
+	// staged, out of its reach: the merge removes them before the tree
+	// moves into place, so no second rm is needed. A failure here leaves
+	// the floor unwritten.
+	if err := s.removeStaged(st, guardBuried(live, plan.merged)); err != nil {
+		return r, err
+	}
 	// Only keystore-lock: the merge writes the root-owned floor and nothing
 	// under keystore/, so it takes no keystore/.lock, which the service user
 	// can hold or replace to stop it. Readers need no .lock against it
@@ -345,6 +352,19 @@ func (fl floor) guardEra() map[floorBurial]bool {
 		}
 	}
 	return out
+}
+
+// guardBuried is each name, sorted, with a guard-era burial in live (rm
+// run under the guard) that merged does not hold live: the entries whose
+// staged directory the merge removes (removeStaged).
+func guardBuried(live, merged floor) []string {
+	set := map[string]bool{}
+	for b := range live.guardEra() {
+		if !merged[b.name].live() {
+			set[b.name] = true
+		}
+	}
+	return sortedNames(set)
 }
 
 // renumberGuard renumbers fl's burials, order kept: those in guarded from

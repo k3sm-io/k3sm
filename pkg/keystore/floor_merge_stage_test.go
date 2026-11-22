@@ -281,3 +281,32 @@ func TestFloorMergeNeedsStagedTree(t *testing.T) {
 		t.Fatal("live floor changed by the refused merge")
 	}
 }
+
+// TestFloorMergeRemovesGuardBuriedStaged (U192): an rm under the guard
+// buries the restored entry while its files are staged in
+// pre-restore.d/restored, out of rm's reach; the merge removes that entry's
+// staged directory before it moves the tree into place, so no second rm is
+// needed, and leaves every other entry.
+func TestFloorMergeRemovesGuardBuriedStaged(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("v"))
+	mustPut(t, s, "other", KindOpaque, []byte("v"))
+	writeAsideFloor(t, server, floorOf(t, server))
+	stageTree(t, s)
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete under the guard: %v", err)
+	}
+	if _, err := os.Lstat(stagePath(s, stagedTreeName, "k")); err != nil {
+		t.Fatalf("k's staged directory after the rm: %v, want it still staged", err)
+	}
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dir, "k")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("k's directory after the merge: %v, want it removed", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dir, "other")); err != nil {
+		t.Fatalf("other's directory after the merge: %v, want it moved into place", err)
+	}
+}

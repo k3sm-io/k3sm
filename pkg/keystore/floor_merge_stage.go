@@ -263,6 +263,34 @@ func (s *FileStore) chownTree(root *os.Root, depth int) error {
 	return nil
 }
 
+// removeStaged removes the directory of each of names from
+// pre-restore.d/restored, through the tree opened by descriptor inside the
+// root-only pre-restore.d (st.tree): os.Root's RemoveAll never follows a
+// symlink, removing one itself, and never leaves the tree. A name already
+// absent is no error.
+func (s *FileStore) removeStaged(st *mergeStaging, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	tree, err := st.tree(stagedTreeName)
+	if err != nil {
+		return err
+	}
+	if tree == nil {
+		return errNotStaged
+	}
+	defer func() { _ = tree.Close() }() // removals are synced below
+	for _, name := range names {
+		if err := checkName(name); err != nil {
+			return err
+		}
+		if err := tree.RemoveAll(name); err != nil {
+			return fmt.Errorf("remove the staged directory of %s, deleted under the guard, from %s/%s: %w; nothing is written, run the merge again", name, preRestoreDirName, stagedTreeName, err)
+		}
+	}
+	return syncDir(tree)
+}
+
 // moveStaged renames pre-restore.d/restored to the store's Dir, through the
 // two directory descriptors, refusing when anything, a symlink included, is
 // at Dir (renameExcl). Once the rename is made it stands: a failed fsync of
