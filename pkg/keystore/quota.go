@@ -282,6 +282,9 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		}
 		return err
 	}
+	if g, ok := u.authenticatedGeneration(root, e); ok {
+		b.addAuthenticated(g)
+	}
 	b.addTree(e, name)
 	if len(b.gens) == 0 {
 		e.close()
@@ -389,9 +392,11 @@ type burial struct {
 	name    string
 	gens    [][generationSize]byte
 	sources []string
-	// floor is the floor's live generations, and pointer the pointer
-	// header's, when it read.
+	// floor is the floor's live generations, authed the generation the
+	// pointer authenticates under K_u, and pointer the pointer header's,
+	// when each read.
 	floor   [][generationSize]byte
+	authed  *[generationSize]byte
 	pointer *[generationSize]byte
 	// capped is set when the tree named more than maxTreeGenerations
 	// generations beyond floor: gens is then floor and pointer alone.
@@ -406,9 +411,41 @@ func newBurial(name string, live [][generationSize]byte) *burial {
 	return b
 }
 
-// treeOnly is how many of gens the floor does not hold live.
+// treeOnly is how many of gens only the tree names: neither the floor holds
+// it live nor the authenticated pointer carries it.
 func (b *burial) treeOnly() int {
-	return len(b.gens) - len(b.floor)
+	n := len(b.floor)
+	if b.authed != nil && !slices.Contains(b.floor, *b.authed) {
+		n++
+	}
+	return len(b.gens) - n
+}
+
+// addAuthenticated adds the generation the entry's pointer authenticates
+// under K_u. It is no tree claim, so maxTreeGenerations does not count it,
+// and the reservation covers it with the rest.
+func (b *burial) addAuthenticated(g [generationSize]byte) {
+	b.authed = &g
+	b.add("the authenticated pointer", g)
+}
+
+// authenticatedGeneration is the generation e's pointer authenticates under
+// the scope's K_u, when the master loads, the scope.key opens under W (with
+// no GeneratedUID check, as for any revocation) and the pointer
+// authenticates. It is best effort: rm needs neither W nor K_u, so a key
+// that does not load only leaves the burial to the floor and the tree.
+func (u *UserScope) authenticatedGeneration(root *os.Root, e *entry) ([generationSize]byte, bool) {
+	k, err := u.s.loadMaster()
+	if err != nil {
+		return [generationSize]byte{}, false
+	}
+	o, err := u.openScopeForRevoke(root, k)
+	if err != nil {
+		return [generationSize]byte{}, false
+	}
+	defer o.close()
+	g, _, ok := authenticatedPointer(&entry{root: e.root, name: e.name}, o.uk)
+	return g, ok
 }
 
 func (b *burial) add(source string, g [generationSize]byte) {
@@ -437,6 +474,9 @@ func (b *burial) addTree(e *entry, name string) {
 		b.capped, b.gens, b.sources = true, nil, nil
 		for _, g := range b.floor {
 			b.add("the floor", g)
+		}
+		if b.authed != nil {
+			b.add("the authenticated pointer", *b.authed)
 		}
 		if b.pointer != nil {
 			b.add("the pointer header", *b.pointer)

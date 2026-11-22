@@ -1415,10 +1415,18 @@ store refuses to read or write a sealed record over 1,056 KiB.
   an unknown UID included) appends the catch-up line, in the revocation class, before it
   serves, when the floor is behind the record. The process's mark does not survive a restart;
   the catch-up line does, so after a restart the earlier record copied back at the floor's
-  one-behind sequence is refused, not re-sealed. A user entry needs no such line today: its
-  floor line is always at sequence 1, and no exclusive-lock operation authenticates an entry
-  pointer (`current` and `list` take the shared lock, and `rm` opens no record); no
-  server-start sweep is built. `rm` is a revocation too: it
+  one-behind sequence is refused, not re-sealed. A user entry's floor line is always at
+  sequence 1, so it needs no sequence catch-up, but a `put` can lose the line itself after its
+  commit (a crash between the pointer and the floor line, or a floor that refused it), and
+  then the entry's generation rests only on its tree, which a tree-writer can rewrite before
+  the user runs `rm`. So the server-start catch-up (`CatchUpUser`, below) also appends, scope
+  by scope and best effort, a live floor line at the pointer's sequence for every user entry
+  whose pointer authenticates under `K_u` and whose authenticated generation has no floor
+  line; a generation a tombstone buries is never given one, and a line the floor refuses is
+  logged at Warn and named in the error. `rm` also buries the generation its pointer
+  authenticates under `K_u`, when `W` and `K_u` load (best effort: `rm` needs neither). A
+  tree-writer who rewrites the pointer's header breaks its authentication, so only the start
+  catch-up covers a lost line whose tree was then rewritten throughout. `rm` is a revocation too: it
   only removes files, so it needs neither `W` nor `K_u`, and is never refused for a lookup
   that ran and failed or timed out, or for `ErrRewrapInProgress`. A lookup refused at once for
   capacity, where none ran (eight already outstanding, or an earlier call for the uid stuck past
@@ -1507,11 +1515,13 @@ service user can only add to.
   one source: it buries every generation the floor holds a live line for under
   `(scope, name)`, the `generation` file's value, the generation in the current
   pointer's header and the generation in each `v<N>` version record's header, the headers
-  parsed without a key. A source that does not read or parse adds nothing (a tree a
+  parsed without a key, and, when `W` and `K_u` load and the pointer authenticates, the
+  generation the pointer authenticates, which is no tree claim and counts against the same
+  reservation. A source that does not read or parse adds nothing (a tree a
   crashed `put` left has no pointer). Those tree sources are unauthenticated, so one `rm`
   buries at most 4 distinct generations (`maxTreeGenerations`) named only by them beyond
   the floor's live ones: past that, it stops reading headers, buries the floor's live
-  generations and the pointer header's, removes the tree and reports, as after a commit
+  generations, the authenticated pointer's and the pointer header's, removes the tree and reports, as after a commit
   (`errCommitted`), that the tree was altered, so a planted tree of many `v<N>` headers cannot
   spend the floor's revocation headroom through one `rm`. The floor's live generations are taken first and
   buried **whatever stands at the name**: a directory (with the tree's sources added); a
@@ -1859,7 +1869,8 @@ That wait is the store `.lock`
   lock, appends the catch-up floor line of every user scope whose authenticated delivery
   record sits above its floor line (a withdraw whose floor line failed leaves one behind, and
   the process's own mark of the record's sequence does not survive a restart), so the
-  catch-up does not wait for that scope's next mutation. `New` only constructs the store and
+  catch-up does not wait for that scope's next mutation, and the live floor line of every
+  user entry whose authenticated pointer's generation has none (a `put` that lost it). `New` only constructs the store and
   reads neither log, so neither call runs there; the server start that exports the user
   scope makes both, through the unexported `startUserScopes`, which runs `CheckLogBounds`
   and then `CatchUpUser`, in that order, and then marks the user scope started. Until it

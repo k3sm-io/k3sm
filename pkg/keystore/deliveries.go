@@ -996,14 +996,20 @@ func (s *FileStore) catchUpUser(ctx context.Context) (scopeErrs, err error) {
 	return errors.Join(errs...), err
 }
 
-// catchUpScope runs catchUpDeliveries for u's scope, opened for a
-// revocation. A scope with no delivery record has nothing to catch up.
+// catchUpScope runs catchUpDeliveries, then catchUpEntries, for u's scope,
+// opened for a revocation. A scope with no delivery record has no delivery
+// line to catch up; its entries are still caught up.
 func (u *UserScope) catchUpScope(root *os.Root, k keys) error {
 	o, err := u.openScopeForRevoke(root, k)
 	if err != nil {
 		return err
 	}
 	defer o.close()
+	return errors.Join(u.catchUpScopeDeliveries(o), u.catchUpEntries(o))
+}
+
+// catchUpScopeDeliveries is catchUpScope's delivery-record half.
+func (u *UserScope) catchUpScopeDeliveries(o *openedScope) error {
 	rd, err := u.readDeliveriesFloor(o, true)
 	if errors.Is(err, ErrScopeAbsent) {
 		return nil
@@ -1018,6 +1024,88 @@ func (u *UserScope) catchUpScope(root *os.Root, k keys) error {
 		return errors.New("the user-scope floor did not take the delivery record's catch-up line")
 	}
 	return nil
+}
+
+// catchUpEntries appends the floor line a put lost after its commit (a
+// crash between the pointer and the floor line, or a floor that refused
+// the line): for every entry of o's scope whose pointer authenticates under
+// K_u and whose authenticated generation has no floor line, a live line at
+// the pointer's sequence. Without it the entry's generation rests only on
+// the tree's word, which a tree-writer can rewrite before the user runs rm.
+// A generation a tombstone buries is never given a live line: that tree is
+// a copy put back after rm. An entry whose pointer does not authenticate
+// has nothing to catch up. It is best effort: each line the floor does not
+// take is logged at Warn and named in the joined error, and the rest are
+// still appended.
+func (u *UserScope) catchUpEntries(o *openedScope) error {
+	entries, err := u.s.openSubdir(o.dir, scopeEntriesName, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err)
+	}
+	defer func() { _ = entries.Close() }() // nothing is written in entries/
+	names, err := readDirNames(entries, maxDirNames)
+	if err != nil {
+		return fmt.Errorf("list %s: %w", scopeEntriesName, err)
+	}
+	var errs []error
+	for _, name := range names {
+		e, err := openEntryDirRaw(entries, name)
+		if err != nil {
+			continue // no entry directory the store wrote
+		}
+		gen, seq, ok := authenticatedPointer(e, o.uk)
+		e.close()
+		if !ok {
+			continue
+		}
+		if err := u.catchUpEntry(name, gen, seq); err != nil {
+			slog.Warn("the user-scope floor did not take an entry's catch-up line; the entry's generation rests on its tree alone", "scope", u.scope, "err", err)
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// catchUpEntry appends name's live floor line at gen and seq unless the
+// floor already holds one for gen or buries it.
+func (u *UserScope) catchUpEntry(name string, gen [generationSize]byte, seq uint64) error {
+	live, err := u.s.userFloor.liveGens(u.scope, name)
+	if err != nil {
+		return fmt.Errorf("read the floor's generations for an entry: %w", err)
+	}
+	if slices.Contains(live, gen) {
+		return nil
+	}
+	if _, err := u.s.userFloor.floor(u.scope, name, gen); errors.Is(err, errFloorBuried) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("read the floor for an entry: %w", err)
+	}
+	if err := u.s.userFloor.append(u.scope, name, gen, seq, false); err != nil {
+		return fmt.Errorf("an entry's catch-up line: %w", err)
+	}
+	return nil
+}
+
+// authenticatedPointer opens e's current pointer under uk at the
+// generation its header names, and returns that generation and the
+// pointer's sequence when the pointer authenticates: a generation K_u
+// vouches for, unlike the generation file's or a header read without a
+// key.
+func authenticatedPointer(e *entry, uk keys) ([generationSize]byte, uint64, bool) {
+	g, ok := headerGeneration(e.root, currentName, e.name, true)
+	if !ok {
+		return g, 0, false
+	}
+	e.generation = g
+	_, seq, err := e.pointer(uk)
+	if err != nil {
+		return g, 0, false
+	}
+	return g, seq, true
 }
 
 // rootHasUserScopes reports whether root holds a .user name.
