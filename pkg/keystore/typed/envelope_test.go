@@ -299,13 +299,14 @@ func FuzzEnvelopeParse(f *testing.F) {
 				t.Fatalf("decode error %v is neither ErrCorrupt nor ErrKindUnsupported", err)
 			}
 			// The sentinels' fixed texts are not the input's; what is left of
-			// the message must not carry 16 input bytes in a row.
+			// the message must not carry 16 input bytes in a row, anywhere
+			// in the input.
 			msg := err.Error()
 			for _, s := range []error{ErrCorrupt, ErrKindUnsupported} {
 				msg = strings.ReplaceAll(msg, s.Error(), "")
 			}
-			if len(in) >= 16 && strings.Contains(msg, string(in)) {
-				t.Fatalf("decode error carries the input: %v", err)
+			if at, ok := windowLeak(msg, in); ok {
+				t.Fatalf("decode error carries input bytes %d to %d: %v", at, at+leakWindow, err)
 			}
 			return
 		}
@@ -317,4 +318,85 @@ func FuzzEnvelopeParse(f *testing.F) {
 			t.Fatalf("encode(decode(b)) != b:\n got %x\nwant %x", out, in)
 		}
 	})
+}
+
+// leakWindow is the run of input bytes an error must never carry.
+const leakWindow = 16
+
+// windowLeak reports the offset of the first leakWindow-byte window of in
+// that appears in msg.
+func windowLeak(msg string, in []byte) (int, bool) {
+	for i := 0; i+leakWindow <= len(in); i++ {
+		if strings.Contains(msg, string(in[i:i+leakWindow])) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// TestEnvelopeRefusalsNeverCarryRefreshToken plants a marker refresh token in
+// an oauth envelope, breaks the envelope around it in every way Decode
+// refuses, and checks that no refusal's text carries the marker, nor any 16
+// bytes of the input in a row.
+func TestEnvelopeRefusalsNeverCarryRefreshToken(t *testing.T) {
+	marker := []byte("MARKER-refresh-token-5f0c1e9a7b3d")
+	at := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
+	good, err := Encode(credential.KindOAuth, Envelope{
+		Credential: Credential{
+			AccessToken:     []byte("access"),
+			AccessExpiresAt: at.Add(time.Hour),
+			AccessIssuedAt:  at,
+			RefreshOwner:    "local",
+		},
+		RefreshToken: marker,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refresh := bytes.Index(good, marker) - 3 // the refresh token's field header
+	if refresh < 1 || good[refresh] != tagRefreshToken {
+		t.Fatalf("the marker is not the refresh token field in %x", good)
+	}
+	field := func(tag byte, v []byte) []byte {
+		return append(binary.BigEndian.AppendUint16([]byte{tag}, uint16(len(v))), v...)
+	}
+	splice := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+	head, tail := good[:refresh], good[refresh+3+len(marker):]
+	big := bytes.Repeat(marker, MaxRefreshToken/len(marker)+1)
+	cases := map[string][]byte{
+		"envelope version 0":           splice([]byte{0}, good[1:]),
+		"envelope version 2":           splice([]byte{2}, good[1:]),
+		"oversized":                    splice(good, bytes.Repeat(marker, MaxEnvelopeSize/len(marker)+1)),
+		"truncated inside the token":   good[:refresh+3+len(marker)/2],
+		"truncated field header":       splice(good, []byte{0x40, 0}),
+		"length past the end":          splice(head, []byte{tagRefreshToken, 0xff, 0xff}, marker),
+		"refresh token over its bound": splice(head, field(tagRefreshToken, big), tail),
+		"empty refresh token":          splice(head, field(tagRefreshToken, nil), tail),
+		"refresh token missing":        splice(head, tail),
+		"refresh token repeated":       splice(head, field(tagRefreshToken, marker), field(tagRefreshToken, marker), tail),
+		"refresh token out of order":   splice(good[:1], field(tagRefreshToken, marker), good[1:refresh], tail),
+		"unknown tag carrying it":      splice(head, field(0x3f, marker), tail),
+		"another kind's tag":           splice(head, field(tagValue, marker), tail),
+		"trailing field after owner":   splice(good, field(0x37, marker)),
+		"refresh owner is the marker":  splice(head, field(tagRefreshToken, marker), good[bytes.LastIndexByte(good, tagRefreshOwner):bytes.LastIndexByte(good, tagRefreshOwner)+1], binary.BigEndian.AppendUint16(nil, uint16(len(marker))), marker),
+	}
+	for name, in := range cases {
+		for _, kind := range fuzzKinds {
+			_, err := Decode(kind, in)
+			if err == nil {
+				t.Errorf("%s as %s: decoded", name, kind)
+				continue
+			}
+			msg := err.Error()
+			if bytes.Contains([]byte(msg), marker) {
+				t.Errorf("%s as %s: the refusal carries the marker: %v", name, kind, err)
+			}
+			for _, s := range []error{ErrCorrupt, ErrKindUnsupported} {
+				msg = strings.ReplaceAll(msg, s.Error(), "")
+			}
+			if at, ok := windowLeak(msg, in); ok {
+				t.Errorf("%s as %s: the refusal carries input bytes %d to %d: %v", name, kind, at, at+leakWindow, err)
+			}
+		}
+	}
 }

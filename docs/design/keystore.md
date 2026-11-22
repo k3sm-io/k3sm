@@ -3356,7 +3356,10 @@ The record kinds as merged are `KindUnknown = 0` (never written), `KindEd25519 =
   state.
 - **Tests pin the bytes.** Committed per-kind golden vectors under
   `pkg/keystore/typed/testdata/envelope/` (U143). `FuzzEnvelopeParse` asserts that an accepted
-  input re-encodes byte-identically and that an error never contains input bytes; its seeds live
+  input re-encodes byte-identically and that an error never contains input bytes: no 16-byte
+  window slid over the input appears in the error text (the sentinels' fixed texts aside), and
+  `TestEnvelopeRefusalsNeverCarryRefreshToken` plants a marker refresh token and triggers every
+  refusal around it; its seeds live
   in `testdata/fuzz/FuzzEnvelopeParse/`, which a lint keeps non-empty (U154).
 
 **Binding into the AAD.** The kind byte is already `LP(kind)` in the six-field AAD ("Record
@@ -3646,7 +3649,8 @@ Two observers; the server holds the durable record.
   untrusted input, which stays on the maintained library, behind k3sm's own limits: at most
   4 KiB of input, exactly one `OPENSSH PRIVATE KEY` PEM block with no headers and nothing but
   whitespace around it, an ed25519 key whose private half matches its seed, and one fixed
-  refusal message that quotes no input byte. `FuzzSSHImport` covers it, with seeds in
+  refusal message that quotes no input byte. `FuzzSSHImport` covers it, asserting that no 16-byte
+  window of the PEM body appears in a refusal, with seeds in
   `testdata/fuzz/FuzzSSHImport/`. The key's own comment is not kept; `--comment` sets it.
 - **Tests do not compare the library with itself.** `TestSSHFingerprintMatchesOpenSSH` checks
   against a committed `ssh-keygen -l -E sha256` output for a committed key (U148).
@@ -4286,7 +4290,7 @@ carried by the unit rows.
 | U146 | `rotate` and `put` over an existing entry cannot change its kind (`ErrKindMismatch`) | `k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind` | checked: the typed store |
 | U147 | token needs `expiresAt`; oauth needs access token, access expiry, refresh token and an owner in the grammar | `k3sm/pkg/keystore::TestTypedPutValidation` | checked: the typed store |
 | U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH`, `k3sm/pkg/keystore::TestStoreGenerateSSHUsesRandomSeam` | checked: the typed envelope and the typed store |
-| U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential` | partial: every exported method of `*FileStore` and `*UserScope`, enumerated by reflection (a method neither called by hand, callable with built arguments nor allowlisted with a reason fails the test), the typed reads and the deliveries path checked (the typed store); pending: the consumer interfaces and `internal/refreshopen`'s import graph, `TestRefreshOpenerImportGraph` (the refresher) |
+| U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential`, `k3sm/pkg/keystore/typed::TestEnvelopeRefusalsNeverCarryRefreshToken` | partial: every exported method of `*FileStore` and `*UserScope`, enumerated by reflection (a method neither called by hand, callable with built arguments nor allowlisted with a reason fails the test), the typed reads and the deliveries path checked (the typed store); pending: the consumer interfaces and `internal/refreshopen`'s import graph, `TestRefreshOpenerImportGraph` (the refresher) |
 | U150 | `RotateIf` refuses a stale version, and a version read from an entry since deleted and put again; a rotation never changes an oauth entry's refresh owner | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused`, `TestRotateIfRefusesRecreatedEntry`, `TestRefreshOwnerFixedPerEntry` | checked: the typed store |
 | U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test); a failure after the pointer flip reports the commit | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep`; a failure after the flip returns the new version with `ErrCommitted`, `TestRotateReportsCommitAfterFlip` | checked: the typed store |
 | U152 | a pruned oauth entry: List shows it healthy, Rewrap re-seals `low..current`, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught | `k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt`, `TestRewrapHandlesPrunedOAuth`, `TestDeletePrunedOAuthEntry`, `TestGapInsideCommittedRangeIsCorrupt`, `TestCopyBackAcrossPruneCaught` | checked: the typed store |

@@ -232,6 +232,10 @@ func FuzzSSHImport(f *testing.F) {
 			if err != errSSHRefused {
 				t.Fatalf("refusal %v is not the fixed reason", err)
 			}
+			// The refusal never carries 16 bytes of the PEM body in a row.
+			if at, ok := windowLeak(err.Error(), b); ok {
+				t.Fatalf("the refusal carries input bytes %d to %d: %v", at, at+leakWindow, err)
+			}
 			return
 		}
 		if len(seed) != ed25519.SeedSize {
