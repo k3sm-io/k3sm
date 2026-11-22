@@ -533,21 +533,21 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
 - Each file write is still temp-and-rename, so a process that dies releases the lock and
   leaves a state the next operation can finish or discard. The lock is for serialization,
   not for crash safety.
-- Every verb that writes the floor also takes `flock(2)` on the data root directory itself,
-  opened `O_NOFOLLOW|O_DIRECTORY` and judged root-owned and not shared on that descriptor,
-  after `keystore/.lock` and with the same bounded wait. Under it each verb re-reads
+- Every verb that writes the floor also takes `flock(2)` on `keystore-lock`, a root:wheel
+  0600 file in the data root: the data root is opened `O_NOFOLLOW|O_DIRECTORY` and judged
+  root-owned and not shared on that descriptor, and the file is created
+  `O_CREAT|O_EXCL|O_NOFOLLOW` through that directory, opened `O_RDWR|O_NOFOLLOW|O_NONBLOCK`
+  and refused unless, on that descriptor, it is a regular file owned by root with no group
+  or other access. The order is `keystore/.lock` first, then `keystore-lock`, each with the
+  same bounded wait. Under it each verb re-reads
   `keystore-floor.json` and applies only its own change to what it read (Rotate and the
   start of a verb raise a sequence of the same generation, Put sets sequence 1 for a new
   generation, Delete removes the entry only if it records the deleted generation), holding
   the lock through the rename and the directory fsync. This lock defends against a writer
   under a swapped `.lock` writing the floor; it does not stop racing entry files under a
-  swapped `.lock`. The data root is root:wheel 0755, so any local process able to open it,
-  not only the service user, can take this lock and hold it. A root verb that writes the
-  floor then fails with the lock timeout after the bounded wait; while the lock is held,
-  Delete and Rotate fail too, so a compromised secret cannot be removed or replaced until
-  the holder lets go. That is a denial of
-  service against the root write verbs and nothing more: holding the lock writes nothing,
-  so the floor, the entries and the readers (which do not take it) lose no integrity.
+  swapped `.lock`. Only root can open `keystore-lock`, so only root can hold this lock. The
+  data root itself is root:wheel 0755 and any local process can open it and `flock(2)` it,
+  but no verb takes that lock, so holding it blocks nothing (U119).
 - An entry directory with no `current` is an incomplete Put only in the one shape a crashed
   Put can leave, ignoring leftover `.tmp` files, and only when the floor does not record its
   generation; any other directory with no `current` is damage. "An entry directory with no
@@ -3296,7 +3296,7 @@ carried by the unit rows.
 | U115 | `rm-scope` names each blocking binding, a RoleBinding with its namespace; `--remove-bindings` deletes each listed binding through the admin client before anything else changes, and a failed delete stops the verb, changing nothing further | `k3sm/cmd/k3sm::TestRmScopeNamesBindingsAndRemovesThem` | pending: the KeyDelivery reconciler (lifecycle) |
 | U116 | the Pod uid refusal applies to native Pods only: a vm Pod with `runAsUser: 1000` is allowed, since a guest uid has no host meaning, while a native Pod with the same drop target is refused; the guest's groups skip the host group rules the same way | `runtimed/pkg/runtime::TestVMPodGuestUIDNotRefused` (the refusal sits on the native spawn path, `checkPodUID` in `pkg/runtime/security.go`; the same test, in `pkg/runtime/vmcontainers_test.go`, also pins that a vm Pod's `runAsGroup` of 1000 reaches the guest's GID and SupplementalGIDs unrefused) | checked: runtimed's sandbox change |
 | U118 | the old log is never service-user-owned while unflagged (integration, a root-run row: `--root`): in `audit --rotate` and `floor --rebuild` the step that clears `sappnd` on the old file, and on each archive rotate shifts, also `fchown`s it to root and `fchmod`s it 0600 on the verb's descriptor; the service user's `open(O_WRONLY\|O_TRUNC)` of each, between the clear and the re-flag, gets EACCES and changes no byte | `k3sm/cmd/k3sm::TestMaintenanceOldFileRootOwnedWhileUnflagged` (integration, root-run) | pending: the append-only files |
-| U119 | the floor lock is `keystore-lock`, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root (`put`, `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise of `list` and `show`, `rm-scope`, `floor --rebuild`, `audit --rotate`); run as root (a root-run row, `--root`), a non-root process holding the old data-root flock blocks none of them | `k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb` (integration, root-run) | pending: the append-only files |
+| U119 | the floor lock is `keystore-lock`, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root (`put`, `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise of `list` and `show`, `rm-scope`, `floor --rebuild`, `audit --rotate`); run as root (a root-run row, `--root`), a non-root process holding the old data-root flock blocks none of them | `k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb` (integration, root-run) | checked as a root-run row (`--root`) for the verbs that exist: `put`, `rotate`, `rm`, `rewrap` and the floor raise; `rm-scope`, `floor --rebuild` and `audit --rotate` take it as they land (the append-only files) |
 | U120 | the activated listening descriptor reaches no child (integration): the server spawns each child type, an `exec.Command` child, the runtimed helper and a Pod through the exec shim, lists each one's open descriptors, and the listening socket is among none of them | `k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild` (integration) | pending: the socket listener |
 | U121 | under activation, a client whose connected peer reads as uid 0 or as launchd's code refuses and writes nothing; U36 is never relaxed to accept uid 0, and if K7a finds the client-side peer names launchd the self-bind form ships (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer` | pending: the socket listener |
 | U122 | when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup | `k3sm/pkg/provider::TestPodProfileDeniesLaunchdSocketActivation`; rig leg E27 | pending: the socket listener |

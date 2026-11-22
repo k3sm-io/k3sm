@@ -666,7 +666,7 @@ check U116 "the Pod uid refusal applies to native Pods only: a vm Pod with runAs
 	runtimed/pkg/runtime::TestVMPodGuestUIDNotRefused
 rootpend U118 "root-run: the old log is never service-user-owned while unflagged: in audit --rotate and floor --rebuild the step that clears sappnd on the old file, and on each archive rotate shifts, also fchowns it to root and fchmods it 0600 on the verb's descriptor; the service user's open(O_WRONLY|O_TRUNC) of each, between the clear and the re-flag, gets EACCES and changes no byte (append-only files)" \
 	k3sm/cmd/k3sm::TestMaintenanceOldFileRootOwnedWhileUnflagged
-rootpend U119 "root-run: the floor lock is keystore-lock, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root, rm-scope, floor --rebuild and audit --rotate included; a non-root process holding the old data-root flock blocks none of them (append-only files)" \
+rootcheck U119 "root-run: the floor lock is keystore-lock, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root, rm-scope, floor --rebuild and audit --rotate included; a non-root process holding the old data-root flock blocks none of them (append-only files)" \
 	k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb
 pend U120 "the activated listening descriptor reaches no child (integration): an exec.Command child, the runtimed helper and a Pod through the exec shim each list their open descriptors, and the listening socket is among none of them (socket listener)" \
 	k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild
