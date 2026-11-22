@@ -105,9 +105,10 @@ func TestAuditBeforeGrant(t *testing.T) {
 }
 
 // In a store built by New, whose data root has no append-only logs (no
-// sudo k3sm install), every mutating user verb refuses, and a refused mint
-// creates no directory: a grant refuses with errLogMissing before its
-// first write.
+// sudo k3sm install), the start step refuses (CheckLogBounds fails closed)
+// and the user scope stays unstarted; and should the logs go after the
+// start, every mutating user verb refuses, and a refused mint creates no
+// directory: a grant refuses with errLogMissing before its first write.
 func TestUserVerbsRefuseInProduction(t *testing.T) {
 	ctx := context.Background()
 	fake, server := newMasteredStore(t)
@@ -116,6 +117,13 @@ func TestUserVerbsRefuseInProduction(t *testing.T) {
 		DataRoot: fake.dataRoot, FloorUID: fake.floorUID, FloorGID: fake.floorGID,
 	})
 	fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
+	if err := s.startUserScopes(ctx); !errors.Is(err, errLogMissing) {
+		t.Fatalf("start with no logs: %v, want errLogMissing", err)
+	}
+	if _, err := s.UserScope(1001); !errors.Is(err, errUserScopesNotStarted) {
+		t.Fatalf("UserScope after the refused start: %v, want errUserScopesNotStarted", err)
+	}
+	s.userScopesStarted.Store(true) // the logs went after the start
 	u := userScope(t, s, 1001)
 	snap := treeSnapshot(t, server)
 	if _, err := u.Put(ctx, "user/1001/token", KindOpaque, []byte("v")); !errors.Is(err, errLogMissing) {

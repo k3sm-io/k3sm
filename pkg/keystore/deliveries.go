@@ -932,8 +932,9 @@ func (u *UserScope) catchUpDeliveries(gen [generationSize]byte, rd deliveriesRea
 // startUserScopes is the server's user-scope start step, owed before the
 // listener serves: CheckLogBounds, then catchUpUser, in that order. Once
 // both have run it marks the user scope started, and only then does
-// UserScope build one (errUserScopesNotStarted). A refused CheckLogBounds,
-// or a catch-up that could not run at all (no lock, no master), leaves it
+// UserScope build one (errUserScopesNotStarted). A refused CheckLogBounds
+// (it fails closed: a log missing, untrusted, unflagged or unreadable is
+// refused), or a catch-up that could not run at all (no lock, no master), leaves it
 // unstarted. catchUpUser is best effort per scope, so a scope it could not
 // catch up does not hold the others: the user scope starts, and the error
 // names that scope.
@@ -943,8 +944,12 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 	if s.userScopesStarted == nil {
 		return fmt.Errorf("%w: the store was not made by New", errInvalidConfig)
 	}
-	if err := s.CheckLogBounds(ctx); err != nil {
+	damage, err := s.CheckLogBounds(ctx)
+	if err != nil {
 		return err
+	}
+	if damage > 0 {
+		slog.Warn("the keystore append-only logs hold damaged lines, which are skipped", "damaged", damage)
 	}
 	scopeErrs, err := s.catchUpUser(ctx)
 	if err != nil {

@@ -1576,7 +1576,8 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 // log would read as damage and refuse every user-scope operation.
 // errLogRevokeBudgetSpent is a configuration under which a uid's lines past
 // the hard cap already spend its revocation budget, so its next revocation
-// would be refused: root-only, refused at store open.
+// would be refused, or has less than one whole line of it left: root-only,
+// refused at store open.
 var errLogRevokeBudgetSpent = errors.New("the configured log caps leave a uid's revocation budget already spent past the hard cap, so its revocations would be refused; configure the caps the log was written under, or restore the caps and rotate the audit log (the audit rotation verb is not yet available: until it is, restore the log from a backup and run sudo k3sm doctor)")
 
 var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's bounds below what an existing append-only log already holds, so it would read as damage; configure the caps the log was written under, or " + restoreRemedy)
@@ -1585,17 +1586,21 @@ var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's 
 // configuration whose reader's bounds sit below what an existing log
 // already holds: a log larger than logReadBound, or a floor with more keys
 // than the reader's key bound; and, as errLogRevokeBudgetSpent, one under
-// which a uid's lines past the hard cap in either log already exceed its
-// revocation budget, which would silently refuse its revocations. It is the server's store-open check, and its
-// error, which names the current figures, is root's alone: it never reaches
-// the socket. A log that does not open is left to each operation's own
-// judgement.
-func (s *FileStore) CheckLogBounds(ctx context.Context) error {
+// which a uid's lines past the hard cap in either log leave less than one
+// whole line (maxLogLine) of its revocation budget, which would silently
+// refuse its revocations. It fails closed: a file-backed log that is
+// missing, untrusted or unflagged, one that cannot be read, or one whose
+// state is damage that refuses it whole, is an error, so the start step
+// (startUserScopes) does not start the user scope. Bounded damage, lines
+// the reader skips, is no error: damage is their count across both logs.
+// It is the server's store-open check, and its error, which names the
+// current figures, is root's alone: it never reaches the socket.
+func (s *FileStore) CheckLogBounds(ctx context.Context) (damage int, err error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, err
 	}
 	if err := s.checkConfig(); err != nil {
-		return err
+		return 0, err
 	}
 	bound := s.logReadBound()
 	for _, l := range []any{s.userFloor, s.auditSink} {
@@ -1611,36 +1616,39 @@ func (s *FileStore) CheckLogBounds(ctx context.Context) error {
 		f, st, err := log.open(unix.O_RDONLY)
 		if err != nil {
 			log.forgetUnflagged(err, false)
-			continue
+			return 0, err
 		}
-		err = func() error {
+		n, err := func() (int, error) {
 			defer func() { _ = f.Close() }() // read-only
 			if st.Size > bound {
-				return fmt.Errorf("%w: %w (%s is %d bytes, over the reader's bound of %d)", errInvalidConfig, errLogBoundsBelowLog, log.name, st.Size, bound)
+				return 0, fmt.Errorf("%w: %w (%s is %d bytes, over the reader's bound of %d)", errInvalidConfig, errLogBoundsBelowLog, log.name, st.Size, bound)
 			}
 			log.mu.Lock()
 			defer log.mu.Unlock()
 			state, err := log.sync(f, st)
 			if err != nil {
-				return nil
+				return 0, err
 			}
 			for uid, n := range state.pastCap {
-				if uid != 0 && n > s.logRevokeBudget {
-					return fmt.Errorf("%w: %w (uid %d has %d bytes past the hard cap in %s, over its budget of %d)", errInvalidConfig, errLogRevokeBudgetSpent, uid, n, log.name, s.logRevokeBudget)
+				if uid != 0 && n+maxLogLine > s.logRevokeBudget {
+					return 0, fmt.Errorf("%w: %w (uid %d has %d bytes past the hard cap in %s, leaving under one line of its budget of %d)", errInvalidConfig, errLogRevokeBudgetSpent, uid, n, log.name, s.logRevokeBudget)
 				}
 			}
-			if log.addsKey == nil {
-				return nil
+			if log.addsKey != nil {
+				// A state read under a larger key bound is judged by its count.
+				if errors.Is(state.bad, errFloorTooManyKeys) || state.keys > log.readKeyBound() {
+					return 0, fmt.Errorf("%w: %w (%s holds more than the reader's key bound of %d keys)", errInvalidConfig, errLogBoundsBelowLog, log.name, log.readKeyBound())
+				}
 			}
-			// A state read under a larger key bound is judged by its count.
-			if errors.Is(state.bad, errFloorTooManyKeys) || state.keys > log.readKeyBound() {
-				return fmt.Errorf("%w: %w (%s holds more than the reader's key bound of %d keys)", errInvalidConfig, errLogBoundsBelowLog, log.name, log.readKeyBound())
+			if state.bad != nil {
+				return 0, fmt.Errorf("%s: %w", log.name, state.bad)
 			}
-			return nil
+			return state.damaged(), nil
 		}()
 		if err != nil {
-			return err
+			return 0, err
 		}
+		damage += n
 	}
-	return nil
+	return damage, nil
 }

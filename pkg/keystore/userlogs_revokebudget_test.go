@@ -37,12 +37,12 @@ func TestCheckLogBoundsRefusesSpentRevocationBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	appendLogBytes(t, s, auditLogName, bytes.Repeat(line, 4*maxLogLine/len(line)))
-	if err := s.CheckLogBounds(ctx); err != nil {
+	appendLogBytes(t, s, auditLogName, bytes.Repeat(line, 3*maxLogLine/len(line)))
+	if _, err := s.CheckLogBounds(ctx); err != nil {
 		t.Fatalf("store open with the budget not yet spent: %v", err)
 	}
-	appendLogBytes(t, s, auditLogName, bytes.Repeat(line, 2))
-	err = s.CheckLogBounds(ctx)
+	appendLogBytes(t, s, auditLogName, bytes.Repeat(line, maxLogLine/len(line)+2))
+	_, err = s.CheckLogBounds(ctx)
 	if !errors.Is(err, errInvalidConfig) || !errors.Is(err, errLogRevokeBudgetSpent) {
 		t.Fatalf("store open with a uid past its revocation budget: %v, want errLogRevokeBudgetSpent", err)
 	}

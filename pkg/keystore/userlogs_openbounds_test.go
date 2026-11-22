@@ -31,7 +31,7 @@ import (
 func TestCheckLogBoundsRefusesShrunkCaps(t *testing.T) {
 	ctx := context.Background()
 	s, server, _ := fileLogScope(t)
-	if err := s.CheckLogBounds(ctx); err != nil {
+	if _, err := s.CheckLogBounds(ctx); err != nil {
 		t.Fatalf("store open at the default caps: %v", err)
 	}
 	line, err := floorLine("user/1001", "token", entryGeneration(t, server, "token"), 1)
@@ -41,7 +41,7 @@ func TestCheckLogBoundsRefusesShrunkCaps(t *testing.T) {
 	appendLogBytes(t, s, userFloorLogName, bytes.Repeat(line, (4<<20)/len(line)))
 	size := int64(len(readLog(t, s, userFloorLogName)))
 	s.logSoftCap, s.logHardCap, s.logRevokeBudget = 1, 1, 2*maxLogLine
-	err = s.CheckLogBounds(ctx)
+	_, err = s.CheckLogBounds(ctx)
 	if !errors.Is(err, errInvalidConfig) || !errors.Is(err, errLogBoundsBelowLog) {
 		t.Fatalf("store open with caps below the floor's size: %v, want errLogBoundsBelowLog", err)
 	}
@@ -59,7 +59,7 @@ func TestCheckLogBoundsRefusesKeysPastBound(t *testing.T) {
 	l.mu.Lock()
 	l.maxKeys = l.state.keys - 1
 	l.mu.Unlock()
-	if err := s.CheckLogBounds(ctx); !errors.Is(err, errLogBoundsBelowLog) {
+	if _, err := s.CheckLogBounds(ctx); !errors.Is(err, errLogBoundsBelowLog) {
 		t.Fatalf("store open with a key bound below the floor's keys: %v, want errLogBoundsBelowLog", err)
 	}
 }
