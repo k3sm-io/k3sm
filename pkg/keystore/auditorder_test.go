@@ -104,9 +104,10 @@ func TestAuditBeforeGrant(t *testing.T) {
 	})
 }
 
-// In a store built by New, with no fake floor or audit sink, every
-// mutating user verb refuses, and a refused mint creates no directory:
-// errUserLogsUnbuilt's "nothing was changed" holds.
+// In a store built by New, whose data root has no append-only logs (no
+// sudo k3sm install), every mutating user verb refuses, and a refused mint
+// creates no directory: a grant refuses with errLogMissing before its
+// first write.
 func TestUserVerbsRefuseInProduction(t *testing.T) {
 	ctx := context.Background()
 	fake, server := newMasteredStore(t)
@@ -117,11 +118,11 @@ func TestUserVerbsRefuseInProduction(t *testing.T) {
 	fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
 	u := userScope(t, s, 1001)
 	snap := treeSnapshot(t, server)
-	if _, err := u.Put(ctx, "user/1001/token", KindOpaque, []byte("v")); !errors.Is(err, errUserLogsUnbuilt) {
-		t.Fatalf("put: %v, want errUserLogsUnbuilt", err)
+	if _, err := u.Put(ctx, "user/1001/token", KindOpaque, []byte("v")); !errors.Is(err, errLogMissing) {
+		t.Fatalf("put: %v, want errLogMissing", err)
 	}
-	if err := u.addDelivery(ctx, testDelivery(1)); !errors.Is(err, errUserLogsUnbuilt) {
-		t.Fatalf("deliver: %v, want errUserLogsUnbuilt", err)
+	if err := u.addDelivery(ctx, testDelivery(1)); !errors.Is(err, errLogMissing) {
+		t.Fatalf("deliver: %v, want errLogMissing", err)
 	}
 	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err == nil {
 		t.Fatal("withdraw was not refused")

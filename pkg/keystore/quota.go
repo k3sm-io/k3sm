@@ -163,7 +163,8 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 	}
 	defer done()
 	defer func() { // before done: the line is appended under the lock
-		if aerr := u.audit("rm", name, "", err); err == nil {
+		l := auditLine{op: "rm", name: name, revoke: err == nil}
+		if aerr := u.appendAudit(l, err); err == nil {
 			err = aerr
 		}
 	}()
@@ -190,9 +191,16 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	}
 	fi, err := entries.Lstat(name)
 	if errors.Is(err, fs.ErrNotExist) {
+		// An rm that removes nothing is not in the revocation class.
+		if err := u.s.admit(u.uid, false); err != nil {
+			return err
+		}
 		return ErrNotFound
 	}
 	if err != nil {
+		return err
+	}
+	if err := u.s.admit(u.uid, true); err != nil {
 		return err
 	}
 	if fi.IsDir() {

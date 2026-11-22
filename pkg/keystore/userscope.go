@@ -43,22 +43,19 @@ import (
 // (O_NOFOLLOW, a regular file, a bounded read).
 //
 // The scope's delivery record (kind 0xFD) is deliveries.go, its quotas and
-// rm quota.go, and Rewrap of scope.key rewrapscope.go. Not here yet: the
-// user-scope floor for entries (the delivery record reaches the floor
-// through the userFloorLog seam, userlogs.go).
+// rm quota.go, and Rewrap of scope.key rewrapscope.go. The user-scope floor
+// (userlogs.go) holds a line per entry and per delivery record: a put
+// appends its entry's line after the pointer, and a read refuses a pointer
+// below its line (userfloor.go).
 //
-// Until the user-scope floor lands, a user entry is read against no floor,
-// with two consequences. A copied-back older pointer of a user entry is not
-// refused. And an entry directory with no current pointer cannot be told
-// apart: the system scope's interrupted-put rule needs the floor to tell a
-// crashed Put (generation, maybe v1) from a committed entry whose current,
-// or current and v1, were unlinked, and without it the two shapes are the
-// same files. So the user scope treats every entry directory without a
-// current pointer as damage: ErrCorrupt, never ErrNotFound, and never
-// removed, a crashed user Put included (openUserEntry, createUserEntry). The
-// user-scope floor brings back the interrupted-put rule. No caller outside
-// this package reaches the user scope before the socket does, after the
-// floor (TestUserScopeIsUnexported).
+// The interrupted-put rule is not brought back yet: the system scope's rule
+// needs the floor to tell a crashed Put (generation, maybe v1) from a
+// committed entry whose current, or current and v1, were unlinked, and the
+// user scope does not consult its floor for that. So it treats every entry
+// directory without a current pointer as damage: ErrCorrupt, never
+// ErrNotFound, and never removed, a crashed user Put included
+// (openUserEntry, createUserEntry). No caller outside this package reaches
+// the user scope before the socket does (TestUserScopeIsUnexported).
 
 const (
 	// scopeKeyName is a scope's wrapped key, scopeEntriesName its entries'
@@ -200,6 +197,9 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 			g.refused(err)
 		}
 	}()
+	if err := u.s.admit(u.uid, false); err != nil {
+		return Version{}, err
+	}
 	grant := g.take
 	k, err := u.masterForWrite()
 	if err != nil {
@@ -231,7 +231,16 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	defer e.close()
-	return u.s.writeEntry(e, uk, kind, value)
+	v, err := u.s.writeEntry(e, uk, kind, value)
+	if err != nil {
+		return Version{}, err
+	}
+	// The record, the pointer, then the floor line: a crash between the
+	// last two leaves the floor one behind, which a read accepts.
+	if err := u.s.userFloor.append(u.scope, name, e.generation, 1); err != nil {
+		return v, fmt.Errorf("%w, and its floor line was not written: %w", errCommitted, err)
+	}
+	return v, nil
 }
 
 // masterForWrite loads the master for a user-scope write, read-only: it
@@ -303,7 +312,7 @@ func (u *UserScope) createUserEntry(entries *os.Root, name string) (*entry, erro
 }
 
 // errUserNoPointer is a user entry directory with no current pointer.
-var errUserNoPointer = fmt.Errorf("%w: the entry has no current pointer; until the user-scope floor lands an interrupted put cannot be told from a committed entry whose pointer was removed, so it is refused and kept, not removed", ErrCorrupt)
+var errUserNoPointer = fmt.Errorf("%w: the entry has no current pointer; an interrupted put cannot be told from a committed entry whose pointer was removed, so it is refused and kept, not removed", ErrCorrupt)
 
 // openUserEntry opens name's directory in a user scope's entries/ and reads
 // its generation. A missing directory is ErrNotFound; a directory with no
@@ -344,7 +353,7 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 			return err
 		}
 		defer e.close()
-		cur, _, err := e.checkedPointer(uk, nil)
+		cur, err := u.flooredPointer(e, uk)
 		if err != nil {
 			return err
 		}
@@ -378,6 +387,11 @@ func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 			}
 			if err != nil {
 				out = append(out, Entry{Name: name, Err: err})
+				continue
+			}
+			if _, err := u.flooredPointer(e, uk); err != nil {
+				out = append(out, Entry{Name: name, Err: err})
+				e.close()
 				continue
 			}
 			out = append(out, listEntry(e, uk, nil))

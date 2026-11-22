@@ -460,7 +460,9 @@ func (u *UserScope) readDeliveries(o *openedScope) ([]delivery, uint64, error) {
 }
 
 // readDeliveriesFloor is readDeliveries. With revoke set, a floor that
-// cannot be read skips the floor check rather than refuse: a withdraw only
+// is absent or cannot be read skips the floor check rather than refuse,
+// but a floor whose bytes do not parse (matching ErrCorrupt) refuses: it is
+// damage, which root repairs with floor --rebuild. A withdraw only
 // adds a tombstone, so it goes ahead without the floor, checking the record
 // against the highest sequence this process has read or written instead (the
 // residuals are named in docs/design/keystore.md § "Quotas", "Revocation
@@ -487,7 +489,7 @@ func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) ([]delivery
 		return nil, 0, fmt.Errorf("%w: %s is not bound to this scope's owner", ErrCorrupt, deliveriesName)
 	}
 	fl, err := u.s.userFloor.floor(u.scope, deliveriesFloorName, o.gen)
-	if err != nil && !revoke {
+	if err != nil && (!revoke || errors.Is(err, ErrCorrupt)) {
 		return nil, 0, err
 	}
 	if err != nil {
@@ -777,7 +779,8 @@ func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (err error) 
 	}
 	var ns string
 	defer func() { // before done: the line is appended under the lock
-		if aerr := u.appendAudit(auditLine{op: "withdraw", namespace: ns, delivery: id}, err); err == nil {
+		l := auditLine{op: "withdraw", namespace: ns, delivery: id, revoke: err == nil}
+		if aerr := u.appendAudit(l, err); err == nil {
 			err = aerr
 		}
 	}()
@@ -806,11 +809,20 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, error) {
 			continue
 		}
 		ns := ds[i].namespace
+		// Only a withdraw that revokes is in the revocation class; a repeat
+		// changes nothing and is refused past the hard cap like any other
+		// operation.
+		if err := u.s.admit(u.uid, !ds[i].withdrawn); err != nil {
+			return ns, err
+		}
 		if ds[i].withdrawn {
 			return ns, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq)
 		}
 		ds[i].withdrawn = true
 		return ns, u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1)
+	}
+	if err := u.s.admit(u.uid, false); err != nil {
+		return "", err
 	}
 	return "", ErrNotFound
 }
@@ -835,6 +847,9 @@ func (u *UserScope) grantLocked(ctx context.Context, g *grantAudit, fn func(*ope
 			g.refused(err)
 		}
 	}()
+	if err := u.s.admit(u.uid, false); err != nil {
+		return err
+	}
 	grant := g.take
 	k, err := u.masterForWrite()
 	if err != nil {
@@ -927,17 +942,11 @@ func (u *UserScope) auditBriefly(ctx context.Context, l auditLine, err error) {
 // appended.
 var errAuditRefused = errors.New("the audit line could not be written, so nothing was changed")
 
-// audit appends one line for op to the audit sink, with result "ok" or the
-// refusal's name; name and namespace must already be validated (or
-// auditPlaceholder), and never a value. It is the revocations' order:
-// commit, then audit. Its error, after a change was made, matches
-// errCommitted.
-func (u *UserScope) audit(op, name, namespace string, err error) error {
-	return u.appendAudit(auditLine{op: op, name: name, namespace: namespace}, err)
-}
-
-// appendAudit is audit for a line whose other fields the caller fills: it
-// sets the scope and the result.
+// appendAudit appends l to the audit sink, setting its scope and its
+// result, "ok" or the refusal's name; its name and namespace must already
+// be validated (or auditPlaceholder), and never a value. It is the
+// revocations' order: commit, then audit. Its error, after a change was
+// made, matches errCommitted.
 func (u *UserScope) appendAudit(l auditLine, err error) error {
 	l.scope, l.result = u.scope, auditResult(err)
 	if aerr := u.s.auditSink.append(l); aerr != nil {
@@ -965,6 +974,8 @@ func auditResult(err error) string {
 		return "scope-absent"
 	case errors.Is(err, ErrCorrupt):
 		return "corrupt"
+	case errors.Is(err, ErrLogFull):
+		return "log-full"
 	}
 	return "error"
 }

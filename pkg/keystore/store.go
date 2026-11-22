@@ -95,6 +95,13 @@ type Config struct {
 	// A negative value, or a nonzero one in a process whose effective uid is
 	// 0, makes every operation fail: root's floor belongs to root.
 	FloorUID, FloorGID int
+	// LogSoftCap and LogHardCap are each append-only log's soft and hard
+	// caps in bytes (keystore.logSoftCap, keystore.logHardCap), and
+	// LogRevocationBudget each uid's bytes per log for the revocation class
+	// past the hard cap. Zero is the default: 64 MiB, 256 MiB and 64 KiB. A
+	// negative value, or a soft cap over the hard cap, makes every
+	// operation fail.
+	LogSoftCap, LogHardCap, LogRevocationBudget int64
 }
 
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
@@ -137,9 +144,15 @@ type FileStore struct {
 	// a new directory must be owned by before it is handed over.
 	euid func() int
 	// userFloor and auditSink are the user-scope floor and the audit log
-	// (userlogs.go). New installs ones that refuse every call.
+	// (userlogs.go). New installs the file-backed ones.
 	userFloor userFloorLog
 	auditSink auditSink
+	// logFlags is the chflags flag source: a log's st_flags, read on its
+	// descriptor, which must carry SF_APPEND.
+	logFlags func(*os.File) (uint32, error)
+	// logSoftCap, logHardCap and logRevokeBudget are Config's log caps,
+	// with the defaults filled in.
+	logSoftCap, logHardCap, logRevokeBudget int64
 }
 
 var _ Store = (*FileStore)(nil)
@@ -147,27 +160,39 @@ var _ Store = (*FileStore)(nil)
 // New returns the FileStore cfg describes. It touches nothing on disk, and it
 // does not judge cfg: every operation does that first (see checkConfig).
 func New(cfg Config) *FileStore {
-	return &FileStore{
-		dir:            cfg.Dir,
-		masterDir:      cfg.MasterDir,
-		dataRoot:       cfg.DataRoot,
-		uid:            cfg.UID,
-		gid:            cfg.GID,
-		floorUID:       cfg.FloorUID,
-		floorGID:       cfg.FloorGID,
-		scope:          scopeSystem,
-		rand:           rand.Reader,
-		now:            time.Now,
-		chown:          (*os.File).Chown,
-		lockWait:       lockTimeout,
-		step:           func(string) error { return nil },
-		entryMade:      func(string) {},
-		dirMade:        func(string) {},
-		dataRootLocked: func() {},
-		euid:           os.Geteuid,
-		userFloor:      unbuiltUserFloor{},
-		auditSink:      unbuiltAudit{},
+	s := &FileStore{
+		dir:             cfg.Dir,
+		masterDir:       cfg.MasterDir,
+		dataRoot:        cfg.DataRoot,
+		uid:             cfg.UID,
+		gid:             cfg.GID,
+		floorUID:        cfg.FloorUID,
+		floorGID:        cfg.FloorGID,
+		scope:           scopeSystem,
+		rand:            rand.Reader,
+		now:             time.Now,
+		chown:           (*os.File).Chown,
+		lockWait:        lockTimeout,
+		step:            func(string) error { return nil },
+		entryMade:       func(string) {},
+		dirMade:         func(string) {},
+		dataRootLocked:  func() {},
+		euid:            os.Geteuid,
+		logFlags:        fileFlags,
+		logSoftCap:      orDefault(cfg.LogSoftCap, defaultLogSoftCap),
+		logHardCap:      orDefault(cfg.LogHardCap, defaultLogHardCap),
+		logRevokeBudget: orDefault(cfg.LogRevocationBudget, defaultLogRevocationBytes),
 	}
+	s.userFloor, s.auditSink = newFileFloorLog(s), newFileAuditLog(s)
+	return s
+}
+
+// orDefault is v, or def when v is zero.
+func orDefault(v, def int64) int64 {
+	if v == 0 {
+		return def
+	}
+	return v
 }
 
 // checkConfig refuses a store every operation must fail closed on: a zero
@@ -194,6 +219,10 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: MasterDir is empty", errInvalidConfig)
 	case s.dataRoot == "":
 		return fmt.Errorf("%w: DataRoot is empty", errInvalidConfig)
+	case s.logSoftCap < 0 || s.logHardCap < 0 || s.logRevokeBudget < 0:
+		return fmt.Errorf("%w: a log cap or budget is negative", errInvalidConfig)
+	case s.logSoftCap > s.logHardCap:
+		return fmt.Errorf("%w: LogSoftCap %d is over LogHardCap %d", errInvalidConfig, s.logSoftCap, s.logHardCap)
 	}
 	for _, p := range []struct{ field, path string }{{"Dir", s.dir}, {"MasterDir", s.masterDir}, {"DataRoot", s.dataRoot}} {
 		if !filepath.IsAbs(p.path) {

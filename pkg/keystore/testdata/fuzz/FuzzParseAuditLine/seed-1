@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"v\":1,\"ts\":\"2026-11-22T00:00:00Z\",\"op\":\"withdraw\",\"scope\":\"user/1001\",\"name\":\"\",\"namespace\":\"team-a\",\"delivery\":\"00000000-0000-0000-0000-000000000001\",\"result\":\"ok\"}")
