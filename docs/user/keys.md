@@ -273,8 +273,19 @@ To save, while no `k3sm keys` verb is running (`ditto` keeps owners and modes):
 ```
 sudo ditto /var/lib/k3sm/server/keystore /path/to/backup/keystore
 sudo ditto /var/lib/k3sm/server/cred/keystore-master /other/place/keystore-master
-sudo cp -p /var/lib/k3sm/keystore-floor.json /path/to/backup/
+sudo install -d -o root -g wheel -m 0700 /var/root/keystore-floor-backup
+sudo install -o root -g wheel -m 0644 /var/lib/k3sm/keystore-floor.json /var/root/keystore-floor-backup/keystore-floor.json
 ```
+
+Save `keystore/` and the floor file in the same run, and keep them as a pair. A floor file saved
+at another moment does not describe the saved entries: some of them are refused, or deletions
+recorded after it are lost.
+
+The saved floor file goes to a directory owned by root with mode 0700, such as
+`/var/root/keystore-floor-backup` above, not beside `keystore/` in a path your user can write.
+The floor decides which entries are live, so a floor someone else could replace would let them
+mark a revoked entry live again. If you copy it to a backup volume, keep it in a directory only
+root can read and write there too.
 
 To restore the same backup, for example after deleting an entry by mistake, move the live
 `keystore/` and the live `keystore-floor.json` aside rather than deleting or overwriting them, so
@@ -286,10 +297,15 @@ sudo k3sm stop
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
 sudo ditto /path/to/backup/keystore /var/lib/k3sm/server/keystore
-sudo cp -p /path/to/backup/keystore-floor.json /var/lib/k3sm/keystore-floor.json
+sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/keystore-floor.json /var/lib/k3sm/keystore-floor.json
 sudo k3sm start
 sudo k3sm keys list
 ```
+
+Restore the floor file with `install` as shown. The floor is refused unless root owns it,
+and on a volume that ignores ownership, such as an external drive set to ignore
+ownership or a network share, `cp -p` gives the copy a non-root owner. `install -o root -g wheel
+-m 0644` sets the owner and mode whatever the volume reports.
 
 Restore the floor file too, or the entry stays refused. When you delete an entry, root's record
 notes the deletion, and any copy of that entry put back later is refused with a message saying
@@ -304,10 +320,6 @@ A restore puts back the whole keystore as it was when you saved it, not one entr
 - Every entry you deleted since the backup comes back, and root's record of those deletions is
   gone. A key you deleted to revoke it is live again: delete it again with `rm`.
 
-Keep the saved `keystore-floor.json` in a location only root can write and read, such as a
-directory owned by root with mode 0700. The floor decides which entries are live, so a floor
-someone else could replace would let them mark a revoked entry live again.
-
 Only when `list` shows every entry `ok`, delete the copies you moved aside:
 
 ```
@@ -315,7 +327,18 @@ sudo rm -rf /var/lib/k3sm/server/keystore.pre-restore
 sudo rm /var/lib/k3sm/keystore-floor.json.pre-restore
 ```
 
-To undo the restore instead, stop the server and move both copies back over what you restored.
+To undo the restore instead, stop the server, move what you restored out of the way, then move
+both copies back. Rename the restored `keystore/` first: `mv` onto a directory that exists moves
+the source inside it rather than replacing it.
+
+```
+sudo k3sm stop
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.restored
+sudo mv /var/lib/k3sm/server/keystore.pre-restore /var/lib/k3sm/server/keystore
+sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.restored
+sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json
+sudo k3sm start
+```
 
 The values come back byte for byte: `show --reveal` prints exactly what it printed before. Restore
 the master key the same way, from its own backup, if it was lost too.

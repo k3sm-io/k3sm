@@ -451,7 +451,9 @@ with its master key kept apart from the entries. A restore stops the server, mov
 `keystore/` aside rather than deleting it, puts the backup in place with `ditto`, starts the
 server, and checks `sudo k3sm keys list` before the moved-aside copy is deleted.
 A restored `keystore/` older than the live one is refused until root removes
-`/var/lib/k3sm/keystore-floor.json`. The steps are in
+`/var/lib/k3sm/keystore-floor.json`. Removing the floor discards every deletion it recorded, so
+every copy of a deleted entry, a key revoked by deleting it included, is accepted again if it is
+put back. The steps are in
 [Keys: Restoring an older keystore/](keys.md#restoring-an-older-keystore), and how to save and
 restore the keystore files is in [Keys: Backing up and restoring](keys.md#backing-up-and-restoring).
 
