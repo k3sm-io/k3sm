@@ -30,6 +30,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -720,9 +721,27 @@ func treeNotRemoved(name string, buried []string, err error) error {
 	return fmt.Errorf("the entry is already deleted: the floor records it as deleted and refuses any copy of it, but its directory was not removed; rerun rm system/%s once the keystore lock is free: %w", name, err)
 }
 
-// evicted is the error of a Delete given err, the error it would otherwise
-// return.
-func evicted(_ string, _ []string, _ *[generationSize]byte, _ floor, err error) error {
+// evicted is the error of a Delete that would otherwise return err (nil
+// for success), given the generations it buried, the directory's
+// authenticated generation (nil for none) and the floor as written. When
+// the floor no longer buries one of them, the write pruned it: the entry is
+// deleted, but a copy of it put back is accepted again, so the Delete fails
+// with ErrTombstoneEvicted (joined with err, if any) rather than only
+// logging it.
+func evicted(name string, buried []string, authentic *[generationSize]byte, after floor, err error) error {
+	named := buried
+	if authentic != nil {
+		named = append(slices.Clone(buried), hex.EncodeToString(authentic[:]))
+	}
+	f := after[name]
+	for _, g := range named {
+		if !f.buries(g) && f.Generation != g {
+			if err == nil {
+				return ErrTombstoneEvicted
+			}
+			return fmt.Errorf("%w; and: %w", ErrTombstoneEvicted, err)
+		}
+	}
 	return err
 }
 

@@ -155,6 +155,11 @@ var (
 	ErrCorrupt = errors.New("keystore record is corrupt: it failed authentication or does not parse, so it was tampered with, moved or truncated; restore it from backup")
 	// ErrNotFound reports that no entry has the requested name.
 	ErrNotFound = errors.New("keystore entry not found")
+	// ErrTombstoneEvicted reports a Delete that deleted the entry but whose
+	// floor write pruned the burial it recorded (or one of a generation it
+	// names): the floor is at its tombstone budget, and a copy of the entry
+	// put back is accepted again.
+	ErrTombstoneEvicted = errors.New("the entry is deleted, but its tombstone was evicted in the same floor write because the floor is at its tombstone budget, so a copy of the deleted entry put back would be accepted again; delete entries that are no longer used to make room")
 	// ErrVersionNotFound reports that the entry exists but holds no such
 	// version.
 	ErrVersionNotFound = errors.New("keystore entry version not found")

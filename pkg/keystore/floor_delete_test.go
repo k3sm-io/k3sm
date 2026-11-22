@@ -205,3 +205,29 @@ func TestDeleteWithoutMasterWarnsUnrecorded(t *testing.T) {
 		t.Fatalf("log of a master-less Delete with no record = %q, want a Warn naming k and %q", got, residual)
 	}
 }
+
+// TestDeleteReportsEvictedTombstone (U192): when the floor is at its
+// tombstone budget and the write that buries a Delete's generation prunes
+// that very burial, Delete removes the entry but fails with
+// ErrTombstoneEvicted: a copy of the entry put back is accepted again.
+func TestDeleteReportsEvictedTombstone(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	old := saveEntry(t, server, "k", generationName, "v1", currentName)
+	setFloorLimits(t, smallFloorSize, 10) // smaller than one burial
+	err := s.Delete(ctx, "k")
+	if !errors.Is(err, ErrTombstoneEvicted) || !strings.Contains(err.Error(), "tombstone budget") {
+		t.Fatalf("Delete whose burial is pruned in the same write: %v, want ErrTombstoneEvicted", err)
+	}
+	if _, err := os.Lstat(filepath.Join(server, "keystore", "k")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("entry after the evicting Delete: %v, want it removed", err)
+	}
+	if ts := tombstonesOf(t, server); len(ts["k"]) != 0 {
+		t.Fatalf("tombstones = %+v, want k's evicted", ts)
+	}
+	putBack(t, server, old, "k")
+	if _, _, err := s.Current(ctx, "k"); err != nil {
+		t.Fatalf("Current of the copy put back after the eviction: %v, want it accepted, as the error warned", err)
+	}
+}
