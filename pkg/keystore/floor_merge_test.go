@@ -69,8 +69,8 @@ func TestFloorMergeSemantics(t *testing.T) {
 	if e := kept["live"]; e.Generation != mgen(1) || e.Seq != 3 || len(e.burials()) != 0 {
 		t.Errorf("live after the merge keeping it = %+v, want its live record kept and nothing buried", e)
 	}
-	if e := restored["other"]; e.Generation != mgen(2) || !e.buries(mgen(4)) || e.buries(mgen(9)) {
-		t.Errorf("other after the merge = %+v, want its live record kept and only the burial merged", e)
+	if e := restored["other"]; e.Generation != mgen(2) || !e.buries(mgen(4)) || !e.buries(mgen(9)) || r.Retired != 1 {
+		t.Errorf("other after the merge = %+v (retired %d), want its live record kept, the burial merged and the aside's live generation retired", e, r.Retired)
 	}
 	bs := restored["revoked"].burials()
 	if len(bs) != 2 || bs[0].Generation != mgen(5) || bs[1].Generation != mgen(6) || bs[0].Deleted <= 1 || bs[1].Deleted <= bs[0].Deleted {
@@ -240,5 +240,44 @@ func TestMergeFloorKeep(t *testing.T) {
 	}
 	if e := fl["b"]; e.live() || !e.buries(mgen(2)) {
 		t.Errorf("b after the merge = %+v, want it buried", e)
+	}
+}
+
+// TestFloorMergeRetiresAsideLive (U192): a live generation in the
+// moved-aside floor that the restored floor does not hold live, under
+// another generation or not at all, is buried (counted as retired), unless
+// keep names the entry; one the restored floor holds live is left alone.
+func TestFloorMergeRetiresAsideLive(t *testing.T) {
+	restored := floor{
+		"other": {Generation: mgen(1), Seq: 1},
+		"same":  {Generation: mgen(3), Seq: 1},
+		"kept":  {Generation: mgen(5), Seq: 1},
+		"gone":  {Buried: []burial{{Generation: mgen(7), Deleted: 1}}},
+	}
+	aside := floor{
+		"other": {Generation: mgen(2), Seq: 4},
+		"same":  {Generation: mgen(3), Seq: 2},
+		"kept":  {Generation: mgen(6), Seq: 1},
+		"new":   {Generation: mgen(4), Seq: 1},
+		"gone":  {Generation: mgen(7), Seq: 1},
+	}
+	r, _ := restored.merge(aside, map[string]bool{"kept": true})
+	if r.Retired != 2 || !slices.Equal(r.Kept, []string{"kept"}) {
+		t.Fatalf("merge = %+v; want 2 retired and kept kept", r)
+	}
+	if e := restored["other"]; e.Generation != mgen(1) || !e.buries(mgen(2)) {
+		t.Errorf("other after the merge = %+v, want its live record kept and the aside's buried", e)
+	}
+	if e := restored["new"]; e.live() || !e.buries(mgen(4)) {
+		t.Errorf("new after the merge = %+v, want the aside's generation buried", e)
+	}
+	if e := restored["same"]; e.Generation != mgen(3) || len(e.burials()) != 0 {
+		t.Errorf("same after the merge = %+v, want it left alone", e)
+	}
+	if e := restored["kept"]; e.Generation != mgen(5) || len(e.burials()) != 0 {
+		t.Errorf("kept after the merge = %+v, want it left alone", e)
+	}
+	if e := restored["gone"]; len(e.burials()) != 1 {
+		t.Errorf("gone after the merge = %+v, want its one burial", e)
 	}
 }

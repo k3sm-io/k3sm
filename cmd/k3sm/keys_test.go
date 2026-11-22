@@ -807,7 +807,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		h := newKeysHarness(t)
 		saveRmRestore(t, h, true)
 		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore")
-		if got := h.stdout.String(); !strings.Contains(got, "merged 1\nalready present 0\nburied live 1\nkept 0\ndropped 0\n") || !strings.Contains(got, "buried live system/rb:") {
+		if got := h.stdout.String(); !strings.Contains(got, "merged 1\nalready present 0\nburied live 1\nkept 0\nretired 0\ndropped 0\n") || !strings.Contains(got, "buried live system/rb:") {
 			t.Fatalf("floor merge printed %q, want rb buried live", got)
 		}
 		refusedDeleted(t, h, "system/rb")
@@ -827,7 +827,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		value, _ := saveRmRestore(t, h, true)
 		h.mustRun(2, "floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "rb")
 		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "system/rb")
-		if got := h.stdout.String(); !strings.Contains(got, "merged 0\nalready present 0\nburied live 0\nkept 1\ndropped 0\n") || !strings.Contains(got, "kept system/rb:") {
+		if got := h.stdout.String(); !strings.Contains(got, "merged 0\nalready present 0\nburied live 0\nkept 1\nretired 0\ndropped 0\n") || !strings.Contains(got, "kept system/rb:") {
 			t.Fatalf("floor merge --keep printed %q, want rb kept", got)
 		}
 		h.mustRun(0, "show", "system/rb", "--reveal")
@@ -850,12 +850,36 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			t.Fatalf("restore: %v", err)
 		}
 		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore")
-		if got := h.stdout.String(); !strings.HasPrefix(got, "merged 1\nalready present 0\nburied live 0\nkept 0\ndropped 0\n") {
+		if got := h.stdout.String(); !strings.HasPrefix(got, "merged 1\nalready present 0\nburied live 0\nkept 0\nretired 0\ndropped 0\n") {
 			t.Fatalf("floor merge printed %q, want late's burial merged", got)
 		}
 		copyTree(t, late, filepath.Join(h.keystoreDir(), "late"))
 		refusedDeleted(t, h, "system/late")
 		h.mustRun(0, "show", "system/base", "--reveal")
+	})
+	// N is live as G1 at the backup, deleted, then put again as G2. The
+	// restore puts G1 back, which the merge buries; G2, live in the floor
+	// moved aside, is buried too, since choosing the backup retired it, so
+	// G2's directory put back is refused.
+	t.Run("a generation put after the backup is retired by the merge", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/n", []byte("g1"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		h.mustRun(0, "rm", "system/n", "--yes")
+		h.put("system/n", []byte("g2"))
+		g2 := filepath.Join(t.TempDir(), "n")
+		copyTree(t, filepath.Join(h.keystoreDir(), "n"), g2)
+		if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore")
+		merged := h.stdout.String()
+		h.mustRun(0, "rm", "system/n", "--yes")
+		copyTree(t, g2, filepath.Join(h.keystoreDir(), "n"))
+		refusedDeleted(t, h, "system/n")
+		if !strings.Contains(merged, "retired 1\n") {
+			t.Fatalf("floor merge printed %q, want G2 retired", merged)
+		}
 	})
 	// A name with two generations buried after the backup keeps both
 	// burials through the merge: a copy of either is refused.

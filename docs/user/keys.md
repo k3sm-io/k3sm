@@ -343,9 +343,13 @@ sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore --keep 
 ```
 
 Decide before you run the merge: once it has deleted an entry again, running it once more with
-`--keep` does not bring that entry back. The merge prints how many deletions it merged, how many
-the restored floor already had, how many restored entries it deleted again, how many it kept
-because `--keep` named them, and how many it had to drop to stay within the floor's limits. It
+`--keep` does not bring that entry back. The merge also deletes each version that was current in
+the floor you moved aside but is not the restored one, such as an entry you put again after
+deleting it since the backup: by restoring the backup you chose its version, so a copy of the
+newer one put back is refused. `--keep` exempts that entry too. The merge prints how many
+deletions it merged, how many the restored floor already had, how many restored entries it
+deleted again, how many it kept because `--keep` named them, how many moved-aside versions it
+retired, and how many it had to drop to stay within the floor's limits. It
 lists each entry it deleted again as `buried live system/<name>`, and each one it kept as `kept
 system/<name>`. Remove each deleted entry's files with `sudo k3sm keys rm system/<name> --yes`.
 A line starting `dropped` names a deletion the floor could not keep: a copy of that entry put

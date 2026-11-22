@@ -923,6 +923,7 @@ func (k *keepFlag) Set(q string) error {
 //	already present N
 //	buried live N
 //	kept N
+//	retired N
 //	dropped N
 //
 // then one line per entry buried live ("buried live system/<name>: ..."),
@@ -960,7 +961,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	fmt.Fprintf(env.stdout, "merged %d\nalready present %d\nburied live %d\nkept %d\ndropped %d\n", r.Merged, r.AlreadyPresent, len(r.BuriedLive), len(r.Kept), len(r.Dropped))
+	fmt.Fprintf(env.stdout, "merged %d\nalready present %d\nburied live %d\nkept %d\nretired %d\ndropped %d\n", r.Merged, r.AlreadyPresent, len(r.BuriedLive), len(r.Kept), r.Retired, len(r.Dropped))
 	for _, name := range r.BuriedLive {
 		fmt.Fprintf(env.stdout, "buried live %s: deleted since the backup, so the restored entry is deleted again and refused; run sudo k3sm keys rm %s --yes to remove it\n", qualify(name), qualify(name))
 	}

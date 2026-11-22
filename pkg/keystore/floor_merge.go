@@ -38,10 +38,16 @@ type MergeReport struct {
 	// floor buries and the live floor held live: the merge buried it, so a
 	// key revoked by deleting it since the backup stays refused.
 	BuriedLive []string
-	// Kept names, sorted, each entry the keep set named whose live
-	// generation the merge would otherwise have buried: it stays live, the
-	// entry restored on purpose.
+	// Kept names, sorted, each entry the keep set named that the merge
+	// would otherwise have buried a generation of: its restored live
+	// generation, or the moved-aside floor's live one (Retired). It is left
+	// as restored, the entry restored on purpose.
 	Kept []string
+	// Retired is how many live generations of the moved-aside floor the
+	// merge buried: each one the restored floor does not hold live, under
+	// another generation or not at all. Choosing the backup retired it, so
+	// its directory put back is refused.
+	Retired int
 	// Dropped names, sorted and with repeats, each burial the write dropped
 	// to stay within the floor's caps (the per-name cap and the tombstone
 	// budget): a copy of it put back is accepted again.
@@ -59,7 +65,9 @@ type MergeReport struct {
 // adds each burial the live floor lacks, in the order the file buried them.
 // A generation the live floor holds live is buried too (BuriedLive): it was
 // deleted after the backup, so the merge fails closed, unless keep names
-// the entry, whose restored generation then stays live (Kept). keep holds
+// the entry, whose restored generation then stays live (Kept). Each live
+// generation of the moved-aside floor that the live floor does not hold live
+// is buried as well (Retired), unless keep names the entry. keep holds
 // entry names, each checked as a name is. The write is pruned as every
 // floor write is, and each burial it drops is logged at Warn and reported.
 func (s *FileStore) MergeFloor(ctx context.Context, path string, keep []string) (MergeReport, error) {
@@ -106,7 +114,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	var capDropped []pruned
 	_, dropped, err := fdir.updatePruned(func(fl floor) bool {
 		r, capDropped = fl.merge(from, kept)
-		return r.Merged > 0
+		return r.Merged > 0 || r.Retired > 0
 	})
 	if err != nil {
 		return MergeReport{}, err
@@ -164,7 +172,9 @@ func (s *FileStore) readFloorAt(path string) (floor, error) {
 // so the merged burials keep their order and stay newer than fl's own. A
 // generation fl holds live under the name is buried as well, its live record
 // cleared (BuriedLive), unless keep names the entry (Kept); fl's other live
-// records are kept. At maxBuriedPerName, add drops the name's oldest,
+// records are kept. Then, by name, each live generation in from that fl
+// neither holds live nor buries is buried after them (Retired), unless keep
+// names the entry. At maxBuriedPerName, add drops the name's oldest,
 // returned. It does not prune: update does.
 func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) {
 	type at struct {
@@ -201,7 +211,6 @@ func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) 
 			out = append(out, pruned{name: name, generation: dropped.Generation})
 		}
 		fl[name] = f
-		r.Merged++
 	}
 	kept, buriedLive := map[string]bool{}, map[string]bool{}
 	for _, a := range all {
@@ -218,6 +227,24 @@ func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) 
 			continue
 		}
 		add(a.name, a.b.Generation)
+		r.Merged++
+	}
+	names := make([]string, 0, len(from))
+	for name := range from {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		a, f := from[name], fl[name]
+		switch {
+		case !a.live(), f.live() && f.Generation == a.Generation, f.buries(a.Generation):
+			continue
+		case keep[name]:
+			kept[name] = true
+			continue
+		}
+		add(name, a.Generation)
+		r.Retired++
 	}
 	r.BuriedLive, r.Kept = sortedNames(buriedLive), sortedNames(kept)
 	return r, out
