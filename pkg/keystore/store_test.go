@@ -93,8 +93,8 @@ func TestPutCurrentGet(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			put := mustPut(t, s, tt.name, tt.kind, tt.value)
-			want := Version{Name: tt.name, Version: 1, Kind: tt.kind, Created: time.Unix(now.Unix(), 0).UTC(), Fingerprint: put.Fingerprint}
-			if put != want || put.Fingerprint == "" {
+			want := Version{Name: tt.name, Version: 1, Kind: tt.kind, Created: time.Unix(now.Unix(), 0).UTC(), Fingerprint: put.Fingerprint, identity: put.identity}
+			if put != want || put.Fingerprint == "" || put.identity == ([identitySize]byte{}) {
 				t.Fatalf("Put = %+v, want %+v", put, want)
 			}
 			if loc := put.Created.Location(); loc != time.UTC {

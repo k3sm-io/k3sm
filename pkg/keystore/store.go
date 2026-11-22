@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -1220,7 +1221,24 @@ func versionOf(r record, value, fpKey []byte) Version {
 		Kind:        kind,
 		Created:     time.Unix(r.created, 0).UTC(),
 		Fingerprint: fingerprint(kind, value, fpKey),
+		identity:    versionIdentity(r),
 	}
+}
+
+// versionIdentity is the identity of the version r seals: a domain-separated
+// SHA-256 of its name, generation and version number, truncated. The
+// generation is 16 random bytes fresh for every life of a name, so no two
+// lives share an identity, and the digest does not reveal it.
+func versionIdentity(r record) [identitySize]byte {
+	h := sha256.New()
+	h.Write([]byte("k3sm keystore version identity\x00"))
+	h.Write([]byte(r.name))
+	h.Write([]byte{0})
+	h.Write(r.generation[:])
+	h.Write(binary.BigEndian.AppendUint64(nil, r.version))
+	var id [identitySize]byte
+	copy(id[:], h.Sum(nil))
+	return id
 }
 
 // versionName is version n's file name.

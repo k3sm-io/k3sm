@@ -91,21 +91,26 @@ func (s *FileStore) GenerateSSH(ctx context.Context, name, comment string) (Vers
 // one previous: the rotation records the oldest retained version in the
 // pointer and unlinks the versions below it.
 func (s *FileStore) RotateCredential(ctx context.Context, name string, kind Kind, e typed.Envelope) (Version, error) {
-	return s.rotateCredential(ctx, name, kind, 0, e)
+	return s.rotateCredential(ctx, name, kind, nil, e)
 }
 
-// RotateIf is RotateCredential that refuses, with ErrVersionStale, unless the
-// entry's current version is current: a writer that read a version (the
-// refresher, which read the pair it refreshed) never writes over a newer one.
-func (s *FileStore) RotateIf(ctx context.Context, name string, kind Kind, current uint64, e typed.Envelope) (Version, error) {
-	if current == 0 {
-		return Version{}, fmt.Errorf("rotate %s: %w: version 0 is never current", name, ErrVersionStale)
+// RotateIf is RotateCredential that refuses, with ErrVersionStale, unless
+// read is the entry's current version: the same version number of the same
+// life of the entry. read is a Version a read returned (CurrentCredential,
+// GetCredential or the refresher's opener), which carries an opaque identity
+// besides its number, so a writer that read a version (the refresher, which
+// read the pair it refreshed) never writes over a newer one, nor over an
+// entry deleted and put again since, whose versions restart at 1. A Version
+// built by the caller has no identity and is always stale.
+func (s *FileStore) RotateIf(ctx context.Context, name string, kind Kind, read Version, e typed.Envelope) (Version, error) {
+	if read.Version == 0 || read.identity == ([identitySize]byte{}) {
+		return Version{}, fmt.Errorf("rotate %s: %w: the expected version was not read from the store", name, ErrVersionStale)
 	}
-	return s.rotateCredential(ctx, name, kind, current, e)
+	return s.rotateCredential(ctx, name, kind, &read, e)
 }
 
-// rotateCredential is RotateCredential, and RotateIf when current is not 0.
-func (s *FileStore) rotateCredential(ctx context.Context, name string, kind Kind, current uint64, e typed.Envelope) (Version, error) {
+// rotateCredential is RotateCredential, and RotateIf when read is not nil.
+func (s *FileStore) rotateCredential(ctx context.Context, name string, kind Kind, read *Version, e typed.Envelope) (Version, error) {
 	v, err := func() (Version, error) {
 		if _, err := s.envelope(kind, e); err != nil {
 			return Version{}, err
@@ -114,8 +119,8 @@ func (s *FileStore) rotateCredential(ctx context.Context, name string, kind Kind
 			if old.Kind != kind {
 				return nil, fmt.Errorf("%w: %s is %s, not %s", ErrKindMismatch, name, old.Kind, kind)
 			}
-			if current != 0 && old.Version != current {
-				return nil, fmt.Errorf("%w: version %d is current, not %d", ErrVersionStale, old.Version, current)
+			if read != nil && (old.Version != read.Version || old.identity != read.identity) {
+				return nil, fmt.Errorf("%w: the current version is not the one read (version %d is current, version %d was read)", ErrVersionStale, old.Version, read.Version)
 			}
 			return s.envelope(kind, e)
 		})

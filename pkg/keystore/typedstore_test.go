@@ -111,7 +111,8 @@ func TestTypedIssuedAtStampedAndSealed(t *testing.T) {
 	if _, c := mustCredential(t, s, "tok"); !c.IssuedAt.Equal(later) {
 		t.Fatalf("rotated token issuedAt %v, want %v", c.IssuedAt, later)
 	}
-	if _, err := s.RotateIf(context.Background(), "pair", KindOAuth, 1, oauthEnvelope("a2", "r2")); err != nil {
+	read, _ := mustCredential(t, s, "pair")
+	if _, err := s.RotateIf(context.Background(), "pair", KindOAuth, read, oauthEnvelope("a2", "r2")); err != nil {
 		t.Fatal(err)
 	}
 	if _, c := mustCredential(t, s, "pair"); !c.AccessIssuedAt.Equal(later) {
@@ -171,7 +172,7 @@ func TestRotateAndPutCannotChangeKind(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTypedStore(t)
 	mustPut(t, s, "raw", KindOpaque, []byte("v"))
-	mustPutCredential(t, s, "tok", KindToken, tokenEnvelope("t"))
+	tok := mustPutCredential(t, s, "tok", KindToken, tokenEnvelope("t"))
 	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a", "r"))
 	checks := []struct {
 		name string
@@ -183,7 +184,7 @@ func TestRotateAndPutCannotChangeKind(t *testing.T) {
 		{"rotate opaque as token", func() error { _, err := s.RotateCredential(ctx, "raw", KindToken, tokenEnvelope("t")); return err }},
 		{"rotate token with a raw value", func() error { _, err := s.Rotate(ctx, "tok", []byte("v")); return err }},
 		{"rotate oauth as token", func() error { _, err := s.RotateCredential(ctx, "pair", KindToken, tokenEnvelope("t")); return err }},
-		{"rotateIf token as oauth", func() error { _, err := s.RotateIf(ctx, "tok", KindOAuth, 1, oauthEnvelope("a", "r")); return err }},
+		{"rotateIf token as oauth", func() error { _, err := s.RotateIf(ctx, "tok", KindOAuth, tok, oauthEnvelope("a", "r")); return err }},
 		{"raw put of a typed kind", func() error { _, err := s.Put(ctx, "fresh", KindToken, []byte("v")); return err }},
 	}
 	for _, c := range checks {
@@ -330,11 +331,16 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	check("RotateFrom", v, err)
 	v, err = s.Rotate(ctx, "pair", planted)
 	check("Rotate", v, err)
-	v, err = s.RotateIf(ctx, "pair", KindOAuth, 9, oauthEnvelope("access-x", string(second)))
+	stale := v
+	v, err = s.RotateIf(ctx, "pair", KindOAuth, Version{Name: "pair", Version: 9}, oauthEnvelope("access-x", string(second)))
+	check("RotateIf (unread)", v, err)
+	v, err = s.RotateIf(ctx, "pair", KindOAuth, stale, oauthEnvelope("access-x", string(second)))
 	check("RotateIf (stale)", v, err)
 	v, err = s.RotateCredential(ctx, "pair", KindOAuth, oauthEnvelope("access-2", string(second)))
 	check("RotateCredential", v, err)
-	v, err = s.RotateIf(ctx, "pair", KindOAuth, 2, oauthEnvelope("access-3", string(second)))
+	read, _, err := s.CurrentCredential(ctx, "pair")
+	check("CurrentCredential (2)", read, err)
+	v, err = s.RotateIf(ctx, "pair", KindOAuth, read, oauthEnvelope("access-3", string(second)))
 	check("RotateIf", v, err)
 	v, err = s.PutCredential(ctx, "pair", KindOAuth, oauthEnvelope("access-4", string(planted)))
 	check("PutCredential (exists)", v, err)
@@ -394,21 +400,69 @@ func TestRotateIfStaleVersionRefused(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTypedStore(t)
 	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	v1, _ := mustCredential(t, s, "pair")
 	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a2", "r2"))
-	for _, stale := range []uint64{0, 1, 3} {
+	v2, _ := mustCredential(t, s, "pair")
+	for _, stale := range []Version{
+		{},
+		v1,
+		{Name: "pair", Version: 2}, // built, not read: no identity
+		{Name: "pair", Version: 3},
+	} {
 		if _, err := s.RotateIf(ctx, "pair", KindOAuth, stale, oauthEnvelope("ax", "rx")); !errors.Is(err, ErrVersionStale) {
-			t.Errorf("RotateIf at %d: %v, want ErrVersionStale", stale, err)
+			t.Errorf("RotateIf at %d: %v, want ErrVersionStale", stale.Version, err)
 		}
 	}
 	if v, c := mustCredential(t, s, "pair"); v.Version != 2 || string(c.AccessToken) != "a2" {
 		t.Fatalf("a stale RotateIf wrote: %+v %q", v, c.AccessToken)
 	}
-	v, err := s.RotateIf(ctx, "pair", KindOAuth, 2, oauthEnvelope("a3", "r3"))
+	v, err := s.RotateIf(ctx, "pair", KindOAuth, v2, oauthEnvelope("a3", "r3"))
 	if err != nil || v.Version != 3 {
 		t.Fatalf("RotateIf at the current version: %+v, %v", v, err)
 	}
-	if _, err := s.RotateIf(ctx, "absent", KindOAuth, 1, oauthEnvelope("a", "r")); !errors.Is(err, ErrNotFound) {
+	if _, err := s.RotateIf(ctx, "absent", KindOAuth, v1, oauthEnvelope("a", "r")); !errors.Is(err, ErrNotFound) {
 		t.Errorf("RotateIf of a missing entry: %v", err)
+	}
+}
+
+// TestRotateIfRefusesRecreatedEntry is U150: an entry deleted and put again
+// restarts at version 1, so a refresher holding a version of the old entry
+// whose number the new one reaches again is refused; the identity of a
+// version read from the new entry is accepted. The clock is fixed and the
+// values repeat, so the fingerprints of the two lives are equal too: only
+// the identity tells them apart.
+func TestRotateIfRefusesRecreatedEntry(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTypedStore(t)
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a2", "r2"))
+	old, _ := mustCredential(t, s, "pair")
+	if err := s.Delete(ctx, "pair"); err != nil {
+		t.Fatal(err)
+	}
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a2", "r2"))
+	fresh, _ := mustCredential(t, s, "pair")
+	if fresh.Version != old.Version || fresh.Fingerprint != old.Fingerprint {
+		t.Fatalf("the two lives differ before the identity: %+v, %+v", old, fresh)
+	}
+	if _, err := s.RotateIf(ctx, "pair", KindOAuth, old, oauthEnvelope("stale", "stale")); !errors.Is(err, ErrVersionStale) {
+		t.Fatalf("RotateIf holding the deleted entry's version: %v, want ErrVersionStale", err)
+	}
+	if v, c := mustCredential(t, s, "pair"); v.Version != 2 || string(c.AccessToken) != "a2" {
+		t.Fatalf("the refused RotateIf wrote: %+v %q", v, c.AccessToken)
+	}
+	if v, err := s.RotateIf(ctx, "pair", KindOAuth, fresh, oauthEnvelope("a3", "r3")); err != nil || v.Version != 3 {
+		t.Fatalf("RotateIf holding the new entry's version: %+v, %v", v, err)
+	}
+	// List and GetCredential hand out the same identity as CurrentCredential.
+	got, _, err := s.GetCredential(ctx, "pair", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.List(ctx)
+	if err != nil || len(list) != 1 || list[0].Current != got {
+		t.Fatalf("List current %+v, GetCredential %+v, %v", list, got, err)
 	}
 }
 

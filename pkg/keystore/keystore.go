@@ -87,7 +87,19 @@ type Version struct {
 	// truncated one, never a plain hash of the value, because List output
 	// would otherwise be a guessing oracle for a low-entropy value.
 	Fingerprint string
+
+	// identity names this version of this entry's life, and no other: a
+	// digest of the entry's generation, name and version number. An entry
+	// deleted and put again restarts at version 1 under a fresh generation,
+	// so its versions never share an identity with the old entry's. It is
+	// opaque and unexported: RotateIf compares the identity of the Version
+	// a writer read with the current one, and pkg/keystore exposes no
+	// generation.
+	identity [identitySize]byte
 }
+
+// identitySize is the length of a Version's identity.
+const identitySize = 16
 
 // Entry is the metadata of a named entry: its current version and every
 // version still stored. Like Version, it never carries a value.
@@ -188,7 +200,9 @@ var (
 	// can carry an oauth refresh token.
 	ErrTypedCredential = errors.New("the keystore entry is a typed credential: read it as a typed credential, not as raw bytes")
 	// ErrVersionStale reports a RotateIf whose expected current version is
-	// not the entry's current version: another write came first.
+	// not the entry's current version: another write came first, or the
+	// entry was deleted and put again since the expected version was read,
+	// or the expected Version was not read from the store.
 	ErrVersionStale = errors.New("the keystore entry's current version is not the one expected: another write came first; read it again")
 	// ErrFromVersionOAuth reports a rotate from an earlier version of an
 	// oauth entry: resurrecting a rotated refresh token can trip the
