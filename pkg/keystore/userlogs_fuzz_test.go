@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"bytes"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -51,9 +52,12 @@ func FuzzParseFloorLine(f *testing.F) {
 	})
 }
 
-// FuzzParseAuditLine drives the tolerant audit reader. It must never
-// panic, must accept only format version 1 lines of at most 1 KiB, and what
-// it accepts must encode back to a line it accepts.
+// FuzzParseAuditLine drives the audit reader. It must never panic, must
+// accept only format version 1 lines of at most 1 KiB, and what it accepts
+// must encode back to a line it accepts. The uid a line is charged to is
+// stable: it is the scope under the exact key "scope" read by a decoder
+// that folds no case and keeps no duplicate, and the re-encoded line is
+// charged to the same uid.
 func FuzzParseAuditLine(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		r, err := parseAuditLine(b)
@@ -68,8 +72,25 @@ func FuzzParseAuditLine(f *testing.F) {
 			// A record re-encoded with its JSON escapes can pass 1 KiB.
 			return
 		}
-		if _, err := parseAuditLine(line[:len(line)-1]); err != nil {
+		back, err := parseAuditLine(line[:len(line)-1])
+		if err != nil {
 			t.Fatalf("re-encoded %q does not read back: %v", line, err)
+		}
+		if scopeUID(back.Scope) != scopeUID(r.Scope) {
+			t.Fatalf("%q is charged to uid %d, its re-encoding to %d", b, scopeUID(r.Scope), scopeUID(back.Scope))
+		}
+		var exact map[string]json.RawMessage
+		if err := json.Unmarshal(b, &exact); err != nil {
+			t.Fatalf("accepted %q, which is no JSON object: %v", b, err)
+		}
+		var scope string
+		if raw, ok := exact["scope"]; ok {
+			if err := json.Unmarshal(raw, &scope); err != nil {
+				t.Fatalf("accepted %q, whose scope is no string: %v", b, err)
+			}
+		}
+		if scopeUID(scope) != scopeUID(r.Scope) {
+			t.Fatalf("%q is charged to uid %d, but its exact scope key names uid %d", b, scopeUID(r.Scope), scopeUID(scope))
 		}
 	})
 }

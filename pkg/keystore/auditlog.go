@@ -17,9 +17,11 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -50,10 +52,10 @@ func newFileAuditLog(s *FileStore) *fileAuditLog {
 	l.lineUID = func(_ *logState, line []byte) (uint32, error) {
 		r, err := parseAuditLine(line)
 		if err != nil {
-			// A line this build cannot read is charged to no uid: the audit
-			// log is evidence, and one unreadable line does not stop the
-			// store.
-			return 0, nil
+			// A line this build cannot read, strictly, is damage charged to
+			// no uid: the audit log is evidence, and one unreadable line is
+			// skipped and counted, never stopping the store.
+			return 0, err
 		}
 		return scopeUID(r.Scope), nil
 	}
@@ -90,15 +92,20 @@ func marshalAuditLine(l auditLine, now time.Time) ([]byte, error) {
 	return append(b, '\n'), nil
 }
 
-// parseAuditLine is the tolerant audit reader for one line without its
-// newline: a JSON object of at most maxLogLine bytes with "v" 1. Fields it
-// does not know are ignored, so a later writer may add some; a line of
-// another format version, one that is not a JSON object, or a longer one,
-// is an error.
+// parseAuditLine is the audit reader for one line without its newline: a
+// JSON object of at most maxLogLine bytes with "v" 1. Fields it does not
+// know are ignored, so a later writer may add some; but it decodes strictly
+// for charging (auditKeysStrict): a known key spelled in another case, or
+// any key given twice, is an error, so a line is never charged to whichever
+// scope a lenient decoder would pick. A line of another format version, one
+// that is not a JSON object, or a longer one, is an error too.
 func parseAuditLine(line []byte) (auditRecord, error) {
 	var r auditRecord
 	if len(line)+1 > maxLogLine {
 		return r, errLogLineTooLong
+	}
+	if err := auditKeysStrict(line); err != nil {
+		return auditRecord{}, err
 	}
 	if err := json.Unmarshal(line, &r); err != nil {
 		return auditRecord{}, fmt.Errorf("an audit line does not parse: %w", err)
@@ -107,4 +114,48 @@ func parseAuditLine(line []byte) (auditRecord, error) {
 		return auditRecord{}, errors.New("an audit line is not format version 1")
 	}
 	return r, nil
+}
+
+// auditKeys are auditRecord's JSON keys, exact.
+var auditKeys = []string{"v", "ts", "op", "scope", "name", "namespace", "delivery", "result"}
+
+// auditKeysStrict refuses line unless it is one JSON object whose keys are
+// each given once and, where one matches a known key under encoding/json's
+// case folding, spelled exactly as that key. With it json.Unmarshal reads
+// each known field from the one key a strict decoder would.
+func auditKeysStrict(line []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return errors.New("an audit line is not a JSON object")
+	}
+	var seen []string
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("an audit line does not parse: %w", err)
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return errors.New("an audit line does not parse: a key is not a string")
+		}
+		for _, k := range seen {
+			if strings.EqualFold(k, key) {
+				return errors.New("an audit line gives a key twice")
+			}
+		}
+		seen = append(seen, key)
+		for _, k := range auditKeys {
+			if strings.EqualFold(k, key) && k != key {
+				return errors.New("an audit line spells a known key in another case")
+			}
+		}
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return fmt.Errorf("an audit line does not parse: %w", err)
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return fmt.Errorf("an audit line does not parse: %w", err)
+	}
+	return nil
 }
