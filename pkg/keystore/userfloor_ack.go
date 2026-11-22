@@ -168,6 +168,8 @@ var errAckStale = errors.New("the user-scope floor changed since its damage was 
 // damage: the floor's size and its count of unattributable damaged lines,
 // the torn last line included, which ackFloorDamage compares again under
 // the lock.
+//
+//lint:ignore U1000 root maintenance calls it once its verb lands; until then the tests hold it.
 func (s *FileStore) floorAckView(ctx context.Context) (size int64, unattributable int, err error) {
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
