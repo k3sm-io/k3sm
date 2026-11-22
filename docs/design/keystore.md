@@ -1375,7 +1375,7 @@ store refuses to read or write a sealed record over 1,056 KiB.
 
 - *`deliver` is refused at the bound.* It adds an entry, and answers `quota` when the record
   has 64 live entries or 320 in all.
-- *Revocation always succeeds,* with the two residuals below. A withdrawal turns a live entry
+- *Revocation always succeeds,* with the residuals below. A withdrawal turns a live entry
   into a tombstone in place, so it never adds an entry, never grows the record and is never
   refused for the bound. It is
   monotone, so it needs nothing a grant needs: it opens `scope.key` with the generation the
@@ -1412,6 +1412,20 @@ store refuses to read or write a sealed record over 1,056 KiB.
   back a list the floor already says was replaced. The withdrawal waits on the root remedy:
   restore the current record, or, for a deliberate restore, `sudo k3sm keys floor --rebuild`,
   then withdraw again.
+  *Residual (a refused revocation).* A withdrawal or an `rm` can still be refused: by the store
+  lock held past its wait, or by damage a process running as the service uid did to the scope
+  (a `scope.key` or record it rewrote, a directory it replaced). The store cannot rule out the
+  service uid, so the remedy is the reconciler's: it treats a withdrawal that is refused or
+  errors as "delete the delivered Secret anyway", so the value leaves the cluster whatever the
+  record says. That rule is owed by the reconciler change, not this one.
+  *Residual (withdrawal ignores ownership).* A withdrawal does no GeneratedUID lookup, by
+  design, so when a uid is reused its new holder can withdraw the former owner's deliveries.
+  That costs availability (a delivered Secret is deleted), never access: a withdrawal only
+  adds a tombstone, and opens and returns no value.
+  *Residual (no lines in this build).* Until the real append-only floor and audit log land,
+  `New` installs ones that refuse every call, and a revocation commits regardless: its tombstone
+  or removal stands, and it is reported (`errCommitted`) with no audit line and no floor line
+  written for it.
 - *A tombstone is pruned once its target is no longer its Secret.* The reconciler removes a
   withdrawn entry when its recorded target is not this UID's owned Secret, gone or held by a
   Secret that fails the ownership test for this UID, on two observations at least 60 s apart
