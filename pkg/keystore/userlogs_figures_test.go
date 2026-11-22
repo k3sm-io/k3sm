@@ -70,6 +70,14 @@ func TestLogErrorsNameNoFigures(t *testing.T) {
 			t.Fatalf("the kept offset is %d, want %d", at, want)
 		}
 	})
+	t.Run("field count", func(t *testing.T) {
+		s, _, u := fileLogScope(t)
+		appendLogBytes(t, s, userFloorLogName, []byte("one two three four five six seven\n"))
+		_, _, err := u.Current(ctx, "user/1001/token")
+		if !errors.Is(err, errFloorLogMalformed) || strings.Contains(err.Error(), "7") || strings.Contains(err.Error(), "want 4") {
+			t.Fatalf("current over a floor line with the wrong field count: %v, want it refused naming no count", err)
+		}
+	})
 	t.Run("unreadable", func(t *testing.T) {
 		s, _, u := fileLogScope(t)
 		s.userFloor.(*fileFloorLog).log.readAt = func(*os.File) io.ReaderAt { return failingReaderAt{} }

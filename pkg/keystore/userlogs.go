@@ -1290,7 +1290,7 @@ func parseFloorLine(line []byte) (floorRec, error) {
 	}
 	f := bytes.Split(line, []byte{' '})
 	if len(f) != 4 {
-		return r, fmt.Errorf("a floor line has %d fields, want 4", len(f))
+		return r, errors.New("a floor line has the wrong number of fields")
 	}
 	k := &r.key
 	k.scope, k.name = string(f[0]), string(f[1])
