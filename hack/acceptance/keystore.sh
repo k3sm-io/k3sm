@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
-# rows G1 to G22, the user-scope rows U1 to U137 (U15, U39 and U117 are unused)
-# and the rig legs E1 to E27. Every row is listed, on exactly one line. A row runs
+# rows G1 to G22, the user-scope rows U1 to U137 (U15, U39 and U117 are unused),
+# the typed-credential rows U138 to U191, and the rig legs E1 to E36. Every row
+# is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
 # never PASS. A row delivered in part prints PENDING when its delivered part
@@ -52,11 +53,21 @@
 #                   U72, U75, U77, U79, U83, U85, U86, U89, U93, U95, U96, U98, U100, U102, U103, U106, U107, U109, U110, U114, U115,
 #                   U123 to U126, U130, U133, U134, U136.
 #   --grammar       the entry grammar in apis: U57.
+#   --credential    the typed KeyDelivery API and credential names in apis: U18, U19,
+#                   U139 to U142.
+#   --typed         the typed store: U143 to U154.
+#   --typed-cli     the typed verbs: U155 to U159.
+#   --projection    typed projection: U160 to U164.
+#   --expiry        expiry and revocation: U165 to U168.
+#   --mount-audit   the mount audit: U169 to U174.
+#   --refresh-profiles  refresh profiles: U175 to U181.
+#   --refresh       the refresher: U182 to U190.
+#   --typed-docs    the typed-credential docs: U191.
 #   --docs          the user docs: no row yet, so it exits 3.
 # A unit mode runs only its rows and only their tests, with the same exit
 # status: it exits 0 only when every row it names passes.
 #
-# --lab runs the rig legs E1 to E27, and nothing else, as an explicit, recorded
+# --lab runs the rig legs E1 to E36, and nothing else, as an explicit, recorded
 # step. --<unit mode> --lab runs that mode's unit rows and then only the legs
 # mapped to that mode (the leg's last feature to land, see the leg table); a
 # leg mapped to no mode runs only under plain --lab. Each leg's description
@@ -77,7 +88,10 @@
 # of the design's gate table and in this script's description of the row, and
 # a phrase missing from either fails L1. L1 also holds the test names: for each
 # U row, the Test and Fuzz names in the design table's "Validated by" column
-# must be exactly the names this script's row runs. Exit status: 0 every row present and
+# must be exactly the names this script's row runs. Row L2 is the duplicate-id
+# lint (U138): it fails on any U or E id that appears twice among this script's
+# rows, in EXPECTED_ROWS, in one mode's row list, or among the design's gate and
+# leg table rows. Exit status: 0 every row present and
 # every named test exists; 3 every row present, some named tests do not exist yet; 1 a row
 # is missing or a checked row's test is missing.
 #
@@ -140,16 +154,23 @@ EXPECTED_ROWS="$EXPECTED_ROWS U115"
 EXPECTED_ROWS="$EXPECTED_ROWS U116"
 EXPECTED_ROWS="$EXPECTED_ROWS U118 U119 U120 U121 U122 U123 U124 U125 U126 U127"
 EXPECTED_ROWS="$EXPECTED_ROWS U128 U129 U130 U131 U132 U133 U134 U135 U136 U137"
-# >>> ADD NEW U ROWS (U64 upward) HERE <<<
+EXPECTED_ROWS="$EXPECTED_ROWS U138 U139 U140 U141 U142 U143 U144 U145 U146 U147 U148 U149"
+EXPECTED_ROWS="$EXPECTED_ROWS U150 U151 U152 U153 U154 U155 U156 U157 U158 U159 U160 U161"
+EXPECTED_ROWS="$EXPECTED_ROWS U162 U163 U164 U165 U166 U167 U168 U169 U170 U171 U172 U173"
+EXPECTED_ROWS="$EXPECTED_ROWS U174 U175 U176 U177 U178 U179 U180 U181 U182 U183 U184 U185"
+EXPECTED_ROWS="$EXPECTED_ROWS U186 U187 U188 U189 U190 U191"
+# >>> ADD NEW U ROWS (U192 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25 E26 E27"
-# >>> ADD NEW E LEGS (E24 upward) HERE <<<
+EXPECTED_ROWS="$EXPECTED_ROWS E28 E29 E30 E31 E32 E33 E34 E35 E36"
+# >>> ADD NEW E LEGS (E37 upward) HERE <<<
 
 MODES="check rewrap verbs delivery sandbox api scope scope-store files socket socket-ops exec"
-MODES="$MODES kd-author kd-reconcile kd-lifecycle grammar docs lab listed root"
+MODES="$MODES kd-author kd-reconcile kd-lifecycle grammar credential typed typed-cli projection"
+MODES="$MODES expiry mount-audit refresh-profiles refresh typed-docs docs lab listed root"
 
 usage() {
-	echo "usage: $0 --check|--rewrap|--verbs|--delivery|--sandbox|--api|--scope|--scope-store|--files|--socket|--socket-ops|--exec|--kd-author|--kd-reconcile|--kd-lifecycle|--grammar|--docs|--lab|--listed|--root" >&2
+	echo "usage: $0 --check|--rewrap|--verbs|--delivery|--sandbox|--api|--scope|--scope-store|--files|--socket|--socket-ops|--exec|--kd-author|--kd-reconcile|--kd-lifecycle|--grammar|--credential|--typed|--typed-cli|--projection|--expiry|--mount-audit|--refresh-profiles|--refresh|--typed-docs|--docs|--lab|--listed|--root" >&2
 	echo "       $0 --<unit mode> --lab   (a unit mode's rows, then only its rig legs)" >&2
 	exit 2
 }
@@ -178,6 +199,15 @@ mode_rows() {
 	kd-reconcile) echo "U42 U43 U59 U73 U78 U81 U111" ;;
 	kd-lifecycle) echo "U22 U44 U53 U55 U56 U62 U65 U72 U75 U77 U79 U83 U85 U86 U89 U93 U95 U96 U98 U100 U102 U103 U106 U107 U109 U110 U114 U115 U123 U124 U125 U126 U130 U133 U134 U136" ;;
 	grammar) echo "U57" ;;
+	credential) echo "U18 U19 U139 U140 U141 U142" ;;
+	typed) echo "U143 U144 U145 U146 U147 U148 U149 U150 U151 U152 U153 U154" ;;
+	typed-cli) echo "U155 U156 U157 U158 U159" ;;
+	projection) echo "U160 U161 U162 U163 U164" ;;
+	expiry) echo "U165 U166 U167 U168" ;;
+	mount-audit) echo "U169 U170 U171 U172 U173 U174" ;;
+	refresh-profiles) echo "U175 U176 U177 U178 U179 U180 U181" ;;
+	refresh) echo "U182 U183 U184 U185 U186 U187 U188 U189 U190" ;;
+	typed-docs) echo "U191" ;;
 	*) echo "" ;;
 	esac
 }
@@ -502,8 +532,8 @@ pend U12 "master Rewrap re-wraps every scope.key and leaves user records byte-id
 	TestRewrapRewrapsScopeKeysResumable
 pend U13 "quotas: the 257th entry and the byte budget answer ErrQuota, and so does the 65th live delivery; rm and withdraw still work (user-scope store)" \
 	TestUserScopeQuota TestDeliveryRecordQuota
-pend U14 "the delivery record stores UID, the full target tuple under its seal, and target digest; add, look up and withdraw round-trip under the floor; the digest covers entry, namespace, secretName, dataKey and requestedBy (user-scope store)" \
-	TestDeliveryRecordDigestRoundTrip TestDeliveryRecordVersionByteAndDigestLabel TestDeliveryDigestCoversRequestedBy
+pend U14 "the delivery record stores UID, the full target tuple under its seal, and target digest; add, look up and withdraw round-trip under the floor; the digest covers entry, namespace, secretName and the key-sorted items, a reorder leaving it unchanged (user-scope store)" \
+	TestDeliveryRecordDigestRoundTrip TestDeliveryRecordVersionByteAndDigestLabel TestDeliveryDigestCoversTargetAndItems
 check U16 "every pod profile variant (native, vm, container-vm, xcode, expose-paths, wasm, the profile an exec-session process runs under, a custom pod root distinct from the data root) denies every keystore path, the keystore-sock/ tree included, the protected-prefix validator refusing any re-allow onto one, since the order of denies and allows protects nothing; a hostPath or expose path onto the data root is refused; an empty data root fails closed; over the whole rendered profile, a pod root equal to or a parent of the data root included, no emitted allow matches a keystore path; the keystore stanza is the profile's last rule, in the /var, /private/var and /System/Volumes/Data spellings, with a case-folded regex keystore- prefix deny; a caller path naming a keystore path is refused with ErrProtectedPath; a write, create, unlink, rename and network-bind on keystore-sock/, keys.sock and every keystore-* name are refused; each also through /System/Volumes/Data/private/var/lib/k3sm and the data volume's mount path; rig leg E10 (sandbox denies)" \
 	runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile TestShimProfileKeepsTheKeystoreDeniesLast TestKeystoreDenyStanzaShape TestDataRootRefusesPodRootUnderKeystoreName TestValidateRefusesKeystoreExtraPaths TestEmptyDataRootFailsClosed TestDataRootRefusesWhatCannotHoldTheDeny TestKeystoreDeniesUnderSandboxExec
 check U17 "runtimed refuses a pod identity it may not hold through Credential.CheckPodIdentity (pkg/supervisor/privdrop.go), not in resolveCredential: at startContainer, at Exec (an exec session), at the resident shim's dropShim and in RunLaunchSequence; a drop target uid is refused if it is 0, negative, 501 or above, or the service uid; groups are refused if they are 0, 20, 80, the privileged system groups (wheel, daemon, kmem, sys, tty, operator, procview, procmod, _developer), the service gid, negative or out of range, and a gid of 501 or above unless it is an admitted fsGroup; a missing group defaults to nobody; a gid-only drop that leaves uid 0 is refused; an inherited uid with no drop is allowed; a gid in 1..500 is refused for a pod drop, as the primary or a supplemental group, when the host assigns it (an unassigned gid is allowed, and so is nobody; the never-list is always refused, a lookup error refuses, and an operator-admitted fsGroup the host assigns is still refused); the service identity (the _k3sm lookup and the owners of the installed directories) is resolved again on every drop check; a symlink at an installed path refuses every drop; the system gids (1, 2, 3, 4, 5, 8, 9, 204) are refused as the primary gid and as a supplemental gid; when the account lookup returns not-found, a drop to the owner of the installed work dir or the keystore socket dir is refused (the installed service-uid fallback); the live check is strict, a denial is an EPERM and planting is included; rig legs E21, E22 (sandbox denies)" \
@@ -511,7 +541,7 @@ check U17 "runtimed refuses a pod identity it may not hold through Credential.Ch
 	runtimed/internal/execshim::TestDropShim \
 	runtimed/pkg/supervisor::TestRunLaunchSequenceRefusesPodUID TestRunLaunchSequenceRefusesPodGroups TestFSGroupGidAllowList TestResolveServiceIdentityInstalledOwner TestPodGroupsHostAssigned \
 	runtimed/pkg/sandbox::TestKeystoreDeniesUnderSandboxExec TestShimProfileKeepsTheKeystoreDeniesLast
-pend U18 "CRD: entry, secretName, dataKey, requestedBy immutable by CEL transition rules; status subresource on; reasons listed; a system/ entry is refused (KeyDelivery API)" \
+pend U18 "CRD: entry, secretName, items, requestedBy required with no default and immutable by CEL transition rules (items as a map); status subresource on; reasons listed; a system/ entry is refused (KeyDelivery API)" \
 	apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes TestKeyDeliveryImmutableFields TestKeyDeliveryRequiredFields TestKeyDeliveryRequestedByMatchesEntryUID TestKeyDeliveryConditionsListMap TestKeyDeliveryRefusesSystemEntry
 pend U19 "the CRD pattern, its maxLength, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors (KeyDelivery API)" \
 	apis/config/crd::TestEntryGrammarVectors
@@ -671,7 +701,7 @@ pend U94 "withdraw opens the caller's scope and so runs the GeneratedUID check: 
 	k3sm/pkg/keystore/socket::TestWithdrawChecksGeneratedUID
 pend U95 "rm-scope lists every RoleBinding and ClusterRoleBinding with the subject k3sm:local:<uid> and refuses, changing nothing, unless none exist or --keep-bindings is given (KeyDelivery lifecycle)" \
 	k3sm/cmd/k3sm::TestRmScopeRefusesWithBindings
-pend U96 "the deliveries record is exempt from the 64 KiB value cap and bounded at 64 live entries plus 256 withdrawn tombstones, 1,280 bytes an entry, 416 KiB sealed; at the bound deliver answers quota and a withdrawal still succeeds, in place; a tombstone is pruned only after its Secret is seen gone (Get not found) on two sweeps at least 60 s apart (KeyDelivery lifecycle)" \
+pend U96 "the deliveries record is exempt from the 64 KiB value cap and bounded at 64 live entries plus 256 withdrawn tombstones, 3,328 bytes an entry (8 items), 1,056 KiB sealed; at the bound deliver answers quota and a withdrawal still succeeds, in place; a tombstone is pruned only after its Secret is seen gone (Get not found) on two sweeps at least 60 s apart (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestDeliveriesRecordBoundAndPrune TestRevocationNeverRefusedAtRecordBound
 pend U97 "when rotate answers ErrQuota, rm then put recovers: rm frees every version and put stores the value as version 1 of a new generation; the quota error names that recovery (user-scope store)" \
 	k3sm/pkg/keystore::TestRotateQuotaRecoveredByRmThenPut
@@ -753,7 +783,114 @@ pend U136 "every root verb and doctor line that prints annotation text strips co
 	k3sm/cmd/k3sm::TestRootVerbsStripAnnotationControlChars
 pend U137 "the listener refuses a sandboxed peer before the first frame: it calls sandbox_check on the peer's audit token through the peer-sandbox source, a constructor parameter that refuses nil, so a Pod process is refused whatever its uid; rig leg E26 (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerRefusesSandboxedPeer
-# >>> ADD NEW U ROWS (U64 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
+pend U138 "--listed fails on a duplicated U or E id: in the script's rows, its expected-row list, one mode's row list, or the design's gate and leg tables (the typed-credential design)"
+pend U139 "items required, no default, 1 to 8, unique keys, the key pattern with . and a .. prefix refused, both maxLengths, immutable as a map (a reorder accepted, a change refused), CEL cost within budget; no dataKey (the typed KeyDelivery API)" \
+	apis/config/crd::TestKeyDeliveryItemsSchema TestItemKeyMatchesIsConfigMapKey TestKeyDeliveryHasNoDataKey TestItemsReorderAcceptedChangeRefused TestItemsCELCostWithinBudget
+pend U140 "the field enum equals the credential table's union; a KeyDelivery naming refreshToken is refused by the schema; rig leg E31 (the typed KeyDelivery API)" \
+	apis/config/crd::TestFieldEnumEqualsCredentialTable TestSchemaRefusesRefreshTokenField
+pend U141 "the credential leaf: kind names, field table vectors, no refresh field, the item type, the refresh-owner vectors, closed validity, Event and refresh_state sets, the metadata keys; stdlib only (the typed KeyDelivery API)" \
+	apis/keystore/credential::TestFieldTableVectors TestNoRefreshField TestRefreshOwnerGrammarVectors TestNameSetsClosed TestImportsStdlibOnly
+pend U142 "the CRD descriptions list the CredentialValid reasons and ProjectionInvalid, say Ready means delivered and that Valid, Expiring and RefreshFailing share True; every condition has observedGeneration (the typed KeyDelivery API)" \
+	apis/config/crd::TestKeyDeliveryReasonDescriptions TestConditionsCarryObservedGeneration
+pend U143 "the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is ErrCorrupt; the fuzz invariants hold (the typed store)" \
+	k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors TestEnvelopeRejectsUnknownTagDuplicateAndOrder FuzzEnvelopeParse
+pend U144 "token and oauth require a sealed issuedAt/accessIssuedAt stamped from the clock seam; editing the created header changes no typed time (the typed store)" \
+	k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed TestCreatedHeaderEditChangesNoTypedTime
+pend U145 "a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are ErrKindUnsupported, 0xFD and 0xFE ErrCorrupt; list shows unsupported (the typed store)" \
+	k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen TestKindByteTable
+pend U146 "rotate and put over an existing entry cannot change its kind (ErrKindMismatch) (the typed store)" \
+	k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind
+pend U147 "token needs expiresAt; oauth needs access token, access expiry, refresh token and an owner in the grammar (the typed store)" \
+	k3sm/pkg/keystore::TestTypedPutValidation
+pend U148 "SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed ssh-keygen -l vector (the typed store)" \
+	k3sm/pkg/keystore/typed::TestSSHGenerateAndImport TestSSHFingerprintMatchesOpenSSH
+pend U149 "write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; Get returns a typed.Credential for kinds 3 to 5; only refresh (and the installing pkg/keystore) imports internal/refreshopen (the typed store)" \
+	k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned TestGetReturnsRedactedCredential TestRefreshOpenerImportGraph
+pend U150 "RotateIf refuses a stale version (the typed store)" \
+	k3sm/pkg/keystore::TestRotateIfStaleVersionRefused
+pend U151 "oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means low = 1); crash-safe at every step, prune included (the prune cases of the crash test) (the typed store)" \
+	k3sm/pkg/keystore::TestOAuthPruneKeepsTwo TestPointerLowWaterMark TestRotateCrashAtEveryStep
+pend U152 "a pruned oauth entry: List shows it healthy, Rewrap re-seals low..current, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught (the typed store)" \
+	k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt TestRewrapHandlesPrunedOAuth TestDeletePrunedOAuthEntry TestGapInsideCommittedRangeIsCorrupt TestCopyBackAcrossPruneCaught
+pend U153 "--from-version is refused for oauth (the typed store)" \
+	k3sm/pkg/keystore::TestFromVersionRefusedForOAuth
+pend U154 "every Fuzz* target in the keystore packages has a non-empty committed seed directory (the typed store)" \
+	k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds
+pend U155 "HELLO lists capabilities; mutating ops refuse an unknown header (unknown-header), non-mutating ops tolerate it; the CLI refuses a typed request to a daemon without the capability (the typed verbs)" \
+	k3sm/pkg/keystore/socket::TestHelloListsCapabilities TestMutatingOpRefusesUnknownHeader TestNonMutatingOpToleratesUnknownHeader k3sm/cmd/k3sm::TestCLIRefusesTypedAgainstOldDaemon
+pend U156 "an oauth put takes an RFC 6749 response, stamps times from the clock, drops id_token and unknown fields; an error response is refused printing only the code (the typed verbs)" \
+	k3sm/pkg/keystore/socket::TestPutOAuthTokenResponse TestTokenResponseWithErrorRefused FuzzTokenResponseParse
+pend U157 "generate returns only the public key; pubkey prints only the public line (the typed verbs)" \
+	k3sm/pkg/keystore/socket::TestGenerateReturnsPublicKeyOnly k3sm/cmd/k3sm::TestKeysPubkeyPrintsOnlyPublicKey
+pend U158 "the kind flags; per-kind exec field defaults, ssh needs a field; show --field and exec --field refuse refreshToken; kind-mismatch on the wire (the typed verbs)" \
+	k3sm/cmd/k3sm::TestKeysPutKindFlags TestKeysExecFieldDefaults TestFieldSelectionRefusesRefreshToken k3sm/pkg/keystore/socket::TestRotateKindMismatch
+pend U159 "list -o json and the socket list carry the typed metadata (snake_case) and no token bytes (planted) (the typed verbs)" \
+	k3sm/cmd/k3sm::TestKeysListJSONTypedMetadata
+pend U160 "typed.Project is exact per kind and supports exactly the apis table's fields; a planted refresh token is in no projection for any item set (typed projection)" \
+	k3sm/pkg/keystore/typed::TestProjectFieldsPerKind TestProjectSupportsExactlyCredentialTable TestProjectNeverEmitsRefreshToken
+pend U161 "the Secret's data keys equal items; a field wrong for the kind gives ProjectionInvalid with the Secret unchanged; digest golden vectors over entry, namespace, secretName and key-sorted items, order-insensitive (typed projection)" \
+	k3sm/pkg/keystore/reconcile::TestItemsProjectExactKeys TestProjectionInvalidLeavesSecret TestDigestGoldenVectors
+pend U162 "root-file items are parsed strictly and use the same projection (typed projection)" \
+	k3sm/pkg/keystore/reconcile::TestRootFileItemsStrictAndProjected
+pend U163 "--item, --data-key shorthand, per-kind defaults; an ssh delivery without items is refused (typed projection)" \
+	k3sm/cmd/k3sm::TestDeliverItemDefaultsPerKind TestDeliverSSHWithoutItemsRefused
+pend U164 "ErrKindUnsupported and ErrCorrupt on a typed entry are Indeterminate; encryption off refuses every typed kind (G18) (typed projection)" \
+	k3sm/pkg/keystore/reconcile::TestTypedEntryErrorsAreIndeterminate TestEncryptionOffRefusesTypedKinds
+pend U165 "the CredentialValid table on a fake clock, thresholds from issuedAt, the oauth rules, the nil-RefreshStatus fallback, observedGeneration set (expiry and revocation)" \
+	k3sm/pkg/keystore/reconcile::TestCredentialValidConditionTable TestExpiringThresholdUsesIssuedAt TestNilRefreshStatusUsesStoredExpiry
+pend U166 "Events: events.k8s.io, related the Secret, Warning or Normal per reason, once per real transition with hysteresis; prior state from persisted status, so a restart re-emits none (expiry and revocation)" \
+	k3sm/pkg/keystore/reconcile::TestCredentialEventsOncePerTransition TestCredentialEventTypesAndRelated TestRestartReemitsNoCredentialEvent
+pend U167 "messages carry names, times and a closed cause only (planted token and error body absent) (expiry and revocation)" \
+	k3sm/pkg/keystore/reconcile::TestCredentialEventsCarryNamesOnly
+pend U168 "expiry never deletes the Secret and never changes Ready; requeue at the next threshold (expiry and revocation)" \
+	k3sm/pkg/keystore/reconcile::TestExpiredKeepsSecret TestRequeueAtNextThreshold
+pend U169 "the mount observer is level-based: one baseline line at start, a relist emits nothing, tombstones and terminal pods unmount (the mount audit)" \
+	k3sm/pkg/keystore/mountaudit::TestStartupBaselineOneLine TestRelistEmitsNothing TestTombstoneAndTerminalPodsUnmount
+pend U170 "pod-refresh only for volume and projected refs without subPath; env, envFrom and subPath get refreshes: false and never pod-refresh (the mount audit)" \
+	k3sm/pkg/keystore/mountaudit::TestPodRefreshOnlyForRefreshingRefs
+pend U171 "the mount-line field set is closed; lines are built from metadata only, on the error path too (planted token) (the mount audit)" \
+	k3sm/pkg/keystore/mountaudit::TestMountLineFieldsClosed TestMountLinesMetadataOnly
+pend U172 "a first-seen pair is never rate-limited; repeats are limited per namespace and globally, with a summary; all stop at the soft cap; never ErrLogFull; an append failure fails nothing; server class (the mount audit)" \
+	k3sm/pkg/keystore/mountaudit::TestFirstSeenNeverDropped TestRepeatsRateLimitedAndGlobalCap TestMountLinesStopAtSoftCap TestMountLinesNotCharged
+pend U173 "the provider's MountObserver: at the caller of Secret(), metadata from the lister, once per pod per version, labelled Secrets only, bounded per pod track, no re-emit after a restart, no value in the Event (the mount audit)" \
+	k3sm/pkg/provider::TestKeystoreSecretMountedOncePerVersion TestMountObserverReadsListerNotData TestMountObserverRestartReplay TestKeystoreMountEventCarriesNoValue
+pend U174 "a doctor row and a server Warn at 80% of the soft cap (the mount audit)" \
+	k3sm/cmd/k3sm::TestDoctorAuditSoftCapWarnAt80
+pend U175 "the profile file is strict and fuzzed; owner and mode 0640 root:_k3sm through the floor helper's stat seam; --client-secret-entry checks; revokedErrorCodes default (refresh profiles)" \
+	k3sm/pkg/keystore/refresh::TestProfileFileStrict TestProfileFileOwnerAndMode FuzzProfileFile TestRevokedErrorCodesDefault
+pend U176 "refresh-profile add validates the URL: https, no userinfo, no fragment, no IP literal without --allow-private (refresh profiles)" \
+	k3sm/cmd/k3sm::TestRefreshProfileAddValidatesURL
+pend U177 "Proxy is nil; a redirect is response-invalid; 64 KiB cap; timeout; a 200 with an error field is an error (fake RoundTripper) (refresh profiles)" \
+	k3sm/pkg/keystore/refresh::TestRefreshClientProxyNil TestRefreshClientRefusesRedirect TestRefreshResponseCap TestHTTP200WithErrorIsError
+pend U178 "the dial guard's deny table on synthetic addresses, the --allow-private override, and a rebind to 169.254.169.254 through a fake resolver; rig leg E36 (refresh profiles)" \
+	k3sm/pkg/keystore/refresh::TestDialGuardDenyTable TestDialGuardAllowPrivate TestDialGuardRefusesRebindToLinkLocal
+pend U179 "error mapping against golden response fixtures; the cause set is closed (dns, clock-skew included); a RetrieveError body never reaches a log or error (refresh profiles)" \
+	k3sm/pkg/keystore/refresh::TestErrorMappingGoldenFixtures TestRefreshCausesClosedSet TestRetrieveErrorBodyNeverSurfaces
+pend U180 "the refresh package's TestMain stubs its RoundTripper factory, resolver, Control and clock seams; refresh and mountaudit are on U58's seam-package list (refresh profiles)" \
+	k3sm/pkg/keystore/refresh::TestRealPrimitivesUnreachable k3sm/pkg/keystore::TestEverySeamPackageHasAGuard
+pend U181 "refresh-profile test sends a random refresh token, never a stored one, and passes only on a revoked-code answer (refresh profiles)" \
+	k3sm/cmd/k3sm::TestRefreshProfileTestSendsNoStoredToken
+pend U182 "schedule at half of accessExpiresAt − accessIssuedAt, lead, jitter, minimum interval, nearest-expiry first, backoff bound, retry at the maximum past access expiry (synctest, in-bubble fake RoundTripper) (the refresher)" \
+	k3sm/pkg/keystore/refresh::TestRefreshSchedule TestRetriesPastAccessExpiry
+pend U183 "success rotates via RotateIf and prunes; a missing refresh_token keeps the old one; one compacted summary line per entry per UTC day, at most 512 bytes, charged to no uid (the refresher)" \
+	k3sm/pkg/keystore/refresh::TestRefreshRotatesEntry TestRefreshKeepsRefreshTokenWhenNotReturned TestRefreshOkCompactedPerDay TestRefresherLinesServerClass
+pend U184 "a revoked code parks; unpark by a new version at most once per 10 minutes; refresh-state.json holds names and states only; losing it costs one retry (the refresher)" \
+	k3sm/pkg/keystore/refresh::TestRevokedCodeParks TestUnparkRateLimited TestRefreshStateFileHoldsNoSecret TestLostRefreshStateCostsOneRetry
+pend U185 "an owner's rotate during a refresh wins (the refresher)" \
+	k3sm/pkg/keystore/refresh::TestOwnerRotateDuringRefreshWins
+pend U186 "local is never server-refreshed; per-uid-per-profile fairness; global and per-user caps (the refresher)" \
+	k3sm/pkg/keystore/refresh::TestLocalOwnerNeverServerRefreshed TestRefreshFairnessPerUIDPerProfile TestRefreshCaps
+pend U187 "a second server joining mid-run pauses the refresher before its next refresh; removing it resumes with no restart (the refresher)" \
+	k3sm/pkg/keystore/refresh::TestSecondServerPausesAndRemovalResumes
+pend U188 "SIGTERM stops new refreshes and drains in-flight ones within 10 s; no refresh starts under the maintenance marker or exclusive lock; the lock order holds (the refresher)" \
+	k3sm/pkg/keystore/refresh::TestShutdownDrainsWithin10s TestNoRefreshUnderMaintenance TestLockOrderLeaseThenLock
+pend U189 "refresh-now is owner-only, rate-limited, refresh-not-owned for local, sends nothing for a parked pair (the refresher)" \
+	k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly
+pend U190 "the refresher doctor rows; every state change logs at Warn or Error under io.k3sm.keystore, names and causes only (the refresher)" \
+	k3sm/cmd/k3sm::TestDoctorRefresherRows k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn
+pend U191 "examples/keydelivery-github.yaml validates against the apis CRD schema; limitations.md lists the typed-credential residuals (the typed-credential docs)" \
+	k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD TestLimitationsListTypedResiduals
+# >>> ADD NEW U ROWS (U192 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
 leg E2 "socket-ops" "the user, no sudo, puts user/<me>/e2e-token (short-name form): exit 0; the CLI prints the resolved user/<uid>; k3sm keys list shows it; the audit log has a put line with no value" "the socket operations"
@@ -782,7 +919,16 @@ leg E24 "exec" "with the server running, a non-k3sm program run as the service u
 leg E25 "files" "helper variant only: a native pod tries connect(2) to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an append: EPERM for the pod, both refused, no line appended" "the helper pin"
 leg E26 "socket" "a native pod on a test build whose pod profile omits the keystore deny stanza (restored at the end) tries connect(2) to keys.sock: the listener refuses it before any frame, since the peer is sandboxed, and writes a refused line" "the sandboxed-peer refusal"
 leg E27 "socket" "a native pod calls launch_activate_socket for the server's socket name: no descriptor is returned, and nothing in the pod can accept on keys.sock" "the launchd lookup deny"
-# >>> ADD NEW E LEGS (E24 upward) HERE, with the unit mode that delivers the last feature <<<
+leg E28 "" "the typed-credential tracer (\"Rig credentials and custody\"): a generated deploy key and a server-refreshed oauth pair delivered into one pod, which pushes over ssh and opens a pull request; then k3sm keys refresh: push and pull request succeed; the access-token file's hash changes in the same pod with restartCount 0; mount lines; the positive-controlled scans find nothing they should not; PENDING (exit 3) if the oauth pair is missing or not ok" "typed projection, the mount audit or the refresher"
+leg E29 "expiry" "a synthetic token put with --expires-at now+8 m, delivered: Valid, then Expiring after about 6 m, then Expired at 8 m; one Warning Event each, related the Secret; the Secret kept; Ready unchanged" "expiry and revocation"
+leg E30 "projection" "generate --kind ssh; deliver --item privateKey=id_ed25519 --item publicKey=id_ed25519.pub (defaultMode 0400); the pod runs ssh-keygen -y -f id_ed25519; a delivery without items is refused: the output equals k3sm keys pubkey; the fingerprint matches" "typed projection"
+leg E31 "projection" "a synthetic oauth pair (local, planted access and refresh tokens) put from a token-response JSON, then delivered with the CLI default: positive control: the planted access token is found base64-encoded in the Secret; then every Secret, Event, pod log and keystore-audit.log holds no planted refresh-token bytes (raw, base64, URL-encoded); a KeyDelivery naming refreshToken is refused by the schema" "typed projection"
+leg E32 "refresh" "on the real server/github-e2e pair, k3sm keys refresh (recorded during E28): the pod's access_token hash changes without a restart; one refresh-now and one refresher line; refresh_state ok; CredentialValid=True Valid; PENDING (exit 3) if the pair is missing or not ok" "the refresher"
+leg E33 "refresh" "a separate entry holding a planted random refresh token against the real token endpoint, delivered; k3sm keys refresh: Revoked through the profile's revokedErrorCodes (the endpoint answers HTTP 200 with an error field); one CredentialRevoked Warning Event; parked: a second refresh-now sends nothing; a positive-controlled scan as E31" "the refresher"
+leg E34 "mount-audit" "two pods mount a delivered Secret; delete one; churn 200 short pods; rotate the entry 40 times in a minute: pod-mount for every first-seen pod, pod-unmounts, pod-refresh lines with one rate summary; no ErrLogFull; put still works" "the mount audit"
+leg E35 "sandbox" "precondition: refresh-profile list shows a profile; a pod reads a sibling non-keystore file in the same directory (positive control), then keystore-refresh-profiles.json and keystore-run/refresh-state.json: the sibling read succeeds; both keystore reads are EPERM; a regression guard, which cannot fail before refresh profiles land" "the keystore-* prefix deny"
+leg E36 "refresh-profiles" "a profile with https://localhost:<port>/token, a loopback listener on that port counting accepted connections, a pair naming it, k3sm keys refresh: RefreshFailing with cause dial-refused; the listener counted 0 connections; the redirect case is unit-only (U177)" "refresh profiles"
+# >>> ADD NEW E LEGS (E37 upward) HERE, with the unit mode that delivers the last feature <<<
 
 nrows=${#R_ID[@]}
 
@@ -989,7 +1135,13 @@ U127|not a deleting outcome
 U129|without the GeneratedUID check
 U133|the parse is strict
 U135|admits DELETE only
-U137|sandbox_check"
+U137|sandbox_check
+U14|key-sorted items
+U140|refused by the schema
+U149|a planted refresh token appears in no result
+U161|key-sorted items
+U172|a first-seen pair is never rate-limited
+U178|169.254.169.254"
 
 # --listed: the row-presence lint.
 if [ "$mode" = listed ]; then
@@ -1023,6 +1175,13 @@ if [ "$mode" = listed ]; then
 		L_PKG+=("$1")
 		L_HOW+=("$how")
 		LK=$n
+	}
+	# lint_unique_ids appends to dups each U or E id that list $2 (words) holds
+	# more than once, naming the list $1.
+	lint_unique_ids() {
+		local d
+		d="$(printf '%s\n' $2 | grep -E '^[UE][0-9]+$' | sort | uniq -d | tr '\n' ' ' || true)"
+		if [ -n "$d" ]; then dups="$dups; $1: ${d% }"; fi
 	}
 	for id in $EXPECTED_ROWS; do
 		if [ -z "$(row_index "$id")" ]; then fail "$id" "in the design's gate table, not in this script"; fi
@@ -1104,6 +1263,17 @@ if [ "$mode" = listed ]; then
 		fail L1 "the design's table and this script drifted:${drift#;}"
 	else
 		row L1 LISTED "$nclaims security claims and $nnamed rows' test names match the design's table and this script"
+	fi
+	# L2 (U138): no U or E id twice in any list that names rows.
+	dups=""
+	lint_unique_ids "this script's rows" "$(printf '%s\n' "${R_ID[@]}")"
+	lint_unique_ids "EXPECTED_ROWS" "$EXPECTED_ROWS"
+	for m in $MODES; do lint_unique_ids "mode --$m" "$(mode_rows "$m")"; done
+	lint_unique_ids "the design's tables" "$(grep -o -E '^\| [UE][0-9]+ \|' "$doc" | tr -d '| ' || true)"
+	if [ -n "$dups" ]; then
+		fail L2 "duplicated row ids:${dups#;}"
+	else
+		row L2 LISTED "no U or E id is duplicated in this script's rows, EXPECTED_ROWS, any mode or the design's tables"
 	fi
 	if [ "$failed" -gt 0 ]; then echo "keystore --listed: FAIL ($failed) (not proof)"; exit 1; fi
 	if [ "$pend_missing" -gt 0 ]; then
