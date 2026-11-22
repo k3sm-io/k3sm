@@ -298,8 +298,8 @@ func pruneLogsAtWarn(t *testing.T) {
 		mustPut(t, s, "k", KindOpaque, []byte("v"))
 		fillFloor(t, server, floor{"k": floorOf(t, server)["k"]}, floorSizeLimit)
 		buf := captureWarn(t)
-		if err := s.Delete(ctx, "k"); err != nil {
-			t.Fatalf("Delete over a full floor: %v", err)
+		if err := s.Delete(ctx, "k"); !errors.Is(err, ErrTombstoneEvicted) {
+			t.Fatalf("Delete over a full floor: %v, want ErrTombstoneEvicted", err)
 		}
 		got := buf.String()
 		if !strings.Contains(got, "level=WARN") || !strings.Contains(got, "count=1") || !strings.Contains(got, "names=[k]") {

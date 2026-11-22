@@ -197,8 +197,10 @@ func TestFloorFull(t *testing.T) {
 	t.Run("Delete makes room", func(t *testing.T) {
 		t.Parallel()
 		s, server, _ := setup(t)
-		if err := s.Delete(ctx, "k"); err != nil {
-			t.Fatalf("Delete in a full floor: %v", err)
+		// Over a full floor the burial is pruned in its own write: the
+		// entry is deleted, and Delete says its tombstone was evicted.
+		if err := s.Delete(ctx, "k"); !errors.Is(err, ErrTombstoneEvicted) {
+			t.Fatalf("Delete in a full floor: %v, want ErrTombstoneEvicted", err)
 		}
 		if _, ok := floorOf(t, server)["k"]; ok {
 			t.Fatal("Delete left k's floor entry")
