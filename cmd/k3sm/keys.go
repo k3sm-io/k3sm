@@ -73,6 +73,12 @@ const keysUsage = `Usage:
         --key-in FILE only finishes an interrupted rewrap, with the key its
         --key-out saved: the recorded master.next.sha256, or a key some
         record already opens under; any other key is refused
+  sudo k3sm keys floor merge FLOOR
+        after a restore, before k3sm start: merge every deleted generation
+        the floor FILE you moved aside records (keystore-floor.json.pre-restore)
+        into the restored floor, so keys revoked since the backup stay
+        refused. An entry the restored floor holds live is never deleted by
+        the merge; it is listed as skipped live, for rm if it was revoked
   sudo k3sm keys deliver system/<name> --namespace NS [--secret S] [--data-key K]
         declare that the server delivers the entry's current version as an
         Opaque Secret S (default: <name>) in NS, under data key K
@@ -135,6 +141,7 @@ type keysStore interface {
 	InterruptedRewrap(ctx context.Context) (fingerprint [sha256.Size]byte, ok bool, err error)
 	RecordsSealedUnder(ctx context.Context, key []byte) (bool, error)
 	UserScopesExist(ctx context.Context) (bool, error)
+	MergeFloor(ctx context.Context, path string) (keystore.MergeReport, error)
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -480,6 +487,8 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 		return keysRm(ctx, rest, env)
 	case "rewrap":
 		return keysRewrap(ctx, rest, env)
+	case "floor":
+		return keysFloor(ctx, rest, env)
 	case "deliver":
 		return keysDeliver(ctx, rest, env)
 	case "undeliver":
@@ -872,6 +881,57 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 	}
 	fmt.Fprintf(env.stdout, "deleted %s\n", qualify(name))
 	v.warnDeclared(name)
+	return keysOK
+}
+
+// keysFloor is "k3sm keys floor merge FLOOR": it merges the deleted
+// generations the moved-aside floor file FLOOR records into the live floor a
+// restore put back (keystore.FileStore.MergeFloor), and prints a summary:
+//
+//	merged N
+//	already present N
+//	skipped live N
+//	dropped N
+//
+// then one line per entry skipped live ("skipped live system/<name>: ...")
+// and per burial dropped ("dropped system/<name>: ..."). It exits 0 when the
+// merge is written, skipped or dropped burials included.
+func keysFloor(ctx context.Context, args []string, env keysEnv) int {
+	if len(args) == 0 || args[0] != "merge" {
+		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge FLOOR")
+		return keysBadUsage
+	}
+	v := newKeysVerb("floor merge", env)
+	pos, err := v.parse(args[1:])
+	if err != nil {
+		return keysBadUsage
+	}
+	if len(pos) != 1 {
+		return v.failf(keysBadUsage, "want one argument: the floor file moved aside before the restore")
+	}
+	path := pos[0]
+	if !filepath.IsAbs(path) {
+		return v.failf(keysBadUsage, "the floor file must be an absolute path")
+	}
+	path = filepath.Clean(path)
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	r, err := s.MergeFloor(ctx, path)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	fmt.Fprintf(env.stdout, "merged %d\nalready present %d\nskipped live %d\ndropped %d\n", r.Merged, r.AlreadyPresent, len(r.SkippedLive), len(r.Dropped))
+	for _, name := range r.SkippedLive {
+		fmt.Fprintf(env.stdout, "skipped live %s: the restored floor holds it live; if it was deleted to revoke it, run sudo k3sm keys rm %s --yes\n", qualify(name), qualify(name))
+	}
+	for _, name := range r.Dropped {
+		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
+	}
 	return keysOK
 }
 

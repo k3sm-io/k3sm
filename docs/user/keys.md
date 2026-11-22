@@ -322,20 +322,23 @@ sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/server/keystore
 sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json
 ```
 
-Before you start the server, delete again every key you revoked since the backup. The floor you
-moved aside records every entry deleted while it was live. Print those names and the restored
-entries:
+Before you start the server, carry over every deletion recorded since the backup. The floor you
+moved aside records every entry deleted while it was live. Merge those deletions into the
+restored floor:
 
 ```
-sudo plutil -extract tombstones raw -o - /var/lib/k3sm/keystore-floor.json.pre-restore
-sudo k3sm keys list
+sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore
 ```
 
-A name in both lists was deleted after the backup, or deleted before it and put again, and the
-restore makes it live. For each one you deleted to revoke a key, delete it again now, with
-`sudo k3sm keys rm system/<name> --yes`. When `plutil` prints an error instead of names, the
-moved-aside floor records no deletion, and there is nothing to delete again. Then start the
-server and check the entries:
+The merge keeps every key revoked since the backup refused, a key created after the backup
+included, and every older version of a name deleted more than once. It prints how many deletions
+it merged, how many the restored floor already had, how many it skipped because the restored
+floor holds that entry live, and how many it had to drop to stay within the floor's limits. It
+never deletes an entry the restored floor holds live, because that is the entry you restored on
+purpose. It lists each one it skipped as `skipped live system/<name>`. For each skipped name you
+deleted to revoke a key, delete it again now, with `sudo k3sm keys rm system/<name> --yes`. A
+line starting `dropped` names a deletion the floor could not keep: a copy of that entry put back
+is accepted. Then start the server and check the entries:
 
 ```
 sudo k3sm start
@@ -358,8 +361,9 @@ A restore puts back the whole keystore as it was when you saved it, not one entr
 - Every `rotate` since the backup is undone. Each entry's current version is the one it had
   then.
 - Every entry you deleted since the backup comes back, and root's record of those deletions is
-  gone. A key you deleted to revoke it is live again until you delete it again with `rm`, before
-  `k3sm start`, as above.
+  gone, until the merge above carries those deletions over. The merge never deletes an entry
+  the restored floor holds live, so a key you deleted to revoke it that the backup holds is
+  live again until you delete it again with `rm`, before `k3sm start`, as above.
 
 Only when `list` shows every entry `ok`, delete the copies you moved aside:
 

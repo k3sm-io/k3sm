@@ -668,6 +668,15 @@ func restoreRecipeBackup(t *testing.T, h *keysHarness, b recipeBackup, withFloor
 	return aside, nil
 }
 
+// refusedDeleted fails t unless show of name is refused as a deleted entry
+// put back, printing no value.
+func refusedDeleted(t *testing.T, h *keysHarness, name string) {
+	t.Helper()
+	if code := h.run("show", name, "--reveal"); code == 0 || h.stdout.Len() != 0 || !strings.Contains(h.stderr.String(), "records as deleted") {
+		t.Fatalf("show of the copy of %s put back: exit %d, stdout %q, stderr %q; want it refused as deleted", name, code, h.stdout.String(), h.stderr.String())
+	}
+}
+
 // recipeDeletedNames is plutil -extract tombstones raw on the moved-aside
 // floor: the names it records as deleted, sorted. It runs plutil itself
 // when the host has it, and reads the same field in Go otherwise.
@@ -748,7 +757,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			"sudo mv -n /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore",
 			"sudo mv -n /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json",
-			"sudo plutil -extract tombstones raw -o - /var/lib/k3sm/keystore-floor.json.pre-restore",
+			"sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo k3sm keys rm system/<name> --yes",
 			"sudo k3sm start",
 		}
@@ -783,22 +792,73 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			}
 		}
 	})
-	// A key deleted to revoke it is live again after the restore; the
-	// recipe lists it from the moved-aside floor and deletes it again before
-	// start, and it stays deleted.
+	// A key deleted to revoke it is live again after the restore: the
+	// merge never buries a generation the restored floor holds live, and
+	// reports it as skipped live; the recipe deletes it again before start,
+	// and it stays deleted.
 	t.Run("save rm restore, the revoked key deleted again before start", func(t *testing.T) {
 		h := newKeysHarness(t)
 		saveRmRestore(t, h, true)
-		h.mustRun(0, "list")
-		listed := h.stdout.String()
-		for _, name := range recipeDeletedNames(t, h) {
-			if strings.Contains(listed, "system/"+name) {
-				h.mustRun(0, "rm", "system/"+name, "--yes")
-			}
+		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore")
+		if got := h.stdout.String(); !strings.Contains(got, "merged 0\nalready present 0\nskipped live 1\ndropped 0\n") || !strings.Contains(got, "skipped live system/rb:") {
+			t.Fatalf("floor merge printed %q, want rb skipped live", got)
 		}
+		h.mustRun(0, "show", "system/rb", "--reveal")
+		h.mustRun(0, "rm", "system/rb", "--yes")
 		h.mustRun(1, "show", "system/rb", "--reveal")
 		if h.stdout.Len() != 0 {
 			t.Fatalf("show printed %q for the key deleted again", h.stdout.Bytes())
+		}
+	})
+	// A key created after the backup and revoked before the restore is in
+	// neither the backup nor the restored floor; the merge carries its
+	// tombstone over, so its copy put back is refused.
+	t.Run("a key created and revoked after the backup stays refused", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/base", []byte("base"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		h.put("system/late", []byte("late"))
+		late := filepath.Join(t.TempDir(), "late")
+		copyTree(t, filepath.Join(h.keystoreDir(), "late"), late)
+		h.mustRun(0, "rm", "system/late", "--yes")
+		if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore")
+		if got := h.stdout.String(); !strings.HasPrefix(got, "merged 1\nalready present 0\nskipped live 0\ndropped 0\n") {
+			t.Fatalf("floor merge printed %q, want late's burial merged", got)
+		}
+		copyTree(t, late, filepath.Join(h.keystoreDir(), "late"))
+		refusedDeleted(t, h, "system/late")
+		h.mustRun(0, "show", "system/base", "--reveal")
+	})
+	// A name with two generations buried after the backup keeps both
+	// burials through the merge: a copy of either is refused.
+	t.Run("two generations buried after the backup stay refused", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/base", []byte("base"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		var copies []string
+		for i := range 2 {
+			h.put("system/twice", []byte(fmt.Sprintf("gen %d", i)))
+			c := filepath.Join(t.TempDir(), "twice")
+			copyTree(t, filepath.Join(h.keystoreDir(), "twice"), c)
+			copies = append(copies, c)
+			h.mustRun(0, "rm", "system/twice", "--yes")
+		}
+		if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore")
+		if got := h.stdout.String(); !strings.HasPrefix(got, "merged 2\n") {
+			t.Fatalf("floor merge printed %q, want both burials merged", got)
+		}
+		for _, c := range copies {
+			copyTree(t, c, filepath.Join(h.keystoreDir(), "twice"))
+			refusedDeleted(t, h, "system/twice")
+			if err := os.RemoveAll(filepath.Join(h.keystoreDir(), "twice")); err != nil {
+				t.Fatal(err)
+			}
 		}
 	})
 	// A .pre-restore copy left by an earlier restore is never replaced:

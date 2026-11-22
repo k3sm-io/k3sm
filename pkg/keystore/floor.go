@@ -1020,9 +1020,15 @@ func (l *floorLock) read() (floor, error) {
 // write is done (logPruned). The lock is held through the rename and the directory fsync. op sees
 // a non-nil floor; an absent file it leaves unchanged stays absent.
 func (l *floorLock) update(op func(floor) bool) (floor, error) {
+	fl, _, err := l.updatePruned(op)
+	return fl, err
+}
+
+// updatePruned is update, also returning what the prune dropped.
+func (l *floorLock) updatePruned(op func(floor) bool) (floor, []pruned, error) {
 	fl, err := l.read()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	absent := fl == nil
 	if absent {
@@ -1030,23 +1036,23 @@ func (l *floorLock) update(op func(floor) bool) (floor, error) {
 	}
 	if !op(fl) {
 		if absent {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return fl, nil
+		return fl, nil, nil
 	}
 	dropped := fl.prune()
 	b, err := marshalFloor(fl)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(b) > floorSizeLimit {
-		return nil, fmt.Errorf("%w (%d bytes)", errFloorFull, len(b))
+		return nil, nil, fmt.Errorf("%w (%d bytes)", errFloorFull, len(b))
 	}
 	if err := l.s.writeFileAs(l.root, floorName, b, uint32(l.s.floorUID), uint32(l.s.floorGID), floorFileMode); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	logPruned(dropped)
-	return fl, nil
+	return fl, dropped, nil
 }
 
 // unlock releases the floor lock and closes what lockFloor opened.
