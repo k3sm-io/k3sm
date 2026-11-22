@@ -246,13 +246,6 @@ func marshalFloor(fl floor) ([]byte, error) {
 	return append(b, '\n'), nil
 }
 
-// size is the length of fl's encoding by marshalFloor, computed without
-// encoding it: an entry's name is a checkName name and its generation hex, so
-// neither is escaped.
-func (fl floor) size() int {
-	return fl.liveSize() + fl.deadSize()
-}
-
 // deadSize is the length of fl's tombstones object, with the comma before
 // it: nothing when fl buries nothing.
 func (fl floor) deadSize() int {

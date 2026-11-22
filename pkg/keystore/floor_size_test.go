@@ -30,6 +30,13 @@ import (
 // The tests for the floor's size bound: every floor write refuses a result
 // larger than maxFloorSize, so the floor on disk always reads back.
 
+// size is the length of fl's encoding by marshalFloor, computed without
+// encoding it: an entry's name is a checkName name and its generation hex, so
+// neither is escaped.
+func (fl floor) size() int {
+	return fl.liveSize() + fl.deadSize()
+}
+
 // nameOfLen returns a checkName name of n characters made of c.
 func nameOfLen(n int, c string) string {
 	var b strings.Builder
