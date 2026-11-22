@@ -24,7 +24,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"syscall"
@@ -191,6 +193,23 @@ type floorFile struct {
 // per-name cap.
 type pruned struct {
 	name, generation string
+}
+
+// logPruned logs, at Warn, the burials a floor write dropped: how many, and
+// the names they were under. Each name's old copy put back is accepted again
+// unless a live entry of another generation refuses it.
+func logPruned(ps []pruned) {
+	if len(ps) == 0 {
+		return
+	}
+	var names []string
+	for _, p := range ps {
+		names = append(names, p.name)
+	}
+	sort.Strings(names)
+	names = slices.Compact(names)
+	slog.Warn("keystore floor: dropped the oldest deleted generations to stay within its bounds; an old copy of those deleted entries put back is no longer refused as deleted",
+		"count", len(ps), "names", names)
 }
 
 // floorMalformedError is errFloorMalformed's type. It matches ErrCorrupt
@@ -936,7 +955,8 @@ func (l *floorLock) read() (floor, error) {
 // update re-reads the floor under the lock, applies op to what it read, and
 // writes the result if op reports a change, returning the floor as it now
 // is. A change is pruned (prune) before it is written, so tombstones never
-// take a live entry's room. The lock is held through the rename and the directory fsync. op sees
+// take a live entry's room, and what the prune dropped is logged once the
+// write is done (logPruned). The lock is held through the rename and the directory fsync. op sees
 // a non-nil floor; an absent file it leaves unchanged stays absent.
 func (l *floorLock) update(op func(floor) bool) (floor, error) {
 	fl, err := l.read()
@@ -953,7 +973,7 @@ func (l *floorLock) update(op func(floor) bool) (floor, error) {
 		}
 		return fl, nil
 	}
-	fl.prune()
+	dropped := fl.prune()
 	b, err := marshalFloor(fl)
 	if err != nil {
 		return nil, err
@@ -964,6 +984,7 @@ func (l *floorLock) update(op func(floor) bool) (floor, error) {
 	if err := l.s.writeFileAs(l.root, floorName, b, uint32(l.s.floorUID), uint32(l.s.floorGID), floorFileMode); err != nil {
 		return nil, err
 	}
+	logPruned(dropped)
 	return fl, nil
 }
 

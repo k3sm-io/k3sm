@@ -894,8 +894,8 @@ pend U190 "the refresher doctor rows; every state change logs at Warn or Error u
 	k3sm/cmd/k3sm::TestDoctorRefresherRows k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn
 pend U191 "examples/keydelivery-github.yaml validates against the apis CRD schema; limitations.md lists the typed-credential residuals (the typed-credential docs)" \
 	k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD TestLimitationsListTypedResiduals
-check U192 "the floor's tombstones: a completed Delete buries the floor's live generation for the name (the directory's only when the floor has no record of the name) with a delete sequence, without the master too; a later Put keeps the buried set; at most 8 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry; a floor with no tombstones field parses, and a burial is parsed as strictly as an entry (the floor's tombstone)" \
-	TestTombstoneKeptByPut TestDeleteWithoutMasterTombstones TestTombstonePrune TestTombstoneNeverRefusesPut TestParseFloorTombstones FuzzParseFloor
+check U192 "the floor's tombstones: a completed Delete buries the floor's live generation for the name (the directory's only when the floor has no record of the name) with a delete sequence, without the master too; a later Put keeps the buried set; at most 8 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no tombstones field parses, and a burial is parsed as strictly as an entry (the floor's tombstone)" \
+	TestTombstoneKeptByPut TestDeleteWithoutMasterTombstones TestTombstonePrune TestTombstoneNeverRefusesPut TestPruneLogsAtWarn TestParseFloorTombstones FuzzParseFloor
 # >>> ADD NEW U ROWS (U193 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"

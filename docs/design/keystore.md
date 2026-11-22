@@ -419,7 +419,9 @@ buried set, oldest first:
   fit. The residual of a pruned burial is the behaviour before this change: an old copy of
   that deleted entry put back under its name is accepted, unless the name's live entry of
   another generation refuses it. The oldest burials are the longest-revoked keys, and any
-  root-run churn, bulk puts included, can evict them. 1 MiB holds about 3,500 burials of the
+  root-run churn, bulk puts included, can evict them, so every drop is visible: each prune,
+  the per-name cap's included, logs at Warn through `log/slog` with the count and the names,
+  and a Delete whose own new burial the same write prunes logs that too. 1 MiB holds about 3,500 burials of the
   longest names and about 16,000 of short ones.
 - *Deletion without the master.* Delete still works without the master. A burial needs only
   the floor's own record (or, with none, the directory's `generation` file) and the floor
@@ -4382,7 +4384,7 @@ carried by the unit rows.
 | U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
-| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (the directory's only when the floor has no record of the name) with a delete sequence, without the master too; a later Put keeps the buried set; at most 8 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestParseFloorTombstones`, `FuzzParseFloor` | checked: the floor's tombstone |
+| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (the directory's only when the floor has no record of the name) with a delete sequence, without the master too; a later Put keeps the buried set; at most 8 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `FuzzParseFloor` | checked: the floor's tombstone |
 
 ### Rig legs
 

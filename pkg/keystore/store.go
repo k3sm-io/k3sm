@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -651,11 +652,22 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if genErr == nil {
 		deleted = &gen
 	}
-	_, err = fdir.update(func(fl floor) bool {
-		g, _ := fl.bury(name, deleted)
-		return g != ""
+	var buried string
+	var dropped []pruned
+	after, err := fdir.update(func(fl floor) bool {
+		buried, dropped = fl.bury(name, deleted)
+		return buried != ""
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	// The per-name cap's drop is a prune too; and over a full floor the
+	// write may prune the very burial this Delete added.
+	logPruned(dropped)
+	if buried != "" && !after[name].buries(buried) {
+		slog.Warn("keystore floor: the burial this delete wrote was pruned in the same write, so an old copy of the deleted entry put back is not refused as deleted", "name", name)
+	}
+	return nil
 }
 
 // Rotate seals value as the next version of name, of the kind name already

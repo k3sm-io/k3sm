@@ -17,9 +17,11 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"strings"
 	"testing"
@@ -235,4 +237,59 @@ func TestParseFloorTombstones(t *testing.T) {
 	if fl, err := parseFloor(b); !errors.Is(err, errFloorMalformed) || fl != nil {
 		t.Errorf("parseFloor(tombstones of %d bytes) = %v; want errFloorMalformed", big.deadSize(), err)
 	}
+}
+
+// captureWarn sends the default slog logger to a buffer for the rest of
+// the test and returns it.
+func captureWarn(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// TestPruneLogsAtWarn (U192): every burial a floor write drops is logged at
+// Warn with the count and the names: the per-name cap's drop, and the
+// floor's prune. A Delete whose own new burial the same write prunes says
+// so.
+func TestPruneLogsAtWarn(t *testing.T) {
+	ctx := context.Background()
+	t.Run("the per-name cap", func(t *testing.T) {
+		s, _ := newTestStore(t)
+		buf := captureWarn(t)
+		for range maxBuriedPerName {
+			mustPut(t, s, "k", KindOpaque, []byte("v"))
+			if err := s.Delete(ctx, "k"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("logged before the cap: %s", buf)
+		}
+		mustPut(t, s, "k", KindOpaque, []byte("v"))
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatal(err)
+		}
+		if got := buf.String(); !strings.Contains(got, "level=WARN") || !strings.Contains(got, "count=1") || !strings.Contains(got, "names=[k]") {
+			t.Fatalf("log at the per-name cap = %q, want a Warn with count=1 and names=[k]", got)
+		}
+	})
+	t.Run("Delete's own burial pruned", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("v"))
+		fillFloor(t, server, floor{"k": floorOf(t, server)["k"]}, maxFloorSize)
+		buf := captureWarn(t)
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatalf("Delete over a full floor: %v", err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, "level=WARN") || !strings.Contains(got, "count=1") || !strings.Contains(got, "names=[k]") {
+			t.Fatalf("log of the prune = %q, want a Warn with count=1 and names=[k]", got)
+		}
+		if !strings.Contains(got, "the burial this delete wrote was pruned") {
+			t.Fatalf("log = %q, want the Delete to say its own burial was pruned", got)
+		}
+	})
 }
