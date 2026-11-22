@@ -3375,8 +3375,12 @@ them meaning.
 
 - `token` and `ssh` keep the unbounded retention of every other kind.
 - `oauth` keeps the current version and one previous. Otherwise refreshes would fill the 16 MiB
-  quota and keep dead refresh tokens forever; a pruned version's refresh token is gone, which is
-  the point.
+  quota and keep dead refresh tokens forever; a pruned version's file is unlinked, which is
+  the point. Unlinked is not erased: on APFS the unlink frees the file's blocks without
+  overwriting them, a local snapshot (Time Machine's included) taken before the prune still holds
+  the sealed file, and a copy-on-write clone shares its blocks. The record stays sealed under the
+  master, so reading it needs the master too; the provider's refresh-token rotation, not the
+  unlink, is what makes the old token useless.
 - **The mark lives in the current-pointer plaintext.** Today that is 16 bytes (`version`,
   `sequence`). A pointer that records a prune carries 24 bytes: `version`, `sequence`, `low`,
   where `low` is the oldest retained version and `1 ≤ low ≤ version`. A 16-byte pointer means
@@ -4051,7 +4055,8 @@ Pre-deploy: `sudo k3sm keys refresh-profile add`, then `refresh-profile test`, b
 `server/` pair is put; the server needs direct outbound HTTPS to profile endpoints (no proxy).
 Rollback is revert, rebuild, reinstall; rolling back past typed kinds or the refresher means
 owners sign in again for their `server/` pairs after rolling forward ("Unknown kinds, ownership
-and rollback").
+and rollback"). A build from before typed records reads them as corrupt and advises removing the
+entry with `rm`: do not follow that advice for a typed entry; upgrade again instead.
 
 ### Gate mechanics
 
