@@ -42,9 +42,10 @@ import (
 // SameFile, owner and mode on the descriptor) and each file with readFile
 // (O_NOFOLLOW, a regular file, a bounded read).
 //
-// Not here yet, and each the change named in the design: the delivery record
-// (kind 0xFD) and scope-key Rewrap (Rewrap refuses while .user exists until
-// then), quotas, and the user-scope floor.
+// The scope's delivery record (kind 0xFD) is deliveries.go, its quotas and
+// rm quota.go, and Rewrap of scope.key rewrapscope.go. Not here yet: the
+// user-scope floor for entries (the delivery record reaches the floor
+// through the userFloorLog seam, userlogs.go).
 //
 // Until the user-scope floor lands, a user entry is read against no floor,
 // with two consequences. A copied-back older pointer of a user entry is not
@@ -191,7 +192,7 @@ func (u *UserScope) put(ctx context.Context, input string, kind Kind, value []by
 	if err != nil {
 		return Version{}, err
 	}
-	uk, entries, err := u.openScope(root, func() ([]byte, error) { return k.wrap, nil })
+	uk, entries, err := u.openScope(root, func() (keys, error) { return k, nil })
 	if errors.Is(err, errNoScopeKey) {
 		uk, entries, err = u.mint(root, k.wrap)
 	}
@@ -199,6 +200,9 @@ func (u *UserScope) put(ctx context.Context, input string, kind Kind, value []by
 		return Version{}, err
 	}
 	defer func() { _ = entries.Close() }() // writes are fsynced by writeFile
+	if err := checkScopeQuota(entries, name, value); err != nil {
+		return Version{}, err
+	}
 	e, err := u.createUserEntry(entries, name)
 	if err != nil {
 		return Version{}, err
@@ -350,6 +354,11 @@ func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 // lock. A read never mints: a missing keystore, scope or container is
 // ErrScopeAbsent.
 func (u *UserScope) read(ctx context.Context, fn func(*os.Root, keys) error) error {
+	return u.readScope(ctx, func(entries *os.Root, o *openedScope) error { return fn(entries, o.uk) })
+}
+
+// readScope is read, giving fn the opened scope.
+func (u *UserScope) readScope(ctx context.Context, fn func(*os.Root, *openedScope) error) error {
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
@@ -361,15 +370,13 @@ func (u *UserScope) read(ctx context.Context, fn func(*os.Root, keys) error) err
 		return err
 	}
 	defer done()
-	uk, entries, err := u.openScope(root, func() ([]byte, error) {
-		k, err := u.s.loadMaster()
-		return k.wrap, err
-	})
+	o, entries, err := u.openScopeFull(root, u.s.loadMaster)
 	if err != nil {
 		return err
 	}
+	defer o.close()
 	defer func() { _ = entries.Close() }() // read-only; nothing to flush
-	return fn(entries, uk)
+	return fn(entries, o)
 }
 
 // openScope opens the scope under root, the entries' directory, and returns
@@ -378,29 +385,55 @@ func (u *UserScope) read(ctx context.Context, fn func(*os.Root, keys) error) err
 // whether or not the master opens. A missing .user, .user/<uid>/ or
 // scope.key is errNoScopeKey; a missing entries/ beside a scope.key is
 // ErrScopeAbsent too, never an empty scope, and never minted over.
-func (u *UserScope) openScope(root *os.Root, wrap func() ([]byte, error)) (keys, *os.Root, error) {
+func (u *UserScope) openScope(root *os.Root, wrap func() (keys, error)) (keys, *os.Root, error) {
+	o, entries, err := u.openScopeFull(root, wrap)
+	if err != nil {
+		return keys{}, nil, err
+	}
+	uk := o.uk
+	o.close()
+	return uk, entries, nil
+}
+
+// openScopeFull is openScope, returning the opened scope: its directory,
+// derived keys, delivery-record key and bound generation. A scope.key with
+// no deliveries record beside it is ErrScopeAbsent, an incomplete scope and
+// never an empty record, as a missing entries/ is.
+func (u *UserScope) openScopeFull(root *os.Root, wrap func() (keys, error)) (*openedScope, *os.Root, error) {
 	dir, err := u.openScopeDir(root, false)
 	if err != nil {
-		return keys{}, nil, err
+		return nil, nil, err
 	}
-	defer func() { _ = dir.Close() }() // read-only here
-	ku, err := u.readScopeKey(dir, wrap)
+	ok := false
+	defer func() {
+		if !ok {
+			_ = dir.Close() // abandoned; read-only so far
+		}
+	}()
+	ku, gen, err := u.readScopeKey(dir, wrap)
 	if err != nil {
-		return keys{}, nil, err
+		return nil, nil, err
 	}
 	uk, err := deriveKeys(ku, u.scope)
+	dk := deliveriesKey(ku, u.scope)
 	clear(ku) // only the derived keys are kept
 	if err != nil {
-		return keys{}, nil, err
+		return nil, nil, err
+	}
+	if _, err := dir.Lstat(deliveriesName); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, fmt.Errorf("%w: the scope has a scope key and no %s record", ErrScopeAbsent, deliveriesName)
+	} else if err != nil {
+		return nil, nil, fmt.Errorf("check for %s: %w", deliveriesName, err)
 	}
 	entries, err := u.s.openSubdir(dir, scopeEntriesName, false)
 	if errors.Is(err, fs.ErrNotExist) {
-		return keys{}, nil, fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent)
+		return nil, nil, fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent)
 	}
 	if err != nil {
-		return keys{}, nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err)
+		return nil, nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err)
 	}
-	return uk, entries, nil
+	ok = true
+	return &openedScope{dir: dir, key: dk, gen: gen, uk: uk}, entries, nil
 }
 
 // openScopeDir opens .user/<uid>/ under root, each level with openSubdir,
@@ -431,51 +464,67 @@ func (u *UserScope) openScopeDir(root *os.Root, create bool) (*os.Root, error) {
 // size; the record must be kind 0xFE, named "scope", at the key epoch. The
 // uid's live GeneratedUID is read (lookupGeneratedUID, failing closed) and
 // must equal the record's generation, which the record authenticates under
-// W: a real, different answer is ErrScopeOwnerChanged.
-func (u *UserScope) readScopeKey(dir *os.Root, wrap func() ([]byte, error)) ([]byte, error) {
+// W: a real, different answer is ErrScopeOwnerChanged. It returns the
+// record's generation beside K_u. A scope.key that does not open under W is
+// opened once more under master.next's W when the master keys carry one:
+// the reader's rule for a Rewrap that crashed after moving it.
+func (u *UserScope) readScopeKey(dir *os.Root, wrap func() (keys, error)) ([]byte, [generationSize]byte, error) {
+	var zero [generationSize]byte
+	r, err := u.s.readScopeKeyRecord(dir)
+	if err != nil {
+		return nil, zero, err
+	}
+	live, err := lookupGeneratedUID(u.uid)
+	if err != nil {
+		return nil, zero, err
+	}
+	k, err := wrap()
+	if err != nil {
+		return nil, zero, err
+	}
+	ku, err := r.open(k.wrap, u.scope)
+	if err != nil && errors.Is(err, ErrCorrupt) && k.next != nil && k.next.wrap != nil {
+		ku, err = r.open(k.next.wrap, u.scope)
+	}
+	if err != nil {
+		return nil, zero, fmt.Errorf("%s: %w", scopeKeyName, err)
+	}
+	if len(ku) != scopeKeySize {
+		clear(ku)
+		return nil, zero, fmt.Errorf("%w: %s holds %d bytes, want %d", ErrCorrupt, scopeKeyName, len(ku), scopeKeySize)
+	}
+	if r.generation != live {
+		clear(ku)
+		return nil, zero, fmt.Errorf("%w: uid %d", ErrScopeOwnerChanged, u.uid)
+	}
+	return ku, r.generation, nil
+}
+
+// readScopeKeyRecord reads and parses dir's scope.key, unopened. The file
+// must be a regular file reached without a symlink, owned by the service
+// user, at most 0600, with one link, and of a scope key's size and shape. A
+// missing one is errNoScopeKey. Rewrap reads it this way too: it re-seals
+// the record and never needs the owner's live GeneratedUID.
+func (s *FileStore) readScopeKeyRecord(dir *os.Root) (record, error) {
 	b, fi, err := readFile(dir, scopeKeyName, int64(maxScopeKeyRecordSize))
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return nil, errNoScopeKey
+		return record{}, errNoScopeKey
 	case errors.Is(err, errBadFile):
-		return nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeKeyName, err)
+		return record{}, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeKeyName, err)
 	case err != nil:
-		return nil, fmt.Errorf("read %s: %w", scopeKeyName, err)
+		return record{}, fmt.Errorf("read %s: %w", scopeKeyName, err)
 	}
-	if err := u.s.checkOwned(fi, fileMode); err != nil {
-		return nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeKeyName, err)
+	if err := s.checkOwned(fi, fileMode); err != nil {
+		return record{}, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeKeyName, err)
 	}
 	// scope.key is only ever written by rename, so it has one link; a second
 	// one keeps a copy the store does not know of, which a later re-seal of
 	// the key would leave behind.
 	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Nlink != 1 {
-		return nil, fmt.Errorf("%w: %s has more than one link", ErrCorrupt, scopeKeyName)
+		return record{}, fmt.Errorf("%w: %s has more than one link", ErrCorrupt, scopeKeyName)
 	}
-	r, err := parseScopeKey(b)
-	if err != nil {
-		return nil, err
-	}
-	live, err := lookupGeneratedUID(u.uid)
-	if err != nil {
-		return nil, err
-	}
-	w, err := wrap()
-	if err != nil {
-		return nil, err
-	}
-	ku, err := r.open(w, u.scope)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", scopeKeyName, err)
-	}
-	if len(ku) != scopeKeySize {
-		clear(ku)
-		return nil, fmt.Errorf("%w: %s holds %d bytes, want %d", ErrCorrupt, scopeKeyName, len(ku), scopeKeySize)
-	}
-	if r.generation != live {
-		clear(ku)
-		return nil, fmt.Errorf("%w: uid %d", ErrScopeOwnerChanged, u.uid)
-	}
-	return ku, nil
+	return parseScopeKey(b)
 }
 
 // parseScopeKey decodes a scope.key file: a record of kind 0xFE, named
@@ -493,9 +542,10 @@ func parseScopeKey(b []byte) (record, error) {
 }
 
 // mint makes the scope: the uid's GeneratedUID is read first, so a lookup
-// that fails creates nothing; then .user/<uid>/ and entries/ are made, and
-// scope.key is written last, so a scope whose scope.key opens has its
-// entries/ directory. A fresh K_u is never minted over entries: an entries/
+// that fails creates nothing; then .user/<uid>/ and entries/ are made, then
+// the empty deliveries record (sequence 1) and its floor line, and scope.key
+// is written last, so a scope whose scope.key opens has its entries/
+// directory and its delivery record. A fresh K_u is never minted over entries: an entries/
 // directory that holds anything, without a scope.key, is a scope whose key
 // was lost, and ErrScopeAbsent, as the master is never minted over entries.
 // The caller holds the exclusive lock.
@@ -532,10 +582,26 @@ func (u *UserScope) mint(root *os.Root, wrap []byte) (keys, *os.Root, error) {
 	if len(names) > 0 {
 		return keys{}, nil, fmt.Errorf("%w: entries/ holds %d names and there is no scope key, so a new key would orphan them; restore scope.key", ErrScopeAbsent, len(names))
 	}
+	// A floor past the first sequence for this owner's generation means a
+	// delivery record under the lost key committed writes: a new key would
+	// reset its history under a floor that refuses the reset record.
+	if fl, err := u.s.userFloor.floor(u.scope, deliveriesFloorName, g); err != nil {
+		return keys{}, nil, err
+	} else if fl > 1 {
+		return keys{}, nil, fmt.Errorf("%w: the user-scope floor records %s writes under a scope key that is gone; restore scope.key", ErrScopeAbsent, deliveriesName)
+	}
 	ku := make([]byte, scopeKeySize)
 	defer clear(ku) // only the derived keys outlive the mint
 	if err := u.s.readRandom(ku); err != nil {
 		return keys{}, nil, fmt.Errorf("mint the scope key: %w", err)
+	}
+	// The empty delivery record, sequence 1, before scope.key: a scope whose
+	// scope.key opens has its record.
+	dk := deliveriesKey(ku, u.scope)
+	err = u.writeDeliveries(dir, dk, g, nil, 1)
+	clear(dk)
+	if err != nil {
+		return keys{}, nil, err
 	}
 	rec := record{kind: kindScopeKey, name: scopeKeyRecordName, version: scopeKeyEpoch, generation: g, created: u.s.now().Unix()}
 	if err := rec.seal(wrap, u.scope, ku, u.s.rand); err != nil {

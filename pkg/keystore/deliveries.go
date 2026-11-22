@@ -1,0 +1,628 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package keystore
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"sort"
+	"strconv"
+
+	"k3sm.io/apis/keystore/credential"
+	keyentry "k3sm.io/apis/keystore/entry"
+)
+
+// This file is a user scope's sealed delivery record: docs/design/
+// keystore.md § "User scope", "Key hierarchy", "Quotas" and "KeyDelivery".
+// .user/<uid>/deliveries is a kind-0xFD record in the Phase A encoding, AAD
+// scope user/<uid>, name "deliveries", generation the scope's bound
+// GeneratedUID and version the record's sequence, sealed under
+// HMAC(K_u, "k3sm-keystore-deliveries-v1" ‖ 0x00 ‖ "user/<uid>"). Every
+// write re-seals the whole record at the previous sequence plus 1, then
+// appends its floor line (user/<uid>, .deliveries, generation, seq); a read
+// refuses a sequence below the floor's.
+//
+// The plaintext is
+//
+//	0  1  format version (deliveriesFormat)
+//	1  4  entry count (big-endian uint32), at most maxDeliveries
+//	5  …  the entries
+//
+// and each entry is LP(uid) ‖ LP(name) ‖ LP(entry) ‖ LP(namespace) ‖
+// LP(secretName) ‖ LP(requestedBy) ‖ LP(items) ‖ digest (32) ‖ last
+// delivered version (8, big-endian) ‖ state (1): seven 4-byte length
+// prefixes, as "Quotas" counts them. items is the blob the digest covers:
+// the items sorted by key bytewise, each LP(field) ‖ LP(key).
+
+const (
+	// kindDeliveries is the delivery record's kind byte; only
+	// parseDeliveriesRecord accepts it.
+	kindDeliveries = 0xFD
+	// deliveriesName is the record's file in the scope directory, and also
+	// its record name (the AAD name).
+	deliveriesName = "deliveries"
+	// deliveriesFloorName is the record's name in the user-scope floor: no
+	// valid entry name (a leading dot is an empty label), so it never
+	// collides with an entry named deliveries.
+	deliveriesFloorName = ".deliveries"
+	// deliveriesFormat is the plaintext's format version byte.
+	deliveriesFormat = 1
+	// deliveriesKeyLabel derives the delivery-record key from K_u.
+	deliveriesKeyLabel = "k3sm-keystore-deliveries-v1"
+	// deliveryDigestLabel is the target digest's domain label.
+	deliveryDigestLabel = "k3sm-keystore-delivery-target/v1"
+
+	// maxLiveDeliveries and maxDeliveries bound the record: 64 live entries,
+	// 320 in all with the withdrawn tombstones.
+	maxLiveDeliveries = 64
+	maxDeliveries     = 320
+	// maxDeliveriesRecordSize bounds the sealed record a read or a write
+	// accepts (1,056 KiB), and maxDeliveriesPlaintext its plaintext (1,040
+	// KiB and a 16-byte header).
+	maxDeliveriesRecordSize = 1056 << 10
+	maxDeliveriesPlaintext  = 1040<<10 + 16
+
+	// The field bounds of one entry ("Quotas").
+	maxDeliveryUIDLen   = 36
+	maxObjectNameLen    = 253
+	maxDeliveryEntryLen = 269
+	maxNamespaceLen     = 63
+	maxSecretNameLen    = 253
+	maxRequestedByLen   = 21
+	maxDeliveryItems    = 8
+	maxItemKeyLen       = 253
+	maxItemsBlobLen     = maxDeliveryItems * (8 + credential.MaxFieldLength + maxItemKeyLen)
+
+	// The entry states.
+	deliveryLive      = 1
+	deliveryWithdrawn = 2
+
+	// requestedByPrefix begins a user delivery's requester: k3sm:local:<uid>.
+	requestedByPrefix = "k3sm:local:"
+)
+
+// delivery is one entry of the record: a KeyDelivery's UID and name, its
+// target tuple, the target digest, the last delivered version and whether
+// it is withdrawn.
+type delivery struct {
+	uid         string
+	name        string
+	entry       string
+	namespace   string
+	secretName  string
+	items       []credential.Item
+	requestedBy string
+	digest      [sha256.Size]byte
+	delivered   uint64
+	withdrawn   bool
+}
+
+// itemsBlob is the items as the digest and the record carry them: sorted by
+// key bytewise, each LP(field) ‖ LP(key).
+func itemsBlob(items []credential.Item) []byte {
+	sorted := append([]credential.Item(nil), items...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Key < sorted[j].Key })
+	var b []byte
+	for _, it := range sorted {
+		b = appendLP(b, []byte(it.Field))
+		b = appendLP(b, []byte(it.Key))
+	}
+	return b
+}
+
+// deliveryDigest is the target digest: sha256(label ‖ LP(entry) ‖
+// LP(namespace) ‖ LP(secretName) ‖ LP(items)). requestedBy is not in it.
+func deliveryDigest(entry, namespace, secretName string, items []credential.Item) [sha256.Size]byte {
+	b := []byte(deliveryDigestLabel)
+	b = appendLP(b, []byte(entry))
+	b = appendLP(b, []byte(namespace))
+	b = appendLP(b, []byte(secretName))
+	b = appendLP(b, itemsBlob(items))
+	return sha256.Sum256(b)
+}
+
+// appendLP appends v with its 4-byte big-endian length.
+func appendLP(b, v []byte) []byte {
+	b = binary.BigEndian.AppendUint32(b, uint32(len(v)))
+	return append(b, v...)
+}
+
+// errDeliveriesFormat is a plaintext whose format version this build does
+// not know: refused, and a reader treats it as indeterminate, never as an
+// empty record.
+var errDeliveriesFormat = fmt.Errorf("%w: the deliveries record has a format version this build of k3sm does not know", ErrCorrupt)
+
+// marshalDeliveries encodes ds as the record's plaintext.
+func marshalDeliveries(ds []delivery) []byte {
+	b := []byte{deliveriesFormat}
+	b = binary.BigEndian.AppendUint32(b, uint32(len(ds)))
+	for _, d := range ds {
+		for _, f := range []string{d.uid, d.name, d.entry, d.namespace, d.secretName, d.requestedBy} {
+			b = appendLP(b, []byte(f))
+		}
+		b = appendLP(b, itemsBlob(d.items))
+		b = append(b, d.digest[:]...)
+		b = binary.BigEndian.AppendUint64(b, d.delivered)
+		state := byte(deliveryLive)
+		if d.withdrawn {
+			state = deliveryWithdrawn
+		}
+		b = append(b, state)
+	}
+	return b
+}
+
+// lpReader reads length-prefixed fields off a bounded plaintext.
+type lpReader struct {
+	b   []byte
+	err error
+}
+
+// field reads one LP field of 1 to max bytes.
+func (r *lpReader) field(what string, max int) []byte {
+	if r.err != nil {
+		return nil
+	}
+	if len(r.b) < 4 {
+		r.err = fmt.Errorf("%w: the deliveries record ends inside %s's length", ErrCorrupt, what)
+		return nil
+	}
+	n := binary.BigEndian.Uint32(r.b)
+	if n == 0 || n > uint32(max) || uint64(n) > uint64(len(r.b)-4) {
+		r.err = fmt.Errorf("%w: the deliveries record's %s is %d bytes, want 1 to %d within the record", ErrCorrupt, what, n, max)
+		return nil
+	}
+	v := r.b[4 : 4+n]
+	r.b = r.b[4+n:]
+	return v
+}
+
+// fixed reads n bytes.
+func (r *lpReader) fixed(what string, n int) []byte {
+	if r.err != nil {
+		return nil
+	}
+	if len(r.b) < n {
+		r.err = fmt.Errorf("%w: the deliveries record ends inside %s", ErrCorrupt, what)
+		return nil
+	}
+	v := r.b[:n]
+	r.b = r.b[n:]
+	return v
+}
+
+// parseDeliveries decodes the record's plaintext. It is bounded and strict:
+// the format version must be deliveriesFormat (else errDeliveriesFormat),
+// the count at most maxDeliveries with at most maxLiveDeliveries live, every
+// field within its bound, every entry a valid user entry, the items 1 to 8
+// with unique keys in their sorted order, each stored digest the digest of
+// its tuple, no UID twice, a known state byte, and no trailing bytes. Any
+// other refusal is ErrCorrupt.
+func parseDeliveries(pt []byte) ([]delivery, error) {
+	if len(pt) > maxDeliveriesPlaintext {
+		return nil, fmt.Errorf("%w: the deliveries record is %d bytes, over %d", ErrCorrupt, len(pt), maxDeliveriesPlaintext)
+	}
+	if len(pt) < 5 {
+		return nil, fmt.Errorf("%w: the deliveries record is %d bytes, shorter than its header", ErrCorrupt, len(pt))
+	}
+	if pt[0] != deliveriesFormat {
+		return nil, fmt.Errorf("%w (version %d, want %d)", errDeliveriesFormat, pt[0], deliveriesFormat)
+	}
+	n := binary.BigEndian.Uint32(pt[1:5])
+	if n > maxDeliveries {
+		return nil, fmt.Errorf("%w: the deliveries record holds %d entries, over %d", ErrCorrupt, n, maxDeliveries)
+	}
+	r := &lpReader{b: pt[5:]}
+	out := make([]delivery, 0, n)
+	seen := map[string]bool{}
+	live := 0
+	for i := uint32(0); i < n; i++ {
+		var d delivery
+		d.uid = string(r.field("uid", maxDeliveryUIDLen))
+		d.name = string(r.field("name", maxObjectNameLen))
+		d.entry = string(r.field("entry", maxDeliveryEntryLen))
+		d.namespace = string(r.field("namespace", maxNamespaceLen))
+		d.secretName = string(r.field("secretName", maxSecretNameLen))
+		d.requestedBy = string(r.field("requestedBy", maxRequestedByLen))
+		blob := r.field("items", maxItemsBlobLen)
+		digest := r.fixed("digest", sha256.Size)
+		ver := r.fixed("delivered version", 8)
+		state := r.fixed("state", 1)
+		if r.err != nil {
+			return nil, r.err
+		}
+		var err error
+		if d.items, err = parseItemsBlob(blob); err != nil {
+			return nil, err
+		}
+		if e, err := ParseEntry(d.entry); err != nil || e.Scope != keyentry.ScopeUser {
+			return nil, fmt.Errorf("%w: a deliveries record entry names no user entry", ErrCorrupt)
+		}
+		copy(d.digest[:], digest)
+		if d.digest != deliveryDigest(d.entry, d.namespace, d.secretName, d.items) {
+			return nil, fmt.Errorf("%w: a deliveries record entry's digest is not its target's", ErrCorrupt)
+		}
+		d.delivered = binary.BigEndian.Uint64(ver)
+		switch state[0] {
+		case deliveryLive:
+			live++
+		case deliveryWithdrawn:
+			d.withdrawn = true
+		default:
+			return nil, fmt.Errorf("%w: a deliveries record entry has state %d", ErrCorrupt, state[0])
+		}
+		if seen[d.uid] {
+			return nil, fmt.Errorf("%w: the deliveries record names one UID twice", ErrCorrupt)
+		}
+		seen[d.uid] = true
+		out = append(out, d)
+	}
+	if len(r.b) != 0 {
+		return nil, fmt.Errorf("%w: %d bytes follow the deliveries record's last entry", ErrCorrupt, len(r.b))
+	}
+	if live > maxLiveDeliveries {
+		return nil, fmt.Errorf("%w: the deliveries record holds %d live entries, over %d", ErrCorrupt, live, maxLiveDeliveries)
+	}
+	return out, nil
+}
+
+// parseItemsBlob decodes an items blob: 1 to 8 items, each a field of 1 to
+// 32 bytes and a key of 1 to 253, keys strictly increasing bytewise (so
+// unique, and in the order itemsBlob writes).
+func parseItemsBlob(blob []byte) ([]credential.Item, error) {
+	r := &lpReader{b: blob}
+	var items []credential.Item
+	for len(r.b) > 0 {
+		if len(items) == maxDeliveryItems {
+			return nil, fmt.Errorf("%w: a deliveries record entry has more than %d items", ErrCorrupt, maxDeliveryItems)
+		}
+		f := r.field("item field", credential.MaxFieldLength)
+		k := r.field("item key", maxItemKeyLen)
+		if r.err != nil {
+			return nil, r.err
+		}
+		if n := len(items); n > 0 && items[n-1].Key >= string(k) {
+			return nil, fmt.Errorf("%w: a deliveries record entry's item keys are not unique and sorted", ErrCorrupt)
+		}
+		items = append(items, credential.Item{Field: credential.Field(f), Key: string(k)})
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("%w: a deliveries record entry has no items", ErrCorrupt)
+	}
+	return items, nil
+}
+
+// parseDeliveriesRecord decodes a deliveries file: a record of kind 0xFD
+// named "deliveries", within the record bound. Anything else is ErrCorrupt.
+// parseRecord, which every other reader uses, still refuses kind 0xFD.
+func parseDeliveriesRecord(b []byte) (record, error) {
+	if len(b) > maxDeliveriesRecordSize {
+		return record{}, fmt.Errorf("%w: %s is %d bytes, over %d", ErrCorrupt, deliveriesName, len(b), maxDeliveriesRecordSize)
+	}
+	r, err := parseRecordOf(b, func(kind byte) bool { return kind == kindDeliveries })
+	if err != nil {
+		return record{}, fmt.Errorf("%s: %w", deliveriesName, err)
+	}
+	if r.name != deliveriesName || r.version == 0 {
+		return record{}, fmt.Errorf("%w: %s does not hold this scope's delivery record", ErrCorrupt, deliveriesName)
+	}
+	return r, nil
+}
+
+// checkDelivery validates a delivery the caller adds: every field within its
+// bound and grammar, the entry in the caller's own scope (else notFound, as
+// any other scope's name), and requestedBy the caller's own principal.
+func (u *UserScope) checkDelivery(op string, d delivery) error {
+	if _, err := u.own(op, d.entry); err != nil {
+		return err
+	}
+	if d.requestedBy != requestedByPrefix+strconv.FormatUint(uint64(u.uid), 10) {
+		return fmt.Errorf("user scope %s: requestedBy must be %s%d", op, requestedByPrefix, u.uid)
+	}
+	for _, f := range []struct {
+		what string
+		v    string
+		max  int
+	}{{"uid", d.uid, maxDeliveryUIDLen}, {"name", d.name, maxObjectNameLen}, {"namespace", d.namespace, maxNamespaceLen}, {"secretName", d.secretName, maxSecretNameLen}} {
+		if f.v == "" || len(f.v) > f.max {
+			return fmt.Errorf("user scope %s: the delivery's %s is %d bytes, want 1 to %d", op, f.what, len(f.v), f.max)
+		}
+	}
+	if _, err := parseItemsBlob(itemsBlob(d.items)); err != nil {
+		return fmt.Errorf("user scope %s: the delivery's items: %w", op, err)
+	}
+	return nil
+}
+
+// openedScope is an opened user scope: the scope directory, its derived
+// keys, the delivery-record key and the bound generation.
+type openedScope struct {
+	dir *os.Root
+	uk  keys
+	key []byte
+	gen [generationSize]byte
+}
+
+// close clears the delivery-record key and closes the scope directory; the
+// derived keys stay with whoever copied them.
+func (o *openedScope) close() {
+	clear(o.key)
+	_ = o.dir.Close() // writes are fsynced by writeFile
+}
+
+// readDeliveries reads, checks and opens the scope's delivery record, and
+// returns its entries and sequence. A missing record is ErrScopeAbsent,
+// never an empty record. The record must be the service user's, at most
+// 0600, of kind 0xFD named deliveries, at the scope's bound generation, and
+// at or above the floor's sequence for that generation.
+func (u *UserScope) readDeliveries(o *openedScope) ([]delivery, uint64, error) {
+	b, fi, err := readFile(o.dir, deliveriesName, maxDeliveriesRecordSize)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, 0, fmt.Errorf("%w: the scope has a scope key and no %s record", ErrScopeAbsent, deliveriesName)
+	case errors.Is(err, errBadFile):
+		return nil, 0, fmt.Errorf("%w: %s: %w", ErrCorrupt, deliveriesName, err)
+	case err != nil:
+		return nil, 0, fmt.Errorf("read %s: %w", deliveriesName, err)
+	}
+	if err := u.s.checkOwned(fi, fileMode); err != nil {
+		return nil, 0, fmt.Errorf("%w: %s: %w", ErrCorrupt, deliveriesName, err)
+	}
+	r, err := parseDeliveriesRecord(b)
+	if err != nil {
+		return nil, 0, err
+	}
+	if r.generation != o.gen {
+		return nil, 0, fmt.Errorf("%w: %s is not bound to this scope's owner", ErrCorrupt, deliveriesName)
+	}
+	fl, err := u.s.userFloor.floor(u.scope, deliveriesFloorName, o.gen)
+	if err != nil {
+		return nil, 0, err
+	}
+	if r.version < fl {
+		return nil, 0, fmt.Errorf("%w: the %s record (sequence %d) is older than the user-scope floor (sequence %d); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, fl)
+	}
+	pt, err := r.open(o.key, u.scope)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s: %w", deliveriesName, err)
+	}
+	ds, err := parseDeliveries(pt)
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, d := range ds {
+		if e, _ := ParseEntry(d.entry); e.UID != u.uid {
+			return nil, 0, fmt.Errorf("%w: %s names another scope's entry", ErrCorrupt, deliveriesName)
+		}
+	}
+	return ds, r.version, nil
+}
+
+// writeDeliveries seals ds at seq and writes the record, then its floor
+// line: a crash between the two leaves the floor one behind, which a read
+// accepts.
+func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSize]byte, ds []delivery, seq uint64) error {
+	pt := marshalDeliveries(ds)
+	if len(pt) > maxDeliveriesPlaintext {
+		return fmt.Errorf("the deliveries record would be %d bytes, over %d", len(pt), maxDeliveriesPlaintext)
+	}
+	rec := record{kind: kindDeliveries, name: deliveriesName, version: seq, generation: gen, created: u.s.now().Unix()}
+	if err := rec.seal(key, u.scope, pt, u.s.rand); err != nil {
+		return err
+	}
+	b := rec.marshal()
+	if len(b) > maxDeliveriesRecordSize {
+		return fmt.Errorf("the deliveries record would be %d bytes, over %d", len(b), maxDeliveriesRecordSize)
+	}
+	if err := u.s.writeFile(dir, deliveriesName, b); err != nil {
+		return err
+	}
+	return u.s.userFloor.append(u.scope, deliveriesFloorName, gen, seq)
+}
+
+// deliveriesKey derives the delivery-record key from K_u.
+func deliveriesKey(ku []byte, scope string) []byte {
+	return hmacSHA256(ku, scopedLabel(deliveriesKeyLabel, scope))
+}
+
+// addDelivery records d, live, in the caller's delivery record, minting the
+// scope on its first mutating operation. A UID already recorded is
+// ErrExists; a record with 64 live entries, or 320 in all, is ErrQuota.
+func (u *UserScope) addDelivery(ctx context.Context, d delivery) error {
+	err := u.addDeliveryLocked(ctx, d)
+	if aerr := u.audit("deliver", d.entry, d.namespace, err); err == nil {
+		err = aerr
+	}
+	if err != nil {
+		return fail("deliver", err)
+	}
+	return nil
+}
+
+func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery) error {
+	if err := u.s.checkConfig(); err != nil {
+		return err
+	}
+	if err := u.checkDelivery("deliver", d); err != nil {
+		return err
+	}
+	return u.writeLocked(ctx, true, func(o *openedScope) error {
+		ds, seq, err := u.readDeliveries(o)
+		if err != nil {
+			return err
+		}
+		live := 0
+		for _, x := range ds {
+			if x.uid == d.uid {
+				return fmt.Errorf("%w: the delivery UID is already recorded", ErrExists)
+			}
+			if !x.withdrawn {
+				live++
+			}
+		}
+		if live >= maxLiveDeliveries || len(ds) >= maxDeliveries {
+			return fmt.Errorf("%w: the scope has %d live deliveries and %d in all (at most %d and %d)", ErrQuota, live, len(ds), maxLiveDeliveries, maxDeliveries)
+		}
+		d.items = append([]credential.Item(nil), d.items...)
+		sort.Slice(d.items, func(i, j int) bool { return d.items[i].Key < d.items[j].Key })
+		d.digest = deliveryDigest(d.entry, d.namespace, d.secretName, d.items)
+		d.withdrawn, d.delivered = false, 0
+		return u.writeDeliveries(o.dir, o.key, o.gen, append(ds, d), seq+1)
+	})
+}
+
+// lookupDelivery returns the recorded delivery with uid, live or withdrawn.
+// A UID absent from a record that opened is ErrNotFound; a scope or record
+// that is not there is ErrScopeAbsent. A read never mints.
+func (u *UserScope) lookupDelivery(ctx context.Context, uid string) (delivery, error) {
+	var out delivery
+	err := u.readScope(ctx, func(_ *os.Root, o *openedScope) error {
+		ds, _, err := u.readDeliveries(o)
+		if err != nil {
+			return err
+		}
+		for _, d := range ds {
+			if d.uid == uid {
+				out = d
+				return nil
+			}
+		}
+		return ErrNotFound
+	})
+	if err != nil {
+		return delivery{}, fail("look up a delivery", err)
+	}
+	return out, nil
+}
+
+// withdrawDelivery turns the live delivery uid into a tombstone in place. It
+// never adds an entry, so it is never refused for a quota, and it runs while
+// a Rewrap is half done: revocation always succeeds. An already withdrawn
+// UID is no change; an absent one is ErrNotFound.
+func (u *UserScope) withdrawDelivery(ctx context.Context, uid string) error {
+	err := u.withdrawLocked(ctx, uid)
+	if aerr := u.audit("withdraw", "", "", err); err == nil {
+		err = aerr
+	}
+	if err != nil {
+		return fail("withdraw", err)
+	}
+	return nil
+}
+
+func (u *UserScope) withdrawLocked(ctx context.Context, uid string) error {
+	if err := u.s.checkConfig(); err != nil {
+		return err
+	}
+	return u.writeLocked(ctx, false, func(o *openedScope) error {
+		ds, seq, err := u.readDeliveries(o)
+		if err != nil {
+			return err
+		}
+		for i := range ds {
+			if ds[i].uid != uid {
+				continue
+			}
+			if ds[i].withdrawn {
+				return nil
+			}
+			ds[i].withdrawn = true
+			return u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1)
+		}
+		return ErrNotFound
+	})
+}
+
+// writeLocked runs fn on the opened scope under the exclusive lock. With
+// mint set it is a write that may create the scope: it never mints the
+// master and refuses while a Rewrap is half done, as Put does. Without it,
+// the scope must exist, and the master's fallback key opens a scope.key a
+// crashed Rewrap already moved.
+func (u *UserScope) writeLocked(ctx context.Context, mint bool, fn func(*openedScope) error) error {
+	root, done, err := u.s.openLocked(ctx, false, true)
+	if errors.Is(err, fs.ErrNotExist) {
+		if mint {
+			return fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)
+		}
+		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
+	}
+	if err != nil {
+		return err
+	}
+	defer done()
+	var k keys
+	if mint {
+		k, err = u.masterForWrite()
+	} else {
+		k, err = u.s.loadMaster()
+	}
+	if err != nil {
+		return err
+	}
+	o, entries, err := u.openScopeFull(root, func() (keys, error) { return k, nil })
+	if mint && errors.Is(err, errNoScopeKey) {
+		_, entries, err = u.mint(root, k.wrap)
+		if err == nil {
+			_ = entries.Close() // nothing written through it here
+			o, entries, err = u.openScopeFull(root, func() (keys, error) { return k, nil })
+		}
+	}
+	if err != nil {
+		return err
+	}
+	_ = entries.Close() // not written through here
+	defer o.close()
+	return fn(o)
+}
+
+// audit appends one line for op to the audit sink, with result "ok" or the
+// refusal's name; never a value. Its error is the caller's to report when
+// the operation itself succeeded: the change is made, its line is not.
+func (u *UserScope) audit(op, entry, namespace string, err error) error {
+	name := ""
+	if e, perr := ParseEntry(entry); perr == nil && e.UID == u.uid {
+		name = e.Name
+	}
+	if aerr := u.s.auditSink.append(auditLine{op: op, scope: u.scope, name: name, namespace: namespace, result: auditResult(err)}); aerr != nil {
+		return fmt.Errorf("the change was made, and its audit line was not written: %w", aerr)
+	}
+	return nil
+}
+
+// auditResult names an operation's outcome for its audit line.
+func auditResult(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, ErrQuota):
+		return "quota"
+	case errors.Is(err, ErrNotFound):
+		return "not-found"
+	case errors.Is(err, ErrExists):
+		return "exists"
+	case errors.Is(err, ErrScopeAbsent):
+		return "scope-absent"
+	case errors.Is(err, ErrCorrupt):
+		return "corrupt"
+	}
+	return "error"
+}

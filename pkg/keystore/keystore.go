@@ -126,9 +126,9 @@ type Store interface {
 	Delete(ctx context.Context, name string) error
 	// Rewrap re-seals every stored version and current pointer under a new
 	// master key, then retires the old one. It is resumable: a crash at any
-	// step leaves every record readable, and the next call completes it. It
-	// refuses with ErrScopeUnsupported, changing nothing, while user scopes
-	// exist.
+	// step leaves every record readable, and the next call completes it.
+	// Each user scope's scope.key is re-sealed with them; every other user
+	// record is left as it is.
 	Rewrap(ctx context.Context, newMaster []byte) error
 }
 
@@ -171,11 +171,11 @@ var (
 	// is missing), or its directory, or cred/ above it, is a symlink, not the
 	// service user's, or open to group or others.
 	ErrMasterUntrusted = errors.New("the keystore master key is not trusted: the master file must be a regular file of 32 bytes, mode 0600, owned by the service user, and match its recorded fingerprint, in a directory (and cred/ above it) owned by the service user and closed to group and others")
-	// ErrScopeUnsupported is Rewrap's refusal while the name reserved for
-	// user scopes exists in the entries' directory, whatever its type. This
-	// build cannot re-wrap user scopes, so re-wrapping the master under them
-	// would leave them unreadable; Rewrap writes nothing. A .user that is not
-	// a user scope (a stray file or link) is root's to remove.
+	// ErrScopeUnsupported was Rewrap's refusal, in builds before scope-key
+	// Rewrap, while the name reserved for user scopes existed. This build
+	// re-wraps scope keys and no longer returns it; the sentinel stays so a
+	// caller that maps it, and the reconciler's table of store sentinels,
+	// keep their meaning for an older build's answer.
 	ErrScopeUnsupported = errors.New("the keystore holds user scopes at the reserved path keystore/.user, which this build of k3sm cannot re-wrap: the master was not swapped and every record still opens; upgrade k3sm, then run rewrap again. If keystore/.user is not a user scope, root must remove it before rewrap can run")
 	// ErrScopeAbsent reports a user scope, or a container of it, that is not
 	// there: .user, .user/<uid>/, its scope.key or its entries/ directory. It
@@ -194,6 +194,11 @@ var (
 	// synthesized value for a uid with no directory record. Nothing in the
 	// scope opens and no scope key is minted.
 	ErrScopeOwnerUnknown = errors.New("the user scope's owner could not be confirmed: the uid's GeneratedUID lookup failed, timed out or found no directory record, so nothing in the scope was opened or created")
+	// ErrQuota reports a user-scope write past one of the scope's bounds:
+	// 256 entries or 16 MiB of sealed records for put, 64 live deliveries
+	// (or 320 in all, tombstones included) for deliver. rm and withdraw are
+	// never refused for a quota: they are how room is made.
+	ErrQuota = errors.New("the user scope is over its quota: at most 256 entries and 16 MiB of sealed records, and 64 live deliveries; rm an entry (then put it again) or withdraw a delivery to make room")
 	// ErrRewrapInProgress is a user scope's refusal to write while a Rewrap is
 	// half done: master.next, or its fingerprint, is in the master directory.
 	// The user path never completes a swap or mints a master, and a .user it

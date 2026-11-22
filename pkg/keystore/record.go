@@ -47,8 +47,8 @@ const (
 	// kindPointer is the kind byte of a current-pointer record. Version
 	// records carry a Kind (1 or 2).
 	// kindScopeKey is a user scope's wrapped scope key, scope.key; only
-	// parseScopeKey accepts it. Kind 0xFD (a sealed per-user delivery list) is
-	// reserved, and no reader accepts it yet.
+	// parseScopeKey accepts it. Kind 0xFD, a user scope's sealed delivery
+	// record, is accepted only by parseDeliveriesRecord (deliveries.go).
 	kindPointer  = 0xFF
 	kindScopeKey = 0xFE
 	// headerSize is the size of a record's fixed fields: everything but the
@@ -177,8 +177,8 @@ func (r *record) marshal() []byte {
 }
 
 // parseRecord decodes a record file. It is strict: the kind must be one a
-// record carries today (the two Kinds or kindPointer; the reserved 0xFE and
-// 0xFD are refused), every length must agree with the file's size exactly, and
+// record carries today (the two Kinds or kindPointer; 0xFE and 0xFD, which
+// only their own parsers accept, are refused), every length must agree with the file's size exactly, and
 // anything else is ErrCorrupt. It does not
 // check that the record belongs where it was found; openRecord does.
 func parseRecord(b []byte) (record, error) {
