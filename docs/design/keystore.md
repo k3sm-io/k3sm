@@ -757,10 +757,13 @@ rewrap --key-out FILE | --key-in FILE
       under, and refuses any other. Takes no value.
       Prints that entry backups taken earlier no longer open.
 
-deliver system/<name> --namespace NS [--secret NAME] [--data-key KEY] [--remove]
-      Root delivery: declare (or, with --remove, withdraw) delivery of an
-      existing system entry as a Secret. Refuses a name that does not exist.
-      Warns when secrets encryption is off on this data root.
+deliver system/<name> --namespace NS [--secret NAME] [--data-key KEY]
+      Root delivery: declare delivery of an existing system entry as a
+      Secret. Refuses a name that does not exist. Warns when secrets
+      encryption is off on this data root.
+undeliver system/<name> --namespace NS [--secret NAME]
+      Withdraw the entry's root delivery into NS (only into Secret NAME,
+      with --secret). The Secret stays.
 ```
 
 Exit codes: 0 success, 1 refused (the sentinel's message), 2 bad usage, the three-value shape
@@ -779,8 +782,12 @@ labelled Secret per declared target, never LISTs, never prunes anything it did n
 apply, log-and-continue on a per-target failure (the same posture `pkg/addons/doc.go`
 already documents and justifies).
 
-**Target declaration.** `k3sm keys deliver` writes `/var/lib/k3sm/keystore-delivery.json`,
-root:wheel 0644, atomically (temp-and-rename), and nothing else writes it:
+**Target declaration.** `k3sm keys deliver` and `undeliver` write
+`/var/lib/k3sm/keystore-delivery.json`, root:wheel 0644, atomically (temp-and-rename), and
+nothing else writes it. The two verbs serialize their read-modify-write on an exclusive flock
+of `/var/lib/k3sm/.keystore-delivery.lock`, a root-owned 0600 file opened O_NOFOLLOW and
+judged on its descriptor like the declaration, with a bounded wait; the data root directory
+itself is never flocked:
 
 ```json
 {"version": 1, "targets": [
@@ -804,9 +811,10 @@ backstop, so a Rotate reaches its Secret within one interval.
 **Identity.** The reconciler runs in the server process and uses the admin client that
 process already holds for the embedded add-on reconciler (the `system:masters` admin
 kubeconfig). **It adds no role, no binding and no ServiceAccount.** What it does with that
-client is narrower than the client allows: Get, create and update of one named `Opaque`
-Secret per declared target, labelled as below, and nothing else — no list, no delete, no
-other kind, no Secret it does not own. The set of principals who can cause a write stays
+client is narrower than the client allows: get, create and update of one named `Opaque`
+Secret per declared target, labelled as below; delete only an owned immutable Secret, under a
+UID precondition; and nothing else — no list, no other delete, no other kind, no Secret it
+does not own. The set of principals who can cause a write stays
 {root on the node} because only root can edit the declaration. A bounded ServiceAccount in
 the manner of `kube-system/k3sm-manifests` would need a new Role granting Secret write,
 which widens what the control plane can do; Phase A does not add one. This paragraph holds
@@ -821,15 +829,51 @@ wrapping, no bundled public key.
 **Ownership label:** `k3sm.io/keystore-delivery: <entry-name>`, distinct from
 `k3sm.io/managed` (reusing that label would make this reconciler's Secrets
 indistinguishable from the embedded add-on set's objects for "which reconciler may touch
-this," the exact hazard `pkg/addons/doc.go` warns a label-selector prune into). Ownership
-is checked by reading the existing Secret first: present and labelled for this entry name
-→ update; present without the label or for a different entry → left alone, skipped with a
-logged reason, never forced.
+this," the exact hazard `pkg/addons/doc.go` warns a label-selector prune into). The label
+is not proof of ownership: anyone who can write Secrets in the namespace can set it on a
+Secret they create first. So on create the reconciler records the UID the apiserver gave
+the Secret in `<server work dir>/keystore-delivery-state.json`
+(`/var/lib/k3sm/server/keystore-delivery-state.json` on an install), mode 0600, written
+atomically by the server and so owned by the server's euid (`_k3sm` on an install, root on a
+root server). It is read on the opened descriptor, O_NOFOLLOW: the file must be owned by
+the server's euid and not group- or other-writable, and the directory owned by that euid, by
+root or, for a root server, by the service user, and not group- or other-writable. That owner
+adds no trust: a process running as the server's uid already holds the admin kubeconfig and
+can write any Secret without forging the file. Pods are kept off it by the runtime's
+whole-tree pod deny on the server work dir (`runtimed/pkg/sandbox::TestStateDirDeniedUnderACustomLeaf`,
+`TestStateDirEnforcedAcrossCaseAndNormalization`); the `keystore-` prefix, which the runtime's
+`keystore-*` deny also covers, is defence in depth only. A service-user-owned parent can rename
+or delete the file: a missing record makes the reconciler skip a Secret it cannot prove it
+created, failing closed, and a file the service user wrote is refused because it is not root's.
+The residual is replay: on a root server the service user can put back an older state file
+root wrote, which restores records only for Secrets this server created, in targets root
+declared. Ownership is checked by reading the existing Secret first: present and
+carrying the recorded UID → update, relabelling it if its label is missing or names another
+entry (a tenant's edit, or root re-pointing the Secret at another entry with `deliver`), since
+the UID alone decides; anything else (no recorded UID, or a different UID because the Secret
+was deleted and recreated, whatever its label says) → "not created by this server", left
+alone, skipped with a logged reason, never written into. An update writes
+only `data`, `type`, the label and the two annotations, and strips any `immutable` flag on
+its own object. A target that leaves a declaration that exists and parses loses its state
+entry, so declaring it again does not adopt the old Secret; an absent declaration (the file or
+the data root missing) withdraws nothing, keeps every record and changes no Secret. A state file that fails its checks delivers nothing,
+and a create happens only after the state file was written successfully in that sweep.
 
-**Re-delivery on rotation:** the sweep compares the target's current version
-(`Store.Current`) against the version recorded in the Secret's own
-`k3sm.io/keystore-version` annotation; a mismatch re-applies `data` and bumps the
-annotation — content-derived, like the embedded reconciler's own checksum-skip.
+**Re-delivery on rotation:** the sweep compares the target's current version and
+fingerprint (`Store.Current`'s `Version.Version` and `Version.Fingerprint`) against the
+Secret's own `k3sm.io/keystore-version` and `k3sm.io/keystore-fingerprint` annotations, and
+checks that `data` holds exactly the declared `dataKey` and that its bytes are the stored
+value (`subtle.ConstantTimeCompare`, so an edit of `data` that leaves the annotations intact is
+drift: re-applied and logged, without the value); any mismatch re-applies `data` and
+both annotations — content-derived, like the embedded reconciler's own checksum-skip. The
+version alone is not enough: an entry deleted and put back starts at version 1 again with a
+new value, and `pkg/keystore` exposes no generation, so the value's fingerprint is what
+tells the two apart. A changed `dataKey` re-applies too, and the stale key leaves `data`. An
+`immutable` Secret the reconciler owns cannot be updated, so a re-delivery deletes it with
+`DeleteOptions{Preconditions: {UID: <recorded UID>}}`, creates it again and records the new
+UID, logging both steps without the value. It is the reconciler's only delete, and it is safe
+because the precondition proves the object is the one this server created; a failed
+precondition deletes and creates nothing.
 
 **Refusal while secrets encryption is off.** Delivery is refused by default; the override
 is explicit, as the maintainer answered on the issue. Two facts the first revision got

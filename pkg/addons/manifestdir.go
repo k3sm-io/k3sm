@@ -107,13 +107,15 @@ var refusedGroups = map[string]bool{
 }
 
 // fileCheck decides whether an opened file (or the directory itself) may be read.
-// Production binds rootOwnedNotShared; tests bind a variant that accepts the test
+// Production binds RootOwnedNotShared; tests bind a variant that accepts the test
 // user as the owner, since a unit test cannot create a root-owned file.
 type fileCheck func(fi fs.FileInfo) error
 
-// rootOwnedNotShared refuses anything not owned by root, or writable by its group
-// or by others.
-func rootOwnedNotShared(fi fs.FileInfo) error {
+// RootOwnedNotShared refuses anything not owned by root, or writable by its group
+// or by others. It judges the FileInfo it is given, so a caller passes the Stat
+// of the descriptor it opened, never a path's Lstat. The keystore's delivery
+// declaration is read with the same check (pkg/keystore/deliver).
+func RootOwnedNotShared(fi fs.FileInfo) error {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok || st == nil {
 		return errors.New("owner unknown")
@@ -121,11 +123,12 @@ func rootOwnedNotShared(fi fs.FileInfo) error {
 	if st.Uid != 0 {
 		return fmt.Errorf("owned by uid %d, not root", st.Uid)
 	}
-	return notShared(fi)
+	return NotShared(fi)
 }
 
-// notShared refuses a group- or other-writable mode.
-func notShared(fi fs.FileInfo) error {
+// NotShared refuses a group- or other-writable mode: RootOwnedNotShared without
+// the owner, for a test that cannot make a root-owned file.
+func NotShared(fi fs.FileInfo) error {
 	if fi.Mode().Perm()&0o022 != 0 {
 		return fmt.Errorf("mode %04o is group- or other-writable", fi.Mode().Perm())
 	}
@@ -171,7 +174,7 @@ func NewManifestDir(dir string, dyn dynamic.Interface, mapper meta.RESTMapper, e
 		mapper:   mapper,
 		events:   events,
 		logger:   logger,
-		check:    rootOwnedNotShared,
+		check:    RootOwnedNotShared,
 		interval: ManifestSweepInterval,
 		now:      time.Now,
 		settled:  map[string]string{},

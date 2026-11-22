@@ -29,8 +29,9 @@
 # Modes. Neither --check nor a unit mode calls sudo.
 #   --check         every G and U row; the E rows print as RIG (run --lab). It
 #                   runs every package a row names, whole: the keystore package's
-#                   tests, and for the CLI rows (G7, G10, G16, G17, G21) the keys
-#                   verbs' tests in ./cmd/k3sm/, named k3sm/cmd/k3sm::<Test> below.
+#                   tests, the delivery's in ./pkg/keystore/deliver/ (G18 to G20),
+#                   and for the CLI rows (G7, G10, G16 to G21) the keys verbs'
+#                   tests in ./cmd/k3sm/, named k3sm/cmd/k3sm::<Test> below.
 #   --rewrap        Rewrap's rows: G3, G12, G13, G14 and U5.
 #   --verbs         the keys verbs: G16, G17, G21, U1.
 #   --delivery      the system delivery: G18 to G20.
@@ -400,9 +401,28 @@ check G16 "List marks an unreadable entry with Err, and Delete still removes it;
 	k3sm/cmd/k3sm::TestKeysListCorruptExitsOne TestKeysRmCorruptEntry
 check G17 "show prints a value only with --reveal, byte-exact for an opaque value and 32- and 64-byte Ed25519 values; no verb takes a value as an argument" \
 	k3sm/cmd/k3sm::TestKeysShowRevealByteExact TestKeysShowMetadataOnly TestKeysRefusals
-pend G18 "delivery refused while encryption is off (PR 5)"
-pend G19 "the delivery declaration is root-owned (PR 5)"
-pend G20 "the reconciler touches only its labelled Secrets (PR 5)"
+check G18 "delivery is refused while encryption is off, before any apiserver call, logged once per target; the server's override flag allows it; a target delivered under the override stays when it is removed; deliver prints the refusal" \
+	k3sm/pkg/keystore/deliver::TestDeliveryRefusedWhileEncryptionOff TestDeliveryOverrideAllowsPlaintext TestDeliveredTargetStaysWhenOverrideRemoved \
+	k3sm/cmd/k3sm::TestKeysDeliveryServerFlag TestKeysDeliveryServerConfig TestKeysDeliverEncryptionOffNote TestKeysDeliveryServerGate
+check G19 "the delivery declaration is root-owned and not group- or other-writable, opened O_NOFOLLOW and judged on the descriptor, size- and count-capped and parsed strictly, each entry system/<name>; anything else is refused whole, by the reconciler and by the verbs; the verbs serialize on a root-owned lock file judged the same way; the data root holding them is root's and not shared-writable, judged on its descriptor; the state file is the server euid's, in a directory of that euid, root or (for a root server) the service user" \
+	k3sm/pkg/keystore/deliver::TestDeclarationRootOwned TestDeclarationOpenedWithNoFollow TestLockRefusesUntrustedFile TestLockBoundedWait \
+	TestNewDefaultsBindRoot TestDataRootDirectoryChecked TestStateFileOtherOwnerRefused TestStateDirServiceUserOwner \
+	TestDeclarationEntryField TestStateFileMalformedDeliversNothing \
+	k3sm/cmd/k3sm::TestKeysDeliverRefusals TestKeysDeliverWritersSerialize TestKeysEnvDefaultsBindRoot TestKeysUndeliverSecret
+check G20 "the reconciler only gets, creates and updates the Opaque Secrets it created, proven by the UID it recorded, not the label: an unlabelled, foreign, pre-created or recreated Secret is untouched, and no list is ever made, and no delete but an owned immutable Secret's under a UID precondition; content drift is re-applied; one hung call cannot stall the sweep; rm of a declared entry warns that its Secret keeps the value; no stored value reaches the log or the verbs' output" \
+	k3sm/pkg/keystore/deliver::TestReconcilerTouchesOnlyLabelledSecrets TestReconcilerRedeliversOnRotation \
+	TestReconcilerSkipsLabelledNonOpaque TestReconcilerContinuesAfterTargetFailure \
+	TestReconcilerRedeliversAfterRmPut TestReconcilerReappliesChangedDataKey \
+	TestReconcilerNeverWritesTenantPrecreated TestReconcilerDoesNotAdoptRecreated \
+	TestReconcilerRecordsCreatedUID TestReconcilerReappliesDrift TestReconcilerImmutableOwned \
+	TestReconcilerLogsNoValue TestReconcilerTargetTimeout TestNewTargetTimeout TestWatchLogsErrors \
+	TestStateStockInstallShape TestMissingDeclarationKeepsRecords \
+	TestReconcilerRepointsOwnedSecret TestReconcilerRelabelledOwnedSecret \
+	TestReconcilerImmutableDeleteConflict TestStateWriteFailureCreatesNothing \
+	TestReconcilerUpdateCarriesUIDAndResourceVersion TestStateWriteFailureDeletesNothing \
+	TestReconcilerImmutableMetadataOnly TestReconcilerTerminatingNotDeleted \
+	TestMissingDeclarationWarnsOnce TestReconcilerImmutableDeleteNotFound \
+	k3sm/cmd/k3sm::TestKeysRmWarnsDeclared TestKeysDeliveryPrintsNoValue
 check G21 "the rollback recipe is a byte-exact round trip: show --reveal into rotate --in -, the new version compared with version N byte for byte (bytes.Equal, as cmp), opaque and Ed25519" \
 	k3sm/cmd/k3sm::TestKeysRollbackRoundTrip
 special g22 G22

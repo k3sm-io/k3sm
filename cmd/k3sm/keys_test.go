@@ -110,8 +110,10 @@ type keysHarness struct {
 	rand      io.Reader
 	// keyOutStep, when set, is the verb's keyOutStep seam.
 	keyOutStep func(string) error
-	stdout     bytes.Buffer
-	stderr     bytes.Buffer
+	// encryptionOff is what the verbs' encryptionOn seam answers, negated.
+	encryptionOff bool
+	stdout        bytes.Buffer
+	stderr        bytes.Buffer
 }
 
 func newKeysHarness(t *testing.T) *keysHarness {
@@ -158,8 +160,13 @@ func (h *keysHarness) run(args ...string) int {
 		stdoutTTY:  func() bool { return h.stdoutTTY },
 		rand:       h.rand,
 		keyOutStep: h.keyOutStep,
-		stdout:     &h.stdout,
-		stderr:     &h.stderr,
+		// Non-root, the test user stands in for root as the declaration's
+		// owner, and the declaration cannot be handed to root.
+		deliveryCheck: keysTestDeliveryCheck,
+		deliveryChown: func(*os.File) error { return nil },
+		encryptionOn:  func(string) bool { return !h.encryptionOff },
+		stdout:        &h.stdout,
+		stderr:        &h.stderr,
 	}
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") && args[0] != "help" && !slices.Contains(args, "--work-dir") {
 		args = append(slices.Clone(args), "--work-dir", h.work)
@@ -1437,6 +1444,8 @@ func TestKeysDocsSayWhatTheVerbsDo(t *testing.T) {
 	for _, want := range []string{
 		keysResumeFailed,
 		keysSwapUnsynced,
+		keysUndeliverHint,
+		"unless the server was started with the override (`--allow-plaintext-secrets-delivery`)",
 		"It writes the raw bytes, so a value holding terminal escape sequences is interpreted by the terminal.",
 		"Never delegate the `keys` verbs through `sudoers`: `put --in` and `show --reveal` read any file root can read",
 		"After a successful rewrap, `FILE` is a second copy of the live master key: delete it, or move it to offline storage, and never keep it beside a backup of the entries.",

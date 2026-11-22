@@ -120,7 +120,7 @@ func newManifestHarness(t *testing.T) *manifestHarness {
 		if h.foreign[fi.Name()] {
 			return errors.New("owned by uid 501, not root")
 		}
-		return notShared(fi)
+		return NotShared(fi)
 	}
 	return h
 }

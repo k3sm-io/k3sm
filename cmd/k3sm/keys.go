@@ -41,6 +41,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/keystore"
+	keydeliver "k3sm.io/k3sm/pkg/keystore/deliver"
 	"k3sm.io/k3sm/pkg/status"
 )
 
@@ -72,6 +73,16 @@ const keysUsage = `Usage:
         --key-in FILE only finishes an interrupted rewrap, with the key its
         --key-out saved: the recorded master.next.sha256, or a key some
         record already opens under; any other key is refused
+  sudo k3sm keys deliver system/<name> --namespace NS [--secret S] [--data-key K]
+        declare that the server delivers the entry's current version as an
+        Opaque Secret S (default: <name>) in NS, under data key K
+        (default: value); the entry must exist. While secrets encryption is
+        off the server refuses delivery unless it was started with
+        --allow-plaintext-secrets-delivery
+  sudo k3sm keys undeliver system/<name> --namespace NS [--secret S]
+        withdraw the entry's delivery into NS (only into Secret S, with
+        --secret). The Secret stays; delete it with kubectl, and rotate the
+        entry to revoke
 
 Names are scope-qualified: system/<name>, where <name> is 1 to 253 bytes of
 dot-separated labels of lowercase letters, digits and '-'. This build
@@ -140,8 +151,22 @@ type keysEnv struct {
 	// --key-out file ("chmod", "write", "sync"); a non-nil return fails the
 	// write there, as the failing call would. Production leaves it nil.
 	keyOutStep func(step string) error
-	stdout     io.Writer
-	stderr     io.Writer
+	// deliveryCheck judges the opened delivery declaration; deliveryChown
+	// hands a new one to root:wheel. A non-root test replaces both.
+	deliveryCheck keydeliver.FileCheck
+	deliveryChown func(f *os.File) error
+	// deliveryLockBusy is the wait between attempts at the declaration's
+	// lock while another writer holds it; nil is keydeliver.DefaultLockBusy.
+	// deliveryRead, when set, is called after the declaration is read and
+	// before it is written back, where a test parks a writer. Production
+	// leaves both nil.
+	deliveryLockBusy func() <-chan time.Time
+	deliveryRead     func()
+	// encryptionOn reports whether the server would start the work dir's
+	// apiserver with secrets encryption.
+	encryptionOn func(workDir string) bool
+	stdout       io.Writer
+	stderr       io.Writer
 }
 
 func defaultKeysEnv(stdout, stderr io.Writer) keysEnv {
@@ -153,8 +178,12 @@ func defaultKeysEnv(stdout, stderr io.Writer) keysEnv {
 		stdinTTY:   func() bool { return status.IsTerminal(os.Stdin) },
 		stdoutTTY:  func() bool { return status.IsTerminal(os.Stdout) },
 		rand:       rand.Reader,
-		stdout:     stdout,
-		stderr:     stderr,
+		// The declaration is read with the manifest directory's check.
+		deliveryCheck: keydeliver.RootCheck,
+		deliveryChown: keydeliver.ChownRoot,
+		encryptionOn:  encryptionOnAt,
+		stdout:        stdout,
+		stderr:        stderr,
 	}
 }
 
@@ -291,11 +320,7 @@ func (v *keysVerb) store() (keysStore, error) {
 	if !filepath.IsAbs(work) {
 		return nil, errors.New("--work-dir is not an absolute path (the value given is not echoed)")
 	}
-	cfg := keystore.Config{
-		Dir:       filepath.Join(work, keystoreSubdir),
-		MasterDir: filepath.Join(executor.CredDir(work), keystoreMasterSubdir),
-		DataRoot:  executor.RuntimeRoot(work),
-	}
+	cfg := keystoreLayout(work)
 	v.roots = []string{work, cfg.MasterDir, cfg.DataRoot}
 	uid, gid, err := v.env.serviceIDs()
 	if err != nil {
@@ -303,6 +328,17 @@ func (v *keysVerb) store() (keysStore, error) {
 	}
 	cfg.UID, cfg.GID = uid, gid
 	return v.env.open(cfg), nil
+}
+
+// keystoreLayout is the store's Config, without its owner, for the server
+// work dir work (absolute and clean): the layout the keys verbs and the
+// server's delivery reconciler both open.
+func keystoreLayout(work string) keystore.Config {
+	return keystore.Config{
+		Dir:       filepath.Join(work, keystoreSubdir),
+		MasterDir: filepath.Join(executor.CredDir(work), keystoreMasterSubdir),
+		DataRoot:  executor.RuntimeRoot(work),
+	}
 }
 
 // scrubTokens name scrubPaths' roots, by position.
@@ -443,6 +479,10 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 		return keysRm(ctx, rest, env)
 	case "rewrap":
 		return keysRewrap(ctx, rest, env)
+	case "deliver":
+		return keysDeliver(ctx, rest, env)
+	case "undeliver":
+		return keysUndeliver(ctx, rest, env)
 	default:
 		// The argument is not echoed: it may be a value typed in the wrong place.
 		fmt.Fprintln(env.stderr, "k3sm keys: unknown subcommand (not echoed); see k3sm keys --help")
@@ -830,6 +870,7 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	fmt.Fprintf(env.stdout, "deleted %s\n", qualify(name))
+	v.warnDeclared(name)
 	return keysOK
 }
 
