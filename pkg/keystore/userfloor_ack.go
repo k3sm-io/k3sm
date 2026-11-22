@@ -17,11 +17,13 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 
 	"golang.org/x/sys/unix"
 )
@@ -66,18 +68,57 @@ func (a floorAck) encode() []byte {
 	return fmt.Appendf(nil, "%s %d %d %d %d\n", floorAckTag, a.ino, a.birth.Sec, a.birth.Nsec, a.watermark)
 }
 
-// parseFloorAck decodes b strictly: it must be what encode writes.
+// parseFloorAck decodes b strictly: the tag, then exactly four fixed
+// fields of canonical decimal, each after one space, and a newline. Every
+// field is unsigned, so a sign, a negative, a leading zero or an empty
+// field is refused, as is a nanosecond count of a second or more.
 func parseFloorAck(b []byte) (floorAck, error) {
-	var a floorAck
-	var sec, nsec int64
-	if _, err := fmt.Sscanf(string(b), floorAckTag+" %d %d %d %d\n", &a.ino, &sec, &nsec, &a.watermark); err != nil {
-		return floorAck{}, fmt.Errorf("the floor acknowledgement does not parse: %w", err)
+	rest, ok := bytes.CutPrefix(b, []byte(floorAckTag+" "))
+	if !ok {
+		return floorAck{}, errors.New("the floor acknowledgement does not parse: its tag is wrong")
 	}
-	a.birth = unix.Timespec{Sec: sec, Nsec: nsec}
-	if a.watermark < 0 || string(a.encode()) != string(b) {
-		return floorAck{}, errors.New("the floor acknowledgement is not canonical")
+	rest, ok = bytes.CutSuffix(rest, []byte{'\n'})
+	if !ok {
+		return floorAck{}, errors.New("the floor acknowledgement does not parse: it does not end in a newline")
 	}
-	return a, nil
+	fields := bytes.Split(rest, []byte{' '})
+	if len(fields) != 4 {
+		return floorAck{}, errors.New("the floor acknowledgement does not parse: it does not hold four fields")
+	}
+	var v [4]uint64
+	for i, f := range fields {
+		bits := 63 // the signed fields' non-negative range
+		if i == 0 {
+			bits = 64 // the inode
+		}
+		n, err := canonicalDecimal(f, bits)
+		if err != nil {
+			return floorAck{}, fmt.Errorf("the floor acknowledgement does not parse: %w", err)
+		}
+		v[i] = n
+	}
+	if v[2] >= 1e9 {
+		return floorAck{}, errors.New("the floor acknowledgement does not parse: its nanoseconds are a second or more")
+	}
+	return floorAck{ino: v[0], birth: unix.Timespec{Sec: int64(v[1]), Nsec: int64(v[2])}, watermark: int64(v[3])}, nil
+}
+
+// canonicalDecimal parses f as unsigned decimal of at most bits bits, in
+// its canonical form: digits only, and no leading zero but "0" itself.
+func canonicalDecimal(f []byte, bits int) (uint64, error) {
+	if len(f) == 0 || (f[0] == '0' && len(f) > 1) {
+		return 0, errors.New("a field is not canonical decimal")
+	}
+	for _, c := range f {
+		if c < '0' || c > '9' {
+			return 0, errors.New("a field is not canonical decimal")
+		}
+	}
+	n, err := strconv.ParseUint(string(f), 10, bits)
+	if err != nil {
+		return 0, errors.New("a field is out of range")
+	}
+	return n, nil
 }
 
 // readFloorAck reads and judges the acknowledgement. ok is false for none,
