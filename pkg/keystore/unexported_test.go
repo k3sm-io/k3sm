@@ -45,14 +45,22 @@ import (
 //
 // The hold is also mechanical: UserScope refuses until startUserScopes
 // (CheckLogBounds, then CatchUpUser) has run. And before any exported
-// identifier reaches the user scope, the tests of two rows must exist,
-// checked with go/parser over their packages' test files (exportPrereqs),
-// so the socket slice that lifts the ban cannot land ahead of them:
+// identifier reaches the user scope, the tests of three rows must exist,
+// checked with go/ast over their packages' test files (exportPrereqs), so
+// the socket slice that lifts the ban cannot land ahead of them. A test
+// counts only if its body calls t.Error* or t.Fatal* and never t.Skip,
+// t.SkipNow or t.Skipf. An exported identifier reaches the user scope when
+// a file outside pkg/keystore references a banned name, or when an exported
+// function or method declared in pkg/keystore has a body that references
+// UserScope, startUserScopes, ResolveEntry, ParseEntry, Deliver, Withdraw
+// or Delivery, past the reasoned allowlist inPackageReachAllow:
 //   - U51, the per-uid byte shares, in pkg/keystore/socket:
 //     TestLogSharePerUIDRefusesOnlyThatUID, TestLogShareAtMostOneSixteenthOfHardCap,
 //     TestShareRefusalIsNotGlobalAppendFailure, TestReadRateLimitPerUID,
 //     TestReadsChargedToShare, TestShareExhaustionIsolatedPerUID;
-//   - U193, the rebuild, in cmd/k3sm: TestRebuildCarriesTombstonesForward.
+//   - U193, the rebuild, in cmd/k3sm: TestRebuildCarriesTombstonesForward;
+//   - U194, the rebuild after rm-scope, in cmd/k3sm:
+//     TestRebuildDropsRemovedScopeKeys.
 //
 // The socket slice lifts the ban on references, never the prerequisite
 // check.
@@ -100,6 +108,14 @@ func TestUserScopeIsUnexported(t *testing.T) {
 	if files < 100 {
 		t.Fatalf("scanned only %d files under %s", files, root)
 	}
+	inPkg, err := inPackageExports(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range inPkg {
+		exported = true
+		t.Logf("pkg/keystore exports %s, whose body reaches the user scope", name)
+	}
 	if exported {
 		missing, err := missingExportPrereqs(root)
 		if err != nil {
@@ -113,7 +129,8 @@ func TestUserScopeIsUnexported(t *testing.T) {
 
 // exportPrereqs are the tests that must exist, each in its package's test
 // files, before any exported identifier reaches the user scope: U51's (the
-// per-uid byte shares) and U193's (the rebuild).
+// per-uid byte shares), U193's (the rebuild) and U194's (the rebuild after
+// rm-scope).
 var exportPrereqs = []struct {
 	row, dir string
 	tests    []string
@@ -124,6 +141,116 @@ var exportPrereqs = []struct {
 		"TestReadsChargedToShare", "TestShareExhaustionIsolatedPerUID",
 	}},
 	{"U193", "cmd/k3sm", []string{"TestRebuildCarriesTombstonesForward"}},
+	{"U194", "cmd/k3sm", []string{"TestRebuildDropsRemovedScopeKeys"}},
+}
+
+// userScopeReach are the names whose reference, in the body of an exported
+// function or method declared in pkg/keystore, makes that name an export of
+// the user scope.
+var userScopeReach = map[string]bool{
+	"UserScope": true, "startUserScopes": true, "ResolveEntry": true, "ParseEntry": true,
+	"Deliver": true, "Withdraw": true, "Delivery": true,
+}
+
+// inPackageReachAllow are the exported names declared in pkg/keystore whose
+// bodies already reach the user scope, keyed "<Recv>.<Name>" for a method,
+// each with why it is not an export of it.
+var inPackageReachAllow = map[string]string{
+	"FileStore.UserScope": "the user scope's own constructor, which the outside ban holds",
+	"ResolveEntry":        "the entry resolver itself, which the outside ban holds",
+	"UserScope.Delivery":  "a method on *UserScope, reachable only through UserScope, which the outside ban holds",
+}
+
+// inPackageExports returns, as "<Recv>.<Name>" or "<Name>", each exported
+// function or method declared in dir's non-test files whose body
+// references a name of userScopeReach, past inPackageReachAllow.
+func inPackageExports(dir string) ([]string, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || !fd.Name.IsExported() || fd.Body == nil {
+				continue
+			}
+			reaches := false
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				if id, ok := n.(*ast.Ident); ok && userScopeReach[id.Name] {
+					reaches = true
+				}
+				return !reaches
+			})
+			if !reaches {
+				continue
+			}
+			name := fd.Name.Name
+			if r := recvName(fd); r != "" {
+				name = r + "." + name
+			}
+			if _, ok := inPackageReachAllow[name]; !ok {
+				out = append(out, name)
+			}
+		}
+	}
+	return out, nil
+}
+
+// recvName is the receiver's type name of a method, or "" for a function.
+func recvName(fd *ast.FuncDecl) string {
+	if fd.Recv == nil || len(fd.Recv.List) == 0 {
+		return ""
+	}
+	x := fd.Recv.List[0].Type
+	if st, ok := x.(*ast.StarExpr); ok {
+		x = st.X
+	}
+	switch v := x.(type) {
+	case *ast.Ident:
+		return v.Name
+	case *ast.IndexExpr:
+		if id, ok := v.X.(*ast.Ident); ok {
+			return id.Name
+		}
+	}
+	return "?"
+}
+
+// provesSomething reports whether a prerequisite test's body can fail and
+// never skips: it holds a call to a selector Error, Errorf, Fatal or Fatalf,
+// and none to Skip, SkipNow or Skipf.
+func provesSomething(fd *ast.FuncDecl) bool {
+	if fd.Body == nil {
+		return false
+	}
+	fails, skips := false, false
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch sel.Sel.Name {
+		case "Error", "Errorf", "Fatal", "Fatalf":
+			fails = true
+		case "Skip", "SkipNow", "Skipf":
+			skips = true
+		}
+		return true
+	})
+	return fails && !skips
 }
 
 // missingExportPrereqs returns, as "<row> <dir>::<Test>", each of
@@ -144,7 +271,7 @@ func missingExportPrereqs(root string) ([]string, error) {
 				return nil, err
 			}
 			for _, d := range f.Decls {
-				if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil {
+				if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && provesSomething(fd) {
 					have[fd.Name.Name] = true
 				}
 			}
@@ -174,31 +301,89 @@ func TestExportPrereqsChecked(t *testing.T) {
 	if len(missing) != want {
 		t.Fatalf("an empty tree lacks %d prerequisites (%v), want %d", len(missing), missing, want)
 	}
-	write := func(dir, src string) {
+	write := func(dir, file, src string) {
 		t.Helper()
 		d := filepath.Join(root, filepath.FromSlash(dir))
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(d, "x_test.go"), []byte(src), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(d, file+"_test.go"), []byte(src), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	write("pkg/other", "package other\nfunc TestRebuildCarriesTombstonesForward() {}\n")
-	write("cmd/k3sm", "package main\ntype r struct{}\nfunc (r) TestRebuildCarriesTombstonesForward() {}\n")
+	write("pkg/other", "x", "package other\nimport \"testing\"\nfunc TestRebuildCarriesTombstonesForward(t *testing.T) { t.Fatal(\"x\") }\n")
+	write("cmd/k3sm", "x", "package main\nimport \"testing\"\ntype r struct{}\nfunc (r) TestRebuildCarriesTombstonesForward(t *testing.T) { t.Fatal(\"x\") }\n")
 	if missing, err = missingExportPrereqs(root); err != nil || len(missing) != want {
 		t.Fatalf("a method and a test in another package count as declared: %v, %v", missing, err)
 	}
 	for _, p := range exportPrereqs {
 		var b strings.Builder
-		b.WriteString("package p\n")
+		b.WriteString("package p\nimport \"testing\"\n")
 		for _, name := range p.tests {
-			b.WriteString("func " + name + "(*testing.T) {}\n")
+			b.WriteString("func " + name + "(t *testing.T) { if false { t.Fatal(\"x\") } }\n")
 		}
-		write(p.dir, b.String())
+		write(p.dir, p.row, b.String())
 	}
 	if missing, err = missingExportPrereqs(root); err != nil || len(missing) != 0 {
 		t.Fatalf("every prerequisite declared: still missing %v, %v", missing, err)
+	}
+	// A prerequisite whose body is empty, never fails, or skips is no
+	// prerequisite.
+	for _, tc := range []struct{ what, body string }{
+		{"an empty body", ""},
+		{"a body that never fails", "_ = t.Name()"},
+		{"a t.Skip", "t.Skip(\"later\"); t.Fatal(\"x\")"},
+		{"a t.SkipNow", "if false { t.Error(\"x\") }; t.SkipNow()"},
+		{"a t.Skipf", "t.Skipf(\"%s\", \"later\"); t.Errorf(\"x\")"},
+	} {
+		for _, p := range exportPrereqs {
+			var b strings.Builder
+			b.WriteString("package p\nimport \"testing\"\n")
+			for _, name := range p.tests {
+				b.WriteString("func " + name + "(t *testing.T) { " + tc.body + " }\n")
+			}
+			write(p.dir, p.row, b.String())
+		}
+		if missing, err = missingExportPrereqs(root); err != nil || len(missing) != want {
+			t.Errorf("prerequisites with %s count as present: missing %d (%v), want %d, %v", tc.what, len(missing), missing, want, err)
+		}
+	}
+	t.Run("an in-package wrapper", checkInPackageExports)
+}
+
+// checkInPackageExports: the scan of pkg/keystore itself counts an
+// exported function or method whose body reaches the user scope as an
+// export unless it is on inPackageReachAllow, and the package as it stands
+// has none past it.
+func checkInPackageExports(t *testing.T) {
+	dir := t.TempDir()
+	src := "package keystore\n" +
+		"type FileStore struct{}\n" +
+		"func (s *FileStore) UserScope(uint32) {}\n" +
+		"func Wrap(s *FileStore) { s.UserScope(1001) }\n" +
+		"func (s *FileStore) Start() { startUserScopes() }\n" +
+		"func Parse() { _ = ParseEntry }\n" +
+		"func quiet(s *FileStore) { s.UserScope(1001) }\n" +
+		"func Plain() {}\n"
+	if err := os.WriteFile(filepath.Join(dir, "w.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "w_test.go"), []byte("package keystore\nfunc Hidden(s *FileStore) { s.UserScope(1) }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := inPackageExports(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "Wrap,FileStore.Start,Parse"; strings.Join(got, ",") != want {
+		t.Errorf("inPackageExports = %v, want %s", got, want)
+	}
+	got, err = inPackageExports(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("exported names in pkg/keystore reach the user scope past the allowlist: %v", got)
 	}
 }
 

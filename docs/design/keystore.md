@@ -1825,10 +1825,19 @@ That wait is the store `.lock`
   `pkg/keystore`, before the per-uid shares (U51) are built:** until then one uid can fill
   either log to the hard cap for everyone. `TestUserScopeIsUnexported` holds that gate, and
   holds it mechanically: once any exported identifier reaches the user scope, it fails
-  unless the tests of U51 (the per-uid byte shares, in `pkg/keystore/socket`) and of U193
-  (the rebuild, `cmd/k3sm::TestRebuildCarriesTombstonesForward`) exist, found with
-  `go/parser` over each package's test files; the test and its comment list them. The
-  socket slice lifts its ban on references, never that check. The
+  unless the tests of U51 (the per-uid byte shares, in `pkg/keystore/socket`), of U193
+  (the rebuild, `cmd/k3sm::TestRebuildCarriesTombstonesForward`) and of U194 (the rebuild
+  after `rm-scope`, `cmd/k3sm::TestRebuildDropsRemovedScopeKeys`) exist, found with `go/ast`
+  over each package's test files; the test and its comment list them. A prerequisite counts
+  only if its body calls `t.Error*` or `t.Fatal*` and never `t.Skip`, `t.SkipNow` or
+  `t.Skipf`, so an empty or skipped stub does not satisfy the gate. An exported identifier
+  reaches the user scope when a file outside `pkg/keystore` references a banned name, and
+  also when an exported function or method declared in `pkg/keystore` has a body that
+  references `UserScope`, `startUserScopes`, `ResolveEntry`, `ParseEntry`, `Deliver`,
+  `Withdraw` or `Delivery`, so an in-package wrapper is an export too; the names that
+  already do (the scope's constructor, the entry resolver, and the `Delivery` method on the
+  scope) are an explicit allowlist in the test, each with its reason. The socket slice lifts
+  its ban on references, never that check. The
   `ErrLogFull` texts name the log and which bound was met (the hard cap, the key bound, the
   reader's bound or the caller's revocation budget), never a size, a key count, a cap or a
   uid: they reach the socket, and the figures are root's, through `doctor` (`LogSizes`). So
