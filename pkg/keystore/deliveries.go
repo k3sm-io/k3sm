@@ -671,9 +671,16 @@ func (u *UserScope) lookupDelivery(ctx context.Context, uid string) (delivery, e
 // "Revocation always succeeds"). An already withdrawn UID is no change; an absent one is ErrNotFound. As a revocation it
 // commits first and audits after: a failed append is reported (errCommitted)
 // and the tombstone stands.
+//
+// Its audit line names the delivery UID (auditPlaceholder for one outside
+// the grammar) and the namespace the record holds for it, when found.
 func (u *UserScope) withdrawDelivery(ctx context.Context, uid string) error {
-	err := u.withdrawLocked(ctx, uid)
-	if aerr := u.audit("withdraw", "", "", err); err == nil {
+	ns, err := u.withdrawLocked(ctx, uid)
+	id := auditPlaceholder
+	if uuidShaped(uid) {
+		id = uid
+	}
+	if aerr := u.appendAudit(auditLine{op: "withdraw", namespace: ns, delivery: id}, err); err == nil {
 		err = aerr
 	}
 	if err != nil {
@@ -686,43 +693,45 @@ func (u *UserScope) withdrawDelivery(ctx context.Context, uid string) error {
 // can read, and runs with master.next present (openScopeForRevoke). An
 // already withdrawn UID re-appends the record's floor line, in case the
 // withdraw that wrote the tombstone could not: the floor keeps the highest
-// sequence, so a repeat is idempotent.
-func (u *UserScope) withdrawLocked(ctx context.Context, uid string) error {
+// sequence, so a repeat is idempotent. It returns the recorded namespace
+// of the delivery it found, for the audit line.
+func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (string, error) {
 	if err := u.s.checkConfig(); err != nil {
-		return err
+		return "", err
 	}
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
+		return "", fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer done()
 	k, err := u.s.loadMaster()
 	if err != nil {
-		return err
+		return "", err
 	}
 	o, err := u.openScopeForRevoke(root, k)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer o.close()
 	ds, seq, err := u.readDeliveriesFloor(o, true)
 	if err != nil {
-		return err
+		return "", err
 	}
 	for i := range ds {
 		if ds[i].uid != uid {
 			continue
 		}
+		ns := ds[i].namespace
 		if ds[i].withdrawn {
-			return u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq)
+			return ns, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq)
 		}
 		ds[i].withdrawn = true
-		return u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1)
+		return ns, u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1)
 	}
-	return ErrNotFound
+	return "", ErrNotFound
 }
 
 // grantLocked runs fn on the opened scope under the exclusive lock, minting
@@ -812,7 +821,14 @@ var errAuditRefused = errors.New("the audit line could not be written, so nothin
 // commit, then audit. Its error, after a change was made, matches
 // errCommitted.
 func (u *UserScope) audit(op, name, namespace string, err error) error {
-	if aerr := u.s.auditSink.append(auditLine{op: op, scope: u.scope, name: name, namespace: namespace, result: auditResult(err)}); aerr != nil {
+	return u.appendAudit(auditLine{op: op, name: name, namespace: namespace}, err)
+}
+
+// appendAudit is audit for a line whose other fields the caller fills: it
+// sets the scope and the result.
+func (u *UserScope) appendAudit(l auditLine, err error) error {
+	l.scope, l.result = u.scope, auditResult(err)
+	if aerr := u.s.auditSink.append(l); aerr != nil {
 		return fmt.Errorf("%w, and its audit line was not written: %w", errCommitted, aerr)
 	}
 	return nil

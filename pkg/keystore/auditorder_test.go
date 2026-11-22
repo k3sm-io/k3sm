@@ -134,3 +134,31 @@ func TestUserVerbsRefuseInProduction(t *testing.T) {
 		t.Fatalf("a refused verb created %s: %v", userScopesName, err)
 	}
 }
+
+// The withdraw audit line names the delivery UID and its recorded
+// namespace.
+func TestWithdrawAuditNamesDelivery(t *testing.T) {
+	ctx := context.Background()
+	s, _, u := newDeliveryScope(t)
+	_, audit := userLogs(s)
+	if err := u.addDelivery(ctx, testDelivery(1)); err != nil {
+		t.Fatal(err)
+	}
+	n := len(audit.all())
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil {
+		t.Fatal(err)
+	}
+	lines := audit.all()[n:]
+	if len(lines) != 1 || lines[0].op != "withdraw" || lines[0].result != "ok" || lines[0].delivery != testDelivery(1).uid || lines[0].namespace != "team-a" {
+		t.Fatalf("withdraw audit lines %+v", lines)
+	}
+	// A UID outside the grammar is audited as the placeholder, never as
+	// given.
+	n = len(audit.all())
+	if err := u.withdrawDelivery(ctx, "not a uid"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("withdraw of a malformed UID: %v, want ErrNotFound", err)
+	}
+	if lines := audit.all()[n:]; len(lines) != 1 || lines[0].delivery != auditPlaceholder || lines[0].result != "not-found" {
+		t.Fatalf("malformed withdraw audit lines %+v", lines)
+	}
+}
