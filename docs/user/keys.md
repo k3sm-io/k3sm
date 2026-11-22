@@ -348,7 +348,10 @@ Before you start the server, carry over every deletion recorded since the backup
 moved aside records every entry deleted while it was live. Until you merge it, `put`, `rotate`
 and `rewrap` refuse with a message that names `keys floor merge`, and `list` and `show` run with a
 warning on stderr but find no entries, since the restored ones are not in place yet. `rm` still deletes, with
-the same warning, and the merge keeps each deletion it records. A server started
+the same warning, and the merge keeps each deletion it records. An `rm` at this point records
+the deletion, but the restored entry's files are still in `pre-restore.d/restored`, out of its
+reach, so its cluster Secret stays in place until the merge. The merge removes those files
+before it moves the restored copy into place, so you do not need to run `rm` again. A server started
 before the merge delivers no keys to the cluster: it logs an error and tries again until the
 merge has run. Merge those deletions into the restored floor:
 
@@ -397,19 +400,34 @@ deleted again, how many it kept because `--keep` named them, how many moved-asid
 retired, how many it had to drop to stay within the floor's limits, and how many restored entries
 it fenced off from their newer pre-restore copies. It
 lists each entry it deleted again as `buried live system/<name>`, each one it kept as `kept
-system/<name>` and each one whose pre-restore version it retired as `retired system/<name>`. It
-warns on stderr about each kept entry, since keeping it brings back a key
-that may have been deleted to revoke it. A `--keep` name the merge would not delete, such as a
+system/<name>` and each one whose pre-restore version it retired as `retired system/<name>`. A
+`kept` line says `revoked, kept live` for an entry deleted since the backup, and `recorded the
+moved-aside version` for an entry the backup does not hold. It warns on stderr about each
+revoked entry it keeps, since keeping it brings back a key that may have been deleted to revoke
+it. A `--keep` name the merge would not delete, such as a
 typo, makes it refuse and change nothing. Remove each deleted entry's files with `sudo k3sm keys rm system/<name> --yes`.
 A line starting `dropped` names a deletion the floor could not keep: a copy of that entry put
-back is accepted. Only a deletion the restored floor already held is ever dropped: if the
-deletions the merge adds would not all fit, it refuses with a message that the floor is full,
-changes nothing and leaves the file in place, so the other verbs still refuse. To make room,
-delete each entry you no longer need with `sudo k3sm keys rm system/<name> --yes`, which works
-while the merge is pending, then run the merge again. A line starting `unverified` names a restored entry whose current version the
+back is accepted. If the merge would drop any deletion to fit, even one the restored floor
+already held, it refuses with a message that the floor is full, changes nothing and leaves the
+file in place, so the other verbs still refuse. To make room, delete each entry you no longer
+need with `sudo k3sm keys rm system/<name> --yes`, which works while the merge is pending, then
+run the merge again. When the message names `--accept-drops`, deleting entries cannot help, and
+`--accept-drops` lets the merge drop the oldest deletions to fit. It never drops the deletion of
+an entry the merge deletes again: the restored copy would then be accepted with nothing to
+refuse it. If that is the only way to fit, the merge refuses even with `--accept-drops` and names
+the entries: delete each one with `sudo k3sm keys rm system/<name> --yes` first, then run the
+merge again. A line starting `unverified` names a restored entry whose current version the
 merge could not check with the master key, most often because the master key is missing. The
-merge then trusts the restored floor's record of that entry, so if the backup's copy is newer
-than the floor saved with it, `show` refuses the entry as a copy from before the restore. Then start the server and check the entries:
+merge then leaves the restored floor's record of that entry as it is. A copy older than that
+record is refused and a copy at it is accepted. If the merge also fenced the entry, a newer copy
+up to the fence is refused until the next `rotate`, so if the backup's copy is newer than the
+floor saved with it, `show` refuses the entry as a copy from before the restore.
+
+The merge exits 0 when it is written and there is nothing to read in the report. It exits 4 when
+it is written but dropped a deletion, kept an entry because `--keep` named it, or left an entry
+`unverified`, so read the report. It exits 5 when it is written but the restored copy was not
+moved into place or the file was not renamed (run it again), and 1 when it refuses and changes
+nothing. With `--dry-run` it exits with the code the merge itself would return. Then start the server and check the entries:
 
 ```
 sudo k3sm start
@@ -472,10 +490,11 @@ The last `rm -rf` removes the restored copy, which the steps above left in `pre-
 
 Read the `--dry-run` report before you run the merge. A `buried live` line names an entry that
 the restored floor records as deleted. That is either an entry you deleted after the restore,
-which stays deleted, or a version the first merge retired, which is live again in the keystore
-you moved back. Name each entry of the second kind with `--keep system/<name>` in the merge.
-Then remove the files of each entry the merge deleted again with `sudo k3sm keys rm
-system/<name> --yes` before you start the server.
+which stays deleted, or a version the first merge retired, which the reverse merge buries though
+it is live again in the keystore you moved back. Do not remove the second kind. Run the merge
+with `--keep system/<name>` for each of them instead, and run `--dry-run` with the same `--keep`
+flags first to check that no such line is left. Then remove the files of each entry you deleted
+after the restore with `sudo k3sm keys rm system/<name> --yes` before you start the server.
 
 The values come back byte for byte: `show --reveal` prints exactly what it printed before. Restore
 the master key the same way, from its own backup, if it was lost too.
