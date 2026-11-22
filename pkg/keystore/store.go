@@ -1150,7 +1150,9 @@ func (e *entry) pointer(k keys) (version, seq uint64, err error) {
 // pointerRange is pointer with low, the oldest committed version: 1 for a
 // 16-byte pointer, and the recorded mark for a 24-byte one, which only an
 // oauth prune writes. Any other size, or a low outside 1..version, is
-// ErrCorrupt.
+// ErrCorrupt, and so is a pointer not in its one canonical form: a 24-byte
+// pointer recording low 1, which the 16-byte form says, or one over a
+// version that is not oauth, which never prunes.
 func (e *entry) pointerRange(k keys) (version, seq, low uint64, err error) {
 	_, pt, err := e.openRecord(k, currentName, true, 0)
 	if err != nil {
@@ -1175,7 +1177,36 @@ func (e *entry) pointerRange(k keys) (version, seq, low uint64, err error) {
 	if low == 0 || low > version {
 		return 0, 0, 0, fmt.Errorf("%w: the pointer's oldest retained version %d is outside 1 to %d", ErrCorrupt, low, version)
 	}
+	if len(pt) == prunedPointerSize {
+		if low == 1 {
+			return 0, 0, 0, fmt.Errorf("%w: the pointer records oldest retained version 1 in its 24-byte form", ErrCorrupt)
+		}
+		if err := e.checkPrunedKind(version); err != nil {
+			return 0, 0, 0, err
+		}
+	}
 	return version, seq, low, nil
+}
+
+// checkPrunedKind refuses, as ErrCorrupt, a 24-byte pointer naming version
+// of e when that version's record is not oauth: only an oauth rotation
+// prunes. It reads the record's kind header without opening it; a header
+// relabelled to oauth fails the record's open, since the kind is in its
+// additional data.
+func (e *entry) checkPrunedKind(version uint64) error {
+	name := versionName(version)
+	b, _, err := readFile(e.root, name, maxRecordSize)
+	if err != nil {
+		return readError(name, err)
+	}
+	r, err := parseRecord(b)
+	if err != nil {
+		return err
+	}
+	if Kind(r.kind) != KindOAuth {
+		return fmt.Errorf("%w: the pointer records a prune of a %s entry, which never prunes", ErrCorrupt, Kind(r.kind))
+	}
+	return nil
 }
 
 // checkedPointer is pointer, refused (a staleError, matching ErrCorrupt)

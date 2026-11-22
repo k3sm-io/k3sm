@@ -873,3 +873,65 @@ func TestRefreshOwnerFixedPerEntry(t *testing.T) {
 		})
 	}
 }
+
+// sealPointer replaces name's current pointer with one sealing pt.
+func sealPointer(t *testing.T, s *FileStore, server, name string, pt []byte) {
+	t.Helper()
+	k, err := s.loadMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := hex.DecodeString(strings.TrimSpace(readString(t, entryPath(server, name, generationName))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ptr := record{kind: kindPointer, name: name, created: 1}
+	copy(ptr.generation[:], gen)
+	if err := ptr.seal(k.seal, k.scope, pt, rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entryPath(server, name, currentName), ptr.marshal(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPointerCanonicalForm is U151: the low-water mark has one encoding. A
+// 24-byte pointer recording low = 1, which the 16-byte form says, and a
+// 24-byte pointer over an entry that is not oauth, which never prunes, are
+// corrupt, at the sequence the floor records.
+func TestPointerCanonicalForm(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a2", "r2"))
+	mustPutCredential(t, s, "tok", KindToken, tokenEnvelope("t1"))
+	mustRotateCredential(t, s, "tok", KindToken, tokenEnvelope("t2"))
+	mustPut(t, s, "raw", KindOpaque, []byte("one"))
+	mustRotate(t, s, "raw", "two")
+
+	sealPointer(t, s, server, "pair", binary.BigEndian.AppendUint64(pointerPlaintext(2, 2), 1))
+	if _, _, err := s.CurrentCredential(ctx, "pair"); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("a 24-byte oauth pointer with low 1: %v, want ErrCorrupt", err)
+	}
+	sealPointer(t, s, server, "pair", binary.BigEndian.AppendUint64(pointerPlaintext(2, 2), 2))
+	if v, _, err := s.CurrentCredential(ctx, "pair"); err != nil || v.Version != 2 {
+		t.Errorf("a 24-byte oauth pointer with low 2: %+v, %v", v, err)
+	}
+	sealPointer(t, s, server, "tok", binary.BigEndian.AppendUint64(pointerPlaintext(2, 2), 2))
+	if _, _, err := s.CurrentCredential(ctx, "tok"); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("a 24-byte token pointer: %v, want ErrCorrupt", err)
+	}
+	sealPointer(t, s, server, "raw", binary.BigEndian.AppendUint64(pointerPlaintext(2, 2), 2))
+	if _, _, err := s.Current(ctx, "raw"); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("a 24-byte opaque pointer: %v, want ErrCorrupt", err)
+	}
+	list, err := s.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range list {
+		if (e.Name == "tok" || e.Name == "raw") && !errors.Is(e.Err, ErrCorrupt) {
+			t.Errorf("List %s with a 24-byte pointer: %+v, want ErrCorrupt", e.Name, e)
+		}
+	}
+}
