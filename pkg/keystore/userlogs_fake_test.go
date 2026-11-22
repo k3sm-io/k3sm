@@ -69,6 +69,15 @@ func (f *memFloor) append(scope, name string, gen [generationSize]byte, seq uint
 	return nil
 }
 
+func (f *memFloor) check() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failRead {
+		return errors.New("injected floor read failure")
+	}
+	return nil
+}
+
 func (f *memFloor) bury(scope, name string, gen [generationSize]byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

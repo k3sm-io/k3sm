@@ -886,14 +886,19 @@ func (u *UserScope) grant(op, name, namespace string) *grantAudit {
 	return &grantAudit{u: u, op: op, name: name, ns: namespace}
 }
 
-// take appends the line once. Its error refuses the grant, which has
-// written nothing.
+// take judges the user-scope floor, then appends the line once. Its error
+// refuses the grant, which has written nothing: a floor that is absent,
+// untrusted, unflagged, unreadable or malformed refuses before the ok line,
+// and the refusal is audited in its place (refused).
 func (g *grantAudit) take() error {
 	if g.tried {
 		if !g.appended {
 			return errAuditRefused
 		}
 		return nil
+	}
+	if err := g.u.s.userFloor.check(); err != nil {
+		return fmt.Errorf("the user-scope floor: %w", err)
 	}
 	g.tried = true
 	if err := g.u.s.auditSink.append(auditLine{op: g.op, scope: g.u.scope, name: g.name, namespace: g.ns, result: "ok"}); err != nil {

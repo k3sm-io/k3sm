@@ -127,6 +127,10 @@ type userFloorLog interface {
 	append(scope, name string, gen [generationSize]byte, seq uint64) error
 	// bury records the tombstone of scope, name and gen.
 	bury(scope, name string, gen [generationSize]byte) error
+	// check judges the floor as a grant needs it: present, trusted,
+	// flagged, readable and parsing. A grant calls it before its first
+	// write.
+	check() error
 }
 
 // auditLine is one audit line's fields that this package fills: never a
@@ -520,26 +524,43 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 	return &fileFloorLog{log: l}
 }
 
-func (f *fileFloorLog) floor(scope, name string, gen [generationSize]byte) (uint64, error) {
+// read opens, judges and reads the floor and runs fn on what was read,
+// under the log's lock. A floor that does not parse is
+// errFloorLogMalformed.
+func (f *fileFloorLog) read(fn func(*logState)) error {
 	file, st, err := f.log.open(unix.O_RDONLY)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer func() { _ = file.Close() }() // read-only
 	f.log.mu.Lock()
 	defer f.log.mu.Unlock()
 	state, err := f.log.sync(file, st)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	if state.bad != nil {
-		return 0, fmt.Errorf("%w (%v)", errFloorLogMalformed, state.bad)
+		return fmt.Errorf("%w (%v)", errFloorLogMalformed, state.bad)
 	}
+	fn(state)
+	return nil
+}
+
+func (f *fileFloorLog) check() error { return f.read(func(*logState) {}) }
+
+func (f *fileFloorLog) floor(scope, name string, gen [generationSize]byte) (uint64, error) {
+	var (
+		seq    uint64
+		buried bool
+	)
 	k := floorKey{scope, name, gen}
-	if state.buried[k] {
+	if err := f.read(func(state *logState) { seq, buried = state.maxSeq[k], state.buried[k] }); err != nil {
+		return 0, err
+	}
+	if buried {
 		return 0, errFloorBuried
 	}
-	return state.maxSeq[k], nil
+	return seq, nil
 }
 
 func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq uint64) error {
