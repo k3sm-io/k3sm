@@ -76,7 +76,31 @@ const (
 	defaultLogSoftCap         = 64 << 20
 	defaultLogHardCap         = 256 << 20
 	defaultLogRevocationBytes = 64 << 10
+
+	// The reader's bounds (docs/design/keystore.md § "Size caps"). A log
+	// is read whole, and the service user can append to it without limit,
+	// so a log larger than logReadBound is damage, and so is a floor with
+	// more than maxFloorKeys distinct keys. The bound is the hard cap,
+	// plus maxRevokeUIDs uids' revocation budgets past it, plus
+	// logBoundMargin; the server never appends past it itself.
+	maxRevokeUIDs  = 1024
+	logBoundMargin = 1 << 20
+	maxFloorKeys   = 1 << 20
 )
+
+// keyBound is the most distinct keys the floor may hold.
+func (l *appendLog) keyBound() int {
+	if l.maxKeys != 0 {
+		return l.maxKeys
+	}
+	return maxFloorKeys
+}
+
+// logReadBound is the size past which a log is damage: the hard cap, the
+// revocation budgets of maxRevokeUIDs uids, and a margin.
+func (s *FileStore) logReadBound() int64 {
+	return s.logHardCap + maxRevokeUIDs*s.logRevokeBudget + logBoundMargin
+}
 
 // ErrLogFull refuses an operation because an append-only log is past its
 // hard cap, or, for a revocation past the hard cap, because the uid's
@@ -92,6 +116,11 @@ var (
 	// errLogUntrusted is a log, or the data root holding it, that is not
 	// what install makes.
 	errLogUntrusted = errors.New("the keystore append-only log is not trusted: it must be a regular file with one link, owned by the service user, mode 0600, in a data root owned by root and not group- or other-writable")
+	// errLogTooLarge is a log larger than logReadBound: damage.
+	errLogTooLarge = errors.New("the keystore append-only log is larger than the reader's bound")
+	// errFloorTooManyKeys is a floor with more than maxFloorKeys distinct
+	// keys: damage.
+	errFloorTooManyKeys = fmt.Errorf("the user-scope floor holds more than %d distinct keys", maxFloorKeys)
 	// errLogTorn is a last line with no newline: damage.
 	errLogTorn = errors.New("the last line has no newline")
 	// errLogLineTooLong is a line over maxLogLine, which is never written.
@@ -210,6 +239,9 @@ type appendLog struct {
 	// whole reports whether every line must be read (the floor), or only
 	// those past the hard cap (the audit log).
 	whole bool
+	// maxKeys, when not 0, replaces maxFloorKeys: the test seam for the
+	// key bound.
+	maxKeys int
 	// readAt, when set, is the source sync reads f through: the test seam
 	// for a read I/O error.
 	readAt func(f *os.File) io.ReaderAt
@@ -222,7 +254,11 @@ type appendLog struct {
 // logState is what has been read of one file.
 type logState struct {
 	dev, ino uint64
-	hardCap  int64
+	// hardCap and bound are the hard cap and logReadBound it was read
+	// under.
+	hardCap, bound int64
+	// keys is the floor's count of distinct keys.
+	keys int
 	// off is where reading stopped: just past the last whole line read.
 	off int64
 	// pastCap is each uid's bytes in lines that start at or past hardCap.
@@ -273,7 +309,9 @@ func (l *appendLog) open(flag int) (*os.File, unix.Stat_t, error) {
 		return nil, st, err
 	}
 	defer func() { _ = unix.Close(dfd) }() // the file is opened; the directory is done with
-	fd, err := unix.Openat(dfd, l.name, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	// O_NONBLOCK, so a FIFO planted at the name is opened, and refused on
+	// its descriptor, rather than blocking the open.
+	fd, err := unix.Openat(dfd, l.name, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if errors.Is(err, unix.ENOENT) {
 		return nil, st, fmt.Errorf("%w: %s: %w", errLogMissing, l.name, fs.ErrNotExist)
 	}
@@ -324,10 +362,15 @@ func (s *FileStore) judgeLog(f *os.File, st *unix.Stat_t) error {
 // kept, and reading resumes past the last whole line read.
 func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 	s := &l.state
-	if s.dev != uint64(st.Dev) || s.ino != st.Ino || s.hardCap != l.s.logHardCap || st.Size < s.off {
-		*s = logState{dev: uint64(st.Dev), ino: st.Ino, hardCap: l.s.logHardCap, pastCap: map[uint32]int64{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
+	bound := l.s.logReadBound()
+	if s.dev != uint64(st.Dev) || s.ino != st.Ino || s.hardCap != l.s.logHardCap || s.bound != bound || st.Size < s.off {
+		*s = logState{dev: uint64(st.Dev), ino: st.Ino, hardCap: l.s.logHardCap, bound: bound, pastCap: map[uint32]int64{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
 	}
 	if s.bad != nil || st.Size == s.off {
+		return s, nil
+	}
+	if st.Size > bound {
+		s.bad = fmt.Errorf("%w: %s is %d bytes, over the reader's bound of %d", errLogTooLarge, l.name, st.Size, bound)
 		return s, nil
 	}
 	start := s.off
@@ -348,16 +391,24 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 	r := bufio.NewReaderSize(io.NewSectionReader(src, start, st.Size-start), 64<<10)
 	off := start
 	if !l.whole && s.off < s.hardCap {
-		skipped, err := r.ReadSlice('\n')
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, bufio.ErrBufferFull) {
+		// Skip the line that straddles the cap, however long: it is read
+		// through, a chunk the size of the buffer at a time. A last line
+		// with no newline is damage, as it is anywhere.
+		for {
+			skipped, err := r.ReadSlice('\n')
+			off += int64(len(skipped))
+			if err == nil {
+				break
+			}
+			switch {
+			case errors.Is(err, bufio.ErrBufferFull):
+				continue
+			case errors.Is(err, io.EOF):
+				s.bad = fmt.Errorf("at byte %d: %w", off, errLogTorn)
+				return s, nil
+			}
 			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, err)
 		}
-		if err != nil {
-			// No newline yet past the cap: a line straddles it, and nothing
-			// starts past it.
-			return s, nil
-		}
-		off += int64(len(skipped))
 	}
 	for off < st.Size {
 		line, err := readLogLine(r)
@@ -433,7 +484,20 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 	if err != nil || state.bad != nil {
 		return nil
 	}
-	if state.pastCap[uid]+maxLogLine > l.s.logRevokeBudget {
+	// The line is not written yet: room charges the longest a line can
+	// be, through the predicate appendLine charges the real line through.
+	return l.revokeRoom(state, st.Size, uid, maxLogLine)
+}
+
+// revokeRoom refuses, as ErrLogFull, n more bytes for uid past the hard
+// cap: when they would take the log past logReadBound, or uid's lines that
+// start past the hard cap past its revocation budget. room and appendLine
+// both judge through it.
+func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64) error {
+	if size+n > l.s.logReadBound() {
+		return fmt.Errorf("%w (%s is %d bytes, the reader's bound %d)", ErrLogFull, l.name, size, l.s.logReadBound())
+	}
+	if state.pastCap[uid]+n > l.s.logRevokeBudget {
 		return fmt.Errorf("%w (uid %d has spent its %d-byte revocation budget in %s)", ErrLogFull, uid, l.s.logRevokeBudget, l.name)
 	}
 	return nil
@@ -453,6 +517,10 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 	defer func() { _ = f.Close() }() // each append is fsynced below
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if bound := l.s.logReadBound(); st.Size+int64(len(line)) > bound {
+		// Never make the damage the reader refuses.
+		return fmt.Errorf("%w (%s is %d bytes, the reader's bound %d)", ErrLogFull, l.name, st.Size, bound)
+	}
 	if st.Size >= l.s.logHardCap {
 		if !budget || uid == 0 {
 			return fmt.Errorf("%w (%s is %d bytes, its hard cap %d)", ErrLogFull, l.name, st.Size, l.s.logHardCap)
@@ -472,8 +540,8 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 		if state.bad != nil {
 			return fmt.Errorf("%s: %w", l.name, state.bad)
 		}
-		if state.pastCap[uid]+int64(len(line)) > l.s.logRevokeBudget {
-			return fmt.Errorf("%w (uid %d has spent its %d-byte revocation budget in %s)", ErrLogFull, uid, l.s.logRevokeBudget, l.name)
+		if err := l.revokeRoom(state, st.Size, uid, int64(len(line))); err != nil {
+			return err
 		}
 	}
 	n, err := f.Write(line)
@@ -513,10 +581,17 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		if err != nil {
 			return 0, err
 		}
+		seq, inSeq := st.maxSeq[r.key]
+		if !inSeq && !st.buried[r.key] && (r.tomb || r.seq > seq) {
+			if st.keys >= l.keyBound() {
+				return 0, errFloorTooManyKeys
+			}
+			st.keys++
+		}
 		switch {
 		case r.tomb:
 			st.buried[r.key] = true
-		case r.seq > st.maxSeq[r.key]:
+		case r.seq > seq:
 			st.maxSeq[r.key] = r.seq
 		}
 		return scopeUID(r.key.scope), nil

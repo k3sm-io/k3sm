@@ -556,8 +556,8 @@ pend U22 "floor --rebuild and audit --rotate mark and stage under keystore- name
 	k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares
 check U23 "every audited operation writes one v:1 line; no line carries a value or its length; readers ignore unknown fields" \
 	TestAuditLineNeverCarriesValue TestAuditReaderIgnoresUnknownFields FuzzParseAuditLine
-check U24 "the logs' sizes and soft cap are exposed for doctor (LogSizes); past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on its uid's revocation budget; a line over 1 KiB is refused" \
-	TestLogHardCapRefusesMutations TestAuditLineBoundedAtOneKiB
+check U24 "the logs' sizes and soft cap are exposed for doctor (LogSizes); past the hard cap every mutating user op is ErrLogFull, except the revocation class, which draws on its uid's revocation budget; a line over 1 KiB is refused; the reader is bounded in size and floor keys, reads through a line straddling the cap, and never blocks on a FIFO" \
+	TestLogHardCapRefusesMutations TestAuditLineBoundedAtOneKiB TestLogReaderSizeBound TestFloorKeyBound TestAuditStraddlingLineCharged TestLogOpenFIFORefused
 pend U25 "backup and restore round trip: a restored tree with cleared flags is refused until floor --rebuild, then opens; the rebuild writes a line for every entry directory holding a generation file, sequence 0 without an authenticated pointer, so a damaged entry stays ErrCorrupt and never becomes ErrNotFound; rig leg E17 (append-only files)" \
 	TestBackupRestoreRoundTripRebuild TestRebuildKeepsDamagedEntryCorrupt
 pend U26 "peers uid 0, the service uid and uid < 501 are refused before any frame is read (socket listener)" \
