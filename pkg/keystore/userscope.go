@@ -113,14 +113,13 @@ type UserScope struct {
 // 2147483647, or the service uid, is refused: root has no user scope, and
 // neither has a system account, nobody or the service user. Until the
 // server's start step has run (startUserScopes) it refuses every uid,
-// errUserScopesNotStarted; after it, a uid whose scope the start step
-// quarantined is refused, errFloorDegraded.
+// errUserScopesNotStarted. A uid whose scope the start step quarantined
+// still gets its view: its grant and read verbs refuse (quarantineErr), and
+// its rm and withdraw run, since a revocation is never blocked by the
+// floor's damage.
 func (s *FileStore) UserScope(uid uint32) (*UserScope, error) {
 	if s.userScopesStarted == nil || !s.userScopesStarted.Load() {
 		return nil, errUserScopesNotStarted
-	}
-	if s.scopeQuarantined(uid) {
-		return nil, fmt.Errorf("%w: %w", errScopeQuarantined, errFloorDegraded)
 	}
 	scope := userScopeOf(uid)
 	if err := checkScope(scope); err != nil {
@@ -130,6 +129,18 @@ func (s *FileStore) UserScope(uid uint32) (*UserScope, error) {
 		return nil, err
 	}
 	return &UserScope{s: s, uid: uid, scope: scope}, nil
+}
+
+// quarantineErr refuses a grant or a read in a scope the start step
+// quarantined (startUserScopes), errFloorDegraded; nil otherwise. It is
+// asked per call, so an acknowledgement that lifts the quarantine
+// (ackFloorDamage) takes effect on a view already handed out. Delete and
+// Withdraw never ask it.
+func (u *UserScope) quarantineErr() error {
+	if u.s.scopeQuarantined(u.uid) {
+		return fmt.Errorf("%w: %w", errScopeQuarantined, errFloorDegraded)
+	}
+	return nil
 }
 
 // notFound is the one ErrNotFound a UserScope answers for op, whatever the
@@ -188,6 +199,10 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	if err := checkValue(kind, value); err != nil {
+		g.refusedBriefly(ctx, err)
+		return Version{}, err
+	}
+	if err := u.quarantineErr(); err != nil {
 		g.refusedBriefly(ctx, err)
 		return Version{}, err
 	}
@@ -371,6 +386,9 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 	if err != nil {
 		return Version{}, nil, err
 	}
+	if err := u.quarantineErr(); err != nil {
+		return Version{}, nil, fail("current", err)
+	}
 	err = u.read(ctx, func(entries *os.Root, uk keys) error {
 		e, err := openUserEntry(entries, name)
 		if err != nil {
@@ -394,6 +412,9 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 // does: an entry that cannot be opened carries Err. A uid with no scope is
 // ErrScopeAbsent.
 func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
+	if err := u.quarantineErr(); err != nil {
+		return nil, fail("list", err)
+	}
 	var out []Entry
 	err := u.read(ctx, func(entries *os.Root, uk keys) error {
 		names, err := readDirNames(entries, maxDirNames)

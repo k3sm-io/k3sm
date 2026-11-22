@@ -107,8 +107,10 @@ func TestFloorDamageDegradesLiveLines(t *testing.T) {
 	if err := s2.startUserScopes(ctx); !errors.Is(err, errCatchUpRefused) || !s2.userScopesStarted.Load() {
 		t.Fatalf("start over a refused live-line catch-up: %v, started %v; want it started with the refusal named", err, s2.userScopesStarted.Load())
 	}
-	if _, err := s2.UserScope(1001); !errors.Is(err, errFloorDegraded) {
-		t.Fatalf("UserScope of the scope whose catch-up was refused: %v, want errFloorDegraded (quarantined)", err)
+	if q, err := s2.UserScope(1001); err != nil {
+		t.Fatalf("UserScope of the scope whose catch-up was refused: %v, want a view that still revokes", err)
+	} else if _, _, err := q.Current(ctx, "user/1001/token"); !errors.Is(err, errFloorDegraded) {
+		t.Fatalf("current in the scope whose catch-up was refused: %v, want errFloorDegraded (quarantined)", err)
 	}
 
 	if _, _, err := u.Current(ctx, "user/1001/lost"); !errors.Is(err, errFloorDegraded) {

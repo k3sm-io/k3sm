@@ -37,7 +37,7 @@ func tornFloorWrite(l *appendLog) {
 
 // uid A's put whose floor line tore (a crash between the pointer and the
 // floor line) quarantines only A after a restart: the start step starts the
-// user scope, UserScope refuses A with errFloorDegraded, and uid B starts
+// user scope, A's grants and reads refuse with errFloorDegraded, and uid B starts
 // and works.
 func TestTornPutLineQuarantinesOnlyItsScope(t *testing.T) {
 	ctx := context.Background()
@@ -59,8 +59,10 @@ func TestTornPutLineQuarantinesOnlyItsScope(t *testing.T) {
 	if !errors.Is(err, errCatchUpRefused) {
 		t.Fatalf("start: %v, want the refused catch-up named", err)
 	}
-	if _, err := s2.UserScope(1001); !errors.Is(err, errFloorDegraded) {
-		t.Fatalf("UserScope of the quarantined uid: %v, want errFloorDegraded", err)
+	if q, err := s2.UserScope(1001); err != nil {
+		t.Fatalf("UserScope of the quarantined uid: %v, want a view that still revokes", err)
+	} else if _, _, err := q.Current(ctx, "user/1001/token"); !errors.Is(err, errFloorDegraded) {
+		t.Fatalf("current in the quarantined scope: %v, want errFloorDegraded", err)
 	}
 	ub2 := userScope(t, s2, 1002)
 	if _, _, err := ub2.Current(ctx, "user/1002/token"); err != nil {

@@ -291,7 +291,7 @@ var (
 // tombstone, so a live line written now could bring a deleted entry back.
 // No verb clears it yet: root reads the damage and acknowledges damage no
 // key can be read from as root maintenance, which never lifts a key's taint.
-var errFloorDegraded = fmt.Errorf("the user-scope floor %s holds damaged lines, one of which could be a tombstone for this key or, when no key can be read from it, for any: no live line is written for such a key and no generation is trusted that the floor has no line for; rm and withdraw still work; root must read the damage count (CheckLogBounds, at the server's start), and can acknowledge damage no key can be read from as root maintenance, which never lifts a key's taint", userFloorLogName)
+var errFloorDegraded = fmt.Errorf("the user-scope floor %s holds damaged lines, one of which could be a tombstone or a later sequence for this key (or, when no key can be read from it, for any key), so this put, deliver or read is refused; rm and withdraw still run; root must read the damage count (CheckLogBounds, at the server's start), and can acknowledge damage no key can be read from as root maintenance, which never lifts a key's taint", userFloorLogName)
 
 // floorTombstone is a tombstone line's last field, where a live line has
 // its sequence.
@@ -1448,7 +1448,9 @@ func (f *fileFloorLog) floor(scope, name string, gen [generationSize]byte) (uint
 		return 0, errFloorBuried
 	}
 	if refusing {
-		return 0, errFloorDegraded
+		// The highest sequence the floor's whole lines hold for k still
+		// comes back: a revocation checks a record against it.
+		return seq, errFloorDegraded
 	}
 	return seq, nil
 }

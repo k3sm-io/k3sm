@@ -507,13 +507,18 @@ func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) (deliveries
 	if flErr != nil && (!revoke || errors.Is(flErr, ErrCorrupt)) {
 		return deliveriesRead{}, flErr
 	}
+	// A floor whose damage could name the record (errFloorDegraded) still
+	// reports the highest sequence its whole lines hold: a withdraw checks
+	// the record against it, so a copy put back below what the floor still
+	// knows is refused under the taint too.
+	degraded := errors.Is(flErr, errFloorDegraded)
 	// The record is checked against the larger of the floor and the
 	// sequence this process last read or wrote, always: a withdraw whose
 	// floor line failed leaves the floor one behind the record, and a copy
 	// put back at the floor must still not be re-sealed at a later sequence
 	// with a tombstone lost. With no floor to read the mark stands alone.
 	seen := deliveriesSeen.high(u.s.dir, u.scope, o.gen)
-	if flErr == nil && r.version < fl {
+	if (flErr == nil || degraded) && r.version < fl {
 		return deliveriesRead{}, fmt.Errorf("%w: the %s record (sequence %d) is older than the user-scope floor (sequence %d); an older copy was put back. For a deliberate restore, "+restoreRemedy, ErrCorrupt, deliveriesName, r.version, fl)
 	}
 	if r.version < seen {
@@ -706,7 +711,12 @@ func (u *UserScope) addDelivery(ctx context.Context, d delivery) error {
 		return fail("deliver", err)
 	}
 	e, _ := ParseEntry(d.entry) // checked by checkDelivery
-	if err := u.addDeliveryLocked(ctx, d, u.grant("deliver", e.Name, d.namespace)); err != nil {
+	g := u.grant("deliver", e.Name, d.namespace)
+	if err := u.quarantineErr(); err != nil {
+		g.refusedBriefly(ctx, err)
+		return fail("deliver", err)
+	}
+	if err := u.addDeliveryLocked(ctx, d, g); err != nil {
 		return fail("deliver", err)
 	}
 	return nil
@@ -759,6 +769,9 @@ func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery, g *grantA
 // A UID absent from a record that opened is ErrNotFound; a scope or record
 // that is not there is ErrScopeAbsent. A read never mints.
 func (u *UserScope) lookupDelivery(ctx context.Context, uid string) (delivery, error) {
+	if err := u.quarantineErr(); err != nil {
+		return delivery{}, fail("look up a delivery", err)
+	}
 	var out delivery
 	err := u.readScope(ctx, func(_ *os.Root, o *openedScope) error {
 		ds, _, err := u.readDeliveries(o)
@@ -861,10 +874,13 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 			continue
 		}
 		ns := ds[i].namespace
-		if !ds[i].withdrawn && rd.unverified != nil {
+		if !ds[i].withdrawn && rd.unverified != nil && !errors.Is(rd.unverified, errFloorDegraded) {
 			// The record was not checked against the floor, so it may be an
 			// older copy put back; sealing it at a fresh sequence would make
-			// that copy authentic. Nothing is sealed.
+			// that copy authentic. Nothing is sealed. A floor that read but
+			// holds damage naming the record (errFloorDegraded) did check it
+			// against every line it has (readDeliveriesFloor): the withdraw
+			// only removes, so it seals and writes its floor line.
 			return ns, false, fmt.Errorf("%w: %w", errWithdrawUnsealed, rd.unverified)
 		}
 		// Only a withdraw that revokes is in the revocation class, and a
@@ -922,20 +938,37 @@ func (u *UserScope) catchUpDeliveries(gen [generationSize]byte, rd deliveriesRea
 	if rd.unverified != nil || rd.seq <= rd.floor {
 		return false
 	}
+	return u.catchUpDeliveryLine(gen, rd) == nil
+}
+
+// catchUpDeliveryLine is catchUpDeliveries' append, with its reason: nil
+// for a line appended or none owed, errFloorDegraded for one the floor's
+// damage refuses (a tainted delivery record, which only that damage can
+// lift), and any other error for one the floor did not take for a
+// transient reason (ErrLogFull, errLogNoSpace, an I/O error), which the
+// next operation on the scope tries again.
+func (u *UserScope) catchUpDeliveryLine(gen [generationSize]byte, rd deliveriesRead) error {
+	if rd.unverified != nil || rd.seq <= rd.floor {
+		return nil
+	}
 	if ff, ok := u.s.userFloor.(*fileFloorLog); ok {
 		// A catch-up writes no live line for a tainted key, nor for a
 		// generation the floor has no line for while unattributable damage
 		// counts.
-		if refused, err := ff.liveRefused(floorKey{u.scope, deliveriesFloorName, gen}); err != nil || refused {
-			slog.Warn("the user-scope floor holds damage that could name the delivery record, so its catch-up line is not written", "scope", u.scope, "err", err)
-			return false
+		refused, err := ff.liveRefused(floorKey{u.scope, deliveriesFloorName, gen})
+		if err == nil && refused {
+			err = errFloorDegraded
+		}
+		if err != nil {
+			slog.Warn("the user-scope floor holds damage that could name the delivery record, or cannot be read, so its catch-up line is not written", "scope", u.scope, "err", err)
+			return err
 		}
 	}
 	if err := u.s.userFloor.append(u.scope, deliveriesFloorName, gen, rd.seq, true); err != nil {
 		slog.Warn("the user-scope floor did not take the delivery record's catch-up line; the floor stays behind the record", "scope", u.scope, "err", err)
-		return false
+		return err
 	}
-	return true
+	return nil
 }
 
 // startUserScopes is the server's user-scope start step, owed before the
@@ -1100,11 +1133,13 @@ func (u *UserScope) catchUpScopeDeliveries(o *openedScope) error {
 	if err != nil {
 		return err
 	}
-	if rd.unverified != nil || rd.seq <= rd.floor {
-		return nil
-	}
-	if !u.catchUpDeliveries(o.gen, rd) {
-		return fmt.Errorf("%w: the delivery record's", errCatchUpRefused)
+	switch err := u.catchUpDeliveryLine(o.gen, rd); {
+	case errors.Is(err, errFloorDegraded):
+		return fmt.Errorf("%w: the delivery record's: %w", errCatchUpRefused, err)
+	case err != nil:
+		// Transient: the scope is not quarantined, and the next operation
+		// on it runs this catch-up again (catchUpDeliveries).
+		return fmt.Errorf("the delivery record's catch-up line: %w", err)
 	}
 	return nil
 }
@@ -1156,9 +1191,10 @@ func (u *UserScope) catchUpEntries(o *openedScope) error {
 // floor already holds one for gen or buries it. The line is in the
 // revocation class: it is what lets a later rm bury the entry's real
 // generation, so past the hard cap it draws on the uid's revocation budget.
-// While the floor holds damage it writes nothing (errFloorDegraded): the
-// skipped line could be the tombstone that buries gen. A line the floor
-// refuses is errCatchUpRefused, which refuses the start step.
+// While the floor holds damage that could name gen it writes nothing
+// (errFloorDegraded): the skipped line could be the tombstone that buries
+// gen. Only that refusal is errCatchUpRefused, which quarantines the scope
+// at the start step; a transient error is returned as it is.
 func (u *UserScope) catchUpEntry(name string, gen [generationSize]byte, seq uint64) error {
 	live, err := u.s.userFloor.liveGens(u.scope, name)
 	if err != nil {
@@ -1174,8 +1210,13 @@ func (u *UserScope) catchUpEntry(name string, gen [generationSize]byte, seq uint
 	} else if err != nil {
 		return fmt.Errorf("read the floor for an entry: %w", err)
 	}
-	if err := u.s.userFloor.append(u.scope, name, gen, seq, true); err != nil {
+	if err := u.s.userFloor.append(u.scope, name, gen, seq, true); errors.Is(err, errFloorDegraded) {
 		return fmt.Errorf("%w: an entry's catch-up line: %w", errCatchUpRefused, err)
+	} else if err != nil {
+		// Transient (ErrLogFull, errLogNoSpace, an I/O error): the scope is
+		// not quarantined, and the next operation on it runs this catch-up
+		// again (catchUpScope at the next start).
+		return fmt.Errorf("an entry's catch-up line: %w", err)
 	}
 	return nil
 }
