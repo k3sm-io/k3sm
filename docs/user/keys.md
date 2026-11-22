@@ -58,6 +58,8 @@ name.
 | `sudo k3sm keys rotate system/NAME --from-version N` | Stores a copy of version N as a new version. The copy is made inside k3sm and the value is never printed. This is the rollback. |
 | `sudo k3sm keys rm system/NAME --yes` | Deletes the entry and every version. This cannot be undone, so it needs `--yes`. It also removes an entry `list` reports as corrupt. |
 | `sudo k3sm keys rewrap --key-out FILE` | Re-seals every entry under a new master key (see [Changing the master key](#changing-the-master-key)). |
+| `sudo k3sm keys deliver system/NAME --namespace NS` | Declares that the server delivers the entry's current version into the cluster as a Secret (see [Delivering an entry as a Secret](#delivering-an-entry-as-a-secret)). |
+| `sudo k3sm keys undeliver system/NAME --namespace NS` | Withdraws that declaration. The Secret stays. |
 
 `--work-dir DIR` points every verb at a server work dir other than the default
 `/var/lib/k3sm/server`. The data root is its parent.
@@ -166,6 +168,62 @@ holds. The message names the path. Nothing was changed.
 After a rewrap, backups of the keystore taken before it no longer open (see below), and the
 fingerprints of `opaque` entries change.
 
+## Delivering an Entry as a Secret
+
+A Pod reads a key the usual Kubernetes way, from a Secret. `deliver` tells the server which entry
+goes into which Secret:
+
+```
+sudo k3sm keys deliver system/signer-key --namespace payments
+sudo k3sm keys deliver system/signer-key --namespace payments --secret-name signer --data-key private.key
+```
+
+The server then keeps an `Opaque` Secret in that namespace holding the entry's current version.
+The Secret is named after the entry unless you pass `--secret-name`, and the value is under the
+data key `value` unless you pass `--data-key`. An `ed25519` entry is delivered as the stored
+32-byte seed or 64-byte key, with no PEM wrapping. The entry must exist when you run `deliver`.
+
+- **Rotation reaches the Secret.** After a `rotate`, the server updates the Secret within a
+  minute. The Secret's `k3sm.io/keystore-version` annotation says which version it holds.
+- **Only its own Secrets.** The server labels each Secret it creates
+  `k3sm.io/keystore-delivery: <entry>`, and it only ever updates a Secret that carries that label
+  for that entry. If a Secret of that name already exists without the label, or labelled for
+  another entry, the server leaves it alone and logs why: delete it, or pick another
+  `--secret-name`. The server never lists Secrets and never deletes one.
+- **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
+  declaration, and prints: the Secret stays; delete it with kubectl, and rotate the entry to
+  revoke. A Pod that read the value still has it, which is why revoking it means rotating.
+
+The declaration is `/var/lib/k3sm/keystore-delivery.json`, owned by root, mode 0644, and only
+`k3sm keys deliver` and `undeliver` write it. It decides which namespace the server writes a
+Secret into, so the server refuses the whole file, and delivers nothing from it, if it is not
+owned by root, is writable by its group or by others, is a symlink, is over 64 KiB, or holds a
+field or a version it does not know. The refusal is in the server log, and the verbs refuse that
+file too rather than overwrite it.
+
+### While secrets encryption is off
+
+A delivered Secret is stored in the datastore like any other. With secrets encryption off (see
+`sudo k3sm secrets-encrypt status`), it would be stored there in plaintext, so the server refuses
+every delivery and logs a warning for each target. `deliver` still records the target and warns
+that the server refuses it unless the server was started with the override
+(`--allow-plaintext-secrets-delivery`). It cannot see a running server's flags, so it does not
+know whether the server was.
+
+The better fix is to turn secrets encryption on. To deliver without it instead, turn the override
+on:
+
+1. Add `--allow-plaintext-secrets-delivery` to the server daemon's arguments, in the
+   LaunchDaemon plist.
+2. Restart the server daemon. The server reads the flag only at start.
+3. Run `sudo k3sm install`, so the server-arguments record keeps the flag. A flag that is only in
+   the plist is lost if you uninstall before the next install (see
+   [Server flags across a reinstall](install.md#server-flags-across-a-reinstall)).
+
+To turn it off, remove the flag from the plist, restart the server daemon, and run
+`sudo k3sm install`. If the record still carries the flag, remove it there too. A Secret delivered
+while the override was on stays as it is: the server does not delete it, and stops updating it.
+
 ## Backing Up and Restoring
 
 The keystore is not part of `k3sm snapshot save`. It lives in three places:
@@ -175,6 +233,7 @@ The keystore is not part of `k3sm snapshot save`. It lives in three places:
 | `/var/lib/k3sm/server/keystore/` | The entries and all their versions. |
 | `/var/lib/k3sm/server/cred/keystore-master/` | The master key and its fingerprint. |
 | `/var/lib/k3sm/keystore-floor.json` | Root's record of the newest version of each entry, which is how an older copy put back is caught. |
+| `/var/lib/k3sm/keystore-delivery.json` | Which entries are delivered as which Secrets. It holds no value. |
 
 Back up the entries and the master key **to different places**, so a copy of the entries that
 leaks does not come with the key that opens it. They are still a matched pair: entries open only
