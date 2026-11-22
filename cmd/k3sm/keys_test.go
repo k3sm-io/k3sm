@@ -552,17 +552,26 @@ func copyTree(t *testing.T, src, dst string) {
 }
 
 // TestKeysRollbackRoundTrip is G21's CLI test: the rollback recipes in
-// docs/user/keys.md run as written. A restore of a saved keystore/ brings an
-// entry back, and `show --version N --reveal` piped into `rotate --in -`
+// docs/user/keys.md run as written. A restore of a saved keystore/, with the
+// floor saved beside it, brings a deleted entry back, and without the floor it
+// is refused; and `show --version N --reveal` piped into `rotate --in -`
 // stores a version whose value equals version N's byte for byte
 // (bytes.Equal, the comparison cmp makes), for an opaque and an Ed25519 entry.
 func TestKeysRollbackRoundTrip(t *testing.T) {
-	t.Run("save rm restore", func(t *testing.T) {
-		h := newKeysHarness(t)
+	// saveRmRestore saves keystore/ and the floor, rm's the entry, then
+	// restores keystore/ as the recipe does, with the saved floor when
+	// withFloor is set, and returns the entry's value and the moved-aside copy.
+	saveRmRestore := func(t *testing.T, h *keysHarness, withFloor bool) ([]byte, string) {
+		t.Helper()
 		value := []byte("rollback\x00value\n")
 		h.put("system/rb", value)
 		backup := filepath.Join(t.TempDir(), "keystore")
 		copyTree(t, h.keystoreDir(), backup)
+		floor := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+		savedFloor, err := os.ReadFile(floor)
+		if err != nil {
+			t.Fatal(err)
+		}
 		h.mustRun(0, "rm", "system/rb", "--yes")
 		h.mustRun(1, "show", "system/rb", "--reveal")
 		// The recipe moves the live copy aside, never deletes it first.
@@ -571,6 +580,21 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 		copyTree(t, backup, h.keystoreDir())
+		if withFloor {
+			// The floor saved with the backup goes back too, as root.
+			tmp := floor + ".restore"
+			if err := os.WriteFile(tmp, savedFloor, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(tmp, floor); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return value, aside
+	}
+	t.Run("save rm restore", func(t *testing.T) {
+		h := newKeysHarness(t)
+		value, aside := saveRmRestore(t, h, true)
 		h.mustRun(0, "list")
 		h.mustRun(0, "show", "system/rb", "--reveal")
 		if !bytes.Equal(h.stdout.Bytes(), value) {
@@ -578,6 +602,20 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		}
 		if err := os.RemoveAll(aside); err != nil {
 			t.Fatal(err)
+		}
+	})
+	// Without its floor, the restored entry is the deleted one put back, and
+	// the floor's tombstone refuses it.
+	t.Run("save rm restore without the floor is refused", func(t *testing.T) {
+		h := newKeysHarness(t)
+		saveRmRestore(t, h, false)
+		h.mustRun(1, "list")
+		h.mustRun(1, "show", "system/rb", "--reveal")
+		if h.stdout.Len() != 0 {
+			t.Fatalf("show printed %q for a refused entry", h.stdout.Bytes())
+		}
+		if msg := h.stderr.String(); !strings.Contains(msg, "the floor records as deleted") {
+			t.Fatalf("show of an entry restored without its floor: %q, want the floor's refusal", msg)
 		}
 	})
 	seed := bytes.Repeat([]byte{0x00, 0x0a, 0xff, 0x20}, 8)
