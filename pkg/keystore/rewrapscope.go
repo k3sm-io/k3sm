@@ -176,7 +176,7 @@ func (s *FileStore) checkScopesPlanned(ctx context.Context, root *os.Root, plan 
 			clear(pt)
 		}
 		if err != nil {
-			return fmt.Errorf("%w: the scope key of user/%s does not open under the new master after its commit, so the old master is kept. Run rewrap again, which re-seals a scope key still under the old master; one that opens under neither is damage: restore keystore/%s/%s/%s from a backup or, as root, remove keystore/%s/%s/, then run rewrap again: %w", ErrCorrupt, uid, userScopesName, uid, scopeKeyName, userScopesName, uid, err)
+			return fmt.Errorf("%w: the scope key of user/%s does not open under the new master after its commit, so the old master is kept. Run rewrap again, which re-seals a scope key still under the old master; one that opens under neither is damage: restore keystore/%s/%s/%s from a backup, or %s, then run rewrap again: %w", ErrCorrupt, uid, userScopesName, uid, scopeKeyName, damagedScopeRecovery(uid), err)
 		}
 		return nil
 	})
@@ -194,6 +194,16 @@ func (s *FileStore) checkScopesPlanned(ctx context.Context, root *os.Root, plan 
 		}
 	}
 	return nil
+}
+
+// damagedScopeRecovery names root's recovery, short of a backup, for the
+// damaged scope of uid. Removing the scope directory by hand recovers only a
+// user who never delivered: for one who did, the floor records the
+// deliveries record past its first sequence, and the owner's next put
+// refuses to mint over it. That recovery is rm-scope, not built yet; until
+// it is, floor --rebuild after the removal is the way, and its cost is said.
+func damagedScopeRecovery(uid string) string {
+	return fmt.Sprintf("remove keystore/%s/%s/ by hand, which recovers only a user who never delivered (the owner loses their values and re-puts them). For a user who did, the owner's next put refuses to mint over the floor: the recovery is rm-scope, which is not built yet. Until it is, root removes keystore/%s/%s/ and runs `sudo k3sm keys floor --rebuild`, which rewrites the floor from what is on disk and so lowers every record's floor, every user's, to the sequence on disk now: a copied-back older record already in place is accepted from then on", userScopesName, uid, userScopesName, uid)
 }
 
 // withScopeDir calls fn with the scope directory .user/<uid>.
@@ -231,7 +241,7 @@ func (s *FileStore) planScopes(ctx context.Context, root *os.Root, old keys, nex
 			committed = committed || underNext
 		}
 		if err != nil {
-			return fmt.Errorf("the scope key of user/%s does not open, and a rewrap would leave it sealed under a master that no longer exists. Root must restore keystore/%s/%s/ from a backup or, until rm-scope lands, remove keystore/%s/%s/ by hand (its owner re-puts their values), then run rewrap again: %w", uid, userScopesName, uid, userScopesName, uid, err)
+			return fmt.Errorf("the scope key of user/%s does not open, and a rewrap would leave it sealed under a master that no longer exists. Root must restore keystore/%s/%s/ from a backup, or %s, then run rewrap again: %w", uid, userScopesName, uid, damagedScopeRecovery(uid), err)
 		}
 		out = append(out, planned{scope: uid})
 		return nil

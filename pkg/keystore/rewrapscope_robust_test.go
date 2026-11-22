@@ -134,6 +134,7 @@ func TestRewrapVerifiesScopeKeysBeforeSwap(t *testing.T) {
 			if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "does not open under the new master") {
 				t.Fatalf("Rewrap with scope.key %s after its commit: %v, want ErrCorrupt", tt.name, err)
 			}
+			checkDamagedScopeRecovery(t, err)
 			if !bytes.Equal(mustMaster(t, server), master) {
 				t.Fatal("the master was swapped past a scope.key that does not open under it")
 			}
@@ -194,5 +195,22 @@ func TestRewrapRefusesStrayScopeDirs(t *testing.T) {
 		if strings.Contains(err.Error(), "restore it first") {
 			t.Fatalf("refusal %q still says restore it first", err)
 		}
+		checkDamagedScopeRecovery(t, err)
 	})
+}
+
+// checkDamagedScopeRecovery asserts a damaged-scope refusal names the
+// recovery that works: removing the scope by hand recovers only a user who
+// never delivered (mint refuses over a floor past 1); otherwise it is
+// rm-scope, and until that lands floor --rebuild, whose cost is said.
+func checkDamagedScopeRecovery(t *testing.T, err error) {
+	t.Helper()
+	for _, want := range []string{"never delivered", "rm-scope", "floor --rebuild", "lowers every record's floor"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not say %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "(its owner re-puts their values)") {
+		t.Errorf("refusal %q still offers removal by hand as the recovery for every user", err)
+	}
 }

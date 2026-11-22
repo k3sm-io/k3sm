@@ -1324,9 +1324,15 @@ past it would leave that scope sealed under a master that no longer exists. The 
 `ErrCorrupt` and names the scope. After committing every `scope.key`, and before it swaps
 the master, Rewrap re-opens each planned `scope.key` under the new `W`; one swapped back to an
 old copy or damaged since its commit refuses the swap, so the old master is not retired under
-it. The recovery is root's: restore the scope from a backup, or,
-until `rm-scope` lands, remove that scope's directory `.user/<uid>/` by hand (its owner loses
-its values and re-puts them), then run `rewrap` again.
+it. The recovery is root's: restore the scope from a backup, then run `rewrap` again. Removing
+that scope's directory `.user/<uid>/` by hand recovers only a user who never delivered (its
+owner loses its values and re-puts them): for one who did, the user-scope floor records the
+`deliveries` record past its first sequence, and the owner's next put refuses to mint a fresh
+scope over it. For that user the recovery is `rm-scope`, which a later change builds. Until it
+lands, root removes `.user/<uid>/` and runs `sudo k3sm keys floor --rebuild`, and the cost is
+the whole store's: rebuild writes the floor from what is on disk, so it lowers every record's
+floor, for every user, to the sequence on disk at that moment, and a copied-back older record
+already in place is accepted from then on. Rewrap's refusal is correct either way and stays.
 
 **Rewrap does not re-key `K_u`.** It re-seals each `scope.key` under the new `W`, but the
 `K_u` inside is the same 32 bytes, and every user record stays sealed under it. So an old master
