@@ -17,7 +17,6 @@ limitations under the License.
 package keystore
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -185,7 +184,12 @@ func TestUnattributableDamageKeepsFloorWideRefusal(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
 	ff := s.userFloor.(*fileFloorLog)
-	for _, garbage := range []string{"\nuser/\n", "\nuser/1001 Bad\n", "\ngarbage line\n", "\nuser/1001 gone zz\n", "\nuser/1001 gone " + string(bytes.Repeat([]byte("a"), 32)) + " rX\n"} {
+	flipped, err := floorLine("user/1001", "gone", guid(0x76), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flipped[len(flipped)-2] ^= 1 // the checksum's last digit: a line flipped in place
+	for _, garbage := range []string{"\nuser/\n", "\ngarbage line\n", "\nuser/0 gone\n", "\nuser/1001 a b c d e\n", "\n" + string(flipped)} {
 		base := readLog(t, s, userFloorLogName)
 		appendLogBytes(t, s, userFloorLogName, []byte(garbage))
 		if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v")); !errors.Is(err, errFloorDegraded) {
@@ -265,12 +269,21 @@ func TestClassifyEveryPrefixTaintsItsKey(t *testing.T) {
 	}
 }
 
-// A partial scope or name that is the prefix of no valid one, or a scope
-// prefix shorter than "user/" and one digit, is unattributable.
+// A partial scope that is the prefix of no valid one, a scope prefix
+// shorter than "user/" and one digit, or a line with more separators than
+// the grammar's is unattributable; a whole scope with no valid name after
+// it taints the scope.
 func TestClassifyInvalidPrefixIsUnattributable(t *testing.T) {
-	for _, line := range []string{"user/", "user", "u", "user/0", "user/01", "user/99999999999", "user/1001 -a", "user/1001 a..", "user/1001 A", "user/1001 a_b", "user/1001 ..d"} {
+	for _, line := range []string{"user/", "user", "u", "user/0", "user/01", "user/99999999999", "user/0 a", "user/1001 a b c d e f"} {
 		if kind, _ := classifyFloorDamage([]byte(line)); kind != taintUnattributable {
 			t.Fatalf("%q: %v, want unattributable", line, kind)
+		}
+	}
+	// A whole scope and its space, then no valid name or name prefix, taint
+	// the scope: every name of it.
+	for _, line := range []string{"user/1001 -a", "user/1001 a..", "user/1001 A", "user/1001 a_b", "user/1001 ..d", "user/1001 Bad x"} {
+		if kind, k := classifyFloorDamage([]byte(line)); kind != taintNamePrefix || k.scope != "user/1001" || k.name != "" {
+			t.Fatalf("%q: %v %+v, want the scope tainted", line, kind, k)
 		}
 	}
 	for _, line := range []string{"user/2", "user/21474", "user/2147483647", "user/1001 ", "user/1001 a-", "user/1001 a.", "user/1001 .", "user/1001 .del"} {

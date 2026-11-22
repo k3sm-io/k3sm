@@ -48,7 +48,7 @@ func corruptTombstones(t *testing.T, s *FileStore, scope, name string, gen [gene
 		if i < 0 {
 			break
 		}
-		at := off + i + len(tomb) - 2 // the "m" of "rm"
+		at := off + i + len(tomb) - 2 - 1 - floorCRCLen // the "m" of "rm", before " <crc>\n"
 		if _, err := f.WriteAt([]byte{'X'}, int64(at)); err != nil {
 			t.Fatal(err)
 		}
@@ -116,6 +116,9 @@ func TestFloorDamageDegradesLiveLines(t *testing.T) {
 	if _, _, err := u.Current(ctx, "user/1001/lost"); !errors.Is(err, errFloorDegraded) {
 		t.Fatalf("current of the copied-back tree over a damaged floor: %v, want errFloorDegraded", err)
 	}
+	// The corrupted tombstone names its key (a generation taint); a put of
+	// another name is refused once damage no key can be read from is there.
+	appendLogBytes(t, s, userFloorLogName, []byte("\ngarbage line\n"))
 	before := readLog(t, s, userFloorLogName)
 	_, err = u.Put(ctx, "user/1001/other", KindOpaque, []byte("v"))
 	if !errors.Is(err, errFloorDegraded) {

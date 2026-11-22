@@ -25,35 +25,47 @@ import (
 )
 
 // The floor's damage is scoped (docs/design/keystore.md § "The user-scope
-// floor", "Damage and taint"). Every damaged line the reader skips, a torn
-// last line included, is classified by what it could have been:
+// floor", "Damage and taint"). Every floor line ends in a checksum
+// (appendFloorCRC), so a line torn or flipped in place never parses: it is
+// skipped and classified by what of it still parses, its leading fields
+// read strictly, each with the space after it:
 //
-//   - a taint on (scope, name), when its leading fields parse strictly as
-//     "<scope> <name> " and the rest is a prefix of a generation: lowercase
-//     hex, under 32 digits;
-//   - a taint on (scope, name, generation), when the rest is a whole
-//     generation of 32 lowercase hex digits, then nothing, or a space and
-//     nothing, "r" or "rm" (a tombstone's prefix), or a canonical decimal
-//     prefix of at most 20 digits (a live line's);
+//   - a whole line in the grammar, five fields, whose checksum does not
+//     match is corruption in place, not a tear, and the flip could be in
+//     any field: a taint on (scope, name) and unattributable damage too;
+//   - a line with more than the grammar's four spaces cannot be a tear:
+//     unattributable damage;
+//   - a line with three spaces whose last field is shaped like a checksum
+//     (8 lowercase hex digits) is a tear inside a long sequence or a whole
+//     line with a separator flipped away: a taint on the (scope, name) its
+//     fields name and unattributable damage too, or unattributable damage
+//     alone when its name does not parse;
+//   - a taint on (scope, name, generation), when "<scope> <name> " is
+//     followed by a whole generation, 32 lowercase hex digits, then a space
+//     or nothing;
+//   - a taint on (scope, name), when "<scope> <name> " parses and the
+//     generation does not;
 //   - a taint on a name prefix, when the line is "<scope> <partial>": the
 //     scope parses with its space and partial, with no space, is a prefix of
 //     the delivery record's name or of a valid entry name; it covers every
 //     name of the scope that starts with partial;
+//   - a taint on the scope, every name of it, when "<scope> " parses and
+//     the rest is none of the above;
 //   - a taint on a scope prefix, when the line, with no space, is "user/"
 //     and at least one digit, with no leading zero, and extends to a uid in
 //     range; it covers every scope whose canonical text starts with it;
-//   - unattributable damage, for anything else: a scope or name that does
-//     not parse and is no valid prefix, a scope prefix shorter than "user/"
-//     and a digit, a rest that is the prefix of no line, or a line over
-//     maxLogLine.
+//   - unattributable damage, for anything else: a scope that does not
+//     parse and is no valid prefix, a scope prefix shorter than "user/" and
+//     a digit, or a line over maxLogLine.
 //
-// A tainted key's every generation (a name or prefix taint) or the one
-// generation (a generation taint) is refused, whatever the floor knows of it: the skipped
-// line could have been its tombstone, or a live line above what the floor
-// holds. Unattributable damage keeps the floor-wide rule: no live line for
-// a generation the floor has no line for, and no put or deliver line. The
-// taint set is capped at maxTaintKeys entries and maxTaintBytes bytes; a
-// taint past the cap is counted as unattributable damage instead.
+// A tainted key's every generation (a name, scope or prefix taint) or the
+// one generation (a generation taint) is refused, whatever the floor knows
+// of it: the skipped line could have been its tombstone, or a live line
+// above what the floor holds. Unattributable damage keeps the floor-wide
+// rule: no live line for a generation the floor has no line for, and no put
+// or deliver line. The taint set is capped at maxTaintKeys entries; a taint
+// past the cap makes the floor refuse every generation of every key
+// (taintOverflow), never unattributable damage.
 
 const (
 	// maxUIDDigits is the most digits of a user scope's uid.
@@ -64,8 +76,6 @@ const (
 	// taintEntryOverhead is what one taint entry is charged beyond its
 	// scope and name bytes: its generation and its map slot.
 	taintEntryOverhead = generationSize + 32
-	// maxSeqDigits is the most digits of a canonical uint64.
-	maxSeqDigits = 20
 )
 
 // taintKind is what a damaged floor line could have been.
@@ -85,14 +95,44 @@ const (
 	// taintScopePrefix is a line torn inside its scope: every scope whose
 	// canonical text starts with the partial scope.
 	taintScopePrefix
+	// taintNameFlip is a whole line in the grammar whose checksum does not
+	// match: (scope, name) as taintName, and unattributable damage too.
+	taintNameFlip
 )
 
 // classifyFloorDamage is the taint a damaged floor line, without its
-// newline, carries, and the key it names: for taintName the key's gen is
-// zero and unused.
+// newline, carries, and the key it names: for taintName, taintNameFlip and
+// a scope taint (taintNamePrefix with an empty name) the key's gen is zero
+// and unused.
 func classifyFloorDamage(line []byte) (taintKind, floorKey) {
+	kind, k := classifyFloorLadder(line)
+	if bytes.Count(line, []byte{' '}) != 3 {
+		return kind, k
+	}
+	if _, canonical, _ := splitFloorCRC(line); !canonical {
+		return kind, k
+	}
+	// Three separators and a last field shaped like a checksum: a tear
+	// inside a long sequence, or a whole line with one separator flipped
+	// away, which merged two fields. Both readings are kept: the key the
+	// fields name as a name taint, and unattributable damage.
+	switch kind {
+	case taintGen, taintName, taintNameFlip:
+		return taintNameFlip, floorKey{scope: k.scope, name: k.name}
+	}
+	return taintUnattributable, floorKey{}
+}
+
+// classifyFloorLadder is classifyFloorDamage's ladder, before the
+// three-separator rule.
+func classifyFloorLadder(line []byte) (taintKind, floorKey) {
 	var k floorKey
 	if len(line)+1 > maxLogLine {
+		return taintUnattributable, k
+	}
+	if bytes.Count(line, []byte{' '}) > 4 {
+		// A tear only shortens a line: more separators than the grammar's
+		// is a byte flipped into one, which could have split any field.
 		return taintUnattributable, k
 	}
 	sp := bytes.IndexByte(line, ' ')
@@ -108,50 +148,41 @@ func classifyFloorDamage(line []byte) (taintKind, floorKey) {
 	if uid := scopeUID(scope); uid == 0 || userScopeOf(uid) != scope {
 		return taintUnattributable, k
 	}
+	k.scope = scope
 	rest := line[sp+1:]
 	sp = bytes.IndexByte(rest, ' ')
 	if sp < 0 {
 		// Torn inside its name: every name of the scope it is a prefix of.
 		if namePrefixOK(string(rest)) {
-			k.scope, k.name = scope, string(rest)
+			k.name = string(rest)
 			return taintNamePrefix, k
 		}
-		return taintUnattributable, k
+		return taintNamePrefix, floorKey{scope: scope} // the scope, whole
 	}
 	name := string(rest[:sp])
 	if name != deliveriesFloorName && checkName(name) != nil {
-		return taintUnattributable, k
+		return taintNamePrefix, floorKey{scope: scope} // the scope, whole
 	}
-	k.scope, k.name = scope, name
-	rest = rest[sp+1:]
-	n := 0
-	for n < len(rest) && n < 2*generationSize && unhex(rest[n]) >= 0 {
-		n++
-	}
-	if n < 2*generationSize {
-		if n == len(rest) {
-			return taintName, k
+	k.name = name
+	if body, canonical, match := splitFloorCRC(line); canonical && !match {
+		if _, err := parseFloorBody(body); err == nil {
+			// Whole and in the grammar, its checksum wrong: flipped in
+			// place, any field of it, the generation included.
+			return taintNameFlip, k
 		}
-		return taintUnattributable, floorKey{}
+	}
+	rest = rest[sp+1:]
+	if len(rest) < 2*generationSize || (len(rest) > 2*generationSize && rest[2*generationSize] != ' ') {
+		return taintName, k
 	}
 	for i := range generationSize {
-		k.gen[i] = byte(unhex(rest[2*i])<<4 | unhex(rest[2*i+1]))
+		hi, lo := unhex(rest[2*i]), unhex(rest[2*i+1])
+		if hi < 0 || lo < 0 {
+			return taintName, k
+		}
+		k.gen[i] = byte(hi<<4 | lo)
 	}
-	rest = rest[2*generationSize:]
-	if len(rest) == 0 {
-		return taintGen, k
-	}
-	if rest[0] != ' ' {
-		return taintUnattributable, floorKey{}
-	}
-	rest = rest[1:]
-	switch {
-	case len(rest) == 0, string(rest) == "r", string(rest) == floorTombstone:
-		return taintGen, k
-	case canonicalSeqPrefix(rest):
-		return taintGen, k
-	}
-	return taintUnattributable, floorKey{}
+	return taintGen, k
 }
 
 // scopePrefixOK reports whether p is the prefix, "user/" and at least one
@@ -189,26 +220,15 @@ func namePrefixOK(p string) bool {
 	return checkName(p) == nil || (len(p) < maxNameLen && checkName(p+"a") == nil)
 }
 
-// canonicalSeqPrefix reports whether b, which is not empty, is a prefix of
-// a canonical decimal uint64: digits, no leading zero but a lone "0", at
-// most maxSeqDigits of them.
-func canonicalSeqPrefix(b []byte) bool {
-	if len(b) > maxSeqDigits || (len(b) > 1 && b[0] == '0') {
-		return false
-	}
-	for _, c := range b {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
 // taintLine records the taint of the damaged line line, without its
 // newline, that starts at off: into the taint set, or, past its cap or for
 // a line no key can be read from, as unattributable damage at off.
 func (s *logState) taintLine(off int64, line []byte) {
 	kind, k := classifyFloorDamage(line)
+	if kind == taintNameFlip {
+		s.unattributable(off)
+		kind = taintName
+	}
 	switch kind {
 	case taintName:
 		nk := nameKey{k.scope, k.name}
@@ -300,7 +320,7 @@ func (s *logState) nameTainted(scope, name string) bool {
 		return false
 	}
 	switch s.tornKind {
-	case taintName:
+	case taintName, taintNameFlip:
 		return s.tornKey.scope == scope && s.tornKey.name == name
 	case taintNamePrefix, taintScopePrefix:
 		return prefixTaint{s.tornKind, s.tornKey.scope, s.tornKey.name}.covers(scope, name)
@@ -328,7 +348,7 @@ func (p prefixTaint) covers(scope, name string) bool {
 // the torn last line included, and whether there is any.
 func (s *logState) unattributedAt() (int64, bool) {
 	at, ok := s.unattribAt, s.unattrib
-	if s.tornSize != 0 && s.tornKind == taintUnattributable && (!ok || s.tornAt > at) {
+	if s.tornSize != 0 && (s.tornKind == taintUnattributable || s.tornKind == taintNameFlip) && (!ok || s.tornAt > at) {
 		at, ok = s.tornAt, true
 	}
 	return at, ok

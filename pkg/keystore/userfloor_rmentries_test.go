@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
 
@@ -29,6 +30,10 @@ import (
 // entries/ is missing, buries the floor's live generations for the name
 // first, then returns ErrScopeAbsent; the tree put back is refused as
 // deleted.
+// tombSuffix matches a floor whose last line is a tombstone: the marker,
+// then its checksum.
+var tombSuffix = regexp.MustCompile(` rm [0-9a-f]{8}\n$`)
+
 func TestUserRmMissingEntriesBuriesFirst(t *testing.T) {
 	ctx := context.Background()
 	s, u, dir, _ := rmShapeSetup(t)
@@ -41,7 +46,7 @@ func TestUserRmMissingEntriesBuriesFirst(t *testing.T) {
 	if !errors.Is(err, ErrScopeAbsent) || !errors.Is(err, errCommitted) {
 		t.Fatalf("rm with entries/ missing: %v, want ErrScopeAbsent after the burial", err)
 	}
-	if !bytes.Contains(readLog(t, s, userFloorLogName), []byte(" token ")) || !bytes.HasSuffix(readLog(t, s, userFloorLogName), []byte(" rm\n")) {
+	if !bytes.Contains(readLog(t, s, userFloorLogName), []byte(" token ")) || !tombSuffix.Match(readLog(t, s, userFloorLogName)) {
 		t.Fatalf("rm with entries/ missing wrote no tombstone:\n%s", readLog(t, s, userFloorLogName))
 	}
 	if err := os.Rename(aside, entries); err != nil {

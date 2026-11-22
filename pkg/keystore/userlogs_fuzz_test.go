@@ -28,11 +28,34 @@ import (
 // stray copy can put any bytes there: the parser must refuse what floorLine
 // or tombLine would not write, never panic, and what it accepts must encode
 // back to the same bytes. The seeds are committed under testdata/fuzz/FuzzParseFloorLine.
+//
+// The checksum's property: every byte string either parses, with a
+// checksum that matches its body, or is classified (classifyFloorDamage,
+// never a panic); and every truncation and every single-byte flip of a
+// line that parses never parses, and taints its key or counts as
+// unattributable.
 func FuzzParseFloorLine(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		r, err := parseFloorLine(b)
 		if err != nil {
+			kind, _ := classifyFloorDamage(b)
+			if kind < taintName || kind > taintNameFlip {
+				t.Fatalf("%q: classified as %d, no taint kind", b, kind)
+			}
 			return
+		}
+		if body, canonical, match := splitFloorCRC(b); !canonical || !match {
+			t.Fatalf("accepted %q, whose checksum does not match %q", b, body)
+		}
+		for n := range len(b) {
+			checkDamagedLine(t, b[:n], r.key)
+		}
+		for i := range b {
+			p := append([]byte(nil), b...)
+			p[i] ^= 0x01
+			checkDamagedLine(t, p, r.key)
+			p[i] ^= 0x01 ^ 0x20
+			checkDamagedLine(t, p, r.key)
 		}
 		if len(b)+1 > maxLogLine {
 			t.Fatalf("accepted a %d-byte line", len(b))

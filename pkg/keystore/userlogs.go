@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -89,21 +90,24 @@ const (
 	// maxTombLineBytes and maxRmAuditLineBytes are the longest tombstone and
 	// rm audit line: the longest scope (user/2147483647), a 253-byte name,
 	// the longest result and a full RFC3339Nano timestamp
-	// (TestCheckConfigRevocationBudgetFloor).
-	maxTombLineBytes    = 306
+	// (TestCheckConfigRevocationBudgetFloor). The tombstone is
+	// 15 + 1 + 253 + 1 + 32 + 1 + 2 ("rm") + 1 + 8 (its checksum) + 1 (its
+	// newline) = 315 bytes.
+	maxTombLineBytes    = 315
 	maxRmAuditLineBytes = 384
 	// minLogRevokeBudget is the least revocation budget checkConfig accepts:
 	// one worst-case burial plus its audit line, each one append led by its
-	// newline, 6 × 306 + 1 + 384 + 1 = 2,222 bytes, which is over two whole
+	// newline, 6 × 315 + 1 + 384 + 1 = 2,276 bytes, which is over two whole
 	// appends (2,050).
 	minLogRevokeBudget = maxBurialTombstones*maxTombLineBytes + 1 + maxRmAuditLineBytes + 1
 	// defaultLogRevocationBytes holds one scope's full revocation, under the
 	// longest scope and a 253-byte name, each append charged its leading
 	// newline: each of maxScopeEntries entries rm'd, a burial of
-	// maxBurialTombstones 306-byte tombstones and a 384-byte audit line,
-	// 256 × (6 × 306 + 1 + 384 + 1) = 568,832 bytes; and maxDeliveries
-	// withdraws, each an 82-byte floor line and a withdraw audit line of at
-	// most 250 bytes, 320 × (82 + 1 + 250 + 1) = 106,880 bytes; 675,712
+	// maxBurialTombstones 315-byte tombstones and a 384-byte audit line,
+	// 256 × (6 × 315 + 1 + 384 + 1) = 582,656 bytes; and maxDeliveries
+	// withdraws, each a 91-byte floor line (15 + 1 + 11 + 1 + 32 + 1 + 20 +
+	// 1 + 8 + 1, the checksum included) and a withdraw audit line of at
+	// most 250 bytes, 320 × (91 + 1 + 250 + 1) = 109,760 bytes; 692,416
 	// bytes in all, rounded up to 704 KiB (720,896). With it
 	// logReadBound at the default caps is 256 MiB + 1024 × 704 KiB + 1 MiB
 	// = 961 MiB, and at the configuration's upper bounds 2^40 + 1024 × 2^30
@@ -127,8 +131,8 @@ const (
 	// the longest scope, about 128 MiB of heap and 0.41 s
 	// (BenchmarkFloorReadLongNames); the most lines the size bound held
 	// under the former 64 KiB revocation budget, about 7.3M, about 69 MiB
-	// and 3.9 s (BenchmarkFloorReadLineCount), about 11.7 s scaled to the
-	// 21.9M lines of 46 bytes today's 961 MiB bound holds (not
+	// and 3.9 s (BenchmarkFloorReadLineCount), about 9.8 s scaled to the
+	// 18.3M lines of 55 bytes today's 961 MiB bound holds (not
 	// re-measured). At
 	// 1<<20 the long-name case held about 494 MiB, so the ceiling was
 	// lowered to stay under 200 MiB (docs/design/keystore.md § "Size caps").
@@ -163,7 +167,12 @@ const (
 )
 
 // minFloorLine is the shortest line that adds a key to the floor: the
-// lowest user scope, a one-byte name and sequence 1, 46 bytes.
+// lowest user scope, a one-byte name, sequence 1 and its checksum,
+// 8 + 1 + 1 + 1 + 32 + 1 + 1 + 1 + 8 + 1 = 55 bytes. logReadBound itself
+// is the caps' and the margin's alone, so the checksum leaves it as it
+// was; it lowers the key bound the size alone allows, from about 21.9M
+// keys to about 18.3M at the default caps, both far over the 2^18 ceiling
+// that binds.
 var minFloorLine = func() int {
 	b, err := floorLine(userScopeOf(minScopeUID), "a", [generationSize]byte{}, 1)
 	if err != nil {
@@ -1546,17 +1555,58 @@ func (f *fileFloorLog) buryAll(scope, name string, gens [][generationSize]byte) 
 	return f.log.appendLines(scopeUID(scope), lines, true, true, true, maxAppendLine)
 }
 
-// floorLine encodes one floor line: "<scope> <name> <generation> <seq>\n",
-// the generation in lowercase hex and seq in decimal. It refuses a field
-// the parser would refuse, so every line written reads back.
+// floorLine encodes one floor line: "<scope> <name> <generation> <seq>
+// <crc>\n", the generation in lowercase hex, seq in decimal and crc the
+// line's checksum (floorCRC). It refuses a field the parser would refuse,
+// so every line written reads back.
 func floorLine(scope, name string, gen [generationSize]byte, seq uint64) ([]byte, error) {
-	return encodeFloorLine(fmt.Appendf(nil, "%s %s %x %d", scope, name, gen[:], seq))
+	return encodeFloorLine(appendFloorCRC(fmt.Appendf(nil, "%s %s %x %d", scope, name, gen[:], seq)))
 }
 
-// tombLine encodes one tombstone line: "<scope> <name> <generation> rm\n".
-// Only an entry name has one; the delivery record is never deleted.
+// tombLine encodes one tombstone line: "<scope> <name> <generation> rm
+// <crc>\n". Only an entry name has one; the delivery record is never
+// deleted.
 func tombLine(scope, name string, gen [generationSize]byte) ([]byte, error) {
-	return encodeFloorLine(fmt.Appendf(nil, "%s %s %x %s", scope, name, gen[:], floorTombstone))
+	return encodeFloorLine(appendFloorCRC(fmt.Appendf(nil, "%s %s %x %s", scope, name, gen[:], floorTombstone)))
+}
+
+// floorCRCTable is CRC-32C (Castagnoli), the floor line's checksum.
+var floorCRCTable = crc32.MakeTable(crc32.Castagnoli)
+
+// floorCRCLen is the checksum field's length: 8 lowercase hex digits.
+const floorCRCLen = 8
+
+// floorCRC is the checksum of body, a floor line's bytes before " <crc>".
+func floorCRC(body []byte) uint32 { return crc32.Checksum(body, floorCRCTable) }
+
+// appendFloorCRC is body with " <crc>" appended: the checksum field that
+// makes every floor line self-delimiting, so a line torn or flipped in
+// place never parses, and a closed tear never reads as a lower sequence.
+func appendFloorCRC(body []byte) []byte {
+	return fmt.Appendf(body, " %08x", floorCRC(body))
+}
+
+// splitFloorCRC splits line at its last space into the body and the
+// checksum field, and reports whether that field is canonical (8 lowercase
+// hex digits) and matches the body.
+func splitFloorCRC(line []byte) (body []byte, canonical, match bool) {
+	sp := bytes.LastIndexByte(line, ' ')
+	if sp < 0 {
+		return nil, false, false
+	}
+	body, sum := line[:sp], line[sp+1:]
+	if len(sum) != floorCRCLen {
+		return body, false, false
+	}
+	var v uint32
+	for _, c := range sum {
+		d := unhex(c)
+		if d < 0 {
+			return body, false, false
+		}
+		v = v<<4 | uint32(d)
+	}
+	return body, true, v == floorCRC(body)
 }
 
 // encodeFloorLine refuses b, a floor line without its newline, unless it
@@ -1581,14 +1631,28 @@ type floorRec struct {
 
 // parseFloorLine decodes one floor line without its newline, strictly: a
 // user scope, an entry name or the delivery record's floor name, a
-// generation of 32 lowercase hex digits, and either a decimal seq with no
-// sign or leading zero or, for an entry name only, the tombstone marker
-// "rm"; separated by single spaces. Anything else is an error.
+// generation of 32 lowercase hex digits, either a decimal seq with no sign
+// or leading zero or, for an entry name only, the tombstone marker "rm",
+// and the checksum of the bytes before it, 8 lowercase hex digits of
+// CRC-32C; separated by single spaces. Anything else is an error: a line
+// torn or flipped in place fails its checksum.
 func parseFloorLine(line []byte) (floorRec, error) {
-	var r floorRec
 	if len(line)+1 > maxLogLine {
-		return r, errLogLineTooLong
+		return floorRec{}, errLogLineTooLong
 	}
+	body, canonical, match := splitFloorCRC(line)
+	if !canonical {
+		return floorRec{}, errors.New("a floor line has no checksum of 8 lowercase hex digits")
+	}
+	if !match {
+		return floorRec{}, errors.New("a floor line's checksum does not match")
+	}
+	return parseFloorBody(body)
+}
+
+// parseFloorBody decodes a floor line's body, the bytes before " <crc>".
+func parseFloorBody(line []byte) (floorRec, error) {
+	var r floorRec
 	f := bytes.Split(line, []byte{' '})
 	if len(f) != 4 {
 		return r, errors.New("a floor line has the wrong number of fields")

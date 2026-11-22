@@ -51,12 +51,12 @@ func TestUserRmCapsTreeGenerations(t *testing.T) {
 		}
 		giveToService(t, p)
 	}
-	before := bytes.Count(readLog(t, s, userFloorLogName), []byte(" rm\n"))
+	before := bytes.Count(readLog(t, s, userFloorLogName), []byte(" rm "))
 	err = u.Delete(ctx, "user/1001/token")
 	if !errors.Is(err, errCommitted) || !strings.Contains(err.Error(), "altered") {
 		t.Fatalf("rm of a tree naming 50 generations: %v, want the alteration reported after the commit", err)
 	}
-	if got := bytes.Count(readLog(t, s, userFloorLogName), []byte(" rm\n")) - before; got != 1 {
+	if got := bytes.Count(readLog(t, s, userFloorLogName), []byte(" rm ")) - before; got != 1 {
 		t.Fatalf("rm wrote %d tombstones, want 1: the floor's live generation, which the pointer header names too", got)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {

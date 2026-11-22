@@ -146,7 +146,7 @@ func entryGenerationOf(t *testing.T, s *FileStore) [generationSize]byte {
 }
 
 // The key bound is the read bound over the shortest line that adds a key
-// (46 bytes), held to a ceiling of 1<<18 keys, which is met first at the
+// (55 bytes, its checksum included), held to a ceiling of 1<<18 keys, which is met first at the
 // default caps and bounds the reader's memory.
 func TestFloorKeyBoundDerivedFromCaps(t *testing.T) {
 	s, _, _ := fileLogScope(t)
@@ -154,18 +154,18 @@ func TestFloorKeyBoundDerivedFromCaps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(line) != 46 {
-		t.Fatalf("the shortest floor line is %d bytes, want 46", len(line))
+	if len(line) != 55 {
+		t.Fatalf("the shortest floor line is %d bytes, want 55", len(line))
 	}
 	l := s.userFloor.(*fileFloorLog).log
-	// At the default caps the size would allow about 7.3M keys; the ceiling
+	// At the default caps the size would allow about 18.3M keys; the ceiling
 	// of 1<<18, which bounds the reader's memory, is met first.
 	if got := l.keyBound(); got != 1<<18 {
 		t.Fatalf("key bound %d at the default caps, want the ceiling %d", got, 1<<18)
 	}
 	// Under small caps the size-derived bound is met first.
 	s.logHardCap, s.logSoftCap, s.logRevokeBudget = 1<<20, 1<<20, maxLogLine
-	if got, want := l.keyBound(), int(s.logReadBound()/46+1); got != want || want >= 1<<18 {
+	if got, want := l.keyBound(), int(s.logReadBound()/55+1); got != want || want >= 1<<18 {
 		t.Fatalf("key bound %d under 1 MiB caps, want the size-derived %d", got, want)
 	}
 }

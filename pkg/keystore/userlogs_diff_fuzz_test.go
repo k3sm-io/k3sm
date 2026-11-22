@@ -61,7 +61,8 @@ func diffStream(d *diffInput) [][]diffItem {
 		scope := fmt.Sprintf("user/%d", uid)
 		name := names[d.next()%len(names)]
 		gen := guid(byte(d.next() % 3))
-		live := fmt.Appendf(nil, "%s %s %x %d\n", scope, name, gen[:], d.next())
+		live := appendFloorCRC(fmt.Appendf(nil, "%s %s %x %d", scope, name, gen[:], d.next()))
+		live = append(live, '\n')
 		audit := func(op string, pad int) []byte {
 			return fmt.Appendf(nil, `{"v":1,"op":%q,"scope":%q,"name":%q,"pad":%q,"result":"ok"}`+"\n", op, scope, name, bytes.Repeat([]byte("p"), pad))
 		}
@@ -70,7 +71,7 @@ func diffStream(d *diffInput) [][]diffItem {
 		case 0, 1:
 			it = diffItem{live, audit("put", 0)}
 		case 2:
-			it = diffItem{fmt.Appendf(nil, "%s %s %x rm\n", scope, name, gen[:]), audit("rm", 0)}
+			it = diffItem{append(appendFloorCRC(fmt.Appendf(nil, "%s %s %x rm", scope, name, gen[:])), '\n'), audit("rm", 0)}
 		case 3:
 			n := d.next() % 40
 			g := bytes.ReplaceAll(append([]byte(nil), d.b[:min(len(d.b), n)]...), []byte("\n"), []byte(" "))
@@ -271,9 +272,9 @@ func diffPrefixTaints(t *testing.T, s *FileStore, maxKeys int, buf *[]byte, d *d
 	k := diffKeys()[d.next()%len(diffKeys())]
 	var line []byte
 	if d.next()%2 == 0 && k.name != deliveriesFloorName {
-		line = fmt.Appendf(nil, "%s %s %x rm", k.scope, k.name, k.gen[:])
+		line = appendFloorCRC(fmt.Appendf(nil, "%s %s %x rm", k.scope, k.name, k.gen[:]))
 	} else {
-		line = fmt.Appendf(nil, "%s %s %x %d", k.scope, k.name, k.gen[:], 1+d.next()*977)
+		line = appendFloorCRC(fmt.Appendf(nil, "%s %s %x %d", k.scope, k.name, k.gen[:], 1+d.next()*977))
 	}
 	head := len(k.scope) + 1 + len(k.name) + 1
 	minScope := len("user/1")
@@ -281,8 +282,8 @@ func diffPrefixTaints(t *testing.T, s *FileStore, maxKeys int, buf *[]byte, d *d
 	for _, closed := range []bool{false, true} {
 		b := append(append(append([]byte(nil), *buf...), '\n'), line[:n]...)
 		if closed {
-			if _, err := parseFloorLine(line[:n]); err == nil {
-				continue // a closed prefix that is itself a whole line is no damage
+			if r, err := parseFloorLine(line[:n]); err == nil {
+				t.Fatalf("the prefix %q of a line for %+v parses, as %+v", line[:n], k, r)
 			}
 			b = append(b, '\n')
 		}
@@ -299,5 +300,20 @@ func diffPrefixTaints(t *testing.T, s *FileStore, maxKeys int, buf *[]byte, d *d
 		if n >= head+2*generationSize && !st.tainted(k) {
 			t.Fatalf("the prefix %q (closed %v) with a whole generation does not taint %+v", line[:n], closed, k)
 		}
+	}
+	// One byte of the whole line flipped in place, then closed: it never
+	// parses, and it taints its key or counts as unattributable.
+	flip := append([]byte(nil), line...)
+	flip[d.next()%len(flip)] ^= byte(1 + d.next()%255)
+	if r, err := parseFloorLine(flip); err == nil {
+		t.Fatalf("%q, a line for %+v with a byte flipped, parses, as %+v", flip, k, r)
+	}
+	b := append(append(append(append([]byte(nil), *buf...), '\n'), flip...), '\n')
+	st := newDiffLog(s, true, maxKeys, &b).sync(t)
+	if st.bad != nil || len(st.taintNames)+len(st.taintGens)+len(st.taintPrefixes) >= maxTaintKeys {
+		return
+	}
+	if _, unattrib := st.unattributedAt(); !unattrib && !st.tainted(k) {
+		t.Fatalf("%q, a line for %+v with a byte flipped, neither taints it nor is unattributable", flip, k)
 	}
 }
