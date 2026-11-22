@@ -2010,7 +2010,11 @@ That wait is the store `.lock`
   record sits above its floor line (a withdraw whose floor line failed leaves one behind, and
   the process's own mark of the record's sequence does not survive a restart), so the
   catch-up does not wait for that scope's next mutation, and the live floor line of every
-  user entry whose authenticated pointer's generation has none (a `put` that lost it). `New` only constructs the store and
+  user entry whose authenticated pointer's generation has none (a `put` that lost it). Without
+  a restart, a `put` that returns its commit with the floor line lost marks the name in the
+  process, and the next `put`, `deliver` or `withdraw` on that scope catches the entry up under
+  the exclusive store lock, before it serves, at the authenticated pointer and under the
+  same refusals (`TestRuntimeCatchUpRestoresLostEntryLine`). `New` only constructs the store and
   reads neither log, so neither call runs there; the server start that exports the user
   scope makes both, through the unexported `startUserScopes`, which runs `CheckLogBounds`
   and then `catchUpUser`, in that order, and then marks the user scope started. Until it

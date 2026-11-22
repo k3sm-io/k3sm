@@ -864,6 +864,7 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 		return "", false, err
 	}
 	defer o.close()
+	u.catchUpLostEntries(o)
 	rd, err := u.readDeliveriesFloor(o, true)
 	if err != nil {
 		return "", false, err
@@ -1307,6 +1308,7 @@ func (u *UserScope) grantLocked(ctx context.Context, g *grantAudit, fn func(*ope
 	}
 	_ = entries.Close() // not written through here
 	defer o.close()
+	u.catchUpLostEntries(o)
 	return fn(o)
 }
 

@@ -168,6 +168,10 @@ type FileStore struct {
 	// and every other scope starts. A pointer, as userScopesStarted is;
 	// New allocates it.
 	quarantined *atomic.Pointer[map[uint32]bool]
+	// lostLines is the entries whose put this process committed without
+	// its floor line, which the next operation on the scope catches up. A
+	// pointer, as userScopesStarted is; New allocates it.
+	lostLines *lostEntryLines
 }
 
 var _ Store = (*FileStore)(nil)
@@ -200,6 +204,7 @@ func New(cfg Config) *FileStore {
 
 		userScopesStarted: new(atomic.Bool),
 		quarantined:       new(atomic.Pointer[map[uint32]bool]),
+		lostLines:         new(lostEntryLines),
 	}
 	s.userFloor, s.auditSink = newFileFloorLog(s), newFileAuditLog(s)
 	return s

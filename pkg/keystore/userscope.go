@@ -245,6 +245,9 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	defer func() { _ = entries.Close() }() // writes are fsynced by writeFile
+	if names := u.s.lostLines.names(u.scope); len(names) > 0 {
+		u.catchUpLostIn(entries, uk, names)
+	}
 	if err := u.checkNewName(entries, name); err != nil {
 		return Version{}, err
 	}
@@ -277,6 +280,8 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	// The record, the pointer, then the floor line: a crash between the
 	// last two leaves the floor one behind, which a read accepts.
 	if err := u.s.userFloor.append(u.scope, name, e.generation, 1, false); err != nil {
+		// The next operation on the scope catches the line up.
+		u.s.lostLines.note(u.scope, name)
 		return v, fmt.Errorf("%w, and its floor line was not written: %w", errCommitted, err)
 	}
 	return v, nil
