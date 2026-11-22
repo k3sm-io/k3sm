@@ -609,7 +609,7 @@ pend U48 "seam guard: the real primitives the socket listener's tests replace ar
 
 pend U49 "the shared keystore path names build with CGO_ENABLED=0 and import only the standard library; pkg/keystore never imports the sandbox package (sandbox change)" \
 	runtimed/pkg/keystorepaths::TestLeafImportsOnlyTheStandardLibrary k3sm/pkg/keystore::TestKeystoreImportsNoSandbox
-rootpend U50 "root-run: the defeat list run as the service user against both flagged logs, by name under --root, a SKIP failing it: each defeat fails, bytes and flag unchanged, O_APPEND still succeeds (append-only files)" \
+rootcheck U50 "root-run: the defeat list run as the service user against both flagged logs, by name under --root, a SKIP failing it, in a root-owned 0755 directory (a name operation refused by the directory, EACCES) and a service-owned 0700 one (refused by the flag, EPERM): each defeat fails, F_SETFL clearing O_APPEND included, bytes and flag unchanged, O_APPEND still succeeds and a seek-then-write appends at the end" \
 	k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser
 pend U51 "per-uid log fairness: the share is a fixed byte count, at most 1/16 of the hard cap; every line, reads included, is charged to its uid; a uid past its share has its mutations and reads refused with ErrLogFull while another uid's succeed, never as the global append failure; it cannot get another uid's mutations, reads or revocations refused, though it can delay them through the store lock; list and deliveries are rate-limited per uid (socket operations)" \
 	k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID TestLogShareAtMostOneSixteenthOfHardCap TestShareRefusalIsNotGlobalAppendFailure TestReadRateLimitPerUID TestReadsChargedToShare TestShareExhaustionIsolatedPerUID

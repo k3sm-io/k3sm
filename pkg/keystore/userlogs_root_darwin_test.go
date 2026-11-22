@@ -114,6 +114,20 @@ func TestAppendOnlyFlagHoldsAsRoot(t *testing.T) {
 			_, err := unix.Pwrite(rw, []byte("XXXXX"), 0)
 			return err
 		}},
+		{"F_SETFL clearing O_APPEND", func(t *testing.T) error {
+			needRW(t)
+			fl, err := unix.FcntlInt(uintptr(rw), unix.F_GETFL, 0)
+			if err != nil {
+				return err
+			}
+			_, err = unix.FcntlInt(uintptr(rw), unix.F_SETFL, fl&^unix.O_APPEND)
+			return err
+		}},
+		{"pwrite at offset 0 after the F_SETFL attempt", func(t *testing.T) error {
+			needRW(t)
+			_, err := unix.Pwrite(rw, []byte("XXXXX"), 0)
+			return err
+		}},
 		{"pwrite at offset 3 through O_RDWR|O_APPEND", func(t *testing.T) error {
 			needRW(t)
 			_, err := unix.Pwrite(rw, []byte("XXXXX"), 3)
