@@ -437,17 +437,17 @@ check U4 "the first-Put mint refuses with .user present and the master missing" 
 	TestMintCountsReservedUserName
 check U5 "Rewrap refuses with ErrScopeUnsupported, writing nothing, while .user exists as a directory, a file or a symlink" \
 	TestRewrapRefusesWhileUserScopesExist
-pend U6 "scope.key is sealed under W, bound to the GeneratedUID; a mismatch is ErrScopeOwnerChanged (user scopes)" \
+check U6 "scope.key is sealed under W, bound to the GeneratedUID; a mismatch is ErrScopeOwnerChanged" \
 	TestScopeKeyGeneratedUIDMismatch
-pend U7 "the GeneratedUID lookup past its deadline, 250 ms everywhere, or in error fails closed; mbr_uid_to_uuid is in the symbol canary (user scopes)" \
+check U7 "the GeneratedUID lookup past its deadline, 250 ms everywhere, or in error fails closed; mbr_uid_to_uuid is in the symbol canary" \
 	TestGeneratedUIDLookupDeadlineFailsClosed k3sm/internal/hostacl::TestMbrUIDToUUIDSymbolCanary
-pend U8 "a scope's records open only under its K_u; a copied .user/<uid>/ without the master opens nothing (user scopes)" \
+check U8 "a scope's records open only under its K_u; a copied .user/<uid>/ without the master opens nothing" \
 	TestScopeCopyWithoutMasterOpensNothing
-pend U9 "per-scope fingerprints differ for equal values in two scopes (user scopes)" \
+check U9 "per-scope fingerprints differ for equal values in two scopes" \
 	TestFingerprintsDifferAcrossScopes
-pend U10 "user/<other>/... is ErrNotFound, same text as an absent entry; a short name resolves to the uid and is printed (user scopes)" \
+check U10 "user/<other>/... is ErrNotFound, same text as an absent entry; a short name resolves to the uid and is printed" \
 	TestOtherUserIsNotFound TestShortNameResolvesToUID
-pend U11 "the Go resolver and Phase A's checkName pass the shared entry-grammar vectors; pkg/keystore imports no Kubernetes package (user scopes)" \
+check U11 "the Go resolver and Phase A's checkName pass the shared entry-grammar vectors; pkg/keystore imports no Kubernetes package" \
 	TestEntryGrammarVectorsResolver TestEntryGrammarVectorsCheckName TestCheckScopeRefusesUserZero TestAllDigitSegmentIsAlwaysUID TestKeystoreIsKubernetesFree
 pend U12 "master Rewrap re-wraps every scope.key and leaves user records byte-identical; resumable at every step, by fault injection as G12 (user-scope store)" \
 	TestRewrapRewrapsScopeKeysResumable
