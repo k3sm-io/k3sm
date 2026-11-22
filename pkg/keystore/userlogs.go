@@ -234,9 +234,11 @@ func (s *FileStore) LogSizes(ctx context.Context) (LogSizes, error) {
 // appendLog is one append-only log and what has been read of it: the
 // sizes of the lines that start past the hard cap, per uid, which is how
 // much of each uid's revocation budget is spent, and for the floor the
-// highest seq per key. What was read is kept for one file (dev, ino) and is
-// read on from where it stopped; a different file, or a shorter one, is
-// read again from the start.
+// highest seq per key. What was read is kept for one file (dev, ino and
+// birth time) and is read on from where it stopped, once the last whole line
+// parsed still reads back the same; a different file, a shorter one, one
+// whose last parsed line changed, or one whose flag was seen clear, is read
+// again from the start.
 type appendLog struct {
 	s    *FileStore
 	name string
@@ -264,6 +266,7 @@ type appendLog struct {
 // logState is what has been read of one file.
 type logState struct {
 	dev, ino uint64
+	birth    unix.Timespec
 	// hardCap and bound are the hard cap and logReadBound it was read
 	// under.
 	hardCap, bound int64
@@ -271,6 +274,12 @@ type logState struct {
 	keys int
 	// off is where reading stopped: just past the last whole line read.
 	off int64
+	// lastAt and last are the start and bytes, its newline included, of the
+	// last whole line parsed: sync reads them again before it uses the
+	// state, and reads the file from the start when they changed. A line is
+	// at most maxLogLine bytes, so last is too.
+	lastAt int64
+	last   []byte
 	// pastCap is each uid's bytes in lines that start at or past hardCap.
 	pastCap map[uint32]int64
 	// maxSeq is the floor's highest seq per key, and buried its tombstones.
@@ -366,6 +375,21 @@ func (s *FileStore) judgeLog(f *os.File, st *unix.Stat_t) error {
 	return nil
 }
 
+// forgetUnflagged drops what was read when err is a log seen with its
+// SF_APPEND flag clear: while it was clear the file could have been
+// rewritten anywhere, so it is read again from the start once the flag is
+// back. held reports whether the caller holds l.mu.
+func (l *appendLog) forgetUnflagged(err error, held bool) {
+	if !errors.Is(err, errLogNotAppendOnly) {
+		return
+	}
+	if !held {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+	}
+	l.state = logState{}
+}
+
 // sync reads f (which st describes) on from where reading stopped, under
 // l.mu, and returns the state. A line that does not parse is state.bad,
 // which sticks; a read I/O error is errLogUnreadable, returned and not
@@ -373,8 +397,27 @@ func (s *FileStore) judgeLog(f *os.File, st *unix.Stat_t) error {
 func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 	s := &l.state
 	bound := l.s.logReadBound()
-	if s.dev != uint64(st.Dev) || s.ino != st.Ino || s.hardCap != l.s.logHardCap || s.bound != bound || st.Size < s.off {
-		*s = logState{dev: uint64(st.Dev), ino: st.Ino, hardCap: l.s.logHardCap, bound: bound, pastCap: map[uint32]int64{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
+	var src io.ReaderAt = f
+	if l.readAt != nil {
+		src = l.readAt(f)
+	}
+	fresh := func() {
+		*s = logState{dev: uint64(st.Dev), ino: st.Ino, birth: logBirth(&st), hardCap: l.s.logHardCap, bound: bound, pastCap: map[uint32]int64{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
+	}
+	if s.pastCap == nil || s.dev != uint64(st.Dev) || s.ino != st.Ino || s.birth != logBirth(&st) || s.hardCap != l.s.logHardCap || s.bound != bound || st.Size < s.off {
+		fresh()
+	} else if len(s.last) > 0 {
+		// The same file at the same or a larger size can still have been
+		// rewritten in place: the last line parsed must read back.
+		got := make([]byte, len(s.last))
+		n, err := src.ReadAt(got, s.lastAt)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, s.lastAt, err)
+		}
+		// A short read is a file that no longer holds the line.
+		if !bytes.Equal(got[:n], s.last) {
+			fresh()
+		}
 	}
 	if s.bad != nil || st.Size == s.off {
 		return s, nil
@@ -393,10 +436,6 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		// The first line past the cap starts after the newline at or after
 		// hardCap-1.
 		start = s.hardCap - 1
-	}
-	var src io.ReaderAt = f
-	if l.readAt != nil {
-		src = l.readAt(f)
 	}
 	r := bufio.NewReaderSize(io.NewSectionReader(src, start, st.Size-start), 64<<10)
 	off := start
@@ -441,6 +480,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		if off >= s.hardCap && uid != 0 {
 			s.pastCap[uid] += int64(len(line))
 		}
+		s.lastAt, s.last = off, line
 		off += int64(len(line))
 	}
 	s.off = off
@@ -479,6 +519,7 @@ func readLogLine(r *bufio.Reader) ([]byte, error) {
 func (l *appendLog) room(uid uint32, revoke bool) error {
 	f, st, err := l.open(unix.O_RDONLY)
 	if err != nil {
+		l.forgetUnflagged(err, false)
 		return nil
 	}
 	defer func() { _ = f.Close() }() // read-only
@@ -522,6 +563,7 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 	}
 	f, st, err := l.open(unix.O_WRONLY | unix.O_APPEND)
 	if err != nil {
+		l.forgetUnflagged(err, false)
 		return err
 	}
 	defer func() { _ = f.Close() }() // each append is fsynced below
@@ -537,6 +579,7 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 		}
 		r, rst, err := l.open(unix.O_RDONLY)
 		if err != nil {
+			l.forgetUnflagged(err, true)
 			return err
 		}
 		defer func() { _ = r.Close() }() // read-only
@@ -648,6 +691,7 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 func (f *fileFloorLog) read(fn func(*logState)) error {
 	file, st, err := f.log.open(unix.O_RDONLY)
 	if err != nil {
+		f.log.forgetUnflagged(err, false)
 		return err
 	}
 	defer func() { _ = file.Close() }() // read-only
