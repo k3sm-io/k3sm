@@ -584,16 +584,26 @@ func TestRewrapKeyReuse(t *testing.T) {
 	})
 }
 
-// TestRewrapRefusesWhileUserScopesExist: the entries' directory name reserved
-// for user scopes, whatever its type, makes Rewrap refuse with
-// ErrScopeUnsupported, saying to upgrade, and write nothing.
-func TestRewrapRefusesWhileUserScopesExist(t *testing.T) {
+// TestRewrapRefusesDamagedUserScopes replaces U5's refusal (U12 re-wraps
+// scope keys): an empty .user directory no longer stops Rewrap, while a
+// .user that is a file or a symlink, which no user scope can be, refuses it
+// with ErrCorrupt, naming the path, and writes nothing.
+func TestRewrapRefusesDamagedUserScopes(t *testing.T) {
+	t.Run("an empty directory", func(t *testing.T) {
+		s, server := newTestStore(t)
+		vals := seedRewrap(t, s)
+		p := filepath.Join(server, "keystore", userScopesName)
+		if err := os.Mkdir(p, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		giveToService(t, p)
+		if err := s.Rewrap(context.Background(), rewrapKey(1)); err != nil {
+			t.Fatalf("Rewrap with an empty %s: %v", userScopesName, err)
+		}
+		checkMasterIs(t, server, rewrapKey(1))
+		checkRewrapValues(t, s, vals)
+	})
 	for name, plant := range map[string]func(t *testing.T, p string){
-		"directory": func(t *testing.T, p string) {
-			if err := os.Mkdir(p, 0o700); err != nil {
-				t.Fatal(err)
-			}
-		},
 		"file": func(t *testing.T, p string) { writeFile(t, p, "") },
 		"symlink": func(t *testing.T, p string) {
 			if err := os.Symlink("nowhere", p); err != nil {
@@ -607,13 +617,11 @@ func TestRewrapRefusesWhileUserScopesExist(t *testing.T) {
 			plant(t, filepath.Join(server, "keystore", userScopesName))
 			snap := treeSnapshot(t, filepath.Dir(server))
 			err := s.Rewrap(context.Background(), rewrapKey(1))
-			if !errors.Is(err, ErrScopeUnsupported) {
-				t.Fatalf("Rewrap with %s present: %v, want ErrScopeUnsupported", userScopesName, err)
+			if !errors.Is(err, ErrCorrupt) || !errors.Is(err, ErrRewrapNotStarted) {
+				t.Fatalf("Rewrap with %s a %s: %v, want ErrCorrupt before anything is written", userScopesName, name, err)
 			}
-			for _, want := range []string{"upgrade k3sm", "keystore/" + userScopesName, "root must remove it", filepath.Join(server, "keystore", userScopesName)} {
-				if !strings.Contains(err.Error(), want) {
-					t.Fatalf("Rewrap refusal %q does not say %q", err, want)
-				}
+			if !strings.Contains(err.Error(), "keystore/"+userScopesName) {
+				t.Fatalf("Rewrap refusal %q does not name keystore/%s", err, userScopesName)
 			}
 			checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
 			checkRewrapValues(t, s, vals)
@@ -786,21 +794,7 @@ func TestRewrapGuards(t *testing.T) {
 		}
 		checkRewrapValues(t, s, vals)
 	})
-	t.Run("user scopes on a store with no lock file yet create nothing", func(t *testing.T) {
-		s, server := newTestStore(t)
-		if err := os.Mkdir(filepath.Join(server, "keystore"), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Mkdir(filepath.Join(server, "keystore", userScopesName), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		giveToService(t, filepath.Join(server, "keystore"), filepath.Join(server, "keystore", userScopesName))
-		snap := treeSnapshot(t, filepath.Dir(server))
-		if err := s.Rewrap(ctx, rewrapKey(1)); !errors.Is(err, ErrScopeUnsupported) {
-			t.Fatalf("Rewrap: %v, want ErrScopeUnsupported", err)
-		}
-		checkTreeUnchanged(t, snap, treeSnapshot(t, filepath.Dir(server)))
-	})
+
 	t.Run("a master.next its fingerprint does not match is no fallback key", func(t *testing.T) {
 		s, server := newTestStore(t)
 		seedRewrap(t, s)
@@ -850,49 +844,6 @@ func TestRewrapRefusesLiveMasterFirst(t *testing.T) {
 	if _, err := os.Lstat(masterPath(server, masterNextFingerprintName)); err != nil {
 		t.Fatalf("master.next.sha256 was removed: %v", err)
 	}
-}
-
-// TestRewrapUserScopesBeforeSwap: a .user created while a Rewrap runs stops
-// it before the master swap with ErrScopeUnsupported. The master is left as
-// it was, master.next is left agreeing, every record reads, and once .user is
-// gone a rerun with the same key completes the Rewrap.
-func TestRewrapUserScopesBeforeSwap(t *testing.T) {
-	ctx := context.Background()
-	s, server := newTestStore(t)
-	vals := seedRewrap(t, s)
-	old, err := os.ReadFile(masterPath(server, masterName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	user := filepath.Join(server, "keystore", userScopesName)
-	s.step = func(name string) error {
-		if name == "rename b/current" { // the last commit step
-			if err := os.Mkdir(user, 0o700); err != nil {
-				t.Error(err)
-			}
-		}
-		return nil
-	}
-	if err := s.Rewrap(ctx, rewrapKey(1)); !errors.Is(err, ErrScopeUnsupported) {
-		t.Fatalf("Rewrap with %s created before the swap: %v, want ErrScopeUnsupported", userScopesName, err)
-	}
-	s.step = func(string) error { return nil }
-	if now, _ := os.ReadFile(masterPath(server, masterName)); !bytes.Equal(now, old) {
-		t.Fatalf("master = %x, want the old master left in place", now)
-	}
-	if got, err := os.ReadFile(masterPath(server, masterNextName)); err != nil || !bytes.Equal(got, rewrapKey(1)) {
-		t.Fatalf("master.next = %x, %v; want the new key left for the rerun", got, err)
-	}
-	checkRewrapValues(t, s, vals)
-	if err := os.Remove(user); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Rewrap(ctx, rewrapKey(1)); err != nil {
-		t.Fatalf("Rewrap rerun with the same key: %v", err)
-	}
-	checkMasterIs(t, server, rewrapKey(1))
-	checkUnderKey(t, server, rewrapKey(1))
-	checkRewrapValues(t, s, vals)
 }
 
 // TestRewrapRecoversReplacedNext: when master.next is replaced or removed
@@ -1064,47 +1015,6 @@ func TestRewrapCommitChecksMetadata(t *testing.T) {
 	}
 }
 
-// TestRewrapUserScopesUnderLock: a .user created after the check before the
-// lock, while the lock is taken, is refused by the check under it with
-// ErrScopeUnsupported, and nothing is written but the lock file whose
-// creation stands in for that window.
-func TestRewrapUserScopesUnderLock(t *testing.T) {
-	s, server := newTestStore(t)
-	vals := seedRewrap(t, s)
-	lock := filepath.Join(server, "keystore", lockName)
-	user := filepath.Join(server, "keystore", userScopesName)
-	// With no lock file, taking the lock creates it and chowns it.
-	if err := os.Remove(lock); err != nil {
-		t.Fatal(err)
-	}
-	chown, made := s.chown, false
-	s.chown = func(f *os.File, uid, gid int) error {
-		if !made && filepath.Base(f.Name()) == lockName {
-			made = true
-			if err := os.Mkdir(user, 0o700); err != nil {
-				return err
-			}
-		}
-		return chown(f, uid, gid)
-	}
-	snap := treeSnapshot(t, filepath.Dir(server))
-	if err := s.Rewrap(context.Background(), rewrapKey(1)); !errors.Is(err, ErrScopeUnsupported) {
-		t.Fatalf("Rewrap with %s created under the lock: %v, want ErrScopeUnsupported", userScopesName, err)
-	}
-	if !made {
-		t.Fatal("the lock file was not created, so .user was not planted")
-	}
-	after := treeSnapshot(t, filepath.Dir(server))
-	delete(after, lock)
-	delete(after, user)
-	checkTreeUnchanged(t, snap, after)
-	s.chown = chown
-	if err := os.Remove(user); err != nil {
-		t.Fatal(err)
-	}
-	checkRewrapValues(t, s, vals)
-}
-
 // TestInterruptedRewrap: InterruptedRewrap reports the fingerprint a crashed
 // Rewrap recorded, SHA-256 of its key, from a crash after master.next.sha256
 // lands through one between the two master renames, and nothing for a store
@@ -1215,12 +1125,10 @@ func TestRewrapNotStarted(t *testing.T) {
 			}
 			return s, live
 		},
-		"user scopes": func(t *testing.T) (*FileStore, []byte) {
+		"a user-scope directory that is a file": func(t *testing.T) (*FileStore, []byte) {
 			s, server := newTestStore(t)
 			seedRewrap(t, s)
-			if err := os.Mkdir(filepath.Join(server, "keystore", userScopesName), 0o700); err != nil {
-				t.Fatal(err)
-			}
+			writeFile(t, filepath.Join(server, "keystore", userScopesName), "")
 			return s, rewrapKey(1)
 		},
 		"an entry that does not open": func(t *testing.T) (*FileStore, []byte) {

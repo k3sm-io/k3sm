@@ -96,7 +96,7 @@ func (s *FileStore) loadMaster() (keys, error) {
 		return keys{}, err
 	}
 	if next, nerr := s.readNext(root); nerr == nil {
-		nk, derr := deriveKeys(next, s.scope)
+		nk, derr := deriveMasterKeys(next, s.scope)
 		clear(next)
 		if derr == nil {
 			k.next = &nk

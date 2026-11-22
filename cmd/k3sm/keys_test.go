@@ -1088,11 +1088,11 @@ func TestKeysRewrap(t *testing.T) {
 		want   error
 		say    string
 	}{
-		{"scope unsupported", func(t *testing.T, h *keysHarness) {
-			if err := os.Mkdir(filepath.Join(h.keystoreDir(), ".user"), 0o700); err != nil {
+		{"a user-scope directory that is not one", func(t *testing.T, h *keysHarness) {
+			if err := os.WriteFile(filepath.Join(h.keystoreDir(), ".user"), nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
-		}, keystore.ErrScopeUnsupported, "keystore/.user"},
+		}, keystore.ErrCorrupt, "keystore/.user"},
 		{"an entry that does not open", func(t *testing.T, h *keysHarness) { h.damageRecord("a", "v1") }, keystore.ErrCorrupt, "rm"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

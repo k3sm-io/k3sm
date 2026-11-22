@@ -463,8 +463,8 @@ check G10 "the master is minted only by the first put, never over entries; rewra
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 check G12 "Rewrap resumes after a crash at every step, old key then new, nothing unreadable; a bad master.next is discarded only with no .new file" \
 	TestRewrapCrashAtEveryStep TestRewrapKeyReuse TestRewrapRefusesStalePointer TestRewrapVerifiesCommit TestRewrapGuards \
-	TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap TestRewrapRecoversReplacedNext \
-	TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata TestRewrapUserScopesUnderLock \
+	TestRewrapRefusesLiveMasterFirst TestRewrapRecoversReplacedNext \
+	TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata \
 	TestInterruptedRewrap TestRecordsSealedUnder TestRewrapNotStarted
 check G13 "a crash between the master renames leaves a trusted master, and the next verb completes the swap" \
 	TestRewrapMasterRenameCompleted TestFinishSwapLeavesUnmatchedFingerprint
@@ -514,8 +514,8 @@ check U3 "KDF labels take the scope; checkScope accepts only system and user/<de
 	TestDerivedKeysDifferByScope TestCheckScope TestParseRecordRefusesMalformed
 check U4 "the first-Put mint refuses with .user present and the master missing" \
 	TestMintCountsReservedUserName
-check U5 "Rewrap refuses with ErrScopeUnsupported, writing nothing, while .user exists as a directory, a file or a symlink" \
-	TestRewrapRefusesWhileUserScopesExist
+check U5 "replaced by U12: Rewrap no longer refuses with ErrScopeUnsupported while .user exists; a .user that is a file or a symlink refuses with ErrCorrupt, writing nothing" \
+	TestRewrapRefusesDamagedUserScopes
 check U6 "scope.key is sealed under W, bound to the GeneratedUID; a mismatch is ErrScopeOwnerChanged" \
 	TestScopeKeyGeneratedUIDMismatch
 check U7 "the GeneratedUID lookup past its deadline, 250 ms everywhere, or in error fails closed; mbr_uid_to_uuid is in the symbol canary" \
