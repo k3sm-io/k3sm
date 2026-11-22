@@ -431,6 +431,11 @@ func TestLogHardCapRefusesMutations(t *testing.T) {
 	checkEntryGone(t, server, "second")
 	// Spend the rest of uid 1001's budget in the audit log; its next
 	// revocation is refused and changes nothing.
+	spend, err := marshalAuditLine(auditLine{op: "rm", scope: "user/1001", name: "token", result: "ok"}, s.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendLogBytes(t, s, auditLogName, bytes.Repeat(spend, 2*maxLogLine/len(spend)+1))
 	auditUsed := int64(len(readLog(t, s, auditLogName))) - max(s.logHardCap, sizes.Audit)
 	s.logRevokeBudget = auditUsed + maxLogLine - 1
 	if err := u.withdrawDelivery(ctx, testDelivery(2).uid); !errors.Is(err, ErrLogFull) {

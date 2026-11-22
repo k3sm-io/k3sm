@@ -76,9 +76,15 @@ const (
 	// The cap defaults (docs/design/keystore.md § "Size caps"), and the
 	// per-uid revocation budget the revocation class draws on past the hard
 	// cap (the socket margin of "Per-uid fairness").
-	defaultLogSoftCap         = 64 << 20
-	defaultLogHardCap         = 256 << 20
-	defaultLogRevocationBytes = 64 << 10
+	defaultLogSoftCap = 64 << 20
+	defaultLogHardCap = 256 << 20
+	// defaultLogRevocationBytes holds one scope's full revocation: each of
+	// maxScopeEntries entries rm'd under the longest scope
+	// (user/2147483647) and a 253-byte name, a 306-byte floor tombstone
+	// and an rm audit line of at most 384 bytes (the longest result and a
+	// full RFC3339Nano timestamp), 256 × (306 + 384) = 176,640 bytes,
+	// rounded up to 192 KiB (TestDefaultRevocationBudgetHoldsFullRevocation).
+	defaultLogRevocationBytes = 192 << 10
 
 	// The reader's bounds (docs/design/keystore.md § "Size caps"). A log
 	// is read whole, and the service user can append to it without limit,
@@ -90,12 +96,13 @@ const (
 	logBoundMargin = 1 << 20
 	// maxFloorKeysCeiling is the absolute ceiling on the floor's key bound,
 	// whatever the caps are configured to: what bounds the reader's memory.
-	// At the default caps the size alone would allow about 7.3M keys. The
+	// At the default caps the size alone would allow about 10.2M keys. The
 	// reader's worst case at this ceiling plus the revocation headroom
 	// (278,528 keys), read from scratch on an M1 Ultra: 253-byte names and
 	// the longest scope, about 128 MiB of heap and 0.41 s
-	// (BenchmarkFloorReadLongNames); the most lines the size bound holds,
-	// about 7.3M, about 69 MiB and 3.9 s (BenchmarkFloorReadLineCount). At
+	// (BenchmarkFloorReadLongNames); the most lines the size bound held at
+	// a 64 KiB revocation budget, about 7.3M, about 69 MiB and 3.9 s
+	// (BenchmarkFloorReadLineCount), about 5.5 s scaled to today's 10.2M. At
 	// 1<<20 the long-name case held about 494 MiB, so the ceiling was
 	// lowered to stay under 200 MiB (docs/design/keystore.md § "Size caps").
 	maxFloorKeysCeiling = 1 << 18
@@ -1440,12 +1447,19 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 // errLogBoundsBelowLog refuses, at store open, a configuration whose
 // reader's bounds sit below what an existing log already holds: under it the
 // log would read as damage and refuse every user-scope operation.
+// errLogRevokeBudgetSpent is a configuration under which a uid's lines past
+// the hard cap already spend its revocation budget, so its next revocation
+// would be refused: root-only, refused at store open.
+var errLogRevokeBudgetSpent = errors.New("the configured log caps leave a uid's revocation budget already spent past the hard cap, so its revocations would be refused; configure the caps the log was written under, or restore the caps and rotate the audit log (sudo k3sm keys audit --rotate, which is not yet available: until it is, restore the log from a backup and run sudo k3sm doctor)")
+
 var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's bounds below what an existing append-only log already holds, so it would read as damage; configure the caps the log was written under, or run sudo k3sm keys floor --rebuild or sudo k3sm keys audit --rotate")
 
 // CheckLogBounds refuses, as errInvalidConfig and errLogBoundsBelowLog, a
 // configuration whose reader's bounds sit below what an existing log
 // already holds: a log larger than logReadBound, or a floor with more keys
-// than the reader's key bound. It is the server's store-open check, and its
+// than the reader's key bound; and, as errLogRevokeBudgetSpent, one under
+// which a uid's lines past the hard cap in either log already exceed its
+// revocation budget, which would silently refuse its revocations. It is the server's store-open check, and its
 // error, which names the current figures, is root's alone: it never reaches
 // the socket. A log that does not open is left to each operation's own
 // judgement.
@@ -1477,13 +1491,18 @@ func (s *FileStore) CheckLogBounds(ctx context.Context) error {
 			if st.Size > bound {
 				return fmt.Errorf("%w: %w (%s is %d bytes, over the reader's bound of %d)", errInvalidConfig, errLogBoundsBelowLog, log.name, st.Size, bound)
 			}
-			if log.addsKey == nil {
-				return nil
-			}
 			log.mu.Lock()
 			defer log.mu.Unlock()
 			state, err := log.sync(f, st)
 			if err != nil {
+				return nil
+			}
+			for uid, n := range state.pastCap {
+				if uid != 0 && n > s.logRevokeBudget {
+					return fmt.Errorf("%w: %w (uid %d has %d bytes past the hard cap in %s, over its budget of %d)", errInvalidConfig, errLogRevokeBudgetSpent, uid, n, log.name, s.logRevokeBudget)
+				}
+			}
+			if log.addsKey == nil {
 				return nil
 			}
 			// A state read under a larger key bound is judged by its count.

@@ -48,7 +48,7 @@ func TestUserRmRemovalFailureIsCommitted(t *testing.T) {
 func TestUserRmChargesEveryTombstone(t *testing.T) {
 	s, _, u := fileLogScope(t)
 	var b []byte
-	for i := range 30 {
+	for i := range 60 {
 		line, err := floorLine("user/1001", "token", guid(byte(0x40+i)), 1)
 		if err != nil {
 			t.Fatal(err)
@@ -61,7 +61,7 @@ func TestUserRmChargesEveryTombstone(t *testing.T) {
 	}
 	before := readLog(t, s, userFloorLogName)
 	s.logSoftCap, s.logHardCap = int64(len(before)), int64(len(before))
-	s.logRevokeBudget = maxLogLine + 100
+	s.logRevokeBudget = 2 * maxLogLine
 	err := u.Delete(context.Background(), "user/1001/token")
 	if !errors.Is(err, ErrLogFull) || errors.Is(err, errCommitted) {
 		t.Fatalf("rm with budget for fewer tombstones than it needs: %v, want ErrLogFull before any", err)

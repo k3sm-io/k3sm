@@ -232,6 +232,10 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: DataRoot is empty", errInvalidConfig)
 	case s.logSoftCap < 0 || s.logHardCap < 0 || s.logRevokeBudget < 0:
 		return fmt.Errorf("%w: a log cap or budget is negative", errInvalidConfig)
+	case s.logRevokeBudget < 2*maxLogLine:
+		// A budget under two whole lines refuses a revocation's line and
+		// its audit line, so it would silently disable revocation.
+		return fmt.Errorf("%w: LogRevocationBudget %d is under two log lines, %d", errInvalidConfig, s.logRevokeBudget, 2*maxLogLine)
 	case s.logSoftCap > s.logHardCap:
 		return fmt.Errorf("%w: LogSoftCap %d is over LogHardCap %d", errInvalidConfig, s.logSoftCap, s.logHardCap)
 	case s.logHardCap > maxLogHardCap || s.logRevokeBudget > maxLogRevokeBudget:
