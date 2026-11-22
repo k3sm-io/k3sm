@@ -20,6 +20,10 @@ package keystore
 
 import "errors"
 
+// generatedUIDIsReal reports that this build has no GeneratedUID lookup: a
+// darwin build without cgo fails TestGeneratedUIDLookupIsRealOnDarwin.
+const generatedUIDIsReal = false
+
 // realGeneratedUID has no GeneratedUID to read off macOS or without cgo, so
 // every user scope fails closed with ErrScopeOwnerUnknown.
 func realGeneratedUID(uint32) ([generationSize]byte, error) {

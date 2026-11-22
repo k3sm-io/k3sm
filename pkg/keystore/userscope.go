@@ -24,6 +24,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"syscall"
 
 	keyentry "k3sm.io/apis/keystore/entry"
 )
@@ -443,6 +444,12 @@ func (u *UserScope) readScopeKey(dir *os.Root, wrap func() ([]byte, error)) ([]b
 	}
 	if err := u.s.checkOwned(fi, fileMode); err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeKeyName, err)
+	}
+	// scope.key is only ever written by rename, so it has one link; a second
+	// one keeps a copy the store does not know of, which a later re-seal of
+	// the key would leave behind.
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Nlink != 1 {
+		return nil, fmt.Errorf("%w: %s has more than one link", ErrCorrupt, scopeKeyName)
 	}
 	r, err := parseScopeKey(b)
 	if err != nil {
