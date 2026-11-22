@@ -329,20 +329,39 @@ func shapeOf(fi fs.FileInfo) string {
 	return "a special file"
 }
 
+// maxTreeGenerations caps the distinct generations, beyond the floor's live
+// ones, that one rm buries on the word of the tree alone: the generation
+// file's, the pointer header's and the v<N> headers', none authenticated.
+// Without it a tree-writer could plant a v<N> per generation and spend the
+// floor's revocation headroom through one rm.
+const maxTreeGenerations = 4
+
 // burial is the generations rm buries for one name, and the source that
 // named each.
 type burial struct {
 	name    string
 	gens    [][generationSize]byte
 	sources []string
+	// floor is the floor's live generations, and pointer the pointer
+	// header's, when it read.
+	floor   [][generationSize]byte
+	pointer *[generationSize]byte
+	// capped is set when the tree named more than maxTreeGenerations
+	// generations beyond floor: gens is then floor and pointer alone.
+	capped bool
 }
 
 func newBurial(name string, live [][generationSize]byte) *burial {
-	b := &burial{name: name}
+	b := &burial{name: name, floor: live}
 	for _, g := range live {
 		b.add("the floor", g)
 	}
 	return b
+}
+
+// treeOnly is how many of gens the floor does not hold live.
+func (b *burial) treeOnly() int {
+	return len(b.gens) - len(b.floor)
 }
 
 func (b *burial) add(source string, g [generationSize]byte) {
@@ -356,12 +375,31 @@ func (b *burial) add(source string, g [generationSize]byte) {
 // pointer header's and each v<N> record header's, the headers parsed
 // without a key. A source that does not read or parse adds nothing, since a
 // tree a crashed Put left has no pointer.
+//
+// Past maxTreeGenerations distinct generations beyond the floor's live ones
+// it stops reading and keeps only the floor's and the pointer header's
+// (capped).
 func (b *burial) addTree(e *entry, name string) {
+	if g, ok := headerGeneration(e.root, currentName, name, true); ok {
+		b.pointer = &g
+	}
+	defer func() {
+		if b.treeOnly() <= maxTreeGenerations {
+			return
+		}
+		b.capped, b.gens, b.sources = true, nil, nil
+		for _, g := range b.floor {
+			b.add("the floor", g)
+		}
+		if b.pointer != nil {
+			b.add("the pointer header", *b.pointer)
+		}
+	}()
 	if g, err := readGeneration(e.root); err == nil {
 		b.add("the generation file", g)
 	}
-	if g, ok := headerGeneration(e.root, currentName, name, true); ok {
-		b.add("the pointer header", g)
+	if b.pointer != nil {
+		b.add("the pointer header", *b.pointer)
 	}
 	files, err := readDirNames(e.root, maxDirNames)
 	if err != nil {
@@ -375,6 +413,9 @@ func (b *burial) addTree(e *entry, name string) {
 	}
 	slices.Sort(vs)
 	for _, n := range vs {
+		if b.treeOnly() > maxTreeGenerations {
+			return
+		}
 		if g, ok := headerGeneration(e.root, versionName(n), name, false); ok {
 			b.add(versionName(n)+"'s header", g)
 		}
@@ -401,6 +442,9 @@ func (b *burial) bury(u *UserScope) error {
 // since the tree was altered. An rm with no generation to bury never
 // commits (errRmNoGeneration).
 func (b *burial) report() error {
+	if b.capped {
+		return fmt.Errorf("the entry's tree named more than %d generations beyond the floor's live ones, so it was altered; rm buried the floor's live generations and the pointer header's, and removed it", maxTreeGenerations)
+	}
 	if len(b.gens) > 1 {
 		return fmt.Errorf("the entry's generations disagree (%s), so its tree was altered; rm buried every one", strings.Join(b.sources, ", "))
 	}
