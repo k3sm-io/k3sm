@@ -364,7 +364,7 @@ func parseFloor(b []byte) (floor, error) {
 // floorLock is the floor held under its lock, which every floor write
 // takes: lock is keystore-lock in the data root, opened O_RDONLY|O_NOFOLLOW|
 // O_NONBLOCK, judged on that descriptor, flocked, and checked again after the
-// flock to be the one file at that name; locked the data root's
+// flock to be the file at that name; locked the data root's
 // info, judged on its own descriptor; and root the os.Root the floor is read
 // and written through, checked to be the same directory.
 //
@@ -480,19 +480,22 @@ func (s *FileStore) lockFloor(ctx context.Context) (*floorLock, floor, error) {
 
 // recheckFloorLock refuses (errFloorUntrusted) the flocked keystore-lock f
 // unless the name, Lstat'd again through root, the data root f was opened in,
-// is still the file f holds, and that file has one link: a name replaced, or
-// a second name for the file, would let two writers lock different files.
+// is still the file f holds: a name replaced after the open would let two
+// writers lock different files. The link count is not judged: macOS lets any
+// local user hard-link a file it cannot read (it has no protected_hardlinks),
+// so refusing a second link would let anyone block every floor verb, and a
+// link elsewhere is the same inode, which changes nothing about the lock.
 func recheckFloorLock(root *os.Root, f *os.File) error {
 	held, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("the keystore floor: %w", err)
 	}
 	named, err := root.Lstat(floorLockName)
-	if err != nil || !os.SameFile(held, named) {
-		return fmt.Errorf("%w: %s was replaced while it was locked (%v)", errFloorUntrusted, floorLockName, err)
+	if err != nil {
+		return fmt.Errorf("%w: %s was replaced while it was locked: %w", errFloorUntrusted, floorLockName, err)
 	}
-	if st, ok := held.Sys().(*syscall.Stat_t); !ok || st == nil || st.Nlink != 1 {
-		return fmt.Errorf("%w: %s has more than one link", errFloorUntrusted, floorLockName)
+	if !os.SameFile(held, named) {
+		return fmt.Errorf("%w: %s was replaced while it was locked", errFloorUntrusted, floorLockName)
 	}
 	return nil
 }

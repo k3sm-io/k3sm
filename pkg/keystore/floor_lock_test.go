@@ -302,26 +302,29 @@ func TestFloorLockFileUntrustedRefused(t *testing.T) {
 
 // TestFloorLockFileRecheckedAfterFlock: once keystore-lock is flocked, it is
 // Lstat'd again through the data root it was opened in, and the verb refuses
-// (errFloorUntrusted) a name that no longer holds the locked file or a file
-// with a second hard link, either of which would let two writers lock
-// different files, or one lock under two names.
+// (errFloorUntrusted) a name that no longer holds the locked file, which
+// would let two writers lock different files. Its link count is not judged:
+// macOS lets any local user hard-link a file it cannot read, so a refusal of
+// a second link would hand every user a lasting block on the floor verbs,
+// and a second link is the same inode, so it changes nothing about the lock.
 func TestFloorLockFileRecheckedAfterFlock(t *testing.T) {
 	ctx := context.Background()
 	lockPath := func(s *FileStore) string { return filepath.Join(s.dataRoot, floorLockName) }
-	t.Run("hard-linked", func(t *testing.T) {
+	t.Run("a hard link outside the data root blocks nothing", func(t *testing.T) {
 		s, server := newTestStore(t)
 		mustPut(t, s, "a", KindOpaque, []byte("a"))
-		before := floorOf(t, server)
-		if err := os.Link(lockPath(s), lockPath(s)+".link"); err != nil {
+		// t.TempDir is on the data root's volume, as the data root is
+		// another t.TempDir.
+		if err := os.Link(lockPath(s), filepath.Join(t.TempDir(), "held")); err != nil {
 			t.Fatal(err)
 		}
-		for op, fn := range floorVerbs(ctx, s) {
-			if err := fn(); !errors.Is(err, errFloorUntrusted) || !strings.Contains(err.Error(), floorLockName) {
-				t.Fatalf("%s over a hard-linked %s: %v, want errFloorUntrusted naming it", op, floorLockName, err)
+		for _, op := range []string{"Put", "Rotate", "RaiseFloor", "Rewrap", "Delete"} {
+			if err := floorVerbs(ctx, s)[op](); err != nil {
+				t.Fatalf("%s with a second link to %s: %v, want success", op, floorLockName, err)
 			}
 		}
-		if after := floorOf(t, server); !maps.Equal(after, before) {
-			t.Fatalf("floor after the refused verbs = %+v, was %+v", after, before)
+		if fl := floorOf(t, server); fl["b"].Seq != 1 {
+			t.Fatalf("floor b after the Put = %+v, want sequence 1", fl["b"])
 		}
 	})
 	t.Run("replaced after the open", func(t *testing.T) {
