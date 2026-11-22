@@ -375,6 +375,7 @@ func fingerprint(kind Kind, value []byte, fpKey []byte) string {
 		if err != nil {
 			return ""
 		}
+		defer clear(e.Credential.Seed)
 		fp, err := typed.SSHFingerprint(e.Credential.Seed)
 		if err != nil {
 			return ""

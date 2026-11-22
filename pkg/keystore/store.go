@@ -308,7 +308,8 @@ func existingKind(root *os.Root, name string, k keys, fl floor) Kind {
 	if err != nil {
 		return KindUnknown
 	}
-	v, _, err := e.version(k, cur)
+	v, val, err := e.version(k, cur)
+	clear(val) // only the kind is wanted
 	if err != nil {
 		return KindUnknown
 	}
@@ -404,7 +405,12 @@ func (s *FileStore) Current(ctx context.Context, name string) (Version, []byte, 
 			return err
 		}
 		v, val, err = e.version(k, cur)
-		return rawOnly(v, err)
+		if err := rawOnly(v, err); err != nil {
+			clear(val) // a refused typed envelope never lingers
+			val = nil
+			return err
+		}
+		return nil
 	})
 	if err != nil {
 		return Version{}, nil, err
@@ -428,7 +434,12 @@ func (s *FileStore) Get(ctx context.Context, name string, version uint64) (Versi
 			return ErrVersionNotFound
 		}
 		v, val, err = e.version(k, version)
-		return rawOnly(v, err)
+		if err := rawOnly(v, err); err != nil {
+			clear(val) // a refused typed envelope never lingers
+			val = nil
+			return err
+		}
+		return nil
 	})
 	if err != nil {
 		return Version{}, nil, err
@@ -565,7 +576,8 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 	// The committed range is low..cur: versions below low were pruned.
 	out := Entry{Name: e.name, Versions: make([]Version, 0, cur-low+1)}
 	for n := low; n <= cur; n++ {
-		v, _, err := e.version(k, n)
+		v, val, err := e.version(k, n)
+		clear(val) // List carries metadata only
 		if err != nil {
 			return Entry{Name: e.name, Err: fmt.Errorf("version %d: %w", n, err)}
 		}

@@ -55,7 +55,9 @@ func (s *FileStore) putCredential(ctx context.Context, name string, kind Kind, e
 	}
 	// The envelope is checked before anything is locked, and sealed with
 	// the time the store takes it once it is.
-	if _, err := s.envelope(kind, e); err != nil {
+	probe, err := s.envelope(kind, e)
+	clear(probe)
+	if err != nil {
 		return Version{}, err
 	}
 	return s.putChecked(ctx, name, kind, func() ([]byte, error) { return s.envelope(kind, e) })
@@ -117,7 +119,9 @@ func (s *FileStore) RotateIf(ctx context.Context, name string, kind Kind, read V
 // rotateCredential is RotateCredential, and RotateIf when read is not nil.
 func (s *FileStore) rotateCredential(ctx context.Context, name string, kind Kind, read *Version, e typed.Envelope) (Version, error) {
 	v, err := func() (Version, error) {
-		if _, err := s.envelope(kind, e); err != nil {
+		probe, err := s.envelope(kind, e)
+		clear(probe)
+		if err != nil {
 			return Version{}, err
 		}
 		return s.rotate(ctx, name, func(en *entry, k keys, old Version) ([]byte, error) {
@@ -169,6 +173,8 @@ func sameRefreshOwner(en *entry, k keys, old Version, owner string) error {
 // from changing one. A
 // typed value keeps the issue time it was sealed with.
 func (s *FileStore) RotateFrom(ctx context.Context, name string, from uint64) (Version, error) {
+	var val []byte
+	defer func() { clear(val) }() // sealed by then, or refused
 	v, err := s.rotate(ctx, name, func(e *entry, k keys, old Version) ([]byte, error) {
 		if old.Kind == KindOAuth {
 			return nil, ErrFromVersionOAuth
@@ -176,7 +182,8 @@ func (s *FileStore) RotateFrom(ctx context.Context, name string, from uint64) (V
 		if from == 0 || from > old.Version {
 			return nil, ErrVersionNotFound
 		}
-		_, val, err := e.version(k, from)
+		var err error
+		_, val, err = e.version(k, from)
 		return val, err
 	})
 	if err != nil {

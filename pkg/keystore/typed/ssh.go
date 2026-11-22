@@ -69,6 +69,11 @@ func ImportSSH(pemBytes []byte) ([]byte, error) {
 		return nil, errSSHRefused
 	}
 	block, rest := pem.Decode(trimmed)
+	if block != nil {
+		// The decoded body holds the private key; only the shape check
+		// below reads it, and the parser decodes the PEM again itself.
+		defer clear(block.Bytes)
+	}
 	if block == nil || block.Type != openSSHBlockType || len(block.Headers) != 0 || len(bytes.TrimSpace(rest)) != 0 {
 		return nil, errSSHRefused
 	}
@@ -77,16 +82,33 @@ func ImportSSH(pemBytes []byte) ([]byte, error) {
 		return nil, errSSHRefused
 	}
 	key, ok := raw.(*ed25519.PrivateKey)
-	if !ok || len(*key) != ed25519.PrivateKeySize {
+	if !ok {
+		clearRawKey(raw)
 		return nil, errSSHRefused
 	}
-	seed := key.Seed()
+	defer clear(*key)
+	if len(*key) != ed25519.PrivateKeySize {
+		return nil, errSSHRefused
+	}
+	seed := key.Seed() // a copy, which the caller owns
 	// The parser checks the private half's length, not that its public half
 	// belongs to the seed; a key that disagrees with itself is refused.
-	if !bytes.Equal(ed25519.NewKeyFromSeed(seed), *key) {
+	again := ed25519.NewKeyFromSeed(seed)
+	defer clear(again)
+	if !bytes.Equal(again, *key) {
+		clear(seed)
 		return nil, errSSHRefused
 	}
 	return seed, nil
+}
+
+// clearRawKey zeroes what of a refused parsed key is a byte slice in our
+// hands: an ed25519 key by value. The parser's RSA and ECDSA keys hold
+// big.Int values, which cannot be zeroed through their API.
+func clearRawKey(raw any) {
+	if k, ok := raw.(ed25519.PrivateKey); ok {
+		clear(k)
+	}
 }
 
 // sshPublicKey returns the SSH public key of an ed25519 seed.
