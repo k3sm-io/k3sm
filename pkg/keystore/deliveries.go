@@ -24,8 +24,11 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 
 	"k3sm.io/apis/keystore/credential"
 	keyentry "k3sm.io/apis/keystore/entry"
@@ -254,8 +257,8 @@ func parseDeliveries(pt []byte) ([]delivery, error) {
 		if d.items, err = parseItemsBlob(blob); err != nil {
 			return nil, err
 		}
-		if e, err := ParseEntry(d.entry); err != nil || e.Scope != keyentry.ScopeUser {
-			return nil, fmt.Errorf("%w: a deliveries record entry names no user entry", ErrCorrupt)
+		if err := checkDeliveryFields(d); err != nil {
+			return nil, fmt.Errorf("%w: a deliveries record entry: %w", ErrCorrupt, err)
 		}
 		copy(d.digest[:], digest)
 		if d.digest != deliveryDigest(d.entry, d.namespace, d.secretName, d.items) {
@@ -328,29 +331,106 @@ func parseDeliveriesRecord(b []byte) (record, error) {
 	return r, nil
 }
 
-// checkDelivery validates a delivery the caller adds: every field within its
-// bound and grammar, the entry in the caller's own scope (else notFound, as
-// any other scope's name), and requestedBy the caller's own principal.
+// checkDelivery validates a delivery the caller adds: the entry in the
+// caller's own scope (else notFound, as any other scope's name), then every
+// field's grammar (checkDeliveryFields), which ties requestedBy to the
+// caller's own principal. No error carries a field's value.
 func (u *UserScope) checkDelivery(op string, d delivery) error {
 	if _, err := u.own(op, d.entry); err != nil {
 		return err
 	}
-	if d.requestedBy != requestedByPrefix+strconv.FormatUint(uint64(u.uid), 10) {
-		return fmt.Errorf("user scope %s: requestedBy must be %s%d", op, requestedByPrefix, u.uid)
-	}
-	for _, f := range []struct {
-		what string
-		v    string
-		max  int
-	}{{"uid", d.uid, maxDeliveryUIDLen}, {"name", d.name, maxObjectNameLen}, {"namespace", d.namespace, maxNamespaceLen}, {"secretName", d.secretName, maxSecretNameLen}} {
-		if f.v == "" || len(f.v) > f.max {
-			return fmt.Errorf("user scope %s: the delivery's %s is %d bytes, want 1 to %d", op, f.what, len(f.v), f.max)
-		}
+	if err := checkDeliveryFields(d); err != nil {
+		return fmt.Errorf("user scope %s: %w", op, err)
 	}
 	if _, err := parseItemsBlob(itemsBlob(d.items)); err != nil {
 		return fmt.Errorf("user scope %s: the delivery's items: %w", op, err)
 	}
 	return nil
+}
+
+// errDeliveryField is a delivery field outside its grammar, at add and at
+// parse alike.
+var errDeliveryField = errors.New("a delivery field is outside its grammar")
+
+// requestedByRE is the KeyDelivery's spec.requestedBy grammar.
+var requestedByRE = regexp.MustCompile(keyentry.RequestedByPattern)
+
+// checkDeliveryFields checks each field of d against the grammar its
+// KeyDelivery field has, so an add and a parse refuse the same records:
+// uid UUID-shaped; name a DNS-1123 subdomain (the entry name grammar);
+// entry a user entry; namespace a DNS-1123 label of at most 63 bytes;
+// secretName a DNS-1123 subdomain of at most 253; requestedBy matching
+// RequestedByPattern and equal to k3sm:local:<the entry's uid>; each item's
+// field in the credential Fields table and its key a ConfigMap key. The
+// error names the field, never its value.
+func checkDeliveryFields(d delivery) error {
+	bad := func(what string) error { return fmt.Errorf("%w: %s", errDeliveryField, what) }
+	if !uuidShaped(d.uid) {
+		return bad("uid (want a lowercase UUID)")
+	}
+	if checkName(d.name) != nil {
+		return bad("name (want a DNS-1123 subdomain)")
+	}
+	e, err := ParseEntry(d.entry)
+	if err != nil || e.Scope != keyentry.ScopeUser {
+		return bad("entry (want a user entry)")
+	}
+	if len(d.namespace) > maxNamespaceLen || !dnsLabel(d.namespace) {
+		return bad("namespace (want a DNS-1123 label of at most 63 characters)")
+	}
+	if len(d.secretName) > maxSecretNameLen || checkName(d.secretName) != nil {
+		return bad("secretName (want a DNS-1123 subdomain of at most 253 characters)")
+	}
+	if !requestedByRE.MatchString(d.requestedBy) || d.requestedBy != requestedByPrefix+strconv.FormatUint(uint64(e.UID), 10) {
+		return bad("requestedBy (want k3sm:local:<the entry's uid>)")
+	}
+	for _, it := range d.items {
+		if !slices.Contains(credential.Fields(), it.Field) {
+			return bad("item field (want a credential field)")
+		}
+		if !configMapKey(it.Key) {
+			return bad("item key (want a Secret data key)")
+		}
+	}
+	return nil
+}
+
+// uuidShaped reports whether s is 8-4-4-4-12 lowercase hex digits.
+func uuidShaped(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// configMapKey is the Kubernetes ConfigMap and Secret data-key rule, the
+// one pkg/keystore/deliver applies through apimachinery (this package
+// imports no Kubernetes package): 1 to 253 bytes of letters, digits, '-',
+// '_' and '.', not "." or "..", and not beginning "..".
+func configMapKey(k string) bool {
+	if k == "" || len(k) > maxItemKeyLen || k == "." || strings.HasPrefix(k, "..") {
+		return false
+	}
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 // openedScope is an opened user scope: the scope directory, its derived
@@ -465,6 +545,12 @@ func deliveriesKey(ku []byte, scope string) []byte {
 // scope on its first mutating operation. A UID already recorded is
 // ErrExists; a record with 64 live entries, or 320 in all, is ErrQuota.
 func (u *UserScope) addDelivery(ctx context.Context, d delivery) error {
+	if err := u.checkDelivery("deliver", d); err != nil {
+		// A refused add audits the placeholder: its fields are not known
+		// to be in their grammar.
+		_ = u.s.auditSink.append(auditLine{op: "deliver", scope: u.scope, name: auditPlaceholder, namespace: auditPlaceholder, result: auditResult(err)}) // already refused
+		return fail("deliver", err)
+	}
 	err := u.addDeliveryLocked(ctx, d)
 	if aerr := u.audit("deliver", d.entry, d.namespace, err); err == nil {
 		err = aerr
@@ -644,6 +730,10 @@ func (u *UserScope) audit(op, entry, namespace string, err error) error {
 	}
 	return nil
 }
+
+// auditPlaceholder stands in an audit line for a field that failed its
+// grammar: a line carries only validated fields.
+const auditPlaceholder = "-"
 
 // auditResult names an operation's outcome for its audit line.
 func auditResult(err error) string {
