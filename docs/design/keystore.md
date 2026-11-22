@@ -1299,10 +1299,30 @@ wrote: root would follow a hard link planted in it to an unrelated inode
 (`TestKeysRollbackRoundTrip`). The merge keeps every live record of
 the restored floor not buried above. The write is pruned as every floor write is, the per-name cap
 included, and each burial dropped is logged at Warn and reported. Only a burial the restored
-floor already held can be dropped: as Put and Rotate ask for room before they write, the merge
-first prunes its result on a copy, and when that would drop a burial the merge adds itself (a
-merged, retired or buried-live one) it refuses with the floor-full error, writing nothing and
-leaving its input in place, so the guard stays (`TestMergeFloorRefusesDroppingItsOwnBurials`). A
+floor already held before the guard can be dropped: as Put and Rotate ask for room before they
+write, the merge first prunes its result on a copy, and when that would drop a deletion since
+the backup it refuses with the floor-full error, writing nothing and leaving its input in place,
+so the guard stays (`TestMergeFloorRefusesDroppingItsOwnBurials`). A deletion since the backup is
+a burial the merge adds (a merged, retired or buried-live one) or a guard-era burial: one `rm`
+wrote while the guard was set. A Delete under the guard numbers each burial above
+`guardEraSeq`, half the delete-sequence limit, which no floor reaches by counting deletions, so
+the merge tells those burials from the restored floor's from the live floor alone, with no
+record beside it and nothing more for the Delete to write. The merge moves the guard-era
+burials to just above `guardEraSeq`, the others from 1, inserts each burial it adds between the
+two, oldest first, and renumbers every burial from 1 at the end, order kept, which the parser's
+distinct-and-increasing rule accepts. So the burials it carries over, older in real time than
+any written during the guard, are pruned first, and a guard-era burial is never pruned before
+them (`TestGuardEraBurialSurvivesPressuredMerge`, and `FuzzMergeFloor`: none ends above
+`guardEraSeq`, and every added burial ends below every guard-era one). A floor with a burial
+above `guardEraSeq` and no guard (the guard file removed by hand) has those treated as guard-era
+by the next merge, which only keeps them longer. The refusal names what binds. When only the
+floor's size does, it names `keys rm`, which frees a live record. When the tombstone budget or
+the per-name cap binds, `rm` cannot help, since each deletion records one more, so it names the
+budget, or the cap and its names, and `--accept-drops` (`MergeOptions.AcceptDrops`), which writes
+the merge anyway: the write prunes oldest first, as every floor write does, reports and prints
+each burial dropped, exits 4 and renames the input, so the guard has an exit
+(`TestGuardEraTombstoneBudget`, `TestGuardEraBurialPerNameCap`, `TestPendingMergeDeleteMakesRoom`,
+`TestKeysFloorMergeAcceptDrops`). A
 fence is a mark on a live record, which no prune removes. The verb prints `merged N`,
 `already present N`, `buried live N`, `kept N`, `retired N`, `dropped N` and `fenced N`, one per line, then `buried live
 system/<name>: ...` for each name whose live generation it buried (and whose directory `rm`

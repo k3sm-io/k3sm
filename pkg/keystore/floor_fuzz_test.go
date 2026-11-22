@@ -91,7 +91,9 @@ func FuzzParseFloor(f *testing.F) {
 // live), or live already; and, when nothing was dropped, a second merge of
 // the same floors adds nothing. ptrs is the restored pointers the merge is
 // given, name=seq pairs split at commas: a restored live record is never
-// raised more than one sequence, the lag a crash leaves. The seeds are
+// raised more than one sequence, the lag a crash leaves. A guard-era burial
+// of the restored floor (above guardEraSeq) ends numbered above every burial
+// the merge added, and none ends above guardEraSeq. The seeds are
 // committed under testdata/fuzz/FuzzMergeFloor.
 func FuzzMergeFloor(f *testing.F) {
 	type key struct{ name, gen string }
@@ -121,7 +123,26 @@ func FuzzMergeFloor(f *testing.F) {
 			}
 			ptrs[name] = seq
 		}
+		guarded := restored.guardEra()
 		r, d := restored.merge(aside, keepSet, ptrs)
+		if len(guarded) > 0 {
+			var lowestGuard, highestAdded uint64 = math.MaxUint64, 0
+			for name, e := range restored {
+				for _, b := range e.burials() {
+					switch {
+					case b.Deleted > guardEraSeq:
+						t.Fatalf("merge left %s's burial %+v above guardEraSeq", name, b)
+					case guarded[floorBurial{name, b.Generation}]:
+						lowestGuard = min(lowestGuard, b.Deleted)
+					case !before[name].buries(b.Generation):
+						highestAdded = max(highestAdded, b.Deleted)
+					}
+				}
+			}
+			if highestAdded > lowestGuard {
+				t.Fatalf("merge numbered an added burial at %d, above a guard-era one at %d", highestAdded, lowestGuard)
+			}
+		}
 		for name, was := range before {
 			if now := restored[name]; was.live() && now.live() && now.Generation == was.Generation && now.Seq > was.Seq && now.Seq-was.Seq > 1 {
 				t.Fatalf("merge raised %s from seq %d to %d, more than one sequence", name, was.Seq, now.Seq)

@@ -73,7 +73,7 @@ const keysUsage = `Usage:
         --key-in FILE only finishes an interrupted rewrap, with the key its
         --key-out saved: the recorded master.next.sha256, or a key some
         record already opens under; any other key is refused
-  sudo k3sm keys floor merge [--keep system/<name>]...
+  sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops]
         after a restore, before k3sm start: merge every deleted generation
         the floor you moved aside to keystore-floor.json.pre-restore in the
         data root records (the only file it reads) into the restored floor, so keys revoked since the backup stay
@@ -81,7 +81,10 @@ const keysUsage = `Usage:
         (buried live); --keep, repeatable, keeps that entry's restored
         version live instead, for an entry you are restoring on purpose.
         Until it runs, put, rotate and rewrap refuse; once written, the
-        file is renamed to keystore-floor.json.merged-<unix>
+        file is renamed to keystore-floor.json.merged-<unix>. A merge that
+        would drop a deletion since the backup to fit the floor refuses;
+        --accept-drops writes it anyway, dropping the oldest deletions,
+        printing each one, and exits 4
   sudo k3sm keys deliver system/<name> --namespace NS [--secret S] [--data-key K]
         declare that the server delivers the entry's current version as an
         Opaque Secret S (default: <name>) in NS, under data key K
@@ -973,7 +976,8 @@ func (k *keepFlag) Set(q string) error {
 	return nil
 }
 
-// keysFloor is "k3sm keys floor merge [--keep system/<name>]...": it
+// keysFloor is "k3sm keys floor merge [--keep system/<name>]...
+// [--accept-drops]": it
 // merges the deleted generations the data root's moved-aside floor,
 // keystore-floor.json.pre-restore, records into the live floor a restore put back (keystore.FileStore.MergeFloor),
 // keeping live the restored generation of each entry --keep names, and
@@ -997,12 +1001,13 @@ func (k *keepFlag) Set(q string) error {
 // or its input could not be renamed (keystore.Committed).
 func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if len(args) == 0 || args[0] != "merge" {
-		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge [--keep system/<name>]...")
+		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops]")
 		return keysBadUsage
 	}
 	v := newKeysVerb("floor merge", env)
 	var keep keepFlag
 	v.fs.Var(&keep, "keep", "keep this entry's restored version live (system/<name>; repeatable)")
+	acceptDrops := v.fs.Bool("accept-drops", false, "write a merge that has to drop deletions since the backup to fit the floor, printing each one")
 	pos, err := v.parse(args[1:])
 	if err != nil {
 		return keysBadUsage
@@ -1017,7 +1022,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	r, err := s.MergeFloor(ctx, keystore.MergeOptions{Keep: keep})
+	r, err := s.MergeFloor(ctx, keystore.MergeOptions{Keep: keep, AcceptDrops: *acceptDrops})
 	if err != nil && !keystore.Committed(err) {
 		return v.failf(keysRefused, "%v", err)
 	}

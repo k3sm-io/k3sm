@@ -2637,3 +2637,37 @@ func TestKeysFloorMergeTakesNoFile(t *testing.T) {
 	}
 	h.mustRun(0, "floor", "merge")
 }
+
+// TestKeysFloorMergeAcceptDrops (U192): a merge that would drop a deletion
+// since the backup because the per-name cap binds is refused (exit 1),
+// naming the cap and --accept-drops; an rm under the guard is kept, and
+// --accept-drops writes the merge, prints each burial dropped, exits 4 and
+// clears the guard.
+func TestKeysFloorMergeAcceptDrops(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	h.put("system/other", []byte("v"))
+	aside := recipeFloor(h) + ".pre-restore"
+	raw, err := os.ReadFile(recipeFloor(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aside, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plantBurials(t, aside, "k", 1000, keysPerNameCap)
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if code := h.run("floor", "merge"); code != keysRefused || !strings.Contains(h.stderr.String(), "per-name cap") || !strings.Contains(h.stderr.String(), "--accept-drops") {
+		t.Fatalf("floor merge at the per-name cap: exit %d, stderr %q; want %d naming the cap and --accept-drops", code, h.stderr.String(), keysRefused)
+	}
+	if code := h.run("floor", "merge", "--accept-drops"); code != keysCommitted {
+		t.Fatalf("floor merge --accept-drops: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+	}
+	if got := h.stdout.String(); !strings.Contains(got, "dropped 1\n") || !strings.Contains(got, "dropped system/k:") {
+		t.Fatalf("floor merge --accept-drops printed %q, want the drop reported", got)
+	}
+	if _, err := os.Lstat(aside); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the guard file after --accept-drops: %v, want it renamed", err)
+	}
+	h.mustRun(1, "show", "system/k")
+}

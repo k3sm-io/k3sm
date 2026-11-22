@@ -592,7 +592,8 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // Unlike Put, Rotate and Rewrap, Delete runs while a restore is unfinished
 // (keystore-floor.json.pre-restore in the data root), so rm can make room
 // for a merge refused because the floor is full. It then raises no other
-// entry's floor, and it writes nothing but its burials.
+// entry's floor, and it writes nothing but its burials, each numbered above
+// guardEraSeq, so the merge keeps them newest and never drops one silently.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -624,6 +625,12 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// only adds burials, so a burial written now is kept by it. It raises
 	// no other entry's floor then, as RaiseFloor does not.
 	pending := fdir.mergePending() != nil
+	// Under the guard each burial is numbered above guardEraSeq, so the
+	// merge tells it from the restored floor's and never drops it silently.
+	var above uint64
+	if pending {
+		above = guardEraSeq
+	}
 	if err := s.step("bury " + name); err != nil {
 		return evicted(fdir, nil, err)
 	}
@@ -632,7 +639,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// per-name cap; fdir.dropped holds what the writes' prunes dropped.
 	var dropped, capDropped []pruned
 	after, err := fdir.update(func(fl floor) bool {
-		gs, dropped = fl.bury(name, nil)
+		gs, dropped = fl.buryAbove(name, nil, above)
 		return len(gs) > 0
 	})
 	if err != nil {
@@ -696,7 +703,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if authentic != nil {
 		var more []string
 		after, err = fdir.update(func(fl floor) bool {
-			more, dropped = fl.bury(name, authentic)
+			more, dropped = fl.buryAbove(name, authentic, above)
 			return len(more) > 0
 		})
 		if err != nil {

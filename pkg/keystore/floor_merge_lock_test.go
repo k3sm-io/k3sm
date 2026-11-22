@@ -87,14 +87,20 @@ func TestMergeFloorRefusesWrongInput(t *testing.T) {
 	}{
 		{"an absent live floor", nil, "restore the saved keystore-floor.json first"},
 		{"the live floor's own inode", floor{"x": {Buried: []burial{{Generation: mgen(2), Deleted: 7}}}}, "is the live floor itself"},
-		{"the live floor itself", aside, "the live floor itself, byte for byte"},
+		// With a live record, a merge of the floor into itself would fence
+		// it, so only the byte-for-byte check refuses it.
+		{"the live floor itself", floor{"gone": aside["gone"], "k": {Generation: mgen(4), Seq: 2}}, "the live floor itself, byte for byte"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, server := newTestStore(t)
 			if tc.live != nil {
 				putFloorFile(t, server, tc.live)
 			}
-			path := writeAsideFloor(t, server, aside)
+			in := aside
+			if tc.name == "the live floor itself" {
+				in = tc.live
+			}
+			path := writeAsideFloor(t, server, in)
 			if tc.name == "the live floor's own inode" {
 				// A hard link: refused outright, never renamed.
 				remove(t, path)

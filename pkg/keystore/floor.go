@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -86,6 +87,15 @@ const (
 	// burials, so bury renumbers them, order kept, before one would pass it:
 	// the sequence never wraps.
 	maxDeleteSeq uint64 = 1 << 53
+	// guardEraSeq is the delete sequence a Delete run while a restore is
+	// unfinished (keystore-floor.json.pre-restore in the data root) numbers
+	// its burials above: half of maxDeleteSeq, which no floor reaches by
+	// counting deletions. A burial above it is a guard-era burial, written
+	// after the restore put the saved floor back, so the merge numbers the
+	// burials it carries from the moved-aside floor, older in real time,
+	// below it, and never drops one silently (floor.merge, mergeLoses). The
+	// merge renumbers every burial back below it.
+	guardEraSeq uint64 = maxDeleteSeq / 2
 )
 
 // The floor's limits as the code reads them. Each is its production
@@ -194,6 +204,23 @@ func (e *floorEntry) add(b burial) (burial, bool) {
 	dropped := bs[0]
 	e.Buried = append(slices.Clone(bs[1:]), b)
 	return dropped, true
+}
+
+// insert buries b among e's burials at its place by delete sequence, so
+// they stay oldest first. When e then holds more than maxBuriedPerName, its
+// oldest is dropped, and returned: b itself when b is the oldest.
+func (e *floorEntry) insert(b burial) (burial, bool) {
+	bs := e.burials()
+	i, _ := slices.BinarySearchFunc(bs, b.Deleted, func(x burial, d uint64) int {
+		return cmp.Compare(x.Deleted, d)
+	})
+	out := slices.Insert(slices.Clone(bs), i, b)
+	if len(out) <= buriedPerNameLimit {
+		e.Buried = out
+		return burial{}, false
+	}
+	e.Buried = out[1:]
+	return out[0], true
 }
 
 // dropOldest removes e's oldest burial.
@@ -592,6 +619,14 @@ func (fl floor) set(name string, gen [generationSize]byte) (bool, string, []prun
 // Each new burial's delete sequence is one more than the highest in the
 // floor (renumber keeps that under maxDeleteSeq).
 func (fl floor) bury(name string, dirGen *[generationSize]byte) ([]string, []pruned) {
+	return fl.buryAbove(name, dirGen, 0)
+}
+
+// buryAbove is bury, numbering each new burial above both the floor's
+// highest delete sequence and above: guardEraSeq for a Delete run while a
+// restore is unfinished, so the merge can tell its burials from the
+// restored floor's, and 0 otherwise.
+func (fl floor) buryAbove(name string, dirGen *[generationSize]byte, above uint64) ([]string, []pruned) {
 	f := fl[name]
 	var gs []string
 	if f.live() && !f.buries(f.Generation) {
@@ -609,7 +644,7 @@ func (fl floor) bury(name string, dirGen *[generationSize]byte) ([]string, []pru
 	}
 	var out []pruned
 	for _, g := range gs {
-		last := fl.lastDeleted()
+		last := max(fl.lastDeleted(), above)
 		if last >= maxDeleteSeq {
 			last = fl.renumber()
 		}

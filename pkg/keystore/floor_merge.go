@@ -121,6 +121,9 @@ type MergeReport struct {
 	// pointer was more than one sequence above the restored record, so the
 	// merge did not raise to it (also in Unverified).
 	overRaise []string
+	// renumbered is set when the merge renumbered guard-era burials back
+	// below guardEraSeq, which is a change to write.
+	renumbered bool
 }
 
 // MergeOptions is what a floor merge is asked to do beyond the merge itself.
@@ -128,6 +131,11 @@ type MergeOptions struct {
 	// Keep holds entry names, each checked as a name is, whose restored
 	// generation the merge keeps live (Kept).
 	Keep []string
+	// AcceptDrops lets a merge whose write would drop a deletion since the
+	// backup (one it carries over, or one rm wrote under the guard) go on:
+	// the write prunes oldest first as every floor write does, and each
+	// burial dropped is reported (Dropped).
+	AcceptDrops bool
 }
 
 // MergeFloor merges every burial the data root's
@@ -209,8 +217,8 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		return r, err
 	}
 	from := in.fl
-	if err := checkMergeInput(live, from); err != nil {
-		return r, err
+	if live == nil {
+		return r, checkMergeInput(live, from)
 	}
 	ptrs, unverified, err := s.restoredPointers(ctx, live, from)
 	if err != nil {
@@ -231,11 +239,16 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		}
 		return pr, nil
 	}
+	if err := checkMergeInput(live, from); err != nil {
+		return r, err
+	}
 	// As Put and Rotate ask room before they write: a merge whose write
 	// would drop a burial it adds is refused, with nothing written and the
 	// input left where it is, so the guard stays.
-	if lost := mergeLoses(live, probe, probeDropped); len(lost) > 0 {
-		return r, fmt.Errorf("%w: the merge would drop the deletions it adds for %s to stay within the floor's caps, so a copy of each would be accepted again. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished. To make room, delete each entry that is no longer needed with sudo k3sm keys rm system/<name> --yes, which runs while the merge is pending, then run the merge again", errFloorFull, strings.Join(lost, ", "))
+	// A guard-era burial (rm run under the guard) is never dropped either,
+	// unless opts.AcceptDrops says so: the exit when rm cannot make room.
+	if l := mergeLoses(live, probe, probeDropped); len(l.names) > 0 && !opts.AcceptDrops {
+		return r, l.err()
 	}
 	// The guard file must still be the file read: one replaced since is
 	// not merged.
@@ -275,26 +288,145 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	return r, nil
 }
 
-// mergeLoses names, sorted and without repeats, each entry with a burial the
-// merge that took live to merged added (BuriedLive, a merged or a retired
-// burial) that the write would drop: at the per-name cap (capDropped, what
-// merge returned) or in the write's prune, run here on a copy. A burial live
-// already held is not the merge's own, and dropping it is reported, not
-// refused. A fence is a high-water mark on a live record, which no prune
-// removes.
-func mergeLoses(live, merged floor, capDropped []pruned) []string {
-	lost := map[string]bool{}
-	for _, p := range append(slices.Clone(capDropped), maps.Clone(merged).prune()...) {
-		if !live[p.name].buries(p.generation) {
-			lost[p.name] = true
+// floorBurial is one burial by name and generation.
+type floorBurial struct{ name, generation string }
+
+// guardEra is each burial in fl above guardEraSeq: one a Delete wrote while
+// a restore was unfinished.
+func (fl floor) guardEra() map[floorBurial]bool {
+	out := map[floorBurial]bool{}
+	for name, e := range fl {
+		for _, b := range e.burials() {
+			if b.Deleted > guardEraSeq {
+				out[floorBurial{name, b.Generation}] = true
+			}
 		}
 	}
-	return sortedNames(lost)
+	return out
 }
+
+// renumberGuard renumbers fl's burials, order kept: those in guarded from
+// guardEraSeq+1, the others from 1, and returns how many others there are.
+// Burials the merge adds then fit between the two, below every guard-era
+// one.
+func (fl floor) renumberGuard(guarded map[floorBurial]bool) uint64 {
+	fl.renumber()
+	var below uint64
+	for name, e := range fl {
+		bs := slices.Clone(e.burials())
+		for i := range bs {
+			if !guarded[floorBurial{name, bs[i].Generation}] {
+				below++
+			}
+		}
+		e.Buried = bs
+		fl[name] = e
+	}
+	// renumber gave 1..n in order; move the guard-era ones up by
+	// guardEraSeq and close the gaps below.
+	type at struct {
+		name string
+		i    int
+		d    uint64
+	}
+	var lo, hi []at
+	for name, e := range fl {
+		for i, b := range e.burials() {
+			if guarded[floorBurial{name, b.Generation}] {
+				hi = append(hi, at{name, i, b.Deleted})
+			} else {
+				lo = append(lo, at{name, i, b.Deleted})
+			}
+		}
+	}
+	for _, set := range [][]at{lo, hi} {
+		sort.Slice(set, func(i, j int) bool { return set[i].d < set[j].d })
+	}
+	for n, a := range lo {
+		fl[a.name].Buried[a.i].Deleted = uint64(n + 1)
+	}
+	for n, a := range hi {
+		fl[a.name].Buried[a.i].Deleted = guardEraSeq + uint64(n+1)
+	}
+	return below
+}
+
+// mergeLoss is what mergeLoses found: the names whose burial the write
+// would drop, and which of the floor's caps drops them.
+type mergeLoss struct {
+	// names is each entry with a burial lost, sorted and without repeats.
+	names []string
+	// capNames is each of them whose burial the per-name cap drops.
+	capNames []string
+	// tombstones is the size the merged floor's tombstones would take before
+	// the prune, when it is over the tombstone budget, or 0.
+	tombstones int
+}
+
+// mergeLoses finds each burial of the merge that took live to merged that
+// the write would drop: at the per-name cap (capDropped, what merge
+// returned) or in the write's prune, run here on a copy. A lost burial is
+// one the merge added (BuriedLive, a merged or a retired burial), or a
+// guard-era one live holds (rm run under the guard, guardEra): both are
+// deletions since the backup. Another burial live already held is the
+// restored floor's own, and dropping it is reported, not refused. A fence
+// is a high-water mark on a live record, which no prune removes.
+func mergeLoses(live, merged floor, capDropped []pruned) mergeLoss {
+	guarded := live.guardEra()
+	lost := func(p pruned) bool {
+		return !live[p.name].buries(p.generation) || guarded[floorBurial{p.name, p.generation}]
+	}
+	var l mergeLoss
+	names, capNames := map[string]bool{}, map[string]bool{}
+	for _, p := range capDropped {
+		if lost(p) {
+			names[p.name], capNames[p.name] = true, true
+		}
+	}
+	for _, p := range maps.Clone(merged).prune() {
+		if lost(p) {
+			names[p.name] = true
+		}
+	}
+	l.names, l.capNames = sortedNames(names), sortedNames(capNames)
+	if t := merged.deadSize(); t > tombstoneSizeLimit {
+		l.tombstones = t
+	}
+	return l
+}
+
+// err is the refusal of a merge that would lose l, naming what binds: when
+// only the floor's size does, keys rm makes room (each rm frees a live
+// record); when the tombstone budget or the per-name cap does, rm adds a
+// burial and cannot help, so it names --accept-drops and what it costs.
+func (l mergeLoss) err() error {
+	lost := strings.Join(l.names, ", ")
+	if len(l.capNames) == 0 && l.tombstones == 0 {
+		return fmt.Errorf("%w: the merge would drop the deletions it carries over for %s to keep keystore-floor.json within its %d-byte size, so a copy of each would be accepted again. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished. To make room, delete each entry that is no longer needed with sudo k3sm keys rm system/<name> --yes, which runs while the merge is pending, then run the merge again", errFloorFull, lost, floorSizeLimit)
+	}
+	var why []string
+	if l.tombstones > 0 {
+		why = append(why, fmt.Sprintf("the tombstone budget binds: the deletions would take %d bytes, over the %d-byte budget", l.tombstones, tombstoneSizeLimit))
+	}
+	if len(l.capNames) > 0 {
+		why = append(why, fmt.Sprintf("the per-name cap of %d deletions binds for %s", buriedPerNameLimit, strings.Join(l.capNames, ", ")))
+	}
+	return &mergeFullError{msg: fmt.Sprintf("the keystore floor cannot hold the merge: it would drop the deletions since the backup recorded for %s, so a copy of each would be accepted again: %s. Deleting more entries cannot make room, since each deletion records one more. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished. To finish it anyway, run sudo k3sm keys floor merge --accept-drops: it drops the oldest deletions to fit, those among them, prints each one it drops, exits 4 and finishes the restore; a copy of each dropped entry put back is accepted again", lost, strings.Join(why, "; and "))}
+}
+
+// mergeFullError is a merge refused because the tombstone budget or the
+// per-name cap binds. It matches errFloorFull, with its own advice: the
+// floor-full text's "delete entries" cannot help there.
+type mergeFullError struct{ msg string }
+
+func (e *mergeFullError) Error() string { return e.msg }
+
+// Is matches errFloorFull.
+func (e *mergeFullError) Is(target error) bool { return target == errFloorFull }
 
 // changes reports whether the merge r reports changed the floor.
 func (r MergeReport) changes() bool {
-	return r.Merged > 0 || len(r.Retired) > 0 || len(r.Fenced) > 0 || r.raised > 0 || r.recorded > 0
+	return r.Merged > 0 || len(r.Retired) > 0 || len(r.Fenced) > 0 || r.raised > 0 || r.recorded > 0 || r.renumbered
 }
 
 // errMergeLiveFloor refuses a merge whose input is the data root's live
@@ -447,8 +579,17 @@ func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) 
 	})
 	var r MergeReport
 	var out []pruned
-	// last is the highest delete sequence in fl, kept as each burial lands.
+	// last is the highest delete sequence below the guard-era burials (rm
+	// run under the guard), kept as each burial lands. The burials the merge
+	// adds are older in real time than the guard-era ones, so they are
+	// numbered below them: the guard-era burials are moved to just above
+	// guardEraSeq first, the others renumbered from 1, so the added ones fit
+	// between, and every burial is renumbered from 1 at the end, order kept.
+	guarded := fl.guardEra()
 	last := fl.lastDeleted()
+	if len(guarded) > 0 {
+		last = fl.renumberGuard(guarded)
+	}
 	add := func(name, g string) {
 		if last >= maxDeleteSeq {
 			last = fl.renumber()
@@ -459,7 +600,7 @@ func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) 
 		if f.live() && f.Generation == g {
 			f.Generation, f.Seq, f.HighWater = "", 0, 0
 		}
-		if dropped, ok := f.add(burial{Generation: g, Deleted: last}); ok {
+		if dropped, ok := f.insert(burial{Generation: g, Deleted: last}); ok {
 			out = append(out, pruned{name: name, generation: dropped.Generation})
 		}
 		fl[name] = f
@@ -540,6 +681,10 @@ func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) 
 	}
 	r.BuriedLive, r.Kept, r.Fenced = sortedNames(buriedLive), sortedNames(kept), sortedNames(fenced)
 	r.Unverified, r.overRaise = sortedNames(overRaise), sortedNames(overRaise)
+	if len(guarded) > 0 {
+		fl.renumber()
+		r.renumbered = true
+	}
 	return r, out
 }
 

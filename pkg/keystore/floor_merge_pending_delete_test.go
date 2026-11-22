@@ -23,17 +23,18 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
 
 // TestPendingMergeDeleteMakesRoom (U192): a merge refused because the floor
-// is full names the recovery and leaves the guard in place, and rm still
-// runs under it: deleting
-// live entries makes room, and the merge run again succeeds and clears the
-// guard. The rm calls raise the live floor's newest deletion above the
-// moved-aside floor's, which the merge's older-input check does not count:
-// they were written while the guard was set.
+// size binds names keys rm and leaves the guard in place, and rm still runs
+// under it. Each burial rm writes then is a guard-era one, numbered above
+// guardEraSeq, which the merge keeps like the deletions it carries over: a
+// live record freed costs a burial, so the merge run again is still
+// refused, and --accept-drops writes it, dropping only burials it carries
+// over, keeping every guard-era one, and clears the guard.
 func TestPendingMergeDeleteMakesRoom(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
@@ -69,20 +70,38 @@ func TestPendingMergeDeleteMakesRoom(t *testing.T) {
 			t.Fatalf("Delete with a merge pending: %v, want nil", err)
 		}
 	}
-	if fl := floorOf(t, server); fl.lastDeleted() <= aside.lastDeleted() {
-		t.Fatalf("the live floor's newest deletion is %d, want it above the moved-aside floor's %d", fl.lastDeleted(), aside.lastDeleted())
+	gens := map[string]string{}
+	for name, e := range floorOf(t, server) {
+		for _, b := range e.burials() {
+			if b.Deleted <= guardEraSeq {
+				t.Fatalf("%s's burial %+v under the guard, want it above guardEraSeq", name, b)
+			}
+			gens[name] = b.Generation
+		}
 	}
-	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
-		t.Fatalf("MergeFloor after the deletes: %v", err)
+	if len(gens) != removed {
+		t.Fatalf("guard-era burials %v, want one per rm", gens)
+	}
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); !errors.Is(err, errFloorFull) {
+		t.Fatalf("MergeFloor after the deletes: %v, want it still refused: each rm's burial is kept", err)
+	}
+	r, err := s.MergeFloor(ctx, MergeOptions{AcceptDrops: true})
+	if err != nil {
+		t.Fatalf("MergeFloor --accept-drops after the deletes: %v", err)
 	}
 	if err := s.MergePending(); err != nil {
 		t.Fatalf("MergePending after the merge: %v, want the guard cleared", err)
 	}
 	fl := floorOf(t, server)
+	for name, g := range gens {
+		if !fl[name].buries(g) || slices.Contains(r.Dropped, name) {
+			t.Errorf("%s after the merge = %+v (dropped %v), want its guard-era burial kept", name, fl[name], r.Dropped)
+		}
+	}
 	for i := range gone {
 		name := fmt.Sprintf("gone-%02d", i)
-		if !fl[name].buries(mgen(100 + i)) {
-			t.Errorf("%s after the merge = %+v, want its moved-aside generation buried", name, fl[name])
+		if !fl[name].buries(mgen(100+i)) && !slices.Contains(r.Dropped, name) {
+			t.Errorf("%s after the merge = %+v, want its moved-aside generation buried or reported dropped", name, fl[name])
 		}
 	}
 	mustCurrent(t, s, fmt.Sprintf("e-%02d", removed), "v")
