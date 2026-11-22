@@ -1608,8 +1608,8 @@ func TestStateWriteFailureCreatesNothing(t *testing.T) {
 
 // TestStateFileMalformedDeliversNothing: a state file owned and moded as it
 // must be but not parsing strictly (unknown field, wrong version, trailing
-// data, too many records, an empty UID, a repeated record) delivers nothing
-// (G19).
+// data, too many records, an empty UID, a repeated record, a namespace
+// holding the key's "/" separator) delivers nothing (G19).
 func TestStateFileMalformedDeliversNothing(t *testing.T) {
 	rec := func(i int) string { return fmt.Sprintf(`{"namespace":"p","secretName":"s%d","uid":"u%d"}`, i, i) }
 	many := `{"version":1,"secrets":[`
@@ -1628,6 +1628,7 @@ func TestStateFileMalformedDeliversNothing(t *testing.T) {
 		{"too many records", many},
 		{"empty uid", `{"version":1,"secrets":[{"namespace":"p","secretName":"s","uid":""}]}`},
 		{"duplicate record", `{"version":1,"secrets":[` + rec(1) + `,` + rec(1) + `]}`},
+		{"namespace with a slash", `{"version":1,"secrets":[{"namespace":"p/q","secretName":"s","uid":"u"}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, true, false)
