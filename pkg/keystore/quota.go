@@ -108,19 +108,27 @@ func entryBytes(entries *os.Root, name string) (int64, error) {
 // opens no record. The scope must still have its scope.key, as every user
 // verb's scope must. An entry directory without a current pointer, which
 // the user scope reads as damage, is removed too.
+//
+// As a revocation it commits first and audits after: a failed append is
+// reported (errCommitted) and the removal stands.
 func (u *UserScope) Delete(ctx context.Context, input string) error {
-	if err := u.delete(ctx, input); err != nil {
+	name, err := u.own("rm", input)
+	if err != nil {
+		_ = u.audit("rm", auditPlaceholder, "", err) // already refused
+		return fail("rm", err)
+	}
+	err = u.delete(ctx, name)
+	if aerr := u.audit("rm", name, "", err); err == nil {
+		err = aerr
+	}
+	if err != nil {
 		return fail("rm", err)
 	}
 	return nil
 }
 
-func (u *UserScope) delete(ctx context.Context, input string) error {
+func (u *UserScope) delete(ctx context.Context, name string) error {
 	if err := u.s.checkConfig(); err != nil {
-		return err
-	}
-	name, err := u.own("rm", input)
-	if err != nil {
 		return err
 	}
 	root, done, err := u.s.openLocked(ctx, false, true)

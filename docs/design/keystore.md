@@ -1730,11 +1730,18 @@ refused before its first frame:
     the lock exclusively for at most 250 ms in any second. Many uids together can push another
     uid's wait past the 2-second bound, which is `busy`, never a refusal for the share and
     never a deletion.
-- **Order: commit, then append, then reply.** A socket operation commits its change to the
-  store, then appends its audit line, then replies. If the append fails after the commit, the
-  change stands and the reply says so: `ok` with the warning `committed; audit failed`, which
-  the CLI prints. The server counts every such unaudited operation in memory, and `doctor`
-  shows the count (U112).
+- **Order: a grant appends first; a revocation commits first.** A grant (a user `put`, and
+  `deliver`, each with the scope's mint) appends its audit line before its first write, after
+  every refusal it can give, and only then commits: a failed append refuses it and nothing is
+  written, the mint's directories included, so no grant takes effect unrecorded. A refusal
+  before that point is audited best effort with its result, and a commit that fails after the
+  line gets a second line with its result. Every other socket operation, and the revocation
+  class above all (`withdraw`, `rm`, `rotate`), commits its change to the store, then appends
+  its audit line, then replies. If the append fails after the commit, the change stands and the
+  reply says so: `ok` with the warning `committed; audit failed`, which the CLI prints. The
+  server counts every such unaudited operation in memory, and `doctor` shows the count (U112).
+  An audit line carries only validated fields; a field that failed its grammar is a fixed
+  placeholder.
 - **Fail closed, except for revocations.** While appends fail (a full disk, an I/O error), the
   server refuses user mutations and reads (`list`, `read-for-exec`, `deliveries`) until an
   append succeeds (U32). The revocation class is the exception: a socket `withdraw`, `rm` or

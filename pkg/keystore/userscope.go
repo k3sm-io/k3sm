@@ -159,20 +159,26 @@ func (u *UserScope) own(op, input string) (string, error) {
 // GeneratedUID, and a lookup that fails mints nothing. It never mints the
 // master, which root verbs create (ErrMasterMissing without one), and never
 // writes while a Rewrap is half done (ErrRewrapInProgress).
+//
+// It is a grant: its audit line is appended before its first write, and a
+// failed append refuses it with nothing written, the scope's mint included.
 func (u *UserScope) Put(ctx context.Context, input string, kind Kind, value []byte) (Version, error) {
-	v, err := u.put(ctx, input, kind, value)
+	name, err := u.own("put", input)
 	if err != nil {
+		_ = u.audit("put", auditPlaceholder, "", err) // already refused
+		return Version{}, fail("put", err)
+	}
+	g := u.grant("put", name, "")
+	v, err := u.put(ctx, name, kind, value, g.take)
+	if err != nil {
+		g.refused(err)
 		return Version{}, fail("put", err)
 	}
 	return v, nil
 }
 
-func (u *UserScope) put(ctx context.Context, input string, kind Kind, value []byte) (Version, error) {
+func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byte, grant func() error) (Version, error) {
 	if err := u.s.checkConfig(); err != nil {
-		return Version{}, err
-	}
-	name, err := u.own("put", input)
-	if err != nil {
 		return Version{}, err
 	}
 	if err := checkValue(kind, value); err != nil {
@@ -194,13 +200,19 @@ func (u *UserScope) put(ctx context.Context, input string, kind Kind, value []by
 	}
 	uk, entries, err := u.openScope(root, func() (keys, error) { return k, nil })
 	if errors.Is(err, errNoScopeKey) {
-		uk, entries, err = u.mint(root, k.wrap)
+		uk, entries, err = u.mint(root, k.wrap, grant)
 	}
 	if err != nil {
 		return Version{}, err
 	}
 	defer func() { _ = entries.Close() }() // writes are fsynced by writeFile
 	if err := checkScopeQuota(entries, name, value); err != nil {
+		return Version{}, err
+	}
+	if err := u.checkNewName(entries, name); err != nil {
+		return Version{}, err
+	}
+	if err := grant(); err != nil {
 		return Version{}, err
 	}
 	e, err := u.createUserEntry(entries, name)
@@ -238,6 +250,24 @@ func (u *UserScope) masterForWrite() (keys, error) {
 	}
 	_ = root.Close() // read-only
 	return u.s.loadMaster()
+}
+
+// checkNewName refuses, before a grant's audit line, a name entries
+// already holds: ErrExists for an entry, and damage (openUserEntry) for a
+// directory without a current pointer. createUserEntry checks again under
+// the same lock.
+func (u *UserScope) checkNewName(entries *os.Root, name string) error {
+	if _, err := entries.Lstat(name); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	e, err := openUserEntry(entries, name)
+	if err != nil {
+		return err
+	}
+	e.close()
+	return ErrExists
 }
 
 // createUserEntry makes name's directory in entries with a fresh
@@ -592,12 +622,25 @@ func parseScopeKey(b []byte) (record, error) {
 // directory that holds anything, without a scope.key, is a scope whose key
 // was lost, and ErrScopeAbsent, as the master is never minted over entries.
 // The caller holds the exclusive lock.
-func (u *UserScope) mint(root *os.Root, wrap []byte) (keys, *os.Root, error) {
+func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, *os.Root, error) {
 	if err := u.s.eligibleUID(u.uid); err != nil {
 		return keys{}, nil, err
 	}
 	g, err := lookupGeneratedUID(u.uid)
 	if err != nil {
+		return keys{}, nil, err
+	}
+	// The floor is read, and the grant's audit line appended, before the
+	// first mkdir, so a mint refused for either creates nothing.
+	// A floor past the first sequence for this owner's generation means a
+	// delivery record under the lost key committed writes: a new key would
+	// reset its history under a floor that refuses the reset record.
+	if fl, err := u.s.userFloor.floor(u.scope, deliveriesFloorName, g); err != nil {
+		return keys{}, nil, err
+	} else if fl > 1 {
+		return keys{}, nil, fmt.Errorf("%w: the user-scope floor records %s writes under a scope key that is gone; restore scope.key", ErrScopeAbsent, deliveriesName)
+	}
+	if err := grant(); err != nil {
 		return keys{}, nil, err
 	}
 	dir, err := u.openScopeDir(root, true)
@@ -624,14 +667,6 @@ func (u *UserScope) mint(root *os.Root, wrap []byte) (keys, *os.Root, error) {
 	}
 	if len(names) > 0 {
 		return keys{}, nil, fmt.Errorf("%w: entries/ holds %d names and there is no scope key, so a new key would orphan them; restore scope.key", ErrScopeAbsent, len(names))
-	}
-	// A floor past the first sequence for this owner's generation means a
-	// delivery record under the lost key committed writes: a new key would
-	// reset its history under a floor that refuses the reset record.
-	if fl, err := u.s.userFloor.floor(u.scope, deliveriesFloorName, g); err != nil {
-		return keys{}, nil, err
-	} else if fl > 1 {
-		return keys{}, nil, fmt.Errorf("%w: the user-scope floor records %s writes under a scope key that is gone; restore scope.key", ErrScopeAbsent, deliveriesName)
 	}
 	ku := make([]byte, scopeKeySize)
 	defer clear(ku) // only the derived keys outlive the mint

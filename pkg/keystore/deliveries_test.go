@@ -157,7 +157,7 @@ func TestDeliveryRecordDigestRoundTrip(t *testing.T) {
 			t.Errorf("audit line %+v is not for user/1001", l)
 		}
 	}
-	if ops != "deliver=ok withdraw=ok withdraw=ok withdraw=not-found deliver=exists " {
+	if ops != "put=ok deliver=ok withdraw=ok withdraw=ok withdraw=not-found deliver=exists " {
 		t.Fatalf("audit lines %q", ops)
 	}
 	// A copied-back older record, which still lists the UID live, is

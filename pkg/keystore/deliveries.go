@@ -543,32 +543,30 @@ func deliveriesKey(ku []byte, scope string) []byte {
 
 // addDelivery records d, live, in the caller's delivery record, minting the
 // scope on its first mutating operation. A UID already recorded is
-// ErrExists; a record with 64 live entries, or 320 in all, is ErrQuota.
+// ErrExists; a record with 64 live entries, or 320 in all, is ErrQuota. It
+// is a grant, so its audit line is appended before anything is written: a
+// failed append refuses it, and nothing is written (the mint included).
 func (u *UserScope) addDelivery(ctx context.Context, d delivery) error {
 	if err := u.checkDelivery("deliver", d); err != nil {
 		// A refused add audits the placeholder: its fields are not known
 		// to be in their grammar.
-		_ = u.s.auditSink.append(auditLine{op: "deliver", scope: u.scope, name: auditPlaceholder, namespace: auditPlaceholder, result: auditResult(err)}) // already refused
+		_ = u.audit("deliver", auditPlaceholder, auditPlaceholder, err) // already refused
 		return fail("deliver", err)
 	}
-	err := u.addDeliveryLocked(ctx, d)
-	if aerr := u.audit("deliver", d.entry, d.namespace, err); err == nil {
-		err = aerr
-	}
-	if err != nil {
+	e, _ := ParseEntry(d.entry) // checked by checkDelivery
+	g := u.grant("deliver", e.Name, d.namespace)
+	if err := u.addDeliveryLocked(ctx, d, g.take); err != nil {
+		g.refused(err)
 		return fail("deliver", err)
 	}
 	return nil
 }
 
-func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery) error {
+func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery, grant func() error) error {
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
-	if err := u.checkDelivery("deliver", d); err != nil {
-		return err
-	}
-	return u.writeLocked(ctx, true, func(o *openedScope) error {
+	return u.grantLocked(ctx, grant, func(o *openedScope) error {
 		ds, seq, err := u.readDeliveries(o)
 		if err != nil {
 			return err
@@ -589,6 +587,9 @@ func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery) error {
 		sort.Slice(d.items, func(i, j int) bool { return d.items[i].Key < d.items[j].Key })
 		d.digest = deliveryDigest(d.entry, d.namespace, d.secretName, d.items)
 		d.withdrawn, d.delivered = false, 0
+		if err := grant(); err != nil {
+			return err
+		}
 		return u.writeDeliveries(o.dir, o.key, o.gen, append(ds, d), seq+1)
 	})
 }
@@ -620,7 +621,9 @@ func (u *UserScope) lookupDelivery(ctx context.Context, uid string) (delivery, e
 // withdrawDelivery turns the live delivery uid into a tombstone in place. It
 // never adds an entry, so it is never refused for a quota, and it runs while
 // a Rewrap is half done: revocation always succeeds. An already withdrawn
-// UID is no change; an absent one is ErrNotFound.
+// UID is no change; an absent one is ErrNotFound. As a revocation it
+// commits first and audits after: a failed append is reported (errCommitted)
+// and the tombstone stands.
 func (u *UserScope) withdrawDelivery(ctx context.Context, uid string) error {
 	err := u.withdrawLocked(ctx, uid)
 	if aerr := u.audit("withdraw", "", "", err); err == nil {
@@ -675,35 +678,28 @@ func (u *UserScope) withdrawLocked(ctx context.Context, uid string) error {
 	return ErrNotFound
 }
 
-// writeLocked runs fn on the opened scope under the exclusive lock. With
-// mint set it is a write that may create the scope: it never mints the
-// master and refuses while a Rewrap is half done, as Put does. Without it,
-// the scope must exist, and the master's fallback key opens a scope.key a
-// crashed Rewrap already moved.
-func (u *UserScope) writeLocked(ctx context.Context, mint bool, fn func(*openedScope) error) error {
+// grantLocked runs fn on the opened scope under the exclusive lock, minting
+// the scope first when it has none. It never mints the master and refuses
+// while a Rewrap is half done, as Put does. grant appends the operation's
+// audit line; it is called before the mint's first write, and fn calls it
+// before its own first write, so a failed append writes nothing. It
+// appends at most once.
+func (u *UserScope) grantLocked(ctx context.Context, grant func() error, fn func(*openedScope) error) error {
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
-		if mint {
-			return fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)
-		}
-		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
+		return fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)
 	}
 	if err != nil {
 		return err
 	}
 	defer done()
-	var k keys
-	if mint {
-		k, err = u.masterForWrite()
-	} else {
-		k, err = u.s.loadMaster()
-	}
+	k, err := u.masterForWrite()
 	if err != nil {
 		return err
 	}
 	o, entries, err := u.openScopeFull(root, func() (keys, error) { return k, nil })
-	if mint && errors.Is(err, errNoScopeKey) {
-		_, entries, err = u.mint(root, k.wrap)
+	if errors.Is(err, errNoScopeKey) {
+		_, entries, err = u.mint(root, k.wrap, grant)
 		if err == nil {
 			_ = entries.Close() // nothing written through it here
 			o, entries, err = u.openScopeFull(root, func() (keys, error) { return k, nil })
@@ -717,16 +713,60 @@ func (u *UserScope) writeLocked(ctx context.Context, mint bool, fn func(*openedS
 	return fn(o)
 }
 
-// audit appends one line for op to the audit sink, with result "ok" or the
-// refusal's name; never a value. Its error is the caller's to report when
-// the operation itself succeeded: the change is made, its line is not.
-func (u *UserScope) audit(op, entry, namespace string, err error) error {
-	name := ""
-	if e, perr := ParseEntry(entry); perr == nil && e.UID == u.uid {
-		name = e.Name
+// grantAudit is a grant's audit line: appended once, before the grant's
+// first write, with result ok; a refusal before it is audited with the
+// refusal's result instead, and a failure after it with a second line.
+type grantAudit struct {
+	u               *UserScope
+	op, name, ns    string
+	appended, tried bool
+}
+
+// grant returns op's grant audit line over the validated name and
+// namespace.
+func (u *UserScope) grant(op, name, namespace string) *grantAudit {
+	return &grantAudit{u: u, op: op, name: name, ns: namespace}
+}
+
+// take appends the line once. Its error refuses the grant, which has
+// written nothing.
+func (g *grantAudit) take() error {
+	if g.tried {
+		if !g.appended {
+			return errAuditRefused
+		}
+		return nil
 	}
+	g.tried = true
+	if err := g.u.s.auditSink.append(auditLine{op: g.op, scope: g.u.scope, name: g.name, namespace: g.ns, result: "ok"}); err != nil {
+		return fmt.Errorf("%w: %w", errAuditRefused, err)
+	}
+	g.appended = true
+	return nil
+}
+
+// refused audits err, the grant's refusal, best effort: as the refusal when
+// no line was appended (an append that itself failed is not retried), as a
+// second line after the ok one otherwise.
+func (g *grantAudit) refused(err error) {
+	if g.tried && !g.appended {
+		return
+	}
+	_ = g.u.s.auditSink.append(auditLine{op: g.op, scope: g.u.scope, name: g.name, namespace: g.ns, result: auditResult(err)}) // already refused
+}
+
+// errAuditRefused is a grant refused because its audit line could not be
+// appended.
+var errAuditRefused = errors.New("the audit line could not be written, so nothing was changed")
+
+// audit appends one line for op to the audit sink, with result "ok" or the
+// refusal's name; name and namespace must already be validated (or
+// auditPlaceholder), and never a value. It is the revocations' order:
+// commit, then audit. Its error, after a change was made, matches
+// errCommitted.
+func (u *UserScope) audit(op, name, namespace string, err error) error {
 	if aerr := u.s.auditSink.append(auditLine{op: op, scope: u.scope, name: name, namespace: namespace, result: auditResult(err)}); aerr != nil {
-		return fmt.Errorf("the change was made, and its audit line was not written: %w", aerr)
+		return fmt.Errorf("%w, and its audit line was not written: %w", errCommitted, aerr)
 	}
 	return nil
 }
@@ -738,7 +778,7 @@ const auditPlaceholder = "-"
 // auditResult names an operation's outcome for its audit line.
 func auditResult(err error) string {
 	switch {
-	case err == nil:
+	case err == nil, errors.Is(err, errCommitted):
 		return "ok"
 	case errors.Is(err, ErrQuota):
 		return "quota"
