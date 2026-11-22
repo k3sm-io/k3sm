@@ -364,8 +364,12 @@ first Put mints no master.
   flag makes unlink fail even for root). If the `.lock` or `keystore/` step fails after the
   burial, Delete returns an error saying the entry is already deleted and refused, its tree
   was not removed, and `rm` should be rerun once the lock is free. Once `.lock` is held,
-  Delete buries the directory's authenticated generation, when there is one (below). Before removing, Delete clears the BSD user flags (`UF_*` only, through the opened
-  descriptor, never following a symlink) on the entry's files; root may clear those. A
+  Delete buries the directory's authenticated generation, when there is one (below). When the removal answers `EPERM`, Delete clears the user locking flags (`uchg`,
+  `uappnd` and `uunlnk` only, through the opened descriptor, never following a symlink) on
+  `keystore/` itself and on the entry's files, and removes once more; root may clear those.
+  It clears a file's flags only when the service user owns it and, for anything but a
+  directory, when it has one link: a hard link shares its flags with names that may be outside
+  the keystore. A flag left in place is named in the error, a flag on `keystore/` included. A
   removal that still fails, or a crash during it, leaves the entry already deleted and
   refused: Delete returns an error saying so and that the directory is left behind, and
   `rm` run again removes the directory without changing the floor. A floor raise at the
@@ -4242,7 +4246,7 @@ last pull request lands and no row is pending.
 | G20 | The reconciler only Gets, creates and updates its labelled `Opaque` Secrets, and leaves an unlabelled or foreign Secret alone | unit over a fake client that records every call |
 | G21 | The rollback recipe in this document runs as written and is a byte-exact round trip | a script test that pipes `show --reveal` into `rotate --in -`, then compares the new current version's value byte for byte (`cmp`) with version N's, for an opaque entry and an Ed25519 entry |
 | G22 | `hack/ci.sh` passes | the gate runs it |
-| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current`; a directory planted with a changed generation file and removed by `rm`, a delete, re-create, delete cycle, a decoy swapped in before `rm`, the entry's directory or `keystore/` hidden during `rm` and moved back, a symlink or an incomplete Put in its place, a Delete crashed before its floor write and run again, a crashed Delete followed by a Put and a Delete, a Delete faulted after its burial and before its removal (an error naming the directory left behind; a retried `rm` removes it with no floor change), a `uchg` flag on an entry file or the entry directory, `keystore/.lock` held past the bounded wait or replaced by a directory (the burial lands first; a retry once the lock is free removes the tree), and more planted names under `keystore/` than a read takes, each leaving the original copy refused |
+| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current`; a directory planted with a changed generation file and removed by `rm`, a delete, re-create, delete cycle, a decoy swapped in before `rm`, the entry's directory or `keystore/` hidden during `rm` and moved back, a symlink or an incomplete Put in its place, a Delete crashed before its floor write and run again, a crashed Delete followed by a Put and a Delete, a Delete faulted after its burial and before its removal (an error naming the directory left behind; a retried `rm` removes it with no floor change), a `uchg` flag on an entry file, the entry directory or `keystore/` (removed), a flagged file hard-linked into the entry from outside it (its flag kept, the entry left behind), `keystore/.lock` held past the bounded wait or replaced by a directory (the burial lands first; a retry once the lock is free removes the tree), and more planted names under `keystore/` than a read takes, each leaving the original copy refused |
 
 Phase A is complete when the gate passes with no row pending. A row can be reworded or dropped only by a change
 to this document, reviewed like any other.

@@ -31,9 +31,8 @@ import (
 
 // TestDeleteClearsUserFlags (G23): a uchg the service user set on a file in
 // the entry, or on the entry directory, makes unlink fail even for root. rm
-// buries first, then clears the user flags and removes the entry; and if the
-// removal still fails, it reports the directory left behind. Either way the
-// copy put back is refused as deleted.
+// buries first, then, after the removal answers EPERM, clears the locking
+// flags and removes the entry; the copy put back is refused as deleted.
 func TestDeleteClearsUserFlags(t *testing.T) {
 	ctx := context.Background()
 	for _, at := range []string{"v1", currentName, "."} {
@@ -46,23 +45,67 @@ func TestDeleteClearsUserFlags(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = unix.Chflags(p, 0) })
-			err := s.Delete(ctx, "k")
-			_, lerr := os.Lstat(filepath.Join(server, "keystore", "k"))
-			switch {
-			case err == nil && errors.Is(lerr, os.ErrNotExist):
-				// The flag was cleared and the entry removed.
-			case err != nil && strings.Contains(err.Error(), "left behind") && lerr == nil:
-				// The leftover is reported.
-				_ = unix.Chflags(p, 0)
-				if err := os.RemoveAll(filepath.Join(server, "keystore", "k")); err != nil {
-					t.Fatal(err)
-				}
-			default:
-				t.Fatalf("Delete with uchg on %s: %v (entry: %v), want it removed or the leftover reported", at, err, lerr)
+			if err := s.Delete(ctx, "k"); err != nil {
+				t.Fatalf("Delete with uchg on %s: %v, want the flag cleared and the entry removed", at, err)
+			}
+			if _, err := os.Lstat(filepath.Join(server, "keystore", "k")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("entry after Delete with uchg on %s: %v, want it removed", at, err)
 			}
 			putBack(t, server, old, "k")
-			_, _, err = s.Current(ctx, "k")
+			_, _, err := s.Current(ctx, "k")
 			refusedAsDeleted(t, "Current of the copy put back", err)
 		})
+	}
+}
+
+// TestDeleteKeepsHardLinkedFlags (G23): a flagged file hard-linked into the
+// entry from outside it shares its flags with that other name, so Delete
+// never clears them: the file outside keeps its uchg, and the error reports
+// the entry left behind, naming the hard link.
+func TestDeleteKeepsHardLinkedFlags(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	outside := filepath.Join(server, "outside")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(outside, filepath.Join(server, "keystore", "k", "planted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Chflags(outside, unix.UF_IMMUTABLE); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Chflags(outside, 0) })
+	err := s.Delete(ctx, "k")
+	if err == nil || !strings.Contains(err.Error(), "left behind") || !strings.Contains(err.Error(), "hard link") {
+		t.Fatalf("Delete with a flagged hard link: %v, want the entry left behind and the hard link named", err)
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(outside, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Flags&unix.UF_IMMUTABLE == 0 {
+		t.Fatalf("the file outside the entry lost its uchg (flags %#x)", st.Flags)
+	}
+}
+
+// TestDeleteClearsKeystoreDirFlag (G23): a uchg on keystore/ itself makes
+// the entry's unlink from it fail; Delete clears it, as it clears the
+// entry's, and removes the entry.
+func TestDeleteClearsKeystoreDirFlag(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	ks := filepath.Join(server, "keystore")
+	if err := unix.Chflags(ks, unix.UF_IMMUTABLE); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Chflags(ks, 0) })
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatalf("Delete with uchg on keystore/: %v, want the flag cleared and the entry removed", err)
+	}
+	if _, err := os.Lstat(filepath.Join(ks, "k")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("entry after Delete with uchg on keystore/: %v, want it removed", err)
 	}
 }

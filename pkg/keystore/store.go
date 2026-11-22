@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -753,15 +754,31 @@ func warnUnrecorded(root *os.Root, name string, fl floor) {
 
 // removeEntry removes what stands under name, after the burial: a
 // non-directory is unlinked (a symlink itself, never what it names), and an
-// entry directory loses current first and then the whole directory. The
-// BSD user flags on the entry's files are cleared first (clearUserFlags), so
-// a uchg the service user planted does not block the removal. fl, the floor
+// entry directory loses current first and then the whole directory. When
+// the removal answers EPERM, the user locking flags on keystore/ and the
+// entry's files are cleared (clearUserFlags) and the removal runs once more,
+// so a uchg the service user planted does not block it; a flag left in place
+// (a hard link, a file another user owns) is named in the error. fl, the floor
 // after the burial, tells an interrupted Put from an entry, which only
 // changes the answer, so it reports one (interrupted): an interrupted Put
 // with nothing buried is ErrNotFound, after its directory is removed (it may
 // hold a sealed v1 a Delete that crashed after removing the pointer left).
 func (s *FileStore) removeEntry(root *os.Root, name string, fi fs.FileInfo, fl floor) (interrupted bool, err error) {
-	clearUserFlags(root, name)
+	interrupted, err = s.removeEntryOnce(root, name, fi, fl)
+	if !errors.Is(err, syscall.EPERM) {
+		return interrupted, err
+	}
+	// A locking flag answers EPERM: clear them, and try once more. The
+	// first pass's answer stands, since it may have removed current.
+	skipped := clearUserFlags(root, name, s.uid)
+	if _, err = s.removeEntryOnce(root, name, fi, fl); err != nil && len(skipped) > 0 {
+		err = fmt.Errorf("%w (a locking flag was left in place: %s)", err, strings.Join(skipped, "; "))
+	}
+	return interrupted, err
+}
+
+// removeEntryOnce is one pass of removeEntry, with no flag cleared.
+func (s *FileStore) removeEntryOnce(root *os.Root, name string, fi fs.FileInfo, fl floor) (interrupted bool, err error) {
 	if !fi.IsDir() {
 		// Anything but a directory at the name was planted there, since Put
 		// makes only directories.
