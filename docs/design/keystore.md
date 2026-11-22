@@ -1196,7 +1196,12 @@ below carries them over.
 not a symlink, owned by root and not group- or other-writable, at most 4 MiB, in a directory
 judged on its descriptor as the data root is: owned by root and not group- or other-writable,
 so no other user can swap the file in) and parses it
-with the same strict parser, then, under `keystore-lock` alone, adds every
+with the same strict parser. It refuses, writing nothing, when the live floor is absent ("restore
+the saved keystore-floor.json first": merging into nothing would leave the moved-aside burials
+with no live records), when the file's highest delete sequence is below the live floor's (it is
+older than the floor it would merge into, so it is the restored floor named by mistake, not the
+one moved aside), and when it is the live floor itself (equal floors are byte-identical files,
+since the parser accepts one encoding per floor). Then, under `keystore-lock` alone, it adds every
 burial it records that the restored floor lacks, oldest first, each at the next delete
 sequence, so the merged burials keep their order. It writes only the root-owned floor and
 nothing under `keystore/`, so it never takes `keystore/.lock`, which the service user can hold

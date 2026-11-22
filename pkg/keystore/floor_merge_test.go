@@ -330,6 +330,7 @@ func TestFloorMergeRefusesUntrustedPlace(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, server := newTestStore(t)
+			putFloorFile(t, server, floor{"live": {Generation: mgen(9), Seq: 1}})
 			path := plant(t, tc.dirMode, tc.fileMode)
 			before, err := os.ReadFile(floorPath(server))
 			if err != nil && !errors.Is(err, os.ErrNotExist) {

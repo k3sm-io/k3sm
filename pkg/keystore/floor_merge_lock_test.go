@@ -18,8 +18,11 @@ package keystore
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -64,6 +67,48 @@ func TestMergeFloorIgnoresEntryLock(t *testing.T) {
 			}
 			if fl := readFloorFile(t, server); !fl["gone"].buries(mgen(1)) {
 				t.Fatalf("floor after the merge = %+v, want gone's burial", fl)
+			}
+		})
+	}
+}
+
+// TestMergeFloorRefusesWrongInput (U192): the merge refuses, writing
+// nothing, onto an absent live floor (the saved floor was never put back),
+// from a file whose highest delete sequence is below the live floor's (the
+// restored floor, not the one moved aside) and from a file equal to the
+// live floor.
+func TestMergeFloorRefusesWrongInput(t *testing.T) {
+	ctx := context.Background()
+	aside := floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 3}}}}
+	for _, tc := range []struct {
+		name string
+		live floor // nil: no live floor file
+		want string
+	}{
+		{"an absent live floor", nil, "restore the saved keystore-floor.json first"},
+		{"an older input", floor{"x": {Buried: []burial{{Generation: mgen(2), Deleted: 7}}}}, "older than the live floor's"},
+		{"the live floor itself", aside, "the live floor itself"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			if tc.live != nil {
+				putFloorFile(t, server, tc.live)
+			}
+			path := writeAsideFloor(t, server, aside)
+			before, _ := os.ReadFile(floorPath(server))
+			_, err := s.MergeFloor(ctx, path, nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("MergeFloor: %v, want a refusal saying %q", err, tc.want)
+			}
+			after, aerr := os.ReadFile(floorPath(server))
+			if tc.live == nil {
+				if !errors.Is(aerr, fs.ErrNotExist) {
+					t.Fatalf("live floor after the refusal: %v, want it still absent", aerr)
+				}
+				return
+			}
+			if string(after) != string(before) {
+				t.Fatalf("live floor after the refusal = %s, want %s", after, before)
 			}
 		})
 	}

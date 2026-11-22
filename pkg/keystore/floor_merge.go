@@ -17,6 +17,7 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -68,7 +69,9 @@ type MergeReport struct {
 // "Pointer sequence and floor", "Restoring with the saved floor"). The file
 // is read as the floor is, judged on its descriptor (a regular file owned by
 // root and not group- or other-writable, under maxFloorSize) and parsed by
-// parseFloor. Under keystore-lock alone (§ Concurrency; it writes nothing
+// parseFloor. It refuses, writing nothing, a merge onto an absent live floor,
+// from a file older than the live floor or equal to it (checkMergeInput).
+// Under keystore-lock alone (§ Concurrency; it writes nothing
 // under keystore/, so it never takes keystore/.lock) it adds each burial the live floor lacks, in the order the file buried them.
 // A generation the live floor holds live is buried too (BuriedLive): it was
 // deleted after the backup, so the merge fails closed, unless keep names
@@ -106,11 +109,14 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	if err := s.checkFloorWritable(); err != nil {
 		return r, err
 	}
-	fdir, _, err := s.lockFloor(ctx)
+	fdir, live, err := s.lockFloor(ctx)
 	if err != nil {
 		return r, err
 	}
 	defer fdir.unlock()
+	if err := checkMergeInput(live, from); err != nil {
+		return r, err
+	}
 	// Only keystore-lock: the merge writes the root-owned floor and nothing
 	// under keystore/, so it takes no keystore/.lock, which the service user
 	// can hold or replace to stop it. Readers need no .lock against it
@@ -132,6 +138,35 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and the restored entry is refused; rm removes its directory", "name", name)
 	}
 	return r, nil
+}
+
+// checkMergeInput refuses a merge of from into live, the floor read under
+// keystore-lock, that cannot be the restore's: an absent live floor (the
+// saved floor was never put back, and merging into nothing would write the
+// moved-aside floor's burials alone, with no live records), a from whose
+// highest delete sequence is below live's (from is older than the floor it
+// would merge into: the restored floor, most likely, not the one moved
+// aside), and a from equal to live (the same floor merged into itself:
+// parseFloor accepts one encoding per floor, so equal floors are
+// byte-identical files, up to the trailing newline).
+func checkMergeInput(live, from floor) error {
+	if live == nil {
+		return errors.New("the live keystore floor is absent, so there is nothing to merge into: restore the saved keystore-floor.json first, with install -o root -g wheel -m 0644 as docs/user/keys.md describes, then run the merge again")
+	}
+	if a, l := from.lastDeleted(), live.lastDeleted(); a < l {
+		return fmt.Errorf("the floor file to merge records deletions older than the live floor's (its newest deletion is %d, the live floor's %d): it is not the floor moved aside before the restore, which is never older than the restored one. Check that you named keystore-floor.json.pre-restore, not the restored floor", a, l)
+	}
+	if floorsSame(live, from) {
+		return errors.New("the floor file to merge is the live floor itself, byte for byte: merging it changes nothing. Name the floor moved aside before the restore, keystore-floor.json.pre-restore")
+	}
+	return nil
+}
+
+// floorsSame reports whether a and b encode to the same floor file.
+func floorsSame(a, b floor) bool {
+	ab, aerr := marshalFloor(a)
+	bb, berr := marshalFloor(b)
+	return aerr == nil && berr == nil && bytes.Equal(ab, bb)
 }
 
 // readFloorAt reads and parses the floor file at path, judged as the live

@@ -340,6 +340,11 @@ restored floor:
 sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore
 ```
 
+The merge refuses, and changes nothing, if the restored `keystore-floor.json` is not in place yet
+(put it back with `install` first), or if the file you name is the restored floor rather than the
+one you moved aside: one whose newest deletion is older than the restored floor's, or the live floor
+itself.
+
 The merge keeps every key revoked since the backup refused: a key created after the backup, every
 older version of a name deleted more than once, and an entry the backup holds that you deleted
 since. That last kind is restored and then deleted again by the merge, because a deletion since
