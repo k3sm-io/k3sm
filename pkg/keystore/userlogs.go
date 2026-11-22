@@ -426,7 +426,8 @@ func (s *FileStore) openLogDataRoot() (int, error) {
 	}
 	if int64(st.Uid) != int64(s.floorUID) || st.Mode&0o022 != 0 {
 		_ = unix.Close(dfd) // abandoned
-		return -1, fmt.Errorf("%w: the data root %s is owned by uid %d at mode %04o", errLogUntrusted, s.dataRoot, st.Uid, st.Mode&0o7777)
+		slog.Debug("the keystore data root is not trusted", "path", s.dataRoot, "uid", st.Uid, "mode", fmt.Sprintf("%04o", st.Mode&0o7777))
+		return -1, fmt.Errorf("%w: the data root is not owned by root, or is group- or other-writable", errLogUntrusted)
 	}
 	if err := judgeFlagsACL(dfd, fdFlags); err != nil {
 		_ = unix.Close(dfd) // abandoned
@@ -472,15 +473,22 @@ func (s *FileStore) judgeLog(f *os.File, st *unix.Stat_t) error {
 	if err := unix.Fstat(int(f.Fd()), st); err != nil {
 		return fmt.Errorf("stat: %w", err)
 	}
+	// The figures (links, owner, mode) are root's, logged at Debug: the
+	// error reaches the socket.
+	bad := ""
 	switch {
 	case st.Mode&unix.S_IFMT != unix.S_IFREG:
-		return fmt.Errorf("%w: not a regular file", errLogUntrusted)
+		bad = "not a regular file"
 	case st.Nlink != 1:
-		return fmt.Errorf("%w: %d links", errLogUntrusted, st.Nlink)
+		bad = "more than one link"
 	case st.Uid != s.uid:
-		return fmt.Errorf("%w: owned by uid %d, want the service user's %d", errLogUntrusted, st.Uid, s.uid)
+		bad = "not owned by the service user"
 	case st.Mode&0o7777 != logMode:
-		return fmt.Errorf("%w: mode %04o, want %04o", errLogUntrusted, st.Mode&0o7777, logMode)
+		bad = "not at the log's mode"
+	}
+	if bad != "" {
+		slog.Debug("a keystore append-only log is not trusted", "log", f.Name(), "links", st.Nlink, "uid", st.Uid, "mode", fmt.Sprintf("%04o", st.Mode&0o7777))
+		return fmt.Errorf("%w: %s", errLogUntrusted, bad)
 	}
 	flags, err := s.logFlags(f)
 	if err != nil {
@@ -504,7 +512,8 @@ func judgeFlagsACL(fd int, flags func(int) (uint32, error)) error {
 		return fmt.Errorf("%w: read its flags: %w", errLogUntrusted, err)
 	}
 	if extra := fl &^ sfAppend; extra != 0 {
-		return fmt.Errorf("%w: flags %#x beside SF_APPEND", errLogUntrusted, extra)
+		slog.Debug("a keystore log or data root carries a flag beside SF_APPEND", "flags", fmt.Sprintf("%#x", extra))
+		return fmt.Errorf("%w: a file flag beside SF_APPEND", errLogUntrusted)
 	}
 	acl, err := fdHasACL(fd)
 	if err != nil {
@@ -554,7 +563,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		got := make([]byte, len(s.last))
 		n, err := src.ReadAt(got, s.lastAt)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, s.lastAt, err)
+			return nil, l.unreadable(s.lastAt, err)
 		}
 		// A short read is a file that no longer holds the line.
 		if !bytes.Equal(got[:n], s.last) {
@@ -603,7 +612,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 				s.bad, s.tornSize = s.at(off, errLogTorn), st.Size
 				return s, nil
 			}
-			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, err)
+			return nil, l.unreadable(off, err)
 		}
 	}
 	for off < st.Size {
@@ -613,7 +622,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		}
 		if err != nil && !errors.Is(err, errLogLineTooLong) && !errors.Is(err, errLogTorn) {
 			s.off = off
-			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, err)
+			return nil, l.unreadable(off, err)
 		}
 		if errors.Is(err, errLogTorn) {
 			s.off, s.bad, s.tornSize = off, s.at(off, err), st.Size
@@ -630,7 +639,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 				return s, nil
 			case serr != nil:
 				s.off = off
-				return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, serr)
+				return nil, l.unreadable(off, serr)
 			}
 			off += n
 			continue
@@ -652,6 +661,14 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 	}
 	s.off = off
 	return s, nil
+}
+
+// unreadable is errLogUnreadable for a read of this log that failed at off:
+// the offset is root's, logged at Debug, never in the error a socket caller
+// can see.
+func (l *appendLog) unreadable(off int64, err error) error {
+	slog.Debug("a keystore append-only log could not be read", "log", l.name, "offset", off, "err", err)
+	return fmt.Errorf("%w: %s: %w", errLogUnreadable, l.name, err)
 }
 
 // readLogLine reads one whole line, its newline included, of at most
@@ -733,6 +750,31 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 	return l.revokeRoom(state, st.Size, uid, maxLogLine)
 }
 
+// roomBytes refuses, as ErrLogFull, n bytes of revocation lines of uid's,
+// all of an operation's lines, that would start past the hard cap without
+// room in uid's revocation budget or the reader's bound for all of them:
+// so an operation that writes several lines (rm's tombstones) is refused
+// before the first rather than part way. A log that cannot be opened or read
+// is no answer here, as in room.
+func (l *appendLog) roomBytes(uid uint32, n int64) error {
+	f, st, err := l.open(unix.O_RDONLY)
+	if err != nil {
+		l.forgetUnflagged(err, false)
+		return nil
+	}
+	defer func() { _ = f.Close() }() // read-only
+	if st.Size+n <= l.s.logHardCap {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	state, err := l.sync(f, st)
+	if err != nil || state.bad != nil {
+		return nil
+	}
+	return l.revokeRoom(state, st.Size, uid, n)
+}
+
 // grantKeys is the most keys one grant adds to the floor: a put that mints
 // its scope adds the delivery record's key and the entry's.
 const grantKeys = 2
@@ -808,7 +850,7 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) err
 // floor line is, whatever its class.
 func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, slack bool) error {
 	if len(line) > maxLogLine {
-		return fmt.Errorf("%w: refused a %d-byte line for %s", errLogLineTooLong, len(line), l.name)
+		return fmt.Errorf("%w: refused a line for %s", errLogLineTooLong, l.name)
 	}
 	// Read-write, so the tail and, for the floor, the keys are read on the
 	// descriptor the line is appended through.
@@ -908,7 +950,7 @@ func (l *appendLog) tornTail(f *os.File, size int64) (bool, error) {
 		src = l.readAt(f)
 	}
 	if _, err := src.ReadAt(b[:], size-1); err != nil {
-		return false, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, size-1, err)
+		return false, l.unreadable(size-1, err)
 	}
 	return b[0] != '\n', nil
 }
@@ -1299,8 +1341,10 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 	if newKeys != nil {
 		n = newKeys(state)
 	}
-	if err := l.addKeyRoom(state, scopeUID(scope), n, false); err != nil {
-		return err
+	if n > 0 {
+		if err := l.addKeyRoom(state, scopeUID(scope), n, false); err != nil {
+			return err
+		}
 	}
 	return l.preflight(f, total+int(write), false)
 }

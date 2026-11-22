@@ -880,9 +880,20 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 		ds[i].withdrawn = true
 		return ns, true, u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1, true)
 	}
-	revoked := u.catchUpDeliveries(o.gen, rd)
-	if err := u.s.admit(u.uid, false); err != nil {
-		return "", revoked, err
+	// The catch-up line is a revocation's: admitted as one before it is
+	// appended. Without one the unknown UID is admitted as any other
+	// operation.
+	revoked := false
+	if rd.unverified == nil && rd.seq > rd.floor {
+		if err := u.s.admit(u.uid, true); err != nil {
+			return "", false, err
+		}
+		revoked = u.catchUpDeliveries(o.gen, rd)
+	}
+	if !revoked {
+		if err := u.s.admit(u.uid, false); err != nil {
+			return "", false, err
+		}
 	}
 	return "", revoked, ErrNotFound
 }

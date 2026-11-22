@@ -252,11 +252,12 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		if err := b.bury(u); err != nil {
 			return err
 		}
-		if err := entries.RemoveAll(name); err != nil {
-			return err
+		err := entries.RemoveAll(name)
+		if err == nil {
+			err = syncDir(entries)
 		}
-		if err := syncDir(entries); err != nil {
-			return err
+		if err != nil {
+			return fmt.Errorf("%w: rm buried the floor's live generations, so the name is refused as deleted, but what stood there was not removed: %w", errCommitted, err)
 		}
 		return fmt.Errorf("%w, but the entry's name held %s, not a directory, so its tree was altered; rm buried the floor's live generations and removed it", errCommitted, shapeOf(fi))
 	}
@@ -294,23 +295,25 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	}
 	// Then the pointer, so a crash leaves a directory the user scope reads
 	// as damage, never an older entry; RemoveAll removes a symlink itself,
-	// never what it names.
+	// never what it names. A removal that fails from here on is after the
+	// commit: the tombstones are written, so the entry is refused as
+	// deleted whatever of its tree stays.
 	err = e.root.RemoveAll(currentName)
 	if err == nil {
 		err = syncDir(e.root)
 	}
 	e.close()
+	if err == nil {
+		err = u.s.step("delete " + name)
+	}
+	if err == nil {
+		err = entries.RemoveAll(name)
+	}
+	if err == nil {
+		err = syncDir(entries)
+	}
 	if err != nil {
-		return err
-	}
-	if err := u.s.step("delete " + name); err != nil {
-		return err
-	}
-	if err := entries.RemoveAll(name); err != nil {
-		return err
-	}
-	if err := syncDir(entries); err != nil {
-		return err
+		return fmt.Errorf("%w: rm buried the entry's generations, so it is refused as deleted, but its tree was not fully removed: %w", errCommitted, err)
 	}
 	if rerr := b.report(); rerr != nil {
 		return fmt.Errorf("%w, but %w", errCommitted, rerr)
@@ -472,6 +475,20 @@ func (b *burial) addTree(e *entry, name string) {
 // caller removes anything, when the floor did not take one: the rm is then
 // retryable, and the tree stays.
 func (b *burial) bury(u *UserScope) error {
+	// Every tombstone line is charged before the first is written.
+	if ff, ok := u.s.userFloor.(*fileFloorLog); ok {
+		var n int64
+		for _, g := range b.gens {
+			line, err := tombLine(u.scope, b.name, g)
+			if err != nil {
+				return err
+			}
+			n += int64(len(line))
+		}
+		if err := ff.log.roomBytes(u.uid, n); err != nil {
+			return fmt.Errorf("rm refused, nothing removed: %w", err)
+		}
+	}
 	var errs []error
 	for _, g := range b.gens {
 		if err := u.s.userFloor.bury(u.scope, b.name, g); err != nil {
