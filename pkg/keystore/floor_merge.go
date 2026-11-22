@@ -39,8 +39,10 @@ type MergeReport struct {
 	BuriedLive []string
 	// Kept names, sorted, each entry the keep set named that the merge
 	// would otherwise have buried a generation of: its restored live
-	// generation, or the moved-aside floor's live one (Retired). It is left
-	// as restored, the entry restored on purpose.
+	// generation, or the moved-aside floor's live one when the restored
+	// floor holds no live record of the name. It is left as restored, the
+	// entry restored on purpose; a restored live record keeps only its own
+	// generation, and the moved-aside one is retired regardless.
 	Kept []string
 	// Retired is how many live generations of the moved-aside floor the
 	// merge buried: each one the restored floor does not hold live, under
@@ -72,7 +74,9 @@ type MergeReport struct {
 // deleted after the backup, so the merge fails closed, unless keep names
 // the entry, whose restored generation then stays live (Kept). Each live
 // generation of the moved-aside floor that the live floor does not hold live
-// is buried as well (Retired), unless keep names the entry. keep holds
+// is buried as well (Retired), unless keep names the entry and the live
+// floor holds no live record of it: keep keeps one generation, the
+// restored one, never a second, moved-aside one. keep holds
 // entry names, each checked as a name is. The write is pruned as every
 // floor write is, and each burial it drops is logged at Warn and reported.
 func (s *FileStore) MergeFloor(ctx context.Context, path string, keep []string) (MergeReport, error) {
@@ -184,10 +188,11 @@ func (s *FileStore) readFloorAt(path string) (floor, error) {
 // cleared (BuriedLive), unless keep names the entry (Kept); fl's other live
 // records are kept. Then, by name, each live generation in from that fl
 // neither holds live nor buries is buried after them (Retired), unless keep
-// names the entry. A live generation in from that fl holds live at a lower
-// sequence gets from's sequence as its high-water mark (Fenced). At
-// maxBuriedPerName, add drops the name's oldest,
-// returned. It does not prune: update does.
+// names the entry and fl holds no live record of it (keep keeps the restored
+// generation, never a second one). A live generation in from that fl holds
+// live at a lower sequence gets from's sequence as its high-water mark
+// (Fenced). At maxBuriedPerName, add drops the name's oldest, returned. It
+// does not prune: update does.
 func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) {
 	type at struct {
 		name string
@@ -260,7 +265,10 @@ func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) 
 			continue
 		case !a.live(), f.buries(a.Generation):
 			continue
-		case keep[name]:
+		case keep[name] && !f.live():
+			// keep keeps the restored generation, never a second one: a
+			// name the restored floor holds live has the moved-aside live
+			// generation retired whatever keep says.
 			kept[name] = true
 			continue
 		}

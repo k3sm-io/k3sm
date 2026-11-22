@@ -245,8 +245,10 @@ func TestMergeFloorKeep(t *testing.T) {
 
 // TestFloorMergeRetiresAsideLive (U192): a live generation in the
 // moved-aside floor that the restored floor does not hold live, under
-// another generation or not at all, is buried (counted as retired), unless
-// keep names the entry; one the restored floor holds live at a lower
+// another generation or not at all, is buried (counted as retired). keep
+// spares it only when the restored floor holds no live record of the name:
+// keep keeps the restored generation, never a second, moved-aside one. One
+// the restored floor holds live at a lower
 // sequence is left live, with the moved-aside sequence as its high-water
 // mark (fenced), so the abandoned history above it is refused.
 func TestFloorMergeRetiresAsideLive(t *testing.T) {
@@ -262,10 +264,11 @@ func TestFloorMergeRetiresAsideLive(t *testing.T) {
 		"kept":  {Generation: mgen(6), Seq: 1},
 		"new":   {Generation: mgen(4), Seq: 1},
 		"gone":  {Generation: mgen(7), Seq: 1},
+		"spare": {Generation: mgen(8), Seq: 1},
 	}
-	r, _ := restored.merge(aside, map[string]bool{"kept": true})
-	if r.Retired != 2 || !slices.Equal(r.Kept, []string{"kept"}) {
-		t.Fatalf("merge = %+v; want 2 retired and kept kept", r)
+	r, _ := restored.merge(aside, map[string]bool{"kept": true, "spare": true})
+	if r.Retired != 3 || !slices.Equal(r.Kept, []string{"spare"}) {
+		t.Fatalf("merge = %+v; want 3 retired and only spare kept", r)
 	}
 	if e := restored["other"]; e.Generation != mgen(1) || !e.buries(mgen(2)) {
 		t.Errorf("other after the merge = %+v, want its live record kept and the aside's buried", e)
@@ -276,8 +279,11 @@ func TestFloorMergeRetiresAsideLive(t *testing.T) {
 	if e := restored["same"]; e.Generation != mgen(3) || e.Seq != 1 || e.HighWater != 2 || len(e.burials()) != 0 || !slices.Equal(r.Fenced, []string{"same"}) {
 		t.Errorf("same after the merge = %+v (fenced %v), want it live at seq 1 with high-water 2, nothing buried", e, r.Fenced)
 	}
-	if e := restored["kept"]; e.Generation != mgen(5) || len(e.burials()) != 0 {
-		t.Errorf("kept after the merge = %+v, want it left alone", e)
+	if e := restored["kept"]; e.Generation != mgen(5) || !e.buries(mgen(6)) || len(e.burials()) != 1 {
+		t.Errorf("kept after the merge = %+v, want its restored generation live and the aside's buried", e)
+	}
+	if e, ok := restored["spare"]; ok {
+		t.Errorf("spare after the merge = %+v, want nothing recorded: keep spares a generation the restored floor does not hold", e)
 	}
 	if e := restored["gone"]; len(e.burials()) != 1 {
 		t.Errorf("gone after the merge = %+v, want its one burial", e)

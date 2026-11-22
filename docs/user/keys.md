@@ -354,7 +354,10 @@ Decide before you run the merge: once it has deleted an entry again, running it 
 `--keep` does not bring that entry back. The merge also deletes each version that was current in
 the floor you moved aside but is not the restored one, such as an entry you put again after
 deleting it since the backup: by restoring the backup you chose its version, so a copy of the
-newer one put back is refused. `--keep` exempts that entry too. An entry you rotated since the
+newer one put back is refused. `--keep` keeps only the restored version: an entry you deleted and
+put again since the backup comes back as the backup's version, and the version you put since is
+still retired, so a copy of it stays refused even after you remove the entry. Only an entry the
+backup does not hold at all keeps its newer version when `--keep` names it. An entry you rotated since the
 backup is restored at its older version, and the merge records how far it had been rotated, so a
 copy of a newer version from before the restore is refused, before and after the next `rotate`
 (which numbers past it). The merge prints how many
