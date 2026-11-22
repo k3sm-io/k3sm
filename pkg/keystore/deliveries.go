@@ -711,10 +711,12 @@ func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery, g *grantA
 	}
 	grant := g.take
 	return u.grantLocked(ctx, g, func(o *openedScope) error {
-		ds, seq, err := u.readDeliveries(o)
+		rd, err := u.readDeliveriesFloor(o, false)
 		if err != nil {
 			return err
 		}
+		u.catchUpDeliveries(o.gen, rd)
+		ds, seq := rd.ds, rd.seq
 		live := 0
 		for _, x := range ds {
 			if x.uid == d.uid {
@@ -877,10 +879,27 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 		ds[i].withdrawn = true
 		return ns, true, u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1, true)
 	}
+	revoked := u.catchUpDeliveries(o.gen, rd)
 	if err := u.s.admit(u.uid, false); err != nil {
-		return "", false, err
+		return "", revoked, err
 	}
-	return "", false, ErrNotFound
+	return "", revoked, ErrNotFound
+}
+
+// catchUpDeliveries appends, for an operation that holds the exclusive store
+// lock and read rd, the authenticated delivery record at gen, against a
+// floor it could read, the record's floor line when the floor is behind it:
+// a revocation-class line, so it lands past the hard cap on the uid's
+// revocation budget and in the floor's revocation headroom, and is durable
+// across a restart, where the process's own mark (deliveriesSeen) is not. It
+// runs before the operation serves, and is best effort: a line the floor
+// refuses leaves the floor behind, as before, and the operation's own floor
+// line meets the same floor. It reports whether it appended the line.
+func (u *UserScope) catchUpDeliveries(gen [generationSize]byte, rd deliveriesRead) bool {
+	if rd.unverified != nil || rd.seq <= rd.floor {
+		return false
+	}
+	return u.s.userFloor.append(u.scope, deliveriesFloorName, gen, rd.seq, true) == nil
 }
 
 // grantLocked runs fn on the opened scope under the exclusive lock, minting
