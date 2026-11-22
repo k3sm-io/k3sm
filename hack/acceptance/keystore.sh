@@ -706,7 +706,7 @@ pend U95 "rm-scope lists every RoleBinding and ClusterRoleBinding with the subje
 	k3sm/cmd/k3sm::TestRmScopeRefusesWithBindings
 pend U96 "the deliveries record is exempt from the 64 KiB value cap and bounded at 64 live entries plus 256 withdrawn tombstones, 3,328 bytes an entry (8 items), 1,056 KiB sealed; at the bound deliver answers quota and a withdrawal still succeeds, in place; a tombstone is pruned only after its Secret is seen gone (Get not found) on two sweeps at least 60 s apart (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestDeliveriesRecordBoundAndPrune TestRevocationNeverRefusedAtRecordBound
-pend U97 "when rotate answers ErrQuota, rm then put recovers: rm frees every version and put stores the value as version 1 of a new generation; the quota error names that recovery (user-scope store)" \
+pend U97 "when rotate answers ErrQuota, rm then put recovers: rm frees every version and put stores the value as version 1 of a new generation; no quota text recommends that recovery (user-scope store)" \
 	k3sm/pkg/keystore::TestRotateQuotaRecoveredByRmThenPut
 pend U98 "the sealed deliveries record stores each delivery's KeyDelivery metadata.name; the orphan sweep checks the object with a live Get by that name sent to the API server, never an informer cache and never a List; not found, or another UID, deletes only on two consecutive observations at least 60 s apart, any other answer resetting the count; no sweep before the KeyDelivery and Secret informers sync (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName TestOrphanSweepNeedsTwoObservations

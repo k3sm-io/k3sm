@@ -1363,9 +1363,12 @@ reconciler's pruning (a later change) reclaims it. The `quota` error says so and
 withdrawal frees room.
 
 **When `rotate` gets `ErrQuota`.** Retention is unbounded, so an entry rotated often fills the
-byte budget. The recovery is `rm` then `put`: `rm` frees every version of the entry and `put`
-stores the new value as version 1 of a new generation. The CLI's `quota` error says so. `rm`
-is a deletion, so run `put` at once: the entry's deliveries are deleted only when two
+byte budget. `rm` then `put` recovers: `rm` frees every version of the entry and `put` stores
+the new value as version 1 of a new generation. No `quota` text recommends it, though: `rm` is
+a deletion that cannot be undone, and the `put` after it can itself be refused (the floor's key
+bound or free-space margin), which leaves the entry gone; the error says only that an `rm` of
+an entry no longer needed makes room. A user who takes that path runs `put` at once, since `rm`
+is a deletion: the entry's deliveries are deleted only when two
 observations at least 60 s apart see it gone ("Deleting observations are spaced in time"), and
 one that sees the new entry first resets the count. Past that, the delivered Secrets are
 deleted and their deliveries withdrawn, and the user declares them again with `deliver` (U97).
@@ -4612,7 +4615,7 @@ carried by the unit rows.
 | U94 | `withdraw` opens the caller's scope and so runs the GeneratedUID check: a reused uid with a changed GeneratedUID gets `scope-owner-changed` and deletes nothing (seams: GeneratedUID lookup, peer-credential source) | `k3sm/pkg/keystore/socket::TestWithdrawChecksGeneratedUID` | pending: KeyDelivery authoring |
 | U95 | `rm-scope` lists every RoleBinding and ClusterRoleBinding with the subject `k3sm:local:<uid>` and refuses, changing nothing, unless none exist or `--keep-bindings` is given | `k3sm/cmd/k3sm::TestRmScopeRefusesWithBindings` | pending: the KeyDelivery reconciler (lifecycle) |
 | U96 | the `deliveries` record is exempt from the 64 KiB value cap and bounded at 64 live entries plus 256 withdrawn tombstones, 3,328 bytes an entry (8 items), 1,056 KiB sealed; at the bound `deliver` answers `quota` and a withdrawal still succeeds, in place; a tombstone is pruned only after its Secret is seen gone (Get not found) on two sweeps at least 60 s apart | `k3sm/pkg/keystore/reconcile::TestDeliveriesRecordBoundAndPrune`, `TestRevocationNeverRefusedAtRecordBound` | pending: the KeyDelivery reconciler (lifecycle) |
-| U97 | when `rotate` answers `ErrQuota`, `rm` then `put` recovers: `rm` frees every version and `put` stores the value as version 1 of a new generation; the `quota` error names that recovery | `k3sm/pkg/keystore::TestRotateQuotaRecoveredByRmThenPut` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U97 | when `rotate` answers `ErrQuota`, `rm` then `put` recovers: `rm` frees every version and `put` stores the value as version 1 of a new generation; no `quota` text recommends that recovery | `k3sm/pkg/keystore::TestRotateQuotaRecoveredByRmThenPut` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U98 | the sealed `deliveries` record stores each delivery's KeyDelivery `metadata.name`; the orphan sweep checks the object with a live Get by that name sent to the API server, never an informer cache and never a List; not found, or another UID, deletes only on two consecutive observations at least 60 s apart, and any other answer in between resets the count; no sweep runs before the KeyDelivery and Secret informers sync | `k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName`, `TestOrphanSweepNeedsTwoObservations` | pending: the KeyDelivery reconciler (lifecycle) |
 | U99 | under the store lock, before every audit or floor append, the server compares its descriptor's `(dev, ino)` with the canonical name's and reopens on a mismatch, recounting the per-uid shares from the new file; `audit --rotate` and `floor --rebuild` each complete while the server never saw the marker, and every later line lands in the new canonical file, none in an archive or an unlinked file (seam: chflags flag source) | `k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch` | pending: the socket listener (the server append path) |
 | U100 | a departed account with an unreused uid is reported, not acted on: `doctor` lists every scope whose uid has no directory record (a synthesized GeneratedUID) with its delivery count; each of that scope's deliveries gets `SecretRetained=True` with reason `OwnerUnresolvable`, and no Secret is deleted (seam: GeneratedUID lookup) | `k3sm/cmd/k3sm::TestDoctorListsUnresolvableScopes`, `k3sm/pkg/keystore/reconcile::TestOwnerUnresolvableRetainedCondition` | pending: the KeyDelivery reconciler (lifecycle) |

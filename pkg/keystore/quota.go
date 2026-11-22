@@ -74,7 +74,7 @@ func checkScopeQuota(entries *os.Root, name string, value []byte, base int64) er
 	}
 	add := entryWriteBytes(name, value)
 	if total+add > maxScopeBytes {
-		return fmt.Errorf("%w: the scope's sealed records would be %d bytes with its deliveries record, over %d; rm an entry rotated often, then put it again", ErrQuota, total+add, maxScopeBytes)
+		return fmt.Errorf("%w: the scope's sealed records would be %d bytes with its deliveries record, over %d", ErrQuota, total+add, maxScopeBytes)
 	}
 	return nil
 }
