@@ -49,6 +49,12 @@ const (
 	// it chooses. 65536 versions is far beyond any rotation cadence, and an
 	// entry directory at the bound still lists under maxDirNames.
 	maxVersion = 1 << 16
+	// maxOAuthVersion is maxVersion for an oauth entry, which keeps only its
+	// current version and one previous, so neither List nor Rewrap walks
+	// more than two versions whatever the number: the bound only keeps the
+	// number finite. 2^32 refreshes at one a minute is over 8000 years,
+	// where 2^16 would be 45 days.
+	maxOAuthVersion = 1 << 32
 )
 
 var (
@@ -832,7 +838,7 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 	if err != nil {
 		return Version{}, err
 	}
-	if cur >= maxVersion || seq == math.MaxUint64 {
+	if cur >= versionLimit(old.Kind) || seq == math.MaxUint64 {
 		return Version{}, fmt.Errorf("%w: the pointer is at the last version or sequence", ErrCorrupt)
 	}
 	// A floor with no room for the next sequence refuses the Rotate before
@@ -962,6 +968,16 @@ func discardOrphans(ctx context.Context, e *entry, k keys, low, cur uint64) erro
 		return nil
 	}
 	return syncDir(e.root)
+}
+
+// versionLimit is the highest version an entry of kind may reach:
+// maxOAuthVersion for oauth, which keeps two versions, and maxVersion for
+// every other kind, which keeps them all.
+func versionLimit(kind Kind) uint64 {
+	if kind == KindOAuth {
+		return maxOAuthVersion
+	}
+	return maxVersion
 }
 
 // parseVersionName returns the version a version file name names, if it is
@@ -1281,10 +1297,16 @@ func decodePointer(pt []byte, isOAuth func(version uint64) (bool, error)) (versi
 	if version == 0 || seq == 0 {
 		return 0, 0, 0, fmt.Errorf("%w: the pointer names version %d at sequence %d", ErrCorrupt, version, seq)
 	}
-	if version > maxVersion {
-		return 0, 0, 0, fmt.Errorf("%w: the pointer names version %d, over the %d-version limit", ErrCorrupt, version, maxVersion)
+	if version > maxOAuthVersion {
+		return 0, 0, 0, fmt.Errorf("%w: the pointer names version %d, over the %d-version limit", ErrCorrupt, version, uint64(maxOAuthVersion))
 	}
 	pruned := len(pt) == prunedPointerSize
+	// Only a pruned oauth pointer may name a version past maxVersion: the
+	// kind is asked only in the 24-byte form, which every other kind is
+	// refused below.
+	if version > maxVersion && !pruned {
+		return 0, 0, 0, fmt.Errorf("%w: the pointer names version %d, over the %d-version limit", ErrCorrupt, version, maxVersion)
+	}
 	if !pruned && version <= 2 {
 		return version, seq, low, nil
 	}

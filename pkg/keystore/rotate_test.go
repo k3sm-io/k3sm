@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -858,4 +859,94 @@ func TestRotateVersionSyncFailureRemovesVersion(t *testing.T) {
 	if v := mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a3", "r3")); v.Version != 2 {
 		t.Fatalf("the next rotation made version %d, want 2", v.Version)
 	}
+}
+
+// forgeAtVersion reseals name's version 1 as versions from..cur and seals a
+// pointer naming cur at sequence seq with low as its oldest retained
+// version, then removes version 1 when from is above it: an entry that has
+// been rotated up to cur, made without cur rotations.
+func forgeAtVersion(t *testing.T, s *FileStore, server, name string, from, cur, low, seq uint64) {
+	t.Helper()
+	k, err := s.loadMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(server, "keystore", name)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	e := &entry{root: root, name: name}
+	gen, err := os.ReadFile(filepath.Join(dir, generationName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hex.Decode(e.generation[:], bytes.TrimSpace(gen)); err != nil {
+		t.Fatal(err)
+	}
+	v1, val, err := e.version(k, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := from; n <= cur; n++ {
+		rec := record{kind: byte(v1.Kind), name: name, version: n, generation: e.generation, created: v1.Created.Unix()}
+		if err := rec.seal(k.seal, k.scope, val, rand.Reader); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(dir, versionName(n)), string(rec.marshal()))
+	}
+	ptr := record{kind: kindPointer, name: name, generation: e.generation, created: v1.Created.Unix()}
+	if err := ptr.seal(k.seal, k.scope, rangePlaintext(cur, seq, low), rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, currentName), string(ptr.marshal()))
+	if from > 1 {
+		remove(t, filepath.Join(dir, versionName(1)))
+	}
+}
+
+// TestOAuthVersionCeiling is the oauth ceiling: an oauth entry keeps only
+// two versions, so its pointer may name versions up to maxOAuthVersion
+// (2^32) in the same pointer format, and a rotation past the general
+// maxVersion (2^16) proceeds. Every other kind keeps every version and
+// stops at maxVersion; an oauth pointer past maxOAuthVersion is ErrCorrupt.
+func TestOAuthVersionCeiling(t *testing.T) {
+	ctx := context.Background()
+	t.Run("oauth past maxVersion", func(t *testing.T) {
+		s, server := newTypedStore(t)
+		mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+		forgeAtVersion(t, s, server, "k", maxVersion-1, maxVersion, maxVersion-1, 2)
+		v := mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+		if v.Version != maxVersion+1 {
+			t.Fatalf("rotation at the general ceiling made version %d, want %d", v.Version, maxVersion+1)
+		}
+		cur, c := mustCredential(t, s, "k")
+		if cur.Version != maxVersion+1 || string(c.AccessToken) != "a2" {
+			t.Fatalf("current %d %q", cur.Version, c.AccessToken)
+		}
+		list, err := s.List(ctx)
+		if err != nil || len(list) != 1 || list[0].Err != nil || len(list[0].Versions) != 2 {
+			t.Fatalf("List = %+v, %v; want two versions", list, err)
+		}
+	})
+	t.Run("oauth at maxOAuthVersion", func(t *testing.T) {
+		s, server := newTypedStore(t)
+		mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+		forgeAtVersion(t, s, server, "k", maxOAuthVersion-1, maxOAuthVersion, maxOAuthVersion-1, 2)
+		mustCredential(t, s, "k")
+		if _, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a2", "r2")); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "last version") {
+			t.Fatalf("rotation at the oauth ceiling: %v, want the ErrCorrupt last-version refusal", err)
+		}
+	})
+	t.Run("opaque at maxVersion", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		// An opaque pointer at maxVersion whose version opens: the
+		// rotation is refused at the ceiling, before anything is written.
+		forgeAtVersion(t, s, server, "k", maxVersion, maxVersion, 1, 2)
+		if _, err := s.Rotate(ctx, "k", []byte("two")); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "last version") {
+			t.Fatalf("opaque rotation at maxVersion: %v, want the last-version refusal", err)
+		}
+	})
 }

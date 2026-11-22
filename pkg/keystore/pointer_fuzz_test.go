@@ -35,7 +35,8 @@ func writtenPointer(version, seq uint64, oauth bool) []byte {
 }
 
 // FuzzPointerPlaintext is U151's pointer invariant: decodePointer accepts
-// exactly what the writers produce. A plaintext it accepts re-encodes to
+// exactly what the writers produce, up to each kind's version limit
+// (maxOAuthVersion for oauth, maxVersion otherwise). A plaintext it accepts re-encodes to
 // itself through the writer's own form for that kind, and is ErrCorrupt
 // otherwise; the writer's output for the version and sequence it names
 // always decodes back to them.
@@ -45,6 +46,10 @@ func FuzzPointerPlaintext(f *testing.F) {
 			f.Add(writtenPointer(v, v, oauth), oauth)
 		}
 	}
+	f.Add(writtenPointer(maxVersion+1, 2, true), true)
+	f.Add(writtenPointer(maxOAuthVersion, 2, true), true)
+	f.Add(writtenPointer(maxOAuthVersion+1, 2, true), true)
+	f.Add(writtenPointer(maxVersion+1, 2, true), false)
 	f.Add(binary.BigEndian.AppendUint64(pointerPlaintext(2, 2), 1), true)
 	f.Add(binary.BigEndian.AppendUint64(pointerPlaintext(4, 4), 2), true)
 	f.Add(pointerPlaintext(0, 1), false)
@@ -58,6 +63,9 @@ func FuzzPointerPlaintext(f *testing.F) {
 				t.Fatalf("decodePointer(%x, oauth %t) = %v, not ErrCorrupt", pt, oauth, err)
 			}
 		} else {
+			if version > maxVersion && !oauth || version > maxOAuthVersion {
+				t.Fatalf("decodePointer accepted version %d (oauth %t), over its kind's limit", version, oauth)
+			}
 			if want := writtenPointer(version, seq, oauth); !bytes.Equal(pt, want) {
 				t.Fatalf("decodePointer accepted %x (oauth %t) as %d/%d/%d, but the writer writes %x", pt, oauth, version, seq, low, want)
 			}
@@ -71,7 +79,7 @@ func FuzzPointerPlaintext(f *testing.F) {
 			return
 		}
 		v, s := binary.BigEndian.Uint64(pt[:8]), binary.BigEndian.Uint64(pt[8:16])
-		if v == 0 || s == 0 || v > maxVersion {
+		if v == 0 || s == 0 || v > versionLimit(map[bool]Kind{true: KindOAuth, false: KindOpaque}[oauth]) {
 			return
 		}
 		w := writtenPointer(v, s, oauth)

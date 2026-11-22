@@ -237,7 +237,7 @@ func (s *FileStore) adopt(ctx context.Context, name string, version uint64) (Ver
 	if orphan.Kind != old.Kind {
 		return Version{}, fmt.Errorf("%w: version %d is %s, but %s is %s", ErrKindMismatch, version, orphan.Kind, name, old.Kind)
 	}
-	if cur >= maxVersion || seq == math.MaxUint64 {
+	if cur >= versionLimit(old.Kind) || seq == math.MaxUint64 {
 		return Version{}, fmt.Errorf("%w: the pointer is at the last version or sequence", ErrCorrupt)
 	}
 	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(e.generation[:]), Seq: seq + 1}); err != nil {
