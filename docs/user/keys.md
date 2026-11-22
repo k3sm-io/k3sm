@@ -214,6 +214,13 @@ field or a version it does not know. The refusal is in the server log, and the v
 file too rather than overwrite it. Two `deliver` or `undeliver` runs at once take turns on the lock file
 `/var/lib/k3sm/.keystore-delivery.lock`, so neither loses the other's change.
 
+### Limitation: one server
+
+Delivery is for single-server clusters. On more than one server, each delivers from its own
+keystore: every server runs the delivery from its own declaration and its own keystore, and
+they do not coordinate. Two servers declaring the same Secret do not share it: the one that
+creates it owns it, and the other logs that it was not created by this server and leaves it alone.
+
 ### While secrets encryption is off
 
 A delivered Secret is stored in the datastore like any other. With secrets encryption off (see
