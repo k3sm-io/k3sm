@@ -247,7 +247,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	// would drop a burial it adds is refused, with nothing written and the
 	// input left where it is, so the guard stays.
 	if lost := mergeLoses(live, probe, probeDropped); len(lost) > 0 {
-		return r, fmt.Errorf("%w: the merge would drop the deletions it adds for %s to stay within the floor's caps, so a copy of each would be accepted again. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished", errFloorFull, strings.Join(lost, ", "))
+		return r, fmt.Errorf("%w: the merge would drop the deletions it adds for %s to stay within the floor's caps, so a copy of each would be accepted again. Nothing is written, and the floor moved aside is left in place, so the restore stays unfinished. To make room, delete each entry that is no longer needed with sudo k3sm keys rm system/<name> --yes, which runs while the merge is pending, then run the merge again", errFloorFull, strings.Join(lost, ", "))
 	}
 	// Only keystore-lock: the merge writes the root-owned floor and nothing
 	// under keystore/, so it takes no keystore/.lock, which the service user

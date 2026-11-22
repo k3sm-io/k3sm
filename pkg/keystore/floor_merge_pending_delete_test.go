@@ -28,7 +28,8 @@ import (
 )
 
 // TestPendingMergeDeleteMakesRoom (U192): a merge refused because the floor
-// is full leaves the guard in place, and rm still runs under it: deleting
+// is full names the recovery and leaves the guard in place, and rm still
+// runs under it: deleting
 // live entries makes room, and the merge run again succeeds and clears the
 // guard. The rm calls raise the live floor's newest deletion above the
 // moved-aside floor's, which the merge's older-input check does not count:
@@ -59,8 +60,9 @@ func TestPendingMergeDeleteMakesRoom(t *testing.T) {
 	// burials it adds, and there are no others to drop.
 	size := len(b) - 200
 	setFloorLimits(t, size, size)
-	if _, err := s.MergeFloor(ctx, path, nil); !errors.Is(err, errFloorFull) {
-		t.Fatalf("MergeFloor over a full floor: %v, want errFloorFull", err)
+	_, err = s.MergeFloor(ctx, path, nil)
+	if !errors.Is(err, errFloorFull) || !strings.Contains(err.Error(), "sudo k3sm keys rm system/<name> --yes") || !strings.Contains(err.Error(), "run the merge again") {
+		t.Fatalf("MergeFloor over a full floor: %v, want errFloorFull naming keys rm and running the merge again", err)
 	}
 	for i := range removed {
 		if err := s.Delete(ctx, fmt.Sprintf("e-%02d", i)); err != nil {

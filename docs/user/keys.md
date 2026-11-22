@@ -391,7 +391,9 @@ typo, makes it refuse and change nothing. Remove each deleted entry's files with
 A line starting `dropped` names a deletion the floor could not keep: a copy of that entry put
 back is accepted. Only a deletion the restored floor already held is ever dropped: if the
 deletions the merge adds would not all fit, it refuses with a message that the floor is full,
-changes nothing and leaves the file in place, so the other verbs still refuse. A line starting `unverified` names a restored entry whose current version the
+changes nothing and leaves the file in place, so the other verbs still refuse. To make room,
+delete each entry you no longer need with `sudo k3sm keys rm system/<name> --yes`, which works
+while the merge is pending, then run the merge again. A line starting `unverified` names a restored entry whose current version the
 merge could not check with the master key, most often because the master key is missing. The
 merge then trusts the restored floor's record of that entry, so if the backup's copy is newer
 than the floor saved with it, `show` refuses the entry as a copy from before the restore. Then start the server and check the entries:
