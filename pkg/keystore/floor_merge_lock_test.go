@@ -96,6 +96,10 @@ func TestMergeFloorRefusesWrongInput(t *testing.T) {
 				putFloorFile(t, server, tc.live)
 			}
 			path := writeAsideFloor(t, server, aside)
+			if tc.name == "the live floor itself" {
+				// Named by its own path: refused outright, never renamed.
+				path = floorPath(server)
+			}
 			before, _ := os.ReadFile(floorPath(server))
 			_, err := s.MergeFloor(ctx, path, nil)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -252,4 +256,62 @@ func TestMergeFloorRefusesUnmatchedKeep(t *testing.T) {
 	if _, err := os.Lstat(path); err != nil {
 		t.Fatalf("the input after the refusal: %v, want it left in place", err)
 	}
+}
+
+// TestMergeFloorCommittedRerun (U192): a merge whose write landed but whose
+// rename failed (here the merged name is taken, the clock seam pinning it)
+// returns its full report as committed, leaves the guard, and a rerun of the
+// same input, read again under keystore-lock, writes nothing, renames the
+// input and reports it already merged, which clears the guard. A rerun is
+// already merged even when the input's newest deletion is below the live
+// floor's, which a Delete since the first merge raises.
+func TestMergeFloorCommittedRerun(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	path := writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
+	at := time.Unix(1795370000, 0)
+	s.now = func() time.Time { return at }
+	taken := floorPath(server) + ".merged-1795370000"
+	if err := os.WriteFile(taken, []byte("earlier\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.MergeFloor(ctx, path, nil)
+	if !Committed(err) || r.Merged != 1 {
+		t.Fatalf("MergeFloor with the merged name taken = %+v, %v; want the report, committed", r, err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("the input after the failed rename: %v, want it still there", err)
+	}
+	if _, err := s.Put(ctx, "n", KindOpaque, []byte("v")); !errors.Is(err, errMergePending) {
+		t.Fatalf("Put after the failed rename: %v, want the guard still set", err)
+	}
+	merged, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at = at.Add(time.Second)
+	r, err = s.MergeFloor(ctx, path, nil)
+	if err != nil || !r.AlreadyMerged || r.Merged != 0 || r.AlreadyPresent != 1 {
+		t.Fatalf("the rerun = %+v, %v; want it already merged", r, err)
+	}
+	if after, err := os.ReadFile(floorPath(server)); err != nil || string(after) != string(merged) {
+		t.Fatalf("the floor after the rerun = %s, %v; want it unchanged", after, err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the input after the rerun: %v, want it renamed", err)
+	}
+	mustPut(t, s, "n", KindOpaque, []byte("v"))
+
+	t.Run("an input older than the live floor", func(t *testing.T) {
+		if err := s.Delete(ctx, "n"); err != nil {
+			t.Fatal(err)
+		}
+		path := writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
+		at = at.Add(time.Second)
+		r, err := s.MergeFloor(ctx, path, nil)
+		if err != nil || !r.AlreadyMerged {
+			t.Fatalf("the rerun after a Delete = %+v, %v; want it already merged", r, err)
+		}
+	})
 }

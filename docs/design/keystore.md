@@ -1257,9 +1257,15 @@ under `keystore-lock`, before they write anything, with a message naming `keys f
 (`errMergePending`), and RaiseFloor, which the read verbs call first, raises nothing and logs
 that at Warn, so `list` and `show` still read the restored entries and no pointer put back
 before the merge is recorded. A successful merge renames its input to
-`keystore-floor.json.merged-<unix>` beside it (never over an existing file, and only if the name
-is still the file it read), which clears the guard; a rename that fails after the write is
-reported as committed. `k3sm start` is not hooked: its start path has no cheap synchronous
+`keystore-floor.json.merged-<unix>` beside it, through the directory descriptor it judged the
+input in (never over an existing file, and only if the name is still the file it read), which
+clears the guard. A rename that fails after the write is reported as committed: the verb prints
+the full report and exits 4. A rerun is safe: the input is read again under `keystore-lock`, and
+the merge first runs on a copy of the live floor. When every burial and fence the input records
+is already there, it writes nothing, only renames the input, and reports `already merged`, even
+when the input's newest deletion is below the live floor's (a Delete since). An input that is
+the data root's live floor, by path or by inode, is refused outright
+(`TestMergeFloorCommittedRerun`, `TestKeysFloorMergeCommittedRerun`). `k3sm start` is not hooked: its start path has no cheap synchronous
 check of the keystore, which only the delivery reconciler reads, and it writes no floor. The
 recipe moves the live `keystore/` into `server/pre-restore.d/`, a directory it creates root:wheel
 0700 with `mkdir` (which fails on an existing name), so the service user cannot reach the

@@ -957,8 +957,11 @@ func (k *keepFlag) Set(q string) error {
 //
 // then one line per entry buried live ("buried live system/<name>: ..."),
 // kept ("kept system/<name>: ...") and per burial dropped ("dropped
-// system/<name>: ..."). It exits 0 when the merge is written, and
-// keysCommitted when it is written but dropped a burial.
+// system/<name>: ..."), preceded by "already merged" when the live floor
+// already held everything the input records (a rerun: nothing is written,
+// the input is only renamed). It exits 0 when the merge is written, and
+// keysCommitted, the report printed, when it is written but dropped a burial
+// or its input could not be renamed (keystore.Committed).
 func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if len(args) == 0 || args[0] != "merge" {
 		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge FLOOR [--keep system/<name>]...")
@@ -987,8 +990,11 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	r, err := s.MergeFloor(ctx, path, keep)
-	if err != nil {
+	if err != nil && !keystore.Committed(err) {
 		return v.failf(keysRefused, "%v", err)
+	}
+	if r.AlreadyMerged {
+		fmt.Fprintln(env.stdout, "already merged")
 	}
 	fmt.Fprintf(env.stdout, "merged %d\nalready present %d\nburied live %d\nkept %d\nretired %d\ndropped %d\nfenced %d\n", r.Merged, r.AlreadyPresent, len(r.BuriedLive), len(r.Kept), r.Retired, len(r.Dropped), len(r.Fenced))
 	for _, name := range r.BuriedLive {
@@ -1004,6 +1010,11 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	}
 	for _, name := range r.Dropped {
 		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
+	}
+	if err != nil {
+		// Written, but the input was not renamed: the report above stands,
+		// and a rerun renames it.
+		return v.failf(keysCommitted, "%v", err)
 	}
 	if len(r.Dropped) > 0 {
 		return v.failf(keysCommitted, "the merge is written, but it dropped %d deleted generation(s) to keep the floor within its caps", len(r.Dropped))

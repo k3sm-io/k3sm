@@ -346,7 +346,9 @@ sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore
 ```
 
 Once the merge is written, it renames the file to `keystore-floor.json.merged-<time>`, the time in
-seconds since 1970, and the other verbs work again. The merge refuses, and changes nothing, if the restored `keystore-floor.json` is not in place yet
+seconds since 1970, and the other verbs work again. If it prints its report and exits 4 saying the
+file was not renamed, the merge is written: run the same command again. The second run writes
+nothing more, prints `already merged` and renames the file. The merge refuses, and changes nothing, if the restored `keystore-floor.json` is not in place yet
 (put it back with `install` first), or if the file you name is the restored floor rather than the
 one you moved aside: one whose newest deletion is older than the restored floor's, or the live floor
 itself.

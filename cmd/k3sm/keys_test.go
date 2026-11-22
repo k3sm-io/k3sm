@@ -36,6 +36,7 @@ import (
 	"syscall"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"k3sm.io/k3sm/pkg/keystore"
 )
@@ -2511,4 +2512,55 @@ func TestKeysPendingMergeGuard(t *testing.T) {
 	}
 	h.put("system/n", []byte("n"))
 	h.mustRun(0, "rm", "system/k", "--yes")
+}
+
+// TestKeysFloorMergeCommittedRerun (U192): a merge whose floor write landed
+// but whose rename failed (every keystore-floor.json.merged-<unix> name the
+// clock can reach during the run is taken) prints its full report and exits
+// keysCommitted; the guard stays, and a rerun of the same input, with the
+// names freed, prints "already merged", renames the input and clears it.
+func TestKeysFloorMergeCommittedRerun(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	now := time.Now().Unix()
+	var taken []string
+	for at := now - 2; at <= now+60; at++ {
+		p := fmt.Sprintf("%s.merged-%d", recipeFloor(h), at)
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		taken = append(taken, p)
+	}
+	aside := recipeFloor(h) + ".pre-restore"
+	if code := h.run("floor", "merge", aside); code != keysCommitted {
+		t.Fatalf("merge with the rename failing: exit %d, stdout %q, stderr %q; want %d", code, h.stdout.String(), h.stderr.String(), keysCommitted)
+	}
+	if out := h.stdout.String(); !strings.Contains(out, "buried live 1\n") || !strings.Contains(out, "buried live system/k:") {
+		t.Fatalf("merge with the rename failing printed %q; want the full report", out)
+	}
+	if !strings.Contains(h.stderr.String(), "run the same merge again") {
+		t.Fatalf("merge with the rename failing: stderr %q; want it to say the rerun renames it", h.stderr.String())
+	}
+	h.stdin = strings.NewReader("value")
+	if code := h.run("put", "system/n", "--in", "-"); code != keysRefused {
+		t.Fatalf("put after the failed rename: exit %d, want the guard still set", code)
+	}
+	for _, p := range taken {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.mustRun(0, "floor", "merge", aside)
+	if !strings.Contains(h.stdout.String(), "already merged\n") {
+		t.Fatalf("the rerun printed %q; want already merged", h.stdout.String())
+	}
+	if _, err := os.Lstat(aside); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the input after the rerun: %v, want it renamed", err)
+	}
+	h.put("system/n", []byte("n"))
 }
