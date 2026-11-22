@@ -869,8 +869,11 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		if err != nil {
 			return 0, err
 		}
+		// A key is recorded on its first line, even at sequence 0: floor
+		// --rebuild writes 0 for an entry with no authenticated pointer, and
+		// that line is what keeps the entry damage, so it is present.
 		seq, inSeq := st.maxSeq[r.key]
-		if !inSeq && !st.buried[r.key] && (r.tomb || r.seq > seq) {
+		if !inSeq && !st.buried[r.key] {
 			if bound := l.keyBound(); st.keys >= bound {
 				return 0, fmt.Errorf("%w (%d)", errFloorTooManyKeys, bound)
 			}
@@ -879,7 +882,7 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		switch {
 		case r.tomb:
 			st.buried[r.key] = true
-		case r.seq > seq:
+		case !inSeq || r.seq > seq:
 			st.maxSeq[r.key] = r.seq
 		}
 		return scopeUID(r.key.scope), nil
@@ -890,7 +893,7 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 			return false, err
 		}
 		_, inSeq := st.maxSeq[r.key]
-		return !inSeq && !st.buried[r.key] && (r.tomb || r.seq > 0), nil
+		return !inSeq && !st.buried[r.key], nil
 	}
 	return &fileFloorLog{log: l}
 }

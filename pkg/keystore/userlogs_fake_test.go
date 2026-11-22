@@ -104,7 +104,7 @@ func (f *memFloor) liveGens(scope, name string) ([][generationSize]byte, error) 
 		switch {
 		case l.tomb:
 			live[l.gen] = false
-		case l.seq > 0:
+		default:
 			if _, seen := live[l.gen]; !seen {
 				live[l.gen] = true
 			}
