@@ -761,7 +761,9 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 // has, then flips the current pointer to it at the next sequence, then raises
 // the floor: docs/design/keystore.md § "Rotation and rollback". A failure
 // before the flip leaves the old version current and removes the next
-// version it wrote. A crash there leaves that sealed version above the
+// version it wrote, except for oauth: there a failure after the version
+// file is in place keeps it, for Orphan and Adopt, and returns an error
+// matching ErrOrphanVersion. A crash there leaves that sealed version above the
 // pointer, which the next Rotate refuses as ErrCorrupt and ErrOrphanVersion,
 // since a newer committed version behind a copied-back pointer looks the
 // same; it never promotes or unlinks it, and Adopt is the attended
@@ -880,7 +882,16 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 		flipped, err = s.commitPointer(e, ptr.marshal())
 	}
 	if !flipped {
-		// Nothing committed: the version just written is removed, best
+		// Nothing committed. An oauth version is kept: it holds the
+		// provider's new pair, whose refresh token the provider may have
+		// already rotated, so it is left above the pointer for Orphan and
+		// Adopt, and the error says so with ErrOrphanVersion.
+		if old.Kind == KindOAuth {
+			return Version{}, fmt.Errorf("%w: version %d was written but the pointer flip failed, so version %d stays current; "+
+				"version %d is kept for `k3sm keys adopt %s`; do not delete it: it may hold the only valid refresh token: %w",
+				ErrOrphanVersion, next, cur, next, qualified(name), err)
+		}
+		// Any other kind: the version just written is removed, best
 		// effort, since the next Rotate refuses a sealed version above the
 		// pointer rather than discard it (discardOrphans). Only a crash,
 		// or a failed removal here, leaves it.

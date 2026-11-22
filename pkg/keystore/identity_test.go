@@ -114,3 +114,49 @@ func TestAdoptRefusesReplacedOrphan(t *testing.T) {
 		t.Fatalf("adopted refresh %q, want r2", got)
 	}
 }
+
+// TestOAuthPreFlipFailureKeepsVersion is review round 4, item 2: an oauth
+// rotation that fails after its version file is in place and before the
+// pointer flip keeps that file, which holds the provider's new pair, and
+// says so with ErrOrphanVersion; Orphan and Adopt then recover it. Other
+// kinds still remove it.
+func TestOAuthPreFlipFailureKeepsVersion(t *testing.T) {
+	ctx := context.Background()
+	for _, step := range []string{"sync v2", "write current"} {
+		t.Run(step, func(t *testing.T) {
+			s, server := newTypedStore(t)
+			mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+			s.step = failAt(step)
+			v, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+			s.step = func(string) error { return nil }
+			if !errors.Is(err, ErrOrphanVersion) || errors.Is(err, ErrCommitted) || v != (Version{}) {
+				t.Fatalf("RotateCredential failing at %s = %+v, %v; want a zero Version and ErrOrphanVersion", step, v, err)
+			}
+			if _, err := os.Lstat(entryPath(server, "k", "v2")); err != nil {
+				t.Fatalf("the failed oauth rotation removed its v2: %v", err)
+			}
+			if _, _, err := s.CurrentCredential(ctx, "k"); !errors.Is(err, ErrOrphanVersion) {
+				t.Fatalf("CurrentCredential after the failure: %v, want ErrOrphanVersion", err)
+			}
+			if _, err := s.Adopt(ctx, "k", mustOrphan(t, s, "k")); err != nil {
+				t.Fatalf("Adopt the kept version: %v", err)
+			}
+			if got := sealedRefresh(t, s, "k", 2); got != "r2" {
+				t.Fatalf("adopted refresh %q, want r2", got)
+			}
+		})
+		t.Run(step+" token", func(t *testing.T) {
+			s, server := newTypedStore(t)
+			mustPutCredential(t, s, "k", KindToken, tokenEnvelope("t1"))
+			s.step = failAt(step)
+			_, err := s.RotateCredential(ctx, "k", KindToken, tokenEnvelope("t2"))
+			s.step = func(string) error { return nil }
+			if err == nil || errors.Is(err, ErrOrphanVersion) {
+				t.Fatalf("token RotateCredential failing at %s: %v, want an error that is not ErrOrphanVersion", step, err)
+			}
+			if _, err := os.Lstat(entryPath(server, "k", "v2")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the failed token rotation left its v2: %v", err)
+			}
+		})
+	}
+}

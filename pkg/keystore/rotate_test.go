@@ -559,6 +559,17 @@ func rotateCrashOAuthPrune(t *testing.T) {
 			if flipped {
 				wantCur, wantAccess = 3, "a3"
 			}
+			if i == 1 || i == 2 {
+				// v3 was in place when the step failed: oauth keeps it
+				// for Adopt, which completes the flip.
+				if _, _, err := s.CurrentCredential(ctx, "k"); !errors.Is(err, ErrOrphanVersion) {
+					t.Fatalf("CurrentCredential over the kept v3: %v, want ErrOrphanVersion", err)
+				}
+				if _, err := s.Adopt(ctx, "k", mustOrphan(t, s, "k")); err != nil {
+					t.Fatalf("Adopt the kept v3: %v", err)
+				}
+				wantCur, wantAccess = 3, "a3"
+			}
 			v, c := mustCredential(t, s, "k")
 			if v.Version != wantCur || string(c.AccessToken) != wantAccess {
 				t.Fatalf("after the crash: version %d %q, want %d %q", v.Version, c.AccessToken, wantCur, wantAccess)
@@ -843,20 +854,22 @@ func TestRotateReportsCommitAfterFlip(t *testing.T) {
 // crash leaves an orphan above the pointer.
 func TestRotateVersionSyncFailureRemovesVersion(t *testing.T) {
 	ctx := context.Background()
+	// A token, not oauth: an oauth rotation keeps the version it wrote
+	// (TestOAuthPreFlipFailureKeepsVersion).
 	s, server := newTypedStore(t)
-	mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+	mustPutCredential(t, s, "k", KindToken, tokenEnvelope("t1"))
 	s.step = failAt("sync v2")
-	if v, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a2", "r2")); err == nil || v != (Version{}) {
+	if v, err := s.RotateCredential(ctx, "k", KindToken, tokenEnvelope("t2")); err == nil || v != (Version{}) {
 		t.Fatalf("RotateCredential failing at the version's fsync = %+v, %v; want a zero Version and an error", v, err)
 	}
 	s.step = func(string) error { return nil }
 	if _, err := os.Lstat(entryPath(server, "k", "v2")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the failed rotation left its v2: %v", err)
 	}
-	if v, c := mustCredential(t, s, "k"); v.Version != 1 || string(c.AccessToken) != "a1" {
-		t.Fatalf("current after the failure: version %d %q, want 1 a1", v.Version, c.AccessToken)
+	if v, c := mustCredential(t, s, "k"); v.Version != 1 || string(c.Value) != "t1" {
+		t.Fatalf("current after the failure: version %d %q, want 1 t1", v.Version, c.Value)
 	}
-	if v := mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a3", "r3")); v.Version != 2 {
+	if v := mustRotateCredential(t, s, "k", KindToken, tokenEnvelope("t3")); v.Version != 2 {
 		t.Fatalf("the next rotation made version %d, want 2", v.Version)
 	}
 }

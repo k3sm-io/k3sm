@@ -113,7 +113,9 @@ func (s *FileStore) GenerateSSH(ctx context.Context, name, comment string) (Vers
 // pointer and unlinks the versions below it. A failure after the pointer
 // flip (the floor line, the prune) returns the new version with an error
 // matching ErrCommitted: read the entry again, and never retry from the old
-// pair.
+// pair. An oauth rotation that fails after writing its version file and
+// before the flip keeps that file for Adopt and returns an error matching
+// ErrOrphanVersion; see ErrCommitted for the refresher's retry contract.
 func (s *FileStore) RotateCredential(ctx context.Context, name string, kind Kind, e typed.Envelope) (Version, error) {
 	return s.rotateCredential(ctx, name, kind, nil, e)
 }

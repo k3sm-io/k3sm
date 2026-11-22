@@ -234,6 +234,15 @@ var (
 	// other sentinel of this package, ErrCorrupt included, whatever its
 	// cause was (a floor refusal reads as ErrCorrupt). The cause is in the
 	// message only.
+	//
+	// The refresher's contract on a failure that does not match it: nothing
+	// was made current, and the provider may already have rotated the
+	// stored pair's refresh token, so the refresher retries RotateIf with
+	// the new pair it holds in memory, and never refreshes again from the
+	// stored pair. When the failure matches ErrOrphanVersion, the new pair
+	// is already sealed above the pointer: a retry is refused with
+	// ErrOrphanVersion too, and the refresher stops and leaves the entry to
+	// an operator's Adopt.
 	ErrCommitted = errors.New("the change was made")
 	// ErrRefreshOwnerFixed reports a rotation of an oauth entry whose new
 	// pair names another refresh owner: the owner is fixed when the entry
@@ -251,7 +260,9 @@ var (
 	// pointer was copied back over a newer one. For oauth it may hold the
 	// provider's newest refresh token, so it is never unlinked, and an oauth
 	// read refuses with it rather than hand out a pair that may already be
-	// spent.
+	// spent. An oauth rotation that fails after its version file is in
+	// place and before its pointer flip keeps that file and returns an
+	// error matching it, never ErrCommitted.
 	ErrOrphanVersion = errors.New("a sealed version of the keystore entry lies above its current pointer, left by a crashed rotation or a copied-back pointer")
 	// ErrVersionNotFound reports that the entry exists but holds no such
 	// version.
