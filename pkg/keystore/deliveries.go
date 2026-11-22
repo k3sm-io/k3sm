@@ -474,9 +474,10 @@ type deliveriesRead struct {
 // readDeliveriesFloor is readDeliveries. With revoke set, a floor that
 // is absent or cannot be read skips the floor check rather than refuse,
 // but a floor whose bytes do not parse (matching ErrCorrupt) refuses: it is
-// damage, which root repairs with floor --rebuild. Without the floor it
-// still checks the record against the highest sequence this process has read
-// or written, and reports the floor's error as unverified: a withdraw then
+// damage, which root repairs with floor --rebuild. It always checks the
+// record against the larger of the floor and the highest sequence this
+// process has read or written, and without the floor against that mark
+// alone, reporting the floor's error as unverified: a withdraw then
 // seals nothing (errWithdrawUnsealed; docs/design/keystore.md § "Quotas",
 // "Revocation always succeeds"). A record below a floor that can be read is
 // refused, revoke or not.
@@ -504,16 +505,21 @@ func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) (deliveries
 	if flErr != nil && (!revoke || errors.Is(flErr, ErrCorrupt)) {
 		return deliveriesRead{}, flErr
 	}
-	if flErr != nil {
-		// No floor to check against: the sequence this process last read or
-		// wrote stands in for it, so a copy put back below it is not
-		// re-sealed at a later sequence with a tombstone lost.
-		if seen := deliveriesSeen.high(u.s.dir, u.scope, o.gen); r.version < seen {
-			return deliveriesRead{}, fmt.Errorf("%w: the %s record (sequence %d) is older than one this process has already read or written (sequence %d), and the user-scope floor cannot be read (%v); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, seen, flErr)
-		}
-	}
+	// The record is checked against the larger of the floor and the
+	// sequence this process last read or wrote, always: a withdraw whose
+	// floor line failed leaves the floor one behind the record, and a copy
+	// put back at the floor must still not be re-sealed at a later sequence
+	// with a tombstone lost. With no floor to read the mark stands alone.
+	seen := deliveriesSeen.high(u.s.dir, u.scope, o.gen)
 	if flErr == nil && r.version < fl {
 		return deliveriesRead{}, fmt.Errorf("%w: the %s record (sequence %d) is older than the user-scope floor (sequence %d); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, fl)
+	}
+	if r.version < seen {
+		why := "the user-scope floor is behind it"
+		if flErr != nil {
+			why = fmt.Sprintf("the user-scope floor cannot be read (%v)", flErr)
+		}
+		return deliveriesRead{}, fmt.Errorf("%w: the %s record (sequence %d) is older than one this process has already read or written (sequence %d), and %s; an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, seen, why)
 	}
 	pt, err := r.open(o.key, u.scope)
 	if err != nil {
@@ -838,20 +844,22 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, error) {
 			// that copy authentic. Nothing is sealed.
 			return ns, fmt.Errorf("%w: %w", errWithdrawUnsealed, rd.unverified)
 		}
-		// Only a withdraw that revokes is in the revocation class; a repeat
-		// changes nothing and is refused past the hard cap like any other
-		// operation.
-		if err := u.s.admit(u.uid, !ds[i].withdrawn); err != nil {
+		// Only a withdraw that revokes is in the revocation class, and a
+		// repeat that catches the floor up to the record, which finishes the
+		// revocation whose floor line failed; any other repeat changes
+		// nothing and is refused past the hard cap like any other operation.
+		catchUp := ds[i].withdrawn && rd.unverified == nil && rd.floor < seq
+		if err := u.s.admit(u.uid, !ds[i].withdrawn || catchUp); err != nil {
 			return ns, err
 		}
 		if ds[i].withdrawn {
-			if rd.unverified != nil || rd.floor >= seq {
+			if !catchUp {
 				// The floor already holds the record's sequence, or cannot
 				// be read to take it: nothing changed, and nothing is
 				// appended.
 				return ns, nil
 			}
-			return ns, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq, false)
+			return ns, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq, true)
 		}
 		ds[i].withdrawn = true
 		return ns, u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1, true)
