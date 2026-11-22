@@ -934,7 +934,7 @@ func (u *UserScope) grantLocked(ctx context.Context, g *grantAudit, fn func(*ope
 	if errors.Is(err, errNoScopeKey) {
 		// The mint and then fn each append a floor line for the delivery
 		// record: one new key, preflighted before the mint's first write.
-		if err := u.s.floorGrantRoomKeys(u.scope, []string{deliveriesFloorName, deliveriesFloorName}, func(*logState) int { return 1 }); err != nil {
+		if err := u.s.floorGrantRoomKeys(u.scope, []string{deliveriesFloorName, deliveriesFloorName}, 0, func(*logState) int { return 1 }); err != nil {
 			return err
 		}
 		_, entries, err = u.mint(root, k.wrap, grant)

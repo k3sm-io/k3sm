@@ -796,6 +796,13 @@ func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64)
 // writes a newline first, so the torn bytes read as a line of their own,
 // which the tolerant audit reader drops, and line reads back whole.
 func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) error {
+	return l.appendLineSlack(uid, line, budget, revoke, revoke)
+}
+
+// appendLineSlack is appendLine with the free-space check apart from the
+// class: slack holds the line to revokeFreeSlack, as a committed change's
+// floor line is, whatever its class.
+func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, slack bool) error {
 	if len(line) > maxLogLine {
 		return fmt.Errorf("%w: refused a %d-byte line for %s", errLogLineTooLong, len(line), l.name)
 	}
@@ -867,7 +874,7 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) err
 			}
 		}
 	}
-	if err := l.preflight(f, len(out), revoke); err != nil {
+	if err := l.preflight(f, len(out), slack); err != nil {
 		return err
 	}
 	// One write(2) of the whole line. An ENOSPC or EIO between the
@@ -1074,8 +1081,10 @@ func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq 
 	// Past the hard cap only a revocation's floor line draws on the uid's
 	// revocation budget: any other line is refused there, and a grant checks
 	// before its first write that its lines start below the cap
-	// (floorGrantRoom).
-	return f.log.appendLine(scopeUID(scope), line, revoke, revoke)
+	// (floorGrantRoom). Every floor line follows its change's commit, as
+	// its integrity record, so each is held only to the revocation slack:
+	// the grant's free-space margin was judged before its first write.
+	return f.log.appendLineSlack(scopeUID(scope), line, revoke, revoke, true)
 }
 
 func (f *fileFloorLog) bury(scope, name string, gen [generationSize]byte) error {
@@ -1208,19 +1217,22 @@ func (s *FileStore) admit(uid uint32, revoke bool) error {
 // would refuse after its commit: a line that would start at or past the
 // hard cap (a grant's line draws on no revocation budget), lines that would
 // take the floor past logReadBound, past its key bound or past the scope
-// uid's key share (each counted as a new key), or lines the free-space
-// margin would not hold. So a grant
-// committed without its floor line is left only by a crash or an I/O error
-// between this check and the append. Only the file-backed floor is held.
-func (s *FileStore) floorGrantRoom(scope string, names []string) error {
-	return s.floorGrantRoomKeys(scope, names, nil)
+// uid's key share (each counted as a new key), or lines that, with write
+// more bytes the grant writes before them (its records), the free-space
+// margin would not hold. The post-commit append is then held only to the
+// revocation slack (fileFloorLog.append), so a grant committed without its
+// floor line is left by a crash, an I/O error, or a volume filled past the
+// margin and the slack both between this check and the append. Only the
+// file-backed floor is held.
+func (s *FileStore) floorGrantRoom(scope string, names []string, write int64) error {
+	return s.floorGrantRoomKeys(scope, names, write, nil)
 }
 
 // floorDeliverRoom is floorGrantRoom for a deliver's one floor line, the
 // delivery record's at gen: a new key only when the floor lacks it.
 func (s *FileStore) floorDeliverRoom(scope string, gen [generationSize]byte) error {
 	k := floorKey{scope, deliveriesFloorName, gen}
-	return s.floorGrantRoomKeys(scope, []string{deliveriesFloorName}, func(st *logState) int {
+	return s.floorGrantRoomKeys(scope, []string{deliveriesFloorName}, 0, func(st *logState) int {
 		if _, ok := st.maxSeq[k]; ok || st.buried[k] {
 			return 0
 		}
@@ -1231,7 +1243,7 @@ func (s *FileStore) floorDeliverRoom(scope string, gen [generationSize]byte) err
 // floorGrantRoomKeys is floorGrantRoom with newKeys, when set, counting the
 // keys the lines add from what the floor holds; nil counts each line as a
 // new key.
-func (s *FileStore) floorGrantRoomKeys(scope string, names []string, newKeys func(*logState) int) error {
+func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64, newKeys func(*logState) int) error {
 	ff, ok := s.userFloor.(*fileFloorLog)
 	if !ok {
 		return nil
@@ -1280,7 +1292,7 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, newKeys fun
 	if err := l.addKeyRoom(state, scopeUID(scope), n, false); err != nil {
 		return err
 	}
-	return l.preflight(f, total, false)
+	return l.preflight(f, total+int(write), false)
 }
 
 // errLogBoundsBelowLog refuses, at store open, a configuration whose

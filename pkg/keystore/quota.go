@@ -72,11 +72,17 @@ func checkScopeQuota(entries *os.Root, name string, value []byte, base int64) er
 	if !exists && count >= maxScopeEntries {
 		return fmt.Errorf("%w: the scope holds %d entries, at most %d", ErrQuota, count, maxScopeEntries)
 	}
-	add := int64(headerSize+len(name)+len(value)+tagSize) + int64(headerSize+len(currentName)+pointerSize+tagSize) + generationFileSize
+	add := entryWriteBytes(name, value)
 	if total+add > maxScopeBytes {
 		return fmt.Errorf("%w: the scope's sealed records would be %d bytes with its deliveries record, over %d; rm an entry rotated often, then put it again", ErrQuota, total+add, maxScopeBytes)
 	}
 	return nil
+}
+
+// entryWriteBytes is what a put of value as name writes in the entry's
+// directory: version 1, its pointer and its generation file.
+func entryWriteBytes(name string, value []byte) int64 {
+	return int64(headerSize+len(name)+len(value)+tagSize) + int64(headerSize+len(currentName)+pointerSize+tagSize) + generationFileSize
 }
 
 // deliveriesBytes is the size of the scope's deliveries record, which the

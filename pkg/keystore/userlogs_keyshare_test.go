@@ -76,7 +76,7 @@ func TestFloorTombstoneLandsInHeadroom(t *testing.T) {
 	l.mu.Lock()
 	l.maxKeys, l.maxHeadroom = l.state.keys, 2
 	l.mu.Unlock()
-	if err := s.floorGrantRoom("user/1001", []string{"other"}); !errors.Is(err, ErrLogFull) {
+	if err := s.floorGrantRoom("user/1001", []string{"other"}, 0); !errors.Is(err, ErrLogFull) {
 		t.Fatalf("a grant at the global key bound: %v, want ErrLogFull", err)
 	}
 	for i := range 2 {
