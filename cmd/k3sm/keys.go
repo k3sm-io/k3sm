@@ -64,6 +64,11 @@ const keysUsage = `Usage:
         k3sm so the value is never printed
   sudo k3sm keys rm system/<name> --yes
         delete the entry and every version; irreversible
+  sudo k3sm keys adopt system/<name> [--yes]
+        show the sealed version a crashed rotation left above the current
+        one, beside the current one, and make it current: with --yes, or
+        once confirmed at a terminal. For oauth it may hold the only valid
+        refresh token: adopt it, never delete it
   sudo k3sm keys rewrap --key-out FILE | --key-in FILE
         re-seal every entry under a new master key. --key-out writes the new
         key k3sm mints to FILE (a new file, mode 0600, in a directory only
@@ -135,6 +140,8 @@ type keysStore interface {
 	InterruptedRewrap(ctx context.Context) (fingerprint [sha256.Size]byte, ok bool, err error)
 	RecordsSealedUnder(ctx context.Context, key []byte) (bool, error)
 	UserScopesExist(ctx context.Context) (bool, error)
+	Orphan(ctx context.Context, name string) (keystore.OrphanInfo, error)
+	Adopt(ctx context.Context, name string, version uint64) (keystore.Version, error)
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -478,6 +485,8 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 		return keysRotate(ctx, rest, env)
 	case "rm":
 		return keysRm(ctx, rest, env)
+	case "adopt":
+		return keysAdopt(ctx, rest, env)
 	case "rewrap":
 		return keysRewrap(ctx, rest, env)
 	case "deliver":
@@ -873,6 +882,82 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 	fmt.Fprintf(env.stdout, "deleted %s\n", qualify(name))
 	v.warnDeclared(name)
 	return keysOK
+}
+
+// keysAdopt is `keys adopt`: it prints the entry's current version and the
+// sealed version above it (Orphan), never a value, then makes that version
+// current (Adopt) with --yes, or once a terminal on stdin confirms.
+func keysAdopt(ctx context.Context, args []string, env keysEnv) int {
+	v := newKeysVerb("adopt", env)
+	yes := v.fs.Bool("yes", false, "confirm: make the orphaned version current")
+	pos, err := v.parse(args)
+	if err != nil {
+		return keysBadUsage
+	}
+	name, code := v.nameArg(pos)
+	if code != keysOK {
+		return code
+	}
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	info, err := s.Orphan(ctx, name)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	fmt.Fprintf(env.stdout, "name:     %s\n", qualify(name))
+	fmt.Fprintf(env.stdout, "current:  version %d, %s, created %s, pointer sequence %d\n",
+		info.Current.Version, info.Current.Kind, info.Current.Created.UTC().Format(time.RFC3339), info.Seq)
+	fmt.Fprintf(env.stdout, "orphan:   version %d, %s, created %s\n",
+		info.Orphan.Version, info.Orphan.Kind, info.Orphan.Created.UTC().Format(time.RFC3339))
+	if len(info.Others) > 0 {
+		fmt.Fprintf(env.stdout, "beyond:   versions %v (a copied-back pointer: adopt refuses)\n", info.Others)
+	}
+	if !*yes {
+		if !env.stdinTTY() {
+			return v.failf(keysBadUsage, "adopting makes version %d of %s current: pass --yes, or run it at a terminal to confirm", info.Orphan.Version, qualify(name))
+		}
+		fmt.Fprintf(env.stdout, "make version %d current? [y/N] ", info.Orphan.Version)
+		if !confirmed(env.stdin) {
+			return v.failf(keysRefused, "not confirmed; nothing was changed")
+		}
+	}
+	ver, err := s.Adopt(ctx, name, info.Orphan.Version)
+	if errors.Is(err, keystore.ErrCommitted) {
+		fmt.Fprintf(env.stdout, "adopted %s version %d: it is current\n", qualify(name), ver.Version)
+		return v.failf(keysRefused, "%v", err)
+	}
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	fmt.Fprintf(env.stdout, "adopted %s version %d: it is current\n", qualify(name), ver.Version)
+	return keysOK
+}
+
+// confirmed reads one short answer line from r and reports whether it is
+// y or yes, in any case. It reads at most a few bytes, so a stream that
+// never ends a line is not read whole.
+func confirmed(r io.Reader) bool {
+	var b [8]byte
+	var line []byte
+	for len(line) < len(b) {
+		n, err := r.Read(b[len(line) : len(line)+1])
+		if n == 1 {
+			if b[len(line)] == '\n' {
+				break
+			}
+			line = b[:len(line)+1]
+		}
+		if err != nil {
+			break
+		}
+	}
+	answer := strings.ToLower(strings.TrimSpace(string(line)))
+	return answer == "y" || answer == "yes"
 }
 
 // keyOutFile is a key file writeKeyOut wrote, held through the directory

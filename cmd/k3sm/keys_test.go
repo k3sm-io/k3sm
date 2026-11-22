@@ -1784,3 +1784,74 @@ func TestRewrapWarnsWhenUserScopesExist(t *testing.T) {
 		}
 	})
 }
+
+// TestKeysAdopt is G9's CLI half: keys adopt is root-only, prints the
+// current version and the orphan above it, and adopts only with --yes or a
+// confirmation typed at a terminal. The orphan here is a newer version
+// behind a copied-back pointer with the floor lagging, which leaves the
+// same files a crashed rotation does.
+func TestKeysAdopt(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/alpha", []byte("one"))
+	cur := filepath.Join(h.keystoreDir(), "alpha", "current")
+	saved, err := os.ReadFile(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.stdin = strings.NewReader("two")
+	h.mustRun(0, "rotate", "system/alpha", "--in", "-")
+	if err := os.WriteFile(cur, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	floorPath := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+	b, err := os.ReadFile(floorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lagged := strings.Replace(string(b), `"seq":2`, `"seq":1`, 1)
+	if lagged == string(b) {
+		t.Fatalf("the floor does not record sequence 2: %s", b)
+	}
+	if err := os.WriteFile(floorPath, []byte(lagged), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h.euid = 501
+	h.mustRun(1, "adopt", "system/alpha", "--yes")
+	if !strings.Contains(h.stderr.String(), "run as root") {
+		t.Fatalf("adopt as non-root: %s", h.stderr.String())
+	}
+	h.euid = 0
+
+	// Neither --yes nor a terminal: both sides printed, nothing changed.
+	h.mustRun(2, "adopt", "system/alpha")
+	for _, want := range []string{"current:  version 1, opaque", "orphan:   version 2, opaque", "pass --yes"} {
+		if !strings.Contains(h.stdout.String()+h.stderr.String(), want) {
+			t.Fatalf("adopt without --yes does not print %q:\nstdout:\n%s\nstderr:\n%s", want, h.stdout.String(), h.stderr.String())
+		}
+	}
+	// A terminal answering no changes nothing either.
+	h.stdinTTY = true
+	h.stdin = strings.NewReader("n\n")
+	h.mustRun(1, "adopt", "system/alpha")
+	if got := h.value("alpha", 1); string(got) != "one" {
+		t.Fatalf("alpha v1 = %q", got)
+	}
+	h.stdin = strings.NewReader("yes\n")
+	h.mustRun(0, "adopt", "system/alpha")
+	if !strings.Contains(h.stdout.String(), "adopted system/alpha version 2") {
+		t.Fatalf("adopt output:\n%s", h.stdout.String())
+	}
+	h.stdinTTY = false
+	h.mustRun(0, "show", "system/alpha", "--reveal", "--yes")
+	if h.stdout.String() != "two" {
+		t.Fatalf("current after adopt = %q, want two", h.stdout.String())
+	}
+	h.mustRun(1, "adopt", "system/alpha", "--yes")
+	if !strings.Contains(h.stderr.String(), "no sealed version lies above") {
+		t.Fatalf("adopt with nothing to adopt: %s", h.stderr.String())
+	}
+	if strings.Contains(h.stdout.String()+h.stderr.String(), "two") {
+		t.Fatal("adopt printed a value")
+	}
+}

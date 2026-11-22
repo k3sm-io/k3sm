@@ -458,7 +458,8 @@ check G8 "Rotate flips the pointer last; a crash before the flip leaves the old 
 	TestRotateCrashAtEveryStep TestRotate
 check G9 "a Rotate retry never promotes an orphan: a failed Rotate removes its own, a sealed one a crash left is refused, an unauthenticated one is discarded, and the retry seals the value it was given; only an attended adopt promotes one" \
 	TestRotateRetryDiscardsOrphan TestParseVersionName TestRotateVersionSyncFailureRemovesVersion \
-	TestOAuthCrashOrphanAdopted TestOrphanRefusalTellsCasesApart TestAdoptRefuses
+	TestOAuthCrashOrphanAdopted TestOrphanRefusalTellsCasesApart TestAdoptRefuses \
+	k3sm/cmd/k3sm::TestKeysAdopt
 check G10 "the master is minted only by the first put, never over entries; rewrap --key-in accepts only a key an interrupted rewrap recorded or sealed records under" \
 	TestMasterMint TestMintCountsReservedUserName \
 	k3sm/cmd/k3sm::TestKeysRewrapKeyInRecoveryOnly TestKeysRewrapKeyInRecoversReplacedNext
