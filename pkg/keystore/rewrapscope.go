@@ -19,6 +19,7 @@ package keystore
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -147,15 +148,18 @@ func checkScopeKeyNew(dir *os.Root, uid string) error {
 
 // checkScopesPlanned re-walks .user after the commit and refuses, as
 // ErrCorrupt, unless the scopes with a scope.key are exactly those plan
-// re-sealed, each re-opening under next's W: a scope that appeared or went
-// missing during the run, or a scope.key swapped back to an old copy or
-// damaged after its commit, would be left under a master about to be
-// retired.
+// re-sealed, each re-opening under next's W and holding the K_u,
+// generation and created time pinned at the plan: a scope that appeared or
+// went missing during the run, a scope.key swapped back to an old copy or
+// damaged after its commit, or one swapped for a record under next's W with
+// another K_u, would be left under a master about to be retired.
 func (s *FileStore) checkScopesPlanned(ctx context.Context, root *os.Root, plan []planned, next keys) error {
 	want := map[string]bool{}
+	pins := map[string]scopePin{}
 	for _, p := range plan {
 		if p.scope != "" {
 			want[p.scope] = true
+			pins[p.scope] = p.pin
 		}
 	}
 	got := map[string]bool{}
@@ -173,6 +177,9 @@ func (s *FileStore) checkScopesPlanned(ctx context.Context, root *os.Root, plan 
 		var pt []byte
 		if err == nil {
 			pt, err = r.open(next.wrap, userScopePrefix+uid)
+			if err == nil {
+				err = pins[uid].check(r, pt)
+			}
 			clear(pt)
 		}
 		if err != nil {
@@ -235,31 +242,61 @@ func (s *FileStore) planScopes(ctx context.Context, root *os.Root, old keys, nex
 		if errors.Is(err, errNoScopeKey) {
 			return nil
 		}
+		var pin scopePin
 		if err == nil {
 			var underNext bool
-			underNext, err = openScopeKeyEither(r, userScopePrefix+uid, old, next)
+			underNext, pin, err = openScopeKeyEither(r, userScopePrefix+uid, old, next)
 			committed = committed || underNext
 		}
 		if err != nil {
 			return fmt.Errorf("the scope key of user/%s does not open, and a rewrap would leave it sealed under a master that no longer exists. Root must restore keystore/%s/%s/ from a backup, or %s, then run rewrap again: %w", uid, userScopesName, uid, damagedScopeRecovery(uid), err)
 		}
-		out = append(out, planned{scope: uid})
+		out = append(out, planned{scope: uid, pin: pin})
 		return nil
 	})
 	return out, committed, err
 }
 
+// scopePin is what a scope.key held when Rewrap planned it: a fingerprint
+// of its K_u (never K_u itself), its generation and its created time.
+type scopePin struct {
+	ku         [sha256.Size]byte
+	generation [generationSize]byte
+	created    int64
+}
+
+// pinScopeKey pins r, whose K_u is ku.
+func pinScopeKey(r record, ku []byte) scopePin {
+	return scopePin{ku: sha256.Sum256(ku), generation: r.generation, created: r.created}
+}
+
+// check refuses, as ErrCorrupt, a scope.key r holding ku that is not
+// the one p pinned at the plan: a record swapped in since, even one that
+// opens under the new W, would carry another K_u past the swap.
+func (p scopePin) check(r record, ku []byte) error {
+	if pinScopeKey(r, ku) != p {
+		return fmt.Errorf("%w: %s holds another key, generation or created time than when this rewrap planned it", ErrCorrupt, scopeKeyName)
+	}
+	return nil
+}
+
 // openScopeKeyEither opens r under old's W and, failing that and with next
-// set, under next's, reporting whether it opened only under next's.
-func openScopeKeyEither(r record, scope string, old keys, next *keys) (bool, error) {
+// set, under next's, reporting whether it opened only under next's, and
+// pins what it holds.
+func openScopeKeyEither(r record, scope string, old keys, next *keys) (bool, scopePin, error) {
 	pt, err := r.open(old.wrap, scope)
-	clear(pt)
-	if err == nil || next == nil || !errors.Is(err, ErrCorrupt) {
-		return false, err
+	defer func() { clear(pt) }()
+	if err == nil {
+		return false, pinScopeKey(r, pt), nil
+	}
+	if next == nil || !errors.Is(err, ErrCorrupt) {
+		return false, scopePin{}, err
 	}
 	pt, err = r.open(next.wrap, scope)
-	clear(pt)
-	return err == nil, err
+	if err != nil {
+		return false, scopePin{}, err
+	}
+	return true, pinScopeKey(r, pt), nil
 }
 
 // sealScopeKey is step 3 for one scope: a scope.key still under old's W is
@@ -298,8 +335,10 @@ func (s *FileStore) sealScopeKey(root *os.Root, uid string, old, next keys) erro
 // is replaced by its scope.key.new, which must open under next's W and hold
 // the same key, kind, name, version, generation and created time (else
 // ErrCorrupt, and it is not renamed); one already under next's has any
-// scope.key.new beside it removed.
-func (s *FileStore) commitScopeKey(root *os.Root, uid string, old, next keys) error {
+// scope.key.new beside it removed. Either way the scope.key must still hold
+// the K_u, generation and created time p pinned at the plan (ErrCorrupt).
+func (s *FileStore) commitScopeKey(root *os.Root, p planned, old, next keys) error {
+	uid := p.scope
 	scope := userScopePrefix + uid
 	err := s.withScopeDir(root, uid, func(dir *os.Root) error {
 		r, err := s.readScopeKeyRecord(dir)
@@ -312,6 +351,9 @@ func (s *FileStore) commitScopeKey(root *os.Root, uid string, old, next keys) er
 				return err
 			}
 			npt, err := r.open(next.wrap, scope)
+			if err == nil {
+				err = p.pin.check(r, npt)
+			}
 			clear(npt)
 			if err != nil {
 				return err
@@ -322,6 +364,9 @@ func (s *FileStore) commitScopeKey(root *os.Root, uid string, old, next keys) er
 			return syncDir(dir)
 		}
 		defer clear(pt)
+		if err := p.pin.check(r, pt); err != nil {
+			return err
+		}
 		b, fi, err := readFile(dir, scopeKeyName+newSuffix, int64(maxScopeKeyRecordSize))
 		if err != nil {
 			return fmt.Errorf("%w: %s%s: %w", ErrCorrupt, scopeKeyName, newSuffix, err)

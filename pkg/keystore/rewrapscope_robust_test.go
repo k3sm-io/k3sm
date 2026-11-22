@@ -214,3 +214,55 @@ func checkDamagedScopeRecovery(t *testing.T, err error) {
 		t.Errorf("refusal %q still offers removal by hand as the recovery for every user", err)
 	}
 }
+
+// Rewrap pins each scope's K_u, generation and created time from its plan
+// to its commit and to the final check: a scope.key replaced after the plan
+// by a record that opens under the new W but holds a different K_u refuses
+// the swap, whether it lands before the scope's commit (which would read it
+// as already committed) or after it.
+func TestRewrapPinsScopeKeyFromPlan(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name, at string
+	}{
+		{"before the scope's commit", "rename b/"},
+		{"after the scope's commit", "rename " + userScopesName + "/1001/" + scopeKeyName},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, server, _, _ := seedScopeRewrap(t)
+			master := mustMaster(t, server)
+			key := filepath.Join(scopeDir(server, "1001"), scopeKeyName)
+			b, err := os.ReadFile(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := parseScopeKey(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			forged := record{kind: r.kind, name: r.name, version: r.version, generation: r.generation, created: r.created}
+			nextW := hmacSHA256(rewrapKey(1), []byte(scopeWrapLabel))
+			if err := forged.seal(nextW, userScopePrefix+"1001", bytes.Repeat([]byte{0x42}, scopeKeySize), s.rand); err != nil {
+				t.Fatal(err)
+			}
+			done := false
+			s.step = func(name string) error {
+				if !done && strings.HasPrefix(name, tt.at) {
+					done = true
+					return os.WriteFile(key, forged.marshal(), 0o600)
+				}
+				return nil
+			}
+			err = s.Rewrap(ctx, rewrapKey(1))
+			if !done {
+				t.Fatalf("step %q was never reached", tt.at)
+			}
+			if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "user/1001") {
+				t.Fatalf("Rewrap over a scope.key holding another K_u: %v, want ErrCorrupt naming the scope", err)
+			}
+			if !bytes.Equal(mustMaster(t, server), master) {
+				t.Fatal("the master was swapped past a scope.key holding another K_u")
+			}
+		})
+	}
+}

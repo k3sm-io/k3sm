@@ -621,6 +621,9 @@ type planned struct {
 	// scope, when set, makes this the scope.key of the user scope whose
 	// directory is .user/<scope> (rewrapscope.go), and name and cur unused.
 	scope string
+	// pin is, for a scope, what its scope.key held when it was planned,
+	// which its commit and the final check require it still holds.
+	pin scopePin
 }
 
 // rewrapPlan lists, sorted by name, every entry with the version its pointer
@@ -781,7 +784,7 @@ func (s *FileStore) commitNew(ctx context.Context, root *os.Root, fl floor, plan
 			return err
 		}
 		if p.scope != "" {
-			if err := s.commitScopeKey(root, p.scope, old, next); err != nil {
+			if err := s.commitScopeKey(root, p, old, next); err != nil {
 				return err
 			}
 			continue
