@@ -64,7 +64,15 @@ func (s *FileStore) putCredential(ctx context.Context, name string, kind Kind, e
 	if err != nil {
 		return Version{}, err
 	}
-	return s.putChecked(ctx, name, kind, func() ([]byte, error) { return s.envelope(kind, e) })
+	// The envelope is the store's own buffer, not the caller's: it is
+	// cleared once sealed, whatever the outcome.
+	var sealed []byte
+	defer func() { clear(sealed) }()
+	return s.putChecked(ctx, name, kind, func() ([]byte, error) {
+		var err error
+		sealed, err = s.ownedEnvelope(kind, e)
+		return sealed, err
+	})
 }
 
 // GenerateSSH creates name at version 1 holding a new ed25519 SSH key, its
@@ -126,6 +134,8 @@ func (s *FileStore) RotateIf(ctx context.Context, name string, kind Kind, read V
 
 // rotateCredential is RotateCredential, and RotateIf when read is not nil.
 func (s *FileStore) rotateCredential(ctx context.Context, name string, kind Kind, read *Version, e typed.Envelope) (Version, error) {
+	var sealed []byte
+	defer func() { clear(sealed) }() // the store's own buffer, sealed by then or refused
 	v, err := func() (Version, error) {
 		probe, err := s.envelope(kind, e)
 		clear(probe)
@@ -140,11 +150,13 @@ func (s *FileStore) rotateCredential(ctx context.Context, name string, kind Kind
 				return nil, fmt.Errorf("%w: the current version is not the one read (version %d is current, version %d was read)", ErrVersionStale, old.Version, read.Version)
 			}
 			if kind == KindOAuth {
-				if err := sameRefreshOwner(en, k, old, e.Credential.RefreshOwner); err != nil {
+				if err := s.sameRefreshOwner(en, k, old, e.Credential.RefreshOwner); err != nil {
 					return nil, err
 				}
 			}
-			return s.envelope(kind, e)
+			var err error
+			sealed, err = s.ownedEnvelope(kind, e)
+			return sealed, err
 		})
 	}()
 	if err != nil {
@@ -157,13 +169,16 @@ func (s *FileStore) rotateCredential(ctx context.Context, name string, kind Kind
 // sameRefreshOwner refuses, with ErrRefreshOwnerFixed, an oauth rotation
 // whose envelope names a refresh owner other than old's, the current version
 // of en: the owner is fixed when the entry is put.
-func sameRefreshOwner(en *entry, k keys, old Version, owner string) error {
+func (s *FileStore) sameRefreshOwner(en *entry, k keys, old Version, owner string) error {
 	_, val, err := en.version(k, old.Version)
 	defer clear(val)
 	if err != nil {
 		return err
 	}
 	env, err := typed.Decode(credential.KindOAuth, val)
+	// Only the owner is compared: both tokens are cleared at once.
+	s.owned(env.Credential.AccessToken)
+	clear(env.Credential.AccessToken)
 	clear(env.RefreshToken)
 	if err != nil {
 		return fmt.Errorf("%w: version %d: %w", ErrCorrupt, old.Version, err)
@@ -285,6 +300,16 @@ func (s *FileStore) credential(ctx context.Context, name string, version uint64)
 		return Version{}, typed.Credential{}, err
 	}
 	return v, c, nil
+}
+
+// ownedEnvelope is envelope for a buffer the store seals and then clears,
+// handed to the owned seam.
+func (s *FileStore) ownedEnvelope(kind Kind, e typed.Envelope) ([]byte, error) {
+	b, err := s.envelope(kind, e)
+	if err == nil {
+		s.owned(b)
+	}
+	return b, err
 }
 
 // envelope is e encoded for kind, a typed kind, with its issue time stamped

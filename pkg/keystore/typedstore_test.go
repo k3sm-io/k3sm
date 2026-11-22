@@ -1018,3 +1018,58 @@ func TestRotateFromRefusesOtherKind(t *testing.T) {
 		t.Fatalf("current after the refusal: %d %q", v.Version, c.Value)
 	}
 }
+
+// TestTypedPlaintextZeroedAfterSeal is the zeroing rule: every typed
+// plaintext buffer the store owns (the encoded envelope a typed put or
+// rotation seals, and the access token sameRefreshOwner decodes) is zero
+// once the call returns, and a raw Put or Rotate leaves the caller's slice
+// as it was.
+func TestTypedPlaintextZeroedAfterSeal(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTypedStore(t)
+	var owned [][]byte
+	s.owned = func(b []byte) { owned = append(owned, b) }
+	check := func(op string, want int) {
+		t.Helper()
+		if len(owned) < want {
+			t.Fatalf("%s handed %d store-owned buffers, want at least %d", op, len(owned), want)
+		}
+		for i, b := range owned {
+			if len(b) == 0 {
+				t.Fatalf("%s: buffer %d is empty", op, i)
+			}
+			if !bytes.Equal(b, make([]byte, len(b))) {
+				t.Fatalf("%s: store-owned buffer %d is not zero after the call: %q", op, i, b)
+			}
+		}
+		owned = nil
+	}
+	mustPutCredential(t, s, "o", KindOAuth, oauthEnvelope("a1", "r1"))
+	check("PutCredential", 1)
+	read := mustRotateCredential(t, s, "o", KindOAuth, oauthEnvelope("a2", "r2"))
+	check("RotateCredential", 2) // the envelope and the decoded access token
+	if _, err := s.RotateIf(ctx, "o", KindOAuth, read, oauthEnvelope("a3", "r3")); err != nil {
+		t.Fatal(err)
+	}
+	check("RotateIf", 2)
+
+	raw := []byte("caller's value")
+	mustPut(t, s, "r", KindOpaque, raw)
+	if string(raw) != "caller's value" {
+		t.Fatalf("Put changed the caller's slice to %q", raw)
+	}
+	raw2 := []byte("caller's next value")
+	if _, err := s.Rotate(ctx, "r", raw2); err != nil {
+		t.Fatal(err)
+	}
+	if string(raw2) != "caller's next value" {
+		t.Fatalf("Rotate changed the caller's slice to %q", raw2)
+	}
+	e := oauthEnvelope("a4", "r4")
+	if _, err := s.RotateCredential(ctx, "o", KindOAuth, e); err != nil {
+		t.Fatal(err)
+	}
+	if string(e.Credential.AccessToken) != "a4" || string(e.RefreshToken) != "r4" {
+		t.Fatalf("RotateCredential changed the caller's envelope: %q %q", e.Credential.AccessToken, e.RefreshToken)
+	}
+}

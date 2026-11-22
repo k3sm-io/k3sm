@@ -119,6 +119,10 @@ type FileStore struct {
 	// step is called at each durable step of a write; a non-nil return aborts
 	// the write there, as a crash would.
 	step func(name string) error
+	// owned is called with each typed plaintext buffer the store makes and
+	// clears before the call returns (an encoded envelope it seals, an
+	// access token it decodes to compare), where a test records it.
+	owned func(b []byte)
 	// floorUID and floorGID own the floor and the data root, from
 	// Config.FloorUID and Config.FloorGID: root in production, the test user
 	// in a non-root test. checkConfig refuses a negative one, so the
@@ -162,6 +166,7 @@ func New(cfg Config) *FileStore {
 		chown:          (*os.File).Chown,
 		lockWait:       lockTimeout,
 		step:           func(string) error { return nil },
+		owned:          func([]byte) {},
 		entryMade:      func(string) {},
 		dirMade:        func(string) {},
 		dataRootLocked: func() {},
