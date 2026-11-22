@@ -80,23 +80,39 @@ const (
 	// The reader's bounds (docs/design/keystore.md § "Size caps"). A log
 	// is read whole, and the service user can append to it without limit,
 	// so a log larger than logReadBound is damage, and so is a floor with
-	// more than maxFloorKeys distinct keys. The bound is the hard cap,
+	// more than keyBound distinct keys. The bound is the hard cap,
 	// plus maxRevokeUIDs uids' revocation budgets past it, plus
-	// logBoundMargin; the server never appends past it itself.
+	// logBoundMargin; the server never appends past either itself.
 	maxRevokeUIDs  = 1024
 	logBoundMargin = 1 << 20
-	maxFloorKeys   = 1 << 20
+	// maxFloorKeysCeiling is the absolute ceiling on the floor's key bound,
+	// whatever the caps are configured to: what bounds the reader's memory.
+	maxFloorKeysCeiling = 1 << 23
 	// logFreeMargin is the free space an append leaves on the log's file
 	// system beyond its own line.
 	logFreeMargin = 1 << 20
 )
 
-// keyBound is the most distinct keys the floor may hold.
+// minFloorLine is the shortest line that adds a key to the floor: the
+// lowest user scope, a one-byte name and sequence 1, 46 bytes.
+var minFloorLine = func() int {
+	b, err := floorLine(userScopeOf(minScopeUID), "a", [generationSize]byte{}, 1)
+	if err != nil {
+		panic(err)
+	}
+	return len(b)
+}()
+
+// keyBound is the most distinct keys the floor may hold: as many as lines of
+// minFloorLine bytes fit in logReadBound, so the size bound is normally met
+// first, held to maxFloorKeysCeiling. The writer refuses a line that would
+// add a key past it, so the reader never meets it in a floor the server
+// wrote.
 func (l *appendLog) keyBound() int {
 	if l.maxKeys != 0 {
 		return l.maxKeys
 	}
-	return maxFloorKeys
+	return int(min(l.s.logReadBound()/int64(minFloorLine)+1, maxFloorKeysCeiling))
 }
 
 // logReadBound is the size past which a log is damage: the hard cap, the
@@ -108,7 +124,7 @@ func (s *FileStore) logReadBound() int64 {
 // ErrLogFull refuses an operation because an append-only log is past its
 // hard cap, or, for a revocation past the hard cap, because the uid's
 // revocation budget in that log is spent. Nothing was changed.
-var ErrLogFull = errors.New("the keystore log is full: the user-scope floor or audit log is past its hard cap, so no user-scope change can be recorded; root must run sudo k3sm keys audit --rotate or sudo k3sm keys floor --rebuild; nothing was changed")
+var ErrLogFull = errors.New("the keystore log is full: the user-scope floor or audit log is past its hard cap or the floor's key bound, so no user-scope change can be recorded; root must run sudo k3sm keys audit --rotate or sudo k3sm keys floor --rebuild; nothing was changed")
 
 var (
 	// errLogMissing is a log that does not exist: the data root has not been
@@ -125,9 +141,9 @@ var (
 	errLogNoSpace = errors.New("the keystore log's volume is nearly full, so the line was not appended; free some space and retry; nothing was changed")
 	// errLogTooLarge is a log larger than logReadBound: damage.
 	errLogTooLarge = errors.New("the keystore append-only log is larger than the reader's bound")
-	// errFloorTooManyKeys is a floor with more than maxFloorKeys distinct
-	// keys: damage.
-	errFloorTooManyKeys = fmt.Errorf("the user-scope floor holds more than %d distinct keys", maxFloorKeys)
+	// errFloorTooManyKeys is a floor with more distinct keys than its key
+	// bound: damage.
+	errFloorTooManyKeys = errors.New("the user-scope floor holds more distinct keys than its key bound")
 	// errLogTorn is a last line with no newline: damage.
 	errLogTorn = errors.New("the last line has no newline")
 	// errLogLineTooLong is a line over maxLogLine, which is never written.
@@ -257,6 +273,9 @@ type appendLog struct {
 	// readAt, when set, is the source sync reads f through: the test seam
 	// for a read I/O error.
 	readAt func(f *os.File) io.ReaderAt
+	// addsKey, set for the floor, reports whether line, its newline
+	// included, would add a key to what state holds.
+	addsKey func(state *logState, line []byte) (bool, error)
 
 	// mu guards state: reads under the shared store lock run together.
 	mu    sync.Mutex
@@ -537,6 +556,11 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 		return nil
 	}
 	defer func() { _ = f.Close() }() // read-only
+	if !revoke && l.addsKey != nil {
+		if err := l.keyRoom(f, st); err != nil {
+			return err
+		}
+	}
 	if st.Size < l.s.logHardCap {
 		return nil
 	}
@@ -552,6 +576,27 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 	// The line is not written yet: room charges the longest a line can
 	// be, through the predicate appendLine charges the real line through.
 	return l.revokeRoom(state, st.Size, uid, maxLogLine)
+}
+
+// grantKeys is the most keys one grant adds to the floor: a put that mints
+// its scope adds the delivery record's key and the entry's.
+const grantKeys = 2
+
+// keyRoom refuses, as ErrLogFull, a grant when the floor (f, which st
+// describes) has no room for grantKeys more keys under its key bound. Only a
+// revocation's line for a key the floor already holds is written past it.
+// A floor that cannot be read is no answer here, as in room.
+func (l *appendLog) keyRoom(f *os.File, st unix.Stat_t) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	state, err := l.sync(f, st)
+	if err != nil || state.bad != nil {
+		return nil
+	}
+	if bound := l.keyBound(); state.keys+grantKeys > bound {
+		return fmt.Errorf("%w (%s holds %d distinct keys, its key bound %d)", ErrLogFull, l.name, state.keys, bound)
+	}
+	return nil
 }
 
 // revokeRoom refuses, as ErrLogFull, n more bytes for uid past the hard
@@ -570,12 +615,16 @@ func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64)
 
 // appendLine appends line, which ends in a newline, charged to uid. Past
 // the hard cap only a line that may draw on uid's revocation budget
-// (budget) is written, and only while the budget has room for it.
+// (budget) is written, and only while the budget has room for it. It never
+// writes what the reader would refuse for its size: a line past
+// logReadBound, or a floor line that adds a key past the key bound.
 func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 	if len(line) > maxLogLine {
 		return fmt.Errorf("%w: refused a %d-byte line for %s", errLogLineTooLong, len(line), l.name)
 	}
-	f, st, err := l.open(unix.O_WRONLY | unix.O_APPEND)
+	// Read-write, so the floor's keys are read on the descriptor the line
+	// is appended through.
+	f, st, err := l.open(unix.O_RDWR | unix.O_APPEND)
 	if err != nil {
 		l.forgetUnflagged(err, false)
 		return err
@@ -583,42 +632,57 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 	defer func() { _ = f.Close() }() // each append is fsynced below
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if bound := l.s.logReadBound(); st.Size+int64(len(line)) > bound {
+	out := line
+	if bound := l.s.logReadBound(); st.Size+int64(len(out)) > bound {
 		// Never make the damage the reader refuses.
 		return fmt.Errorf("%w (%s is %d bytes, the reader's bound %d)", ErrLogFull, l.name, st.Size, bound)
 	}
-	if st.Size >= l.s.logHardCap {
-		if !budget || uid == 0 {
-			return fmt.Errorf("%w (%s is %d bytes, its hard cap %d)", ErrLogFull, l.name, st.Size, l.s.logHardCap)
+	var state *logState
+	read := func() error {
+		if state != nil {
+			return nil
 		}
-		r, rst, err := l.open(unix.O_RDONLY)
-		if err != nil {
-			l.forgetUnflagged(err, true)
-			return err
-		}
-		defer func() { _ = r.Close() }() // read-only
-		if rst.Dev != st.Dev || rst.Ino != st.Ino {
-			return fmt.Errorf("%s changed while it was opened", l.name)
-		}
-		state, err := l.sync(r, rst)
+		var err error
+		state, err = l.sync(f, st)
 		if err != nil {
 			return err
 		}
 		if state.bad != nil {
 			return fmt.Errorf("%s: %w", l.name, state.bad)
 		}
+		return nil
+	}
+	if st.Size >= l.s.logHardCap {
+		if !budget || uid == 0 {
+			return fmt.Errorf("%w (%s is %d bytes, its hard cap %d)", ErrLogFull, l.name, st.Size, l.s.logHardCap)
+		}
+		if err := read(); err != nil {
+			return err
+		}
 		if err := l.revokeRoom(state, st.Size, uid, int64(len(line))); err != nil {
 			return err
 		}
 	}
-	if err := l.preflight(f, len(line)); err != nil {
+	if l.addsKey != nil {
+		if err := read(); err != nil {
+			return err
+		}
+		adds, err := l.addsKey(state, line)
+		if err != nil {
+			return fmt.Errorf("%s: %w", l.name, err)
+		}
+		if bound := l.keyBound(); adds && state.keys >= bound {
+			return fmt.Errorf("%w (%s holds %d distinct keys, its key bound %d)", ErrLogFull, l.name, state.keys, bound)
+		}
+	}
+	if err := l.preflight(f, len(out)); err != nil {
 		return err
 	}
 	// One write(2) of the whole line. An ENOSPC or EIO between the
 	// preflight and the write, or a crash mid-write, can still leave a
 	// torn tail the flag keeps: damage, which floor --rebuild repairs
 	// (docs/design/keystore.md § "The user-scope floor").
-	_, err = f.Write(line)
+	_, err = f.Write(out)
 	if err == nil {
 		err = f.Sync()
 	}
@@ -683,8 +747,8 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		}
 		seq, inSeq := st.maxSeq[r.key]
 		if !inSeq && !st.buried[r.key] && (r.tomb || r.seq > seq) {
-			if st.keys >= l.keyBound() {
-				return 0, errFloorTooManyKeys
+			if bound := l.keyBound(); st.keys >= bound {
+				return 0, fmt.Errorf("%w (%d)", errFloorTooManyKeys, bound)
 			}
 			st.keys++
 		}
@@ -695,6 +759,14 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 			st.maxSeq[r.key] = r.seq
 		}
 		return scopeUID(r.key.scope), nil
+	}
+	l.addsKey = func(st *logState, line []byte) (bool, error) {
+		r, err := parseFloorLine(bytes.TrimSuffix(line, []byte{'\n'}))
+		if err != nil {
+			return false, err
+		}
+		_, inSeq := st.maxSeq[r.key]
+		return !inSeq && !st.buried[r.key] && (r.tomb || r.seq > 0), nil
 	}
 	return &fileFloorLog{log: l}
 }

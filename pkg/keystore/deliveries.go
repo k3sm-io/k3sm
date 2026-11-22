@@ -456,7 +456,19 @@ func (o *openedScope) close() {
 // 0600, of kind 0xFD named deliveries, at the scope's bound generation, and
 // at or above the floor's sequence for that generation.
 func (u *UserScope) readDeliveries(o *openedScope) ([]delivery, uint64, error) {
-	return u.readDeliveriesFloor(o, false)
+	r, err := u.readDeliveriesFloor(o, false)
+	return r.ds, r.seq, err
+}
+
+// deliveriesRead is what readDeliveriesFloor read: the record's entries and
+// sequence, and the floor's sequence for it, or, for a revocation that went
+// ahead without the floor, why the floor could not be checked.
+type deliveriesRead struct {
+	ds         []delivery
+	seq, floor uint64
+	// unverified is the floor's error when the record was not checked
+	// against it; nil when it was.
+	unverified error
 }
 
 // readDeliveriesFloor is readDeliveries. With revoke set, a floor that
@@ -468,56 +480,56 @@ func (u *UserScope) readDeliveries(o *openedScope) ([]delivery, uint64, error) {
 // residuals are named in docs/design/keystore.md § "Quotas", "Revocation
 // always succeeds"). A record below a floor that can be read is refused,
 // revoke or not.
-func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) ([]delivery, uint64, error) {
+func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) (deliveriesRead, error) {
 	b, fi, err := readFile(o.dir, deliveriesName, maxDeliveriesRecordSize)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return nil, 0, fmt.Errorf("%w: the scope has a scope key and no %s record", ErrScopeAbsent, deliveriesName)
+		return deliveriesRead{}, fmt.Errorf("%w: the scope has a scope key and no %s record", ErrScopeAbsent, deliveriesName)
 	case errors.Is(err, errBadFile):
-		return nil, 0, fmt.Errorf("%w: %s: %w", ErrCorrupt, deliveriesName, err)
+		return deliveriesRead{}, fmt.Errorf("%w: %s: %w", ErrCorrupt, deliveriesName, err)
 	case err != nil:
-		return nil, 0, fmt.Errorf("read %s: %w", deliveriesName, err)
+		return deliveriesRead{}, fmt.Errorf("read %s: %w", deliveriesName, err)
 	}
 	if err := u.s.checkOwned(fi, fileMode); err != nil {
-		return nil, 0, fmt.Errorf("%w: %s: %w", ErrCorrupt, deliveriesName, err)
+		return deliveriesRead{}, fmt.Errorf("%w: %s: %w", ErrCorrupt, deliveriesName, err)
 	}
 	r, err := parseDeliveriesRecord(b)
 	if err != nil {
-		return nil, 0, err
+		return deliveriesRead{}, err
 	}
 	if r.generation != o.gen {
-		return nil, 0, fmt.Errorf("%w: %s is not bound to this scope's owner", ErrCorrupt, deliveriesName)
+		return deliveriesRead{}, fmt.Errorf("%w: %s is not bound to this scope's owner", ErrCorrupt, deliveriesName)
 	}
-	fl, err := u.s.userFloor.floor(u.scope, deliveriesFloorName, o.gen)
-	if err != nil && (!revoke || errors.Is(err, ErrCorrupt)) {
-		return nil, 0, err
+	fl, flErr := u.s.userFloor.floor(u.scope, deliveriesFloorName, o.gen)
+	if flErr != nil && (!revoke || errors.Is(flErr, ErrCorrupt)) {
+		return deliveriesRead{}, flErr
 	}
-	if err != nil {
+	if flErr != nil {
 		// No floor to check against: the sequence this process last read or
 		// wrote stands in for it, so a copy put back below it is not
 		// re-sealed at a later sequence with a tombstone lost.
 		if seen := deliveriesSeen.high(u.s.dir, u.scope, o.gen); r.version < seen {
-			return nil, 0, fmt.Errorf("%w: the %s record (sequence %d) is older than one this process has already read or written (sequence %d), and the user-scope floor cannot be read (%v); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, seen, err)
+			return deliveriesRead{}, fmt.Errorf("%w: the %s record (sequence %d) is older than one this process has already read or written (sequence %d), and the user-scope floor cannot be read (%v); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, seen, flErr)
 		}
 	}
-	if err == nil && r.version < fl {
-		return nil, 0, fmt.Errorf("%w: the %s record (sequence %d) is older than the user-scope floor (sequence %d); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, fl)
+	if flErr == nil && r.version < fl {
+		return deliveriesRead{}, fmt.Errorf("%w: the %s record (sequence %d) is older than the user-scope floor (sequence %d); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, fl)
 	}
 	pt, err := r.open(o.key, u.scope)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%s: %w", deliveriesName, err)
+		return deliveriesRead{}, fmt.Errorf("%s: %w", deliveriesName, err)
 	}
 	ds, err := parseDeliveries(pt)
 	if err != nil {
-		return nil, 0, err
+		return deliveriesRead{}, err
 	}
 	for _, d := range ds {
 		if e, _ := ParseEntry(d.entry); e.UID != u.uid {
-			return nil, 0, fmt.Errorf("%w: %s names another scope's entry", ErrCorrupt, deliveriesName)
+			return deliveriesRead{}, fmt.Errorf("%w: %s names another scope's entry", ErrCorrupt, deliveriesName)
 		}
 	}
 	deliveriesSeen.note(u.s.dir, u.scope, o.gen, r.version)
-	return ds, r.version, nil
+	return deliveriesRead{ds: ds, seq: r.version, floor: fl, unverified: flErr}, nil
 }
 
 // deliverySeqs is the highest delivery-record sequence the process has read
@@ -756,9 +768,9 @@ func (u *UserScope) withdrawDelivery(ctx context.Context, uid string) error {
 
 // withdrawLocked needs neither the owner's live GeneratedUID nor a floor it
 // can read, and runs with master.next present (openScopeForRevoke). An
-// already withdrawn UID re-appends the record's floor line, in case the
-// withdraw that wrote the tombstone could not: the floor keeps the highest
-// sequence, so a repeat is idempotent. It commits, then appends its audit
+// already withdrawn UID re-appends the record's floor line when the floor
+// is below the record's sequence, in case the withdraw that wrote the
+// tombstone could not, and appends nothing when the floor already holds it. It commits, then appends its audit
 // line, which names the namespace of the delivery it found, before it
 // releases the store lock (auditSink).
 func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (err error) {
@@ -800,10 +812,11 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, error) {
 		return "", err
 	}
 	defer o.close()
-	ds, seq, err := u.readDeliveriesFloor(o, true)
+	rd, err := u.readDeliveriesFloor(o, true)
 	if err != nil {
 		return "", err
 	}
+	ds, seq := rd.ds, rd.seq
 	for i := range ds {
 		if ds[i].uid != uid {
 			continue
@@ -816,6 +829,11 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, error) {
 			return ns, err
 		}
 		if ds[i].withdrawn {
+			if rd.unverified == nil && rd.floor >= seq {
+				// The floor already holds the record's sequence: nothing
+				// changed, and nothing is appended.
+				return ns, nil
+			}
 			return ns, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq)
 		}
 		ds[i].withdrawn = true
