@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os/user"
 	"strconv"
@@ -55,6 +56,14 @@ var synthesizedGUIDPrefix = []byte{0xFF, 0xFF, 0xEE, 0xEE, 0xDD, 0xDD, 0xCC, 0xC
 // that never answers would pin a thread per request.
 const maxOutstandingLookups = 8
 
+// errLookupNotRun marks an ErrScopeOwnerUnknown for which no GeneratedUID
+// lookup ran: the outstanding cap was reached, or an earlier lookup for the
+// uid is stuck past its deadline. It is a capacity refusal, retryable, and
+// unlike a lookup that ran and failed or timed out it is not evidence the
+// directory service has no answer: rm, which goes ahead on the latter,
+// refuses on it.
+var errLookupNotRun = errors.New("no GeneratedUID lookup ran for want of capacity; try again")
+
 // flight is one outstanding GeneratedUID lookup, which every concurrent
 // caller for its uid joins.
 type flight struct {
@@ -83,7 +92,8 @@ var lookups = struct {
 // At most one lookup per uid is outstanding: a caller that finds one joins
 // it, and once that lookup is past its deadline every later caller for the
 // uid fails closed at once and starts none. At most maxOutstandingLookups
-// are outstanding across uids; past that a new uid fails closed at once. A
+// are outstanding across uids; past that a new uid fails closed at once.
+// Those two refusals, where no lookup ran, also match errLookupNotRun. A
 // lookup past its deadline is abandoned, not cancelled (the real call
 // cannot be): it leaves the table when the call returns.
 func lookupGeneratedUID(uid uint32) ([generationSize]byte, error) {
@@ -95,12 +105,12 @@ func lookupGeneratedUID(uid uint32) ([generationSize]byte, error) {
 		case <-f.done:
 			return checkGeneratedUID(uid, f.g, f.err)
 		case <-f.expired:
-			return zero, fmt.Errorf("%w: an earlier GeneratedUID lookup for uid %d is still outstanding past its %s deadline", ErrScopeOwnerUnknown, uid, generatedUIDDeadline)
+			return zero, fmt.Errorf("%w: %w: an earlier GeneratedUID lookup for uid %d is still outstanding past its %s deadline", ErrScopeOwnerUnknown, errLookupNotRun, uid, generatedUIDDeadline)
 		}
 	}
 	if len(lookups.inflight) >= maxOutstandingLookups {
 		lookups.mu.Unlock()
-		return zero, fmt.Errorf("%w: %d GeneratedUID lookups are already outstanding", ErrScopeOwnerUnknown, maxOutstandingLookups)
+		return zero, fmt.Errorf("%w: %w: %d GeneratedUID lookups are already outstanding", ErrScopeOwnerUnknown, errLookupNotRun, maxOutstandingLookups)
 	}
 	f := &flight{done: make(chan struct{}), expired: make(chan struct{})}
 	lookups.inflight[uid] = f

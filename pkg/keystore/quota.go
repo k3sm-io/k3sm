@@ -125,8 +125,9 @@ func entryBytes(entries *os.Root, name string) (int64, error) {
 
 // Delete removes input and every version of it from the caller's scope:
 // rm. It is never refused for a quota, since it is how room is made, and,
-// as a revocation, never for a GeneratedUID lookup that fails or times out,
-// or a Rewrap half done: it only removes files, so it needs neither W nor
+// as a revocation, never for a GeneratedUID lookup that ran and failed or
+// timed out, or a Rewrap half done (a lookup refused for capacity, where
+// none ran, refuses it retryably: errLookupNotRun): it only removes files, so it needs neither W nor
 // K_u, and opens no record. A lookup that answers a real GeneratedUID other
 // than the one scope.key is bound to is ErrScopeOwnerChanged: the uid was
 // reused, and its new holder must not delete the former owner's values. The scope must still have its scope.key, as every user
@@ -176,9 +177,15 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		return err
 	}
 	defer func() { _ = entries.Close() }() // every removal is fsynced
-	// Only a real, different answer refuses; a lookup that fails or times
-	// out is no answer, and rm goes ahead.
-	if live, err := lookupGeneratedUID(u.uid); err == nil && live != gen {
+	// Only a real, different answer refuses; a lookup that ran and failed
+	// or timed out is no answer, and rm goes ahead. One refused for
+	// capacity, where no lookup ran, refuses rm, retryably: going ahead on
+	// it would let a burst of stuck lookups stand in for the owner check.
+	live, err := lookupGeneratedUID(u.uid)
+	switch {
+	case errors.Is(err, errLookupNotRun):
+		return err
+	case err == nil && live != gen:
 		return fmt.Errorf("%w: uid %d", ErrScopeOwnerChanged, u.uid)
 	}
 	fi, err := entries.Lstat(name)

@@ -1389,7 +1389,11 @@ store refuses to read or write a sealed record over 1,056 KiB.
   again, so a floor line an earlier withdrawal could not append is written by the next one; the
   floor keeps the highest sequence, so the repeat is idempotent. `rm` is a revocation too: it
   only removes files, so it needs neither `W` nor `K_u`, and is never refused for a lookup
-  that fails or times out, or for `ErrRewrapInProgress`. A lookup that answers a real
+  that ran and failed or timed out, or for `ErrRewrapInProgress`. A lookup refused at once for
+  capacity, where none ran (eight already outstanding, or an earlier call for the uid stuck past
+  its deadline), refuses `rm` with a retryable error and removes nothing: going ahead on it would
+  let a burst of stuck lookups stand in for the owner check. A withdrawal does no lookup, so it
+  goes ahead in every case. A lookup that answers a real
   GeneratedUID other than the one `scope.key` records refuses it with `ErrScopeOwnerChanged`:
   the uid was reused, and its new holder must not delete the former owner's values (root
   removes such a scope).

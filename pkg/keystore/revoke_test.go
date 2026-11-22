@@ -288,3 +288,62 @@ func TestDeleteOwnerChanged(t *testing.T) {
 		checkEntryGone(t, server, "token")
 	})
 }
+
+// rm proceeds without the owner's answer only when a GeneratedUID lookup
+// actually ran and failed or timed out. Refused one at once for capacity
+// (the outstanding cap) or for a stuck earlier call for the uid, no lookup
+// ran, and rm refuses with a retryable error, deleting nothing. Withdraw,
+// pure revocation, proceeds in every case.
+func TestRmLookupRefusalKinds(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name    string
+		setup   func(t *testing.T)
+		proceed bool
+	}{
+		{"a lookup that timed out", stallLookups, true},
+		{"a lookup that failed", func(t *testing.T) {
+			setSeam(t, &generatedUIDSeam, func(uint32) ([generationSize]byte, error) {
+				return [generationSize]byte{}, errors.New("directory service down")
+			})
+		}, true},
+		{"the outstanding cap", func(t *testing.T) {
+			stuckLookups(t)
+			for uid := uint32(1); uid <= maxOutstandingLookups; uid++ {
+				_, _ = lookupGeneratedUID(uid + 2000) // each times out and stays outstanding
+			}
+		}, false},
+		{"a stuck call for the uid", func(t *testing.T) {
+			stuckLookups(t)
+			_, _ = lookupGeneratedUID(1001) // times out and stays outstanding
+		}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, server, u := newDeliveryScope(t)
+			if err := u.addDelivery(ctx, testDelivery(1)); err != nil {
+				t.Fatal(err)
+			}
+			tt.setup(t)
+			err := u.Delete(ctx, "user/1001/token")
+			if tt.proceed {
+				if err != nil {
+					t.Fatalf("rm after %s: %v", tt.name, err)
+				}
+				checkEntryGone(t, server, "token")
+			} else {
+				if !errors.Is(err, errLookupNotRun) || !strings.Contains(err.Error(), "try again") {
+					t.Fatalf("rm after %s: %v, want the retryable errLookupNotRun", tt.name, err)
+				}
+				if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "token")); err != nil {
+					t.Fatalf("a refused rm removed the entry: %v", err)
+				}
+			}
+			if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil {
+				t.Fatalf("withdraw after %s: %v", tt.name, err)
+			}
+			if d, _ := recordedDelivery(t, s, server, 1); !d.withdrawn {
+				t.Fatal("the delivery is still live")
+			}
+		})
+	}
+}
