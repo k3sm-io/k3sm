@@ -72,8 +72,11 @@ const (
 	maxTombstoneSize = 1 << 20
 	// maxBuriedPerName is the most generations the floor keeps buried for
 	// one name. A Delete that buries one more drops the name's oldest, and
-	// that drop is a prune like any other (prune).
-	maxBuriedPerName = 8
+	// that drop is a prune like any other (prune). It is a backstop, high
+	// enough that the tombstone budget (maxTombstoneSize), which prunes
+	// oldest first across every name, is the main eviction: churning one
+	// name pushes out its own burials only after 64 deletions.
+	maxBuriedPerName = 64
 	// maxDeleteSeq is the highest delete sequence a floor may hold, 2^53 (an
 	// integer every JSON reader keeps exact). A delete sequence only orders
 	// burials, so bury renumbers them, order kept, before one would pass it:

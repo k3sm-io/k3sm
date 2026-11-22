@@ -146,3 +146,28 @@ func TestDeleteBuriesAuthenticatedDirectoryGeneration(t *testing.T) {
 		}
 	})
 }
+
+// TestPerNameCapIsBackstop (U192): a name keeps 64 buried generations, so
+// the tombstone budget, not the per-name cap, is the main eviction; the
+// 65th burial drops the name's oldest and reports it.
+func TestPerNameCapIsBackstop(t *testing.T) {
+	fl := floor{}
+	var first string
+	for i := range 65 {
+		g := fmt.Sprintf("%032x", i+1)
+		if i == 0 {
+			first = g
+		}
+		fl["k"] = floorEntry{Generation: g, Seq: 1, Buried: fl["k"].Buried}
+		_, dropped := fl.bury("k", nil)
+		switch {
+		case i < 64 && len(dropped) != 0:
+			t.Fatalf("burial %d dropped %+v, want all of the first 64 kept", i+1, dropped)
+		case i == 64 && (len(dropped) != 1 || dropped[0].generation != first):
+			t.Fatalf("burial 65 dropped %+v, want the oldest, %s", dropped, first)
+		}
+	}
+	if n := len(fl["k"].burials()); n != 64 {
+		t.Fatalf("k holds %d burials, want 64", n)
+	}
+}

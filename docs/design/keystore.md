@@ -406,9 +406,13 @@ buried set, oldest first:
   entry directory moved away while root runs `rm` and moved back afterwards is refused, and
   so is the copy an earlier build's Delete, which removed the directory before its floor
   write, left when it crashed between the two, once `rm` runs again.
-- *The per-name cap.* A name keeps at most 8 buried generations. A Delete that buries a ninth
+- *The per-name cap.* A name keeps at most 64 buried generations. A Delete that buries a 65th
   drops the name's oldest, and that is a prune (below): logged, and the only way, besides the
-  floor's own prune, that a buried generation leaves the floor.
+  floor's own prune, that a buried generation leaves the floor. The cap is a backstop, not the
+  main eviction: the tombstone budget below prunes oldest first across every name, so churning
+  one name pushes out its own burials only after 64 deletions, and never another name's sooner
+  than age requires. It stays a cap rather than going away because a name's burials are held
+  in a fixed array in memory; at 64 that array is about 1.5 KiB per floor record.
 - *Refusal.* A reader or verb that opens an entry directory whose generation is in the name's
   buried set refuses it as `ErrCorrupt`, with the floor's own message: an older copy of a
   deleted entry was put back. Its advice leads with a safe action. With no live record for
@@ -4422,7 +4426,7 @@ carried by the unit rows.
 | U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
-| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 8 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `TestDeleteIgnoresPlantedGeneration`, `FuzzParseFloor` | checked: the floor's tombstone |
+| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 64 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `TestDeleteIgnoresPlantedGeneration`, `TestPerNameCapIsBackstop`, `FuzzParseFloor` | checked: the floor's tombstone |
 
 ### Rig legs
 
