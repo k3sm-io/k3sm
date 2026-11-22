@@ -412,3 +412,15 @@ func TestKindUnsupportedNamesAlteration(t *testing.T) {
 		}
 	}
 }
+
+// TestFieldTablesSortedByTag is U143's table invariant: each kind's field
+// table is strictly increasing by tag, the order Decode walks it in.
+func TestFieldTablesSortedByTag(t *testing.T) {
+	for kind, fs := range fields {
+		for i := 1; i < len(fs); i++ {
+			if fs[i].tag <= fs[i-1].tag {
+				t.Errorf("kind %s: %s (tag %#02x) does not follow %s (tag %#02x)", kind, fs[i].name, fs[i].tag, fs[i-1].name, fs[i-1].tag)
+			}
+		}
+	}
+}

@@ -793,7 +793,7 @@ check U141 "the credential leaf: kind names, field table vectors, no refresh fie
 pend U142 "the CRD descriptions list the CredentialValid reasons and ProjectionInvalid, say Ready means delivered and that Valid, Expiring and RefreshFailing share True; every condition has observedGeneration (the typed KeyDelivery API)" \
 	apis/config/crd::TestKeyDeliveryReasonDescriptions TestConditionsCarryObservedGeneration
 check U143 "the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is ErrCorrupt; the fuzz invariants hold" \
-	k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors TestEnvelopeRejectsUnknownTagDuplicateAndOrder FuzzEnvelopeParse
+	k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors TestEnvelopeRejectsUnknownTagDuplicateAndOrder TestFieldTablesSortedByTag FuzzEnvelopeParse
 check U144 "token and oauth require a sealed issuedAt/accessIssuedAt stamped from the clock seam; editing the created header changes no typed time" \
 	k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed TestCreatedHeaderEditChangesNoTypedTime
 check U145 "a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are ErrKindUnsupported, 0xFD and 0xFE ErrCorrupt; list shows unsupported" \
