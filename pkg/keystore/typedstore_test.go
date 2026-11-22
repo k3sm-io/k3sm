@@ -298,14 +298,25 @@ func leaks(secret []byte, vals ...any) string {
 }
 
 // TestPlantedRefreshTokenNeverReturned is U149: a planted refresh token
-// appears in no result, value or error of any exported method.
+// appears in no result, value or error of any exported method of *FileStore
+// or *UserScope. Every exported method is enumerated by reflection, so a new
+// one cannot escape: it must be called by hand below (each check names the
+// method it called first), be callable with arguments reflection builds, or
+// be allowlisted with the reason it returns no secret data.
 func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newTypedStore(t)
+	fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
 	planted := []byte("planted-refresh+token/7f3a9c==")
 	second := []byte("second-refresh+token/0b1d2e==")
+	covered := map[string]bool{}
 	check := func(what string, vals ...any) {
 		t.Helper()
+		method, _, _ := strings.Cut(what, " ")
+		if !strings.Contains(method, ".") {
+			method = "FileStore." + method
+		}
+		covered[method] = true
 		for _, sec := range [][]byte{planted, second} {
 			if enc := leaks(sec, vals...); enc != "" {
 				t.Errorf("%s returned the refresh token as %q", what, enc)
@@ -356,8 +367,143 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	}
 	list, err = s.List(ctx)
 	check("List after rewrap", list, err)
+
+	// The rest of the store's surface, with the pair still planted.
+	v, line, err := s.GenerateSSH(ctx, "deploy", "ci")
+	check("GenerateSSH", v, line, err)
+	v, err = s.Put(ctx, "raw", KindOpaque, planted)
+	check("Put (an opaque value, not the pair)", v)
+	fp, ok, err := s.InterruptedRewrap(ctx)
+	check("InterruptedRewrap", fp, ok, err)
+	ok, err = s.RecordsSealedUnder(ctx, rewrapKey(7))
+	check("RecordsSealedUnder", ok, err)
+	ok, err = s.UserScopesExist(ctx)
+	check("UserScopesExist", ok, err)
+
+	// A user scope holding a planted pair, read through every UserScope
+	// method, the deliveries path included.
+	u, err := s.UserScope(1001)
+	check("UserScope", u, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err = u.Put(ctx, "user/1001/pair", KindOpaque, []byte("placeholder"))
+	check("UserScope.Put", v, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plantUserTyped(t, u, "user/1001/pair", KindOAuth, oauthEnvelope("access-u", string(planted)))
+	v, raw, err = u.Current(ctx, "user/1001/pair")
+	check("UserScope.Current", v, raw, err)
+	if !errors.Is(err, ErrTypedCredential) {
+		t.Errorf("UserScope.Current of the planted pair: %v, want ErrTypedCredential", err)
+	}
+	list, err = u.List(ctx)
+	check("UserScope.List", list, err)
+	if len(list) != 1 || list[0].Err != nil || list[0].Current.Kind != KindOAuth {
+		t.Errorf("UserScope.List = %+v, want the planted oauth pair", list)
+	}
+	d := exportDelivery(testDelivery(1))
+	d.Entry = "user/1001/pair"
+	d.Items = nil
+	err = u.Deliver(ctx, d)
+	check("UserScope.Deliver", err)
+	got, err := u.Delivery(ctx, d.UID)
+	check("UserScope.Delivery", got, err)
+	err = u.Withdraw(ctx, d.UID)
+	check("UserScope.Withdraw", err)
+	err = u.Delete(ctx, "user/1001/pair")
+	check("UserScope.Delete", err)
+
 	err = s.Delete(ctx, "pair")
 	check("Delete", err)
+
+	// allow lists the methods that return no secret data and are not
+	// called above, each with its reason. It is empty: every method is
+	// called.
+	allow := map[string]string{}
+	for _, recv := range []any{s, u} {
+		rt := reflect.TypeOf(recv)
+		for i := 0; i < rt.NumMethod(); i++ {
+			m := rt.Method(i)
+			key := rt.Elem().Name() + "." + m.Name
+			if covered[key] || allow[key] != "" {
+				continue
+			}
+			args, ok := reflectArgs(ctx, m.Type)
+			if !ok {
+				t.Errorf("%s: reflection cannot build its arguments; call it by hand in this test, or allowlist it with the reason it returns no secret data", key)
+				continue
+			}
+			out := reflect.ValueOf(recv).Method(i).Call(args)
+			vals := make([]any, len(out))
+			for j := range out {
+				vals[j] = out[j].Interface()
+			}
+			check(key+" (by reflection)", vals...)
+		}
+	}
+}
+
+// reflectArgs builds arguments for a method of type mt (receiver first)
+// from the kinds of parameter a store method takes: a context, an entry
+// name, a version or a uid. Any other parameter type is not built.
+func reflectArgs(ctx context.Context, mt reflect.Type) ([]reflect.Value, bool) {
+	var args []reflect.Value
+	for i := 1; i < mt.NumIn(); i++ {
+		switch in := mt.In(i); {
+		case in == reflect.TypeFor[context.Context]():
+			args = append(args, reflect.ValueOf(ctx))
+		case in.Kind() == reflect.String:
+			args = append(args, reflect.ValueOf("pair").Convert(in))
+		case in.Kind() == reflect.Uint64, in.Kind() == reflect.Uint32:
+			args = append(args, reflect.ValueOf(uint64(1)).Convert(in))
+		default:
+			return nil, false
+		}
+	}
+	return args, true
+}
+
+// plantUserTyped replaces version 1 of u's entry input, an opaque entry,
+// with a record of the typed kind kind sealing e, under the scope's keys:
+// a user scope has no typed put yet, and U149 reads a typed pair through
+// every UserScope method.
+func plantUserTyped(t *testing.T, u *UserScope, input string, kind Kind, e typed.Envelope) {
+	t.Helper()
+	name, err := u.own("current", input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ck, _ := credentialKind(kind)
+	e.Credential.AccessIssuedAt = typedNow
+	env, err := typed.Encode(ck, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = u.read(context.Background(), func(entries *os.Root, uk keys) error {
+		en, err := openUserEntry(entries, name)
+		if err != nil {
+			return err
+		}
+		defer en.close()
+		rec := record{kind: byte(kind), name: name, version: 1, generation: en.generation, created: typedNow.Unix()}
+		if err := rec.seal(uk.seal, uk.scope, env, rand.Reader); err != nil {
+			return err
+		}
+		f, err := en.root.OpenFile(versionName(1), os.O_WRONLY|os.O_TRUNC, 0)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(rec.marshal()); err != nil {
+			f.Close()
+			return err
+		}
+		return f.Close()
+	})
+	if err != nil {
+		t.Fatalf("plant %s: %v", input, err)
+	}
 }
 
 // TestGetReturnsRedactedCredential is U149: a typed entry reads back as a
