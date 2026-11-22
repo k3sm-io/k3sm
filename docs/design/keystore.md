@@ -1552,8 +1552,13 @@ service user can only add to.
   over 1 KiB, is **unattributable** and keeps the floor-wide fail-closed rule: no `put` or
   `deliver` line is written (refused before the first write), no catch-up line for a
   generation the floor holds no line for, and `current` of such an entry generation is
-  refused. The taint set, prefix taints included, is capped at 64 entries or 64 KiB; a
-  taint past the cap counts as unattributable damage. A known, untainted generation is served over damage, logged at
+  refused. The taint set, prefix taints included, is capped at 64 entries (each entry's
+  scope and name are a line's fields, so the count bounds the bytes too). A taint past the
+  cap **overflows** the set, which sticks for the file and fails toward more refusal: every
+  generation of every key, known or not, is refused for grants and reads, as though each
+  key were tainted. The overflow is never demoted to unattributable damage, so the
+  acknowledgement never lifts it; `rm` and `withdraw` still run
+  (`TestFloorTaintOverflowRefusesEveryKey`). A known, untainted generation is served over damage, logged at
   Warn once per process for each damaged file. `rm` and `withdraw` still work: a tombstone
   and a withdraw's delivery-record line can only revoke (`TestTornBurialTaintsOnlyItsKey`,
   `TestTornBurialEveryCutRefusesKnownGeneration`, `TestClassifyEveryPrefixTaintsItsKey`,

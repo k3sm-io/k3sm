@@ -64,18 +64,19 @@ import (
 // above what the floor holds. Unattributable damage keeps the floor-wide
 // rule: no live line for a generation the floor has no line for, and no put
 // or deliver line. The taint set is capped at maxTaintKeys entries; a taint
-// past the cap makes the floor refuse every generation of every key
-// (taintOverflow), never unattributable damage.
+// past the cap overflows it (logState.taintOverflow), which sticks for the
+// file: every generation of every key, known or not, is refused for grants
+// and reads, as though each were tainted. The overflow is never demoted to
+// unattributable damage, so an acknowledgement does not lift it; rm and
+// withdraw still run, as they do over any taint.
 
 const (
 	// maxUIDDigits is the most digits of a user scope's uid.
 	maxUIDDigits = 10
-	// maxTaintKeys and maxTaintBytes cap the floor's taint set.
-	maxTaintKeys  = 64
-	maxTaintBytes = 64 << 10
-	// taintEntryOverhead is what one taint entry is charged beyond its
-	// scope and name bytes: its generation and its map slot.
-	taintEntryOverhead = generationSize + 32
+	// maxTaintKeys caps the floor's taint set. An entry's scope and name
+	// are each a line's field, so 64 entries hold at most 64 lines' bytes:
+	// the count is the only cap.
+	maxTaintKeys = 64
 )
 
 // taintKind is what a damaged floor line could have been.
@@ -221,8 +222,9 @@ func namePrefixOK(p string) bool {
 }
 
 // taintLine records the taint of the damaged line line, without its
-// newline, that starts at off: into the taint set, or, past its cap or for
-// a line no key can be read from, as unattributable damage at off.
+// newline, that starts at off: into the taint set, or, past its cap, as the
+// taint set's overflow, or, for a line no key can be read from, as
+// unattributable damage at off.
 func (s *logState) taintLine(off int64, line []byte) {
 	kind, k := classifyFloorDamage(line)
 	if kind == taintNameFlip {
@@ -235,8 +237,8 @@ func (s *logState) taintLine(off int64, line []byte) {
 		if s.taintNames[nk] {
 			return
 		}
-		if !s.taintRoom(k) {
-			s.unattributable(off)
+		if !s.taintRoom() {
+			s.taintOverflow = true
 			return
 		}
 		if s.taintNames == nil {
@@ -248,8 +250,8 @@ func (s *logState) taintLine(off int64, line []byte) {
 		if s.taintPrefixes[pk] {
 			return
 		}
-		if !s.taintRoom(k) {
-			s.unattributable(off)
+		if !s.taintRoom() {
+			s.taintOverflow = true
 			return
 		}
 		if s.taintPrefixes == nil {
@@ -260,8 +262,8 @@ func (s *logState) taintLine(off int64, line []byte) {
 		if s.taintGens[k] {
 			return
 		}
-		if !s.taintRoom(k) {
-			s.unattributable(off)
+		if !s.taintRoom() {
+			s.taintOverflow = true
 			return
 		}
 		if s.taintGens == nil {
@@ -270,20 +272,21 @@ func (s *logState) taintLine(off int64, line []byte) {
 		s.taintGens[k] = true
 	default:
 		s.unattributable(off)
+	}
+}
+
+// taintRoom reports whether the taint set has room for one more entry.
+func (s *logState) taintRoom() bool {
+	return len(s.taintNames)+len(s.taintGens)+len(s.taintPrefixes) < maxTaintKeys
+}
+
+// unattributable records unattributable damage at off, keeping the latest
+// and counting each damaged line once.
+func (s *logState) unattributable(off int64) {
+	if s.unattrib && off == s.unattribAt {
 		return
 	}
-	s.taintBytes += len(k.scope) + len(k.name) + taintEntryOverhead
-}
-
-// taintRoom reports whether the taint set has room for one more entry
-// for k.
-func (s *logState) taintRoom(k floorKey) bool {
-	return len(s.taintNames)+len(s.taintGens)+len(s.taintPrefixes) < maxTaintKeys &&
-		s.taintBytes+len(k.scope)+len(k.name)+taintEntryOverhead <= maxTaintBytes
-}
-
-// unattributable records unattributable damage at off, keeping the latest.
-func (s *logState) unattributable(off int64) {
+	s.unattribN++
 	if !s.unattrib || off > s.unattribAt {
 		s.unattrib, s.unattribAt = true, off
 	}
@@ -296,7 +299,8 @@ func (s *logState) tornTaint(off int64, torn []byte) {
 }
 
 // tainted reports whether k is tainted: its (scope, name), or k itself, by
-// a skipped line or by the torn last line.
+// a skipped line or by the torn last line, or every key, by the taint set's
+// overflow.
 func (s *logState) tainted(k floorKey) bool {
 	if s.nameTainted(k.scope, k.name) || s.taintGens[k] {
 		return true
@@ -305,10 +309,10 @@ func (s *logState) tainted(k floorKey) bool {
 }
 
 // nameTainted reports whether (scope, name) is tainted as a name, every
-// generation of it: by a name taint, or by a scope or name prefix that
-// covers it.
+// generation of it: by a name taint, by a scope or name prefix that covers
+// it, or by the taint set's overflow, which covers every name.
 func (s *logState) nameTainted(scope, name string) bool {
-	if s.taintNames[nameKey{scope, name}] {
+	if s.taintOverflow || s.taintNames[nameKey{scope, name}] {
 		return true
 	}
 	for p := range s.taintPrefixes {

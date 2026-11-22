@@ -530,18 +530,20 @@ type logState struct {
 	// once an append closes it.
 	tornSize int64
 	// The floor's taint (userfloor_taint.go): taintNames and taintGens are
-	// the keys skipped lines could have named, taintBytes what they are
-	// charged against the cap; unattrib and unattribAt mark unattributable
-	// damage and the start of the latest; tornKind, tornKey and tornAt are
-	// the torn last line's, in force while tornSize is.
+	// the keys skipped lines could have named, and taintOverflow, sticky
+	// for the file, a taint past the set's cap, which taints every key;
+	// unattrib and unattribAt mark unattributable damage and the start of
+	// the latest, and unattribN counts its lines; tornKind, tornKey and
+	// tornAt are the torn last line's, in force while tornSize is.
 	taintNames map[nameKey]bool
 	taintGens  map[floorKey]bool
 	// taintPrefixes are the scope and name prefixes lines torn inside
 	// their scope or name could have named.
 	taintPrefixes map[prefixTaint]bool
-	taintBytes    int
+	taintOverflow bool
 	unattrib      bool
 	unattribAt    int64
+	unattribN     int
 	tornKind      taintKind
 	tornKey       floorKey
 	tornAt        int64

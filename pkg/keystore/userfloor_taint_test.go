@@ -317,8 +317,9 @@ func TestPrefixTaintMatches(t *testing.T) {
 	}
 }
 
-// Prefix taints share the taint set's cap: past it, a prefix line is
-// unattributable damage.
+// Prefix taints share the taint set's cap: past it, a prefix line
+// overflows the set, which taints every key and is never unattributable
+// damage.
 func TestPrefixTaintCapped(t *testing.T) {
 	var st logState
 	for i := range maxTaintKeys {
@@ -327,12 +328,15 @@ func TestPrefixTaintCapped(t *testing.T) {
 	if _, ok := st.unattributedAt(); ok {
 		t.Fatal("a prefix taint under the cap counted as unattributable")
 	}
-	st.taintLine(1000, []byte("user/1001 zz"))
-	if at, ok := st.unattributedAt(); !ok || at != 1000 {
-		t.Fatalf("a prefix taint past the cap: unattributable %v at %d, want at 1000", ok, at)
+	if st.tainted(floorKey{"user/1002", "other", guid(1)}) {
+		t.Fatal("a taint set under its cap tainted a key no line named")
 	}
-	if st.tainted(floorKey{"user/1001", "zz", guid(1)}) {
-		t.Fatal("a prefix past the cap tainted its key")
+	st.taintLine(1000, []byte("user/1001 zz"))
+	if _, ok := st.unattributedAt(); ok {
+		t.Fatal("a prefix taint past the cap counted as unattributable")
+	}
+	if !st.tainted(floorKey{"user/1001", "zz", guid(1)}) || !st.tainted(floorKey{"user/1002", "other", guid(1)}) {
+		t.Fatal("a prefix past the cap did not taint every key")
 	}
 }
 
