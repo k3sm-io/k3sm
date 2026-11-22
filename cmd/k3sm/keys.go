@@ -898,7 +898,8 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 }
 
 // keysAdopt is `keys adopt`: it prints the entry's current version and the
-// sealed version above it (Orphan), never a value, then makes that version
+// sealed version above it (Orphan), each with its kind, fingerprint, record
+// digest, sealed issuedAt and created time, never a value, then makes that version
 // current (Adopt) with --yes, or once a terminal on stdin confirms.
 func keysAdopt(ctx context.Context, args []string, env keysEnv) int {
 	v := newKeysVerb("adopt", env)
@@ -923,10 +924,10 @@ func keysAdopt(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	fmt.Fprintf(env.stdout, "name:     %s\n", qualify(name))
-	fmt.Fprintf(env.stdout, "current:  version %d, %s, created %s, pointer sequence %d\n",
-		info.Current.Version, info.Current.Kind, info.Current.Created.UTC().Format(time.RFC3339), info.Seq)
-	fmt.Fprintf(env.stdout, "orphan:   version %d, %s, created %s\n",
-		info.Orphan.Version, info.Orphan.Kind, info.Orphan.Created.UTC().Format(time.RFC3339))
+	fmt.Fprintf(env.stdout, "current:  version %d, %s, pointer sequence %d\n", info.Current.Version, info.Current.Kind, info.Seq)
+	printAdoptSide(env.stdout, info.Current, info.CurrentIssuedAt)
+	fmt.Fprintf(env.stdout, "orphan:   version %d, %s\n", info.Orphan.Version, info.Orphan.Kind)
+	printAdoptSide(env.stdout, info.Orphan, info.OrphanIssuedAt)
 	if len(info.Others) > 0 {
 		fmt.Fprintf(env.stdout, "beyond:   versions %v (a copied-back pointer: adopt refuses)\n", info.Others)
 	}
@@ -949,6 +950,24 @@ func keysAdopt(ctx context.Context, args []string, env keysEnv) int {
 	}
 	fmt.Fprintf(env.stdout, "adopted %s version %d: it is current\n", qualify(name), ver.Version)
 	return keysOK
+}
+
+// printAdoptSide prints the metadata `keys adopt` shows under one side's
+// heading, never a value: the fingerprint, the record digest, for a token or
+// an oauth pair the issuedAt sealed in its envelope (issued, the zero time
+// when it did not decode), and the record's created header, which is not
+// authenticated.
+func printAdoptSide(w io.Writer, v keystore.Version, issued time.Time) {
+	fmt.Fprintf(w, "  fingerprint:    %s\n", v.Fingerprint)
+	fmt.Fprintf(w, "  record digest:  %s\n", v.RecordDigest())
+	if v.Kind == keystore.KindToken || v.Kind == keystore.KindOAuth {
+		if issued.IsZero() {
+			fmt.Fprintf(w, "  issuedAt:       unreadable (the sealed envelope does not decode)\n")
+		} else {
+			fmt.Fprintf(w, "  issuedAt:       %s (sealed)\n", issued.UTC().Format(time.RFC3339))
+		}
+	}
+	fmt.Fprintf(w, "  created:        %s (unauthenticated)\n", v.Created.UTC().Format(time.RFC3339))
 }
 
 // confirmed reads one short answer line from r and reports whether it is

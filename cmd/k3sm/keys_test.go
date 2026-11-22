@@ -35,8 +35,10 @@ import (
 	"syscall"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"k3sm.io/k3sm/pkg/keystore"
+	"k3sm.io/k3sm/pkg/keystore/typed"
 )
 
 // keysRecorder passes every call to the store it wraps, the real
@@ -1824,11 +1826,24 @@ func TestKeysAdopt(t *testing.T) {
 	h.euid = 0
 
 	// Neither --yes nor a terminal: both sides printed, nothing changed.
+	info, err := keystore.New(h.storeCfg).Orphan(context.Background(), "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.mustRun(2, "adopt", "system/alpha")
-	for _, want := range []string{"current:  version 1, opaque", "orphan:   version 2, opaque", "pass --yes"} {
+	for _, want := range []string{
+		"current:  version 1, opaque",
+		adoptSide(info.Current, time.Time{}),
+		"orphan:   version 2, opaque",
+		adoptSide(info.Orphan, time.Time{}),
+		"pass --yes",
+	} {
 		if !strings.Contains(h.stdout.String()+h.stderr.String(), want) {
 			t.Fatalf("adopt without --yes does not print %q:\nstdout:\n%s\nstderr:\n%s", want, h.stdout.String(), h.stderr.String())
 		}
+	}
+	if strings.Contains(h.stdout.String(), "issuedAt") {
+		t.Fatalf("adopt printed an issuedAt for an opaque entry:\n%s", h.stdout.String())
 	}
 	// A terminal answering no changes nothing either.
 	h.stdinTTY = true
@@ -1855,6 +1870,90 @@ func TestKeysAdopt(t *testing.T) {
 	}
 	if strings.Contains(h.stdout.String()+h.stderr.String(), "two") {
 		t.Fatal("adopt printed a value")
+	}
+
+	t.Run("typed", func(t *testing.T) { keysAdoptTyped(t) })
+}
+
+// adoptSide is the block `keys adopt` prints under one side's heading: the
+// fingerprint, the record digest, the sealed issuedAt when issued is set,
+// and the unauthenticated created time.
+func adoptSide(v keystore.Version, issued time.Time) string {
+	b := fmt.Sprintf("  fingerprint:    %s\n  record digest:  %s\n", v.Fingerprint, v.RecordDigest())
+	if !issued.IsZero() {
+		b += fmt.Sprintf("  issuedAt:       %s (sealed)\n", issued.UTC().Format(time.RFC3339))
+	}
+	return b + fmt.Sprintf("  created:        %s (unauthenticated)\n", v.Created.UTC().Format(time.RFC3339))
+}
+
+// keysAdoptTyped is TestKeysAdopt for a token entry: each side also shows
+// the issuedAt sealed in its envelope, and no output carries the token.
+func keysAdoptTyped(t *testing.T) {
+	ctx := context.Background()
+	h := newKeysHarness(t)
+	h.put("system/seed", []byte("s")) // opens the store config
+	st := keystore.New(h.storeCfg)
+	marker1, marker2 := "MARKER-adopt-first-9c41e7", "MARKER-adopt-orphan-5d2b08"
+	token := func(v string) typed.Envelope {
+		return typed.Envelope{Credential: typed.Credential{Value: []byte(v), ExpiresAt: time.Now().Add(time.Hour)}}
+	}
+	if _, err := st.PutCredential(ctx, "tok", keystore.KindToken, token(marker1)); err != nil {
+		t.Fatal(err)
+	}
+	_, c1, err := st.CurrentCredential(ctx, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := filepath.Join(h.keystoreDir(), "tok", "current")
+	saved, err := os.ReadFile(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RotateCredential(ctx, "tok", keystore.KindToken, token(marker2)); err != nil {
+		t.Fatal(err)
+	}
+	_, c2, err := st.CurrentCredential(ctx, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cur, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	floorPath := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+	b, err := os.ReadFile(floorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lagged := strings.Replace(string(b), `"seq":2`, `"seq":1`, 1)
+	if lagged == string(b) {
+		t.Fatalf("the floor does not record sequence 2: %s", b)
+	}
+	if err := os.WriteFile(floorPath, []byte(lagged), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := st.Orphan(ctx, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h.mustRun(2, "adopt", "system/tok")
+	out := h.stdout.String() + h.stderr.String()
+	for _, want := range []string{
+		"current:  version 1, token",
+		adoptSide(info.Current, c1.IssuedAt),
+		"orphan:   version 2, token",
+		adoptSide(info.Orphan, c2.IssuedAt),
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("adopt does not print %q:\n%s", want, out)
+		}
+	}
+	h.mustRun(0, "adopt", "system/tok", "--yes")
+	out += h.stdout.String() + h.stderr.String()
+	for _, m := range []string{marker1, marker2} {
+		if strings.Contains(out, m) {
+			t.Fatalf("adopt printed the token value %q:\n%s", m, out)
+		}
 	}
 }
 
