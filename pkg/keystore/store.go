@@ -32,6 +32,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -156,6 +157,11 @@ type FileStore struct {
 	// logSoftCap, logHardCap and logRevokeBudget are Config's log caps,
 	// with the defaults filled in.
 	logSoftCap, logHardCap, logRevokeBudget int64
+	// userScopesStarted is set by startUserScopes once the server's
+	// user-scope start step has run; until then UserScope refuses
+	// (errUserScopesNotStarted). A pointer, so a copy of the store shares
+	// it; New allocates it.
+	userScopesStarted *atomic.Bool
 }
 
 var _ Store = (*FileStore)(nil)
@@ -185,6 +191,8 @@ func New(cfg Config) *FileStore {
 		logSoftCap:      orDefault(cfg.LogSoftCap, defaultLogSoftCap),
 		logHardCap:      orDefault(cfg.LogHardCap, defaultLogHardCap),
 		logRevokeBudget: orDefault(cfg.LogRevocationBudget, defaultLogRevocationBytes),
+
+		userScopesStarted: new(atomic.Bool),
 	}
 	s.userFloor, s.auditSink = newFileFloorLog(s), newFileAuditLog(s)
 	return s

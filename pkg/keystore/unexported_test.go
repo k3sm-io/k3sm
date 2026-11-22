@@ -42,6 +42,20 @@ import (
 // without its deliveries record, and no migration is needed for scopes this
 // build's mint wrote without one; it also keeps the floor gap
 // (userscope.go) out of reach until the user-scope floor lands.
+//
+// The hold is also mechanical: UserScope refuses until startUserScopes
+// (CheckLogBounds, then CatchUpUser) has run. And before any exported
+// identifier reaches the user scope, the tests of two rows must exist,
+// checked with go/parser over their packages' test files (exportPrereqs),
+// so the socket slice that lifts the ban cannot land ahead of them:
+//   - U51, the per-uid byte shares, in pkg/keystore/socket:
+//     TestLogSharePerUIDRefusesOnlyThatUID, TestLogShareAtMostOneSixteenthOfHardCap,
+//     TestShareRefusalIsNotGlobalAppendFailure, TestReadRateLimitPerUID,
+//     TestReadsChargedToShare, TestShareExhaustionIsolatedPerUID;
+//   - U193, the rebuild, in cmd/k3sm: TestRebuildCarriesTombstonesForward.
+//
+// The socket slice lifts the ban on references, never the prerequisite
+// check.
 func TestUserScopeIsUnexported(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
@@ -54,7 +68,7 @@ func TestUserScopeIsUnexported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files := 0
+	files, exported := 0, false
 	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -75,6 +89,7 @@ func TestUserScopeIsUnexported(t *testing.T) {
 		files++
 		rel, _ := filepath.Rel(root, p)
 		for _, name := range bannedRefs(f) {
+			exported = true
 			t.Errorf("%s references %s: the user scope stays inside pkg/keystore until the socket slice", rel, name)
 		}
 		return nil
@@ -84,6 +99,106 @@ func TestUserScopeIsUnexported(t *testing.T) {
 	}
 	if files < 100 {
 		t.Fatalf("scanned only %d files under %s", files, root)
+	}
+	if exported {
+		missing, err := missingExportPrereqs(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range missing {
+			t.Errorf("an exported identifier reaches the user scope before %s exists", m)
+		}
+	}
+}
+
+// exportPrereqs are the tests that must exist, each in its package's test
+// files, before any exported identifier reaches the user scope: U51's (the
+// per-uid byte shares) and U193's (the rebuild).
+var exportPrereqs = []struct {
+	row, dir string
+	tests    []string
+}{
+	{"U51", "pkg/keystore/socket", []string{
+		"TestLogSharePerUIDRefusesOnlyThatUID", "TestLogShareAtMostOneSixteenthOfHardCap",
+		"TestShareRefusalIsNotGlobalAppendFailure", "TestReadRateLimitPerUID",
+		"TestReadsChargedToShare", "TestShareExhaustionIsolatedPerUID",
+	}},
+	{"U193", "cmd/k3sm", []string{"TestRebuildCarriesTombstonesForward"}},
+}
+
+// missingExportPrereqs returns, as "<row> <dir>::<Test>", each of
+// exportPrereqs that no _test.go file of its package under root declares as
+// a top-level function. A package directory that does not exist declares
+// none.
+func missingExportPrereqs(root string) ([]string, error) {
+	var missing []string
+	for _, p := range exportPrereqs {
+		have := map[string]bool{}
+		files, err := filepath.Glob(filepath.Join(root, filepath.FromSlash(p.dir), "*_test.go"))
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range files {
+			f, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.SkipObjectResolution)
+			if err != nil {
+				return nil, err
+			}
+			for _, d := range f.Decls {
+				if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil {
+					have[fd.Name.Name] = true
+				}
+			}
+		}
+		for _, name := range p.tests {
+			if !have[name] {
+				missing = append(missing, p.row+" "+p.dir+"::"+name)
+			}
+		}
+	}
+	return missing, nil
+}
+
+// missingExportPrereqs names every prerequisite test a tree lacks, reads a
+// method or a test in another directory as no declaration, and names none
+// once each is declared in its package's test files.
+func TestExportPrereqsChecked(t *testing.T) {
+	root := t.TempDir()
+	missing, err := missingExportPrereqs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := 0
+	for _, p := range exportPrereqs {
+		want += len(p.tests)
+	}
+	if len(missing) != want {
+		t.Fatalf("an empty tree lacks %d prerequisites (%v), want %d", len(missing), missing, want)
+	}
+	write := func(dir, src string) {
+		t.Helper()
+		d := filepath.Join(root, filepath.FromSlash(dir))
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "x_test.go"), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("pkg/other", "package other\nfunc TestRebuildCarriesTombstonesForward() {}\n")
+	write("cmd/k3sm", "package main\ntype r struct{}\nfunc (r) TestRebuildCarriesTombstonesForward() {}\n")
+	if missing, err = missingExportPrereqs(root); err != nil || len(missing) != want {
+		t.Fatalf("a method and a test in another package count as declared: %v, %v", missing, err)
+	}
+	for _, p := range exportPrereqs {
+		var b strings.Builder
+		b.WriteString("package p\n")
+		for _, name := range p.tests {
+			b.WriteString("func " + name + "(*testing.T) {}\n")
+		}
+		write(p.dir, b.String())
+	}
+	if missing, err = missingExportPrereqs(root); err != nil || len(missing) != 0 {
+		t.Fatalf("every prerequisite declared: still missing %v, %v", missing, err)
 	}
 }
 

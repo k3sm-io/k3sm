@@ -30,6 +30,7 @@ import (
 
 func userScope(t *testing.T, s *FileStore, uid uint32) *UserScope {
 	t.Helper()
+	startScopes(t, s)
 	u, err := s.UserScope(uid)
 	if err != nil {
 		t.Fatalf("UserScope(%d): %v", uid, err)

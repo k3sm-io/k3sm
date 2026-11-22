@@ -931,23 +931,59 @@ func (u *UserScope) catchUpDeliveries(gen [generationSize]byte, rd deliveriesRea
 // error it returns, and the rest are still caught up. A keystore with no
 // directory or no user scope has nothing to catch up.
 func (s *FileStore) CatchUpUser(ctx context.Context) error {
-	if err := s.checkConfig(); err != nil {
+	scopeErrs, err := s.catchUpUser(ctx)
+	return errors.Join(err, scopeErrs)
+}
+
+// startUserScopes is the server's user-scope start step, owed before the
+// listener serves: CheckLogBounds, then CatchUpUser, in that order. Once
+// both have run it marks the user scope started, and only then does
+// UserScope build one (errUserScopesNotStarted). A refused CheckLogBounds,
+// or a catch-up that could not run at all (no lock, no master), leaves it
+// unstarted. CatchUpUser is best effort per scope, so a scope it could not
+// catch up does not hold the others: the user scope starts, and the error
+// names that scope.
+//
+//lint:ignore U1000 the server start calls it once the socket lands; until then TestUserScopeIsUnexported holds the user scope in this package.
+func (s *FileStore) startUserScopes(ctx context.Context) error {
+	if s.userScopesStarted == nil {
+		return fmt.Errorf("%w: the store was not made by New", errInvalidConfig)
+	}
+	if err := s.CheckLogBounds(ctx); err != nil {
 		return err
+	}
+	scopeErrs, err := s.catchUpUser(ctx)
+	if err != nil {
+		return errors.Join(err, scopeErrs)
+	}
+	s.userScopesStarted.Store(true)
+	return scopeErrs
+}
+
+// errUserScopesNotStarted refuses a user scope before the server's start
+// step (startUserScopes) has run.
+var errUserScopesNotStarted = errors.New("the user scope is not started: the server's start step (the log bounds check, then the delivery catch-up) has not run")
+
+// catchUpUser is CatchUpUser's work: err when the catch-up could not run at
+// all, and scopeErrs naming each scope it could not catch up.
+func (s *FileStore) catchUpUser(ctx context.Context) (scopeErrs, err error) {
+	if err := s.checkConfig(); err != nil {
+		return nil, err
 	}
 	root, done, err := s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer done()
 	if exists, err := rootHasUserScopes(root); err != nil || !exists {
-		return err
+		return nil, err
 	}
 	k, err := s.loadMaster()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var errs []error
 	err = s.eachScopeDir(ctx, root, func(name string, _ *os.Root) error {
@@ -959,10 +995,7 @@ func (s *FileStore) CatchUpUser(ctx context.Context) error {
 		}
 		return nil
 	})
-	if err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return errors.Join(errs...), err
 }
 
 // catchUpScope runs catchUpDeliveries for u's scope, opened for a

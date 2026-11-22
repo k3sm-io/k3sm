@@ -111,8 +111,13 @@ type UserScope struct {
 
 // UserScope returns uid's view of the store. A uid outside 501 to
 // 2147483647, or the service uid, is refused: root has no user scope, and
-// neither has a system account, nobody or the service user.
+// neither has a system account, nobody or the service user. Until the
+// server's start step has run (startUserScopes) it refuses every uid,
+// errUserScopesNotStarted.
 func (s *FileStore) UserScope(uid uint32) (*UserScope, error) {
+	if s.userScopesStarted == nil || !s.userScopesStarted.Load() {
+		return nil, errUserScopesNotStarted
+	}
 	scope := userScopeOf(uid)
 	if err := checkScope(scope); err != nil {
 		return nil, err
