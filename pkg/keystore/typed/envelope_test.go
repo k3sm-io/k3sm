@@ -400,3 +400,15 @@ func TestEnvelopeRefusalsNeverCarryRefreshToken(t *testing.T) {
 		}
 	}
 }
+
+// TestKindUnsupportedNamesAlteration: a single flipped byte can make an
+// envelope version read as unknown, so the refusal names alteration and a
+// restore beside an upgrade, and never steers an operator only to upgrade.
+func TestKindUnsupportedNamesAlteration(t *testing.T) {
+	msg := ErrKindUnsupported.Error()
+	for _, want := range []string{"upgrade k3sm", "or the file was altered", "if this k3sm is current, restore it from backup"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("ErrKindUnsupported %q does not say %q", msg, want)
+		}
+	}
+}

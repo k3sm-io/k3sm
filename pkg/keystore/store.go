@@ -1241,7 +1241,8 @@ func (e *entry) version(k keys, n uint64) (Version, []byte, error) {
 	if err := checkStored(Kind(r.kind), value); err != nil {
 		clear(value)
 		// An envelope version this build does not know was written by a
-		// newer k3sm: an upgrade, not a restore, is its remedy.
+		// newer k3sm, or altered to read as one: ErrKindUnsupported names
+		// both remedies, so it is not wrapped in ErrCorrupt.
 		if errors.Is(err, ErrKindUnsupported) {
 			return Version{}, nil, fmt.Errorf("version %d: %w", n, err)
 		}

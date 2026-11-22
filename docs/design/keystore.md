@@ -3426,7 +3426,10 @@ them meaning.
 ### Unknown kinds, ownership and rollback
 
 - **No format bump.** `parseRecord`'s refusal splits: a kind byte in 6 to 0xFC, or an unknown
-  envelope version, is `ErrKindUnsupported`: "this entry was written by a newer k3sm; upgrade". It
+  envelope version, is `ErrKindUnsupported`: "this entry was written by a newer k3sm, or the file
+  was altered; upgrade, or, if this k3sm is current, restore it from backup". A single flipped
+  byte can make a record read as a newer kind, so the text never steers an operator to upgrade
+  alone; for an `oauth` entry the restore is followed by the re-login below. It
   is not wrapped in `ErrCorrupt`, whose text says to restore from backup. `list` shows such an
   entry as `unsupported` and exits 1, like `corrupt`.
 - **The reconcilers' mapping is unchanged.** Only `ErrNotFound` (and, once allowed,

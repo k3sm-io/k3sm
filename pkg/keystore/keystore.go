@@ -185,10 +185,10 @@ var (
 	ErrNotFound = errors.New("keystore entry not found")
 	// ErrKindUnsupported is returned for a record this build cannot read: a
 	// kind byte from 6 to 0xFC, or a typed envelope version it does not
-	// know. It was written by a newer k3sm, so it is not wrapped in
-	// ErrCorrupt, whose remedy is a restore from backup; the remedy is an
-	// upgrade. It is typed.ErrKindUnsupported, so the envelope decoder's
-	// refusal matches it unmapped.
+	// know. It was written by a newer k3sm, or altered to read as one, so
+	// it is not wrapped in ErrCorrupt; its text names an upgrade first and
+	// a restore when this k3sm is current. It is typed.ErrKindUnsupported,
+	// so the envelope decoder's refusal matches it unmapped.
 	ErrKindUnsupported = typed.ErrKindUnsupported
 	// ErrKindMismatch reports a rotate, or a put over an existing name, of
 	// a kind other than the entry's: an entry's kind is fixed when it is

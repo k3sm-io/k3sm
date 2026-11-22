@@ -83,8 +83,11 @@ var (
 	// bounds, or a truncated or oversized envelope. No build writes one.
 	ErrCorrupt = errors.New("the typed credential envelope is corrupt")
 	// ErrKindUnsupported reports a credential this build cannot read: a
-	// record kind or an envelope version from a newer k3sm.
-	ErrKindUnsupported = errors.New("the keystore entry was written by a newer k3sm, in a kind or envelope version this build cannot read; upgrade k3sm")
+	// record kind or an envelope version from a newer k3sm, or a file
+	// altered so that it reads as one (a single flipped byte can). Its text
+	// names both remedies, so an alteration never steers an operator to
+	// upgrade alone.
+	ErrKindUnsupported = errors.New("the keystore entry was written by a newer k3sm, in a kind or envelope version this build cannot read, or the file was altered; upgrade k3sm, or, if this k3sm is current, restore it from backup")
 	// ErrInvalidCredential reports a credential Encode or an SSH import
 	// refuses: a missing field, a value out of its bounds, or a field of
 	// another kind.
