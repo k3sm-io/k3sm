@@ -1237,3 +1237,65 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, newKeys fun
 	}
 	return l.preflight(f, total, false)
 }
+
+// errLogBoundsBelowLog refuses, at store open, a configuration whose
+// reader's bounds sit below what an existing log already holds: under it the
+// log would read as damage and refuse every user-scope operation.
+var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's bounds below what an existing append-only log already holds, so it would read as damage; raise the caps back, or run sudo k3sm keys floor --rebuild or sudo k3sm keys audit --rotate")
+
+// CheckLogBounds refuses, as errInvalidConfig and errLogBoundsBelowLog, a
+// configuration whose reader's bounds sit below what an existing log
+// already holds: a log larger than logReadBound, or a floor with more keys
+// than the reader's key bound. It is the server's store-open check, and its
+// error, which names the current figures, is root's alone: it never reaches
+// the socket. A log that does not open is left to each operation's own
+// judgement.
+func (s *FileStore) CheckLogBounds(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.checkConfig(); err != nil {
+		return err
+	}
+	bound := s.logReadBound()
+	for _, l := range []any{s.userFloor, s.auditSink} {
+		var log *appendLog
+		switch v := l.(type) {
+		case *fileFloorLog:
+			log = v.log
+		case *fileAuditLog:
+			log = v.log
+		default:
+			continue
+		}
+		f, st, err := log.open(unix.O_RDONLY)
+		if err != nil {
+			log.forgetUnflagged(err, false)
+			continue
+		}
+		err = func() error {
+			defer func() { _ = f.Close() }() // read-only
+			if st.Size > bound {
+				return fmt.Errorf("%w: %w (%s is %d bytes, over the reader's bound of %d)", errInvalidConfig, errLogBoundsBelowLog, log.name, st.Size, bound)
+			}
+			if log.addsKey == nil {
+				return nil
+			}
+			log.mu.Lock()
+			defer log.mu.Unlock()
+			state, err := log.sync(f, st)
+			if err != nil {
+				return nil
+			}
+			// A state read under a larger key bound is judged by its count.
+			if errors.Is(state.bad, errFloorTooManyKeys) || state.keys > log.readKeyBound() {
+				return fmt.Errorf("%w: %w (%s holds more than the reader's key bound of %d keys)", errInvalidConfig, errLogBoundsBelowLog, log.name, log.readKeyBound())
+			}
+			return nil
+		}()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
