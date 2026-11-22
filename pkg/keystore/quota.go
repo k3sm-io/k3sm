@@ -538,19 +538,28 @@ func (b *burial) addTree(e *entry, name string) {
 // bury appends a tombstone for every generation, the one the pointer
 // authenticates first. The file-backed floor takes them as one write
 // (buryAll): everything the burial needs is judged and reserved for the
-// whole buffer, and a refusal, or a write that fails or lands short,
-// refuses the rm with nothing committed, retryable, and the tree stays;
-// short bytes are a torn tail the reader skips. Any other floor takes them
+// whole buffer, and a refusal, or a write that fails or lands short before
+// its first whole tombstone, refuses the rm with nothing committed,
+// retryable, and the tree stays; short bytes are a torn tail the reader
+// skips. A write that fails after whole tombstones landed has revoked the
+// entry: it is reported after the commit (errCommitted), as below. Any other floor takes them
 // one by one: a first tombstone it does not take refuses the rm with
 // nothing written, and once any has landed the entry is revoked, so a later
 // one that fails is reported after the commit (errCommitted): the rm is
 // audited as a revocation, the tree stays, and a retry buries the rest.
 func (b *burial) bury(u *UserScope) error {
 	if ff, ok := u.s.userFloor.(*fileFloorLog); ok {
-		if err := ff.buryAll(u.scope, b.name, b.ordered()); err != nil {
-			return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstones: %w", err)
+		err := ff.buryAll(u.scope, b.name, b.ordered())
+		var landed *linesLanded
+		switch {
+		case err == nil:
+			return nil
+		case errors.As(err, &landed):
+			// Whole tombstones landed before the write failed: they are in
+			// force, so the entry is revoked and the rm committed.
+			return fmt.Errorf("%w, but only in part: the user-scope floor took %d of the entry's %d tombstones before its write failed, so the entry is refused as deleted and its tree stays; run rm again to bury the rest: %w", errCommitted, landed.lines, len(b.gens), err)
 		}
-		return nil
+		return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstones: %w", err)
 	}
 	landed := false
 	var errs []error

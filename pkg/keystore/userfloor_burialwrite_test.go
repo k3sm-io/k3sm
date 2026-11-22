@@ -147,3 +147,51 @@ func TestRmBurialWriteFailureRefuses(t *testing.T) {
 		})
 	}
 }
+
+// A burial whose single write lands short after one whole tombstone has a
+// tombstone in force: the rm is committed (errCommitted), never refused
+// with "nothing removed", it is audited as a commit, the landed generation
+// is buried, the fragment after it is counted damage, and a retry buries
+// the rest.
+func TestRmBurialShortWriteAfterWholeLineCommits(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := fileLogScope(t)
+	authed, _, _ := swappedGenerationEntry(t, s, server)
+	l := s.userFloor.(*fileFloorLog).log
+	l.write = func(f *os.File, b []byte) (int, error) {
+		cut := bytes.IndexByte(b, '\n') + 1 + 10 // one whole tombstone and a fragment
+		n, err := f.Write(b[:cut])
+		if err != nil {
+			return n, err
+		}
+		return n, io.ErrShortWrite
+	}
+	err := u.Delete(ctx, "user/1001/token")
+	if !errors.Is(err, errCommitted) || strings.Contains(err.Error(), "nothing removed") {
+		t.Fatalf("rm whose burial landed one whole tombstone: %v, want errCommitted without \"nothing removed\"", err)
+	}
+	l.write = nil
+	live, err := s.userFloor.liveGens("user/1001", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range live {
+		if g == authed {
+			t.Fatalf("the landed tombstone's generation is still live: %x", g)
+		}
+	}
+	audit := bytes.Split(bytes.TrimSuffix(readLog(t, s, auditLogName), []byte("\n")), []byte("\n"))
+	r, err := parseAuditLine(audit[len(audit)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Op != "rm" || r.Result != "committed" {
+		t.Fatalf("the rm was audited %+v, want a committed rm", r)
+	}
+	if got := floorDamage(t, s); got != 1 {
+		t.Fatalf("damage after the short burial is %d, want 1 (the fragment)", got)
+	}
+	if err := u.Delete(ctx, "user/1001/token"); err != nil && !errors.Is(err, errCommitted) {
+		t.Fatalf("rm retried after the short burial: %v", err)
+	}
+}

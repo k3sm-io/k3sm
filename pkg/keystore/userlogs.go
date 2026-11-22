@@ -960,7 +960,9 @@ func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, sla
 // the hard cap needs budget and room in uid's revocation budget, the keys
 // the lines add are judged together, and the free space must hold the
 // buffer plus extra bytes the caller appends after it (an rm's audit line).
-// An error means nothing was committed.
+// An error means nothing was committed, except a *linesLanded one: a
+// write that failed or landed short after whole lines of the buffer
+// reached the file, which the reader reads and holds in force.
 func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slack bool, extra int) error {
 	for _, line := range lines {
 		if len(line) > maxLogLine {
@@ -1075,9 +1077,57 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 		err = f.Sync()
 	}
 	if err != nil {
-		return fmt.Errorf("append to %s: %w", l.name, err)
+		err = fmt.Errorf("append to %s: %w", l.name, err)
+		if k := l.landedLines(f, st.Size, out, int(lead), n); k > 0 {
+			return &linesLanded{lines: k, err: err}
+		}
+		return err
 	}
 	return nil
+}
+
+// linesLanded is an append that failed after lines of its buffer reached
+// the file whole: the reader reads them, so what they record is in force.
+type linesLanded struct {
+	lines int // whole lines of the caller's that landed, in order
+	err   error
+}
+
+func (e *linesLanded) Error() string {
+	return fmt.Sprintf("%v (%d whole line(s) landed before it)", e.err, e.lines)
+}
+
+func (e *linesLanded) Unwrap() error { return e.err }
+
+// landedLines counts the caller's lines of out, appended at size after
+// lead bytes (a torn tail's newline), that reached f whole and
+// newline-terminated after a write that failed or landed short. It re-reads
+// the tail on f's descriptor, since a failed write(2) may not report what
+// it wrote; a tail that cannot be read falls back to n, the bytes the write
+// reported. A fragment after the last whole line is a torn tail the reader
+// skips as damage.
+func (l *appendLog) landedLines(f *os.File, size int64, out []byte, lead, n int) int {
+	got := out[:max(0, min(n, len(out)))]
+	var fst unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &fst); err == nil && fst.Size > size {
+		var src io.ReaderAt = f
+		if l.readAt != nil {
+			src = l.readAt(f)
+		}
+		buf := make([]byte, min(fst.Size-size, int64(len(out))))
+		if k, err := src.ReadAt(buf, size); err == nil || k == len(buf) {
+			// The bytes on disk that match the buffer, from its start.
+			m := 0
+			for m < k && buf[m] == out[m] {
+				m++
+			}
+			got = out[:m]
+		}
+	}
+	if len(got) <= lead {
+		return 0
+	}
+	return bytes.Count(got[lead:], []byte{'\n'})
 }
 
 // tornTail reports whether f, size bytes long, is non-empty and its last
