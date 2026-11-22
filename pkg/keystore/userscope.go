@@ -209,7 +209,11 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	if err := u.checkNewName(entries, name); err != nil {
 		return Version{}, err
 	}
-	if err := checkScopeQuota(entries, name, value); err != nil {
+	base, err := u.deliveriesBytes(root)
+	if err != nil {
+		return Version{}, err
+	}
+	if err := checkScopeQuota(entries, name, value, base); err != nil {
 		return Version{}, err
 	}
 	if err := grant(); err != nil {

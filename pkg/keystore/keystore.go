@@ -195,10 +195,13 @@ var (
 	// scope opens and no scope key is minted.
 	ErrScopeOwnerUnknown = errors.New("the user scope's owner could not be confirmed: the uid's GeneratedUID lookup failed, timed out or found no directory record, so nothing in the scope was opened or created")
 	// ErrQuota reports a user-scope write past one of the scope's bounds:
-	// 256 entries or 16 MiB of sealed records for put, 64 live deliveries
-	// (or 320 in all, tombstones included) for deliver. rm and withdraw are
-	// never refused for a quota: they are how room is made.
-	ErrQuota = errors.New("the user scope is over its quota: at most 256 entries and 16 MiB of sealed records, and 64 live deliveries; rm an entry (then put it again) or withdraw a delivery to make room")
+	// 256 entries or 16 MiB of sealed records (every file in every entry
+	// directory, its generation file included, and the deliveries record)
+	// for put, 64 live deliveries (or 320 in all, tombstones included) for
+	// deliver. rm and withdraw are never refused for a quota. rm makes room;
+	// a withdraw leaves a tombstone that counts until its Secret is gone,
+	// when it is reclaimed (the reconciler's pruning, a later change).
+	ErrQuota = errors.New("the user scope is over its quota: at most 256 entries and 16 MiB of sealed records (the entries' files and the deliveries record), and 64 live deliveries or 320 in all; rm an entry (then put it again) to make room. Withdrawn deliveries still count until they are reclaimed once their Secret is gone")
 	// ErrRewrapInProgress is a user scope's refusal to write while a Rewrap is
 	// half done: master.next, or its fingerprint, is in the master directory.
 	// The user path never completes a swap or mints a master, and a .user it

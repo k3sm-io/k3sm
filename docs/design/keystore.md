@@ -1341,7 +1341,11 @@ that each user re-puts their values, with new credentials from each value's issu
 
 Each user scope holds at most 256 entries, 16 MiB of sealed records and 64 live entries in its
 `deliveries` record. Over the first two, `put` and `rotate` answer `ErrQuota`; over the third,
-`deliver` does; `rm` and `withdraw` still work (U13).
+`deliver` does; `rm` and `withdraw` still work (U13). The byte budget counts every file in every
+entry directory, each entry's `generation` file included, and the `deliveries` record. `rm`
+makes room; a `withdraw` does not, since its tombstone counts until its Secret is gone, when the
+reconciler's pruning (a later change) reclaims it. The `quota` error says so and never claims a
+withdrawal frees room.
 
 **When `rotate` gets `ErrQuota`.** Retention is unbounded, so an entry rotated often fills the
 byte budget. The recovery is `rm` then `put`: `rm` frees every version of the entry and `put`

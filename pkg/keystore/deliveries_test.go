@@ -24,6 +24,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -464,5 +465,58 @@ func checkScopeQuotaAt(t *testing.T, u *UserScope, name string) error {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	return checkScopeQuota(root, name, []byte("v"))
+	return checkScopeQuota(root, name, []byte("v"), 0)
+}
+
+// scopeFileBytes sums the regular files under uid 1001's entries/.
+func scopeFileBytes(t *testing.T, server string) int64 {
+	t.Helper()
+	var total int64
+	err := filepath.WalkDir(filepath.Join(scopeDir(server, "1001"), scopeEntriesName), func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return err
+		}
+		fi, err := d.Info()
+		total += fi.Size()
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return total
+}
+
+// U13: the byte budget counts the deliveries record and the new entry's
+// generation file, not only its version record and pointer: a put that fits
+// only without them is ErrQuota, and the refusal does not claim a withdraw
+// frees room.
+func TestUserScopeQuotaCountsDeliveriesAndGeneration(t *testing.T) {
+	ctx := context.Background()
+	_, server, u := newDeliveryScope(t)
+	for n := 1; n <= 3; n++ {
+		if err := u.addDelivery(ctx, testDelivery(n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const name, value = "fits", "v"
+	add := int64(headerSize+len(name)+len(value)+tagSize) + int64(headerSize+len(currentName)+pointerSize+tagSize)
+	// Pad token's entry directory so the entries and the two records fill
+	// the budget exactly.
+	pad := filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "token", "pad")
+	if err := os.WriteFile(pad, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(pad, maxScopeBytes-add-scopeFileBytes(t, server)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := u.Put(ctx, "user/1001/"+name, KindOpaque, []byte(value))
+	if !errors.Is(err, ErrQuota) || !strings.Contains(err.Error(), "sealed records would be") {
+		t.Fatalf("put that fits only without the deliveries record and generation file: %v, want ErrQuota", err)
+	}
+	if strings.Contains(err.Error(), "withdraw a delivery to make room") {
+		t.Fatalf("refusal %q claims a withdraw frees room", err)
+	}
+	if !strings.Contains(err.Error(), "once their Secret is gone") {
+		t.Fatalf("refusal %q does not say when withdrawn deliveries are reclaimed", err)
+	}
 }

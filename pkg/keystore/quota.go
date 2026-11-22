@@ -26,7 +26,8 @@ import (
 
 // This file is the user scope's entry quotas and its rm:
 // docs/design/keystore.md § "User scope", "Quotas". A scope holds at most
-// 256 entries and 16 MiB of sealed records; past either, put answers
+// 256 entries and 16 MiB of sealed records (the entries' files, generation
+// files included, and the deliveries record); past either, put answers
 // ErrQuota, and rm, which frees every version of an entry, still works.
 // (The delivery bound is the delivery record's: deliveries.go.)
 
@@ -40,17 +41,18 @@ const (
 
 // checkScopeQuota refuses, as ErrQuota, a put of value as name into
 // entries when name is new and the scope already holds maxScopeEntries
-// entries, or when its
-// sealed records and the new entry's two records (version 1 and its
-// pointer) would pass maxScopeBytes.
-func checkScopeQuota(entries *os.Root, name string, value []byte) error {
+// entries, or when its sealed records (every file in every entry
+// directory), base (the deliveries record's size) and the new entry's
+// files (version 1, its pointer and its generation file) would pass
+// maxScopeBytes.
+func checkScopeQuota(entries *os.Root, name string, value []byte, base int64) error {
 	names, err := readDirNames(entries, maxDirNames)
 	if err != nil {
 		return err
 	}
 	count := 0
 	exists := false
-	var total int64
+	total := base
 	for _, n := range names {
 		if checkName(n) != nil {
 			continue
@@ -68,11 +70,26 @@ func checkScopeQuota(entries *os.Root, name string, value []byte) error {
 	if !exists && count >= maxScopeEntries {
 		return fmt.Errorf("%w: the scope holds %d entries, at most %d", ErrQuota, count, maxScopeEntries)
 	}
-	add := int64(headerSize+len(name)+len(value)+tagSize) + int64(headerSize+len(currentName)+pointerSize+tagSize)
+	add := int64(headerSize+len(name)+len(value)+tagSize) + int64(headerSize+len(currentName)+pointerSize+tagSize) + generationFileSize
 	if total+add > maxScopeBytes {
-		return fmt.Errorf("%w: the scope's sealed records would be %d bytes, over %d; rm an entry rotated often, then put it again", ErrQuota, total+add, maxScopeBytes)
+		return fmt.Errorf("%w: the scope's sealed records would be %d bytes with its deliveries record, over %d; rm an entry rotated often, then put it again", ErrQuota, total+add, maxScopeBytes)
 	}
 	return nil
+}
+
+// deliveriesBytes is the size of the scope's deliveries record, which the
+// byte budget counts.
+func (u *UserScope) deliveriesBytes(root *os.Root) (int64, error) {
+	dir, err := u.openScopeDir(root, false)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = dir.Close() }() // read-only
+	fi, err := dir.Lstat(deliveriesName)
+	if err != nil {
+		return 0, fmt.Errorf("check for %s: %w", deliveriesName, err)
+	}
+	return fi.Size(), nil
 }
 
 // entryBytes sums the sizes of the regular files in entries/name, without
