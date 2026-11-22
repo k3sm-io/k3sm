@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -122,6 +123,9 @@ type FileStore struct {
 	now      func() time.Time
 	chown    func(f *os.File, uid, gid int) error
 	lockWait time.Duration
+	// log is where the store logs; nil is slog.Default(), read at the
+	// call, so a default the binary sets after New still applies.
+	log *slog.Logger
 	// step is called at each durable step of a write; a non-nil return aborts
 	// the write there, as a crash would.
 	step func(name string) error

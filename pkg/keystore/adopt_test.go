@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -229,6 +231,71 @@ func TestOrphanReportsSealedIssuedAt(t *testing.T) {
 				t.Fatalf("Orphan issuedAt: current %v, orphan %v; want %v, %v", info.CurrentIssuedAt, info.OrphanIssuedAt, wantCur, wantOrphan)
 			}
 		})
+	}
+}
+
+// recordingHandler is a slog.Handler that keeps every record it is given.
+type recordingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler            { return h }
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+// TestAdoptLogs: a successful Adopt emits one Info line naming the entry,
+// the old version, the adopted version and its record digest, and never a
+// value; a refused Adopt logs nothing.
+func TestAdoptLogs(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTypedStore(t)
+	rec := &recordingHandler{}
+	s.log = slog.New(rec)
+	const access1, refresh1 = "MARKER-access-1-c07e", "MARKER-refresh-1-41aa"
+	const access2, refresh2 = "MARKER-access-2-9b3d", "MARKER-refresh-2-e612"
+	mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope(access1, refresh1))
+	crashAfterVersionWrite(t, s, server, "k", func() error {
+		_, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope(access2, refresh2))
+		return err
+	})
+	if _, err := s.Adopt(ctx, "k", Version{Version: 2}); !errors.Is(err, ErrVersionStale) {
+		t.Fatalf("Adopt without the inspected identity: %v, want ErrVersionStale", err)
+	}
+	if len(rec.records) != 0 {
+		t.Fatalf("a refused Adopt logged %d lines", len(rec.records))
+	}
+	orphan := mustOrphan(t, s, "k")
+	if _, err := s.Adopt(ctx, "k", orphan); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.records) != 1 {
+		t.Fatalf("Adopt logged %d lines, want 1", len(rec.records))
+	}
+	r := rec.records[0]
+	if r.Level != slog.LevelInfo {
+		t.Fatalf("Adopt logged at %v, want Info", r.Level)
+	}
+	got := map[string]string{}
+	r.Attrs(func(a slog.Attr) bool {
+		got[a.Key] = a.Value.Resolve().String()
+		return true
+	})
+	want := map[string]string{"entry": "k", "oldVersion": "1", "version": "2", "recordDigest": orphan.RecordDigest()}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("Adopt log attrs %v, want %v", got, want)
+	}
+	line := r.Message + fmt.Sprint(got)
+	for _, m := range []string{access1, refresh1, access2, refresh2} {
+		if strings.Contains(line, m) {
+			t.Fatalf("Adopt logged the value %q: %s", m, line)
+		}
 	}
 }
 

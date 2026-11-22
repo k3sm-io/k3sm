@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"math"
 	"slices"
 	"time"
@@ -197,6 +198,14 @@ func orphanError(e *entry, oauth bool, v, cur uint64) error {
 		ErrCorrupt, ErrOrphanVersion, v, cur, remedy)
 }
 
+// logger is the store's logger: its log seam, or slog.Default().
+func (s *FileStore) logger() *slog.Logger {
+	if s.log != nil {
+		return s.log
+	}
+	return slog.Default()
+}
+
 // qualified is the CLI's form of a system entry name.
 func qualified(name string) string { return "system/" + name }
 
@@ -258,6 +267,9 @@ func (s *FileStore) Orphan(ctx context.Context, name string) (OrphanInfo, error)
 // Adopting is right for both causes an orphan has: after a crashed rotation
 // it completes the flip the crash interrupted, and behind a copied-back
 // pointer it rewrites the newer pointer that was replaced.
+//
+// A successful Adopt logs one Info line with the entry name, the old and
+// adopted versions and the adopted record's digest, never a value.
 func (s *FileStore) Adopt(ctx context.Context, name string, orphan Version) (Version, error) {
 	version := orphan.Version
 	v, err := s.adopt(ctx, name, orphan)
@@ -374,5 +386,9 @@ func (s *FileStore) adopt(ctx context.Context, name string, want Version) (Versi
 			return orphan, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)", version, newLow)
 		}
 	}
+	// Metadata only: the name, the version numbers and the record digest,
+	// which reveals nothing about the value.
+	s.logger().Info("keystore: adopted an orphaned version",
+		"entry", name, "oldVersion", old.Version, "version", orphan.Version, "recordDigest", orphan.RecordDigest())
 	return orphan, nil
 }
