@@ -487,3 +487,28 @@ func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
 		}
 	})
 }
+
+// TestAllowPlaintextSecretsDeliveryIsCarried: the keystore delivery override is
+// an operator flag like any other, so it survives an uninstall then install
+// through the server-arguments record, which is what makes it durable.
+func TestAllowPlaintextSecretsDeliveryIsCarried(t *testing.T) {
+	f := newFakeSystem(t)
+	cfg := testConfig(t)
+	ctx := context.Background()
+	if err := Install(ctx, f, cfg); err != nil {
+		t.Fatal(err)
+	}
+	configureServerArgs(f, cfg, "--allow-plaintext-secrets-delivery")
+	if err := Install(ctx, f, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := Uninstall(ctx, f, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := Install(ctx, f, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := serverArgsOf(t, f, cfg), []string{"--allow-plaintext-secrets-delivery"}; !slices.Equal(got, want) {
+		t.Fatalf("after uninstall then install the server plist carries %v, want %v", got, want)
+	}
+}

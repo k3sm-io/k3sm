@@ -51,6 +51,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
+	keydeliver "k3sm.io/k3sm/pkg/keystore/deliver"
 	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/netserve"
@@ -157,7 +158,10 @@ type serverOptions struct {
 	// on the argv a plist publishes. See resolveTokenFile.
 	tokenFile string
 
-	psaEnforceBaseline bool // flip the PSA cluster-default enforce level privileged→baseline (the baseline-enforce cutover; default = warn-only)
+	// allowPlaintextSecretsDelivery lets the keystore delivery reconciler
+	// write Secrets while secrets encryption is off. Read once, at start.
+	allowPlaintextSecretsDelivery bool
+	psaEnforceBaseline            bool // flip the PSA cluster-default enforce level privileged→baseline (the baseline-enforce cutover; default = warn-only)
 
 	ingressHTTPPort  int // ingress HTTP listener port, bound on the wildcard (0 disables; 80 = production, an explicit high port = integration tier)
 	ingressHTTPSPort int // ingress HTTPS listener port (same contract as ingressHTTPPort; 443 = production)
@@ -414,6 +418,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// baseline-enforce flip: set it only after a pre-flight scan proves the cluster
 	// clean; dropping the flag reverts the posture on the next boot. It is an operator argv toggle of a single apiserver config
 	// value, not a runtime feature-flag code path.
+	fs.BoolVar(&opts.allowPlaintextSecretsDelivery, keydeliver.AllowPlaintextFlag, false, "deliver keystore entries as Secrets even while secrets encryption is off, so they are stored in plaintext in the datastore (read at start; see k3sm keys deliver)")
 	fs.BoolVar(&opts.psaEnforceBaseline, "psa-enforce-baseline", false, "flip the cluster-wide Pod Security Admission default ENFORCE level from privileged to baseline (the baseline-enforce cutover; the shipped default is baseline-warn only)")
 	// Ingress listener ports. 80/443 is the production posture; an EXPLICIT
 	// high-port pair (e.g. 8080/8443) is the integration-tier mode. There is
@@ -629,11 +634,11 @@ func runServer(args []string) (err error) {
 	}
 	stopAddons := startEmbeddedAddons(ctx, plan, restCfg, cs, logger)
 	defer timedTeardownStep(logger, "add-on-regate", stopAddons)
-	// 3c''/3c'. Each stop drains before exec.Stop's defer (LIFO runs it first).
+	// 3c''/3c'/3c'''. Each starts here (a defer's arguments run now); each stop drains before exec.Stop's (LIFO).
 	stopHelm := startHelmController(ctx, plan, restCfg, cs, logger)
 	defer timedTeardownStep(logger, "helm-controller", stopHelm)
-	stopManifests := startManifestDir(ctx, restCfg, cs, logger)
-	defer timedTeardownStep(logger, "manifest-dir", stopManifests)
+	defer timedTeardownStep(logger, "manifest-dir", startManifestDir(ctx, restCfg, cs, logger))
+	defer timedTeardownStep(logger, "keystore-delivery", startKeystoreDelivery(ctx, plan, cs, logger))
 	vmCapable := vmBackendAvailable() // can this node host vm guests? (3d registry, 4c datapath)
 	// 3d. The ingest registry; torn down EARLY, on cpStop's lane, and the defer is its backstop.
 	stopRegistry, registryPuller := startServerRegistry(ctx, plan, restCfg, cs, vmCapable, cpStop, logger)
