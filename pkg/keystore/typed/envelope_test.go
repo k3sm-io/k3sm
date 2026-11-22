@@ -391,7 +391,52 @@ func windowLeak(msg string, in []byte) (int, bool) {
 // refuses, and checks that no refusal's text carries the marker, nor any
 // leakWindow bytes of the input in a row.
 func TestEnvelopeRefusalsNeverCarryRefreshToken(t *testing.T) {
-	marker := []byte("MARKER-refresh-token-5f0c1e9a7b3d")
+	refusalsHideRefreshToken(t, []byte("MARKER-refresh-token-5f0c1e9a7b3d"))
+}
+
+// TestShortSecretNeverInRefusals is the same check with a 4-byte refresh
+// token, below the leak window, so only the marker check can catch it, and
+// with a 4-byte secret in every secret field of an envelope Encode refuses:
+// no refusal on any path carries it, raw or hex-encoded.
+func TestShortSecretNeverInRefusals(t *testing.T) {
+	marker := []byte("Zq9X")
+	refusalsHideRefreshToken(t, marker)
+	at := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
+	refused := map[string]Envelope{
+		"oauth without an owner":       {Credential: Credential{AccessToken: marker, AccessExpiresAt: at, AccessIssuedAt: at}, RefreshToken: marker},
+		"oauth with a bad owner":       {Credential: Credential{AccessToken: marker, AccessExpiresAt: at, AccessIssuedAt: at, RefreshOwner: string(marker)}, RefreshToken: marker},
+		"oauth with a token's field":   {Credential: Credential{AccessToken: marker, AccessExpiresAt: at, AccessIssuedAt: at, RefreshOwner: "local", Value: marker}, RefreshToken: marker},
+		"oauth over its access bound":  {Credential: Credential{AccessToken: bytes.Repeat(marker, MaxEnvelopeSize), AccessExpiresAt: at, AccessIssuedAt: at, RefreshOwner: "local"}, RefreshToken: marker},
+		"token without an expiry":      {Credential: Credential{Value: marker, IssuedAt: at}},
+		"token with oauth's field":     {Credential: Credential{Value: marker, IssuedAt: at, ExpiresAt: at, AccessToken: marker}},
+		"ssh with a short seed":        {Credential: Credential{Algorithm: SSHAlgorithmEd25519, Seed: marker}},
+		"ssh with a bad algorithm":     {Credential: Credential{Algorithm: 9, Seed: bytes.Repeat(marker, 8)}},
+		"ssh with a token's field":     {Credential: Credential{Algorithm: SSHAlgorithmEd25519, Seed: bytes.Repeat(marker, 8), Value: marker}},
+		"oauth with the comment field": {Credential: Credential{AccessToken: marker, AccessExpiresAt: at, AccessIssuedAt: at, RefreshOwner: "local", Comment: string(marker)}, RefreshToken: marker},
+	}
+	for name, e := range refused {
+		for _, kind := range fuzzKinds {
+			_, err := Encode(kind, e)
+			if err == nil {
+				continue // valid for another kind's reading; nothing to check
+			}
+			msg := err.Error()
+			if strings.Contains(msg, string(marker)) || strings.Contains(msg, hex.EncodeToString(marker)) {
+				t.Errorf("Encode %s as %s: the refusal carries the 4-byte secret: %v", name, kind, err)
+			}
+		}
+	}
+	if _, err := ImportSSH(append([]byte("Zq9X"), marker...)); err == nil || strings.Contains(err.Error(), string(marker)) {
+		t.Errorf("ImportSSH of a short input: %v", err)
+	}
+}
+
+// refusalsHideRefreshToken plants marker as the refresh token of an oauth
+// envelope, breaks the envelope around it in every way Decode refuses, and
+// checks no refusal carries the marker, raw or hex, nor leakWindow input
+// bytes in a row.
+func refusalsHideRefreshToken(t *testing.T, marker []byte) {
+	t.Helper()
 	at := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
 	good, err := Encode(credential.KindOAuth, Envelope{
 		Credential: Credential{
@@ -440,7 +485,7 @@ func TestEnvelopeRefusalsNeverCarryRefreshToken(t *testing.T) {
 				continue
 			}
 			msg := err.Error()
-			if bytes.Contains([]byte(msg), marker) {
+			if bytes.Contains([]byte(msg), marker) || strings.Contains(msg, hex.EncodeToString(marker)) {
 				t.Errorf("%s as %s: the refusal carries the marker: %v", name, kind, err)
 			}
 			for _, s := range []error{ErrCorrupt, ErrKindUnsupported} {
