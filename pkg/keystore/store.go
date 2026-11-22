@@ -297,10 +297,13 @@ func (s *FileStore) createEntry(root *os.Root, name string, fl floor) (*entry, e
 			old.close()
 			if gerr == nil {
 				if berr := fl.buried(name, gen); berr != nil {
-					return nil, fmt.Errorf("%w: rm it first: %w", ErrExists, berr)
+					// The floor's own text: the same-backup restore.
+					return nil, fmt.Errorf("%w: %w", ErrExists, berr)
 				}
 			}
 			return nil, ErrExists
+		case errors.As(oerr, new(buriedShapeError)):
+			return nil, fmt.Errorf("%w: %w", ErrExists, oerr)
 		case errors.Is(oerr, errNoPointer):
 			return nil, fmt.Errorf("%w: the entry is damaged, so rm it first: %w", ErrExists, oerr)
 		case !errors.Is(oerr, errInterruptedPut):

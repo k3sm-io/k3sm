@@ -398,3 +398,35 @@ func TestDeleteBuriesFloorGeneration(t *testing.T) {
 	_, _, err := s.Current(ctx, "k")
 	refusedAsDeleted(t, "Current of the real entry after the decoy rm", err)
 }
+
+// TestBuriedErrorPointsToRestore: the refusal of a put-back copy of a
+// deleted entry, from a reader and from Put, points to the same-backup
+// restore recipe in docs/user/keys.md, and suggests neither rm of the entry
+// nor removing the floor, which would discard every burial.
+func TestBuriedErrorPointsToRestore(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	files := []string{generationName, "v1", currentName}
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	old := saveEntry(t, server, "k", files...)
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	putBack(t, server, old, "k")
+	_, _, rerr := s.Current(ctx, "k")
+	_, perr := s.Put(ctx, "k", KindOpaque, []byte("new"))
+	for what, err := range map[string]error{"Current": rerr, "Put": perr} {
+		if err == nil {
+			t.Fatalf("%s of the put-back copy succeeded", what)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, `"Backing Up and Restoring" in docs/user/keys.md`) {
+			t.Errorf("%s: %q, want it to point to the same-backup restore in docs/user/keys.md", what, msg)
+		}
+		for _, bad := range []string{"rm ", "backup-restore.md", "Restoring an older", "remov"} {
+			if strings.Contains(msg, bad) {
+				t.Errorf("%s: %q suggests %q", what, msg, bad)
+			}
+		}
+	}
+}

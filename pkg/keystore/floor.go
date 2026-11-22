@@ -413,11 +413,11 @@ func (fl floor) prune() []pruned {
 // ErrCorrupt but carries its own text, because ErrCorrupt's advice to restore
 // from backup is the opposite of the fix: an older copy is what produced it.
 //
-// A completed Delete leaves a tombstone of the deleted generation, so an
-// older copy of the deleted entry put back is refused (deleted) until the
-// tombstone is pruned; after a new Put of the name, the new generation
-// refuses it (generation) (docs/design/keystore.md § "Pointer sequence and
-// floor").
+// A completed Delete buries the deleted generation, so an older copy of the
+// deleted entry put back is refused (deleted), after a new Put of the name
+// too, until the burial is pruned; then a live entry of another generation
+// still refuses it (generation) (docs/design/keystore.md § "Pointer
+// sequence and floor").
 type staleError struct {
 	name       string
 	seq, floor uint64
@@ -426,10 +426,14 @@ type staleError struct {
 }
 
 func (e *staleError) Error() string {
+	if e.deleted {
+		// Never rm or removing the floor: removing the floor discards every
+		// burial, and only the floor saved with the backup brings the
+		// deleted entry back.
+		return fmt.Sprintf("keystore entry %q: the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back. Do not restore from backup. If the put-back was deliberate, restore that backup together with the keystore-floor.json saved with it, as \"Backing Up and Restoring\" in docs/user/keys.md describes", e.name)
+	}
 	what := fmt.Sprintf("the current pointer (sequence %d) is older than the recorded floor (sequence %d); an older copy of this entry was put back", e.seq, e.floor)
 	switch {
-	case e.deleted:
-		what = "the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back, and rm removes it"
 	case e.generation:
 		what = "the current pointer belongs to another generation of this entry than the recorded floor; an older copy of a deleted entry was put back after a newer put of the name, or a delete and the put after it were both interrupted"
 	}
