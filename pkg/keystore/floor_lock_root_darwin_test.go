@@ -39,9 +39,10 @@ import (
 // It proves only that a flock on the data-root directory no longer blocks a
 // root verb; TestDataRootFlockBlocksNoFloorWrite is the non-root control that
 // failed before the lock moved. The service user still owns keystore/.lock,
-// which every root write verb takes first, and can hold it to delay those
-// verbs by up to lockWait each: that accepted residual (docs/design/
-// keystore.md § "Concurrency") is out of this test's scope.
+// which every root write verb takes first, and can hold it to keep Delete
+// and Rotate failing with the lock timeout for as long as it holds it: that
+// accepted residual (docs/design/keystore.md § "Concurrency") is out of this
+// test's scope.
 func TestNonRootDataRootFlockBlocksNoRootVerb(t *testing.T) {
 	if !asRoot() {
 		t.Skip("root-run (U119): run as root through hack/acceptance/keystore.sh --root")

@@ -539,8 +539,11 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   `O_CREAT|O_EXCL|O_NOFOLLOW` through that directory, opened `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`
   and refused unless, on that descriptor, it is a regular file owned by root with no group
   or other access; after the flock its name is `lstat`ed again through the same directory
-  and must still be the held file, with one link. The order is `keystore/.lock` first, then `keystore-lock`, each with the
-  same bounded wait. Under it each verb re-reads
+  and must still be the held file. Its link count is not judged: macOS lets any local user
+  hard-link a file it cannot read, so refusing a second link would let anyone block every
+  floor verb, and a link elsewhere is the same file, so it changes nothing about the lock.
+  The order is `keystore/.lock` first, then `keystore-lock`, each with the same bounded
+  wait. Under it each verb re-reads
   `keystore-floor.json` and applies only its own change to what it read (Rotate and the
   start of a verb raise a sequence of the same generation, Put sets sequence 1 for a new
   generation, Delete removes the entry only if it records the deleted generation), holding
@@ -549,11 +552,15 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   swapped `.lock`. Only root can open `keystore-lock`, so only root can hold this lock. The
   data root itself is root:wheel 0755 and any local process can open it and `flock(2)` it,
   but no verb takes that lock, so holding it blocks nothing (U119). This closes the denial
-  of service for every local process except the service user: it owns `keystore/.lock`,
-  which every root write verb takes first, so it can still hold that lock and delay root's
-  write verbs, Delete and Rotate included, by up to the bounded wait each time. That residual
-  is accepted, since the service user shares the master's trust domain, and it costs no
-  integrity: holding a lock writes nothing.
+  of service for every local process except the service user, and every native Pod runs as
+  the service user ("Threat model"). It owns `keystore/.lock`, which every root write verb
+  takes first, so any native Pod can hold that lock and keep revocation and rotation
+  failing: each Delete and Rotate fails with the lock timeout after the bounded wait, again
+  and again, and the failure does not clear until the holder lets go or exits. That residual
+  is accepted, since every native Pod is the service user, one trust domain with the master.
+  Holding the lock costs no integrity, because holding a lock writes nothing; that covers a
+  held `.lock`, not a replaced one, whose limits are the swapped-`.lock` caveat above (the
+  floor stays defended, racing entry files do not).
 - An entry directory with no `current` is an incomplete Put only in the one shape a crashed
   Put can leave, ignoring leftover `.tmp` files, and only when the floor does not record its
   generation; any other directory with no `current` is damage. "An entry directory with no
