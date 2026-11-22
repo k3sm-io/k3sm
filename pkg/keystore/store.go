@@ -440,6 +440,8 @@ func committedf(cause error, format string, args ...any) error {
 }
 
 // Current returns the version the current pointer names, with its value.
+// A version above the pointer is refused as readAbove says: one that
+// authenticates as this entry's is ErrOrphanVersion.
 func (s *FileStore) Current(ctx context.Context, name string) (Version, []byte, error) {
 	var (
 		v   Version
@@ -453,6 +455,11 @@ func (s *FileStore) Current(ctx context.Context, name string) (Version, []byte, 
 		v, val, err = e.version(k, cur)
 		if err := rawOnly(v, err); err != nil {
 			clear(val) // a refused typed envelope never lingers
+			val = nil
+			return err
+		}
+		if err := readAbove(ctx, e, k, cur); err != nil {
+			clear(val)
 			val = nil
 			return err
 		}
@@ -482,6 +489,11 @@ func (s *FileStore) Get(ctx context.Context, name string, version uint64) (Versi
 		v, val, err = e.version(k, version)
 		if err := rawOnly(v, err); err != nil {
 			clear(val) // a refused typed envelope never lingers
+			val = nil
+			return err
+		}
+		if err := readAbove(ctx, e, k, cur); err != nil {
+			clear(val)
 			val = nil
 			return err
 		}

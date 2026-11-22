@@ -191,8 +191,10 @@ func TestOrphanRefusalTellsCasesApart(t *testing.T) {
 			!strings.Contains(err.Error(), "k3sm keys adopt system/k") || strings.Contains(err.Error(), "refresh token") {
 			t.Fatalf("opaque refusal %v: want adopt or remove v2, and no refresh-token advice", err)
 		}
-		// Reads of a non-oauth entry are not refused.
-		mustCurrent(t, s, "k", "one")
+		// Reads of a non-oauth entry are refused too (review round 4, item 3).
+		if _, val, err := s.Current(ctx, "k"); !errors.Is(err, ErrOrphanVersion) || val != nil {
+			t.Fatalf("Current over the opaque orphan: %v, want ErrOrphanVersion", err)
+		}
 		if v, err := s.Adopt(ctx, "k", mustOrphan(t, s, "k")); err != nil || v.Version != 2 {
 			t.Fatalf("Adopt the opaque orphan = %+v, %v", v, err)
 		}
@@ -273,7 +275,10 @@ func TestAdoptRefuses(t *testing.T) {
 		if _, err := s.Adopt(ctx, "k", Version{Version: 2}); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("Adopt with two orphans: %v, want ErrCorrupt", err)
 		}
-		mustCurrent(t, s, "k", "one")
+		// A read refuses v3, further out than a crash reaches, by name.
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "v3") {
+			t.Fatalf("Current with two orphans: %v, want ErrCorrupt naming v3", err)
+		}
 	})
 }
 

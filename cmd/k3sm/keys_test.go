@@ -1834,8 +1834,10 @@ func TestKeysAdopt(t *testing.T) {
 	h.stdinTTY = true
 	h.stdin = strings.NewReader("n\n")
 	h.mustRun(1, "adopt", "system/alpha")
-	if got := h.value("alpha", 1); string(got) != "one" {
-		t.Fatalf("alpha v1 = %q", got)
+	// A read refuses the orphan (ErrOrphanVersion), so the pointer file is
+	// what shows nothing changed.
+	if got, err := os.ReadFile(cur); err != nil || !bytes.Equal(got, saved) {
+		t.Fatalf("the declined adopt changed the current pointer (%v)", err)
 	}
 	h.stdin = strings.NewReader("yes\n")
 	h.mustRun(0, "adopt", "system/alpha")

@@ -177,12 +177,20 @@ func TestFloorRefusesCopiedBackPointer(t *testing.T) {
 	t.Run("accepted with no floor entry for the name", func(t *testing.T) {
 		s, server := setup(t)
 		writeFile(t, floorPath(server), `{"version":1,"scope":"system","entries":{}}`)
-		mustCurrent(t, s, "k", "one")
+		// The floor accepts the pointer; the version above it is what
+		// refuses the read (review round 4, item 3).
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrOrphanVersion) {
+			t.Fatalf("Current over a copied-back pointer the floor accepts: %v, want ErrOrphanVersion", err)
+		}
 	})
 	t.Run("accepted with no floor file", func(t *testing.T) {
 		s, server := setup(t)
 		remove(t, floorPath(server))
-		mustCurrent(t, s, "k", "one")
+		// The floor accepts the pointer; the version above it is what
+		// refuses the read (review round 4, item 3).
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrOrphanVersion) {
+			t.Fatalf("Current over a copied-back pointer the floor accepts: %v, want ErrOrphanVersion", err)
+		}
 	})
 	t.Run("another generation is refused", func(t *testing.T) {
 		// An old copy of a deleted entry, put back over the entry re-created
@@ -406,7 +414,10 @@ func TestFloorRaised(t *testing.T) {
 		// that is the window the raise closes.
 		copyFile(t, entryPath(server, "k", currentName), filepath.Join(server, "seq3"))
 		copyFile(t, filepath.Join(server, "seq2"), entryPath(server, "k", currentName))
-		mustCurrent(t, s, "k", "two")
+		// The floor accepts it; version 3 above it refuses the read.
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrOrphanVersion) {
+			t.Fatalf("Current over the sequence-2 pointer: %v, want ErrOrphanVersion", err)
+		}
 		copyFile(t, filepath.Join(server, "seq3"), entryPath(server, "k", currentName))
 		// Nothing raises the floor on read: a read verb calls RaiseFloor.
 		mustCurrent(t, s, "k", "three")
@@ -633,7 +644,10 @@ func TestRotateRetryDiscardsOrphan(t *testing.T) {
 			t.Fatalf("the refused Rotate removed %s: %v", n, err)
 		}
 	}
-	mustCurrent(t, s, "k", "one")
+	// A read refuses the stray v7, further out than a crash reaches.
+	if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "v7") {
+		t.Fatalf("Current over v2 and v7: %v, want ErrCorrupt naming v7", err)
+	}
 
 	remove(t, entryPath(server, "k", "v2"))
 	v := mustRotate(t, s, "k", "B")

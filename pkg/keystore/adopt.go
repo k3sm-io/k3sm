@@ -83,6 +83,55 @@ func sealedAbove(ctx context.Context, e *entry, k keys, cur uint64) ([]uint64, e
 	return out, nil
 }
 
+// readAbove is every read's check for what lies above cur, the version e's
+// pointer names (docs/design/keystore.md § "Adopting an orphaned
+// version"). Its cost is bounded: it lists the directory once and opens
+// only the version after cur. A version file numbered further out is
+// refused by its name alone, as ErrCorrupt: a crashed rotation never
+// leaves one. The file at cur+1 that authenticates as this entry's is
+// ErrOrphanVersion. One whose kind this build does not know is refused by
+// name too, never read as a newer k3sm's record: nothing newer writes above
+// the pointer. One that does not authenticate is a true orphan, which the
+// next Rotate discards, and does not stop the read.
+func readAbove(ctx context.Context, e *entry, k keys, cur uint64) error {
+	names, err := readDirNames(e.root, maxDirNames)
+	if err != nil {
+		return err
+	}
+	next := false
+	for i, n := range names {
+		if err := loopCtx(ctx, i); err != nil {
+			return err
+		}
+		v, ok := parseVersionName(n)
+		if !ok || v <= cur {
+			continue
+		}
+		if v-cur > 1 {
+			return fmt.Errorf("%w: %s lies above the current version %d, and a crashed rotation leaves only version %d: "+
+				"an older current pointer was copied back, or the file was put there; restore the newer pointer from backup, or remove %s",
+				ErrCorrupt, n, cur, cur+1, n)
+		}
+		next = true
+	}
+	if !next {
+		return nil
+	}
+	file := versionName(cur + 1)
+	_, pt, err := e.openRecord(k, file, false, cur+1)
+	clear(pt) // only whether it opens is wanted
+	switch {
+	case err == nil:
+		return fmt.Errorf("%w: version %d is above the current version %d: inspect it with `k3sm keys adopt %s`",
+			ErrOrphanVersion, cur+1, cur, qualified(e.name))
+	case errors.Is(err, ErrKindUnsupported):
+		return fmt.Errorf("%w: %s, above the current version %d, is not a version of this entry: remove %s", ErrCorrupt, file, cur, file)
+	case errors.Is(err, ErrCorrupt):
+		return nil
+	}
+	return fmt.Errorf("check %s above the current version: %w", file, err)
+}
+
 // orphanError is the refusal for v, a sealed version of e above cur, the
 // version its pointer names. A crashed rotation leaves only cur+1, so a
 // version further out can only be behind a copied-back pointer. For oauth

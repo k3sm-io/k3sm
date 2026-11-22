@@ -240,6 +240,8 @@ func (s *FileStore) RotateFrom(ctx context.Context, name string, from uint64) (V
 // older pair, because that pair's refresh token may already be spent at the
 // provider. A refresher that gets ErrOrphanVersion stops refreshing the
 // entry and leaves it to an operator's Adopt; it never rotates around it.
+// A token or ssh entry is refused the same way: the orphan may be a newer
+// committed version behind a copied-back pointer.
 func (s *FileStore) CurrentCredential(ctx context.Context, name string) (Version, typed.Credential, error) {
 	return s.credential(ctx, name, 0)
 }
@@ -282,14 +284,11 @@ func (s *FileStore) credential(ctx context.Context, name string, version uint64)
 		if !ok {
 			return fmt.Errorf("%w: %s is %s, not a typed credential", ErrKindMismatch, name, v.Kind)
 		}
-		if v.Kind == KindOAuth {
-			above, err := sealedAbove(ctx, e, k, cur)
-			if err != nil {
-				return err
+		if err := readAbove(ctx, e, k, cur); err != nil {
+			if v.Kind == KindOAuth && errors.Is(err, ErrOrphanVersion) {
+				return fmt.Errorf("%w; the current pair's refresh token may already be spent", err)
 			}
-			if len(above) > 0 {
-				return fmt.Errorf("%w: version %d is above the current version %d, so the current pair's refresh token may already be spent", ErrOrphanVersion, above[0], cur)
-			}
+			return err
 		}
 		env, err := typed.Decode(ck, val)
 		if err != nil {
