@@ -20,6 +20,10 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
 	"k8s.io/client-go/kubernetes/fake"
@@ -79,5 +83,81 @@ func TestKeysDeliveryServerConfig(t *testing.T) {
 	}
 	if _, err := keystoreDeliveryConfig("relative", true, false, cs, ids(501, nil), nil); err == nil {
 		t.Error("a relative work dir built a reconciler")
+	}
+}
+
+// TestKeysDeliveryServerGate: the server's plan refuses delivery when this
+// start passes the apiserver no encryption provider configuration, and
+// allows it when it passes one or the override is set, through the same
+// mapping startKeystoreDelivery uses (G18).
+func TestKeysDeliveryServerGate(t *testing.T) {
+	ids := keystoreDeliveryIDs{
+		euid:    func() int { return 501 },
+		egid:    func() int { return 20 },
+		service: func() (uint32, uint32, error) { return 0, 0, errors.New("unused") },
+	}
+	for _, tc := range []struct {
+		name     string
+		epc      string
+		override bool
+		want     bool
+	}{
+		{"encryption off", "", false, false},
+		{"encryption on", "/var/lib/k3sm/server/cred/encryption-config.json", false, true},
+		{"override", "", true, true},
+	} {
+		var plan serverPlan
+		plan.opts.workDir = "/var/lib/k3sm/server"
+		plan.opts.allowPlaintextSecretsDelivery = tc.override
+		plan.cfg.EncryptionProviderConfig = tc.epc
+		on, allow := keystoreDeliveryGate(plan)
+		cfg, err := keystoreDeliveryConfig(plan.opts.workDir, on, allow, fake.NewClientset(), ids, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.Delivers(); got != tc.want {
+			t.Errorf("%s: delivers %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestKeysEnvDefaultsBindRoot: the production keys environment judges the
+// declaration with the root check and hands a new one to root, by behaviour:
+// a file the test user owns is refused, and the chown either makes the file
+// root's (run as root) or fails (G19).
+func TestKeysEnvDefaultsBindRoot(t *testing.T) {
+	env := defaultKeysEnv(io.Discard, io.Discard)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		if err := os.Chown(path, 1, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.deliveryCheck(fi); err == nil || !strings.Contains(err.Error(), "not root") {
+		t.Fatalf("the default check accepted a file root does not own: %v", err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }() // nothing written
+	cerr := env.deliveryChown(f)
+	fi, err = os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("no stat_t")
+	}
+	if cerr == nil && st.Uid != 0 {
+		t.Fatalf("the default chown succeeded and left the file uid %d, not root's", st.Uid)
 	}
 }

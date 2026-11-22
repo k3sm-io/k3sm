@@ -324,7 +324,7 @@ func (r *Reconciler) note(t Target, state string, level slog.Level, msg string, 
 // (present, with the UID this server recorded when it created it, at another
 // value), or leave it alone (any other Secret, labelled or not).
 func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
-	if !r.encryptionOn && !r.allowPlaintext {
+	if !delivers(r.encryptionOn, r.allowPlaintext) {
 		r.note(t, "refused:encryption-off", slog.LevelWarn,
 			"target refused; start the server with --"+AllowPlaintextFlag+" to deliver anyway",
 			"reason", keystore.ErrEncryptionOff.Error())
@@ -487,6 +487,13 @@ func statSignature(fi fs.FileInfo) string {
 	}
 	return fmt.Sprintf("%d/%d/%o/%d/%d", uid, gid, fi.Mode(), fi.Size(), fi.ModTime().UnixNano())
 }
+
+// Delivers reports whether a reconciler built from c delivers at all: secrets
+// encryption is on, or the plaintext override is set. Otherwise every target
+// is refused.
+func (c Config) Delivers() bool { return delivers(c.EncryptionOn, c.AllowPlaintext) }
+
+func delivers(encryptionOn, allowPlaintext bool) bool { return encryptionOn || allowPlaintext }
 
 // Validate refuses a Config New cannot run with.
 func (c Config) Validate() error {

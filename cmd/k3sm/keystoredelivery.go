@@ -69,6 +69,14 @@ func keystoreDeliveryConfig(workDir string, encryptionOn, allowPlaintext bool, c
 	return cfg, cfg.Validate()
 }
 
+// keystoreDeliveryGate is what plan hands the reconciler about plaintext:
+// whether this start passes the apiserver an encryption provider
+// configuration (an empty EncryptionProviderConfig is encryption off), and
+// whether --allow-plaintext-secrets-delivery is set.
+func keystoreDeliveryGate(plan serverPlan) (encryptionOn, allowPlaintext bool) {
+	return plan.cfg.EncryptionProviderConfig != "", plan.opts.allowPlaintextSecretsDelivery
+}
+
 // startKeystoreDelivery is step 3c”': the keystore delivery reconciler
 // (pkg/keystore/deliver), beside the add-on reconcilers and on the same
 // system:masters admin client, adding no role, binding or ServiceAccount. It
@@ -79,8 +87,8 @@ func keystoreDeliveryConfig(workDir string, encryptionOn, allowPlaintext bool, c
 // cancels it and waits for it; runServer defers it so LIFO drains it before
 // the control plane stops. It is never nil.
 func startKeystoreDelivery(ctx context.Context, plan serverPlan, cs kubernetes.Interface, logger *slog.Logger) (stop func()) {
-	cfg, err := keystoreDeliveryConfig(plan.opts.workDir, plan.cfg.EncryptionProviderConfig != "",
-		plan.opts.allowPlaintextSecretsDelivery, cs,
+	encryptionOn, allowPlaintext := keystoreDeliveryGate(plan)
+	cfg, err := keystoreDeliveryConfig(plan.opts.workDir, encryptionOn, allowPlaintext, cs,
 		keystoreDeliveryIDs{euid: os.Geteuid, egid: os.Getegid, service: lookupServiceIDs}, logger)
 	if err != nil {
 		logger.Error("keystore delivery disabled", "err", err)

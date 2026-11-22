@@ -990,3 +990,58 @@ func TestReconcilerImmutableOwned(t *testing.T) {
 		t.Fatalf("the warning does not tell the operator to delete it\n%s", logs)
 	}
 }
+
+// TestNewDefaultsBindRoot: New's own seams, untouched, refuse what
+// production must: a declaration the test user owns is refused before any
+// apiserver call, a symlink is not followed, and a new state file is handed
+// to root or the hand-over fails (G19).
+func TestNewDefaultsBindRoot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, FileName)
+	if err := os.WriteFile(path, []byte(`{"version":1,"targets":[{"name":"api-token","namespace":"payments"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		if err := os.Chown(path, 1, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := fake.NewClientset()
+	logs := &syncBuffer{}
+	store := &fakeStore{entries: map[string]fakeEntry{}}
+	store.set("api-token", 1, []byte("tok"))
+	r := New(Config{Path: path, Client: client, Store: store, EncryptionOn: true,
+		Logger: slog.New(slog.NewTextHandler(logs, nil))})
+	r.Sweep(context.Background())
+	if n := len(client.Actions()); n != 0 {
+		t.Fatalf("New's default check let a non-root declaration through: %d apiserver calls", n)
+	}
+	if !strings.Contains(logs.String(), "not root") {
+		t.Fatalf("the refusal does not say the file is not root's\n%s", logs.String())
+	}
+
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := r.open(link); !errors.Is(err, syscall.ELOOP) {
+		if f != nil {
+			_ = f.Close() // opened by mistake; read-only
+		}
+		t.Fatalf("New's default opener followed a symlink: %v", err)
+	}
+
+	f, err := os.CreateTemp(dir, "state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }() // nothing written
+	cerr := r.chown(f)
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || (cerr == nil && st.Uid != 0) {
+		t.Fatalf("New's default chown succeeded without making the file root's (%v)", cerr)
+	}
+}
