@@ -267,6 +267,38 @@ func TestAdoptRefuses(t *testing.T) {
 	})
 }
 
+// TestRewrapRefusesOrphan is G12's orphan case: Rewrap re-seals only the
+// committed range, so an authenticated version above the pointer would stay
+// under the retired master and be unlinked by the next rotation. The plan
+// refuses it, naming the entry and the version, and changes nothing; Adopt
+// then works and Rewrap proceeds.
+func TestRewrapRefusesOrphan(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+	crashAfterVersionWrite(t, s, server, "k", func() error {
+		_, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+		return err
+	})
+	master := readMasterFile(t, server)
+	err := s.Rewrap(ctx, rewrapKey(1))
+	if !errors.Is(err, ErrOrphanVersion) || !strings.Contains(err.Error(), `entry "k"`) || !strings.Contains(err.Error(), "version 2") {
+		t.Fatalf("Rewrap over an orphan: %v, want ErrOrphanVersion naming k and version 2", err)
+	}
+	if got := readMasterFile(t, server); string(got) != string(master) {
+		t.Fatal("the refused Rewrap changed the master")
+	}
+	if v, err := s.Adopt(ctx, "k", 2); err != nil || v.Version != 2 {
+		t.Fatalf("Adopt after the refused Rewrap = %+v, %v", v, err)
+	}
+	if err := s.Rewrap(ctx, rewrapKey(1)); err != nil {
+		t.Fatalf("Rewrap after Adopt: %v", err)
+	}
+	if got := sealedRefresh(t, s, "k", 2); got != "r2" {
+		t.Fatalf("refresh token after Rewrap %q, want r2", got)
+	}
+}
+
 // writeFloor writes fl as the floor file: what a floor that lagged its
 // pointer leaves.
 func writeFloor(t *testing.T, server string, fl floor) {

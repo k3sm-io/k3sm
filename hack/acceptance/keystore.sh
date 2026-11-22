@@ -467,7 +467,7 @@ check G12 "Rewrap resumes after a crash at every step, old key then new, nothing
 	TestRewrapCrashAtEveryStep TestRewrapKeyReuse TestRewrapRefusesStalePointer TestRewrapVerifiesCommit TestRewrapGuards \
 	TestRewrapRefusesLiveMasterFirst TestRewrapRecoversReplacedNext \
 	TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata \
-	TestInterruptedRewrap TestRecordsSealedUnder TestRewrapNotStarted
+	TestInterruptedRewrap TestRecordsSealedUnder TestRewrapNotStarted TestRewrapRefusesOrphan
 check G13 "a crash between the master renames leaves a trusted master, and the next verb completes the swap" \
 	TestRewrapMasterRenameCompleted TestFinishSwapLeavesUnmatchedFingerprint
 check G14 "one lock with a bounded wait serializes Rewrap, Rotate, Put, Delete and the reads, and no read blocks" \

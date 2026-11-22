@@ -639,9 +639,16 @@ means a live reader never sees a Rewrap in progress; this fallback exists for th
 the conservative way:
 
 - *What is re-sealed.* Every committed version (`v1` to the version `current` names) and
-  `current`, for every entry. A version above `current` (an interrupted Rotate's orphan) and
-  an interrupted Put are not entries that anything reads; they are left as they are, and the
-  next Rotate or Put discards them. `created` is kept.
+  `current`, for every entry. An interrupted Put is not an entry that anything reads; it is
+  left as it is, and the next Put discards it. A version above `current` that does not
+  authenticate is left too, and the next Rotate discards it. `created` is kept.
+- *A sealed version above `current`* (an interrupted Rotate's orphan, or a newer version
+  behind a copied-back pointer) refuses the Rewrap before anything is written, with
+  `ErrOrphanVersion` naming the entry and the version. Rewrap re-seals only the committed
+  range, so it would leave that version under the retired master, where it no longer
+  authenticates and the next Rotate unlinks it as a true orphan: for oauth, the only valid
+  refresh token. The operator adopts it (`k3sm keys adopt`), or for a kind other than oauth
+  removes it, first.
 - *An entry that does not open* (one `list` reports with `Err`) refuses the Rewrap before
   anything is written, since the swap would strand it under a master that no longer exists.
   It is removed with `rm`, or restored, first.

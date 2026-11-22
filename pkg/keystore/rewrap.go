@@ -657,6 +657,9 @@ func (s *FileStore) rewrapPlan(ctx context.Context, root *os.Root, fl floor, old
 		if errors.Is(err, ErrNotFound) {
 			continue
 		}
+		if errors.Is(err, ErrOrphanVersion) {
+			return nil, false, fmt.Errorf("entry %q: a rewrap would leave its newer version sealed under a master that no longer exists, and the next rotation would unlink it: %w", name, err)
+		}
 		if err != nil {
 			return nil, false, fmt.Errorf("entry %q does not open, and a rewrap would leave it sealed under a master that no longer exists: remove it with rm, or restore it, first: %w", name, err)
 		}
@@ -673,7 +676,8 @@ func (s *FileStore) rewrapPlan(ctx context.Context, root *os.Root, fl floor, old
 // planEntry opens name's pointer, checked against the floor, and every
 // version it covers (low to cur), each under old
 // or, failing that and with next set, under next, and reports whether any
-// opened only under next.
+// opened only under next. A version above cur that opens under either is
+// refused with ErrOrphanVersion.
 func planEntry(ctx context.Context, root *os.Root, name string, fl floor, old keys, next *keys) (uint64, uint64, bool, error) {
 	e, err := openEntry(root, name, fl)
 	if err != nil {
@@ -711,6 +715,23 @@ func planEntry(ctx context.Context, root *os.Root, name string, fl floor, old ke
 		}); err != nil {
 			return 0, 0, false, fmt.Errorf("version %d: %w", n, err)
 		}
+	}
+	// A sealed version above the pointer is refused, never left behind:
+	// Rewrap re-seals only low to cur, so it would stay under the retired
+	// master, fail to authenticate afterwards, and be unlinked as a true
+	// orphan by the next rotation, for oauth with the only valid refresh
+	// token in it.
+	above, err := sealedAbove(ctx, e, both, cur)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if len(above) > 0 {
+		r, pt, err := e.openRecord(both, versionName(above[0]), false, above[0])
+		clear(pt)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		return 0, 0, false, orphanError(e, Kind(r.kind) == KindOAuth, above[0], cur)
 	}
 	return cur, low, underNext, nil
 }
