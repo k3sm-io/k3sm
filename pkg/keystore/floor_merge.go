@@ -96,7 +96,8 @@ type MergeReport struct {
 	Fenced []string
 	// Unverified names, sorted, each entry the restored floor holds live
 	// under the moved-aside floor's live generation whose restored pointer
-	// did not authenticate under the master: its sequence is left as the
+	// did not authenticate under the master, or authenticated more than one
+	// sequence above the restored record: its sequence is left as the
 	// restored floor records it, so a restored pointer above that record is
 	// inside the fence.
 	Unverified []string
@@ -116,6 +117,10 @@ type MergeReport struct {
 	// recorded is how many kept names the restored floor did not record
 	// the merge wrote a live record of the moved-aside generation for.
 	recorded int
+	// overRaise names, sorted, each entry whose authenticated restored
+	// pointer was more than one sequence above the restored record, so the
+	// merge did not raise to it (also in Unverified).
+	overRaise []string
 }
 
 // MergeOptions is what a floor merge is asked to do beyond the merge itself.
@@ -220,7 +225,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		return MergeReport{}, fmt.Errorf("--keep names %s, which the merge would not delete: it keeps an entry only when the floor moved aside records its restored generation as deleted, or holds a newer generation of a name the restored floor does not record. Nothing is written; check the names and run the merge again without them", strings.Join(unmatched, ", "))
 	}
 	if !pr.changes() {
-		pr.AlreadyMerged, pr.Unverified = true, unverified
+		pr.AlreadyMerged, pr.Unverified = true, unionNames(unverified, pr.Unverified)
 		if err := s.renameMerged(in); err != nil {
 			return MergeReport{}, err
 		}
@@ -254,10 +259,13 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	}
 	sort.Strings(r.Dropped)
 	logPruned(capDropped)
-	r.Unverified = unverified
-	for _, name := range r.Unverified {
+	for _, name := range unverified {
 		slog.Warn("keystore floor: the restored pointer of this entry did not authenticate under the master, so the merge left its recorded sequence as the restored floor holds it; a restored pointer above that is refused until a Rotate", "name", name)
 	}
+	for _, name := range r.overRaise {
+		slog.Warn("keystore floor: the restored pointer of this entry is more than one sequence above the restored floor's record, more than a crash leaves, so the merge did not raise the record to it; that pointer is refused until a Rotate", "name", name)
+	}
+	r.Unverified = unionNames(unverified, r.Unverified)
 	for _, name := range r.BuriedLive {
 		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and the restored entry is refused; rm removes its directory", "name", name)
 	}
@@ -412,10 +420,12 @@ func (s *FileStore) readGuard(l *floorLock) (*mergeInput, error) {
 // does not prune: update does.
 //
 // ptrs is the authenticated restored pointer sequence of each name it
-// fences (restoredPointers), or nil. A restored live record below
+// fences (restoredPointers), or nil. A restored live record one below
 // its pointer, and not at or below its own high-water mark, is raised to the
-// pointer first (counted in raised), so the restored entry is never inside
-// the fence. The fence mark is one above the higher of the moved-aside
+// pointer first (counted in raised), so a restored entry whose saved floor
+// lagged its pointer by the one sequence a crash leaves is never inside the
+// fence. A pointer further above the record is not raised to: the name is
+// reported in Unverified, and the fence covers that pointer. The fence mark is one above the higher of the moved-aside
 // record's sequence and mark, so a pre-restore pointer one past a moved-aside
 // floor that lagged it is refused too; at the sequence limit it saturates.
 func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) (MergeReport, []pruned) {
@@ -454,7 +464,7 @@ func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) 
 		}
 		fl[name] = f
 	}
-	kept, buriedLive, fenced := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	kept, buriedLive, fenced, overRaise := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, a := range all {
 		f := fl[a.name]
 		switch {
@@ -484,9 +494,15 @@ func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) 
 			// moved-aside history above it, and one past it, must never
 			// outrank it.
 			if p := ptrs[name]; p > f.Seq && p > f.HighWater {
-				f.Seq, f.HighWater = p, 0
-				fl[name] = f
-				r.raised++
+				if p-f.Seq > 1 {
+					// More than the one-sequence lag a crash leaves: not
+					// raised to, and inside the fence below.
+					overRaise[name] = true
+				} else {
+					f.Seq, f.HighWater = p, 0
+					fl[name] = f
+					r.raised++
+				}
 			}
 			hw := fenceMark(a)
 			if keep[name] && f.Seq == a.Seq && f.HighWater == hw {
@@ -523,6 +539,7 @@ func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) 
 		r.Retired = append(r.Retired, name)
 	}
 	r.BuriedLive, r.Kept, r.Fenced = sortedNames(buriedLive), sortedNames(kept), sortedNames(fenced)
+	r.Unverified, r.overRaise = sortedNames(overRaise), sortedNames(overRaise)
 	return r, out
 }
 
@@ -599,6 +616,16 @@ func (s *FileStore) restoredPointers(ctx context.Context, live, from floor) (map
 		ptrs[name] = seq
 	}
 	return ptrs, unverified, nil
+}
+
+// unionNames is the names in a or b, sorted and without repeats, or nil for
+// none.
+func unionNames(a, b []string) []string {
+	set := map[string]bool{}
+	for _, n := range append(slices.Clone(a), b...) {
+		set[n] = true
+	}
+	return sortedNames(set)
 }
 
 // sortedNames is set's names, sorted, or nil for none.

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -83,4 +84,31 @@ func TestMergeFloorReadsOnlyTheGuardFile(t *testing.T) {
 			t.Errorf("the replacement guard file: %v, want it left in place", err)
 		}
 	})
+}
+
+// TestFloorMergeBoundsRestoredRaise (U192): the merge raises a restored live
+// record to its authenticated restored pointer by at most one sequence, the
+// lag a crash between the pointer flip and the floor write leaves. A
+// pointer further past the record, here at seq+3 and at or below the
+// moved-aside sequence, is not raised to: it is reported unverified, the
+// fence computed after the bounded raise covers it, and that copy is
+// refused after the merge. A pointer one past is raised to.
+func TestFloorMergeBoundsRestoredRaise(t *testing.T) {
+	var gen [generationSize]byte
+	copy(gen[:], mustHex(t, mgen(1)))
+	restored := floor{"k": {Generation: mgen(1), Seq: 5}, "j": {Generation: mgen(2), Seq: 5}}
+	aside := floor{"k": {Generation: mgen(1), Seq: 9}, "j": {Generation: mgen(2), Seq: 9}}
+	r, _ := restored.merge(aside, nil, map[string]uint64{"k": 8, "j": 6})
+	if e := restored["k"]; e.Seq != 5 || e.HighWater != 10 {
+		t.Fatalf("k after the merge = %+v, want seq 5 kept and fenced at 10", e)
+	}
+	if e := restored["j"]; e.Seq != 6 || e.HighWater != 10 {
+		t.Fatalf("j after the merge = %+v, want seq raised to 6 and fenced at 10", e)
+	}
+	if !slices.Equal(r.Unverified, []string{"k"}) {
+		t.Fatalf("unverified = %v, want k", r.Unverified)
+	}
+	if err := restored.check("k", gen, 8); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("check of the pointer at seq+3 after the merge = %v, want it refused", err)
+	}
 }

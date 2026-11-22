@@ -1254,11 +1254,15 @@ sequence and the moved-aside record's own mark. Either floor can lag its pointer
 crash between the pointer flip and the floor write. The `+1` covers a moved-aside floor at seq 9
 whose pointer reached 10: that copy is refused too. For the restored side, the merge, which runs
 as root, authenticates each fenced entry's restored pointer under the master first, and when
-that sequence is above the restored record (and above its own mark) it raises the record to it,
-so a restored pointer one past its saved floor is never inside the fence. A pointer that does
-not authenticate (no master, a missing or replaced directory, another generation) leaves the
-record as the restored floor holds it, logged at Warn and reported as `unverified
-system/<name>` (`MergeReport.Unverified`). At the sequence limit the mark saturates there
+that sequence is exactly one above the restored record (and above its own mark), the lag a crash
+leaves, it raises the record to it, so a restored pointer one past its saved floor is never
+inside the fence. The raise is bounded to that one sequence: a pointer further above the record
+is not raised to, and the fence, computed after the raise, covers it, since an authenticated
+pointer the saved floor never saw that far ahead is a copy of the abandoned history, not the
+restored one (`TestFloorMergeBoundsRestoredRaise`, and `FuzzMergeFloor` with fuzzed pointers:
+no raise exceeds one sequence). Such a pointer, and one that does not authenticate (no master,
+a missing or replaced directory, another generation), leaves the record as the restored floor
+holds it, logged at Warn and reported as `unverified system/<name>` (`MergeReport.Unverified`). At the sequence limit the mark saturates there
 (`TestFloorMergeFenceLaggingFloors`, and `FuzzMergeFloor`'s fence oracle: the result's
 `max(seq, highwater)` is at least the moved-aside record's plus one). The mark is written as an optional `"highwater":N` after `"seq"` in the
 entry and left out when 0, so the parser's canonical round trip and every earlier floor are

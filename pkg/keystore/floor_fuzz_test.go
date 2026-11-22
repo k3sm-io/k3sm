@@ -25,6 +25,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -88,11 +89,13 @@ func FuzzParseFloor(f *testing.F) {
 // generation; every moved-aside live generation ends up buried, reported
 // dropped, kept (keep names it and the restored floor holds the name not
 // live), or live already; and, when nothing was dropped, a second merge of
-// the same floors adds nothing. The seeds are committed under
-// testdata/fuzz/FuzzMergeFloor.
+// the same floors adds nothing. ptrs is the restored pointers the merge is
+// given, name=seq pairs split at commas: a restored live record is never
+// raised more than one sequence, the lag a crash leaves. The seeds are
+// committed under testdata/fuzz/FuzzMergeFloor.
 func FuzzMergeFloor(f *testing.F) {
 	type key struct{ name, gen string }
-	f.Fuzz(func(t *testing.T, restoredB, asideB []byte, keep string) {
+	f.Fuzz(func(t *testing.T, restoredB, asideB []byte, keep, ptrsS string) {
 		restored, err := parseFloor(restoredB)
 		if err != nil {
 			return
@@ -106,7 +109,24 @@ func FuzzMergeFloor(f *testing.F) {
 		for _, k := range strings.Split(keep, ",") {
 			keepSet[k] = true
 		}
-		r, d := restored.merge(aside, keepSet, nil)
+		var ptrs map[string]uint64
+		for _, kv := range strings.Split(ptrsS, ",") {
+			name, v, ok := strings.Cut(kv, "=")
+			seq, err := strconv.ParseUint(v, 10, 64)
+			if !ok || err != nil {
+				continue
+			}
+			if ptrs == nil {
+				ptrs = map[string]uint64{}
+			}
+			ptrs[name] = seq
+		}
+		r, d := restored.merge(aside, keepSet, ptrs)
+		for name, was := range before {
+			if now := restored[name]; was.live() && now.live() && now.Generation == was.Generation && now.Seq > was.Seq && now.Seq-was.Seq > 1 {
+				t.Fatalf("merge raised %s from seq %d to %d, more than one sequence", name, was.Seq, now.Seq)
+			}
+		}
 		d = append(d, restored.prune()...)
 		dropped := map[key]bool{}
 		for _, x := range d {
@@ -192,7 +212,7 @@ func FuzzMergeFloor(f *testing.F) {
 			}
 		}
 		if len(d) == 0 {
-			if r2, d2 := restored.merge(aside, keepSet, nil); r2.Merged+len(r2.Retired) != 0 || len(r2.Fenced) != 0 || len(d2) != 0 {
+			if r2, d2 := restored.merge(aside, keepSet, ptrs); r2.Merged+len(r2.Retired) != 0 || len(r2.Fenced) != 0 || len(d2) != 0 {
 				t.Fatalf("a second merge of the same floors = %+v, dropped %v; want nothing added", r2, d2)
 			}
 		}

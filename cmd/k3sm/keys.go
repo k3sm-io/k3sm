@@ -1037,7 +1037,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		fmt.Fprintf(env.stdout, "retired %s: its version current before the restore is not the restored one, so a copy of it put back is refused\n", qualify(name))
 	}
 	for _, name := range r.Unverified {
-		fmt.Fprintf(env.stdout, "unverified %s: the restored pointer did not authenticate under the master, so its recorded sequence is left as the restored floor holds it\n", qualify(name))
+		fmt.Fprintf(env.stdout, "unverified %s: the restored pointer did not authenticate under the master, or is more than one version past the restored floor's record, so its recorded sequence is left as the restored floor holds it and a copy past it is refused\n", qualify(name))
 	}
 	for _, name := range r.Dropped {
 		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
