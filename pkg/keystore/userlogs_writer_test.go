@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -170,5 +171,44 @@ func TestWithdrawRepeatAppendsNoFloorLine(t *testing.T) {
 	}
 	if after := readLog(t, s, userFloorLogName); !bytes.Equal(before, after) {
 		t.Fatalf("a no-op withdraw appended %q to the floor", after[len(before):])
+	}
+}
+
+// U20: a withdraw over a floor it cannot verify never re-seals a record put
+// back from a backup. With a delivery withdrawn after the backup, the backup
+// restored, the floor's flag clear and the process's own mark gone (a
+// restart), a withdraw is refused with errWithdrawUnsealed and the record
+// on disk is the restored bytes; once the floor is flagged again, the copy
+// stays refused below it, so the delivery withdrawn after the backup never
+// reads as live.
+func TestWithdrawUnverifiedFloorSealsNothing(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := fileLogScope(t)
+	for _, n := range []int{1, 2} {
+		if err := u.addDelivery(ctx, testDelivery(n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backup := readDeliveriesBytes(t, server)
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil {
+		t.Fatal(err)
+	}
+	putBackDeliveries(t, server, backup)
+	s.logFlags = func(*os.File) (uint32, error) { return 0, nil }
+	deliveriesSeen.mu.Lock()
+	delete(deliveriesSeen.m, deliverySeqKey(s.dir, "user/1001", guid(0xA1)))
+	deliveriesSeen.mu.Unlock()
+	for _, n := range []int{2, 1} {
+		err := u.withdrawDelivery(ctx, testDelivery(n).uid)
+		if !errors.Is(err, errWithdrawUnsealed) || errors.Is(err, errCommitted) {
+			t.Fatalf("withdraw %d over an unflagged floor and a restored record: %v, want errWithdrawUnsealed", n, err)
+		}
+		if !bytes.Equal(backup, readDeliveriesBytes(t, server)) {
+			t.Fatalf("withdraw %d re-sealed the restored record", n)
+		}
+	}
+	s.logFlags = flagged
+	if d, err := u.lookupDelivery(ctx, testDelivery(1).uid); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("the delivery withdrawn after the backup reads as %+v, %v; want the restored copy refused (ErrCorrupt)", d, err)
 	}
 }

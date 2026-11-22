@@ -474,12 +474,12 @@ type deliveriesRead struct {
 // readDeliveriesFloor is readDeliveries. With revoke set, a floor that
 // is absent or cannot be read skips the floor check rather than refuse,
 // but a floor whose bytes do not parse (matching ErrCorrupt) refuses: it is
-// damage, which root repairs with floor --rebuild. A withdraw only
-// adds a tombstone, so it goes ahead without the floor, checking the record
-// against the highest sequence this process has read or written instead (the
-// residuals are named in docs/design/keystore.md § "Quotas", "Revocation
-// always succeeds"). A record below a floor that can be read is refused,
-// revoke or not.
+// damage, which root repairs with floor --rebuild. Without the floor it
+// still checks the record against the highest sequence this process has read
+// or written, and reports the floor's error as unverified: a withdraw then
+// seals nothing (errWithdrawUnsealed; docs/design/keystore.md § "Quotas",
+// "Revocation always succeeds"). A record below a floor that can be read is
+// refused, revoke or not.
 func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) (deliveriesRead, error) {
 	b, fi, err := readFile(o.dir, deliveriesName, maxDeliveriesRecordSize)
 	switch {
@@ -595,6 +595,14 @@ func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSiz
 	}
 	return nil
 }
+
+// errWithdrawUnsealed refuses a withdrawal of a live delivery while the
+// user-scope floor cannot be verified (absent, untrusted, unflagged or
+// unreadable): the record on disk may be an older copy put back, and
+// re-sealing it at a fresh sequence would make that copy authentic. Nothing
+// was sealed, so the delivery stays live in the record; the reconciler
+// deletes the delivered Secret anyway, as for any withdrawal that errors.
+var errWithdrawUnsealed = errors.New("the user-scope floor cannot be verified, so the withdrawal was not sealed into the delivery record, which may be an older copy put back; delete the delivered Secret anyway; root must run sudo k3sm keys floor --rebuild, then withdraw again")
 
 // errCommitted marks an error after a change was committed: the change
 // stands, and what follows it (a floor line, an audit line) was not
@@ -750,9 +758,10 @@ func (u *UserScope) lookupDelivery(ctx context.Context, uid string) (delivery, e
 
 // withdrawDelivery turns the live delivery uid into a tombstone in place. It
 // never adds an entry, so it is never refused for a quota, and it runs while
-// a Rewrap is half done. It is refused only for a record put back below the
+// a Rewrap is half done. It is refused for a record put back below the
 // floor, or, with the floor unreadable, below the highest sequence this store
-// has read or written (docs/design/keystore.md § "Quotas", the residuals of
+// has read or written, and with the floor unverifiable it seals nothing
+// (errWithdrawUnsealed) (docs/design/keystore.md § "Quotas", the residuals of
 // "Revocation always succeeds"). An already withdrawn UID is no change; an absent one is ErrNotFound. As a revocation it
 // commits first and audits after: a failed append is reported (errCommitted)
 // and the tombstone stands.
@@ -766,8 +775,9 @@ func (u *UserScope) withdrawDelivery(ctx context.Context, uid string) error {
 	return nil
 }
 
-// withdrawLocked needs neither the owner's live GeneratedUID nor a floor it
-// can read, and runs with master.next present (openScopeForRevoke). An
+// withdrawLocked needs no owner's live GeneratedUID and runs with
+// master.next present (openScopeForRevoke); over a floor it cannot verify it
+// seals nothing (errWithdrawUnsealed). An
 // already withdrawn UID re-appends the record's floor line when the floor
 // is below the record's sequence, in case the withdraw that wrote the
 // tombstone could not, and appends nothing when the floor already holds it. It commits, then appends its audit
@@ -822,6 +832,12 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, error) {
 			continue
 		}
 		ns := ds[i].namespace
+		if !ds[i].withdrawn && rd.unverified != nil {
+			// The record was not checked against the floor, so it may be an
+			// older copy put back; sealing it at a fresh sequence would make
+			// that copy authentic. Nothing is sealed.
+			return ns, fmt.Errorf("%w: %w", errWithdrawUnsealed, rd.unverified)
+		}
 		// Only a withdraw that revokes is in the revocation class; a repeat
 		// changes nothing and is refused past the hard cap like any other
 		// operation.
@@ -829,9 +845,10 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, error) {
 			return ns, err
 		}
 		if ds[i].withdrawn {
-			if rd.unverified == nil && rd.floor >= seq {
-				// The floor already holds the record's sequence: nothing
-				// changed, and nothing is appended.
+			if rd.unverified != nil || rd.floor >= seq {
+				// The floor already holds the record's sequence, or cannot
+				// be read to take it: nothing changed, and nothing is
+				// appended.
 				return ns, nil
 			}
 			return ns, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq)

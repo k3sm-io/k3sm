@@ -32,7 +32,8 @@ type failingReaderAt struct{}
 func (failingReaderAt) ReadAt([]byte, int64) (int, error) { return 0, unix.EIO }
 
 // A read I/O error on the floor is transient, not damage: it is
-// errLogUnreadable, never ErrCorrupt, so a withdraw goes ahead and a read
+// errLogUnreadable, never ErrCorrupt, so a withdraw seals nothing and is
+// refused with errWithdrawUnsealed rather than as damage, and a read
 // refuses, and it is not kept, so the next read that works is served.
 func TestFloorReadErrorIsNotDamage(t *testing.T) {
 	ctx := context.Background()
@@ -55,8 +56,8 @@ func TestFloorReadErrorIsNotDamage(t *testing.T) {
 	if fl.state.bad != nil {
 		t.Fatalf("a read error was kept as damage: %v", fl.state.bad)
 	}
-	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil && !errors.Is(err, errCommitted) {
-		t.Fatalf("withdraw when the floor read fails: %v, want it to go ahead", err)
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, errWithdrawUnsealed) || errors.Is(err, ErrCorrupt) {
+		t.Fatalf("withdraw when the floor read fails: %v, want errWithdrawUnsealed and not ErrCorrupt", err)
 	}
 	fl.readAt = nil
 	if _, _, err := u.Current(ctx, "user/1001/token"); err != nil {

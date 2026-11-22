@@ -155,9 +155,10 @@ func entryGeneration(t *testing.T, server, name string) [generationSize]byte {
 	return g
 }
 
-// An absent user-scope floor lets a withdraw go ahead, as a floor that
-// cannot be read does: the tombstone is written, and the floor line that
-// could not be appended is reported as after a commit.
+// An absent user-scope floor does not let a withdraw re-seal the record it
+// cannot check: the withdraw is refused with errWithdrawUnsealed, which says
+// to delete the delivered Secret anyway, and nothing is sealed. A grant
+// refuses without the floor too.
 func TestWithdrawAbsentFloorProceeds(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
@@ -167,12 +168,13 @@ func TestWithdrawAbsentFloorProceeds(t *testing.T) {
 	if err := os.Remove(filepath.Join(s.dataRoot, userFloorLogName)); err != nil {
 		t.Fatal(err)
 	}
+	before := readDeliveriesBytes(t, server)
 	err := u.withdrawDelivery(ctx, testDelivery(1).uid)
-	if err != nil && !errors.Is(err, errCommitted) {
-		t.Fatalf("withdraw with no floor: %v, want it to go ahead", err)
+	if !errors.Is(err, errWithdrawUnsealed) || errors.Is(err, errCommitted) || !strings.Contains(err.Error(), "delete the delivered Secret anyway") {
+		t.Fatalf("withdraw with no floor: %v, want errWithdrawUnsealed naming the Secret's deletion", err)
 	}
-	if d, _ := recordedDelivery(t, s, server, 1); !d.withdrawn {
-		t.Fatal("the delivery is still live")
+	if !bytes.Equal(before, readDeliveriesBytes(t, server)) {
+		t.Fatal("a withdraw with no floor re-sealed the delivery record")
 	}
 	// A grant still refuses without the floor.
 	if err := u.addDelivery(ctx, testDelivery(2)); !errors.Is(err, errLogMissing) {
