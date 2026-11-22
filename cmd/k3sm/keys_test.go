@@ -679,14 +679,22 @@ func refusedDeleted(t *testing.T, h *keysHarness, name string) {
 
 // recipeDeletedNames is plutil -extract tombstones raw on the moved-aside
 // floor: the names it records as deleted, sorted. It runs plutil itself
-// when the host has it, and reads the same field in Go otherwise.
+// when the host has it, and reads the same field in Go otherwise. Only
+// plutil's exact "No value at that key path" means no deletions; any other
+// failure (an unreadable or malformed file) stops the test.
 func recipeDeletedNames(t *testing.T, h *keysHarness) []string {
 	t.Helper()
 	p := recipeFloor(h) + ".pre-restore"
 	if plutil, err := exec.LookPath("plutil"); err == nil {
-		out, err := exec.Command(plutil, "-extract", "tombstones", "raw", "-o", "-", p).Output()
+		var stderr bytes.Buffer
+		cmd := exec.Command(plutil, "-extract", "tombstones", "raw", "-o", "-", p)
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
 		if err != nil {
-			return nil // no tombstones: nothing to delete again
+			if strings.Contains(stderr.String()+string(out), "No value at that key path") {
+				return nil // no tombstones: nothing deleted
+			}
+			t.Fatalf("plutil on the moved-aside floor: %v: %s%s", err, out, stderr.String())
 		}
 		names := strings.Fields(string(out))
 		slices.Sort(names)

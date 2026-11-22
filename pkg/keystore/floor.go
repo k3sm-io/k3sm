@@ -76,6 +76,10 @@ const (
 	// enough that the tombstone budget (maxTombstoneSize), which prunes
 	// oldest first across every name, is the main eviction: churning one
 	// name pushes out its own burials only after 64 deletions.
+	//
+	// This cap and maxTombstoneSize may only ever be raised, never lowered:
+	// parseFloor refuses a floor over either, so a lower one would make a
+	// floor an earlier release wrote refuse every root verb.
 	maxBuriedPerName = 64
 	// maxDeleteSeq is the highest delete sequence a floor may hold, 2^53 (an
 	// integer every JSON reader keeps exact). A delete sequence only orders

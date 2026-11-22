@@ -420,8 +420,13 @@ buried set, oldest first:
   floor's own prune, that a buried generation leaves the floor. The cap is a backstop, not the
   main eviction: the tombstone budget below prunes oldest first across every name, so churning
   one name pushes out its own burials only after 64 deletions, and never another name's sooner
-  than age requires. It stays a cap rather than going away because a name's burials are held
-  in a fixed array in memory; at 64 that array is about 1.5 KiB per floor record.
+  than age requires. It stays a cap rather than going away so one name's churn cannot fill the
+  tombstone budget alone; a name's burials are a slice in memory, at most 64 long.
+- *The caps only ever rise.* The per-name cap (64) and the tombstone budget (1 MiB) may only
+  ever be raised in a later release, never lowered: the parser refuses a floor over either
+  cap as malformed, so a lower cap would make a floor an earlier release wrote, or a
+  moved-aside floor the restore merge reads, refuse every root verb. A floor at the caps
+  never fails a write: the write prunes.
 - *Refusal.* A reader or verb that opens an entry directory whose generation is in the name's
   buried set refuses it as `ErrCorrupt`, with the floor's own message: an older copy of a
   deleted entry was put back. Its advice leads with a safe action. With no live record for
@@ -481,9 +486,10 @@ buried set, oldest first:
   after its pointer under a name with no live record (none at all, or only burials): that
   generation is lost from the floor, and a copy of it put back later is accepted. The remedy
   is to run `rm` with the master available: the floor raise at its start records the crashed
-  Put's pointer live, and the Delete buries it. A master-less Delete of a directory with a
-  `current` under a name the floor records nothing live for, whose generation it does not
-  already bury, logs this residual at Warn, naming the remedy: rerun `rm` with the master.
+  Put's pointer live, and the Delete buries it. Any Delete that buries nothing, of a directory
+  with a `current` under a name the floor records nothing live for, whose generation it does
+  not already bury, logs this residual at Warn, naming the remedy: rerun `rm` with the master.
+  That covers a master-less Delete and, with the master, a pointer that does not authenticate.
 - *Format.* The floor stays format version 1: nothing has shipped, so this is a hard cut with
   no migration. `tombstones` is optional and comes after `entries`; a verb writes it only when
   the floor holds a tombstone, so `"tombstones":{}` is not the encoding a verb writes and is
@@ -4468,7 +4474,7 @@ carried by the unit rows.
 | U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
-| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 64 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry; `keys floor merge` carries every burial of the moved-aside floor into a restored one, never burying a generation it holds live, pruned and reported | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `TestDeleteIgnoresPlantedGeneration`, `TestPerNameCapIsBackstop`, `TestDeleteWithoutMasterWarnsUnrecorded`, `TestDeleteReportsEvictedTombstone`, `TestFloorMergeSemantics`, `TestFloorMergeCapsAndPrune`, `TestFloorMergeRefusesUntrusted`, `FuzzParseFloor` | checked: the floor's tombstone |
+| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 64 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry; `keys floor merge` carries every burial of the moved-aside floor into a restored one, never burying a generation it holds live, pruned and reported | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `TestDeleteIgnoresPlantedGeneration`, `TestPerNameCapIsBackstop`, `TestDeleteWithoutMasterWarnsUnrecorded`, `TestDeleteReportsEvictedTombstone`, `TestDeleteWarnsUnrecordedWithMaster`, `TestFloorMergeSemantics`, `TestFloorMergeCapsAndPrune`, `TestFloorMergeRefusesUntrusted`, `FuzzParseFloor` | checked: the floor's tombstone |
 
 ### Rig legs
 

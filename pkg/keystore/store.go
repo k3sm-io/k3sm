@@ -574,8 +574,10 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // runs again or a Put of the name replaces that record (floor.set buries
 // it). The deleted directory's generation is buried too, when it is not the
 // live one, only when the master is loaded and the directory's pointer
-// authenticates under it. A master-less Delete of a directory under a name
-// with no live record buries nothing, and logs that (warnUnrecorded).
+// authenticates under it. A Delete that buries nothing (no live record, and
+// no master or no pointer that authenticates) logs that (warnUnrecorded).
+// A Delete whose floor write prunes a burial it recorded or names fails
+// with ErrTombstoneEvicted, though the entry is deleted.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -682,7 +684,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	}
 	buried := len(gs) > 0
 	if !buried && present && fi.IsDir() {
-		warnUnrecorded(root, name, after)
+		warnUnrecorded(root, name, after, kerr == nil)
 	}
 	if !present {
 		if !buried {
@@ -745,14 +747,15 @@ func evicted(name string, buried []string, authentic *[generationSize]byte, afte
 	return err
 }
 
-// warnUnrecorded logs, at Warn, a master-less Delete of a directory with a
-// current pointer under a name the floor records nothing live for, whose
-// generation it does not already bury: without the master no pointer can
-// vouch for the directory's generation, so the Delete buries nothing, and a
-// copy of it put back later is accepted. Rerunning rm with the master
-// records it (docs/design/keystore.md § "Pointer sequence and floor",
+// warnUnrecorded logs, at Warn, a Delete that buries nothing of a directory
+// with a current pointer under a name the floor records nothing live for,
+// whose generation it does not already bury: no pointer vouched for the
+// directory's generation (no master loaded, or, with the master, a pointer
+// that does not authenticate under it), so a copy of it put back later is
+// accepted. Rerunning rm with the master, once the entry's own pointer is
+// back, records it (docs/design/keystore.md § "Pointer sequence and floor",
 // "Deletion without the master").
-func warnUnrecorded(root *os.Root, name string, fl floor) {
+func warnUnrecorded(root *os.Root, name string, fl floor, master bool) {
 	f := fl[name]
 	if f.live() {
 		return
@@ -768,7 +771,11 @@ func warnUnrecorded(root *os.Root, name string, fl floor) {
 	if gen, err := readGeneration(raw.root); err == nil && f.buries(hex.EncodeToString(gen[:])) {
 		return
 	}
-	slog.Warn("keystore: deleting an entry the floor has no record of without the master, so its generation is not recorded as deleted and a copy of it put back is accepted; to record it, put the entry back and rerun rm with the master", "name", name)
+	why := "without the master"
+	if master {
+		why = "whose pointer does not authenticate under the master"
+	}
+	slog.Warn("keystore: deleting an entry the floor has no record of, "+why+", so its generation is not recorded as deleted and a copy of it put back is accepted; to record it, put the entry back and rerun rm with the master", "name", name)
 }
 
 // removeEntry removes what stands under name, after the burial: a

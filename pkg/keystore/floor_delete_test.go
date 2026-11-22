@@ -231,3 +231,22 @@ func TestDeleteReportsEvictedTombstone(t *testing.T) {
 		t.Fatalf("Current of the copy put back after the eviction: %v, want it accepted, as the error warned", err)
 	}
 }
+
+// TestDeleteWarnsUnrecordedWithMaster (U192): with the master loaded, a
+// Delete that buries nothing (no live record, and a pointer that does not
+// authenticate) logs at Warn that the generation is not recorded, as a
+// master-less one does.
+func TestDeleteWarnsUnrecordedWithMaster(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	putFloorFile(t, server, floor{})
+	writeFile(t, filepath.Join(server, "keystore", "k", currentName), "not a sealed pointer")
+	buf := captureWarn(t)
+	if err := s.Delete(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "level=WARN") || !strings.Contains(got, "name=k") || !strings.Contains(got, "does not authenticate under the master") {
+		t.Fatalf("log of a Delete that buried nothing with the master = %q, want a Warn naming k and that its pointer does not authenticate", got)
+	}
+}
