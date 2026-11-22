@@ -922,6 +922,13 @@ func (u *UserScope) catchUpDeliveries(gen [generationSize]byte, rd deliveriesRea
 	if rd.unverified != nil || rd.seq <= rd.floor {
 		return false
 	}
+	if ff, ok := u.s.userFloor.(*fileFloorLog); ok {
+		// A catch-up writes no live line while the floor holds damage.
+		if n, err := ff.damaged(); err != nil || n > 0 {
+			slog.Warn("the user-scope floor holds damage, so the delivery record's catch-up line is not written", "scope", u.scope, "err", err)
+			return false
+		}
+	}
 	if err := u.s.userFloor.append(u.scope, deliveriesFloorName, gen, rd.seq, true); err != nil {
 		slog.Warn("the user-scope floor did not take the delivery record's catch-up line; the floor stays behind the record", "scope", u.scope, "err", err)
 		return false
@@ -934,10 +941,13 @@ func (u *UserScope) catchUpDeliveries(gen [generationSize]byte, rd deliveriesRea
 // both have run it marks the user scope started, and only then does
 // UserScope build one (errUserScopesNotStarted). A refused CheckLogBounds
 // (it fails closed: a log missing, untrusted, unflagged or unreadable is
-// refused), or a catch-up that could not run at all (no lock, no master), leaves it
-// unstarted. catchUpUser is best effort per scope, so a scope it could not
-// catch up does not hold the others: the user scope starts, and the error
-// names that scope.
+// refused), a catch-up that could not run at all (no lock, no master), or
+// a live catch-up line the floor refused (errCatchUpRefused: a floor with
+// damage refuses every one, errFloorDegraded) leaves it unstarted and
+// returns the error: the start fails closed rather than serve over a floor
+// behind an authenticated tree. A scope the catch-up could not open at
+// all has no line to write: it is logged and named in the returned error,
+// and the user scope still starts.
 //
 //lint:ignore U1000 the server start calls it once the socket lands; until then TestUserScopeIsUnexported holds the user scope in this package.
 func (s *FileStore) startUserScopes(ctx context.Context) error {
@@ -958,9 +968,16 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 	if err != nil {
 		return errors.Join(err, scopeErrs)
 	}
+	if errors.Is(scopeErrs, errCatchUpRefused) {
+		return scopeErrs
+	}
 	s.userScopesStarted.Store(true)
 	return scopeErrs
 }
+
+// errCatchUpRefused marks a live catch-up line the floor did not take,
+// which refuses the start step (startUserScopes).
+var errCatchUpRefused = errors.New("the user-scope floor did not take a live catch-up line, so the user scope is not started")
 
 // errUserScopesNotStarted refuses a user scope before the server's start
 // step (startUserScopes) has run.
@@ -1008,7 +1025,32 @@ func (s *FileStore) catchUpUser(ctx context.Context) (scopeErrs, err error) {
 		}
 		return nil
 	})
-	return errors.Join(errs...), err
+	joined := errors.Join(errs...)
+	if n := countCatchUpRefused(joined); n > 0 {
+		slog.Warn("the user-scope floor refused live catch-up lines; none was written", "refused", n)
+	}
+	return joined, err
+}
+
+// countCatchUpRefused counts the errCatchUpRefused leaves in err, a tree of
+// joined errors.
+func countCatchUpRefused(err error) int {
+	if err == nil {
+		return 0
+	}
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		n := 0
+		for _, e := range j.Unwrap() {
+			n += countCatchUpRefused(e)
+		}
+		if n > 0 || !errors.Is(err, errCatchUpRefused) {
+			return n
+		}
+	}
+	if errors.Is(err, errCatchUpRefused) {
+		return 1
+	}
+	return 0
 }
 
 // catchUpScope runs catchUpDeliveries, then catchUpEntries, for u's scope,
@@ -1036,7 +1078,7 @@ func (u *UserScope) catchUpScopeDeliveries(o *openedScope) error {
 		return nil
 	}
 	if !u.catchUpDeliveries(o.gen, rd) {
-		return errors.New("the user-scope floor did not take the delivery record's catch-up line")
+		return fmt.Errorf("%w: the delivery record's", errCatchUpRefused)
 	}
 	return nil
 }
@@ -1088,6 +1130,9 @@ func (u *UserScope) catchUpEntries(o *openedScope) error {
 // floor already holds one for gen or buries it. The line is in the
 // revocation class: it is what lets a later rm bury the entry's real
 // generation, so past the hard cap it draws on the uid's revocation budget.
+// While the floor holds damage it writes nothing (errFloorDegraded): the
+// skipped line could be the tombstone that buries gen. A line the floor
+// refuses is errCatchUpRefused, which refuses the start step.
 func (u *UserScope) catchUpEntry(name string, gen [generationSize]byte, seq uint64) error {
 	live, err := u.s.userFloor.liveGens(u.scope, name)
 	if err != nil {
@@ -1098,11 +1143,13 @@ func (u *UserScope) catchUpEntry(name string, gen [generationSize]byte, seq uint
 	}
 	if _, err := u.s.userFloor.floor(u.scope, name, gen); errors.Is(err, errFloorBuried) {
 		return nil
+	} else if errors.Is(err, errFloorDegraded) {
+		return fmt.Errorf("%w: an entry's catch-up line: %w", errCatchUpRefused, err)
 	} else if err != nil {
 		return fmt.Errorf("read the floor for an entry: %w", err)
 	}
 	if err := u.s.userFloor.append(u.scope, name, gen, seq, true); err != nil {
-		return fmt.Errorf("an entry's catch-up line: %w", err)
+		return fmt.Errorf("%w: an entry's catch-up line: %w", errCatchUpRefused, err)
 	}
 	return nil
 }

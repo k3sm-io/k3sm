@@ -280,6 +280,12 @@ var (
 	errFloorBuried = errors.New("the user-scope floor buries this generation: the entry was deleted")
 )
 
+// errFloorDegraded refuses a live floor line, and a read of a generation
+// the floor has no line for, while the floor holds damaged lines: a skipped
+// line could be a tombstone, so a live line written now could bring a
+// deleted entry back. It is root's to clear.
+var errFloorDegraded = fmt.Errorf("the user-scope floor %s holds damaged lines, one of which could be a tombstone, so it is in a degraded mode that writes no live line and trusts no generation it has no line for: rm and withdraw still work; root must read the damage count (CheckLogBounds, at the server's start) and run sudo k3sm doctor (the floor rebuild verb is not yet available)", userFloorLogName)
+
 // floorTombstone is a tombstone line's last field, where a live line has
 // its sequence.
 const floorTombstone = "rm"
@@ -1329,19 +1335,37 @@ func (f *fileFloorLog) read(fn func(*logState)) error {
 
 func (f *fileFloorLog) check() error { return f.read(func(*logState) {}) }
 
+// floor is the floor's word on scope, name and gen. While the floor holds
+// damage, an entry generation it has no line for is errFloorDegraded: the
+// skipped line could have been its tombstone. The delivery record has no
+// tombstone, so its reads are unchanged.
 func (f *fileFloorLog) floor(scope, name string, gen [generationSize]byte) (uint64, error) {
 	var (
-		seq    uint64
-		buried bool
+		seq           uint64
+		known, buried bool
+		damaged       int
 	)
 	k := floorKey{scope, name, gen}
-	if err := f.read(func(state *logState) { seq, buried = state.maxSeq[k], state.buried[k] }); err != nil {
+	if err := f.read(func(state *logState) {
+		seq, known = state.maxSeq[k]
+		buried, damaged = state.buried[k], state.damaged()
+	}); err != nil {
 		return 0, err
 	}
 	if buried {
 		return 0, errFloorBuried
 	}
+	if !known && damaged > 0 && name != deliveriesFloorName {
+		return 0, errFloorDegraded
+	}
 	return seq, nil
+}
+
+// damaged is the floor's count of damaged lines.
+func (f *fileFloorLog) damaged() (int, error) {
+	var n int
+	err := f.read(func(state *logState) { n = state.damaged() })
+	return n, err
 }
 
 func (f *fileFloorLog) liveGens(scope, name string) ([][generationSize]byte, error) {
@@ -1370,6 +1394,16 @@ func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq 
 	line, err := floorLine(scope, name, gen, seq)
 	if err != nil {
 		return err
+	}
+	// While the floor holds damage, only a withdraw's line, the delivery
+	// record's in the revocation class, is written: an entry's live line
+	// or a grant's could stand where a skipped tombstone was.
+	if name != deliveriesFloorName || !revoke {
+		if n, err := f.damaged(); err != nil {
+			return err
+		} else if n > 0 {
+			return errFloorDegraded
+		}
 	}
 	// Past the hard cap only a revocation's floor line draws on the uid's
 	// revocation budget: any other line is refused there, and a grant checks
@@ -1578,6 +1612,10 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 	}
 	if state.bad != nil {
 		return fmt.Errorf("%w (%v)", errFloorLogMalformed, state.bad)
+	}
+	if state.damaged() > 0 {
+		// The grant's floor line would be refused after its commit.
+		return errFloorDegraded
 	}
 	size := st.Size
 	for _, line := range lines {

@@ -19,6 +19,7 @@ package keystore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -47,9 +48,11 @@ func deliveryFor(uid uint32, n int) delivery {
 }
 
 // U20: garbage appended to the floor with no newline (a torn or forged
-// tail) is no outage. The fragment is skipped and counted as damage; the
-// next append writes a newline first, so the fragment is a line of its own;
-// a grant, an rm and a withdraw of two uids each succeed after it; and the
+// tail) is no outage for reads and revocations. The fragment is skipped and
+// counted as damage; the next append writes a newline first, so the
+// fragment is a line of its own; an rm and a withdraw of two uids each
+// succeed after it, while a grant is refused before its first write
+// (errFloorDegraded: the skipped line could have been a tombstone); and the
 // tombstones written before it still refuse the copies they bury.
 func TestFloorGarbageTailIsSkippedDamage(t *testing.T) {
 	ctx := context.Background()
@@ -84,10 +87,10 @@ func TestFloorGarbageTailIsSkippedDamage(t *testing.T) {
 		t.Fatalf("damage over a garbage tail is %d, want 1", n)
 	}
 	for _, h := range hs {
-		entry := fmt.Sprintf("user/%d/fresh", h.uid)
-		if _, err := h.u.Put(ctx, entry, KindOpaque, []byte("v")); err != nil {
-			t.Fatalf("put after the garbage, uid %d: %v", h.uid, err)
+		if _, err := h.u.Put(ctx, fmt.Sprintf("user/%d/fresh", h.uid), KindOpaque, []byte("v")); !errors.Is(err, errFloorDegraded) {
+			t.Fatalf("put after the garbage, uid %d: %v, want errFloorDegraded", h.uid, err)
 		}
+		entry := fmt.Sprintf("user/%d/token", h.uid)
 		if err := h.u.Delete(ctx, entry); err != nil {
 			t.Fatalf("rm after the garbage, uid %d: %v", h.uid, err)
 		}
@@ -134,11 +137,16 @@ func TestFloorTornMiddleLineIsSkipped(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		want uint64
-	}{{"k1", 5}, {"k2", 0}, {"k3", 7}} {
+	}{{"k1", 5}, {"k3", 7}} {
 		got, err := s.userFloor.floor("user/1001", c.name, guid(1))
 		if err != nil || got != c.want {
 			t.Fatalf("floor of %s: %d, %v; want %d", c.name, got, err, c.want)
 		}
+	}
+	// The torn line's key has no line the floor read: under damage it is
+	// not trusted (the skipped line could have been its tombstone).
+	if _, err := s.userFloor.floor("user/1001", "k2", guid(1)); !errors.Is(err, errFloorDegraded) {
+		t.Fatalf("floor of the torn line's key: %v, want errFloorDegraded", err)
 	}
 	if n := floorDamage(t, s); n != 1 {
 		t.Fatalf("damage is %d, want 1", n)

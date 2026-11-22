@@ -262,8 +262,8 @@ func TestRmOverTornFloorTailBuries(t *testing.T) {
 	if _, _, err := u.Current(ctx, "user/1001/keep"); err != nil {
 		t.Fatalf("the next read over the closed torn line: %v", err)
 	}
-	if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v")); err != nil {
-		t.Fatalf("a grant over the closed torn line: %v", err)
+	if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v")); !errors.Is(err, errFloorDegraded) {
+		t.Fatalf("a grant over the closed torn line: %v, want errFloorDegraded", err)
 	}
 	if n := floorDamage(t, s); n != 1 {
 		t.Fatalf("%d damaged lines, want 1", n)
