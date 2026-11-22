@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -535,8 +536,8 @@ func (b *burial) addTree(e *entry, name string) {
 	}
 }
 
-// bury appends a tombstone for every generation, the one the pointer
-// authenticates first. The file-backed floor takes them as one write
+// bury appends a tombstone for every generation, the one a reader serves
+// (served) first. The file-backed floor takes them as one write
 // (buryAll): everything the burial needs is judged and reserved for the
 // whole buffer, and a refusal, or a write that fails or lands short before
 // its first whole tombstone, refuses the rm with nothing committed,
@@ -548,55 +549,83 @@ func (b *burial) addTree(e *entry, name string) {
 // one that fails is reported after the commit (errCommitted): the rm is
 // audited as a revocation, the tree stays, and a retry buries the rest.
 func (b *burial) bury(u *UserScope) error {
+	order := b.ordered()
 	if ff, ok := u.s.userFloor.(*fileFloorLog); ok {
-		err := ff.buryAll(u.scope, b.name, b.ordered())
+		err := ff.buryAll(u.scope, b.name, order)
 		var landed *linesLanded
 		switch {
 		case err == nil:
 			return nil
 		case errors.As(err, &landed) && landed.unsynced:
 			// The tombstones are visible, so every reader holds them in
-			// force and the entry is revoked, but the fsync failed: a crash
-			// could lose them, so a retry makes them durable.
-			return fmt.Errorf("%w, but the user-scope floor's fsync failed after %d of the entry's %d tombstones were visible, so the entry is refused as deleted and its tree stays; durability uncertain; run rm again: %w", errCommitted, landed.lines, len(b.gens), err)
+			// force, but the fsync failed: a crash could lose them, so a
+			// retry makes them durable.
+			return fmt.Errorf("%w, but the user-scope floor's fsync failed after %d of the entry's %d tombstones were visible, %s, and its tree stays; durability uncertain; run rm again: %w", errCommitted, landed.lines, len(order), b.landedWhat(order[:min(landed.lines, len(order))]), err)
 		case errors.As(err, &landed):
 			// Whole tombstones landed before the write failed: they are in
-			// force, so the entry is revoked and the rm committed.
-			return fmt.Errorf("%w, but only in part: the user-scope floor took %d of the entry's %d tombstones before its write failed, so the entry is refused as deleted and its tree stays; run rm again to bury the rest: %w", errCommitted, landed.lines, len(b.gens), err)
+			// force, so the rm committed.
+			return fmt.Errorf("%w, but only in part: the user-scope floor took %d of the entry's %d tombstones before its write failed, %s, and its tree stays; run rm again to bury the rest: %w", errCommitted, landed.lines, len(order), b.landedWhat(order[:min(landed.lines, len(order))]), err)
 		}
 		return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstones, or could not make them durable; run rm again: %w", err)
 	}
-	landed := false
-	var errs []error
-	for _, g := range b.gens {
+	var (
+		took [][generationSize]byte
+		errs []error
+	)
+	for _, g := range order {
 		if err := u.s.userFloor.bury(u.scope, b.name, g); err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		landed = true
+		took = append(took, g)
 	}
 	switch {
 	case len(errs) == 0:
 		return nil
-	case landed:
-		return fmt.Errorf("%w, but only in part: the user-scope floor took some of the entry's tombstones and not the rest, so the entry is refused as deleted and its tree stays; run rm again to bury the rest: %w", errCommitted, errors.Join(errs...))
+	case len(took) > 0:
+		return fmt.Errorf("%w, but only in part: the user-scope floor took %d of the entry's %d tombstones and not the rest, %s, and its tree stays; run rm again to bury the rest: %w", errCommitted, len(took), len(order), b.landedWhat(took), errors.Join(errs...))
 	}
 	return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstone: %w", errors.Join(errs...))
 }
 
-// ordered is gens with the generation the pointer authenticates first, so
+// served is the generation a reader serves for the entry: the one its
+// pointer authenticates under K_u, or, with none, the pointer header's; nil
+// when neither was read.
+func (b *burial) served() *[generationSize]byte {
+	if b.authed != nil {
+		return b.authed
+	}
+	return b.pointer
+}
+
+// ordered is gens with the generation a reader serves first (served), so
 // the line a reader serves is the first a burial records.
 func (b *burial) ordered() [][generationSize]byte {
-	if b.authed == nil {
+	first := b.served()
+	if first == nil || !slices.Contains(b.gens, *first) {
 		return b.gens
 	}
-	out := [][generationSize]byte{*b.authed}
+	out := [][generationSize]byte{*first}
 	for _, g := range b.gens {
-		if g != *b.authed {
+		if g != *first {
 			out = append(out, g)
 		}
 	}
 	return out
+}
+
+// landedWhat says what a partial burial whose tombstones for took landed
+// revoked: the entry, refused as deleted, when the served generation's
+// tombstone is among them, and otherwise only the generations it names.
+func (b *burial) landedWhat(took [][generationSize]byte) string {
+	if s := b.served(); s != nil && slices.Contains(took, *s) {
+		return "so the entry is refused as deleted"
+	}
+	names := make([]string, len(took))
+	for i, g := range took {
+		names[i] = hex.EncodeToString(g[:])
+	}
+	return fmt.Sprintf("so only generation(s) %s are buried, not one a reader is known to serve", strings.Join(names, ", "))
 }
 
 // report is what rm reports after its commit: generations that disagree,
