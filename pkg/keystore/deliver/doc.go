@@ -51,16 +51,20 @@ limitations under the License.
 //     Store.Current's version or fingerprint, or its data is not exactly the
 //     declared key holding the stored bytes (compared in constant time, so a
 //     hand edit with the annotations left intact is re-applied and logged,
-//     without the value). An immutable one cannot be updated, so it is
-//     deleted under a precondition on the recorded UID, created again and the
-//     new UID recorded, both steps logged without the value;
+//     without the value). When only the label or the annotations differ and
+//     the data is current, only the metadata is updated, immutable or not.
+//     An immutable one whose data is not current cannot be updated, so once
+//     the state file is proven writable it is deleted under a precondition
+//     on the recorded UID, created again and the new UID recorded, both
+//     steps logged once without the value; while it is already being
+//     deleted, it is left to finish;
 //   - anything else (no recorded UID, or a UID other than the recorded one,
 //     whatever its label): leaves it alone and logs why. The
 //     label is forgeable by anyone who can write Secrets in the namespace;
 //     the UID a create returned is not, and a recreated Secret gets a new one.
 //
-// An update writes data, type, the label and the two annotations, and strips
-// any immutable flag. A target withdrawn from a declaration that exists and
+// An update of the value writes data, type, the label and the two
+// annotations, and strips any immutable flag. A target withdrawn from a declaration that exists and
 // parses loses its state record, so declaring it again leaves the old Secret
 // alone; an absent declaration withdraws nothing and keeps every record.
 //

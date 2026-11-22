@@ -360,7 +360,8 @@ func (r *Reconciler) note(t Target, state string, level slog.Level, msg string, 
 // converge delivers one target: refuse it while encryption is off without
 // the override, else Get its Secret and create it (absent), update it
 // (present, with the UID this server recorded when it created it, at another
-// value), or leave it alone (any other Secret, labelled or not).
+// value; only its metadata when the value is current), or leave it alone
+// (any other Secret, labelled or not).
 func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 	ctx, cancel := context.WithTimeout(ctx, r.targetTimeout)
 	defer cancel()
@@ -404,15 +405,26 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 	}
 	stamped, current := upToDate(cur, want, ver.Fingerprint, t.Key(), value)
 	labelled := cur.Labels[LabelKey] == t.Name()
-	if current && labelled {
+	if current && stamped && labelled {
 		r.note(t, "ok:"+want, slog.LevelInfo, "delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
 		return
 	}
+	if current {
+		// The value is in place and only the label or the annotations
+		// differ: put them back without touching data. An immutable Secret
+		// allows a metadata update, so this never deletes.
+		r.updateMetadata(ctx, t, cur, ver, want)
+		return
+	}
 	if cur.Immutable != nil && *cur.Immutable {
+		if cur.DeletionTimestamp != nil {
+			r.note(t, "waiting:terminating", slog.LevelInfo, "the Secret is being deleted; waiting")
+			return
+		}
 		r.recreateImmutable(ctx, sw, t, cur, ver, want, value)
 		return
 	}
-	if stamped && !current {
+	if stamped {
 		// Its stamps say current and its content does not: someone edited
 		// it. Logged every time, since each edit is its own event; the value
 		// is never logged.
@@ -440,6 +452,27 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 	r.note(t, "ok:"+want, slog.LevelInfo, "re-delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
 }
 
+// updateMetadata puts back the label and the version and fingerprint
+// annotations on a Secret this server owns whose data is already current,
+// with a plain Update that leaves data, type and immutability as they are.
+func (r *Reconciler) updateMetadata(ctx context.Context, t Target, cur *corev1.Secret, ver keystore.Version, want string) {
+	next := cur.DeepCopy()
+	if next.Labels == nil {
+		next.Labels = map[string]string{}
+	}
+	if next.Annotations == nil {
+		next.Annotations = map[string]string{}
+	}
+	next.Labels[LabelKey] = t.Name()
+	next.Annotations[VersionAnnotation] = want
+	next.Annotations[FingerprintAnnotation] = ver.Fingerprint
+	if _, err := r.client.CoreV1().Secrets(t.Namespace).Update(ctx, next, metav1.UpdateOptions{}); err != nil {
+		r.note(t, "error:update:"+err.Error(), slog.LevelWarn, "cannot update the Secret's label and annotations; will retry", "err", err)
+		return
+	}
+	r.note(t, "ok:"+want, slog.LevelInfo, "delivered; restored the Secret's label and annotations", "version", ver.Version, "plaintext", !r.encryptionOn)
+}
+
 // recreateImmutable re-delivers an immutable Secret this server owns, which
 // cannot be updated: it deletes it under a precondition on the recorded UID,
 // so only that object can go, then creates it again and records the new UID.
@@ -457,8 +490,8 @@ func (r *Reconciler) recreateImmutable(ctx context.Context, sw *sweep, t Target,
 		r.note(t, "error:delete:"+err.Error(), slog.LevelWarn, "cannot delete the immutable Secret to re-deliver it; will retry", "err", err)
 		return
 	}
-	r.logger.Info("keystore delivery: deleted an immutable Secret this server created, to re-create it at the current version",
-		"entry", t.Entry, "namespace", t.Namespace, "secret", t.Secret(), "version", ver.Version)
+	r.note(t, "deleted:immutable:"+want, slog.LevelInfo, "deleted an immutable Secret this server created, to re-create it at the current version",
+		"version", ver.Version)
 	if r.create(ctx, sw, t, ver, want, value) {
 		r.logger.Info("keystore delivery: re-created the immutable Secret",
 			"entry", t.Entry, "namespace", t.Namespace, "secret", t.Secret(), "version", ver.Version)
@@ -542,19 +575,18 @@ func (r *Reconciler) proveState(sw *sweep, t Target, msg string) bool {
 
 // upToDate reports whether a Secret this server owns holds the current
 // value: stamped when its version and fingerprint annotations match, and
-// current when, as well, data holds exactly the declared key and no other
-// (so a changed --data-key re-applies and drops the stale key) and that key's
-// bytes are the stored value. The bytes are compared in constant time; the
-// annotations alone would leave a hand edit of data in place.
+// current when data holds exactly the declared key and no other (so a
+// changed --data-key re-applies and drops the stale key) and that key's
+// bytes are the stored value, whatever the annotations say. The bytes are
+// compared in constant time; the annotations alone would leave a hand edit
+// of data in place.
 func upToDate(cur *corev1.Secret, version, fingerprint, key string, value []byte) (stamped, current bool) {
-	if cur.Annotations[VersionAnnotation] != version || cur.Annotations[FingerprintAnnotation] != fingerprint {
-		return false, false
-	}
+	stamped = cur.Annotations[VersionAnnotation] == version && cur.Annotations[FingerprintAnnotation] == fingerprint
 	got, ok := cur.Data[key]
 	if !ok || len(cur.Data) != 1 || len(cur.StringData) != 0 {
-		return true, false
+		return stamped, false
 	}
-	return true, subtle.ConstantTimeCompare(got, value) == 1
+	return stamped, subtle.ConstantTimeCompare(got, value) == 1
 }
 
 // statSignature is the identity of a declaration state that was refused: a

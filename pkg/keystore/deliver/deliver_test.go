@@ -1733,3 +1733,79 @@ func TestStateWriteFailureDeletesNothing(t *testing.T) {
 		t.Fatalf("the refusal is not logged\n%s", h.logs.String())
 	}
 }
+
+// TestReconcilerImmutableMetadataOnly: an owned immutable Secret whose data
+// is current but whose label or annotations differ (a tenant's relabel, or a
+// new version of the same value) gets a metadata update that leaves data as
+// it is, and is never deleted (G20).
+func TestReconcilerImmutableMetadataOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		labels  map[string]string
+		version uint64
+	}{
+		{"wrong label", map[string]string{LabelKey: "someone-else"}, 1},
+		{"no label", nil, 1},
+		{"stale version annotation", map[string]string{LabelKey: "api-token"}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ours := staleImmutableOwned()
+			ours.Labels = tc.labels
+			h := newHarness(t, true, false, ours)
+			h.own(t, ours)
+			h.store.set("api-token", tc.version, []byte("one"))
+			h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+			var sent *corev1.Secret
+			h.client.PrependReactor("update", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				sent = a.(k8stesting.UpdateAction).GetObject().(*corev1.Secret).DeepCopy()
+				return false, nil, nil
+			})
+			ctx := context.Background()
+			h.r.Sweep(ctx)
+			h.r.Sweep(ctx)
+			if n := h.deletes(); n != 0 {
+				t.Fatalf("a metadata difference drew a delete: %v", h.verbs())
+			}
+			if n := h.updates(); n != 1 || sent == nil {
+				t.Fatalf("got %d updates, want 1 metadata update: %v", n, h.verbs())
+			}
+			if string(sent.Data[DefaultDataKey]) != "one" || len(sent.Data) != 1 || sent.Immutable == nil || !*sent.Immutable {
+				t.Fatalf("the update touched data or immutability: data %q, immutable %v", sent.Data, sent.Immutable)
+			}
+			got := h.secret(t, "payments", "api-token")
+			want := fmt.Sprint(tc.version)
+			if got.UID != "ours-1" || got.Labels[LabelKey] != "api-token" || got.Annotations[VersionAnnotation] != want {
+				t.Fatalf("uid %q label %q version %q, want ours-1, api-token, %s", got.UID, got.Labels[LabelKey], got.Annotations[VersionAnnotation], want)
+			}
+			h.assertOnlyGetCreateUpdateSecrets(t)
+		})
+	}
+}
+
+// TestReconcilerTerminatingNotDeleted: an owned immutable Secret that needs a
+// rotation but is already being deleted is neither deleted nor re-created
+// while it terminates, and the wait is logged once (G20).
+func TestReconcilerTerminatingNotDeleted(t *testing.T) {
+	ours := staleImmutableOwned()
+	now := metav1.Now()
+	ours.DeletionTimestamp = &now
+	ours.Finalizers = []string{"example.com/hold"}
+	h := newHarness(t, true, false, ours)
+	h.own(t, ours)
+	h.store.set("api-token", 2, []byte("two"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	for _, v := range h.verbs() {
+		if v == "delete/secrets" || v == "create/secrets" {
+			t.Fatalf("a terminating Secret drew %s: %v", v, h.verbs())
+		}
+	}
+	if got := h.secret(t, "payments", "api-token"); got.UID != "ours-1" {
+		t.Fatalf("the Secret was replaced: uid %q", got.UID)
+	}
+	if n := strings.Count(h.logs.String(), "the Secret is being deleted; waiting"); n != 1 {
+		t.Fatalf("the wait is logged %d times, want 1\n%s", n, h.logs.String())
+	}
+}
