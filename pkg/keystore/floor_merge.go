@@ -218,7 +218,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	}
 	from := in.fl
 	if live == nil {
-		return r, checkMergeInput(live, from)
+		return r, checkMergeInput(live, from, kept)
 	}
 	ptrs, unverified, err := s.restoredPointers(ctx, live, from)
 	if err != nil {
@@ -239,7 +239,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		}
 		return pr, nil
 	}
-	if err := checkMergeInput(live, from); err != nil {
+	if err := checkMergeInput(live, from, kept); err != nil {
 		return r, err
 	}
 	// As Put and Rotate ask room before they write: a merge whose write
@@ -433,6 +433,10 @@ func (r MergeReport) changes() bool {
 // floor itself, the same inode under the guard file's name.
 var errMergeLiveFloor = errors.New("keystore-floor.json.pre-restore is the live floor itself: merging it changes nothing. It must be the floor moved aside before the restore")
 
+// errGuardNoFloor refuses a Delete while a restore is unfinished and the
+// live floor is absent.
+var errGuardNoFloor = errors.New("a restore is unfinished (keystore-floor.json.pre-restore is in the data root) and the live floor is absent: install the saved keystore-floor.json first, with install -o root -g wheel -m 0644 as docs/user/keys.md describes; nothing is deleted until then")
+
 // errNoGuard refuses a merge when the data root holds no
 // keystore-floor.json.pre-restore: no restore is unfinished.
 var errNoGuard = errors.New("there is nothing to merge: keystore-floor.json.pre-restore, the floor the restore recipe moves aside, is not in the data root. The merge reads only that file; move the live floor aside under that name as docs/user/keys.md describes")
@@ -462,13 +466,37 @@ func (s *FileStore) renameMerged(in *mergeInput) error {
 // moved-aside floor's burials alone, with no live records), and a from equal
 // to live (the same floor merged into itself: parseFloor accepts one
 // encoding per floor, so equal floors are byte-identical files, up to the
-// trailing newline).
-func checkMergeInput(live, from floor) error {
+// trailing newline), and a merge that would retire every live record of
+// from: live neither holds live nor buries any of their generations (an rm
+// under the guard buries one), keep names none of them, and from buries no
+// generation live holds live, which is a live floor that is not from's
+// backup.
+func checkMergeInput(live, from floor, keep map[string]bool) error {
 	if live == nil {
 		return errors.New("the live keystore floor is absent, so there is nothing to merge into: restore the saved keystore-floor.json first, with install -o root -g wheel -m 0644 as docs/user/keys.md describes, then run the merge again")
 	}
 	if floorsSame(live, from) {
 		return errors.New("keystore-floor.json.pre-restore is the live floor itself, byte for byte: merging it changes nothing. It must be the floor moved aside before the restore")
+	}
+	asideLive, shared := 0, false
+	for name, a := range from {
+		if !a.live() {
+			continue
+		}
+		asideLive++
+		if f := live[name]; keep[name] || (f.live() && f.Generation == a.Generation) || f.buries(a.Generation) {
+			shared = true
+		}
+	}
+	// A restored live generation the moved-aside floor buries (deleted and
+	// put again since the backup) ties the two floors as well.
+	for name, f := range live {
+		if f.live() && from[name].buries(f.Generation) {
+			shared = true
+		}
+	}
+	if asideLive > 0 && !shared {
+		return fmt.Errorf("the merge would retire every entry: the live floor holds none of the %d entries the floor moved aside holds live, so it is most likely not the floor saved with this backup. Nothing is written. Put back the keystore-floor.json saved with the backup, as docs/user/keys.md describes, and run the merge again; to keep an entry the backup does not hold, name it with --keep system/<name>", asideLive)
 	}
 	return nil
 }

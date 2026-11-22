@@ -355,8 +355,10 @@ file was not renamed, the merge is written: run the same command again. The seco
 nothing more, prints `already merged` and renames the file. The merge takes no file name: it reads only `/var/lib/k3sm/keystore-floor.json.pre-restore`,
 the floor the steps above moved aside, so it never reads the floor saved with the backup or any
 other copy. It refuses, and changes nothing, if that file is missing, if the restored
-`keystore-floor.json` is not in place yet (put it back with `install` first), or if the file is
-the live floor itself.
+`keystore-floor.json` is not in place yet (put it back with `install` first), if the file is
+the live floor itself, or if the restored floor holds none of the entries the moved-aside floor
+holds, which means it is not the floor saved with this backup. `rm` also refuses until the
+restored `keystore-floor.json` is in place.
 
 The merge keeps every key revoked since the backup refused: a key created after the backup, every
 older version of a name deleted more than once, and an entry the backup holds that you deleted

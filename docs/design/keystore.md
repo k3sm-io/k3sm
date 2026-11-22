@@ -1216,9 +1216,16 @@ two apart by age (`TestMergeFloorReadsOnlyTheGuardFile`, `TestKeysFloorMergeTake
 name must still be the file it read when it writes and when it renames it: a guard file
 replaced by another inode during the merge refuses it, writing nothing. It refuses, writing
 nothing, when the live floor is absent ("restore the saved keystore-floor.json first": merging
-into nothing would leave the moved-aside burials with no live records) and when the guard file
+into nothing would leave the moved-aside burials with no live records) when the guard file
 is the live floor itself, by inode or byte for byte (equal floors are byte-identical files,
-since the parser accepts one encoding per floor). Then, under `keystore-lock` alone, it adds every
+since the parser accepts one encoding per floor), and when the merge would retire every live
+record the moved-aside floor holds: the live floor neither holds live nor buries any of their
+generations, `--keep` names none, and the moved-aside floor buries no generation the live floor
+holds live, which is a live floor not saved with this backup
+(`TestMergeFloorRefusesRetiringEverything`). A Delete under the guard with the live floor
+absent refuses too ("install the saved keystore-floor.json first"), writing nothing: a floor it
+created would hold its burial alone, and the merge would take it for the restored floor
+(`TestPendingMergeDeleteNeedsLiveFloor`). Then, under `keystore-lock` alone, it adds every
 burial it records that the restored floor lacks, oldest first, each at the next delete
 sequence, so the merged burials keep their order. It writes only the root-owned floor and
 nothing under `keystore/`, so it never takes `keystore/.lock`, which the service user can hold

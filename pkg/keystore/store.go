@@ -594,6 +594,9 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // for a merge refused because the floor is full. It then raises no other
 // entry's floor, and it writes nothing but its burials, each numbered above
 // guardEraSeq, so the merge keeps them newest and never drops one silently.
+//
+// While the guard is set and the live floor is absent (the saved floor not
+// put back yet), Delete refuses (errGuardNoFloor) and writes nothing.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -615,7 +618,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// record needs nothing the service user controls, so it lands before
 	// .lock, which the service user can hold or replace, and before
 	// keystore/ is judged, which it can make refused.
-	fdir, _, err := s.lockFloor(ctx)
+	fdir, fl, err := s.lockFloor(ctx)
 	if err != nil {
 		return err
 	}
@@ -625,6 +628,12 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// only adds burials, so a burial written now is kept by it. It raises
 	// no other entry's floor then, as RaiseFloor does not.
 	pending := fdir.mergePending() != nil
+	if pending && fl == nil {
+		// The saved floor is not put back yet: a floor this Delete created
+		// would hold its burial alone, which the merge would take for the
+		// restored floor.
+		return errGuardNoFloor
+	}
 	// Under the guard each burial is numbered above guardEraSeq, so the
 	// merge tells it from the restored floor's and never drops it silently.
 	var above uint64

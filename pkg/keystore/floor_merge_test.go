@@ -364,7 +364,7 @@ func TestMergeFloorRefusesDroppingItsOwnBurials(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
 	putFloorFile(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}, "revoked": {Generation: mgen(3), Seq: 1}})
-	aside := floor{"revoked": {Buried: []burial{{Generation: mgen(3), Deleted: 1}}}}
+	aside := floor{"keep": {Generation: mgen(2), Seq: 1}, "revoked": {Buried: []burial{{Generation: mgen(3), Deleted: 1}}}}
 	for i := range 40 {
 		aside[fmt.Sprintf("name-%02d", i)] = floorEntry{Generation: mgen(100 + i), Seq: 1}
 	}

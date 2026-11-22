@@ -21,6 +21,9 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -169,5 +172,52 @@ func TestGuardEraBurialPerNameCap(t *testing.T) {
 	fl := floorOf(t, server)
 	if !fl["k"].buries(gen) || fl["k"].buries(mgen(100)) {
 		t.Fatalf("k after --accept-drops = %+v, want the guard-era burial kept and the oldest merged one dropped", fl["k"])
+	}
+}
+
+// TestPendingMergeDeleteNeedsLiveFloor (U192): with the guard set and the
+// live floor absent (the saved floor not put back yet), Delete refuses,
+// naming the install, and writes no floor: a floor it created would hold
+// its burial alone, and the merge would take it for the restored one.
+func TestPendingMergeDeleteNeedsLiveFloor(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("v"))
+	if err := os.Rename(floorPath(server), floorPath(server)+".pre-restore"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, "k"); err == nil || !strings.Contains(err.Error(), "install the saved keystore-floor.json first") {
+		t.Fatalf("Delete with the guard set and no live floor: %v, want a refusal naming the install", err)
+	}
+	if _, err := os.Lstat(floorPath(server)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("live floor after the refused Delete: %v, want it still absent", err)
+	}
+	if _, err := os.Lstat(filepath.Join(server, "keystore", "k")); err != nil {
+		t.Fatalf("k's directory after the refused Delete: %v, want it left", err)
+	}
+}
+
+// TestMergeFloorRefusesRetiringEverything (U192): a merge onto a live floor
+// that holds none of the moved-aside floor's live records live would retire
+// every one of them, so it is refused, writing nothing, unless --keep
+// covers one of them.
+func TestMergeFloorRefusesRetiringEverything(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	putFloorFile(t, server, floor{"x": {Generation: mgen(9), Seq: 1}})
+	writeAsideFloor(t, server, floor{"a": {Generation: mgen(1), Seq: 1}, "b": {Generation: mgen(2), Seq: 1}})
+	before, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err == nil || !strings.Contains(err.Error(), "would retire every entry") {
+		t.Fatalf("MergeFloor retiring every moved-aside live record: %v, want a refusal", err)
+	}
+	if after, _ := os.ReadFile(floorPath(server)); string(after) != string(before) {
+		t.Fatalf("floor after the refused merge changed: %s", after)
+	}
+	r, err := s.MergeFloor(ctx, MergeOptions{Keep: []string{"a"}})
+	if err != nil || !slices.Equal(r.Retired, []string{"b"}) || !slices.Equal(r.Kept, []string{"a"}) {
+		t.Fatalf("MergeFloor keeping a = %+v, %v; want a kept and b retired", r, err)
 	}
 }
