@@ -315,3 +315,23 @@ func TestMergeFloorCommittedRerun(t *testing.T) {
 		}
 	})
 }
+
+// TestMergePending (U192): MergePending reports errMergePending while
+// keystore-floor.json.pre-restore is in the data root, and nil once it is
+// gone.
+func TestMergePending(t *testing.T) {
+	s, server := newTestStore(t)
+	if err := s.MergePending(); err != nil {
+		t.Fatalf("MergePending with no restore: %v", err)
+	}
+	path := writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
+	if err := s.MergePending(); !errors.Is(err, errMergePending) {
+		t.Fatalf("MergePending with the moved-aside floor in place: %v, want errMergePending", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MergePending(); err != nil {
+		t.Fatalf("MergePending after the merge: %v", err)
+	}
+}

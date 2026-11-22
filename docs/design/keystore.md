@@ -1266,7 +1266,12 @@ is already there, it writes nothing, only renames the input, and reports `alread
 when the input's newest deletion is below the live floor's (a Delete since). An input that is
 the data root's live floor, by path or by inode, is refused outright
 (`TestMergeFloorCommittedRerun`, `TestKeysFloorMergeCommittedRerun`). `k3sm start` is not hooked: its start path has no cheap synchronous
-check of the keystore, which only the delivery reconciler reads, and it writes no floor. The
+check of the keystore, and it writes no floor. The delivery reconciler, the server's one reader
+that publishes a value, is: each sweep first asks `FileStore.MergePending` (a Lstat of
+`keystore-floor.json.pre-restore`, any answer but not found counting as pending), and while it is
+set the sweep delivers nothing, reads no entry and makes no apiserver call, logs at Error and
+tries again on the next sweep (`TestDeliveryRefusedWhileMergePending`). `list` and `show` still
+read, and print a warning on stderr. The
 recipe moves the live `keystore/` into `server/pre-restore.d/`, a directory it creates root:wheel
 0700 with `mkdir` (which fails on an existing name), so the service user cannot reach the
 moved-aside entries to copy one back. It changes no file inside: a rename changes no inode's

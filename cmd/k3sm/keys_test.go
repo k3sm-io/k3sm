@@ -2502,6 +2502,13 @@ func TestKeysPendingMergeGuard(t *testing.T) {
 		}
 	}
 	h.mustRun(0, "list")
+	if !strings.Contains(h.stderr.String(), "warning: a restore is unfinished") {
+		t.Fatalf("list with a merge pending: stderr %q; want the warning", h.stderr.String())
+	}
+	h.mustRun(0, "show", "system/k")
+	if !strings.Contains(h.stderr.String(), "warning: a restore is unfinished") {
+		t.Fatalf("show with a merge pending: stderr %q; want the warning", h.stderr.String())
+	}
 	h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "system/k")
 	matches, err := filepath.Glob(recipeFloor(h) + ".merged-*")
 	if err != nil || len(matches) != 1 {

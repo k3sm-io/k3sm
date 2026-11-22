@@ -154,6 +154,7 @@ type keysStore interface {
 	RecordsSealedUnder(ctx context.Context, key []byte) (bool, error)
 	UserScopesExist(ctx context.Context) (bool, error)
 	MergeFloor(ctx context.Context, path string, keep []string) (keystore.MergeReport, error)
+	MergePending() error
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -334,6 +335,15 @@ func (v *keysVerb) evictedCode(err error) int {
 		return v.failf(keysCommitted, "%v", err)
 	}
 	return v.failf(keysRefused, "%v", err)
+}
+
+// warnMergePending prints a warning on stderr while a restore is unfinished
+// (s.MergePending): the read verbs still read the restored entries, which
+// the merge may yet delete again.
+func (v *keysVerb) warnMergePending(s keysStore) {
+	if err := s.MergePending(); err != nil {
+		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: a restore is unfinished: these are the restored entries before sudo k3sm keys floor merge has run, which may delete some of them again (%s)\n", v.name, scrubPaths(err, v.roots...))
+	}
 }
 
 // requireRoot refuses unless the verb runs as root: the master and entries
@@ -760,6 +770,7 @@ func keysList(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
+	v.warnMergePending(s)
 	raised := keysOK
 	if err := s.RaiseFloor(ctx); err != nil {
 		if raised = v.evictedCode(err); raised == keysRefused {
@@ -827,6 +838,7 @@ func keysShow(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
+	v.warnMergePending(s)
 	raised := keysOK
 	if err := s.RaiseFloor(ctx); err != nil {
 		if raised = v.evictedCode(err); raised == keysRefused {

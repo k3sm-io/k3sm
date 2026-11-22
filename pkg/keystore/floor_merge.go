@@ -43,6 +43,26 @@ const floorPreRestoreName = floorName + ".pre-restore"
 // the restored floor still lacks every deletion since the backup.
 var errMergePending = errors.New("a restore is unfinished: keystore-floor.json.pre-restore, the floor moved aside before it, is still in the data root, and the deletions it records are not merged yet. Run sudo k3sm keys floor merge on it first, as docs/user/keys.md describes (it renames the file when it is done); this verb changes nothing until then")
 
+// MergePending returns errMergePending while the restore's moved-aside
+// floor, keystore-floor.json.pre-restore, is in the data root: the merge has
+// not run, so the restored floor lacks every deletion since the backup, and
+// a reader that publishes a value (the delivery reconciler) must not. Any
+// answer but not found counts as pending. It takes no lock and writes
+// nothing; with no data root configured there is no floor, and it is nil.
+func (s *FileStore) MergePending() error {
+	if s.dataRoot == "" {
+		return nil
+	}
+	_, err := os.Lstat(filepath.Join(s.dataRoot, floorPreRestoreName))
+	switch {
+	case err == nil:
+		return errMergePending
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	}
+	return fmt.Errorf("%w (looking for it: %w)", errMergePending, err)
+}
+
 // MergeReport is what MergeFloor did with the moved-aside floor's burials.
 type MergeReport struct {
 	// Merged is how many burials the live floor gained from the moved-aside
