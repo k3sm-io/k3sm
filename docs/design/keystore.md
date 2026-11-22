@@ -1184,14 +1184,20 @@ with the same strict parser, then, under `keystore-lock` and then `keystore/.loc
 burial it records that the restored floor lacks, oldest first, each at the next delete
 sequence, so the merged burials keep their order. So a key created after the backup and
 revoked before the restore stays refused, and so does every generation buried under a name
-after the backup, which re-running `rm` could never record. The merge never buries a
-generation the restored floor holds live: that is the entry restored on purpose, or one
-revoked after the backup that the backup holds; it reports each such name as skipped live,
-and the operator runs `rm` on the ones that were revoked. It keeps every live record. The
-write is pruned as every floor write is, the per-name cap included, and each burial dropped is
-logged at Warn and reported. The verb prints `merged N`, `already present N`, `skipped live N`
-and `dropped N`, one per line, then `skipped live system/<name>: ...` for each name skipped
-and `dropped system/<name>: ...` for each burial dropped, and exits 0 once the merge is
+after the backup, which re-running `rm` could never record. A generation the moved-aside
+floor buries and the restored floor holds live is buried too, its live record cleared: the
+backup holds an entry deleted after it, perhaps to revoke it, so the merge fails closed rather
+than leave it live. The operator names each entry restored on purpose, the one deleted by
+mistake, with `--keep system/<name>` (repeatable; `MergeFloor`'s keep set), which keeps that
+name's restored generation live. The choice is made before the merge: a burial is never
+removed, so a second merge with `--keep` cannot bring back an entry the first buried. The
+residual is the operator's: a name kept by mistake is a revoked key live again. The merge keeps
+every other live record. The write is pruned as every floor write is, the per-name cap
+included, and each burial dropped is logged at Warn and reported. The verb prints `merged N`,
+`already present N`, `buried live N`, `kept N` and `dropped N`, one per line, then `buried live
+system/<name>: ...` for each name whose live generation it buried (and whose directory `rm`
+removes), `kept system/<name>: ...` for each name kept and `dropped system/<name>: ...` for each
+burial dropped, and exits 0 once the merge is
 written. The saved floor must come from a
 root-owned, root-only location: the floor decides what is live, and a planted floor marks
 revoked entries live. Removing the floor, the older-keystore procedure above, discards every
@@ -4474,7 +4480,7 @@ carried by the unit rows.
 | U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
-| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 64 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry; `keys floor merge` carries every burial of the moved-aside floor into a restored one, never burying a generation it holds live, pruned and reported | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `TestDeleteIgnoresPlantedGeneration`, `TestPerNameCapIsBackstop`, `TestDeleteWithoutMasterWarnsUnrecorded`, `TestDeleteReportsEvictedTombstone`, `TestDeleteWarnsUnrecordedWithMaster`, `TestFloorMergeSemantics`, `TestFloorMergeCapsAndPrune`, `TestFloorMergeRefusesUntrusted`, `FuzzParseFloor` | checked: the floor's tombstone |
+| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 64 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry; `keys floor merge` carries every burial of the moved-aside floor into a restored one, burying a generation it holds live unless --keep names the entry, pruned and reported | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `TestDeleteIgnoresPlantedGeneration`, `TestPerNameCapIsBackstop`, `TestDeleteWithoutMasterWarnsUnrecorded`, `TestDeleteReportsEvictedTombstone`, `TestDeleteWarnsUnrecordedWithMaster`, `TestFloorMergeSemantics`, `TestFloorMergeCapsAndPrune`, `TestFloorMergeRefusesUntrusted`, `TestFloorMergeBuriesRevokedLive`, `TestMergeFloorKeep`, `FuzzParseFloor` | checked: the floor's tombstone |
 
 ### Rig legs
 

@@ -29,14 +29,19 @@ import (
 
 // MergeReport is what MergeFloor did with the moved-aside floor's burials.
 type MergeReport struct {
-	// Merged is how many burials the live floor gained.
+	// Merged is how many burials the live floor gained from the moved-aside
+	// floor's, BuriedLive's included.
 	Merged int
 	// AlreadyPresent is how many the live floor already buried.
 	AlreadyPresent int
-	// SkippedLive names, sorted, each entry whose generation the moved-aside
-	// floor buries and the live floor holds live: never buried by the merge,
-	// so a key revoked by deleting it is live again until rm deletes it.
-	SkippedLive []string
+	// BuriedLive names, sorted, each entry whose generation the moved-aside
+	// floor buries and the live floor held live: the merge buried it, so a
+	// key revoked by deleting it since the backup stays refused.
+	BuriedLive []string
+	// Kept names, sorted, each entry the keep set named whose live
+	// generation the merge would otherwise have buried: it stays live, the
+	// entry restored on purpose.
+	Kept []string
 	// Dropped names, sorted and with repeats, each burial the write dropped
 	// to stay within the floor's caps (the per-name cap and the tombstone
 	// budget): a copy of it put back is accepted again.
@@ -51,22 +56,31 @@ type MergeReport struct {
 // is read as the floor is, judged on its descriptor (a regular file owned by
 // root and not group- or other-writable, under maxFloorSize) and parsed by
 // parseFloor. Under keystore-lock and then keystore/.lock (§ Concurrency) it
-// adds each burial the live floor lacks, in the order the file buried them;
-// it never buries a generation the live floor holds live (SkippedLive), and
-// it keeps every live record. The write is pruned as every floor write is,
-// and each burial it drops is logged at Warn and reported.
-func (s *FileStore) MergeFloor(ctx context.Context, path string) (MergeReport, error) {
-	r, err := s.mergeFloor(ctx, path)
+// adds each burial the live floor lacks, in the order the file buried them.
+// A generation the live floor holds live is buried too (BuriedLive): it was
+// deleted after the backup, so the merge fails closed, unless keep names
+// the entry, whose restored generation then stays live (Kept). keep holds
+// entry names, each checked as a name is. The write is pruned as every
+// floor write is, and each burial it drops is logged at Warn and reported.
+func (s *FileStore) MergeFloor(ctx context.Context, path string, keep []string) (MergeReport, error) {
+	r, err := s.mergeFloor(ctx, path, keep)
 	if err != nil {
 		return MergeReport{}, fmt.Errorf("merge the floor: %w", err)
 	}
 	return r, nil
 }
 
-func (s *FileStore) mergeFloor(ctx context.Context, path string) (MergeReport, error) {
+func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) (MergeReport, error) {
 	var r MergeReport
 	if err := s.checkConfig(); err != nil {
 		return r, err
+	}
+	kept := map[string]bool{}
+	for _, name := range keep {
+		if err := checkName(name); err != nil {
+			return r, fmt.Errorf("keep: %w", err)
+		}
+		kept[name] = true
 	}
 	from, err := s.readFloorAt(path)
 	if err != nil {
@@ -91,7 +105,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string) (MergeReport, e
 	}
 	var capDropped []pruned
 	_, dropped, err := fdir.updatePruned(func(fl floor) bool {
-		r, capDropped = fl.merge(from)
+		r, capDropped = fl.merge(from, kept)
 		return r.Merged > 0
 	})
 	if err != nil {
@@ -102,8 +116,8 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string) (MergeReport, e
 	}
 	sort.Strings(r.Dropped)
 	logPruned(capDropped)
-	for _, name := range r.SkippedLive {
-		slog.Warn("keystore floor: the moved-aside floor records a generation of this entry as deleted, and the restored floor holds it live, so the merge did not bury it; if it was deleted to revoke it, run rm on it", "name", name)
+	for _, name := range r.BuriedLive {
+		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and the restored entry is refused; rm removes its directory", "name", name)
 	}
 	return r, nil
 }
@@ -148,10 +162,11 @@ func (s *FileStore) readFloorAt(path string) (floor, error) {
 // merge adds to fl every burial in from that fl lacks, oldest (lowest
 // Deleted) first, each at one more than the highest delete sequence in fl,
 // so the merged burials keep their order and stay newer than fl's own. A
-// generation fl holds live under the name is never buried (SkippedLive),
-// and fl's live records are kept. At maxBuriedPerName, add drops the name's
-// oldest, returned. It does not prune: update does.
-func (fl floor) merge(from floor) (MergeReport, []pruned) {
+// generation fl holds live under the name is buried as well, its live record
+// cleared (BuriedLive), unless keep names the entry (Kept); fl's other live
+// records are kept. At maxBuriedPerName, add drops the name's oldest,
+// returned. It does not prune: update does.
+func (fl floor) merge(from floor, keep map[string]bool) (MergeReport, []pruned) {
 	type at struct {
 		name string
 		b    burial
@@ -170,31 +185,50 @@ func (fl floor) merge(from floor) (MergeReport, []pruned) {
 	})
 	var r MergeReport
 	var out []pruned
-	skipped := map[string]bool{}
+	// last is the highest delete sequence in fl, kept as each burial lands.
+	last := fl.lastDeleted()
+	add := func(name, g string) {
+		if last >= maxDeleteSeq {
+			last = fl.renumber()
+		}
+		last++
+		// Read after renumber, which rewrites the name's own burials in fl.
+		f := fl[name]
+		if f.live() && f.Generation == g {
+			f.Generation, f.Seq = "", 0
+		}
+		if dropped, ok := f.add(burial{Generation: g, Deleted: last}); ok {
+			out = append(out, pruned{name: name, generation: dropped.Generation})
+		}
+		fl[name] = f
+		r.Merged++
+	}
+	kept, buriedLive := map[string]bool{}, map[string]bool{}
 	for _, a := range all {
 		f := fl[a.name]
 		switch {
 		case f.live() && f.Generation == a.b.Generation:
-			skipped[a.name] = true
-			continue
+			if keep[a.name] {
+				kept[a.name] = true
+				continue
+			}
+			buriedLive[a.name] = true
 		case f.buries(a.b.Generation):
 			r.AlreadyPresent++
 			continue
 		}
-		last := fl.lastDeleted()
-		if last >= maxDeleteSeq {
-			last = fl.renumber()
-		}
-		f = fl[a.name]
-		if dropped, ok := f.add(burial{Generation: a.b.Generation, Deleted: last + 1}); ok {
-			out = append(out, pruned{name: a.name, generation: dropped.Generation})
-		}
-		fl[a.name] = f
-		r.Merged++
+		add(a.name, a.b.Generation)
 	}
-	for name := range skipped {
-		r.SkippedLive = append(r.SkippedLive, name)
-	}
-	sort.Strings(r.SkippedLive)
+	r.BuriedLive, r.Kept = sortedNames(buriedLive), sortedNames(kept)
 	return r, out
+}
+
+// sortedNames is set's names, sorted, or nil for none.
+func sortedNames(set map[string]bool) []string {
+	var out []string
+	for name := range set {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }

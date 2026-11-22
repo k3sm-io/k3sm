@@ -36,8 +36,9 @@ func mgen(i int) string { return fmt.Sprintf("%032x", i) }
 
 // TestFloorMergeSemantics (U192): merge adds every burial the restored
 // floor lacks, in the moved-aside floor's order and newer than the restored
-// floor's own; counts the ones already present; never buries a generation
-// the restored floor holds live (reported); and keeps every live record.
+// floor's own; counts the ones already present; buries a generation the
+// restored floor holds live (reported), unless keep names it (reported
+// apart); and keeps every other live record.
 func TestFloorMergeSemantics(t *testing.T) {
 	restored := floor{
 		"live":  {Generation: mgen(1), Seq: 3},
@@ -50,12 +51,23 @@ func TestFloorMergeSemantics(t *testing.T) {
 		"dead":    {Buried: []burial{{Generation: mgen(3), Deleted: 3}}},
 		"revoked": {Buried: []burial{{Generation: mgen(5), Deleted: 4}, {Generation: mgen(6), Deleted: 6}}},
 	}
-	r, dropped := restored.merge(aside)
-	if r.Merged != 3 || r.AlreadyPresent != 1 || !slices.Equal(r.SkippedLive, []string{"live"}) || len(dropped) != 0 {
-		t.Fatalf("merge = %+v, dropped %v; want 3 merged, 1 present, live skipped, none dropped", r, dropped)
+	kept := floor{}
+	for name, e := range restored {
+		kept[name] = e
 	}
-	if e := restored["live"]; e.Generation != mgen(1) || e.Seq != 3 || len(e.burials()) != 0 {
-		t.Errorf("live after the merge = %+v, want its live record kept and nothing buried", e)
+	r, dropped := restored.merge(aside, nil)
+	if r.Merged != 4 || r.AlreadyPresent != 1 || !slices.Equal(r.BuriedLive, []string{"live"}) || len(r.Kept) != 0 || len(dropped) != 0 {
+		t.Fatalf("merge = %+v, dropped %v; want 4 merged, 1 present, live buried, none kept or dropped", r, dropped)
+	}
+	if e := restored["live"]; e.live() || !e.buries(mgen(1)) {
+		t.Errorf("live after the merge = %+v, want its live generation buried", e)
+	}
+	r, _ = kept.merge(aside, map[string]bool{"live": true})
+	if r.Merged != 3 || len(r.BuriedLive) != 0 || !slices.Equal(r.Kept, []string{"live"}) {
+		t.Fatalf("merge keeping live = %+v; want 3 merged, live kept", r)
+	}
+	if e := kept["live"]; e.Generation != mgen(1) || e.Seq != 3 || len(e.burials()) != 0 {
+		t.Errorf("live after the merge keeping it = %+v, want its live record kept and nothing buried", e)
 	}
 	if e := restored["other"]; e.Generation != mgen(2) || !e.buries(mgen(4)) || e.buries(mgen(9)) {
 		t.Errorf("other after the merge = %+v, want its live record kept and only the burial merged", e)
@@ -85,7 +97,7 @@ func TestFloorMergeCapsAndPrune(t *testing.T) {
 		bs = append(bs, burial{Generation: mgen(10 + i), Deleted: uint64(i + 1)})
 	}
 	aside["n"] = floorEntry{Buried: bs}
-	r, dropped := restored.merge(aside)
+	r, dropped := restored.merge(aside, nil)
 	if r.Merged != smallBuriedPerName || len(dropped) != 1 || dropped[0].generation != mgen(1) {
 		t.Fatalf("merge past the cap = %+v, dropped %v; want %d merged and the restored floor's own burial dropped", r, dropped, smallBuriedPerName)
 	}
@@ -106,7 +118,7 @@ func TestFloorMergeCapsAndPrune(t *testing.T) {
 	// floor's own burials it does not.
 	setFloorLimits(t, smallFloorSize, 3100)
 	buf := captureWarn(t)
-	got, err := s.MergeFloor(ctx, path)
+	got, err := s.MergeFloor(ctx, path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,14 +157,14 @@ func TestFloorMergeRefusesUntrusted(t *testing.T) {
 	if err := os.WriteFile(bad, []byte(`{"version":1,"scope":"system","entries":{},"tombstones":{"k":[]}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeFloor(ctx, bad); !errors.Is(err, ErrCorrupt) {
+	if _, err := s.MergeFloor(ctx, bad, nil); !errors.Is(err, ErrCorrupt) {
 		t.Errorf("MergeFloor of a malformed floor: %v, want ErrCorrupt", err)
 	}
 	link := filepath.Join(filepath.Dir(server), "link.json")
 	if err := os.Symlink(floorPath(server), link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeFloor(ctx, link); !errors.Is(err, errFloorUntrusted) {
+	if _, err := s.MergeFloor(ctx, link, nil); !errors.Is(err, errFloorUntrusted) {
 		t.Errorf("MergeFloor of a symlink: %v, want errFloorUntrusted", err)
 	}
 	if after, err := os.ReadFile(floorPath(server)); err != nil || string(after) != string(before) {
@@ -187,4 +199,46 @@ func readFloorFile(t *testing.T, server string) floor {
 		t.Fatal(err)
 	}
 	return fl
+}
+
+// TestFloorMergeBuriesRevokedLive (U192): a generation the moved-aside floor
+// buries and the restored floor holds live (a key revoked since the backup)
+// is buried by the merge, never left live.
+func TestFloorMergeBuriesRevokedLive(t *testing.T) {
+	restored := floor{"n": {Generation: mgen(1), Seq: 3}}
+	aside := floor{"n": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}}
+	restored.merge(aside, nil)
+	if e := restored["n"]; e.live() || !e.buries(mgen(1)) {
+		t.Fatalf("n after the merge = %+v, want its restored live generation buried", e)
+	}
+}
+
+// TestMergeFloorKeep (U192): MergeFloor with a keep set leaves that entry's
+// restored generation live and reports it, buries the others' revoked live
+// generations, and refuses a keep name that is not a valid name.
+func TestMergeFloorKeep(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	putFloorFile(t, server, floor{"a": {Generation: mgen(1), Seq: 1}, "b": {Generation: mgen(2), Seq: 1}})
+	path := writeAsideFloor(t, server, floor{
+		"a": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}},
+		"b": {Buried: []burial{{Generation: mgen(2), Deleted: 2}}},
+	})
+	if _, err := s.MergeFloor(ctx, path, []string{"Bad Name"}); !errors.Is(err, ErrInvalidName) {
+		t.Fatalf("MergeFloor with an invalid keep name: %v, want ErrInvalidName", err)
+	}
+	r, err := s.MergeFloor(ctx, path, []string{"a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(r.Kept, []string{"a"}) || !slices.Equal(r.BuriedLive, []string{"b"}) {
+		t.Fatalf("MergeFloor keeping a = %+v, want a kept and b buried", r)
+	}
+	fl := readFloorFile(t, server)
+	if e := fl["a"]; e.Generation != mgen(1) || e.buries(mgen(1)) {
+		t.Errorf("a after the merge = %+v, want it live", e)
+	}
+	if e := fl["b"]; e.live() || !e.buries(mgen(2)) {
+		t.Errorf("b after the merge = %+v, want it buried", e)
+	}
 }

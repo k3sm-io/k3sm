@@ -330,15 +330,24 @@ restored floor:
 sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore
 ```
 
-The merge keeps every key revoked since the backup refused, a key created after the backup
-included, and every older version of a name deleted more than once. It prints how many deletions
-it merged, how many the restored floor already had, how many it skipped because the restored
-floor holds that entry live, and how many it had to drop to stay within the floor's limits. It
-never deletes an entry the restored floor holds live, because that is the entry you restored on
-purpose. It lists each one it skipped as `skipped live system/<name>`. For each skipped name you
-deleted to revoke a key, delete it again now, with `sudo k3sm keys rm system/<name> --yes`. A
-line starting `dropped` names a deletion the floor could not keep: a copy of that entry put back
-is accepted. Then start the server and check the entries:
+The merge keeps every key revoked since the backup refused: a key created after the backup, every
+older version of a name deleted more than once, and an entry the backup holds that you deleted
+since. That last kind is restored and then deleted again by the merge, because a deletion since
+the backup may have revoked the key. To bring back an entry you deleted by mistake, which is the
+reason to restore, name it with `--keep`, once for each entry:
+
+```
+sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore --keep system/<name>
+```
+
+Decide before you run the merge: once it has deleted an entry again, running it once more with
+`--keep` does not bring that entry back. The merge prints how many deletions it merged, how many
+the restored floor already had, how many restored entries it deleted again, how many it kept
+because `--keep` named them, and how many it had to drop to stay within the floor's limits. It
+lists each entry it deleted again as `buried live system/<name>`, and each one it kept as `kept
+system/<name>`. Remove each deleted entry's files with `sudo k3sm keys rm system/<name> --yes`.
+A line starting `dropped` names a deletion the floor could not keep: a copy of that entry put
+back is accepted. Then start the server and check the entries:
 
 ```
 sudo k3sm start
@@ -354,16 +363,16 @@ Restore the floor file too, or the entry stays refused. When you delete an entry
 notes the deletion, and any copy of that entry put back later is refused with a message saying
 the floor records it as deleted, because the check cannot tell your restore from someone
 putting a deleted key back. The floor file saved with the backup still lists the entry as live,
-so restoring it with `keystore/` brings the entry back.
+so restoring it with `keystore/`, and naming the entry with `--keep` in the merge, brings the
+entry back.
 
 A restore puts back the whole keystore as it was when you saved it, not one entry:
 
 - Every `rotate` since the backup is undone. Each entry's current version is the one it had
   then.
 - Every entry you deleted since the backup comes back, and root's record of those deletions is
-  gone, until the merge above carries those deletions over. The merge never deletes an entry
-  the restored floor holds live, so a key you deleted to revoke it that the backup holds is
-  live again until you delete it again with `rm`, before `k3sm start`, as above.
+  gone, until the merge above carries those deletions over. The merge deletes each of those
+  entries again unless `--keep` names it, so a key you deleted to revoke it stays deleted.
 
 Only when `list` shows every entry `ok`, delete the copies you moved aside:
 

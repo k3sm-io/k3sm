@@ -452,8 +452,9 @@ in a root-only directory on the Mac, never on a volume that ignores ownership or
 write. A restore stops the server, checks that no copy from an earlier restore is still set
 aside and that the saved floor matches the SHA-256 recorded for it, moves the live `keystore/`
 aside rather than deleting it, puts the backup in place with `ditto`, merges every deletion the
-moved-aside floor records into the restored floor with `sudo k3sm keys floor merge`, deletes
-again with `rm` each revoked key the merge reports as skipped live, starts the server, and
+moved-aside floor records into the restored floor with `sudo k3sm keys floor merge`, which
+deletes again each restored entry deleted since the backup unless `--keep` names it, removes
+those entries' files with `rm`, starts the server, and
 checks `sudo k3sm keys list` before the moved-aside copy is deleted.
 A restored `keystore/` older than the live one is refused until root removes
 `/var/lib/k3sm/keystore-floor.json`. Removing the floor discards every deletion it recorded, so

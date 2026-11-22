@@ -800,22 +800,39 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			}
 		}
 	})
-	// A key deleted to revoke it is live again after the restore: the
-	// merge never buries a generation the restored floor holds live, and
-	// reports it as skipped live; the recipe deletes it again before start,
-	// and it stays deleted.
-	t.Run("save rm restore, the revoked key deleted again before start", func(t *testing.T) {
+	// A key deleted to revoke it since the backup is deleted again by the
+	// merge, which buries the restored generation and reports it as buried
+	// live; rm removes its directory, and it stays deleted.
+	t.Run("save rm restore, the revoked key buried by the merge", func(t *testing.T) {
 		h := newKeysHarness(t)
 		saveRmRestore(t, h, true)
 		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore")
-		if got := h.stdout.String(); !strings.Contains(got, "merged 0\nalready present 0\nskipped live 1\ndropped 0\n") || !strings.Contains(got, "skipped live system/rb:") {
-			t.Fatalf("floor merge printed %q, want rb skipped live", got)
+		if got := h.stdout.String(); !strings.Contains(got, "merged 1\nalready present 0\nburied live 1\nkept 0\ndropped 0\n") || !strings.Contains(got, "buried live system/rb:") {
+			t.Fatalf("floor merge printed %q, want rb buried live", got)
 		}
-		h.mustRun(0, "show", "system/rb", "--reveal")
+		refusedDeleted(t, h, "system/rb")
 		h.mustRun(0, "rm", "system/rb", "--yes")
 		h.mustRun(1, "show", "system/rb", "--reveal")
 		if h.stdout.Len() != 0 {
-			t.Fatalf("show printed %q for the key deleted again", h.stdout.Bytes())
+			t.Fatalf("show printed %q for the key buried by the merge", h.stdout.Bytes())
+		}
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "rb")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("rb's directory after rm: %v, want it removed", err)
+		}
+	})
+	// --keep keeps the restored generation of an entry deleted since the
+	// backup live: the entry restored on purpose.
+	t.Run("save rm restore, the key kept with --keep", func(t *testing.T) {
+		h := newKeysHarness(t)
+		value, _ := saveRmRestore(t, h, true)
+		h.mustRun(2, "floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "rb")
+		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "system/rb")
+		if got := h.stdout.String(); !strings.Contains(got, "merged 0\nalready present 0\nburied live 0\nkept 1\ndropped 0\n") || !strings.Contains(got, "kept system/rb:") {
+			t.Fatalf("floor merge --keep printed %q, want rb kept", got)
+		}
+		h.mustRun(0, "show", "system/rb", "--reveal")
+		if !bytes.Equal(h.stdout.Bytes(), value) {
+			t.Fatalf("kept value = %q, want %q", h.stdout.Bytes(), value)
 		}
 	})
 	// A key created after the backup and revoked before the restore is in
@@ -833,7 +850,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			t.Fatalf("restore: %v", err)
 		}
 		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore")
-		if got := h.stdout.String(); !strings.HasPrefix(got, "merged 1\nalready present 0\nskipped live 0\ndropped 0\n") {
+		if got := h.stdout.String(); !strings.HasPrefix(got, "merged 1\nalready present 0\nburied live 0\nkept 0\ndropped 0\n") {
 			t.Fatalf("floor merge printed %q, want late's burial merged", got)
 		}
 		copyTree(t, late, filepath.Join(h.keystoreDir(), "late"))
