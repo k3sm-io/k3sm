@@ -540,10 +540,13 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 	return out
 }
 
-// Delete removes name and every version of it. The pointer is removed first
-// and the entry's floor last, so an interrupted Delete leaves a directory with
-// no pointer whose generation the floor still records: damage that List
-// reports and Delete, called again, clears. With no floor file to say so, a
+// Delete removes name and every version of it. It buries the name in the
+// floor first, then removes the pointer, then the directory, so an
+// interrupted Delete, or a removal the service user made fail, leaves a
+// directory whose generation the floor already records as deleted: refused
+// by every reader, and cleared by Delete called again, with no floor change.
+// A removal that fails after the burial says the entry is already deleted
+// and its directory left behind (leftBehind). With no floor file to say so, a
 // directory holding only generation and v1 is an interrupted Put instead,
 // which is not an entry: Delete, called again, removes it and answers
 // ErrNotFound, and so does the next Put of the name. Delete reads nothing
@@ -560,12 +563,13 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // record buried, and Delete succeeds, logging that the directory was
 // already gone (buryGone); only a name with no live record and nothing
 // under it is ErrNotFound. So a directory moved away during rm and moved
-// back is refused, and so is one a crash after the directory's removal left
-// a live record for, once rm runs again or a Put of the name replaces that
-// record (floor.set buries it). With no live record, the deleted
-// directory's generation is buried only when the master is loaded and the
-// directory's pointer authenticates under it: a Put that crashed after its
-// pointer. A master-less Delete of such a directory buries nothing.
+// back is refused, and so is one an earlier build's Delete, which removed
+// the directory before its floor write, left with a live record, once rm
+// runs again or a Put of the name replaces that record (floor.set buries
+// it). The deleted directory's generation is buried too, when it is not the
+// live one, only when the master is loaded and the directory's pointer
+// authenticates under it. A master-less Delete of a directory under a name
+// with no live record buries nothing, and logs that (warnUnrecorded).
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
