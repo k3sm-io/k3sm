@@ -142,8 +142,9 @@ type Reconciler struct {
 	// mu serializes sweeps and guards fileState and targetState: Run's
 	// goroutine is the only production caller, but a test may call Sweep.
 	mu sync.Mutex
-	// fileState is the signature of the last logged declaration refusal, so an
-	// unchanged refused file logs once; stateFileState is the state file's.
+	// fileState is the signature of the last logged declaration refusal or
+	// absence, so an unchanged refused or absent file logs once;
+	// stateFileState is the state file's.
 	fileState      string
 	stateFileState string
 	// targetState maps a target to its last logged outcome, so each target
@@ -287,15 +288,15 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 		}
 		return
 	}
-	r.fileState = ""
 	if !exists {
 		// An absent declaration (file or data root) is not a withdrawal:
 		// nothing is created or updated, and the ownership records are kept,
 		// so a declaration that comes back still reaches its Secrets. Only a
 		// declaration that exists and parses without a target withdraws it.
-		r.logger.Debug("keystore delivery: no declaration; nothing to deliver, records kept", "file", r.path)
+		r.missingDeclaration()
 		return
 	}
+	r.fileState = ""
 	// Ownership rests on the state file, so one that cannot be trusted
 	// delivers nothing: without it, no Secret is known to be ours.
 	st, err := ReadState(r.statePath, r.open, r.stateDirCheck, r.stateCheck)
@@ -331,6 +332,25 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 		if err := WriteState(r.statePath, sw.state, r.stateDirCheck, r.chown); err != nil {
 			r.logger.Warn("keystore delivery: cannot drop withdrawn targets from the state file; will retry", "file", r.statePath, "err", err)
 		}
+	}
+}
+
+// missingDeclaration logs an absent declaration: at Warn, once per state,
+// when the state file records delivered Secrets that rotations no longer
+// reach, else at Debug. It reads the state file to count the records and
+// never writes it; the count is all it logs.
+func (r *Reconciler) missingDeclaration() {
+	st, err := ReadState(r.statePath, r.open, r.stateDirCheck, r.stateCheck)
+	if err != nil || len(st.owned) == 0 {
+		r.fileState = ""
+		r.logger.Debug("keystore delivery: no declaration; nothing to deliver, records kept", "file", r.path)
+		return
+	}
+	n := len(st.owned)
+	if sig := "absent:" + strconv.Itoa(n); r.fileState != sig {
+		r.fileState = sig
+		r.logger.Warn(fmt.Sprintf("keystore delivery: the declaration is missing; %d delivered Secrets are not being updated", n),
+			"file", r.path, "state", r.statePath)
 	}
 }
 

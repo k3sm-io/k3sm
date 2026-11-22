@@ -66,7 +66,8 @@ limitations under the License.
 // An update of the value writes data, type, the label and the two
 // annotations, and strips any immutable flag. A target withdrawn from a declaration that exists and
 // parses loses its state record, so declaring it again leaves the old Secret
-// alone; an absent declaration withdraws nothing and keeps every record.
+// alone; an absent declaration withdraws nothing and keeps every record,
+// and warns once with the number of Secrets rotations no longer reach.
 //
 // It never lists, deletes only an owned immutable Secret (under a UID
 // precondition) and touches no other kind, so withdrawing a

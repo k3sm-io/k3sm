@@ -1809,3 +1809,50 @@ func TestReconcilerTerminatingNotDeleted(t *testing.T) {
 		t.Fatalf("the wait is logged %d times, want 1\n%s", n, h.logs.String())
 	}
 }
+
+// TestMissingDeclarationWarnsOnce: an absent declaration while the state
+// file holds records warns once per state, with the record count and no
+// value, and leaves the state file unwritten; with no records it does not
+// warn (G20).
+func TestMissingDeclarationWarnsOnce(t *testing.T) {
+	const msg = "the declaration is missing; 1 delivered Secrets are not being updated"
+	h := newHarness(t, true, false)
+	h.r.Sweep(context.Background())
+	if strings.Contains(h.logs.String(), "the declaration is missing") {
+		t.Fatalf("an absent declaration with no records warned\n%s", h.logs.String())
+	}
+	h.store.set("api-token", 1, []byte("the-stored-value"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	if err := os.Remove(h.path); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(h.dir, StateFileName)
+	before := mustStat(t, statePath)
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	logs := h.logs.String()
+	if n := strings.Count(logs, msg); n != 1 {
+		t.Fatalf("the missing declaration is warned %d times, want 1\n%s", n, logs)
+	}
+	if !strings.Contains(logs, "level=WARN msg=\"keystore delivery: "+msg) {
+		t.Fatalf("the missing declaration is not a Warn\n%s", logs)
+	}
+	if strings.Contains(logs, "the-stored-value") {
+		t.Fatalf("the log carries the value\n%s", logs)
+	}
+	if after := mustStat(t, statePath); !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
+		t.Fatalf("an absent declaration rewrote the state file")
+	}
+	// Back, then gone again: a new state, so it warns again.
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	h.r.Sweep(ctx)
+	if err := os.Remove(h.path); err != nil {
+		t.Fatal(err)
+	}
+	h.r.Sweep(ctx)
+	if n := strings.Count(h.logs.String(), msg); n != 2 {
+		t.Fatalf("a second absence is warned %d times in all, want 2\n%s", n, h.logs.String())
+	}
+}
