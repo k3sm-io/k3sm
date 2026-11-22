@@ -276,3 +276,40 @@ func TestKeysDeliverWritersSerialize(t *testing.T) {
 		t.Fatalf("declared namespaces %v, want both writers' (ops, payments)", got)
 	}
 }
+
+// TestKeysRmWarnsDeclared: rm of an entry still declared for delivery warns
+// once per declared target, naming the namespace and Secret and what to do,
+// and prints no path and no value; an undeclared entry draws no warning.
+func TestKeysRmWarnsDeclared(t *testing.T) {
+	h := newKeysHarness(t)
+	value := []byte("rm-warn-secret-value")
+	h.put("system/api-token", value)
+	h.put("system/other", []byte("other-secret-value"))
+	h.mustRun(keysOK, "deliver", "system/api-token", "--namespace", "payments")
+	h.mustRun(keysOK, "deliver", "system/api-token", "--namespace", "ops", "--secret-name", "tok")
+	h.mustRun(keysOK, "deliver", "system/other", "--namespace", "payments")
+	h.mustRun(keysOK, "rm", "system/api-token", "--yes")
+	errOut := h.stderr.String()
+	for _, want := range []string{
+		"system/api-token is still declared for delivery to payments/api-token; the Secret keeps its value: run `k3sm keys undeliver` and delete the Secret",
+		"still declared for delivery to ops/tok",
+	} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("rm does not warn %q\n%s", want, errOut)
+		}
+	}
+	if strings.Contains(errOut, "payments/other") {
+		t.Errorf("rm warned about another entry's target\n%s", errOut)
+	}
+	out := h.stdout.String() + errOut
+	for _, leak := range []string{string(value), filepath.Dir(h.work), keydeliver.FileName} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("rm printed %q\n%s", leak, out)
+		}
+	}
+	h.put("system/fresh", []byte("x"))
+	h.mustRun(keysOK, "rm", "system/fresh", "--yes")
+	if h.stderr.Len() != 0 {
+		t.Fatalf("rm of an undeclared entry warned: %s", h.stderr.String())
+	}
+}

@@ -201,6 +201,10 @@ data key `value` unless you pass `--data-key`. An `ed25519` entry is delivered a
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
   declaration, and prints: the Secret stays; delete it with kubectl, and rotate the entry to
   revoke. A Pod that read the value still has it, which is why revoking it means rotating.
+- **Deleting a delivered entry.** `rm` does not withdraw its deliveries. For each one still
+  declared, it warns: still declared for delivery to `<namespace>/<secret>`; the Secret keeps its
+  value: run `k3sm keys undeliver` and delete the Secret. Until you do, the server logs that it
+  cannot read the entry, and the Secret holds the last value it delivered.
 
 The declaration is `/var/lib/k3sm/keystore-delivery.json`, owned by root, mode 0644, and only
 `k3sm keys deliver` and `undeliver` write it. It decides which namespace the server writes a

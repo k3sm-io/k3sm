@@ -81,6 +81,28 @@ func (v *keysVerb) readDeclaration(path string) (keydeliver.Declaration, error) 
 	return d, nil
 }
 
+// warnDeclared warns, after rm deleted entry name, about each target still
+// declaring it for delivery: the reconciler can no longer read the entry, but
+// the Secret it delivered keeps the value. It prints the namespace and
+// Secret, never a path or a value, and only warns: rm has already succeeded.
+func (v *keysVerb) warnDeclared(name string) {
+	path, err := v.deliveryPath()
+	if err == nil {
+		var d keydeliver.Declaration
+		if d, _, _, err = keydeliver.Read(path, keydeliver.OpenNoFollow, v.env.deliveryCheck); err == nil {
+			for _, t := range d.Targets {
+				if t.Name == name {
+					fmt.Fprintf(v.env.stderr, "k3sm keys rm: warning: %s is still declared for delivery to %s/%s; "+
+						"the Secret keeps its value: run `k3sm keys undeliver` and delete the Secret\n",
+						qualify(name), t.Namespace, t.Secret())
+				}
+			}
+			return
+		}
+	}
+	fmt.Fprintf(v.env.stderr, "k3sm keys rm: warning: cannot read the delivery declaration to check whether %s is still declared for delivery\n", qualify(name))
+}
+
 func keysDeliver(ctx context.Context, args []string, env keysEnv) int {
 	v := newKeysVerb("deliver", env)
 	ns := v.fs.String("namespace", "", "the namespace the Secret is delivered into (required)")

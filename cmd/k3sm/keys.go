@@ -869,6 +869,7 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	fmt.Fprintf(env.stdout, "deleted %s\n", qualify(name))
+	v.warnDeclared(name)
 	return keysOK
 }
 
