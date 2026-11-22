@@ -24,6 +24,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -323,5 +324,46 @@ func TestFloorMergeRemovesGuardBuriedStaged(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(s.dir, "other")); err != nil {
 		t.Fatalf("other's directory after the merge: %v, want it moved into place", err)
+	}
+}
+
+// TestFloorMergeAsideUnverified (U192): a moved-aside pointer that does not
+// authenticate, or a master that does not load for the moved-aside tree, is
+// reported (AsideUnverified), dry run and merge alike: the fence is then one
+// past the moved-aside floor's record, not past a pointer.
+func TestFloorMergeAsideUnverified(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		spoil func(t *testing.T, s *FileStore, server string)
+	}{
+		{"a pointer that does not authenticate", func(t *testing.T, s *FileStore, _ string) {
+			p := stagePath(s, asideTreeName, "k", currentName)
+			raw, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw[len(raw)-1] ^= 0xff
+			if err := os.WriteFile(p, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"no master", func(t *testing.T, _ *FileStore, server string) {
+			if err := os.Rename(masterPath(server, masterName), masterPath(server, masterName+".aside")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			stageRecipe(t, s, server, 0)
+			tc.spoil(t, s, server)
+			for _, dry := range []bool{true, false} {
+				r, err := s.MergeFloor(ctx, MergeOptions{DryRun: dry})
+				if err != nil || !slices.Equal(r.AsideUnverified, []string{"k"}) {
+					t.Fatalf("MergeFloor (dry run %v) with %s: %+v, %v; want k's moved-aside pointer unverified", dry, tc.name, r, err)
+				}
+			}
+		})
 	}
 }

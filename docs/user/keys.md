@@ -431,7 +431,11 @@ merge could not check with the master key, most often because the master key is 
 merge then leaves the restored floor's record of that entry as it is. A copy older than that
 record is refused and a copy at it is accepted. If the merge also fenced the entry, a newer copy
 up to the fence is refused until the next `rotate`, so if the backup's copy is newer than the
-floor saved with it, `show` refuses the entry as a copy from before the restore.
+floor saved with it, `show` refuses the entry as a copy from before the restore. An
+`unverified` line that names the moved-aside pointer is about the copy in
+`pre-restore.d/keystore`: the merge could not check its current version with the master key, so
+it fences the entry only past the version the moved-aside floor records, and a copy from before
+the restore numbered above that may still be accepted.
 
 The merge exits 0 when it is written and there is nothing to read in the report. It exits 4 when
 it is written but dropped a deletion, kept an entry because `--keep` named it, or left an entry

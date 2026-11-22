@@ -2952,7 +2952,8 @@ func TestKeysFloorMergeDryRun(t *testing.T) {
 }
 
 // TestKeysFloorMergeReportCodes (U192): floor merge exits 4 when it keeps an
-// entry with --keep or leaves one unverified, as for a drop, and its dry run
+// entry with --keep or leaves one unverified (a restored pointer, or a
+// moved-aside one, that does not authenticate), as for a drop, and its dry run
 // exits as it would. A kept entry the moved-aside floor records as deleted
 // is reported "revoked, kept live" and warned of on stderr; one the restored
 // floor does not record is reported as the moved-aside version recorded,
@@ -3012,6 +3013,30 @@ func TestKeysFloorMergeReportCodes(t *testing.T) {
 			}
 			if out := h.stdout.String(); !strings.Contains(out, "unverified system/k:") || !strings.Contains(out, "refused until a rotate numbers past the fence") {
 				t.Fatalf("%v printed %q; want k unverified, saying what is refused", args, out)
+			}
+		}
+	})
+	t.Run("aside unverified", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		b := backup(t, h)
+		h.put("system/late", []byte("late"))
+		restore(t, h, b)
+		p := filepath.Join(recipePreRestore(h), "keystore", "k", "current")
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw[len(raw)-1] ^= 0xff
+		if err := os.WriteFile(p, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"floor", "merge", "--dry-run"}, {"floor", "merge"}} {
+			if code := h.run(args...); code != keysCommitted {
+				t.Fatalf("%v with the moved-aside pointer refused: exit %d, stderr %q; want %d", args, code, h.stderr.String(), keysCommitted)
+			}
+			if out := h.stdout.String(); !strings.Contains(out, "unverified system/k: the moved-aside pointer") {
+				t.Fatalf("%v printed %q; want k's moved-aside pointer unverified", args, out)
 			}
 		}
 	})

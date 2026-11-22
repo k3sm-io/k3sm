@@ -1091,6 +1091,9 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	for _, name := range r.Unverified {
 		fmt.Fprintf(env.stdout, "unverified %s: the restored pointer did not authenticate under the master, or is more than one version past the restored floor's record, so the merge leaves that record as the restored floor holds it: a copy below the recorded version is refused; one at it is accepted; one past it is accepted unless the merge fenced the entry, when one past it and at or below the fence is refused until a rotate numbers past the fence\n", qualify(name))
 	}
+	for _, name := range r.AsideUnverified {
+		fmt.Fprintf(env.stdout, "unverified %s: the moved-aside pointer, in pre-restore.d/keystore, did not authenticate under the master, so the merge fences the entry one past the version the floor moved aside records, not past that pointer: a copy from before the restore numbered above that version may be accepted\n", qualify(name))
+	}
 	for _, name := range r.Dropped {
 		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
 	}
@@ -1112,7 +1115,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if n := len(r.Kept); n > 0 {
 		why = append(why, fmt.Sprintf("kept %d entr(y/ies) with --keep (%d revoked since the backup)", n, revoked))
 	}
-	if n := len(r.Unverified); n > 0 {
+	if n := len(unionStrings(r.Unverified, r.AsideUnverified)); n > 0 {
 		why = append(why, fmt.Sprintf("left %d entr(y/ies) unverified", n))
 	}
 	if len(why) > 0 {
@@ -1123,6 +1126,17 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysCommitted, "%s %s; read the report above", lead, strings.Join(why, "; "))
 	}
 	return keysOK
+}
+
+// unionStrings is the strings in a or b, without repeats.
+func unionStrings(a, b []string) []string {
+	out := slices.Clone(a)
+	for _, x := range b {
+		if !slices.Contains(out, x) {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // keyOutFile is a key file writeKeyOut wrote, held through the directory

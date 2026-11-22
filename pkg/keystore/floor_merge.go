@@ -130,6 +130,12 @@ type MergeReport struct {
 	// and fence the input records: the merge wrote nothing and only renamed
 	// the input, as a rerun after a failed rename does.
 	AlreadyMerged bool
+	// AsideUnverified names, sorted, each entry the moved-aside floor holds
+	// live whose pointer in the moved-aside tree (pre-restore.d/keystore)
+	// did not authenticate under the master, or with the tree staged and
+	// no master to load: its fence is one past the moved-aside floor's
+	// record and mark, not past a pointer above them.
+	AsideUnverified []string
 	// raised is how many restored live records the merge raised to their
 	// authenticated restored pointer before fencing.
 	raised int
@@ -299,7 +305,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 			return r, finish(err)
 		}
 	}
-	ptrs, unverified, aside, err := s.stagedPointers(ctx, st, live, from)
+	ptrs, unverified, aside, asideUnverified, err := s.stagedPointers(ctx, st, live, from)
 	if err != nil {
 		return r, finish(err)
 	}
@@ -318,6 +324,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	}
 	if !pr.changes() {
 		pr.AlreadyMerged, pr.Unverified, pr.Dropped = true, unionNames(unverified, pr.Unverified), nil
+		pr.AsideUnverified = asideUnverified
 		if opts.DryRun {
 			_ = moveAside(&pr) // a dry run moves nothing
 			return pr, nil
@@ -353,7 +360,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	// live is refused whatever opts says (planMerge, mergeLoss.refusal).
 	refused := plan.loss.refusal(opts.AcceptDrops)
 	if opts.DryRun {
-		pr.Unverified = unionNames(unverified, pr.Unverified)
+		pr.Unverified, pr.AsideUnverified = unionNames(unverified, pr.Unverified), asideUnverified
 		_ = moveAside(&pr) // a dry run moves nothing
 		return pr, refused
 	}
@@ -414,7 +421,10 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	for _, name := range r.overRaise {
 		slog.Warn("keystore floor: the restored pointer of this entry is more than one sequence above the restored floor's record, more than a crash leaves, so the merge did not raise the record to it: that pointer is refused while it is at or below the fence the merge set, until a Rotate seals above the fence, and accepted above it; the record's own sequence stays accepted", "name", name)
 	}
-	r.Unverified = unionNames(unverified, r.Unverified)
+	r.Unverified, r.AsideUnverified = unionNames(unverified, r.Unverified), asideUnverified
+	for _, name := range asideUnverified {
+		slog.Warn("keystore floor: the moved-aside tree's pointer of this entry did not authenticate under the master, so the merge fenced it one past the moved-aside floor's record, not past that pointer", "name", name)
+	}
 	r.MovedAside, r.MovedAsideType = moved.MovedAside, moved.MovedAsideType
 	if opts.Undo {
 		_ = classifyUndo(&r, undo) // its refusal was decided on the plan
@@ -988,10 +998,14 @@ func unmatchedKeep(keep map[string]bool, kept []string) []string {
 // pointer did not authenticate (no staged tree, no master, no entry, another
 // generation, or a refused record). From the moved-aside tree (keystore),
 // the current pointer of each entry from holds live, under from's
-// generation: the fence goes above it (mergeFenced). It takes no
+// generation: the fence goes above it (mergeFenced); with that tree present,
+// each of those names whose pointer did not authenticate (no master, no
+// entry, another generation, or a refused record) is returned, sorted, in
+// asideUnverified. An absent moved-aside tree holds no pointer to fence
+// above, and is no failure. It takes no
 // keystore/.lock (see mergeFloor) and writes nothing; it stops with ctx's
 // error.
-func (s *FileStore) stagedPointers(ctx context.Context, st *mergeStaging, live, from floor) (ptrs map[string]uint64, unverified []string, aside map[string]uint64, err error) {
+func (s *FileStore) stagedPointers(ctx context.Context, st *mergeStaging, live, from floor) (ptrs map[string]uint64, unverified []string, aside map[string]uint64, asideUnverified []string, err error) {
 	var names, asideNames []string
 	for name, a := range from {
 		if !a.live() {
@@ -1005,7 +1019,7 @@ func (s *FileStore) stagedPointers(ctx context.Context, st *mergeStaging, live, 
 	sort.Strings(names)
 	sort.Strings(asideNames)
 	if len(names) == 0 && len(asideNames) == 0 {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	k, kerr := s.loadMaster()
 	if kerr == nil {
@@ -1014,7 +1028,7 @@ func (s *FileStore) stagedPointers(ctx context.Context, st *mergeStaging, live, 
 	if len(names) > 0 {
 		staged, terr := st.tree(stagedTreeName)
 		if terr != nil {
-			return nil, nil, nil, terr
+			return nil, nil, nil, nil, terr
 		}
 		if staged == nil || kerr != nil {
 			unverified = names
@@ -1022,24 +1036,29 @@ func (s *FileStore) stagedPointers(ctx context.Context, st *mergeStaging, live, 
 			ptrs, unverified, err = treePointers(ctx, staged, k, live, names)
 			_ = staged.Close() // read-only
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, nil, err
 			}
 		}
 	}
-	if len(asideNames) > 0 && kerr == nil {
+	if len(asideNames) > 0 {
 		tree, terr := st.tree(asideTreeName)
 		if terr != nil {
-			return nil, nil, nil, terr
+			return nil, nil, nil, nil, terr
 		}
-		if tree != nil {
-			aside, _, err = treePointers(ctx, tree, k, from, asideNames)
+		switch {
+		case tree == nil:
+		case kerr != nil:
+			_ = tree.Close() // read-only
+			asideUnverified = asideNames
+		default:
+			aside, asideUnverified, err = treePointers(ctx, tree, k, from, asideNames)
 			_ = tree.Close() // read-only
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, nil, err
 			}
 		}
 	}
-	return ptrs, unverified, aside, nil
+	return ptrs, unverified, aside, asideUnverified, nil
 }
 
 // treePointers is the authenticated pointer sequence of each of names in
