@@ -35,8 +35,8 @@ import (
 // delete sequence in deleted, oldest first.
 func buriedEntry(gen string, deleted ...uint64) floorEntry {
 	var e floorEntry
-	for i, d := range deleted {
-		e.Buried[i] = burial{Generation: gen, Deleted: d}
+	for _, d := range deleted {
+		e.Buried = append(e.Buried, burial{Generation: gen, Deleted: d})
 	}
 	return e
 }
@@ -84,7 +84,7 @@ func TestTombstonePrune(t *testing.T) {
 		if len(b) != fl.size() {
 			t.Fatalf("size %d, encoding %d bytes", fl.size(), len(b))
 		}
-		if back, err := parseFloor(b); err != nil || !maps.Equal(back, fl) {
+		if back, err := parseFloor(b); err != nil || !floorsEqual(back, fl) {
 			t.Fatalf("the pruned floor does not read back: %v", err)
 		}
 	})
@@ -106,7 +106,7 @@ func TestTombstonePrune(t *testing.T) {
 			t.Fatalf("floor after prune is %d bytes, over %d", fl.size(), maxFloorSize)
 		}
 		for name, e := range live {
-			if fl[name] != e {
+			if !entriesEqual(fl[name], e) {
 				t.Fatalf("prune touched the live entry %s", name)
 			}
 		}
@@ -166,20 +166,19 @@ func TestParseFloorTombstones(t *testing.T) {
 	const gen2 = "fedcba9876543210fedcba9876543210"
 	old := `{"version":1,"scope":"system","entries":{"a":{"generation":"` + gen + `","seq":4}}}` + "\n"
 	fl, err := parseFloor([]byte(old))
-	if err != nil || !maps.Equal(fl, floor{"a": {Generation: gen, Seq: 4}}) {
+	if err != nil || !floorsEqual(fl, floor{"a": {Generation: gen, Seq: 4}}) {
 		t.Fatalf("parseFloor(old floor) = %v, %v", fl, err)
 	}
 	if again, err := marshalFloor(fl); err != nil || string(again) != old {
 		t.Fatalf("the old floor encodes as %q, %v; want it unchanged", again, err)
 	}
 	withTomb := `{"version":1,"scope":"system","entries":{"a":{"generation":"` + gen + `","seq":4}},"tombstones":{"a":[{"generation":"` + gen2 + `","deleted":3}],"b":[{"generation":"` + gen + `","deleted":2}],"c":[{"generation":"` + gen + `","deleted":1},{"generation":"` + gen2 + `","deleted":4}]}}` + "\n"
-	a := floorEntry{Generation: gen, Seq: 4}
-	a.Buried[0] = burial{Generation: gen2, Deleted: 3}
+	a := floorEntry{Generation: gen, Seq: 4, Buried: []burial{{Generation: gen2, Deleted: 3}}}
 	c := buriedEntry(gen, 1)
-	c.Buried[1] = burial{Generation: gen2, Deleted: 4}
+	c.Buried = append(c.Buried, burial{Generation: gen2, Deleted: 4})
 	want := floor{"a": a, "b": buriedEntry(gen, 2), "c": c}
 	fl, err = parseFloor([]byte(withTomb))
-	if err != nil || !maps.Equal(fl, want) {
+	if err != nil || !floorsEqual(fl, want) {
 		t.Fatalf("parseFloor(tombstones) = %v, %v; want %v", fl, err, want)
 	}
 	if again, err := marshalFloor(fl); err != nil || string(again) != withTomb || len(again) != fl.size() {

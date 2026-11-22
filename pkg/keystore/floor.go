@@ -111,8 +111,9 @@ type floor map[string]floorEntry
 // generation of an entry of that name a Delete removed (docs/design/
 // keystore.md § "Pointer sequence and floor", "A deleted entry put back is
 // refused"). A record with no live record holds at least one burial, and a
-// live generation is never also buried. Buried is an array, not a slice, so
-// a floorEntry is a value: copying one never shares its burials.
+// live generation is never also buried. Buried is never written in place:
+// add, dropOldest and renumber each give the entry a new slice, so a copy of
+// a floorEntry never sees another's burials change.
 type floorEntry struct {
 	// Generation is the live entry's generation, hex, or "" with no live
 	// record.
@@ -121,8 +122,8 @@ type floorEntry struct {
 	// with no live record.
 	Seq uint64
 	// Buried holds the name's buried generations, oldest (lowest Deleted)
-	// first, in Buried[:n]; the slots after them are zero.
-	Buried [maxBuriedPerName]burial
+	// first: at most maxBuriedPerName of them, and nil for none.
+	Buried []burial
 }
 
 // burial is one buried generation, as the floor file encodes it in the
@@ -138,11 +139,7 @@ func (e floorEntry) live() bool { return e.Seq != 0 }
 
 // burials is e's buried generations, oldest first.
 func (e floorEntry) burials() []burial {
-	n := 0
-	for n < len(e.Buried) && e.Buried[n].Deleted != 0 {
-		n++
-	}
-	return e.Buried[:n:n]
+	return e.Buried[:len(e.Buried):len(e.Buried)]
 }
 
 // buries reports whether e records g, hex, as buried.
@@ -159,20 +156,22 @@ func (e floorEntry) buries(g string) bool {
 // oldest is dropped to make room, and returned.
 func (e *floorEntry) add(b burial) (burial, bool) {
 	bs := e.burials()
-	if len(bs) < len(e.Buried) {
-		e.Buried[len(bs)] = b
+	if len(bs) < maxBuriedPerName {
+		e.Buried = append(slices.Clone(bs), b)
 		return burial{}, false
 	}
-	dropped := e.Buried[0]
-	copy(e.Buried[:], e.Buried[1:])
-	e.Buried[len(e.Buried)-1] = b
+	dropped := bs[0]
+	e.Buried = append(slices.Clone(bs[1:]), b)
 	return dropped, true
 }
 
 // dropOldest removes e's oldest burial.
 func (e *floorEntry) dropOldest() {
-	copy(e.Buried[:], e.Buried[1:])
-	e.Buried[len(e.Buried)-1] = burial{}
+	if len(e.Buried) <= 1 {
+		e.Buried = nil
+		return
+	}
+	e.Buried = slices.Clone(e.Buried[1:])
 }
 
 // liveEntry is the encoding of a live record in the floor file.
@@ -606,8 +605,15 @@ func (fl floor) renumber() uint64 {
 		}
 		return all[i].name < all[j].name
 	})
+	// Each name gets a new slice before its first rewrite, so no copy of
+	// its entry sees the new sequences.
+	fresh := map[string]bool{}
 	for n, a := range all {
 		e := fl[a.name]
+		if !fresh[a.name] {
+			e.Buried = slices.Clone(e.Buried)
+			fresh[a.name] = true
+		}
 		e.Buried[a.i].Deleted = uint64(n + 1)
 		fl[a.name] = e
 	}
@@ -728,14 +734,15 @@ func parseFloor(b []byte) (floor, error) {
 			return nil, fmt.Errorf("%w: tombstone %q holds %d generations, want 1 to %d", errFloorMalformed, name, len(bs), maxBuriedPerName)
 		}
 		e := fl[name]
+		e.Buried = make([]burial, 0, len(bs))
 		var prev uint64
-		for i, t := range bs {
+		for _, t := range bs {
 			if !floorGeneration(name, t.Generation) || t.Deleted <= prev || t.Deleted > maxDeleteSeq || seen[t.Deleted] ||
 				e.buries(t.Generation) || (e.live() && e.Generation == t.Generation) {
 				return nil, fmt.Errorf("%w: tombstone %q", errFloorMalformed, name)
 			}
 			seen[t.Deleted], prev = true, t.Deleted
-			e.Buried[i] = t
+			e.Buried = append(e.Buried, t)
 		}
 		fl[name] = e
 	}

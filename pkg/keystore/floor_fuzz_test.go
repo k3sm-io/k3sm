@@ -68,7 +68,7 @@ func FuzzParseFloor(f *testing.F) {
 			t.Fatalf("parseFloor accepted %q, which is not its encoding %q", b, again)
 		}
 		back, err := parseFloor(again)
-		if err != nil || !maps.Equal(back, fl) {
+		if err != nil || !floorsEqual(back, fl) {
 			t.Fatalf("the accepted floor does not encode back: %v, %v != %v", err, back, fl)
 		}
 	})
@@ -87,7 +87,7 @@ func TestParseFloorStrict(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, b := range [][]byte{canon, canon[:len(canon)-1]} {
-		if fl, err := parseFloor(b); err != nil || !maps.Equal(fl, good) {
+		if fl, err := parseFloor(b); err != nil || !floorsEqual(fl, good) {
 			t.Fatalf("parseFloor(%q) = %v, %v; want %v", b, fl, err, good)
 		}
 	}
@@ -114,6 +114,16 @@ func TestParseFloorStrict(t *testing.T) {
 	}
 }
 
+// floorsEqual reports whether a and b hold the same names with equal
+// records.
+func floorsEqual(a, b floor) bool { return maps.EqualFunc(a, b, entriesEqual) }
+
+// entriesEqual reports whether x and y are the same record: the same live
+// part and the same burials in the same order.
+func entriesEqual(x, y floorEntry) bool {
+	return x.Generation == y.Generation && x.Seq == y.Seq && slices.Equal(x.Buried, y.Buried)
+}
+
 // checkFloorEntry fails t unless e, name's record, is one every check can
 // rely on: a live record (a canonical generation and a sequence) or none,
 // at least one burial when there is no live record, at most
@@ -132,10 +142,8 @@ func checkFloorEntry(t *testing.T, name string, e floorEntry) {
 	if !e.live() && len(bs) == 0 {
 		t.Fatalf("record %q has sequence 0 and buries nothing", name)
 	}
-	for i := len(bs); i < len(e.Buried); i++ {
-		if e.Buried[i] != (burial{}) {
-			t.Fatalf("record %q has a burial after its last: %+v", name, e.Buried)
-		}
+	if len(bs) > maxBuriedPerName {
+		t.Fatalf("record %q holds %d burials, over %d", name, len(bs), maxBuriedPerName)
 	}
 	var prev uint64
 	for _, b := range bs {
@@ -217,6 +225,7 @@ func TestFloorOpsProperty(t *testing.T) {
 				op = "lift"
 				if last := fl.lastDeleted(); last > 0 {
 					for n, e := range fl {
+						e.Buried = slices.Clone(e.Buried)
 						for i := range e.burials() {
 							e.Buried[i].Deleted += maxDeleteSeq - last
 						}
@@ -265,7 +274,7 @@ func TestFloorOpsProperty(t *testing.T) {
 				t.Fatalf("run %d step %d (%s): size %d, encoding %d bytes", run, step, op, fl.size(), len(b))
 			}
 			back, err := parseFloor(b)
-			if err != nil || !maps.Equal(back, fl) {
+			if err != nil || !floorsEqual(back, fl) {
 				t.Fatalf("run %d step %d (%s): the floor does not read back: %v", run, step, op, err)
 			}
 		}
@@ -281,16 +290,12 @@ func TestFloorOpsProperty(t *testing.T) {
 // renumbered.
 func TestDeleteSequenceNeverWraps(t *testing.T) {
 	g := func(b byte) string { return strings.Repeat(fmt.Sprintf("%02x", b), generationSize) }
-	var a floorEntry
-	a.Buried[0] = burial{Generation: g(1), Deleted: maxDeleteSeq - 5}
-	a.Buried[1] = burial{Generation: g(2), Deleted: maxDeleteSeq}
+	a := floorEntry{Buried: []burial{{Generation: g(1), Deleted: maxDeleteSeq - 5}, {Generation: g(2), Deleted: maxDeleteSeq}}}
 	// b, the name buried, already holds burials of its own, which the
 	// renumber moves too.
-	b := floorEntry{Generation: g(3), Seq: 2}
-	b.Buried[0] = burial{Generation: g(5), Deleted: maxDeleteSeq - 7}
-	b.Buried[1] = burial{Generation: g(6), Deleted: maxDeleteSeq - 2}
+	b := floorEntry{Generation: g(3), Seq: 2, Buried: []burial{{Generation: g(5), Deleted: maxDeleteSeq - 7}, {Generation: g(6), Deleted: maxDeleteSeq - 2}}}
 	fl := floor{"a": a, "b": b}
-	fl["c"] = floorEntry{Buried: [maxBuriedPerName]burial{{Generation: g(4), Deleted: maxDeleteSeq - 1}}}
+	fl["c"] = floorEntry{Buried: []burial{{Generation: g(4), Deleted: maxDeleteSeq - 1}}}
 	if got, _ := fl.bury("b", nil); len(got) != 1 || got[0] != g(3) {
 		t.Fatalf("bury b buried %q", got)
 	}
@@ -313,11 +318,11 @@ func TestDeleteSequenceNeverWraps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the renumbered floor does not parse: %v", err)
 	}
-	if !maps.Equal(back, fl) {
+	if !floorsEqual(back, fl) {
 		t.Fatalf("the renumbered floor reads back as %+v, want %+v", back, fl)
 	}
 	// One below the cap: the new burial takes maxDeleteSeq itself.
-	fl = floor{"a": {Buried: [maxBuriedPerName]burial{{Generation: g(1), Deleted: maxDeleteSeq - 1}}}, "b": {Generation: g(3), Seq: 1}}
+	fl = floor{"a": {Buried: []burial{{Generation: g(1), Deleted: maxDeleteSeq - 1}}}, "b": {Generation: g(3), Seq: 1}}
 	fl.bury("b", nil)
 	if fl["a"].Buried[0].Deleted != maxDeleteSeq-1 || fl["b"].Buried[0].Deleted != maxDeleteSeq {
 		t.Fatalf("floor after a bury below the cap = %+v", fl)

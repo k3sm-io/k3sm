@@ -110,7 +110,7 @@ func TestFloorWriteRereads(t *testing.T) {
 		if bs := got["k"].burials(); got["k"].live() || len(bs) != 2 || bs[0].Generation != newer.Generation || bs[1].Generation != start["k"].Generation {
 			t.Fatalf("floor k after the Delete = %+v, want the floor's live %s buried, then the directory's %s", got["k"], newer.Generation, start["k"].Generation)
 		}
-		if got["other"] != start["other"] {
+		if !entriesEqual(got["other"], start["other"]) {
 			t.Fatalf("floor other after the Delete = %+v, want %+v", got["other"], start["other"])
 		}
 
@@ -193,7 +193,7 @@ func TestFloorLockBoundedWait(t *testing.T) {
 			if _, err := os.Lstat(filepath.Join(server, "keystore", "b")); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("the timed-out Put left b: %v", err)
 			}
-			if after := floorOf(t, server); after["a"] != before["a"] || len(after) != len(before) {
+			if after := floorOf(t, server); !entriesEqual(after["a"], before["a"]) || len(after) != len(before) {
 				t.Fatalf("floor after the timed-out verbs = %+v, was %+v", after, before)
 			}
 		})
@@ -297,7 +297,7 @@ func TestFloorLockFileUntrustedRefused(t *testing.T) {
 					t.Fatalf("%s over a %s %s: %v, want errFloorUntrusted naming it", op, tc.name, floorLockName, err)
 				}
 			}
-			if after := floorOf(t, server); !maps.Equal(after, before) {
+			if after := floorOf(t, server); !floorsEqual(after, before) {
 				t.Fatalf("floor after the refused verbs = %+v, was %+v", after, before)
 			}
 			if _, err := os.Lstat(filepath.Join(server, "keystore", "b")); !errors.Is(err, os.ErrNotExist) {
@@ -357,7 +357,7 @@ func TestFloorLockFileRecheckedAfterFlock(t *testing.T) {
 		if replaced != 1 {
 			t.Fatalf("the lock file was replaced %d times, want 1", replaced)
 		}
-		if after := floorOf(t, server); !maps.Equal(after, before) {
+		if after := floorOf(t, server); !floorsEqual(after, before) {
 			t.Fatalf("floor after the refused Rotate = %+v, was %+v", after, before)
 		}
 		mustCurrent(t, s, "a", "a")
@@ -457,7 +457,7 @@ func TestDataRootSwapRefused(t *testing.T) {
 				t.Errorf("%s through a symlinked data root: %v, want errFloorUntrusted", op, err)
 			}
 		}
-		if after := floorOf(t, server); !maps.Equal(after, before) {
+		if after := floorOf(t, server); !floorsEqual(after, before) {
 			t.Fatalf("floor after the refused verbs = %+v, was %+v", after, before)
 		}
 	})
@@ -535,7 +535,7 @@ func TestLoopsStopOnContext(t *testing.T) {
 	if _, err := s.syncFloor(cancelled, root, l, read, k); !errors.Is(err, context.Canceled) {
 		t.Fatalf("syncFloor under a cancelled context: %v, want context.Canceled", err)
 	}
-	if got := floorOf(t, server)["k0"]; got != lagging {
+	if got := floorOf(t, server)["k0"]; !entriesEqual(got, lagging) {
 		t.Fatalf("the stopped syncFloor wrote k0's floor %+v, want %+v left", got, lagging)
 	}
 	e, err := openEntry(root, "k0", read)
