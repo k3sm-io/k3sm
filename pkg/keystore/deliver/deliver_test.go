@@ -19,6 +19,8 @@ package deliver
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -82,7 +84,9 @@ func (s *fakeStore) Current(_ context.Context, name string) (keystore.Version, [
 	}
 	// The reconciler clears the value it is given, as the real store's
 	// caller owns it, so each call returns a fresh copy.
-	return keystore.Version{Name: name, Version: e.version, Kind: keystore.KindOpaque}, bytes.Clone(e.value), nil
+	// The fingerprint stands for the real store's: derived from the value.
+	sum := sha256.Sum256(e.value)
+	return keystore.Version{Name: name, Version: e.version, Kind: keystore.KindOpaque, Fingerprint: hex.EncodeToString(sum[:8])}, bytes.Clone(e.value), nil
 }
 
 func (s *fakeStore) set(name string, version uint64, value []byte) {
@@ -687,4 +691,38 @@ func TestWriteAtomic(t *testing.T) {
 	if len(names) != 1 || names[0].Name() != FileName {
 		t.Fatalf("directory holds %v, want only %s", names, FileName)
 	}
+}
+
+// TestReconcilerRedeliversAfterRmPut: an entry deleted and put back holds a
+// new value at version 1 again; the version alone cannot tell, so the Secret
+// must still be re-delivered (G20).
+func TestReconcilerRedeliversAfterRmPut(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("one"))
+	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	h.store.set("api-token", 1, []byte("replaced"))
+	h.r.Sweep(ctx)
+	if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "replaced" {
+		t.Fatalf("after rm and put at version 1 the Secret still holds %q", got)
+	}
+	h.assertOnlyGetCreateUpdateSecrets(t)
+}
+
+// TestReconcilerReappliesChangedDataKey: a target whose dataKey changes is
+// re-applied at the same version, and the stale key leaves data (G20).
+func TestReconcilerReappliesChangedDataKey(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.declare(t, Target{Name: "api-token", Namespace: "payments", DataKey: "old"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	h.declare(t, Target{Name: "api-token", Namespace: "payments", DataKey: "new"})
+	h.r.Sweep(ctx)
+	got := h.secret(t, "payments", "api-token").Data
+	if len(got) != 1 || string(got["new"]) != "tok" {
+		t.Fatalf("data after a dataKey change = %q, want only new=tok", got)
+	}
+	h.assertOnlyGetCreateUpdateSecrets(t)
 }

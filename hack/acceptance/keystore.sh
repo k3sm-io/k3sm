@@ -252,7 +252,8 @@ check G19 "the delivery declaration is root-owned and not group- or other-writab
 	deliver:TestDeclarationRootOwned deliver:TestDeclarationOpenedWithNoFollow cmd:TestKeysDeliverRefusals
 check G20 "the reconciler only gets, creates and updates its labelled Opaque Secrets: an unlabelled or foreign Secret is untouched, and no list or delete is ever made" \
 	deliver:TestReconcilerTouchesOnlyLabelledSecrets deliver:TestReconcilerRedeliversOnRotation \
-	deliver:TestReconcilerSkipsLabelledNonOpaque deliver:TestReconcilerContinuesAfterTargetFailure
+	deliver:TestReconcilerSkipsLabelledNonOpaque deliver:TestReconcilerContinuesAfterTargetFailure \
+	deliver:TestReconcilerRedeliversAfterRmPut deliver:TestReconcilerReappliesChangedDataKey
 check G21 "the rollback recipe is a byte-exact round trip: show --reveal into rotate --in -, the new version compared with version N byte for byte (bytes.Equal, as cmp), opaque and Ed25519" \
 	cmd:TestKeysRollbackRoundTrip
 # hack/ci.sh does not run this script, so G22 cannot recurse into it.

@@ -47,6 +47,15 @@ const LabelKey = "k3sm.io/keystore-delivery"
 // re-applies the Secret when it differs from Store.Current's.
 const VersionAnnotation = "k3sm.io/keystore-version"
 
+// FingerprintAnnotation records the fingerprint (keystore.Version.Fingerprint)
+// of the value a Secret holds. The version alone does not identify a value:
+// an entry deleted and put back starts at version 1 again with a new value.
+// pkg/keystore exposes no generation, and the fingerprint is derived from the
+// value itself, so a value change of any kind re-applies. It names no value:
+// an Ed25519 fingerprint is a digest of the public key, an opaque one a keyed
+// digest (see keystore.Version).
+const FingerprintAnnotation = "k3sm.io/keystore-fingerprint"
+
 // AllowPlaintextFlag is the `k3sm server` flag that lets delivery write
 // Secrets while secrets encryption is off.
 const AllowPlaintextFlag = "allow-plaintext-secrets-delivery"
@@ -321,7 +330,7 @@ func (r *Reconciler) converge(ctx context.Context, t Target) {
 				Name:        t.Secret(),
 				Namespace:   t.Namespace,
 				Labels:      map[string]string{LabelKey: t.Name},
-				Annotations: map[string]string{VersionAnnotation: want},
+				Annotations: map[string]string{VersionAnnotation: want, FingerprintAnnotation: ver.Fingerprint},
 			},
 			Type: corev1.SecretTypeOpaque,
 			Data: map[string][]byte{t.Key(): value},
@@ -333,7 +342,7 @@ func (r *Reconciler) converge(ctx context.Context, t Target) {
 		r.note(t, "ok:"+want, slog.LevelInfo, "delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
 		return
 	}
-	if cur.Annotations[VersionAnnotation] == want {
+	if upToDate(cur, want, ver.Fingerprint, t.Key()) {
 		r.note(t, "ok:"+want, slog.LevelInfo, "delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
 		return
 	}
@@ -342,6 +351,7 @@ func (r *Reconciler) converge(ctx context.Context, t Target) {
 		next.Annotations = map[string]string{}
 	}
 	next.Annotations[VersionAnnotation] = want
+	next.Annotations[FingerprintAnnotation] = ver.Fingerprint
 	next.Data = map[string][]byte{t.Key(): value}
 	next.StringData = nil
 	if _, err := secrets.Update(ctx, next, metav1.UpdateOptions{}); err != nil {
@@ -349,6 +359,18 @@ func (r *Reconciler) converge(ctx context.Context, t Target) {
 		return
 	}
 	r.note(t, "ok:"+want, slog.LevelInfo, "re-delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
+}
+
+// upToDate reports whether a Secret labelled for the entry already holds the
+// current value under exactly the declared data key: its version and
+// fingerprint annotations match, and data has that one key and no other, so
+// a changed --data-key re-applies and drops the stale key.
+func upToDate(cur *corev1.Secret, version, fingerprint, key string) bool {
+	if cur.Annotations[VersionAnnotation] != version || cur.Annotations[FingerprintAnnotation] != fingerprint {
+		return false
+	}
+	_, ok := cur.Data[key]
+	return ok && len(cur.Data) == 1 && len(cur.StringData) == 0
 }
 
 // statSignature is the identity of a declaration state that was refused: a

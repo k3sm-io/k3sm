@@ -39,11 +39,12 @@ limitations under the License.
 // Gets the one named Secret, then
 //
 //   - absent: creates an Opaque Secret labelled LabelKey=<entry> and
-//     annotated VersionAnnotation=<version>, holding the entry's current
+//     annotated with the version and fingerprint, holding the entry's current
 //     value under the data key (an Ed25519 entry's stored seed or key bytes,
 //     with no PEM);
 //   - present and labelled for this entry: updates it only when its
-//     VersionAnnotation differs from Store.Current's version;
+//     VersionAnnotation or FingerprintAnnotation differs from Store.Current's
+//     version or fingerprint, or its data is not exactly the declared key;
 //   - present without the label, or labelled for another entry: leaves it
 //     alone and logs why.
 //
