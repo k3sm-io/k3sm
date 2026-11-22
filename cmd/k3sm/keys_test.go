@@ -624,18 +624,25 @@ func checkRecipeSum(b recipeBackup) error {
 	return nil
 }
 
+// recipePreRestore is h's server/pre-restore.d, the root-only directory the
+// recipe moves the live keystore/ into.
+func recipePreRestore(h *keysHarness) string {
+	return filepath.Join(filepath.Dir(h.keystoreDir()), "pre-restore.d")
+}
+
 // restoreRecipeBackup restores b over h as the recipe does, with the saved
 // floor when withFloor is set, and returns the moved-aside keystore/. Before
-// anything moves, it refuses (an error, nothing changed) when a .pre-restore
-// copy of either is still set aside (the ls -d check) or, with the floor,
-// when the saved floor no longer matches its SHA-256 (shasum -c). The live
-// copies are moved aside, never overwritten (each mv after its test ! -e
-// guard).
+// anything moves, it refuses (an error, nothing changed) when pre-restore.d
+// or the floor's .pre-restore copy is still set aside (the ls -d check) or,
+// with the floor, when the saved floor no longer matches its SHA-256
+// (shasum -c). The live keystore/ is moved, its files untouched, into a new
+// 0700 pre-restore.d (mkdir, which fails on an existing name), and the live
+// floor aside after its test ! -e guard: neither is overwritten.
 func restoreRecipeBackup(t *testing.T, h *keysHarness, b recipeBackup, withFloor bool) (string, error) {
 	t.Helper()
 	floor := recipeFloor(h)
-	aside := h.keystoreDir() + ".pre-restore"
-	for _, p := range []string{aside, floor + ".pre-restore"} {
+	aside := filepath.Join(recipePreRestore(h), "keystore")
+	for _, p := range []string{recipePreRestore(h), floor + ".pre-restore"} {
 		if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("%s is still set aside from an earlier restore (%v)", p, err)
 		}
@@ -644,6 +651,9 @@ func restoreRecipeBackup(t *testing.T, h *keysHarness, b recipeBackup, withFloor
 		if err := checkRecipeSum(b); err != nil {
 			return "", err
 		}
+	}
+	if err := os.Mkdir(recipePreRestore(h), 0o700); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.Rename(h.keystoreDir(), aside); err != nil {
 		t.Fatal(err)
@@ -719,6 +729,45 @@ func recipeDeletedNames(t *testing.T, h *keysHarness) []string {
 	return names
 }
 
+// recipeLines is each line inside a fenced code block of a Markdown doc,
+// keyed by its 1-based line number.
+func recipeLines(doc string) map[int]string {
+	out := map[int]string{}
+	fenced := false
+	for i, line := range strings.Split(doc, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			fenced = !fenced
+			continue
+		}
+		if fenced {
+			out[i+1] = line
+		}
+	}
+	return out
+}
+
+// recursiveChange reports whether line runs chown, chgrp, chmod or chflags
+// with a short-option cluster holding -R.
+func recursiveChange(line string) bool {
+	fields := strings.Fields(line)
+	for i, f := range fields {
+		switch filepath.Base(f) {
+		case "chown", "chgrp", "chmod", "chflags":
+		default:
+			continue
+		}
+		for _, opt := range fields[i+1:] {
+			if !strings.HasPrefix(opt, "-") || strings.HasPrefix(opt, "--") {
+				break
+			}
+			if strings.Contains(opt, "R") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // TestKeysRollbackRoundTrip is G21's CLI test: the rollback recipes in
 // docs/user/keys.md run as written. A restore of a saved keystore/, with the
 // floor saved at the same moment, under the backup's name, into a directory
@@ -761,12 +810,10 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			"sudo shasum -a 256 /var/root/keystore-floor-backup/$B/keystore-floor.json | sudo tee /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
 			"Never keep the saved floor on a volume that ignores ownership",
 			"sudo k3sm stop",
-			"sudo ls -d /var/lib/k3sm/server/keystore.pre-restore /var/lib/k3sm/keystore-floor.json.pre-restore",
+			"sudo ls -d /var/lib/k3sm/server/pre-restore.d /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
-			"test ! -e /var/lib/k3sm/server/keystore.pre-restore || exit 1",
-			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore",
-			"sudo chown -R root:wheel /var/lib/k3sm/server/keystore.pre-restore",
-			"sudo chmod 700 /var/lib/k3sm/server/keystore.pre-restore",
+			"sudo mkdir -m 0700 /var/lib/k3sm/server/pre-restore.d || exit 1",
+			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/pre-restore.d/keystore",
 			"test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json",
@@ -781,6 +828,26 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 				t.Fatalf("docs/user/keys.md does not say %q after the step before it", step)
 			}
 			at += i + len(step)
+		}
+	})
+	// A recursive ownership, mode or flag change run as root over a tree the
+	// service user wrote follows a hard link it planted there to any inode
+	// on the volume, so no recipe line in the user docs makes one.
+	t.Run("no recipe line changes owner, mode or flags recursively", func(t *testing.T) {
+		docs, err := filepath.Glob(filepath.Join("..", "..", "docs", "user", "*.md"))
+		if err != nil || len(docs) == 0 {
+			t.Fatalf("docs/user/*.md: %v, %d files", err, len(docs))
+		}
+		for _, doc := range docs {
+			raw, err := os.ReadFile(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for n, line := range recipeLines(string(raw)) {
+				if recursiveChange(line) {
+					t.Errorf("%s: recipe line %d %q changes owner, mode or flags recursively", filepath.Base(doc), n, line)
+				}
+			}
 		}
 	})
 	t.Run("save rm restore", func(t *testing.T) {
@@ -799,7 +866,13 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if !bytes.Equal(h.stdout.Bytes(), value) {
 			t.Fatalf("restored value = %q, want %q", h.stdout.Bytes(), value)
 		}
-		for _, p := range []string{aside, floor + ".pre-restore"} {
+		if filepath.Dir(aside) != recipePreRestore(h) {
+			t.Fatalf("moved-aside keystore/ = %s, want it inside pre-restore.d", aside)
+		}
+		if fi, err := os.Stat(recipePreRestore(h)); err != nil || fi.Mode().Perm() != 0o700 {
+			t.Fatalf("pre-restore.d = %v, %v; want mode 0700", fi, err)
+		}
+		for _, p := range []string{recipePreRestore(h), floor + ".pre-restore"} {
 			if err := os.RemoveAll(p); err != nil {
 				t.Fatal(err)
 			}
@@ -966,7 +1039,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 				b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
 				left := recipeFloor(h) + ".pre-restore"
 				if which == "keystore" {
-					left = h.keystoreDir() + ".pre-restore"
+					left = recipePreRestore(h)
 				}
 				if err := os.WriteFile(left, []byte("earlier\n"), 0o600); err != nil {
 					t.Fatal(err)
@@ -1005,7 +1078,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if _, err := restoreRecipeBackup(t, h, b, true); err == nil {
 			t.Fatal("restore with a changed saved floor went on")
 		}
-		if _, err := os.Lstat(h.keystoreDir() + ".pre-restore"); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(recipePreRestore(h)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("keystore/ was moved aside before the check: %v", err)
 		}
 		h.mustRun(1, "show", "system/rb", "--reveal")
@@ -1049,6 +1122,11 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			if err := os.Rename(mv[0], mv[1]); err != nil {
 				t.Fatal(err)
 			}
+		}
+		// rmdir: the moved-aside tree went back out, its files never
+		// re-owned, so pre-restore.d is empty.
+		if err := os.Remove(recipePreRestore(h)); err != nil {
+			t.Fatal(err)
 		}
 		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "keystore")); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("undo nested a keystore/ inside the live one: %v", err)

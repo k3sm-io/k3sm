@@ -1251,8 +1251,13 @@ before the merge is recorded. A successful merge renames its input to
 is still the file it read), which clears the guard; a rename that fails after the write is
 reported as committed. `k3sm start` is not hooked: its start path has no cheap synchronous
 check of the keystore, which only the delivery reconciler reads, and it writes no floor. The
-recipe also makes the moved-aside `keystore.pre-restore` root-only (`chown -R root:wheel`,
-`chmod 700`) as it moves it, so the service user cannot copy an entry out of it. The merge keeps every live record of
+recipe moves the live `keystore/` into `server/pre-restore.d/`, a directory it creates root:wheel
+0700 with `mkdir` (which fails on an existing name), so the service user cannot reach the
+moved-aside entries to copy one back. It changes no file inside: a rename changes no inode's
+owner, so the undo moves the tree back out with no ownership change. No recipe changes owner,
+mode or flags recursively (`chown -R`, `chmod -R`, `chflags -R`) over a tree the service user
+wrote: root would follow a hard link planted in it to an unrelated inode
+(`TestKeysRollbackRoundTrip`). The merge keeps every live record of
 the restored floor not buried above. The write is pruned as every floor write is, the per-name cap
 included, and each burial dropped is logged at Warn and reported. The verb prints `merged N`,
 `already present N`, `buried live N`, `kept N`, `retired N`, `dropped N` and `fenced N`, one per line, then `buried live

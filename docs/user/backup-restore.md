@@ -451,7 +451,7 @@ with its master key kept apart from the entries, and its floor saved under the b
 in a root-only directory on the Mac, never on a volume that ignores ownership or that others can
 write. A restore stops the server, checks that no copy from an earlier restore is still set
 aside and that the saved floor matches the SHA-256 recorded for it, moves the live `keystore/`
-aside rather than deleting it, puts the backup in place with `ditto`, merges every deletion the
+into a new directory only root can open rather than deleting it, changing no file inside, puts the backup in place with `ditto`, merges every deletion the
 moved-aside floor records into the restored floor with `sudo k3sm keys floor merge`, which
 deletes again each restored entry deleted since the backup unless `--keep` names it (the keys
 verbs that change the keystore refuse until it has run), removes
