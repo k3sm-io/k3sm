@@ -1647,3 +1647,29 @@ func TestStateFileMalformedDeliversNothing(t *testing.T) {
 		})
 	}
 }
+
+// TestReconcilerUpdateCarriesUIDAndResourceVersion: the object sent to
+// Update carries the uid and resourceVersion the Get returned, so the
+// apiserver refuses the write if the Secret was replaced or changed in
+// between (G20).
+func TestReconcilerUpdateCarriesUIDAndResourceVersion(t *testing.T) {
+	ours := secretObj("payments", "api-token", map[string]string{LabelKey: "api-token"}, map[string][]byte{"value": []byte("old")})
+	ours.UID = "ours-1"
+	ours.ResourceVersion = "42"
+	h := newHarness(t, true, false, ours)
+	h.own(t, ours)
+	h.store.set("api-token", 2, []byte("new"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	var sent *corev1.Secret
+	h.client.PrependReactor("update", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		sent = a.(k8stesting.UpdateAction).GetObject().(*corev1.Secret).DeepCopy()
+		return false, nil, nil
+	})
+	h.r.Sweep(context.Background())
+	if sent == nil {
+		t.Fatalf("no update was sent: %v", h.verbs())
+	}
+	if sent.UID != "ours-1" || sent.ResourceVersion != "42" {
+		t.Fatalf("update sent uid %q resourceVersion %q, want the Get's ours-1 and 42", sent.UID, sent.ResourceVersion)
+	}
+}
