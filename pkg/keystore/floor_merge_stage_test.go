@@ -124,6 +124,7 @@ func stageRecipe(t *testing.T, s *FileStore, server string, asideSeq uint64) str
 	if err := os.Mkdir(stagePath(s, stagedTreeName), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	giveToService(t, stagePath(s, stagedTreeName))
 	copyEntryDir(t, backup, stagePath(s, stagedTreeName, "k"))
 	if err := os.WriteFile(floorPath(server), backupFloor, 0o644); err != nil {
 		t.Fatal(err)

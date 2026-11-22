@@ -237,6 +237,13 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if st.staged && st.targetExists {
 		return r, errStagedTargetExists(s.dir)
 	}
+	// The staged tree's shape is judged read-only before anything is read
+	// from it or planned, so a dry run refuses what the merge refuses.
+	if st.staged {
+		if err := s.checkStaged(st); err != nil {
+			return r, err
+		}
+	}
 	ptrs, unverified, aside, err := s.stagedPointers(ctx, st, live, from)
 	if err != nil {
 		return r, err

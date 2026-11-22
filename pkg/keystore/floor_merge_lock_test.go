@@ -31,12 +31,15 @@ import (
 
 // TestMergeFloorIgnoresEntryLock (U192): the merge writes only the
 // root-owned floor under keystore-lock and never takes keystore/.lock, which
-// the service user can hold or replace, so a held .lock and a .lock replaced
-// by a directory each leave the merge's burials written.
+// the service user can hold or replace, so a held .lock leaves the merge's
+// burials written. A .lock replaced by a directory is no file the keystore
+// writes, so the staged tree's shape check refuses it, naming it, with
+// nothing written: the merge still never waits on it.
 func TestMergeFloorIgnoresEntryLock(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		plant func(t *testing.T, lock string)
+		name    string
+		plant   func(t *testing.T, lock string)
+		refused bool
 	}{
 		{"held", func(t *testing.T, lock string) {
 			held, err := os.Open(lock)
@@ -47,13 +50,14 @@ func TestMergeFloorIgnoresEntryLock(t *testing.T) {
 			if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX); err != nil {
 				t.Fatal(err)
 			}
-		}},
+		}, false},
 		{"replaced by a directory", func(t *testing.T, lock string) {
 			remove(t, lock)
 			if err := os.Mkdir(lock, 0o700); err != nil {
 				t.Fatal(err)
 			}
-		}},
+			giveToService(t, lock)
+		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -63,6 +67,15 @@ func TestMergeFloorIgnoresEntryLock(t *testing.T) {
 			writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
 			tc.plant(t, filepath.Join(server, "keystore", lockName))
 			r, err := mergeStaged(t, s, ctx, MergeOptions{})
+			if tc.refused {
+				if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), lockName) {
+					t.Fatalf("MergeFloor under a %s .lock = %+v, %v; want the staged tree refused naming %s", tc.name, r, err, lockName)
+				}
+				if fl := readFloorFile(t, server); fl["gone"].buries(mgen(1)) {
+					t.Fatalf("floor after the refused merge = %+v, want nothing written", fl)
+				}
+				return
+			}
 			if err != nil || r.Merged != 1 {
 				t.Fatalf("MergeFloor under a %s .lock = %+v, %v; want 1 merged", tc.name, r, err)
 			}

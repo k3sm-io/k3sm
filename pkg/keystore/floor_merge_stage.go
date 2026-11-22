@@ -24,6 +24,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -39,10 +42,18 @@ const (
 	// asideTreeName is the live keystore/ the recipe moved aside into
 	// pre-restore.d.
 	asideTreeName = "keystore"
-	// maxStagedDepth bounds how deep chownStaged descends: keystore/<name>/
-	// <file> is two levels, so anything deeper is not a keystore.
-	maxStagedDepth = 4
+	// maxStagedDepth bounds how deep the staged-tree walk descends: the
+	// deepest node the store writes is a user-scope entry's file,
+	// .user/<uid>/entries/<name>/<file>, five levels below keystore/.
+	maxStagedDepth = 5
+	// unknownUID is the owner macOS reports for every file on a volume that
+	// ignores ownership (_unknown): a backup copied from one carries it.
+	unknownUID = 99
 )
+
+// stagedNameLimit bounds how many names the staged-tree walk accepts in one
+// directory: maxDirNames, which tests lower.
+var stagedNameLimit = maxDirNames
 
 // errNotStaged refuses a merge that would change the floor while the
 // restored keystore/ is not staged in pre-restore.d.
@@ -176,89 +187,292 @@ func errStagedTargetExists(dir string) error {
 	return fmt.Errorf("%w: %s exists, a symlink counted, while the restored keystore/ is staged in pre-restore.d/restored: the restore recipe leaves it absent, and the merge moves the staged tree there itself, never through or over what is there. Nothing is written. Move %s aside (sudo mv %s %s.unexpected) and run the merge again", errFloorUntrusted, dir, dir, dir, dir)
 }
 
-// chownStaged hands pre-restore.d/restored and everything in it to the
-// service user through descriptors: fchownat with AT_SYMLINK_NOFOLLOW, so a
-// symlink is changed itself and never followed, descending only into
-// directories, at most maxStagedDepth deep and maxDirNames names in each.
-// pre-restore.d grants nothing to anyone but root, so nothing changes the
-// tree during the walk; a recursive chown in the recipe is never needed.
-func (s *FileStore) chownStaged(st *mergeStaging) error {
-	if err := s.chownAt(st.dirF, stagedTreeName); err != nil {
-		return err
+// stagedKind is what a node of the staged tree is, by where it sits: the
+// tree itself, an entry's directory, the user scopes' directory, one user
+// scope, a user scope's entries' directory, or a file.
+type stagedKind int
+
+const (
+	stagedTree stagedKind = iota
+	stagedEntry
+	stagedUsers
+	stagedScope
+	stagedScopeEntries
+	stagedFile
+)
+
+// stagedChild is what name may be inside a node of kind parent, and, for a
+// file, its size cap: only what the store itself writes there (the entry-file
+// allowlist of docs/design/keystore.md § "Restoring with the saved floor").
+// ok is false for any other name.
+func stagedChild(parent stagedKind, name string) (kind stagedKind, maxSize int64, ok bool) {
+	switch parent {
+	case stagedTree:
+		switch {
+		case name == lockName:
+			// The lock is created empty and only ever flocked.
+			return stagedFile, 0, true
+		case name == userScopesName:
+			return stagedUsers, 0, true
+		case checkName(name) == nil:
+			return stagedEntry, 0, true
+		}
+	case stagedEntry:
+		if c, ok := entryFileCap(name); ok {
+			return stagedFile, c, true
+		}
+	case stagedUsers:
+		if scopeDirName(name) {
+			return stagedScope, 0, true
+		}
+	case stagedScope:
+		if name == scopeEntriesName {
+			return stagedScopeEntries, 0, true
+		}
+		if c, ok := scopeFileCap(name); ok {
+			return stagedFile, c, true
+		}
+	case stagedScopeEntries:
+		if checkName(name) == nil {
+			return stagedEntry, 0, true
+		}
 	}
-	tree, err := st.tree(stagedTreeName)
-	if err != nil {
-		return err
-	}
-	if tree == nil {
-		return errNotStaged
-	}
-	defer func() { _ = tree.Close() }() // read-only handle
-	return s.chownTree(tree, 1)
+	return 0, 0, false
 }
 
-// chownAt hands name in dir to the service user, unless it already is.
-func (s *FileStore) chownAt(dir *os.File, name string) error {
-	var st unix.Stat_t
-	if err := unix.Fstatat(int(dir.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return fmt.Errorf("stat %s: %w", name, err)
+// tempBase is the name writeFile made the temporary file n for, when n is
+// one (isTempName).
+func tempBase(n string) (string, bool) {
+	rest, ok := strings.CutSuffix(n, ".tmp")
+	if !ok || !strings.HasPrefix(rest, ".") {
+		return "", false
 	}
-	if st.Uid == s.uid && st.Gid == s.gid {
+	i := strings.LastIndexByte(rest, '.')
+	if i <= 1 {
+		return "", false
+	}
+	base := rest[1:i]
+	return base, isTempName(n, base)
+}
+
+// entryFileCap is the size cap of n in an entry's directory, when the store
+// writes a file of that name there: generation, current, v<N> up to
+// maxVersion, the .new sibling Rewrap seals current and v<N> into, and the
+// temporary file writeFile makes for each.
+func entryFileCap(n string) (int64, bool) {
+	if base, ok := tempBase(n); ok {
+		n = base
+	}
+	if n == generationName {
+		return int64(generationFileSize), true
+	}
+	n = strings.TrimSuffix(n, newSuffix)
+	if v, ok := parseVersionName(n); n == currentName || ok && v <= maxVersion {
+		return int64(maxRecordSize), true
+	}
+	return 0, false
+}
+
+// scopeFileCap is the size cap of n in a user scope's directory: scope.key,
+// its Rewrap sibling, the deliveries record, and the temporary file
+// writeFile makes for each.
+func scopeFileCap(n string) (int64, bool) {
+	if base, ok := tempBase(n); ok {
+		n = base
+	}
+	switch n {
+	case scopeKeyName, scopeKeyName + newSuffix:
+		return int64(maxScopeKeyRecordSize), true
+	case deliveriesName:
+		return int64(maxDeliveriesRecordSize), true
+	}
+	return 0, false
+}
+
+// scopeDirName reports whether n names a user scope's directory: a uid in
+// the eligible range, in its canonical decimal form.
+func scopeDirName(n string) bool {
+	u, err := strconv.ParseUint(n, 10, 32)
+	return err == nil && strconv.FormatUint(u, 10) == n && u >= minScopeUID && u <= maxScopeUID
+}
+
+// checkStaged walks pre-restore.d/restored read-only and refuses it
+// (ErrCorrupt, naming the path inside the tree) unless every node is one the
+// keystore writes, in the shape it writes it (judgeStaged). Both a dry run
+// and the merge run it before anything changes, so they refuse alike.
+func (s *FileStore) checkStaged(st *mergeStaging) error {
+	return s.walkStaged(st, false)
+}
+
+// chownStaged hands pre-restore.d/restored and everything in it to the
+// service user, at the modes Put writes (dirMode, fileMode), after
+// checkStaged. Each node is opened by descriptor, never followed
+// (O_NOFOLLOW, O_NONBLOCK so a FIFO cannot block), judged again on that
+// descriptor, and changed through it (fchmod, fchown); an fstat after
+// confirms a file still has one link, or its owner and mode are put back
+// and the tree refused. pre-restore.d grants nothing to anyone but root, so
+// nothing should change the tree during the walk; the checks on the
+// descriptor are what keep a change from reaching another file if
+// something does.
+func (s *FileStore) chownStaged(st *mergeStaging) error {
+	if err := s.checkStaged(st); err != nil {
+		return err
+	}
+	return s.walkStaged(st, true)
+}
+
+// walkStaged is the walk of checkStaged (hand unset) and chownStaged.
+func (s *FileStore) walkStaged(st *mergeStaging, hand bool) error {
+	if st.dirF == nil {
+		return errNotStaged
+	}
+	return s.stagedNode(int(st.dirF.Fd()), stagedTreeName, ".", stagedTree, 0, 0, hand)
+}
+
+// errStagedShape is the refusal of the staged tree at rel.
+func errStagedShape(rel, why string, args ...any) error {
+	return fmt.Errorf("%w: %s/%s/%s %s: the restored keystore/ holds only what the keystore writes, so nothing is handed to the service user and nothing is written", ErrCorrupt, preRestoreDirName, stagedTreeName, rel, fmt.Sprintf(why, args...))
+}
+
+// stagedNode judges name in the directory dirfd, a node of kind k at rel
+// inside the tree, depth levels below it, hands it over when hand is set,
+// and descends into a directory.
+func (s *FileStore) stagedNode(dirfd int, name, rel string, k stagedKind, maxSize int64, depth int, hand bool) error {
+	if depth > maxStagedDepth {
+		return errStagedShape(rel, "is more than %d levels deep", maxStagedDepth)
+	}
+	var named unix.Stat_t
+	if err := unix.Fstatat(dirfd, name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("stat %s/%s/%s: %w", preRestoreDirName, stagedTreeName, rel, err)
+	}
+	// The type is judged before the open: a socket does not open, and a
+	// FIFO or device is no file of the keystore's.
+	if err := judgeStagedType(rel, &named, k); err != nil {
+		return err
+	}
+	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return errStagedShape(rel, "does not open without following it: %v", err)
+	}
+	f := os.NewFile(uintptr(fd), rel)
+	defer func() { _ = f.Close() }() // changes are made through fchown and fchmod; the move fsyncs
+	var opened unix.Stat_t
+	if err := unix.Fstat(fd, &opened); err != nil {
+		return fmt.Errorf("stat %s/%s/%s: %w", preRestoreDirName, stagedTreeName, rel, err)
+	}
+	if opened.Dev != named.Dev || opened.Ino != named.Ino {
+		return errStagedShape(rel, "changed while it was opened")
+	}
+	if err := s.judgeStaged(fd, rel, &opened, k, maxSize); err != nil {
+		return err
+	}
+	if hand {
+		if err := s.step("merge chown " + rel); err != nil {
+			return err
+		}
+		if err := s.handStaged(fd, rel, &opened, k); err != nil {
+			return err
+		}
+	}
+	if k == stagedFile {
 		return nil
 	}
-	// A file with a second link is the same inode as a file elsewhere: a
-	// ditto of the backup makes none (the keystore never links), so one
-	// here was planted, and handing it over would hand over the other.
-	if st.Mode&unix.S_IFMT != unix.S_IFDIR && st.Nlink > 1 {
-		return fmt.Errorf("%w: %s/%s holds %s with %d links: nothing is handed to the service user through it", ErrCorrupt, preRestoreDirName, stagedTreeName, name, st.Nlink)
+	names, err := f.Readdirnames(stagedNameLimit + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("list %s/%s/%s: %w", preRestoreDirName, stagedTreeName, rel, err)
 	}
-	if err := unix.Fchownat(int(dir.Fd()), name, int(s.uid), int(s.gid), unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return fmt.Errorf("hand %s to the service user: %w", name, err)
+	if len(names) > stagedNameLimit {
+		return errStagedShape(rel, "holds more than %d names", stagedNameLimit)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		childRel := n
+		if rel != "." {
+			childRel = rel + "/" + n
+		}
+		ck, cmax, ok := stagedChild(k, n)
+		if !ok {
+			return errStagedShape(childRel, "is no name the keystore writes there")
+		}
+		if err := s.stagedNode(fd, n, childRel, ck, cmax, depth+1, hand); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// chownTree is chownStaged's walk of root, depth levels below restored.
-func (s *FileStore) chownTree(root *os.Root, depth int) error {
-	d, err := root.Open(".")
+// judgeStagedType refuses a node whose type is not the one its place holds:
+// a regular file for a file, a directory for anything else. A symlink is
+// neither.
+func judgeStagedType(rel string, st *unix.Stat_t, k stagedKind) error {
+	typ := st.Mode & unix.S_IFMT
+	if k == stagedFile && typ != unix.S_IFREG {
+		return errStagedShape(rel, "is not a regular file (type %#o)", typ)
+	}
+	if k != stagedFile && typ != unix.S_IFDIR {
+		return errStagedShape(rel, "is not a directory (type %#o)", typ)
+	}
+	return nil
+}
+
+// judgeStaged refuses the node fd holds, at rel, of kind k, unless it is in
+// the shape the keystore writes: its type (judgeStagedType), one link for a
+// file (a second is the same inode as a file elsewhere, and handing it over
+// would hand that file over), no setuid, setgid or sticky bit, no file flag,
+// no extended ACL, a file at most maxSize bytes, and owned by the service
+// user or by the unknown owner an ownership-ignoring volume reports. A
+// root-owned node is refused: a ditto of the backup keeps the service
+// user's owner, so a root file there is a copied link to one of root's.
+func (s *FileStore) judgeStaged(fd int, rel string, st *unix.Stat_t, k stagedKind, maxSize int64) error {
+	if err := judgeStagedType(rel, st, k); err != nil {
+		return err
+	}
+	switch {
+	case k == stagedFile && st.Nlink != 1:
+		return errStagedShape(rel, "has %d links", st.Nlink)
+	case st.Mode&(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) != 0:
+		return errStagedShape(rel, "has the setuid, setgid or sticky bit (mode %#o)", st.Mode&0o7777)
+	case st.Flags != 0:
+		return errStagedShape(rel, "has file flags %#x", st.Flags)
+	case k == stagedFile && st.Size > maxSize:
+		return errStagedShape(rel, "is %d bytes, over the %d its name allows", st.Size, maxSize)
+	case st.Uid != s.uid && st.Uid != unknownUID:
+		return errStagedShape(rel, "is owned by uid %d, neither the service user (%d) nor the unknown owner (%d)", st.Uid, s.uid, unknownUID)
+	}
+	acl, err := hasExtendedACL(fd)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s/%s/%s: %w", preRestoreDirName, stagedTreeName, rel, err)
 	}
-	defer func() { _ = d.Close() }() // read-only
-	names, err := d.Readdirnames(maxDirNames + 1)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return err
+	if acl {
+		return errStagedShape(rel, "has an extended ACL")
 	}
-	if len(names) > maxDirNames {
-		return fmt.Errorf("%w: a directory in %s/%s holds more than %d names", ErrCorrupt, preRestoreDirName, stagedTreeName, maxDirNames)
+	return nil
+}
+
+// handStaged sets the node fd holds to the mode Put writes and hands it to
+// the service user, through the descriptor, then confirms a file still has
+// one link: a link made between the checks and the fchown would share the
+// handover, so its owner and mode are put back and the tree refused.
+func (s *FileStore) handStaged(fd int, rel string, before *unix.Stat_t, k stagedKind) error {
+	mode := uint32(fileMode)
+	if k != stagedFile {
+		mode = uint32(dirMode)
 	}
-	for _, name := range names {
-		if err := s.chownAt(d, name); err != nil {
-			return err
-		}
-		fi, err := root.Lstat(name)
-		if err != nil {
-			return err
-		}
-		if !fi.IsDir() {
-			continue
-		}
-		if depth >= maxStagedDepth {
-			return fmt.Errorf("%w: %s/%s is more than %d levels deep", ErrCorrupt, preRestoreDirName, stagedTreeName, maxStagedDepth)
-		}
-		sub, err := root.OpenRoot(name)
-		if err != nil {
-			return err
-		}
-		if opened, serr := sub.Stat("."); serr != nil || !os.SameFile(fi, opened) {
-			_ = sub.Close() // abandoned
-			return fmt.Errorf("%w: %s changed during the walk", ErrCorrupt, name)
-		}
-		err = s.chownTree(sub, depth+1)
-		_ = sub.Close() // read-only handle
-		if err != nil {
-			return err
-		}
+	if err := unix.Fchmod(fd, mode); err != nil {
+		return fmt.Errorf("set the mode of %s/%s/%s: %w", preRestoreDirName, stagedTreeName, rel, err)
+	}
+	if err := unix.Fchown(fd, int(s.uid), int(s.gid)); err != nil {
+		return fmt.Errorf("hand %s/%s/%s to the service user: %w", preRestoreDirName, stagedTreeName, rel, err)
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(fd, &after); err != nil {
+		return fmt.Errorf("stat %s/%s/%s: %w", preRestoreDirName, stagedTreeName, rel, err)
+	}
+	if k == stagedFile && after.Nlink != 1 {
+		// Put back what the other name had; a failure leaves the refusal.
+		_ = unix.Fchown(fd, int(before.Uid), int(before.Gid))
+		_ = unix.Fchmod(fd, uint32(before.Mode&0o7777))
+		return errStagedShape(rel, "gained a link (%d) while it was handed over", after.Nlink)
 	}
 	return nil
 }
