@@ -64,7 +64,7 @@ func corruptTombstones(t *testing.T, s *FileStore, scope, name string, gen [gene
 // writes no live line. An entry whose put lost its floor line is rm'd, its
 // tombstone is then lost to damage, and its tree is copied back with a
 // pointer that authenticates: the catch-up refuses to give its generation
-// a live line (and the start step refuses), a put refuses before its first
+// a live line (and the start step quarantines its scope), a put refuses before its first
 // write naming doctor, Current refuses, and rm and withdraw still work.
 func TestFloorDamageDegradesLiveLines(t *testing.T) {
 	ctx := context.Background()
@@ -104,8 +104,11 @@ func TestFloorDamageDegradesLiveLines(t *testing.T) {
 		t.Fatalf("the catch-up wrote %d live line(s) for a generation a lost tombstone buried", n)
 	}
 	s2 := reopenStore(t, s)
-	if err := s2.startUserScopes(ctx); err == nil || s2.userScopesStarted.Load() {
-		t.Fatalf("start over a refused live-line catch-up: %v, started %v; want it refused", err, s2.userScopesStarted.Load())
+	if err := s2.startUserScopes(ctx); !errors.Is(err, errCatchUpRefused) || !s2.userScopesStarted.Load() {
+		t.Fatalf("start over a refused live-line catch-up: %v, started %v; want it started with the refusal named", err, s2.userScopesStarted.Load())
+	}
+	if _, err := s2.UserScope(1001); !errors.Is(err, errFloorDegraded) {
+		t.Fatalf("UserScope of the scope whose catch-up was refused: %v, want errFloorDegraded (quarantined)", err)
 	}
 
 	if _, _, err := u.Current(ctx, "user/1001/lost"); !errors.Is(err, errFloorDegraded) {

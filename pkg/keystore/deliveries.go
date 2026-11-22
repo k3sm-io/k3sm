@@ -943,13 +943,16 @@ func (u *UserScope) catchUpDeliveries(gen [generationSize]byte, rd deliveriesRea
 // both have run it marks the user scope started, and only then does
 // UserScope build one (errUserScopesNotStarted). A refused CheckLogBounds
 // (it fails closed: a log missing, untrusted, unflagged or unreadable is
-// refused), a catch-up that could not run at all (no lock, no master), or
-// a live catch-up line the floor refused (errCatchUpRefused: a floor with
-// damage refuses every one, errFloorDegraded) leaves it unstarted and
-// returns the error: the start fails closed rather than serve over a floor
-// behind an authenticated tree. A scope the catch-up could not open at
-// all has no line to write: it is logged and named in the returned error,
-// and the user scope still starts.
+// refused), or a catch-up that could not run at all (no lock, no master),
+// leaves it unstarted and returns the error. A scope whose live catch-up
+// line the floor refused (errCatchUpRefused: a tainted key, or a generation
+// with no line while unattributable damage counts, errFloorDegraded) is
+// quarantined, never served over a floor behind its authenticated tree:
+// UserScope refuses that uid with errFloorDegraded, every other scope
+// starts, and the refusal is named in the returned error. Unattributable
+// damage so quarantines only the scopes that have something to catch up. A
+// scope the catch-up could not open at all has no line to write: it is
+// logged and named in the returned error, and it still starts.
 //
 //lint:ignore U1000 the server start calls it once the socket lands; until then TestUserScopeIsUnexported holds the user scope in this package.
 func (s *FileStore) startUserScopes(ctx context.Context) error {
@@ -966,20 +969,34 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 	if spent > 0 {
 		slog.Warn("uids have spent their revocation budgets past the hard cap; only their revocations are refused", "uids", spent)
 	}
-	scopeErrs, err := s.catchUpUser(ctx)
+	quarantined, scopeErrs, err := s.catchUpUserScopes(ctx)
 	if err != nil {
 		return errors.Join(err, scopeErrs)
 	}
-	if errors.Is(scopeErrs, errCatchUpRefused) {
-		return scopeErrs
+	if len(quarantined) > 0 {
+		slog.Warn("the user-scope floor refused live catch-up lines; those scopes are quarantined and every other scope starts", "quarantined", len(quarantined))
 	}
+	s.quarantined.Store(&quarantined)
 	s.userScopesStarted.Store(true)
 	return scopeErrs
 }
 
+// errScopeQuarantined marks a uid whose scope the start step quarantined
+// (startUserScopes); it wraps errFloorDegraded.
+var errScopeQuarantined = errors.New("the user-scope floor refused this scope's catch-up line at the server's start, so the scope is quarantined")
+
+// scopeQuarantined reports whether the start step quarantined uid's scope.
+func (s *FileStore) scopeQuarantined(uid uint32) bool {
+	if s.quarantined == nil {
+		return false
+	}
+	m := s.quarantined.Load()
+	return m != nil && (*m)[uid]
+}
+
 // errCatchUpRefused marks a live catch-up line the floor did not take,
-// which refuses the start step (startUserScopes).
-var errCatchUpRefused = errors.New("the user-scope floor did not take a live catch-up line, so the user scope is not started")
+// which quarantines its scope at the start step (startUserScopes).
+var errCatchUpRefused = errors.New("the user-scope floor did not take a live catch-up line, so the scope is quarantined")
 
 // errUserScopesNotStarted refuses a user scope before the server's start
 // step (startUserScopes) has run.
@@ -999,23 +1016,32 @@ var errUserScopesNotStarted = errors.New("the user scope is not started: the ser
 // could not run at all. A keystore with no directory or no user scope has
 // nothing to catch up.
 func (s *FileStore) catchUpUser(ctx context.Context) (scopeErrs, err error) {
+	_, scopeErrs, err = s.catchUpUserScopes(ctx)
+	return scopeErrs, err
+}
+
+// catchUpUserScopes is catchUpUser, which also returns the uids whose live
+// catch-up line the floor refused (errCatchUpRefused): the scopes the start
+// step quarantines.
+func (s *FileStore) catchUpUserScopes(ctx context.Context) (quarantined map[uint32]bool, scopeErrs, err error) {
+	quarantined = map[uint32]bool{}
 	if err := s.checkConfig(); err != nil {
-		return nil, err
+		return quarantined, nil, err
 	}
 	root, done, err := s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return quarantined, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return quarantined, nil, err
 	}
 	defer done()
 	if exists, err := rootHasUserScopes(root); err != nil || !exists {
-		return nil, err
+		return quarantined, nil, err
 	}
 	k, err := s.loadMaster()
 	if err != nil {
-		return nil, err
+		return quarantined, nil, err
 	}
 	var errs []error
 	err = s.eachScopeDir(ctx, root, func(name string, _ *os.Root) error {
@@ -1024,6 +1050,9 @@ func (s *FileStore) catchUpUser(ctx context.Context) (scopeErrs, err error) {
 		if err := u.catchUpScope(root, k); err != nil {
 			slog.Warn("the user-scope delivery catch-up did not run for a scope", "scope", u.scope, "err", err)
 			errs = append(errs, fmt.Errorf("%s: %w", u.scope, err))
+			if errors.Is(err, errCatchUpRefused) {
+				quarantined[u.uid] = true
+			}
 		}
 		return nil
 	})
@@ -1031,7 +1060,7 @@ func (s *FileStore) catchUpUser(ctx context.Context) (scopeErrs, err error) {
 	if n := countCatchUpRefused(joined); n > 0 {
 		slog.Warn("the user-scope floor refused live catch-up lines; none was written", "refused", n)
 	}
-	return joined, err
+	return quarantined, joined, err
 }
 
 // countCatchUpRefused counts the errCatchUpRefused leaves in err, a tree of

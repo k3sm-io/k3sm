@@ -113,10 +113,14 @@ type UserScope struct {
 // 2147483647, or the service uid, is refused: root has no user scope, and
 // neither has a system account, nobody or the service user. Until the
 // server's start step has run (startUserScopes) it refuses every uid,
-// errUserScopesNotStarted.
+// errUserScopesNotStarted; after it, a uid whose scope the start step
+// quarantined is refused, errFloorDegraded.
 func (s *FileStore) UserScope(uid uint32) (*UserScope, error) {
 	if s.userScopesStarted == nil || !s.userScopesStarted.Load() {
 		return nil, errUserScopesNotStarted
+	}
+	if s.scopeQuarantined(uid) {
+		return nil, fmt.Errorf("%w: %w", errScopeQuarantined, errFloorDegraded)
 	}
 	scope := userScopeOf(uid)
 	if err := checkScope(scope); err != nil {

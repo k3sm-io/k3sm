@@ -163,6 +163,11 @@ type FileStore struct {
 	// (errUserScopesNotStarted). A pointer, so a copy of the store shares
 	// it; New allocates it.
 	userScopesStarted *atomic.Bool
+	// quarantined is the set of uids whose scope the start step refused a
+	// live catch-up line for: UserScope refuses each with errFloorDegraded,
+	// and every other scope starts. A pointer, as userScopesStarted is;
+	// New allocates it.
+	quarantined *atomic.Pointer[map[uint32]bool]
 }
 
 var _ Store = (*FileStore)(nil)
@@ -194,6 +199,7 @@ func New(cfg Config) *FileStore {
 		logRevokeBudget: orDefault(cfg.LogRevocationBudget, defaultLogRevocationBytes),
 
 		userScopesStarted: new(atomic.Bool),
+		quarantined:       new(atomic.Pointer[map[uint32]bool]),
 	}
 	s.userFloor, s.auditSink = newFileFloorLog(s), newFileAuditLog(s)
 	return s
