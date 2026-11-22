@@ -88,7 +88,11 @@ const (
 	logBoundMargin = 1 << 20
 	// maxFloorKeysCeiling is the absolute ceiling on the floor's key bound,
 	// whatever the caps are configured to: what bounds the reader's memory.
-	maxFloorKeysCeiling = 1 << 23
+	// At the default caps the size alone would allow about 7.3M keys; at
+	// this ceiling a floor read from scratch measured about 145 MiB of heap
+	// and 0.65 s (BenchmarkFloorReadAtKeyBound; docs/design/keystore.md §
+	// "Size caps").
+	maxFloorKeysCeiling = 1 << 20
 	// logFreeMargin is the free space an append leaves on the log's file
 	// system beyond its own line.
 	logFreeMargin = 1 << 20
@@ -108,8 +112,8 @@ var minFloorLine = func() int {
 }()
 
 // keyBound is the most distinct keys the floor may hold: as many as lines of
-// minFloorLine bytes fit in logReadBound, so the size bound is normally met
-// first, held to maxFloorKeysCeiling. The writer refuses a line that would
+// minFloorLine bytes fit in logReadBound, held to maxFloorKeysCeiling, which
+// is met first at the default caps. The writer refuses a line that would
 // add a key past it, so the reader never meets it in a floor the server
 // wrote.
 func (l *appendLog) keyBound() int {

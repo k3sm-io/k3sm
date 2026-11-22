@@ -1704,8 +1704,12 @@ That wait is the store `.lock`
   without limit: a log larger than the hard cap plus 1024 uids' revocation budgets plus 1 MiB
   (321 MiB at the defaults) is damage, and so is a floor holding more distinct
   `(scope, name, generation)` keys than its key bound: that size bound over the shortest line
-  that adds a key (46 bytes), so the size bound is normally met first (about 7.3 million keys
-  at the defaults), held to an absolute ceiling of 2^23 whatever the caps are configured to.
+  that adds a key (46 bytes), held to a ceiling of 2^20 (1,048,576) keys whatever the caps are
+  configured to. The size alone would allow about 7.3 million keys at the defaults, so the
+  ceiling is met first there, and it is what bounds the reader's memory: a floor at the bound
+  (52 MiB of lines) read from scratch holds about 145 MiB of heap and takes about 0.65 s
+  (`BenchmarkFloorReadAtKeyBound`, measured on an M1 Ultra). The writer refuses a new key at
+  that bound, so a floor the server wrote never reaches it as damage.
   The server never appends past either bound itself: an append that would take the log past
   the size bound, or a floor line that would add a key past the key bound, is refused
   (`ErrLogFull`), and the floor's key count is the one the reader keeps, read on the append's

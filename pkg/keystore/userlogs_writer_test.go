@@ -17,13 +17,17 @@ limitations under the License.
 package keystore
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -140,8 +144,9 @@ func entryGenerationOf(t *testing.T, s *FileStore) [generationSize]byte {
 	return gen
 }
 
-// At the default caps the key bound is at least the hard cap over the
-// shortest line that adds a key (46 bytes), so the size cap is met first.
+// The key bound is the read bound over the shortest line that adds a key
+// (46 bytes), held to a ceiling of 1<<20 keys, which is met first at the
+// default caps and bounds the reader's memory.
 func TestFloorKeyBoundDerivedFromCaps(t *testing.T) {
 	s, _, _ := fileLogScope(t)
 	line, err := floorLine(userScopeOf(minScopeUID), "a", [generationSize]byte{}, 1)
@@ -151,8 +156,16 @@ func TestFloorKeyBoundDerivedFromCaps(t *testing.T) {
 	if len(line) != 46 {
 		t.Fatalf("the shortest floor line is %d bytes, want 46", len(line))
 	}
-	if got, want := s.userFloor.(*fileFloorLog).log.keyBound(), int(defaultLogHardCap/46); got < want {
-		t.Fatalf("key bound %d at the default caps, want at least %d", got, want)
+	l := s.userFloor.(*fileFloorLog).log
+	// At the default caps the size would allow about 7.3M keys; the ceiling
+	// of 1<<20, which bounds the reader's memory, is met first.
+	if got := l.keyBound(); got != 1<<20 {
+		t.Fatalf("key bound %d at the default caps, want the ceiling %d", got, 1<<20)
+	}
+	// Under small caps the size-derived bound is met first.
+	s.logHardCap, s.logSoftCap, s.logRevokeBudget = 1<<20, 1<<20, maxLogLine
+	if got, want := l.keyBound(), int(s.logReadBound()/46+1); got != want || want >= 1<<20 {
+		t.Fatalf("key bound %d under 1 MiB caps, want the size-derived %d", got, want)
 	}
 }
 
@@ -299,4 +312,67 @@ func TestAuditTornTailAppendParses(t *testing.T) {
 			t.Fatal("the rm line past the hard cap was not charged to uid 1001")
 		}
 	})
+}
+
+// BenchmarkFloorReadAtKeyBound reads, from scratch, a floor holding exactly
+// the key bound's distinct keys at the default caps, and reports the heap
+// the read state holds and the time one read takes: the reader's cost at
+// the bound the writer never passes (docs/design/keystore.md § "Size caps").
+func BenchmarkFloorReadAtKeyBound(b *testing.B) {
+	s := &FileStore{logHardCap: defaultLogHardCap, logSoftCap: defaultLogSoftCap, logRevokeBudget: defaultLogRevocationBytes}
+	l := newFileFloorLog(s).log
+	keys := l.keyBound()
+	p := filepath.Join(b.TempDir(), userFloorLogName)
+	w, err := os.Create(p)
+	if err != nil {
+		b.Fatal(err)
+	}
+	bw := bufio.NewWriterSize(w, 1<<20)
+	for i := range keys {
+		line, err := floorLine(fmt.Sprintf("user/%d", 501+i%1000), fmt.Sprintf("k%d", i), guid(byte(i)), 1)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_, _ = bw.Write(line)
+	}
+	if err := bw.Flush(); err != nil {
+		b.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		b.Fatal(err)
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		b.Fatal(err)
+	}
+	var (
+		heap uint64
+		read time.Duration
+	)
+	b.ResetTimer()
+	for b.Loop() {
+		l.state = logState{}
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		start := time.Now()
+		state, err := l.sync(f, st)
+		read = time.Since(start)
+		if err != nil || state.bad != nil || state.keys != keys {
+			b.Fatalf("read the floor at its key bound: %v, %v, %d keys of %d", err, state.bad, state.keys, keys)
+		}
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		heap = after.HeapAlloc - before.HeapAlloc
+		runtime.KeepAlive(state)
+	}
+	b.ReportMetric(float64(heap)/(1<<20), "MiB-heap")
+	b.ReportMetric(read.Seconds(), "s-read")
+	b.ReportMetric(float64(st.Size)/(1<<20), "MiB-file")
+	b.ReportMetric(float64(keys), "keys")
 }
