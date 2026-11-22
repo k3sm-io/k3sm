@@ -88,7 +88,8 @@ Two later facts amend this paragraph. The keystore's files directly under the da
 (Phase A's `keystore-floor.json` and `keystore-delivery.json`, and the user scope's files)
 are denied to every Pod by runtimed's data-root denies, which today cover `server` and `agent`
 (`DataRootDenySubdirs`) and which the sandbox change that comes with the user scope widens to
-every `keystore-*` name in the data root and the whole `keystore-run/` tree; the data-root
+every `keystore-*` name in the data root and the whole `keystore-sock/` tree, the socket's
+directory; the data-root
 denies are used, not `DaemonTreeSubdirs`, because a node's Pod root can differ from its data
 root. Both files are root 0644, so a local login user can still read them (residual 11). Whether a Pod can read Phase A's two data-root files
 before that change was not measured: the files did not exist on the rig (K0 amendment 2026-11-21); the denies land either way. And the user scope
@@ -1899,63 +1900,75 @@ layer.**
    `keystore-maintenance` and the staging files
    `keystore-user-floor.log.new` and `keystore-audit.log.new`), and the whole `keystore-sock/`
    tree, which the prefix also covers. A prefix means a keystore file a later change adds is
-   denied without a runtimed change. The keystore names join `DataRootDenyTrees`, the list of
-   data-root trees runtimed denies, which also feeds `protectedPrefixes`. Not
-   `DaemonTreeSubdirs`, which is under the work dir and misses a node whose Pod root differs
-   from its data root.
+   denied without a runtimed change. runtimed renders them under the work dir always and under
+   `Posture.DataRoot` when it is set and differs (`keystoreRoots`), not under
+   `DaemonTreeSubdirs` alone, which is under the work dir and misses a node whose Pod root
+   differs from its data root.
 
-   **What protects the keystore is the validator, not the order.** The profile emits the
-   data-root denies first, and narrow re-allows follow for the Pod volume, exposed paths,
-   `ReadOnlyPaths` and views; in Seatbelt a later allow wins over an earlier deny for the paths
-   it matches, so the order alone protects nothing. The protection is that the protected-prefix
-   validator (`validateExtraPaths` and `validateExposePaths`, over `protectedPrefixes`) refuses
-   any caller-supplied re-allow under the data root or a keystore name, so no re-allow can
-   reach a keystore path, and the Pod is refused rather than started with one. A
-   `ReadOnlyPaths` entry, an `ExposePaths` entry or a hostPath naming the data root or a
-   keystore path is refused (U16).
+   **The keystore stanza is the last rule, and the validator refuses what it would override.**
+   As built (`keystoreDenyStanza`, `runtimed/pkg/sandbox/keystore.go`), runtimed emits the
+   keystore denies as the last rule of every Pod profile. Seatbelt is last-match-wins, so no
+   allow earlier in the profile (an extra path, a volume, an exposure, a credential, a view, a
+   host share) re-opens a keystore path. Two refusals sit in front of it, so a grant that the
+   stanza would silently override is refused rather than rendered:
 
-   **The test reads the whole profile.** U16 does not check that the denies are present; it
+   - *A caller path naming a keystore path is refused at validation.* Every caller-supplied
+     path (extra read and write paths, `ReadOnlyPaths`, `WritePaths`, `ReadPaths`, host
+     shares, `ExposePaths`, artifact views and the Xcode toolchain directory) that is at or
+     under a `keystore-*` name, in any spelling or letter case, is refused with
+     `ErrProtectedPath` (`validateKeystoreReach`), and the Pod is refused rather than started.
+   - *A pods root under a `keystore-*` name is refused* (`ErrInvalidDataRoot`), since the
+     last-rule deny would deny every Pod its own volume there.
+
+   A `ReadOnlyPaths` entry, an `ExposePaths` entry or a hostPath naming a keystore path is
+   refused (U16).
+
+   **The test reads the whole profile.** U16 does not stop at the stanza's presence; it
    asserts over the whole rendered profile, for every variant, that no emitted allow rule, of
-   any operation and any filter (literal, subpath, prefix or regex), matches any keystore path.
-   Two variants are where an allow is most likely to slip in: a Pod root equal to the data root,
-   and a Pod root that is a parent of the data root; each is a case of its own. Two facts of the
-   rendering are stated so the test checks them:
+   any operation and any filter (literal, subpath, prefix or regex), matches any keystore path,
+   and that the keystore stanza is the last rule. Two variants are where an allow is most
+   likely to slip in: a Pod root equal to the data root, and a Pod root that is a parent of the
+   data root; each is a case of its own. The facts of the rendering, as built, are stated so the
+   test checks them:
 
-   - the data-root deny paths are written in the canonical form, `/private/var/lib/k3sm`, since
-     Seatbelt matches the resolved path and `/var` is a symlink to `/private/var`; a deny
-     written under `/var/lib/k3sm` would match nothing;
-   - the `keystore-` prefix deny is a regex rule, `(regex #"^/private/var/lib/k3sm/keystore-")`
-     with the data root quoted, because a `subpath` names one directory, not a name prefix;
-   - every deny also holds under each alias of the data root: the firmlinked
-     `/System/Volumes/Data/private/var/lib/k3sm/...`, and the data volume's own mount path,
-     which `install` sets to the data root (`Mountpoint: install.DefaultDataRoot`,
-     `cmd/k3sm/install.go:664`) but which the test takes from the volume record, so a volume
-     mounted elsewhere is covered too. Either the canonical deny matches the alias or the
-     profile emits a deny for it; the test checks the outcome, not the mechanism.
+   - the stanza denies `file-read*` (metadata included), `file-write*` (create, unlink and
+     rename among them), `file-link`, which `file-write*` does not cover, unix-socket
+     `network-outbound` and unix-socket `network-bind`;
+   - each deny is written in every spelling of each root: the `/var` form, the resolved
+     `/private/var` form, and the data volume's `/System/Volumes/Data/private/var` form
+     (`keystoreForms`), so it holds whichever spelling a Pod uses;
+   - the `keystore-` prefix deny is a regex rule matched in either letter case
+     (`keystorePrefixPattern`, `[Kk][Ee]…`, with the root quoted), because a `subpath` names one
+     directory, not a name prefix, and the data volume is case-insensitive by default; the
+     `keystore-run` and `keystore-sock` trees also get `subpath` filters;
+   - the data volume's own mount path, which `install` sets to the data root (`Mountpoint:
+     install.DefaultDataRoot`, `cmd/k3sm/install.go:664`), is taken by the test from the volume
+     record, so a volume mounted elsewhere is covered too; the test checks the outcome, not the
+     mechanism.
 
-   **An empty `Posture.DataRoot` fails closed.** runtimed refuses to render a Pod profile
-   without one, so a posture that lost its data root cannot produce a profile with no data-root
-   denies (U16).
+   **An empty `Posture.DataRoot` still gets the denies.** As built, runtimed renders the
+   keystore stanza under the work dir when no data root is set (the standalone daemon has none
+   to name), where the default node keeps its data root; the denies are never skipped (U16).
 
    **vm and container-vm Pods.** The guest is given no share of the data root, so nothing in
    the guest names the socket or a keystore file (U16, E10).
 
    **One home for the names.** runtimed owns the keystore path names in a cgo-free leaf
    package, `runtimed/pkg/keystorepaths`, which imports only the standard library: the
-   constants `KeystoreDataRootPrefix`, `KeystoreRunDir` and `KeystoreSockDir`, and
-   `KeystoreSocketPath(dataRoot)`, which returns `<dataRoot>/keystore-sock/keys.sock`.
+   constants `DataRootPrefix`, `RunDir`, `SockDir` and `SocketName`, and
+   `SocketPath(dataRoot)`, which returns `<dataRoot>/keystore-sock/keys.sock`.
    `pkg/sandbox` and k3sm's provider import it; k3sm's `pkg/keystore` imports only
    that leaf, never `pkg/sandbox`, so the store takes on none of the sandbox's dependencies
-   (U49). The prefix deny is built from `KeystoreDataRootPrefix`, install's directory and the
-   plist's `SockPathName` from `KeystoreSockDir` and `KeystoreSocketPath`, and k3sm's
-   `baseSocketDenies` derives the `keys.sock` path from `KeystoreSocketPath` and adds a
+   (U49). The prefix deny is built from `DataRootPrefix`, install's directory and the
+   plist's `SockPathName` from `SockDir` and `SocketPath`, and k3sm's
+   `baseSocketDenies` derives the `keys.sock` path from `SocketPath` and adds a
    `(deny network-outbound (remote unix-socket …))` for it, so there is one spelling (U46,
    E10).
 
-   **The denies cover writes, not only reads and connects.** The data-root denies are on every
-   file operation (`file*`: reads, writes, create, unlink, rename, link and attribute changes),
-   and on `network-bind` of a unix socket under `keystore-sock/`, so a Pod can neither plant a
-   name nor bind a socket where the server's is. U16 asserts, for every variant, that the
+   **The denies cover writes, not only reads and connects.** The stanza denies `file-read*`,
+   `file-write*`, `file-link`, unix `network-outbound` and unix `network-bind` on every
+   `keystore-*` name and the `keystore-sock/` tree, in every spelling, so a Pod can neither plant
+   a name nor bind a socket where the server's is. U16 asserts, for every variant, that the
    rendered profile refuses a write, a create, an unlink, a rename and a `network-bind` on
    `keystore-sock/`, on `keys.sock` and on every `keystore-*` name, beside the read and connect
    cases; E10 attempts each on the rig and expects `EPERM`.
@@ -1969,8 +1982,10 @@ layer.**
    (K0 amendment 2026-11-21), and Phase A's two files were absent, so their reach today is unmeasured.
 2. **Pod uid refusal, the second layer.** Native Pods on an installed server run as the
    service user, below 501. The sandbox change adds a second layer: runtimed refuses an
-   explicit drop target of 501 or above (`cred.UID` with `Drop` set), both when it resolves the
-   credential and again at spawn (U17, E21). The layer holds the uid **at spawn**: a setuid
+   explicit drop target of 501 or above (`cred.UID` with `Drop` set), through
+   `Credential.CheckPodUID` (`runtimed/pkg/supervisor/privdrop.go`), called at `startContainer`,
+   at `Exec` (an exec session), at the resident shim's `dropShim` and again in
+   `RunLaunchSequence`; it is not in `resolveCredential` (U17, E21). The layer holds the uid **at spawn**: a setuid
    exec by the Pod's process after spawn is the sandbox's to stop, a cross-domain item owned by
    runtimed's Seatbelt profile, and this layer claims nothing about it. **The refusal applies
    to native Pods only.** A vm or container-vm guest's uid has no host meaning, since the
@@ -2062,7 +2077,7 @@ objects lose their claim at once, whatever their check reads (Open requirement 1
   | reason | condition | status | when |
   |---|---|---|---|
   | `Authorized` | `Authorized` | `True` | every check below passes |
-  | `EntryUnavailable` | `Authorized` | `False` | check 1 fails |
+  | `EntryUnavailable` | `Authorized` | `False` | check 1 answers `ErrNotFound` or `ErrScopeOwnerChanged` (the latter only once a K7a amendment puts it on the allow-list, Open requirement 10) |
   | `NotRecorded` | `Authorized` | `False` | check 2 fails |
   | `NotAuthorized` | `Authorized` | `False` | a SubjectAccessReview in check 3 returns a definitive denial on two consecutive sweeps |
   | `Indeterminate` | `Authorized` | `Unknown` | any outcome not on the allow-list of definitive outcomes ("A denial deletes; an error does not") |
@@ -2263,6 +2278,10 @@ conditions guard a denial before it deletes anything:
   cannot delete a Secret however many sweeps it spans (U93). The observation state lives only
   in the reconciler's memory: a restart resets it, which delays a deletion by a further pair
   of observations and never speeds one up.
+- **No sweep during maintenance.** While the marker `keystore-maintenance` exists in the data
+  root the reconciler pauses: it starts no sweep, and an append already waiting for the store
+  lock lands in the new file after the server's reopen ("The server reopens after
+  maintenance").
 - **Single-server is re-checked before every sweep.** Before each sweep the reconciler lists
   the nodes with the `node-role.kubernetes.io/control-plane` label afresh, not from a cache.
   With more than one, the sweep does not run and KeyDeliveries get `UserScopeOff`; when the
@@ -2840,14 +2859,22 @@ the uid throughout.
     a suspected master exposure each user re-puts their values with new credentials, and
     `rewrap` warns whenever user scopes exist.
 16. A delivered Secret whose label or owner annotation someone removed is left in place
-    (`LabelRemoved`), so it is not deleted when the delivery is revoked. This adds no reach:
-    the principal that could edit the Secret's metadata holds update on it and could already
-    read and copy its value.
+    (`LabelRemoved`), so it is not deleted when the delivery is revoked, and it is never
+    repaired either: a writer who strips the label holds a substituted value in place at that
+    name, and the reconciler only reports it. This adds no reach: the principal that could edit
+    the Secret's metadata holds update on it and could already read, copy or replace its
+    value.
 17. Root Pods are out of the user-scope threat model. A Pod with no drop on a root daemon runs
     as root, and runtimed does not refuse it. The socket refuses peer uid 0 before any frame
     (U26), and root owns the host anyway (Phase A), so a root Pod gains nothing here that root
     lacks.
-
+18. Permission to update `nodes` freezes revocation. A principal that may label a node
+    `node-role.kubernetes.io/control-plane` (or register a second server) makes the
+    single-server check see more than one server, which stops the listener and every sweep
+    ("Single-server clusters only"): no delivered Secret is deleted or rotated until the label
+    goes, so a revoked credential stays delivered. `nodes` update is therefore a
+    revocation-freezing permission; the user docs say to grant it to no one who should not hold
+    that power, and `doctor` names the extra server.
 ### What the user scope does not do
 
 Phase B direct mounts; a ServiceAccount rotate transport, deferred to a new endpoint with its
@@ -3100,13 +3127,13 @@ carried by the unit rows.
 | U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; the 65th live delivery answers `ErrQuota` to `deliver`; `rm` and `withdraw` still work | `k3sm/pkg/keystore::TestUserScopeQuota`, `TestDeliveryRecordQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U14 | the delivery record stores UID, the full target tuple (`entry`, `namespace`, `secretName`, `dataKey`, `requestedBy`) under its seal, and the target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label; the digest covers `entry`, `namespace`, `secretName`, `dataKey` and `requestedBy` | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel`, `TestDeliveryDigestCoversRequestedBy` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U15 | (reserved for the K0 amendment if leg 5 finds a second Pod-uid path) | none | pending: K0 amendment |
-| U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, wasm (a native Pod whose process is the `k3sm-wasmhost` helper, `runtimed/pkg/wasmhost/doc.go:20`), the profile an exec-session process runs under (`runtimed/pkg/execsession/doc.go:17`), a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-sock/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` refuses to render; a vm or container-vm guest gets no data-root share; over the whole rendered profile of every variant, including a Pod root equal to the data root and a Pod root that is a parent of it, no emitted allow matches any keystore path; the denies are written under the canonical `/private/var/lib/k3sm` and the `keystore-` prefix deny is a regex rule; beside the read and connect cases, a file write, create, unlink and rename and a `network-bind` on `keystore-sock/`, on `keys.sock` and on every `keystore-*` name are each refused; every case also holds through `/System/Volumes/Data/private/var/lib/k3sm/...` and through the data volume's mount path | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestNoEmittedAllowCoversKeystorePath`, `TestDataRootDeniesCanonicalPathAndPrefixRegex`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`, `TestKeystoreDenyCoversWritesAndBind`, `TestKeystoreDeniesCoverPathAliases`; rig leg E10 | pending: runtimed's sandbox change |
-| U17 | runtimed refuses an explicit drop target of 501 or above (`cred.UID` with `Drop` set), at credential resolution and again at spawn, through `Credential.CheckPodUID` (owed until it lands in runtimed); an inherited uid (no drop: the daemon's own euid, which is the service uid, a rootless server's login uid or root on a root daemon) is allowed, and so is a gid-only drop that leaves uid 0 | `runtimed/pkg/runtime::TestResolveCredentialRefusesLoginRangeUID`, `TestResolveCredentialAllowsInheritedUID`; `runtimed/pkg/supervisor::TestSpawnRefusesLoginRangeUID`, `TestSpawnAllowsInheritedUID`; rig legs E21, E22 | pending: runtimed's sandbox change |
+| U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, wasm (a native Pod whose process is the `k3sm-wasmhost` helper, `runtimed/pkg/wasmhost/doc.go:20`), the profile an exec-session process runs under (`runtimed/pkg/execsession/doc.go:17`), a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-sock/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` still gets the denies under the work dir; a vm or container-vm guest gets no data-root share; over the whole rendered profile of every variant, including a Pod root equal to the data root and a Pod root that is a parent of it, no emitted allow matches any keystore path; the keystore stanza is the profile's last rule, written in the `/var`, `/private/var` and `/System/Volumes/Data` spellings, and the `keystore-` prefix deny is a regex rule in either letter case; a caller path naming a keystore path is refused with `ErrProtectedPath` and a pods root under a `keystore-*` name is refused; beside the read and connect cases, a file write, create, unlink and rename and a `network-bind` on `keystore-sock/`, on `keys.sock` and on every `keystore-*` name are each refused; every case also holds through `/System/Volumes/Data/private/var/lib/k3sm/...` and through the data volume's mount path | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestNoEmittedAllowCoversKeystorePath`, `TestDataRootDeniesCanonicalPathAndPrefixRegex`, `TestProtectedPrefixesRefuseKeystoreReallow`, `TestEmptyDataRootFailsClosed`, `TestVMGuestGetsNoDataRootShare`, `TestKeystoreDenyCoversWritesAndBind`, `TestKeystoreDeniesCoverPathAliases`; rig leg E10 | pending: runtimed's sandbox change |
+| U17 | runtimed refuses an explicit drop target of 501 or above (`cred.UID` with `Drop` set) through `Credential.CheckPodUID` (`pkg/supervisor/privdrop.go`), not in `resolveCredential`: at `startContainer`, at `Exec` (an exec session), at the resident shim's `dropShim` and in `RunLaunchSequence` (owed until it lands in runtimed); an inherited uid (no drop: the daemon's own euid, which is the service uid, a rootless server's login uid or root on a root daemon) is allowed, and so is a gid-only drop that leaves uid 0 | `runtimed/pkg/runtime::TestStartContainerRefusesLoginRangeUID`, `TestStartContainerAllowsInheritedUID`, `TestExecSessionRefusesLoginRangeUID`; `runtimed/internal/execshim::TestDropShimRefusesLoginRangeUID`; `runtimed/pkg/supervisor::TestRunLaunchSequenceRefusesPodUID`, `TestCheckPodUIDAllowsInheritedUID`; rig legs E21, E22 | pending: runtimed's sandbox change |
 | U18 | CRD: `entry`, `secretName`, `dataKey`, `requestedBy` required (`dataKey` defaults to `value`) and immutable by CEL transition rules; `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed; a `system/…` entry is refused | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap`, `TestKeyDeliveryRefusesSystemEntry` | pending: the `KeyDelivery` API |
 | U19 | the CRD pattern, its `maxLength` of 269, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors, `user/1/` and `system/` each with a 254-byte name refused | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
 | U20 | a user-scope `current` copied back is refused against the floor log, with the user-scope floor message, which names `floor --rebuild`, not removing `keystore-floor.json` | `k3sm/pkg/keystore::TestUserFloorRefusesCopiedBackCurrent`; rig leg E9 | pending: the append-only files |
 | U21 | install creates both logs service-user-owned 0600 and flagged; the listener refuses to start when a flag is clear or a log is not the service user's (seams: chflags flag source, file-attribute writer, euid source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
-| U22 | `floor --rebuild` and `audit --rotate` write the marker `keystore-maintenance` and stage `keystore-user-floor.log.new` and `keystore-audit.log.new` in the root-owned data root, stop the listener, hold the lock, write the new file before touching the old, clear the old file's flag before any rename, and flag the new file on its held descriptor after the rename; a crash at each step leaves the marker, so the listener stays down until a rerun leaves a flagged file; every audit and floor append, the reconciler's and the pre-frame lines included, takes the store lock that maintenance holds exclusively, so a reconciler append during an `audit --rotate` waits and lands in the new log; after maintenance, under the exclusive lock, the server reopens its audit and floor append descriptors and recounts the per-uid shares before releasing it, and the counts reset (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`, `k3sm/pkg/keystore/reconcile::TestReconcilerAppendWaitsForAuditRotate`, `k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares`; rig leg E17 | pending: the append-only files |
+| U22 | `floor --rebuild` and `audit --rotate` write the marker `keystore-maintenance` and stage `keystore-user-floor.log.new` and `keystore-audit.log.new` in the root-owned data root, stop the listener, hold the lock, write the new file before touching the old, clear the old file's flag before any rename, and flag the new file on its held descriptor after the rename; a crash at each step leaves the marker, so the listener stays down until a rerun leaves a flagged file; every audit and floor append, the reconciler's and the pre-frame lines included, takes the store lock that maintenance holds exclusively, so a reconciler append during an `audit --rotate` waits and lands in the new log; after maintenance, under the exclusive lock, the server reopens its audit and floor append descriptors and recounts the per-uid shares before releasing it, and the counts reset (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`, `k3sm/pkg/keystore/reconcile::TestReconcilerAppendWaitsForAuditRotate`, `k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares`; rig leg E17 | pending: the append-only files, the socket listener and the KeyDelivery reconciler (lifecycle), run in the lifecycle's mode, the last to land |
 | U23 | every audited operation writes one `v:1` line; no line carries a value or its length; readers ignore unknown fields | `k3sm/pkg/keystore::TestAuditLineNeverCarriesValue`, `TestAuditReaderIgnoresUnknownFields` | pending: the append-only files |
 | U24 | soft cap shows in `doctor`; past the hard cap every mutating user op is `ErrLogFull`, except the revocation class, which draws on its uid's revocation budgets; a line over 1 KiB is refused | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations`, `TestAuditLineBoundedAtOneKiB` | pending: the append-only files |
 | U25 | backup and restore round trip: a restored tree with cleared flags is refused until `floor --rebuild`, then opens; the rebuild writes a line for every entry directory holding a `generation` file, an authenticated pointer's sequence or, with none, sequence 0, so a damaged entry stays `ErrCorrupt` and never becomes `ErrNotFound` | `k3sm/pkg/keystore::TestBackupRestoreRoundTripRebuild`, `TestRebuildKeepsDamagedEntryCorrupt`; rig leg E17 | pending: the append-only files |
@@ -3130,7 +3157,7 @@ carried by the unit rows.
 | U43 | reasons are the closed set, each on the condition type and status the reason table gives; "absent" and "not yours" both read `EntryUnavailable`; a pre-existing Secret not claimed by a KeyDelivery (unlabelled, or Phase A's) is `SecretExists`; a second declaration is `SecretClaimed`, the oldest honoured record by `creationTimestamp`, then name, winning; `observedGeneration` tracks; `Ready=False` for any authority failure carries the one reason `NotAuthorized` with the `Authorized` reason in its message; `Ready` is `Unknown`, `Pending` before the first sweep and while `Authorized` is `Unknown`; each `Authorized=False` reason is tied to its action (`EntryUnavailable`, `NotRecorded` for a withdrawn UID or a digest mismatch, and `NotAuthorized` delete; `NotRecorded` for a UID never recorded retains), and a Secret kept under `Authorized=False` sets `SecretRetained=True` (`DeletePending` or `Unowned`) | `k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet`, `TestReasonConditionTable`, `TestOneDeclarationPerSecret`, `TestReadyFalseCarriesNotAuthorized`, `TestReadyUnknownPending`, `TestAuthorizedFalseReasonActionMap`, `TestSecretRetainedWhenKept` | pending: the KeyDelivery reconciler (authority) |
 | U44 | losing authority (a definitive denial) deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; ownership is the label, the owner annotation and that UID in the sealed record, not the ownerReference; the Secret's namespace and name must equal the record's target for that UID, and the record's entry must match the owner annotation; the orphan sweep removes a labelled Secret only when its owner annotation names a KeyDelivery UID the sealed record holds, it is that UID's recorded target, and that object no longer exists or is withdrawn, and never one with the label and owner annotation alone, an unlabelled or a foreign one; a forged label and a real UID on another Secret are left alone, charged to no share and logged as one `refused` line under the reconciler, against the reconciler budget, never as the owner's `deliver-delete` | `k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret`, `TestFinalizerCrashOrder`, `TestOrphanSweep`, `TestForgedOwnerAnnotationOnOtherSecretIsLeftAlone` | pending: the KeyDelivery reconciler (lifecycle) |
 | U45 | cross-user refusal with a fake peer-credential source: a peer with uid B asks for `list`, `read-for-exec`, `rotate`, `rm`, `deliver`, `withdraw` and `deliveries` of uid A's entries and objects, and for any `system/…` name; every call is `ErrNotFound` with text identical to an absent entry of B's own, and the `refused` audit lines carry uid B | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestNonRootCannotNameSystemEntries` | pending: the socket operations |
-| U46 | `baseSocketDenies` derives the `keys.sock` path from `runtimed/pkg/keystorepaths` (`KeystoreSocketPath(dataRoot)`, `<dataRoot>/keystore-sock/keys.sock`) and denies `connect(2)` to it | `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket` | pending: the socket listener |
+| U46 | `baseSocketDenies` derives the `keys.sock` path from `runtimed/pkg/keystorepaths` (`SocketPath(dataRoot)`, `<dataRoot>/keystore-sock/keys.sock`) and denies `connect(2)` to it | `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket` | pending: the socket listener |
 | U47 | seam guard: `pkg/keystore`'s `TestMain` installs a panicking stub on each of its seams, so no unit test reaches a real primitive | `k3sm/pkg/keystore::TestRealPrimitivesUnreachable` | pending: the user-scope store |
 | U48 | seam guard: `pkg/keystore/socket`'s `TestMain` installs a panicking stub on each of its seams, so no unit test reaches a real primitive; the server-side peer-credential source is a constructor parameter of the listener, not a package variable, and the constructor refuses nil | `k3sm/pkg/keystore/socket::TestRealPrimitivesUnreachable`, `TestListenerRequiresPeerCredSource` | pending: the socket listener |
 | U49 | `runtimed/pkg/keystorepaths` builds with `CGO_ENABLED=0` and imports only the standard library; `k3sm/pkg/keystore` imports that leaf and never `runtimed/pkg/sandbox` | `runtimed/pkg/keystorepaths::TestLeafImportsStdlibOnly`; `k3sm/pkg/keystore::TestKeystoreImportsNoSandbox` | pending: runtimed's sandbox change, the append-only files |
@@ -3183,7 +3210,7 @@ carried by the unit rows.
 | U96 | the `deliveries` record is exempt from the 64 KiB value cap and bounded at 64 live entries plus 256 withdrawn tombstones, 1,280 bytes an entry, 416 KiB sealed; at the bound `deliver` answers `quota` and a withdrawal still succeeds, in place; a tombstone is pruned only after its Secret is seen gone (Get not found) on two sweeps at least 60 s apart | `k3sm/pkg/keystore/reconcile::TestDeliveriesRecordBoundAndPrune`, `TestRevocationNeverRefusedAtRecordBound` | pending: the KeyDelivery reconciler (lifecycle) |
 | U97 | when `rotate` answers `ErrQuota`, `rm` then `put` recovers: `rm` frees every version and `put` stores the value as version 1 of a new generation; the `quota` error names that recovery | `k3sm/pkg/keystore::TestRotateQuotaRecoveredByRmThenPut` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U98 | the sealed `deliveries` record stores each delivery's KeyDelivery `metadata.name`; the orphan sweep checks the object with a live Get by that name sent to the API server, never an informer cache and never a List; not found, or another UID, deletes only on two consecutive observations at least 60 s apart, and any other answer in between resets the count; no sweep runs before the KeyDelivery and Secret informers sync | `k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName`, `TestOrphanSweepNeedsTwoObservations` | pending: the KeyDelivery reconciler (lifecycle) |
-| U99 | under the store lock, before every audit or floor append, the server compares its descriptor's `(dev, ino)` with the canonical name's and reopens on a mismatch, recounting the per-uid shares from the new file; `audit --rotate` and `floor --rebuild` each complete while the server never saw the marker, and every later line lands in the new canonical file, none in an archive or an unlinked file (seam: chflags flag source) | `k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch` | pending: the append-only files |
+| U99 | under the store lock, before every audit or floor append, the server compares its descriptor's `(dev, ino)` with the canonical name's and reopens on a mismatch, recounting the per-uid shares from the new file; `audit --rotate` and `floor --rebuild` each complete while the server never saw the marker, and every later line lands in the new canonical file, none in an archive or an unlinked file (seam: chflags flag source) | `k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch` | pending: the socket listener (the server append path) |
 | U100 | a departed account with an unreused uid is reported, not acted on: `doctor` lists every scope whose uid has no directory record (a synthesized GeneratedUID) with its delivery count; each of that scope's deliveries gets `SecretRetained=True` with reason `OwnerUnresolvable`, and no Secret is deleted (seam: GeneratedUID lookup) | `k3sm/cmd/k3sm::TestDoctorListsUnresolvableScopes`, `k3sm/pkg/keystore/reconcile::TestOwnerUnresolvableRetainedCondition` | pending: the KeyDelivery reconciler (lifecycle) |
 | U101 | `rewrap` prints a warning whenever `.user/` exists, before it starts and when it finishes, saying Rewrap does not re-key `K_u` and naming the procedure: each user re-puts their values after a suspected master exposure; with no `.user/` it prints none (seam: euid source) | `k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U102 | the sealed record stores the last delivered version per delivery, raised after the Secret write succeeds; the repair-versus-owner classifier uses only that recorded version: a Secret whose version annotation is rewritten and a KeyDelivery whose `status.deliveredVersion` is rewritten each leave the charge unchanged, a repair stays on the reconciler budget and an owner's new version stays charged to the owner | `k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus` | pending: the KeyDelivery reconciler (lifecycle) |
@@ -3248,10 +3275,10 @@ E20 attended.
 | E8 | admin strips the CRD's transition rules (a test patch, restored at the end) and edits E3's `spec.secretName` | `Authorized=False`, `NotRecorded` (digest mismatch); the original Secret deleted; no Secret under the new name | yes | the target digest: a Secret appears under the new name |
 | E9 | `sudo cp` saves `current`, the user rotates, `sudo cp` puts the old `current` back; then the same for a `system/` entry | user `list` and `sudo k3sm keys list` each mark the entry `corrupt` with the floor message; `floor --rebuild` is not run | no (U20) | the append-only files: the old value is served |
 | E10 | a native Pod (pinned by `nodeName`, darwin selector) tries `connect(2)` to `keys.sock` and to read `server/keystore`, `keystore-sock/`, both logs and Phase A's two files, then a file write, a create, an unlink and a rename on `keystore-sock/`, `keys.sock` and every `keystore-*` file, and a `network-bind` of a unix socket in `keystore-sock/`, each through the canonical path, `/System/Volumes/Data/private/var/lib/k3sm/...` and the data volume's mount path; then a vm Pod on the same node tries to reach `keys.sock` and the data root from the guest | EPERM for each from the native Pod; the guest has no path to the data root and cannot reach the socket | no (U16) | runtimed's sandbox change: the Phase A files read (the red result K0 leg 4 records) |
-| E11 | admin removes the user's RoleBinding in `ks-e2e` | within two sweeps the Secret is deleted (a denial counts only when two consecutive sweeps see it); `Authorized=False`, `NotAuthorized` | no (U44) | the KeyDelivery reconciler (lifecycle): the Secret stays |
+| E11 | admin removes the user's RoleBinding in `ks-e2e` | the Secret is deleted after two spaced observations, so the leg waits at least 90 s (two observations 60 s apart, plus a 30 s sweep) before it judges; `Authorized=False`, `NotAuthorized` | no (U44) | the KeyDelivery reconciler (lifecycle): the Secret stays |
 | E12 | root scope: `sudo k3sm keys put system/e2e-sys`, `sudo k3sm keys deliver system/e2e-sys --namespace ks-e2e`; then the user, with no sudo, tries `k3sm keys deliver`, `list` and `exec` on `system/e2e-sys` | root's Secret is delivered and stays (G20); each of the user's attempts answers `not found` and nothing reaches `ks-e2e-2`: the user cannot read or deliver the system entry. The leg does not claim the user cannot discover the name, which Phase A's 0644 files show (residual 11) | partly (U45): the root delivery is rig-only | root delivery: root delivery missing; the socket operations: a non-root user can name a system entry |
 | E13 | a ServiceAccount token creates a KeyDelivery | refused at admission | no (U40) | KeyDelivery authoring: the object is created |
-| E14 | `k3sm keys undeliver` on E3's object, then `kubectl delete` of a second one | each Secret deleted before its object goes; the hint printed; no orphan Secret after one sweep | no (U44) | the KeyDelivery reconciler (lifecycle): the object hangs or the Secret stays |
+| E14 | `k3sm keys undeliver` on E3's object, then `kubectl delete` of a second one | each Secret deleted before its object goes; the hint printed; no orphan Secret once the leg has waited at least 90 s (two observations 60 s apart, plus a 30 s sweep) | no (U44) | the KeyDelivery reconciler (lifecycle): the object hangs or the Secret stays |
 | E15 | **upgrade** from the previous release's install tree (its signed build installed, then this build over it, then `sudo k3sm install`) | system scope intact; user scope comes on after the install, off with the Warn and `doctor` row before it | yes | upgrade visibility: user scope silently off |
 | E16 | **rollback** to the previous release, then forward again | the old build runs with the keystore files unused; after rolling forward the user's entries, records and Secrets are intact and re-adopted | yes | the rollback guard: entries unreadable after the round trip |
 | E17 | **backup and restore** round trip: copy the data root's keystore set aside with `cp`, remove it, copy it back, then `floor --rebuild` and `audit --rotate` | before the rebuild the listener refuses (flags clear); after it every entry opens and both logs are flagged | no (U25) | the flag check: the listener runs on unflagged logs |
