@@ -186,3 +186,19 @@ func TestRmBuriesAuthenticatedPointerGeneration(t *testing.T) {
 	_, _, err = u.Current(ctx, "user/1001/lost")
 	checkUserDeleted(t, "current", err)
 }
+
+// The start catch-up's entry line is in the revocation class: past the
+// hard cap it draws on the uid's revocation budget, so a floor at its hard
+// cap still takes the line that lets rm bury the entry's real generation.
+func TestStartCatchUpEntryPastHardCap(t *testing.T) {
+	ctx := context.Background()
+	s, _, _, _, gen := lostLineEntry(t)
+	size := int64(len(readLog(t, s, userFloorLogName)))
+	s.logSoftCap, s.logHardCap = size, size
+	if err := s.startUserScopes(ctx); err != nil {
+		t.Fatalf("startUserScopes with the floor at its hard cap: %v", err)
+	}
+	if live, err := s.userFloor.liveGens("user/1001", "lost"); err != nil || !slices.Contains(live, gen) {
+		t.Fatalf("the floor's live generations after the catch-up past the hard cap: %x, %v, want %x", live, err, gen)
+	}
+}

@@ -1082,7 +1082,9 @@ func (u *UserScope) catchUpEntries(o *openedScope) error {
 }
 
 // catchUpEntry appends name's live floor line at gen and seq unless the
-// floor already holds one for gen or buries it.
+// floor already holds one for gen or buries it. The line is in the
+// revocation class: it is what lets a later rm bury the entry's real
+// generation, so past the hard cap it draws on the uid's revocation budget.
 func (u *UserScope) catchUpEntry(name string, gen [generationSize]byte, seq uint64) error {
 	live, err := u.s.userFloor.liveGens(u.scope, name)
 	if err != nil {
@@ -1096,7 +1098,7 @@ func (u *UserScope) catchUpEntry(name string, gen [generationSize]byte, seq uint
 	} else if err != nil {
 		return fmt.Errorf("read the floor for an entry: %w", err)
 	}
-	if err := u.s.userFloor.append(u.scope, name, gen, seq, false); err != nil {
+	if err := u.s.userFloor.append(u.scope, name, gen, seq, true); err != nil {
 		return fmt.Errorf("an entry's catch-up line: %w", err)
 	}
 	return nil
