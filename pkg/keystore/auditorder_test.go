@@ -171,9 +171,13 @@ func TestMintRefusalAuditsOnce(t *testing.T) {
 	s, server := newMasteredStore(t)
 	fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
 	_, audit := userLogs(s)
-	if err := os.MkdirAll(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "orphan"), 0o700); err != nil {
+	scope := scopeDir(server, "1001")
+	if err := os.MkdirAll(filepath.Join(scope, scopeEntriesName, "orphan"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// As root the planted tree is root's; hand it to the service user, as
+	// a tree the store made would be, so the mint reaches its own refusal.
+	giveToService(t, filepath.Dir(scope), scope, filepath.Join(scope, scopeEntriesName), filepath.Join(scope, scopeEntriesName, "orphan"))
 	if _, err := userScope(t, s, 1001).Put(ctx, "user/1001/token", KindOpaque, []byte("v")); !errors.Is(err, ErrScopeAbsent) {
 		t.Fatalf("put over an orphaned entries/: %v, want ErrScopeAbsent", err)
 	}
