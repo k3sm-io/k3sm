@@ -58,8 +58,10 @@ func TestCheckLogBoundsRefusesSpentRevocationBudget(t *testing.T) {
 // and the longest rm audit line.
 func TestCheckConfigRevocationBudgetFloor(t *testing.T) {
 	tomb, rm, _, _ := worstRevocationLines(t)
-	floor := int64(maxBurialTombstones*tomb + rm)
-	if minLogRevokeBudget < floor || minLogRevokeBudget < 2*maxLogLine {
+	// Each append leads with a newline: the burial is one append, its
+	// audit line another.
+	floor := int64(maxBurialTombstones*tomb + 1 + rm + 1)
+	if minLogRevokeBudget < floor || minLogRevokeBudget < 2*maxAppendLine {
 		t.Fatalf("minLogRevokeBudget %d is under one worst-case burial plus its audit line, %d", int64(minLogRevokeBudget), floor)
 	}
 	s, _ := newTestStore(t)
@@ -112,7 +114,7 @@ func worstRevocationLines(t *testing.T) (tomb, rmAudit, withdrawFloor, withdrawA
 // caps' bounds with it.
 func TestDefaultRevocationBudgetHoldsFullRevocation(t *testing.T) {
 	tomb, rm, wFloor, wAudit := worstRevocationLines(t)
-	need := int64(maxScopeEntries*(maxBurialTombstones*tomb+rm) + maxDeliveries*(wFloor+wAudit))
+	need := int64(maxScopeEntries*(maxBurialTombstones*tomb+1+rm+1) + maxDeliveries*(wFloor+1+wAudit+1))
 	if defaultLogRevocationBytes < need {
 		t.Fatalf("defaultLogRevocationBytes %d is under one scope's full revocation, %d", int64(defaultLogRevocationBytes), need)
 	}

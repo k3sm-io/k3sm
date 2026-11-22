@@ -77,7 +77,8 @@ func TestRmBurialIsOneWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var want []byte
+	// The append leads with its newline (appendLines).
+	want := []byte{'\n'}
 	want = append(want, first...)
 	for _, g := range [][generationSize]byte{floorOnly, swapped} {
 		line, err := tombLine("user/1001", "token", g)
@@ -159,7 +160,8 @@ func TestRmBurialShortWriteAfterWholeLineCommits(t *testing.T) {
 	authed, _, _ := swappedGenerationEntry(t, s, server)
 	l := s.userFloor.(*fileFloorLog).log
 	l.write = func(f *os.File, b []byte) (int, error) {
-		cut := bytes.IndexByte(b, '\n') + 1 + 10 // one whole tombstone and a fragment
+		// The leading newline, one whole tombstone and a fragment.
+		cut := 1 + bytes.IndexByte(b[1:], '\n') + 1 + 10
 		n, err := f.Write(b[:cut])
 		if err != nil {
 			return n, err

@@ -1628,11 +1628,20 @@ service user can only add to.
   above for live lines. What is lost is the torn line's own record,
   and that operation was not reported as done. That residual is accepted. Off darwin no log is append-only, none is appended to, and the reservation is
   refused.
-  So no append merges into a torn line: before it writes, under the lock, the server `pread`s
-  the byte at `size-1` on the descriptor it appends through. In either log, when the last
-  byte of a non-empty file is not a newline, the append writes a newline first, in the same
-  `write(2)`, so the torn bytes become a line of their own, which the reader skips as damage
-  and charges to no uid, and the new line parses (U20, U23). A torn floor tail needs no
+  So no append merges into a torn or foreign line: in either log **every append leads with a
+  newline**, in the same `write(2)`, never judged from the tail, since a foreign writer
+  could still add an unterminated fragment between any check of the last byte and the
+  write. Torn or foreign bytes before it become a line of their own, which the reader skips
+  as damage and charges to no uid, and every line of the append parses (U20, U23,
+  `TestForeignFragmentBeforeWriteIsOwnLine`); with no such bytes the newline is an empty
+  line, which the reader passes over as benign, never damage. The leading newline costs one
+  byte per append: past the hard cap it is charged to the uid with the append's lines, and
+  every bound that sums appends counts it (one append of one line is at most 1,025 bytes,
+  `maxAppendLine`, which is what `room`, a grant's pre-check and the store-open spent test
+  charge). An append whose write lands whole but whose `fsync` fails is not known durable:
+  it counts as no line landed, so an `rm` is refused with nothing removed and says to run it
+  again (`TestRmBurialSyncFailureRefuses`); only a write that failed or landed short,
+  followed by an `fsync` that succeeded, counts the whole lines it left. A torn floor tail needs no
   restore, which would bring back every entry deleted since the backup, but it does put the
   floor in the degraded mode until root runs `doctor`.
   The recovery is root's `floor --rebuild` (or `audit --rotate` for the audit log), which
@@ -2047,13 +2056,14 @@ That wait is the store `.lock`
       Each of its 256 entries `rm`'d is a burial of at most 6 tombstones (the floor's live
       generation, the one the pointer authenticates, and the 4 the tree alone may name,
       `maxBurialTombstones`) of 306 bytes and an `rm` audit line of at most 384 bytes (the
-      longest result, a full RFC3339Nano timestamp): 256 × (6 × 306 + 384) = 568,320 bytes.
+      longest result, a full RFC3339Nano timestamp), each of the two appends charged its
+      leading newline: 256 × (6 × 306 + 1 + 384 + 1) = 568,832 bytes.
       Each of its 320 deliveries withdrawn (`maxDeliveries`) is an 82-byte floor line and a
-      `withdraw` audit line of at most 250 bytes: 320 × (82 + 250) = 106,240 bytes. In all
-      674,560 bytes, rounded up to 704 KiB (720,896). With it `logReadBound` at the default
+      `withdraw` audit line of at most 250 bytes: 320 × (82 + 1 + 250 + 1) = 106,880 bytes. In
+      all 675,712 bytes, rounded up to 704 KiB (720,896). With it `logReadBound` at the default
       caps is 256 MiB + 1024 × 704 KiB + 1 MiB = 961 MiB, and at the configuration's upper
       bounds still 2^40 + 1024 × 2^30 + 2^20, which cannot overflow. A configured budget under
-      one worst-case burial plus its audit line, 6 × 306 + 384 = 2,220 bytes
+      one worst-case burial plus its audit line, 6 × 306 + 1 + 384 + 1 = 2,222 bytes
       (`minLogRevokeBudget`), is refused at `checkConfig`, and one a uid's
       lines past the hard cap exceed in either log, which the writer never produces, so only
       lowered caps make it, is refused at store open by `CheckLogBounds`
@@ -2061,7 +2071,7 @@ That wait is the store `.lock`
       log was written under, or restore the caps and rotate the audit log, the rotate verb
       being not yet available, so until it is, restore the log from a backup and run
       `doctor`. Either would otherwise disable that uid's revocations without a word. A
-      uid the writer took honestly to under one whole line (1 KiB) of its budget is that
+      uid the writer took honestly to under one whole append (1,025 bytes) of its budget is that
       uid's state alone, never a start failure: `CheckLogBounds` logs it at Warn and counts
       it in its `spent` return, the store starts, every other uid's `rm` and `withdraw`
       succeed, and that uid's own revocations keep being refused at run time

@@ -59,7 +59,7 @@ func TestSpentRevocationBudgetIsPerUID(t *testing.T) {
 	}
 	// uid 1001's lines past the hard cap leave it under one line of budget.
 	k := int(s.logRevokeBudget)/len(line) - 1
-	if int64(k*len(line)+maxLogLine) <= s.logRevokeBudget {
+	if int64(k*len(line)+maxAppendLine) <= s.logRevokeBudget {
 		k++
 	}
 	appendLogBytes(t, s, auditLogName, bytes.Repeat(line, k))

@@ -121,7 +121,7 @@ func TestPutMintJudgesFloorRoomOnce(t *testing.T) {
 		t.Fatalf("a minting put with room judged before its ok line: %v", err)
 	}
 	added := string(readLog(t, s, auditLogName)[audit:])
-	if strings.Count(added, "\n") != 1 || !strings.Contains(added, "ok") {
+	if len(nonEmptyLines([]byte(added))) != 1 || !strings.Contains(added, "ok") {
 		t.Fatalf("the put's audit lines %q, want its one ok line", added)
 	}
 }

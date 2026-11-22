@@ -66,6 +66,9 @@ const (
 	auditLogName     = "keystore-audit.log"
 	// maxLogLine bounds one line of either log, its newline included.
 	maxLogLine = 1024
+	// maxAppendLine is the most one append of one line writes: the newline
+	// every append leads with (appendLines), then the line.
+	maxAppendLine = maxLogLine + 1
 	// sfAppend is SF_APPEND, the system append-only file flag
 	// (<sys/stat.h>): only root can clear it, and while it is set the file
 	// can only be appended to.
@@ -90,16 +93,18 @@ const (
 	maxTombLineBytes    = 306
 	maxRmAuditLineBytes = 384
 	// minLogRevokeBudget is the least revocation budget checkConfig accepts:
-	// one worst-case burial plus its audit line, 6 × 306 + 384 = 2,220
-	// bytes, which is over two whole lines (2,048).
-	minLogRevokeBudget = maxBurialTombstones*maxTombLineBytes + maxRmAuditLineBytes
+	// one worst-case burial plus its audit line, each one append led by its
+	// newline, 6 × 306 + 1 + 384 + 1 = 2,222 bytes, which is over two whole
+	// appends (2,050).
+	minLogRevokeBudget = maxBurialTombstones*maxTombLineBytes + 1 + maxRmAuditLineBytes + 1
 	// defaultLogRevocationBytes holds one scope's full revocation, under the
-	// longest scope and a 253-byte name: each of maxScopeEntries entries
-	// rm'd, a burial of maxBurialTombstones 306-byte tombstones and a
-	// 384-byte audit line, 256 × (6 × 306 + 384) = 568,320 bytes; and
-	// maxDeliveries withdraws, each an 82-byte floor line and a withdraw
-	// audit line of at most 250 bytes, 320 × (82 + 250) = 106,240 bytes;
-	// 674,560 bytes in all, rounded up to 704 KiB (720,896). With it
+	// longest scope and a 253-byte name, each append charged its leading
+	// newline: each of maxScopeEntries entries rm'd, a burial of
+	// maxBurialTombstones 306-byte tombstones and a 384-byte audit line,
+	// 256 × (6 × 306 + 1 + 384 + 1) = 568,832 bytes; and maxDeliveries
+	// withdraws, each an 82-byte floor line and a withdraw audit line of at
+	// most 250 bytes, 320 × (82 + 1 + 250 + 1) = 106,880 bytes; 675,712
+	// bytes in all, rounded up to 704 KiB (720,896). With it
 	// logReadBound at the default caps is 256 MiB + 1024 × 704 KiB + 1 MiB
 	// = 961 MiB, and at the configuration's upper bounds 2^40 + 1024 × 2^30
 	// + 2^20, which cannot overflow
@@ -152,7 +157,7 @@ const (
 	maxLogRevokeBudget = 1 << 30
 	// revokeFreeSlack replaces logFreeMargin for a revocation's line: the
 	// minimal check, so a nearly full volume still records a revocation. It
-	// is two 4 KiB blocks, as many as one line can newly touch when it
+	// is two 4 KiB blocks, as many as one append can newly touch when it
 	// straddles a block boundary, plus the longest line.
 	revokeFreeSlack = 2*(4<<10) + maxLogLine
 )
@@ -496,6 +501,12 @@ type logState struct {
 	// skipped line can only lose what it would have said, never undo a
 	// tombstone already read. warned is the count last logged at Warn.
 	damage, warned int
+	// leadEnd is the offset just past the last empty line read, which
+	// starts at leadAt: an append's leading newline. A line that parses at
+	// leadEnd is charged that byte too when leadAt is at or past hardCap,
+	// as the writer charges it. An empty line is otherwise benign: no
+	// damage, charged to no uid.
+	leadAt, leadEnd int64
 	// tornSize, when not 0, is the size of the file whose last line had no
 	// newline: a pending damaged line, counted by damaged while the file
 	// keeps that size, and reading resumes at off, the torn line's start,
@@ -799,6 +810,12 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 			off += n
 			continue
 		}
+		if len(line) == 1 {
+			// An empty line: an append's leading newline (appendLines).
+			s.leadAt, s.leadEnd = off, off+1
+			off++
+			continue
+		}
 		uid, perr := l.lineUID(s, line[:len(line)-1])
 		if errors.Is(perr, errFloorTooManyKeys) {
 			s.bad = s.at(off, perr)
@@ -812,6 +829,9 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 		}
 		if off >= s.hardCap && uid != 0 {
 			s.pastCap[uid] += int64(len(line))
+			if s.leadEnd == off && s.leadAt >= s.hardCap {
+				s.pastCap[uid]++
+			}
 		}
 		s.lastAt, s.last = off, line
 		off += int64(len(line))
@@ -902,9 +922,10 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 	if err != nil || state.bad != nil {
 		return nil
 	}
-	// The line is not written yet: room charges the longest a line can
-	// be, through the predicate appendLine charges the real line through.
-	return l.revokeRoom(state, st.Size, uid, maxLogLine)
+	// The line is not written yet: room charges the longest one append of
+	// a line can be, its leading newline included, through the predicate
+	// appendLine charges the real line through.
+	return l.revokeRoom(state, st.Size, uid, maxAppendLine)
 }
 
 // grantKeys is the most keys one grant adds to the floor: a put that mints
@@ -974,9 +995,10 @@ func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64)
 // revocation's line (revoke) is held to revokeFreeSlack rather than the
 // free-space margin. It never writes what the reader would refuse: a line
 // past logReadBound, or a floor line that adds a key past the key bound.
-// After a torn tail, in either log, it writes a newline first, in the same
-// write(2), so the torn bytes read as a line of their own, which the reader
-// skips as damage, and line reads back whole.
+// Every append writes a newline first, in the same write(2), so bytes a
+// foreign writer left with no newline read as a line of their own, which
+// the reader skips as damage, and line reads back whole; with no such bytes
+// the newline is an empty line, which the reader passes over.
 func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) error {
 	return l.appendLineSlack(uid, line, budget, revoke, revoke)
 }
@@ -1015,20 +1037,21 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 	defer func() { _ = f.Close() }() // each append is fsynced below
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	torn, err := l.tornTail(f, st.Size)
-	if err != nil {
-		return err
-	}
-	var out []byte
-	if torn {
-		// The torn bytes become a line of their own, which the reader skips
-		// as damage, and the lines read back whole.
-		out = append(out, '\n')
-	}
+	// Every buffer leads with a newline, never judged from the tail: a
+	// foreign writer racing a check of the last byte could still leave an
+	// unterminated fragment before the write, which would glue to the first
+	// line. With the newline the fragment is a damaged line of its own and
+	// every line here parses; with no fragment it is an empty line, which
+	// the reader passes over.
+	out := []byte{'\n'}
 	lead := int64(len(out))
 	// charge is uid's bytes in lines that start at or past the hard cap,
-	// which the reader charges to its revocation budget.
+	// which the reader charges to its revocation budget, and the leading
+	// newline when it, too, is at or past the cap.
 	var charge int64
+	if st.Size >= l.s.logHardCap {
+		charge = lead
+	}
 	for _, line := range lines {
 		if st.Size+int64(len(out)) >= l.s.logHardCap {
 			charge += int64(len(line))
@@ -1061,9 +1084,13 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 		if err := read(); err != nil {
 			return err
 		}
-		// The newline closing a torn tail ends the torn line, which is
-		// charged to no uid; the lines are uid's.
-		if err := l.revokeRoom(state, st.Size+lead, uid, charge); err != nil {
+		// The leading newline is charged with the lines past the cap, and
+		// otherwise only counted in the size.
+		size := st.Size
+		if st.Size < l.s.logHardCap {
+			size += lead
+		}
+		if err := l.revokeRoom(state, size, uid, charge); err != nil {
 			return err
 		}
 	}
@@ -1136,7 +1163,7 @@ func (e *linesLanded) Error() string {
 func (e *linesLanded) Unwrap() error { return e.err }
 
 // landedLines counts the caller's lines of out, appended at size after
-// lead bytes (a torn tail's newline), that reached f whole and
+// lead bytes (the leading newline), that reached f whole and
 // newline-terminated after a write that failed or landed short. It re-reads
 // the tail on f's descriptor, since a failed write(2) may not report what
 // it wrote; a tail that cannot be read falls back to n, the bytes the write
@@ -1164,23 +1191,6 @@ func (l *appendLog) landedLines(f *os.File, size int64, out []byte, lead, n int)
 		return 0
 	}
 	return bytes.Count(got[lead:], []byte{'\n'})
-}
-
-// tornTail reports whether f, size bytes long, is non-empty and its last
-// byte is not a newline, read by pread on f's descriptor.
-func (l *appendLog) tornTail(f *os.File, size int64) (bool, error) {
-	if size == 0 {
-		return false, nil
-	}
-	var b [1]byte
-	var src io.ReaderAt = f
-	if l.readAt != nil {
-		src = l.readAt(f)
-	}
-	if _, err := src.ReadAt(b[:], size-1); err != nil {
-		return false, l.unreadable(size-1, err)
-	}
-	return b[0] != '\n', nil
 }
 
 // preflight refuses, as errLogNoSpace, an append of n bytes while the
@@ -1423,7 +1433,7 @@ func (f *fileFloorLog) bury(scope, name string, gen [generationSize]byte) error 
 // short of a crash. rm is in the revocation class: past the hard cap its
 // tombstones draw on the uid's revocation budget, the free-space margin does
 // not hold them, and the free space must also hold the rm's audit line,
-// which follows them (maxLogLine).
+// which follows them as one more append (maxAppendLine).
 func (f *fileFloorLog) buryAll(scope, name string, gens [][generationSize]byte) error {
 	lines := make([][]byte, 0, len(gens))
 	for _, g := range gens {
@@ -1433,7 +1443,7 @@ func (f *fileFloorLog) buryAll(scope, name string, gens [][generationSize]byte) 
 		}
 		lines = append(lines, line)
 	}
-	return f.log.appendLines(scopeUID(scope), lines, true, true, true, maxLogLine)
+	return f.log.appendLines(scopeUID(scope), lines, true, true, true, maxAppendLine)
 }
 
 // floorLine encodes one floor line: "<scope> <name> <generation> <seq>\n",
@@ -1617,8 +1627,12 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 		// The grant's floor line would be refused after its commit.
 		return errFloorDegraded
 	}
+	// Each line is its own append, led by its newline (appendLines): the
+	// line starts after it, and the free space must hold it.
 	size := st.Size
 	for _, line := range lines {
+		size++
+		total++
 		if size >= s.logHardCap {
 			return l.pastCap()
 		}
@@ -1655,7 +1669,7 @@ var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's 
 // than the reader's key bound; and, as errLogRevokeBudgetSpent, one under
 // which a uid's lines past the hard cap in either log exceed its revocation
 // budget, which the writer never produces, so only lowered caps make it. A
-// uid with under one whole line (maxLogLine) of its budget left is no
+// uid with under one whole append (maxAppendLine) of its budget left is no
 // refusal: the writer reaches it honestly, and only that uid's revocations
 // are refused, at run time, as ever. Each such uid is logged at Warn and
 // counted in spent (distinct uids across both logs). It fails closed: a
@@ -1708,7 +1722,7 @@ func (s *FileStore) CheckLogBounds(ctx context.Context) (damage, spent int, err 
 				if n > s.logRevokeBudget {
 					return 0, fmt.Errorf("%w: %w (uid %d has %d bytes past the hard cap in %s, over its budget of %d)", errInvalidConfig, errLogRevokeBudgetSpent, uid, n, log.name, s.logRevokeBudget)
 				}
-				if n+maxLogLine > s.logRevokeBudget {
+				if n+maxAppendLine > s.logRevokeBudget {
 					// Root's figures, in the server's log only.
 					slog.Warn("a uid's revocation budget past the hard cap has under one line left; its revocations are refused until the audit log is rotated", "log", log.name, "uid", uid, "bytes", n, "budget", s.logRevokeBudget)
 					spentUIDs[uid] = true

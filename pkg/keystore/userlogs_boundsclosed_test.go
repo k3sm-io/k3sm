@@ -102,7 +102,7 @@ func TestCheckLogBoundsRefusesAtSpent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	k := int(s.logRevokeBudget-maxLogLine) / len(line)
+	k := int(s.logRevokeBudget-maxAppendLine) / len(line)
 	appendLogBytes(t, s, auditLogName, bytes.Repeat(line, k))
 	if _, spent, err := s.CheckLogBounds(ctx); err != nil || spent != 0 {
 		t.Fatalf("store open with a whole line of budget left: %d, %v", spent, err)

@@ -335,7 +335,7 @@ func TestAuditLineNeverCarriesValue(t *testing.T) {
 		t.Fatalf("put over an entry: %v, want ErrExists", err)
 	}
 	b := readLog(t, s, auditLogName)
-	lines := bytes.Split(bytes.TrimSuffix(b, []byte("\n")), []byte("\n"))
+	lines := nonEmptyLines(b)
 	// fileLogScope's put of token, then the five above.
 	wantOps := []string{"put", "put", "deliver", "withdraw", "rm", "put"}
 	if len(lines) != len(wantOps) {

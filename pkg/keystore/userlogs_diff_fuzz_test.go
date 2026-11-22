@@ -140,6 +140,19 @@ func diffClass(err error) string {
 	return ""
 }
 
+// stripEmptyLines is b without its empty lines: a newline at its start or
+// after another newline.
+func stripEmptyLines(b []byte) []byte {
+	var out []byte
+	for i, c := range b {
+		if c == '\n' && (i == 0 || b[i-1] == '\n') {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
 // FuzzLogSyncDifferential checks the incremental reader against a reading
 // from scratch: after every batch of appends, sync of a log read on from
 // where it stopped must agree with sync of the same bytes by a reader that
@@ -147,7 +160,9 @@ func diffClass(err error) string {
 // damage count and verdict, and on both logs' past-cap charges per uid and
 // the revocation room they leave, under small caps, budget and key bound.
 // Garbage, over-long and torn lines are skipped as damage, so the readers
-// are compared on the lines after them too. The seeds are committed under
+// are compared on the lines after them too; an empty line (an append's
+// leading newline) is benign, so the floor read without its empty lines
+// must agree on keys, damage, seqs and tombstones. The seeds are committed under
 // testdata/fuzz/FuzzLogSyncDifferential.
 func FuzzLogSyncDifferential(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
@@ -186,6 +201,18 @@ func FuzzLogSyncDifferential(f *testing.F) {
 				}
 				if !maps.Equal(got.uidKeys, want.uidKeys) {
 					t.Fatalf("%s: incremental per-uid key counts %v, from scratch %v", where, got.uidKeys, want.uidKeys)
+				}
+				if lg.inc.l.whole {
+					// Empty lines, an append's leading newlines, are benign:
+					// the floor without them reads the same.
+					bare := stripEmptyLines(*lg.inc.buf)
+					strip := newDiffLog(s, true, maxKeys, &bare).sync(t)
+					if diffClass(strip.bad) != "" {
+						continue
+					}
+					if strip.keys != want.keys || strip.damaged() != want.damaged() || !maps.Equal(strip.maxSeq, want.maxSeq) || !maps.Equal(strip.buried, want.buried) {
+						t.Fatalf("%s: empty lines changed the reading: %d keys and %d damaged lines with them, %d and %d without", where, want.keys, want.damaged(), strip.keys, strip.damaged())
+					}
 				}
 				size := int64(len(*lg.inc.buf))
 				for uid := uint32(1001); uid <= 1003; uid++ {

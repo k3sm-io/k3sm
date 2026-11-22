@@ -84,7 +84,7 @@ func TestGrantRefusesUntrustedFloorFirst(t *testing.T) {
 			if !bytes.HasPrefix(after, before) {
 				t.Fatal("the audit log was rewritten")
 			}
-			added := bytes.Split(bytes.TrimSuffix(after[len(before):], []byte("\n")), []byte("\n"))
+			added := nonEmptyLines(after[len(before):])
 			if len(added) != 2 {
 				t.Fatalf("want one refusal line per grant, got %q", after[len(before):])
 			}
