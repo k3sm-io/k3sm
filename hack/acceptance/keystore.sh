@@ -12,10 +12,16 @@
 # Exit status: 0 every row passed; 1 a row failed; 3 no row failed but at
 # least one is pending. Phase A is complete when --check exits 0.
 #
-# --check runs every row: the package's tests, and for the CLI rows (G7, G16,
-# G17, G21) the keys verbs' tests in ./cmd/k3sm/, named cmd:<Test> below.
-# --rewrap runs only Rewrap's rows, G3, G12, G13, G14 and U5, and only their
-# tests, with the same exit status. Neither calls sudo.
+# --check runs every row: the package's tests, the delivery reconciler's in
+# ./pkg/keystore/deliver/ (named deliver:<Test> below), and for the CLI rows
+# (G7, G10, G16 to G19, G21) the keys verbs' tests in ./cmd/k3sm/, named
+# cmd:<Test>. --rewrap runs only Rewrap's rows, G3, G12, G13, G14 and U5, and
+# only their tests; --delivery runs only the delivery rows, G18, G19 and G20,
+# and only their tests; both with the same exit status. None calls sudo.
+#
+# KEYSTORE_SKIP_G22=1 prints G22 as SKIP instead of running hack/ci.sh, for a
+# caller that runs the repo gate itself; a skipped row is neither a pass nor
+# pending.
 #
 # --root runs row R1 alone: the package's tests as root, in the deployment's
 # shape (root runs the verbs and owns the data root, the service user owns the
@@ -28,16 +34,17 @@
 # G1 diffs go.mod and go.sum against KEYSTORE_BASE (default: the merge base
 # with origin/main).
 #
-# Usage: hack/acceptance/keystore.sh --check|--rewrap|--root
+# Usage: hack/acceptance/keystore.sh --check|--rewrap|--delivery|--root
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
 
-usage() { echo "usage: $0 --check|--rewrap|--root" >&2; exit 2; }
+usage() { echo "usage: $0 --check|--rewrap|--delivery|--root" >&2; exit 2; }
 [ $# -eq 1 ] || usage
 case "$1" in
 --check) mode=check ;;
 --rewrap) mode=rewrap ;;
+--delivery) mode=delivery ;;
 --root) mode=root ;;
 *) usage ;;
 esac
@@ -112,6 +119,10 @@ rewrap_tests="$rewrap_tests TestInterruptedRewrap TestRecordsSealedUnder TestRew
 # wanted reports whether row $1 runs in this mode.
 wanted() {
 	[ "$mode" = check ] && return 0
+	if [ "$mode" = delivery ]; then
+		case "$1" in G18 | G19 | G20) return 0 ;; esac
+		return 1
+	fi
 	case "$1" in G3 | G12 | G13 | G14 | U5) return 0 ;; esac
 	return 1
 }
@@ -122,21 +133,37 @@ row() { printf '%-4s %-8s %s\n' "$1" "$2" "$3"; }
 pass() { row "$1" PASS "$2"; }
 fail() { row "$1" FAIL "$2"; failed=$((failed + 1)); }
 pend() { wanted "$1" || return 0; row "$1" PENDING "$2"; pending=$((pending + 1)); }
+skip() { row "$1" SKIP "$2"; }
 
 # One run of the package's tests (under --rewrap, of Rewrap's tests only),
 # under -race, verbose so each named test can be checked: a test that does not
 # run is not a pass.
+# --delivery names no package test, so it only builds the package's.
 run=()
 if [ "$mode" = rewrap ]; then run=(-run "^($(tr ' ' '|' <<<"$rewrap_tests"))\$"); fi
+if [ "$mode" = delivery ]; then run=(-run '^$'); fi
 out="$(go test -race -count=1 -v ${run[@]+"${run[@]}"} ./pkg/keystore/ 2>&1)" && pkg_ok=1 || pkg_ok=0
-# The keys verbs' tests, which only the CLI rows name, so --rewrap skips them.
+# The keys verbs' tests, which only the CLI rows name, so --rewrap skips them
+# and --delivery runs only the deliver verbs' and the server flag's.
 cmd_out=""
 cmd_ok=0
-if [ "$mode" = check ]; then
-	cmd_out="$(go test -race -count=1 -v -run '^TestKeys' ./cmd/k3sm/ 2>&1)" && cmd_ok=1 || cmd_ok=0
+cmd_run=""
+case "$mode" in
+check) cmd_run='^TestKeys' ;;
+delivery) cmd_run='^TestKeysDeliver' ;;
+esac
+if [ -n "$cmd_run" ]; then
+	cmd_out="$(go test -race -count=1 -v -run "$cmd_run" ./cmd/k3sm/ 2>&1)" && cmd_ok=1 || cmd_ok=0
+fi
+# The delivery reconciler's tests, which only the delivery rows name.
+del_out=""
+del_ok=0
+if [ "$mode" = check ] || [ "$mode" = delivery ]; then
+	del_out="$(go test -race -count=1 -v ./pkg/keystore/deliver/ 2>&1)" && del_ok=1 || del_ok=0
 fi
 # ran passes when every named test ran and passed: a cmd:<Test> in the keys
-# verbs' run, which must itself have passed, any other in the package's run.
+# verbs' run and a deliver:<Test> in the reconciler's, each run having itself
+# passed, any other in the package's run.
 ran() {
 	local t
 	for t in "$@"; do
@@ -144,6 +171,10 @@ ran() {
 		cmd:*)
 			[ "$cmd_ok" = 1 ] || return 1
 			grep -q -- "--- PASS: ${t#cmd:} " <<<"$cmd_out" || return 1
+			;;
+		deliver:*)
+			[ "$del_ok" = 1 ] || return 1
+			grep -q -- "--- PASS: ${t#deliver:} " <<<"$del_out" || return 1
 			;;
 		*) grep -q -- "--- PASS: $t " <<<"$out" || return 1 ;;
 		esac
@@ -214,13 +245,20 @@ check G16 "List marks an unreadable entry with Err, and Delete still removes it;
 	TestMkdirSyncsParent
 check G17 "show prints a value only with --reveal, byte-exact for an opaque value and 32- and 64-byte Ed25519 values; no verb takes a value as an argument" \
 	cmd:TestKeysShowRevealByteExact cmd:TestKeysShowMetadataOnly cmd:TestKeysRefusals
-pend G18 "delivery refused while encryption is off (PR 5)"
-pend G19 "the delivery declaration is root-owned (PR 5)"
-pend G20 "the reconciler touches only its labelled Secrets (PR 5)"
+check G18 "delivery is refused while encryption is off, before any apiserver call, logged once per target; the server's override flag allows it; a target delivered under the override stays when it is removed; deliver prints the refusal" \
+	deliver:TestDeliveryRefusedWhileEncryptionOff deliver:TestDeliveryOverrideAllowsPlaintext deliver:TestDeliveredTargetStaysWhenOverrideRemoved \
+	cmd:TestKeysDeliveryServerFlag cmd:TestKeysDeliveryServerConfig cmd:TestKeysDeliverEncryptionOffNote
+check G19 "the delivery declaration is root-owned and not group- or other-writable, opened O_NOFOLLOW and judged on the descriptor, size- and count-capped and parsed strictly; anything else is refused whole, by the reconciler and by the verbs" \
+	deliver:TestDeclarationRootOwned deliver:TestDeclarationOpenedWithNoFollow cmd:TestKeysDeliverRefusals
+check G20 "the reconciler only gets, creates and updates its labelled Opaque Secrets: an unlabelled or foreign Secret is untouched, and no list or delete is ever made" \
+	deliver:TestReconcilerTouchesOnlyLabelledSecrets deliver:TestReconcilerRedeliversOnRotation \
+	deliver:TestReconcilerSkipsLabelledNonOpaque deliver:TestReconcilerContinuesAfterTargetFailure
 check G21 "the rollback recipe is a byte-exact round trip: show --reveal into rotate --in -, the new version compared with version N byte for byte (bytes.Equal, as cmp), opaque and Ed25519" \
 	cmd:TestKeysRollbackRoundTrip
 # hack/ci.sh does not run this script, so G22 cannot recurse into it.
-if wanted G22; then
+if wanted G22 && [ "${KEYSTORE_SKIP_G22:-}" = 1 ]; then
+	skip G22 "KEYSTORE_SKIP_G22=1: hack/ci.sh not run here"
+elif wanted G22; then
 	if hack/ci.sh >/dev/null 2>&1; then pass G22 "hack/ci.sh is green"; else fail G22 "hack/ci.sh is not green (rerun it for the reason)"; fi
 fi
 check U5 "Rewrap refuses with ErrScopeUnsupported, writing nothing, while .user exists as a directory, a file or a symlink" \
@@ -229,8 +267,11 @@ check U5 "Rewrap refuses with ErrScopeUnsupported, writing nothing, while .user 
 if [ "$pkg_ok" != 1 ]; then
 	printf '%s\n' "$out" | grep -E -- '^(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' || true
 fi
-if [ "$mode" = check ] && [ "$cmd_ok" != 1 ]; then
+if [ -n "$cmd_run" ] && [ "$cmd_ok" != 1 ]; then
 	printf '%s\n' "$cmd_out" | grep -E -- '^(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' || true
+fi
+if [ -n "$del_out" ] && [ "$del_ok" != 1 ]; then
+	printf '%s\n' "$del_out" | grep -E -- '^(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' || true
 fi
 if [ "$failed" -gt 0 ]; then echo "keystore: FAIL ($failed failed, $pending pending)"; exit 1; fi
 if [ "$pending" -gt 0 ]; then echo "keystore: PENDING ($pending pending, none failed)"; exit 3; fi
