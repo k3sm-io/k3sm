@@ -107,7 +107,9 @@ func TestTypedIssuedAtStampedAndSealed(t *testing.T) {
 	}
 	later := typedNow.Add(90 * time.Minute)
 	s.now = func() time.Time { return later }
-	mustRotateCredential(t, s, "tok", KindToken, tokenEnvelope("t2"))
+	t2 := tokenEnvelope("t2")
+	t2.Credential.ExpiresAt = later.Add(time.Hour) // a token sealed already expired is refused
+	mustRotateCredential(t, s, "tok", KindToken, t2)
 	if _, c := mustCredential(t, s, "tok"); !c.IssuedAt.Equal(later) {
 		t.Fatalf("rotated token issuedAt %v, want %v", c.IssuedAt, later)
 	}
@@ -219,7 +221,10 @@ func TestTypedPutValidation(t *testing.T) {
 		e    typed.Envelope
 	}{
 		{"token without expiresAt", KindToken, noExpiry},
-		{"token without a value", KindToken, typed.Envelope{Credential: typed.Credential{ExpiresAt: typedNow}}},
+		{"token without a value", KindToken, typed.Envelope{Credential: typed.Credential{ExpiresAt: typedNow.Add(time.Hour)}}},
+		{"token expiring at its issue time", KindToken, typed.Envelope{Credential: typed.Credential{Value: []byte("t"), ExpiresAt: typedNow}}},
+		{"token expiring before its issue time", KindToken, typed.Envelope{Credential: typed.Credential{Value: []byte("t"), ExpiresAt: typedNow.Add(-time.Second)}}},
+		{"token claiming a later issue time", KindToken, typed.Envelope{Credential: typed.Credential{Value: []byte("t"), ExpiresAt: typedNow.Add(-time.Minute), IssuedAt: typedNow.Add(-time.Hour)}}},
 		{"oauth without the access token", KindOAuth, without(func(e *typed.Envelope) { e.Credential.AccessToken = nil })},
 		{"oauth without the access expiry", KindOAuth, without(func(e *typed.Envelope) { e.Credential.AccessExpiresAt = time.Time{} })},
 		{"oauth without the refresh token", KindOAuth, without(func(e *typed.Envelope) { e.RefreshToken = nil })},

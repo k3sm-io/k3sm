@@ -3379,7 +3379,10 @@ The record kinds as merged are `KindUnknown = 0` (never written), `KindEd25519 =
 | 5 | `oauth` | envelope: `accessToken`, `accessExpiresAt`, `accessIssuedAt`, `refreshToken`, `refreshExpiresAt` (optional), `tokenType` (optional, default `Bearer`), `refreshOwner` | keyed HMAC over the canonical envelope |
 
 - A credential that never expires is `opaque`. `token` always carries `expiresAt`, so "token"
-  always means "it expires".
+  always means "it expires", and a put or rotation refuses (`ErrInvalidCredential`) an
+  `expiresAt` that is not after the `issuedAt` the store stamps, which would seal a token
+  already expired. `RotateFrom` re-stamps nothing and checks nothing against the clock (see
+  "Rotation and rollback").
 - **An OAuth pair is one record**: one entry, one version per refresh. The access and refresh
   tokens move together under one pointer flip and one floor line. Two entries would need
   cross-entry atomicity, which the store does not have.
@@ -4397,7 +4400,7 @@ carried by the unit rows.
 | U144 | token and oauth require a sealed `issuedAt`/`accessIssuedAt` stamped from the clock seam; editing the `created` header changes no typed time | `k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed`, `TestCreatedHeaderEditChangesNoTypedTime` | checked: the typed store |
 | U145 | a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are `ErrKindUnsupported`, 0xFD and 0xFE `ErrCorrupt`; `list` shows `unsupported` | `k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen`, `TestKindByteTable`, `TestListShowsUnsupportedKind` | checked: the typed envelope and the typed store |
 | U146 | `rotate` and `put` over an existing entry cannot change its kind (`ErrKindMismatch`), nor can `rotate --from-version` from a version of another kind | `k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind`, `TestRotateFromRefusesOtherKind` | checked: the typed store |
-| U147 | token needs `expiresAt`; oauth needs access token, access expiry, refresh token and an owner in the grammar | `k3sm/pkg/keystore::TestTypedPutValidation` | checked: the typed store |
+| U147 | token needs `expiresAt`, after its stamped `issuedAt`; oauth needs access token, access expiry, refresh token and an owner in the grammar | `k3sm/pkg/keystore::TestTypedPutValidation` | checked: the typed store |
 | U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH`, `k3sm/pkg/keystore::TestStoreGenerateSSHUsesRandomSeam` | checked: the typed envelope and the typed store |
 | U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential`, `k3sm/pkg/keystore/typed::TestEnvelopeRefusalsNeverCarryRefreshToken`, `TestSecretTypesRedactWhenFormatted`, `TestNoUnexportedSecretField`, `TestDecodeRefusalClearsClones`, `k3sm/pkg/keystore::TestTypedPlaintextZeroedAfterSeal` | partial: every exported method of `*FileStore` and `*UserScope`, enumerated by reflection (a method neither called by hand, callable with built arguments nor allowlisted with a reason fails the test), the typed reads and the deliveries path checked (the typed store); pending: the consumer interfaces and `internal/refreshopen`'s import graph, `TestRefreshOpenerImportGraph` (the refresher) |
 | U150 | `RotateIf` refuses a stale version, and a version read from an entry since deleted and put again; a rotation never changes an oauth entry's refresh owner | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused`, `TestRotateIfRefusesRecreatedEntry`, `TestRotateIfRefusesVersionBuiltOutside`, `TestRefreshOwnerFixedPerEntry` | checked: the typed store |

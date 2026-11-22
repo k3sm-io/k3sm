@@ -35,7 +35,8 @@ import (
 // PutCredential creates name at version 1 holding e, of the typed kind kind.
 // It stamps a token's issuedAt and an oauth pair's accessIssuedAt from the
 // store's clock, whatever e carries, and refuses, with
-// typed.ErrInvalidCredential, a token without an expiry and an oauth pair
+// typed.ErrInvalidCredential, a token without an expiry or with one not
+// after that issue time, and an oauth pair
 // without its access token, access expiry, refresh token or a refresh owner
 // in the grammar. A put over an existing name of another kind is
 // ErrKindMismatch, and of the same kind ErrExists. A failure after the
@@ -325,6 +326,13 @@ func (s *FileStore) envelope(kind Kind, e typed.Envelope) ([]byte, error) {
 	switch kind {
 	case KindToken:
 		e.Credential.IssuedAt = now
+		// A token that expires at or before the time the store takes it is
+		// refused: it would be sealed already expired. An expiry the
+		// envelope lacks is refused by Encode, which names the field.
+		if !e.Credential.ExpiresAt.IsZero() && !e.Credential.ExpiresAt.After(now) {
+			return nil, fmt.Errorf("%w: the token expires at %s, not after its issue time %s", typed.ErrInvalidCredential,
+				e.Credential.ExpiresAt.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
+		}
 	case KindOAuth:
 		e.Credential.AccessIssuedAt = now
 	}
