@@ -975,3 +975,46 @@ func TestOAuthRetentionWindowOnRead(t *testing.T) {
 		t.Fatalf("the written pointer reads version %d", v.Version)
 	}
 }
+
+// sealVersion writes a record of kind sealing pt as version of name, under
+// the store's master and the entry's generation, as only a master holder
+// could.
+func sealVersion(t *testing.T, s *FileStore, server, name string, version uint64, kind Kind, pt []byte) {
+	t.Helper()
+	k, err := s.loadMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := hex.DecodeString(strings.TrimSpace(readString(t, entryPath(server, name, generationName))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := record{kind: byte(kind), name: name, version: version, created: 1}
+	copy(r.generation[:], gen)
+	if err := r.seal(k.seal, k.scope, pt, rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entryPath(server, name, versionName(version)), r.marshal(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRotateFromRefusesOtherKind is U146's rollback case: RotateFrom refuses,
+// with ErrKindMismatch, a source version whose kind is not the entry's
+// current kind, and writes nothing.
+func TestRotateFromRefusesOtherKind(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "tok", KindToken, tokenEnvelope("t1"))
+	mustRotateCredential(t, s, "tok", KindToken, tokenEnvelope("t2"))
+	sealVersion(t, s, server, "tok", 1, KindOpaque, []byte("raw bytes"))
+	if v, err := s.RotateFrom(ctx, "tok", 1); !errors.Is(err, ErrKindMismatch) || v != (Version{}) {
+		t.Fatalf("RotateFrom an opaque version of a token entry = %+v, %v; want ErrKindMismatch", v, err)
+	}
+	if got := fmt.Sprint(versionFiles(t, server, "tok")); got != "[1 2]" {
+		t.Fatalf("versions after the refusal %s, want [1 2]", got)
+	}
+	if v, c := mustCredential(t, s, "tok"); v.Version != 2 || string(c.Value) != "t2" {
+		t.Fatalf("current after the refusal: %d %q", v.Version, c.Value)
+	}
+}

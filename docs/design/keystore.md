@@ -3423,6 +3423,11 @@ them meaning.
   `low` fails the floor's sequence check as before (U151, U152).
 - `rotate --from-version` is refused for `oauth`: resurrecting a rotated refresh token can trip a
   provider's reuse detection and revoke the whole grant family (U153).
+- `rotate --from-version N` refuses, with `ErrKindMismatch`, a version N whose kind is not the
+  entry's current kind, and writes nothing (U146). It copies version N's sealed value as it is:
+  a `token` keeps the `issuedAt` and `expiresAt` it was sealed with, nothing is re-stamped or
+  checked against the clock, so a token restored past its expiry becomes the current version
+  already expired and reads as expired until a new value is rotated in.
 
 **The refresh token is write-only after `put`, and the store enforces it by type.**
 
@@ -4321,7 +4326,7 @@ carried by the unit rows.
 | U143 | the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is `ErrCorrupt`; the fuzz invariants hold | `k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors`, `TestEnvelopeRejectsUnknownTagDuplicateAndOrder`, `FuzzEnvelopeParse`; each kind's field table is strictly increasing by tag, `TestFieldTablesSortedByTag` | checked: the typed envelope |
 | U144 | token and oauth require a sealed `issuedAt`/`accessIssuedAt` stamped from the clock seam; editing the `created` header changes no typed time | `k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed`, `TestCreatedHeaderEditChangesNoTypedTime` | checked: the typed store |
 | U145 | a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are `ErrKindUnsupported`, 0xFD and 0xFE `ErrCorrupt`; `list` shows `unsupported` | `k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen`, `TestKindByteTable`, `TestListShowsUnsupportedKind` | checked: the typed envelope and the typed store |
-| U146 | `rotate` and `put` over an existing entry cannot change its kind (`ErrKindMismatch`) | `k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind` | checked: the typed store |
+| U146 | `rotate` and `put` over an existing entry cannot change its kind (`ErrKindMismatch`), nor can `rotate --from-version` from a version of another kind | `k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind`, `TestRotateFromRefusesOtherKind` | checked: the typed store |
 | U147 | token needs `expiresAt`; oauth needs access token, access expiry, refresh token and an owner in the grammar | `k3sm/pkg/keystore::TestTypedPutValidation` | checked: the typed store |
 | U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH`, `k3sm/pkg/keystore::TestStoreGenerateSSHUsesRandomSeam` | checked: the typed envelope and the typed store |
 | U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential`, `k3sm/pkg/keystore/typed::TestEnvelopeRefusalsNeverCarryRefreshToken`, `TestSecretTypesRedactWhenFormatted` | partial: every exported method of `*FileStore` and `*UserScope`, enumerated by reflection (a method neither called by hand, callable with built arguments nor allowlisted with a reason fails the test), the typed reads and the deliveries path checked (the typed store); pending: the consumer interfaces and `internal/refreshopen`'s import graph, `TestRefreshOpenerImportGraph` (the refresher) |

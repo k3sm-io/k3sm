@@ -178,8 +178,13 @@ func sameRefreshOwner(en *entry, k keys, old Version, owner string) error {
 // the rollback rotate --from-version names. It is refused for oauth with
 // ErrFromVersionOAuth: a rotated refresh token is never written back. Only
 // an oauth entry has a refresh owner, so that refusal also keeps RotateFrom
-// from changing one. A
-// typed value keeps the issue time it was sealed with.
+// from changing one. A source version whose kind is not the entry's current
+// kind is refused with ErrKindMismatch.
+//
+// A typed value keeps the issue time and expiry it was sealed with: nothing
+// is re-stamped or checked against the clock, so a token restored past its
+// expiresAt becomes the current version already expired, and reads as
+// expired until a new value is rotated in.
 func (s *FileStore) RotateFrom(ctx context.Context, name string, from uint64) (Version, error) {
 	var val []byte
 	defer func() { clear(val) }() // sealed by then, or refused
@@ -190,9 +195,15 @@ func (s *FileStore) RotateFrom(ctx context.Context, name string, from uint64) (V
 		if from == 0 || from > old.Version {
 			return nil, ErrVersionNotFound
 		}
-		var err error
-		_, val, err = e.version(k, from)
-		return val, err
+		src, v, err := e.version(k, from)
+		val = v
+		if err != nil {
+			return nil, err
+		}
+		if src.Kind != old.Kind {
+			return nil, fmt.Errorf("%w: version %d is %s, but %s is %s", ErrKindMismatch, from, src.Kind, name, old.Kind)
+		}
+		return val, nil
 	})
 	if err != nil {
 		// v is the committed version when err is ErrCommitted.

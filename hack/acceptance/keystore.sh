@@ -798,8 +798,8 @@ check U144 "token and oauth require a sealed issuedAt/accessIssuedAt stamped fro
 	k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed TestCreatedHeaderEditChangesNoTypedTime
 check U145 "a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are ErrKindUnsupported, 0xFD and 0xFE ErrCorrupt; list shows unsupported" \
 	k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen TestKindByteTable TestListShowsUnsupportedKind
-check U146 "rotate and put over an existing entry cannot change its kind (ErrKindMismatch)" \
-	k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind
+check U146 "rotate and put over an existing entry cannot change its kind (ErrKindMismatch), nor can rotate --from-version from a version of another kind" \
+	k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind TestRotateFromRefusesOtherKind
 check U147 "token needs expiresAt; oauth needs access token, access expiry, refresh token and an owner in the grammar" \
 	k3sm/pkg/keystore::TestTypedPutValidation
 check U148 "SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed ssh-keygen -l vector" \
