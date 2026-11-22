@@ -86,6 +86,9 @@ const (
 	maxRevokeUIDs  = 1024
 	logBoundMargin = 1 << 20
 	maxFloorKeys   = 1 << 20
+	// logFreeMargin is the free space an append leaves on the log's file
+	// system beyond its own line.
+	logFreeMargin = 1 << 20
 )
 
 // keyBound is the most distinct keys the floor may hold.
@@ -116,6 +119,10 @@ var (
 	// errLogUntrusted is a log, or the data root holding it, that is not
 	// what install makes.
 	errLogUntrusted = errors.New("the keystore append-only log is not trusted: it must be a regular file with one link, owned by the service user, mode 0600, in a data root owned by root and not group- or other-writable")
+	// errLogNoSpace refuses an append because the log's file system has
+	// less than logFreeMargin free beyond the line: retryable once space
+	// is freed, never damage, and nothing was written.
+	errLogNoSpace = errors.New("the keystore log's volume is nearly full, so the line was not appended; free some space and retry; nothing was changed")
 	// errLogTooLarge is a log larger than logReadBound: damage.
 	errLogTooLarge = errors.New("the keystore append-only log is larger than the reader's bound")
 	// errFloorTooManyKeys is a floor with more than maxFloorKeys distinct
@@ -239,6 +246,9 @@ type appendLog struct {
 	// whole reports whether every line must be read (the floor), or only
 	// those past the hard cap (the audit log).
 	whole bool
+	// freeSpace, when set, replaces logFreeSpace: the test seam for the
+	// free-space preflight.
+	freeSpace func(fd int) (uint64, error)
 	// maxKeys, when not 0, replaces maxFloorKeys: the test seam for the
 	// key bound.
 	maxKeys int
@@ -544,10 +554,14 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 			return err
 		}
 	}
-	n, err := f.Write(line)
-	if err == nil && n != len(line) {
-		err = io.ErrShortWrite
+	if err := l.preflight(f, len(line)); err != nil {
+		return err
 	}
+	// One write(2) of the whole line. An ENOSPC or EIO between the
+	// preflight and the write, or a crash mid-write, can still leave a
+	// torn tail the flag keeps: damage, which floor --rebuild repairs
+	// (docs/design/keystore.md § "The user-scope floor").
+	_, err = f.Write(line)
 	if err == nil {
 		err = f.Sync()
 	}
@@ -555,6 +569,35 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 		return fmt.Errorf("append to %s: %w", l.name, err)
 	}
 	return nil
+}
+
+// preflight refuses, as errLogNoSpace, an append of n bytes while the
+// file system holding f, read with fstatfs on its descriptor, has less than
+// logFreeMargin free beyond them. A file system that cannot be asked is
+// refused the same way.
+func (l *appendLog) preflight(f *os.File, n int) error {
+	free := l.freeSpace
+	if free == nil {
+		free = logFreeSpace
+	}
+	avail, err := free(int(f.Fd()))
+	if err != nil {
+		return fmt.Errorf("%w: fstatfs %s: %w", errLogNoSpace, l.name, err)
+	}
+	if avail < logFreeMargin+uint64(n) {
+		return fmt.Errorf("%w (%s: %d bytes free)", errLogNoSpace, l.name, avail)
+	}
+	return nil
+}
+
+// logFreeSpace is the bytes free to an unprivileged writer on the file
+// system holding fd.
+func logFreeSpace(fd int) (uint64, error) {
+	var st unix.Statfs_t
+	if err := unix.Fstatfs(fd, &st); err != nil {
+		return 0, err
+	}
+	return st.Bavail * uint64(st.Bsize), nil
 }
 
 // scopeUID returns the uid of a user scope, user/<uid>, or 0 for any other
