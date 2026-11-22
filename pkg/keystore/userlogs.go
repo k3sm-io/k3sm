@@ -198,15 +198,20 @@ func (s *FileStore) logReadBound() int64 {
 type logMissingScopesError struct{}
 
 func (logMissingScopesError) Error() string {
-	return "the keystore append-only log is missing while user scopes exist, so a new one would lower their floor: restore the matched set (keystore/, keystore/.user/ and both logs) from one backup, then run sudo k3sm keys floor --rebuild"
+	return "the keystore append-only log is missing while user scopes exist, so a new one would lower their floor: restore the matched set (keystore/, keystore/.user/ and both logs) from one backup and run sudo k3sm doctor (the rebuild verb is not yet available)"
 }
 
 func (logMissingScopesError) Is(target error) bool { return target == errLogMissing }
 
+// restoreRemedy is the remedy every user-scope floor error names while the
+// rebuild verb is not built: the matched-set restore, then doctor. No error
+// names a verb that does not exist yet (TestErrorsNameNoUnbuiltVerb).
+const restoreRemedy = "restore the matched set (keystore/, keystore/.user/ and both logs) from one backup and run sudo k3sm doctor (the rebuild verb is not yet available)"
+
 // ErrLogFull refuses an operation because an append-only log is past its
 // hard cap, or, for a revocation past the hard cap, because the uid's
 // revocation budget in that log is spent. Nothing was changed.
-var ErrLogFull = errors.New("the keystore log is full: the user-scope floor or audit log is past its hard cap or the floor's key bound, so no user-scope change can be recorded; root must run sudo k3sm keys audit --rotate or sudo k3sm keys floor --rebuild; nothing was changed")
+var ErrLogFull = errors.New("the keystore log is full: the user-scope floor or audit log is past its hard cap or the floor's key bound, so no user-scope change can be recorded; root must run sudo k3sm doctor (the audit rotation and floor rebuild verbs are not yet available); nothing was changed")
 
 var (
 	// errLogMissing is a log that does not exist: the data root has not been
@@ -217,7 +222,7 @@ var (
 	// create one and the remedy is the matched-set restore.
 	errLogMissingScopes error = logMissingScopesError{}
 	// errLogNotAppendOnly is a log whose SF_APPEND flag is clear.
-	errLogNotAppendOnly = errors.New("the keystore append-only log is not flagged append-only (SF_APPEND is clear), so it could be truncated or rewritten: a restore must end with sudo k3sm keys floor --rebuild and sudo k3sm keys audit --rotate")
+	errLogNotAppendOnly = errors.New("the keystore append-only log is not flagged append-only (SF_APPEND is clear), so it could be truncated or rewritten: root must " + restoreRemedy)
 	// errLogUntrusted is a log, or the data root holding it, that is not
 	// what install makes.
 	errLogUntrusted = errors.New("the keystore append-only log is not trusted: it must be a regular file with one link, owned by the service user, mode 0600, with no file flag but SF_APPEND and no extended ACL, in a data root owned by root, not group- or other-writable, with no such flag or ACL either")
@@ -236,13 +241,13 @@ var (
 	// newline: the line would complete the torn one into a line that does
 	// not parse. Nothing was written; root must run sudo k3sm keys floor
 	// --rebuild.
-	errLogTornTail = errors.New("the keystore log's last line has no newline (a torn tail), so the line was not appended; root must run sudo k3sm keys floor --rebuild")
+	errLogTornTail = errors.New("the keystore log's last line has no newline (a torn tail), so the line was not appended; root must " + restoreRemedy)
 	// errLogLineTooLong is a line over maxLogLine, which is never written.
 	errLogLineTooLong = fmt.Errorf("a keystore log line is at most %d bytes", maxLogLine)
 	// errFloorLogMalformed is a user-scope floor whose bytes do not parse:
 	// damage, which refuses every user-scope operation that reads the floor,
 	// revocations included, until root rebuilds it.
-	errFloorLogMalformed = fmt.Errorf("%w: the user-scope floor %s does not parse; root must run sudo k3sm keys floor --rebuild", ErrCorrupt, userFloorLogName)
+	errFloorLogMalformed = fmt.Errorf("%w: the user-scope floor %s does not parse; root must "+restoreRemedy, ErrCorrupt, userFloorLogName)
 	// errLogUnreadable is a log whose bytes could not be read: an I/O
 	// error, transient and never damage. It is never kept, matches no
 	// ErrCorrupt, and so refuses a grant or read and lets a revocation go
@@ -1452,9 +1457,9 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 // errLogRevokeBudgetSpent is a configuration under which a uid's lines past
 // the hard cap already spend its revocation budget, so its next revocation
 // would be refused: root-only, refused at store open.
-var errLogRevokeBudgetSpent = errors.New("the configured log caps leave a uid's revocation budget already spent past the hard cap, so its revocations would be refused; configure the caps the log was written under, or restore the caps and rotate the audit log (sudo k3sm keys audit --rotate, which is not yet available: until it is, restore the log from a backup and run sudo k3sm doctor)")
+var errLogRevokeBudgetSpent = errors.New("the configured log caps leave a uid's revocation budget already spent past the hard cap, so its revocations would be refused; configure the caps the log was written under, or restore the caps and rotate the audit log (the audit rotation verb is not yet available: until it is, restore the log from a backup and run sudo k3sm doctor)")
 
-var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's bounds below what an existing append-only log already holds, so it would read as damage; configure the caps the log was written under, or run sudo k3sm keys floor --rebuild or sudo k3sm keys audit --rotate")
+var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's bounds below what an existing append-only log already holds, so it would read as damage; configure the caps the log was written under, or " + restoreRemedy)
 
 // CheckLogBounds refuses, as errInvalidConfig and errLogBoundsBelowLog, a
 // configuration whose reader's bounds sit below what an existing log

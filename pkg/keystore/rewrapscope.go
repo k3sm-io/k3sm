@@ -210,7 +210,7 @@ func (s *FileStore) checkScopesPlanned(ctx context.Context, root *os.Root, plan 
 // refuses to mint over it. That recovery is rm-scope, not built yet; until
 // it is, floor --rebuild after the removal is the way, and its cost is said.
 func damagedScopeRecovery(uid string) string {
-	return fmt.Sprintf("remove keystore/%s/%s/ by hand, which recovers only a user who never delivered (the owner loses their values and re-puts them). For a user who did, the owner's next put refuses to mint over the floor: the recovery is rm-scope, which is not built yet. Until it is, root removes keystore/%s/%s/ and runs `sudo k3sm keys floor --rebuild`, which rewrites the floor from what is on disk and so lowers every record's floor, every user's, to the sequence on disk now: a copied-back older record already in place is accepted from then on", userScopesName, uid, userScopesName, uid)
+	return fmt.Sprintf("remove keystore/%s/%s/ by hand, which recovers only a user who never delivered (the owner loses their values and re-puts them). For a user who did, the owner's next put refuses to mint over the floor: the recovery is rm-scope, which is not built yet. Until it is, root removes keystore/%s/%s/ and runs sudo k3sm doctor; the rebuild verb, which would rewrite the floor from what is on disk and so lower every record's floor, every user's, to the sequence on disk now, is not yet available", userScopesName, uid, userScopesName, uid)
 }
 
 // withScopeDir calls fn with the scope directory .user/<uid>.

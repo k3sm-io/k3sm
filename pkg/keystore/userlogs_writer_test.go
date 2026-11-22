@@ -73,7 +73,7 @@ func TestFloorKeyBoundChurnRefusesGrants(t *testing.T) {
 	if !errors.Is(refused, ErrLogFull) {
 		t.Fatalf("a grant past the key bound: %v, want ErrLogFull", refused)
 	}
-	for _, want := range []string{"floor --rebuild", "audit --rotate", "key bound"} {
+	for _, want := range []string{"sudo k3sm doctor", "not yet available", "key bound"} {
 		if !strings.Contains(refused.Error(), want) {
 			t.Fatalf("refusal %q does not say %q", refused, want)
 		}

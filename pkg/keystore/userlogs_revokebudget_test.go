@@ -46,7 +46,7 @@ func TestCheckLogBoundsRefusesSpentRevocationBudget(t *testing.T) {
 	if !errors.Is(err, errInvalidConfig) || !errors.Is(err, errLogRevokeBudgetSpent) {
 		t.Fatalf("store open with a uid past its revocation budget: %v, want errLogRevokeBudgetSpent", err)
 	}
-	if !strings.Contains(err.Error(), "audit --rotate") || !strings.Contains(err.Error(), "caps") {
+	if !strings.Contains(err.Error(), "sudo k3sm doctor") || !strings.Contains(err.Error(), "caps") {
 		t.Fatalf("the refusal %q does not name the remedy", err)
 	}
 }

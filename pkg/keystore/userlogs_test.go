@@ -135,8 +135,8 @@ func checkUserStale(t *testing.T, op string, err error) {
 		t.Fatalf("%s of a copied-back current: %v, want the user-scope floor refusal", op, err)
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "sudo k3sm keys floor --rebuild") || !strings.Contains(msg, "removing keystore-floor.json does not help") {
-		t.Fatalf("%s: the message %q does not name floor --rebuild over removing keystore-floor.json", op, msg)
+	if !strings.Contains(msg, "restore the matched set") || !strings.Contains(msg, "removing keystore-floor.json does not help") {
+		t.Fatalf("%s: the message %q does not name the matched-set restore over removing keystore-floor.json", op, msg)
 	}
 }
 
@@ -199,8 +199,8 @@ func TestWithdrawMalformedFloorRefused(t *testing.T) {
 			appendLogBytes(t, s, userFloorLogName, []byte(tc.junk))
 			snap := treeSnapshot(t, server)
 			err := u.withdrawDelivery(ctx, testDelivery(1).uid)
-			if !errors.Is(err, ErrCorrupt) || !errors.Is(err, errFloorLogMalformed) || !strings.Contains(err.Error(), "floor --rebuild") {
-				t.Fatalf("withdraw over a malformed floor: %v, want ErrCorrupt naming floor --rebuild", err)
+			if !errors.Is(err, ErrCorrupt) || !errors.Is(err, errFloorLogMalformed) || !strings.Contains(err.Error(), "matched set") {
+				t.Fatalf("withdraw over a malformed floor: %v, want ErrCorrupt naming the matched-set restore", err)
 			}
 			checkTreeUnchanged(t, snap, treeSnapshot(t, server))
 			if d, _ := recordedDelivery(t, s, server, 1); d.withdrawn {

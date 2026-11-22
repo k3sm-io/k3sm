@@ -31,7 +31,7 @@ type userStaleError struct {
 }
 
 func (e *userStaleError) Error() string {
-	return fmt.Sprintf("keystore entry %q: its pointer (sequence %d) is older than the user-scope floor (sequence %d), so an older copy of it was put back. Do not restore from backup. If that was deliberate, run sudo k3sm keys floor --rebuild; removing keystore-floor.json does not help, since it holds no user entry", e.name, e.seq, e.floor)
+	return fmt.Sprintf("keystore entry %q: its pointer (sequence %d) is older than the user-scope floor (sequence %d), so an older copy of it was put back. Do not restore the entry from backup on its own. If that was deliberate, "+restoreRemedy+"; removing keystore-floor.json does not help, since it holds no user entry", e.name, e.seq, e.floor)
 }
 
 func (e *userStaleError) Unwrap() error { return ErrCorrupt }
@@ -65,7 +65,7 @@ func (u *UserScope) flooredPointer(e *entry, k keys) (uint64, error) {
 type userDeletedError struct{ name string }
 
 func (e *userDeletedError) Error() string {
-	return fmt.Sprintf("keystore entry %q was deleted: rm buried this copy of it in the user-scope floor, and the copy was put back afterwards. Run rm on it and put it again. Only as a last resort, for a deliberate restore, root can run sudo k3sm keys floor --rebuild", e.name)
+	return fmt.Sprintf("keystore entry %q was deleted: rm buried this copy of it in the user-scope floor, and the copy was put back afterwards. Run rm on it and put it again. Only as a last resort, for a deliberate restore, root can "+restoreRemedy, e.name)
 }
 
 func (e *userDeletedError) Unwrap() error { return ErrCorrupt }

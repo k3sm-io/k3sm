@@ -514,14 +514,14 @@ func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) (deliveries
 	// with a tombstone lost. With no floor to read the mark stands alone.
 	seen := deliveriesSeen.high(u.s.dir, u.scope, o.gen)
 	if flErr == nil && r.version < fl {
-		return deliveriesRead{}, fmt.Errorf("%w: the %s record (sequence %d) is older than the user-scope floor (sequence %d); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, fl)
+		return deliveriesRead{}, fmt.Errorf("%w: the %s record (sequence %d) is older than the user-scope floor (sequence %d); an older copy was put back. For a deliberate restore, "+restoreRemedy, ErrCorrupt, deliveriesName, r.version, fl)
 	}
 	if r.version < seen {
 		why := "the user-scope floor is behind it"
 		if flErr != nil {
 			why = fmt.Sprintf("the user-scope floor cannot be read (%v)", flErr)
 		}
-		return deliveriesRead{}, fmt.Errorf("%w: the %s record (sequence %d) is older than one this process has already read or written (sequence %d), and %s; an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, seen, why)
+		return deliveriesRead{}, fmt.Errorf("%w: the %s record (sequence %d) is older than one this process has already read or written (sequence %d), and %s; an older copy was put back. For a deliberate restore, "+restoreRemedy, ErrCorrupt, deliveriesName, r.version, seen, why)
 	}
 	pt, err := r.open(o.key, u.scope)
 	if err != nil {
@@ -615,7 +615,7 @@ var errDeliveriesLastSeq = fmt.Errorf("%w: the %s record is at the last sequence
 // re-sealing it at a fresh sequence would make that copy authentic. Nothing
 // was sealed, so the delivery stays live in the record; the reconciler
 // deletes the delivered Secret anyway, as for any withdrawal that errors.
-var errWithdrawUnsealed = errors.New("the user-scope floor cannot be verified, so the withdrawal was not sealed into the delivery record, which may be an older copy put back; delete the delivered Secret anyway; root must run sudo k3sm keys floor --rebuild, then withdraw again")
+var errWithdrawUnsealed = errors.New("the user-scope floor cannot be verified, so the withdrawal was not sealed into the delivery record, which may be an older copy put back; delete the delivered Secret anyway; root must " + restoreRemedy + ", then withdraw again")
 
 // errCommitted marks an error after a change was committed: the change
 // stands, and what follows it (a floor line, an audit line) was not

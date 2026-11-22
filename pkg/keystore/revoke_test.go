@@ -250,7 +250,7 @@ func TestWithdrawBelowReadableFloorRefused(t *testing.T) {
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("withdraw below a readable floor: %v, want ErrCorrupt", err)
 	}
-	for _, want := range []string{"is older than the user-scope floor", "sudo k3sm keys floor --rebuild"} {
+	for _, want := range []string{"is older than the user-scope floor", "restore the matched set", "sudo k3sm doctor"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("refusal %q does not say %q", err, want)
 		}

@@ -205,7 +205,7 @@ func TestRewrapRefusesStrayScopeDirs(t *testing.T) {
 // rm-scope, and until that lands floor --rebuild, whose cost is said.
 func checkDamagedScopeRecovery(t *testing.T, err error) {
 	t.Helper()
-	for _, want := range []string{"never delivered", "rm-scope", "floor --rebuild", "lowers every record's floor"} {
+	for _, want := range []string{"never delivered", "rm-scope", "sudo k3sm doctor", "not yet available", "lower every record's floor"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal %q does not say %q", err, want)
 		}
