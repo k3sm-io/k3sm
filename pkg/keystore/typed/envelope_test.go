@@ -21,10 +21,17 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -299,8 +306,8 @@ func FuzzEnvelopeParse(f *testing.F) {
 				t.Fatalf("decode error %v is neither ErrCorrupt nor ErrKindUnsupported", err)
 			}
 			// The sentinels' fixed texts are not the input's; what is left of
-			// the message must not carry 16 input bytes in a row, anywhere
-			// in the input.
+			// the message must not carry leakWindow input bytes in a row,
+			// anywhere in the input.
 			msg := err.Error()
 			for _, s := range []error{ErrCorrupt, ErrKindUnsupported} {
 				msg = strings.ReplaceAll(msg, s.Error(), "")
@@ -321,11 +328,56 @@ func FuzzEnvelopeParse(f *testing.F) {
 }
 
 // leakWindow is the run of input bytes an error must never carry.
-const leakWindow = 16
+const leakWindow = 8
+
+// fixedText is every string literal of the package's non-test files, each
+// cut at its format verbs, longest first, with the credential kind names:
+// the text an error carries that is the package's, not the input's.
+var fixedText = sync.OnceValues(func() ([]string, error) {
+	pieces := []string{string(credential.KindToken), string(credential.KindSSH), string(credential.KindOAuth)}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		return nil, err
+	}
+	verb := regexp.MustCompile(`%[-+# 0-9.]*[a-zA-Z]`)
+	fset := token.NewFileSet()
+	for _, n := range files {
+		if strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return nil, err
+		}
+		ast.Inspect(f, func(node ast.Node) bool {
+			lit, ok := node.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			v, err := strconv.Unquote(lit.Value)
+			if err == nil {
+				pieces = append(pieces, verb.Split(v, -1)...)
+			}
+			return true
+		})
+	}
+	sort.Slice(pieces, func(i, j int) bool { return len(pieces[i]) > len(pieces[j]) })
+	return pieces, nil
+})
 
 // windowLeak reports the offset of the first leakWindow-byte window of in
-// that appears in msg.
+// that appears in msg once the package's own text (fixedText) is cut out of
+// it, so that an input which happens to spell a field name is not a leak.
 func windowLeak(msg string, in []byte) (int, bool) {
+	pieces, err := fixedText()
+	if err != nil {
+		panic(err) // the package's own source does not parse
+	}
+	for _, p := range pieces {
+		if len(p) > 1 {
+			msg = strings.ReplaceAll(msg, p, "\x00")
+		}
+	}
 	for i := 0; i+leakWindow <= len(in); i++ {
 		if strings.Contains(msg, string(in[i:i+leakWindow])) {
 			return i, true
@@ -336,8 +388,8 @@ func windowLeak(msg string, in []byte) (int, bool) {
 
 // TestEnvelopeRefusalsNeverCarryRefreshToken plants a marker refresh token in
 // an oauth envelope, breaks the envelope around it in every way Decode
-// refuses, and checks that no refusal's text carries the marker, nor any 16
-// bytes of the input in a row.
+// refuses, and checks that no refusal's text carries the marker, nor any
+// leakWindow bytes of the input in a row.
 func TestEnvelopeRefusalsNeverCarryRefreshToken(t *testing.T) {
 	marker := []byte("MARKER-refresh-token-5f0c1e9a7b3d")
 	at := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
