@@ -35,6 +35,7 @@ type memFloorLine struct {
 	scope, name string
 	gen         [generationSize]byte
 	seq         uint64
+	tomb        bool
 }
 
 func (f *memFloor) floor(scope, name string, gen [generationSize]byte) (uint64, error) {
@@ -45,7 +46,13 @@ func (f *memFloor) floor(scope, name string, gen [generationSize]byte) (uint64, 
 	}
 	var max uint64
 	for _, l := range f.lines {
-		if l.scope == scope && l.name == name && l.gen == gen && l.seq > max {
+		if l.scope != scope || l.name != name || l.gen != gen {
+			continue
+		}
+		if l.tomb {
+			return 0, errFloorBuried
+		}
+		if l.seq > max {
 			max = l.seq
 		}
 	}
@@ -58,7 +65,17 @@ func (f *memFloor) append(scope, name string, gen [generationSize]byte, seq uint
 	if f.failAppend {
 		return errors.New("injected floor append failure")
 	}
-	f.lines = append(f.lines, memFloorLine{scope, name, gen, seq})
+	f.lines = append(f.lines, memFloorLine{scope: scope, name: name, gen: gen, seq: seq})
+	return nil
+}
+
+func (f *memFloor) bury(scope, name string, gen [generationSize]byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failAppend {
+		return errors.New("injected floor append failure")
+	}
+	f.lines = append(f.lines, memFloorLine{scope: scope, name: name, gen: gen, tomb: true})
 	return nil
 }
 

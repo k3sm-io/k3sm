@@ -465,7 +465,7 @@ func TestAuditLineBoundedAtOneKiB(t *testing.T) {
 	if !bytes.Equal(before, readLog(t, s, auditLogName)) {
 		t.Fatal("a line over 1 KiB was written")
 	}
-	if _, _, err := parseFloorLine(bytes.Repeat([]byte("a"), maxLogLine)); !errors.Is(err, errLogLineTooLong) {
+	if _, err := parseFloorLine(bytes.Repeat([]byte("a"), maxLogLine)); !errors.Is(err, errLogLineTooLong) {
 		t.Fatalf("a floor line over 1 KiB: %v", err)
 	}
 	if err := s.userFloor.append("user/1001", strings.Repeat("a", maxLogLine), guid(1), 1); err == nil {

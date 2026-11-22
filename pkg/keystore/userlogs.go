@@ -98,17 +98,28 @@ var (
 	// damage, which refuses every user-scope operation that reads the floor,
 	// revocations included, until root rebuilds it.
 	errFloorLogMalformed = fmt.Errorf("%w: the user-scope floor %s does not parse; root must run sudo k3sm keys floor --rebuild", ErrCorrupt, userFloorLogName)
+	// errFloorBuried is a generation the user-scope floor holds a tombstone
+	// for: rm deleted it. A reader turns it into userDeletedError.
+	errFloorBuried = errors.New("the user-scope floor buries this generation: the entry was deleted")
 )
+
+// floorTombstone is a tombstone line's last field, where a live line has
+// its sequence.
+const floorTombstone = "rm"
 
 // userFloorLog is the user-scope floor: (scope, name, generation, seq)
 // lines, of which a reader takes, per (scope, name), the highest seq among
-// the lines of a generation, so the floor only rises.
+// the lines of a generation, so the floor only rises; and (scope, name,
+// generation) tombstones, which rm appends and which bury that generation
+// for good.
 type userFloorLog interface {
 	// floor returns the highest seq recorded for scope, name and gen, or 0
-	// when none is.
+	// when none is; errFloorBuried when a tombstone buries gen.
 	floor(scope, name string, gen [generationSize]byte) (uint64, error)
 	// append records one line.
 	append(scope, name string, gen [generationSize]byte, seq uint64) error
+	// bury records the tombstone of scope, name and gen.
+	bury(scope, name string, gen [generationSize]byte) error
 }
 
 // auditLine is one audit line's fields that this package fills: never a
@@ -202,8 +213,9 @@ type logState struct {
 	off int64
 	// pastCap is each uid's bytes in lines that start at or past hardCap.
 	pastCap map[uint32]int64
-	// maxSeq is the floor's highest seq per key.
+	// maxSeq is the floor's highest seq per key, and buried its tombstones.
 	maxSeq map[floorKey]uint64
+	buried map[floorKey]bool
 	// bad is the error of a line that did not parse, which sticks for this
 	// file.
 	bad error
@@ -297,7 +309,7 @@ func (s *FileStore) judgeLog(f *os.File, st *unix.Stat_t) error {
 func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 	s := &l.state
 	if s.dev != uint64(st.Dev) || s.ino != st.Ino || s.hardCap != l.s.logHardCap || st.Size < s.off {
-		*s = logState{dev: uint64(st.Dev), ino: st.Ino, hardCap: l.s.logHardCap, pastCap: map[uint32]int64{}, maxSeq: map[floorKey]uint64{}}
+		*s = logState{dev: uint64(st.Dev), ino: st.Ino, hardCap: l.s.logHardCap, pastCap: map[uint32]int64{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
 	}
 	if s.bad != nil || st.Size == s.off {
 		return s, nil
@@ -470,14 +482,17 @@ type fileFloorLog struct{ log *appendLog }
 func newFileFloorLog(s *FileStore) *fileFloorLog {
 	l := &appendLog{s: s, name: userFloorLogName, whole: true}
 	l.lineUID = func(st *logState, line []byte) (uint32, error) {
-		k, seq, err := parseFloorLine(line)
+		r, err := parseFloorLine(line)
 		if err != nil {
 			return 0, err
 		}
-		if seq > st.maxSeq[k] {
-			st.maxSeq[k] = seq
+		switch {
+		case r.tomb:
+			st.buried[r.key] = true
+		case r.seq > st.maxSeq[r.key]:
+			st.maxSeq[r.key] = r.seq
 		}
-		return scopeUID(k.scope), nil
+		return scopeUID(r.key.scope), nil
 	}
 	return &fileFloorLog{log: l}
 }
@@ -497,7 +512,11 @@ func (f *fileFloorLog) floor(scope, name string, gen [generationSize]byte) (uint
 	if state.bad != nil {
 		return 0, fmt.Errorf("%w (%v)", errFloorLogMalformed, state.bad)
 	}
-	return state.maxSeq[floorKey{scope, name, gen}], nil
+	k := floorKey{scope, name, gen}
+	if state.buried[k] {
+		return 0, errFloorBuried
+	}
+	return state.maxSeq[k], nil
 }
 
 func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq uint64) error {
@@ -511,12 +530,33 @@ func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq 
 	return f.log.appendLine(scopeUID(scope), line, true)
 }
 
+func (f *fileFloorLog) bury(scope, name string, gen [generationSize]byte) error {
+	line, err := tombLine(scope, name, gen)
+	if err != nil {
+		return err
+	}
+	// rm is in the revocation class: past the hard cap its tombstone draws
+	// on the uid's revocation budget.
+	return f.log.appendLine(scopeUID(scope), line, true)
+}
+
 // floorLine encodes one floor line: "<scope> <name> <generation> <seq>\n",
 // the generation in lowercase hex and seq in decimal. It refuses a field
 // the parser would refuse, so every line written reads back.
 func floorLine(scope, name string, gen [generationSize]byte, seq uint64) ([]byte, error) {
-	b := fmt.Appendf(nil, "%s %s %x %d", scope, name, gen[:], seq)
-	if _, _, err := parseFloorLine(b); err != nil {
+	return encodeFloorLine(fmt.Appendf(nil, "%s %s %x %d", scope, name, gen[:], seq))
+}
+
+// tombLine encodes one tombstone line: "<scope> <name> <generation> rm\n".
+// Only an entry name has one; the delivery record is never deleted.
+func tombLine(scope, name string, gen [generationSize]byte) ([]byte, error) {
+	return encodeFloorLine(fmt.Appendf(nil, "%s %s %x %s", scope, name, gen[:], floorTombstone))
+}
+
+// encodeFloorLine refuses b, a floor line without its newline, unless it
+// parses, so every line written reads back, and returns it with its newline.
+func encodeFloorLine(b []byte) ([]byte, error) {
+	if _, err := parseFloorLine(b); err != nil {
 		return nil, fmt.Errorf("encode a user-scope floor line: %w", err)
 	}
 	if len(b)+1 > maxLogLine {
@@ -525,42 +565,60 @@ func floorLine(scope, name string, gen [generationSize]byte, seq uint64) ([]byte
 	return append(b, '\n'), nil
 }
 
+// floorRec is one parsed floor line: a live line's key and seq, or a
+// tombstone's key.
+type floorRec struct {
+	key  floorKey
+	seq  uint64
+	tomb bool
+}
+
 // parseFloorLine decodes one floor line without its newline, strictly: a
 // user scope, an entry name or the delivery record's floor name, a
-// generation of 32 lowercase hex digits and a decimal seq with no sign or
-// leading zero, separated by single spaces. Anything else is an error.
-func parseFloorLine(line []byte) (floorKey, uint64, error) {
-	var k floorKey
+// generation of 32 lowercase hex digits, and either a decimal seq with no
+// sign or leading zero or, for an entry name only, the tombstone marker
+// "rm"; separated by single spaces. Anything else is an error.
+func parseFloorLine(line []byte) (floorRec, error) {
+	var r floorRec
 	if len(line)+1 > maxLogLine {
-		return k, 0, errLogLineTooLong
+		return r, errLogLineTooLong
 	}
 	f := bytes.Split(line, []byte{' '})
 	if len(f) != 4 {
-		return k, 0, fmt.Errorf("a floor line has %d fields, want 4", len(f))
+		return r, fmt.Errorf("a floor line has %d fields, want 4", len(f))
 	}
+	k := &r.key
 	k.scope, k.name = string(f[0]), string(f[1])
 	if scopeUID(k.scope) == 0 || userScopeOf(scopeUID(k.scope)) != k.scope {
-		return k, 0, errors.New("a floor line's scope is not a user scope")
+		return floorRec{}, errors.New("a floor line's scope is not a user scope")
 	}
 	if k.name != deliveriesFloorName && checkName(k.name) != nil {
-		return k, 0, errors.New("a floor line's name is not an entry name")
+		return floorRec{}, errors.New("a floor line's name is not an entry name")
 	}
 	g := f[2]
 	if len(g) != 2*generationSize {
-		return k, 0, errors.New("a floor line's generation is not 32 hex digits")
+		return floorRec{}, errors.New("a floor line's generation is not 32 hex digits")
 	}
 	for i := range generationSize {
 		hi, lo := unhex(g[2*i]), unhex(g[2*i+1])
 		if hi < 0 || lo < 0 {
-			return k, 0, errors.New("a floor line's generation is not lowercase hex")
+			return floorRec{}, errors.New("a floor line's generation is not lowercase hex")
 		}
 		k.gen[i] = byte(hi<<4 | lo)
 	}
+	if string(f[3]) == floorTombstone {
+		if k.name == deliveriesFloorName {
+			return floorRec{}, errors.New("a floor tombstone names the delivery record, which is never deleted")
+		}
+		r.tomb = true
+		return r, nil
+	}
 	seq, err := strconv.ParseUint(string(f[3]), 10, 64)
 	if err != nil || strconv.FormatUint(seq, 10) != string(f[3]) {
-		return k, 0, errors.New("a floor line's sequence is not a canonical decimal number")
+		return floorRec{}, errors.New("a floor line's sequence is neither a canonical decimal number nor the tombstone marker")
 	}
-	return k, seq, nil
+	r.seq = seq
+	return r, nil
 }
 
 // unhex is the value of one lowercase hex digit, or -1.

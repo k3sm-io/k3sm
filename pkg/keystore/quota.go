@@ -163,7 +163,7 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 	}
 	defer done()
 	defer func() { // before done: the line is appended under the lock
-		l := auditLine{op: "rm", name: name, revoke: err == nil}
+		l := auditLine{op: "rm", name: name, revoke: err == nil || errors.Is(err, errCommitted)}
 		if aerr := u.appendAudit(l, err); err == nil {
 			err = aerr
 		}
@@ -203,14 +203,26 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	if err := u.s.admit(u.uid, true); err != nil {
 		return err
 	}
+	var buryErr error
 	if fi.IsDir() {
-		// The pointer first, so a crash leaves a directory the user scope
-		// reads as damage, never an older entry; RemoveAll removes a symlink
-		// itself, never what it names.
+		// The tombstone first, under the lock and before any removal, so an
+		// rm that fails part way, and a copy of the tree put back after it,
+		// are refused as deleted (docs/design/keystore.md § "The user-scope
+		// floor"). A floor that cannot take the line does not stop the
+		// revocation: it is reported as after a commit. A generation that
+		// cannot be read has no tombstone; its tree is removed all the same.
 		e, err := openEntryDirRaw(entries, name)
 		if err != nil {
 			return err
 		}
+		if gen, gerr := readGeneration(e.root); gerr == nil {
+			buryErr = u.s.userFloor.bury(u.scope, name, gen)
+		} else {
+			buryErr = fmt.Errorf("read the generation to bury: %w", gerr)
+		}
+		// Then the pointer, so a crash leaves a directory the user scope
+		// reads as damage, never an older entry; RemoveAll removes a symlink
+		// itself, never what it names.
 		err = e.root.RemoveAll(currentName)
 		if err == nil {
 			err = syncDir(e.root)
@@ -226,7 +238,13 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	if err := entries.RemoveAll(name); err != nil {
 		return err
 	}
-	return syncDir(entries)
+	if err := syncDir(entries); err != nil {
+		return err
+	}
+	if buryErr != nil {
+		return fmt.Errorf("%w, and its tombstone was not written to the user-scope floor: %w", errCommitted, buryErr)
+	}
+	return nil
 }
 
 // openEntriesForRevoke opens the scope's entries/ for an rm: the scope

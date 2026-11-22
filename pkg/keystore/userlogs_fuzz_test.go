@@ -25,18 +25,23 @@ import (
 // FuzzParseFloorLine drives the user-scope floor's line parser. The floor
 // is the service user's, so any process running as it, a restore or a
 // stray copy can put any bytes there: the parser must refuse what floorLine
-// would not write, never panic, and what it accepts must encode back to the
-// same bytes. The seeds are committed under testdata/fuzz/FuzzParseFloorLine.
+// or tombLine would not write, never panic, and what it accepts must encode
+// back to the same bytes. The seeds are committed under testdata/fuzz/FuzzParseFloorLine.
 func FuzzParseFloorLine(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
-		k, seq, err := parseFloorLine(b)
+		r, err := parseFloorLine(b)
 		if err != nil {
 			return
 		}
 		if len(b)+1 > maxLogLine {
 			t.Fatalf("accepted a %d-byte line", len(b))
 		}
-		line, err := floorLine(k.scope, k.name, k.gen, seq)
+		var line []byte
+		if r.tomb {
+			line, err = tombLine(r.key.scope, r.key.name, r.key.gen)
+		} else {
+			line, err = floorLine(r.key.scope, r.key.name, r.key.gen, r.seq)
+		}
 		if err != nil {
 			t.Fatalf("accepted %q, which does not encode: %v", b, err)
 		}
