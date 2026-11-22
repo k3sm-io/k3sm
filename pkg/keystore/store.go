@@ -301,6 +301,12 @@ func (s *FileStore) createEntry(root *os.Root, name string, fl floor) (*entry, e
 	if err != nil {
 		return nil, fmt.Errorf("create the entry directory: %w", err)
 	}
+	return s.initEntry(root, name, made)
+}
+
+// initEntry opens the entry directory name, which mkdirAt just made as made,
+// checks it is that directory, and writes a fresh generation into it.
+func (s *FileStore) initEntry(root *os.Root, name string, made fs.FileInfo) (*entry, error) {
 	s.entryMade(name)
 	sub, err := root.OpenRoot(name)
 	if err != nil {

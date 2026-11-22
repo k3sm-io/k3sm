@@ -3001,6 +3001,13 @@ the uid throughout.
     goes, so a revoked credential stays delivered. `nodes` update is therefore a
     revocation-freezing permission; the user docs say to grant it to no one who should not hold
     that power, and `doctor` names the extra server.
+19. The GeneratedUID binding trusts whatever the directory service answers. On a Mac bound to
+    a network directory (LDAP, or Active Directory with mobile accounts), the GeneratedUID
+    `mbr_uid_to_uuid` returns comes from that directory, so whoever controls the directory,
+    or its answers to this Mac, can make a reused uid look like the scope's original owner,
+    or make the real owner look changed (`ErrScopeOwnerChanged`, which deletes nothing in
+    this release). The binding closes uid reuse by local accounts; it is no defence against
+    the directory itself.
 ### What the user scope does not do
 
 Phase B direct mounts; a ServiceAccount rotate transport, deferred to a new endpoint with its
@@ -4004,12 +4011,12 @@ carried by the unit rows.
 | U3 | KDF labels take the scope; `checkScope` accepts only `system` and `user/<decimal uid>`; kinds 0xFE and 0xFD are reserved | `k3sm/pkg/keystore::TestDerivedKeysDifferByScope`, `TestCheckScope`, `TestParseRecordRefusesMalformed` | checked: the core store's scope binding |
 | U4 | the first-Put mint refuses with `.user` present and the master missing | `k3sm/pkg/keystore::TestMintCountsReservedUserName` | checked: the core store's scope binding |
 | U5 | Rewrap refuses with `ErrScopeUnsupported` while `.user` exists (replaced by U12 when scope keys are re-wrapped) | `k3sm/pkg/keystore::TestRewrapRefusesWhileUserScopesExist` | checked: Rewrap |
-| U6 | `scope.key` is sealed under `W`, bound to the GeneratedUID; a mismatch is `ErrScopeOwnerChanged` | `k3sm/pkg/keystore::TestScopeKeyGeneratedUIDMismatch` | pending: the user-scope store |
-| U7 | the GeneratedUID lookup past its deadline, 250 ms everywhere, or in error fails closed; `mbr_uid_to_uuid` is in the symbol canary (seams: GeneratedUID lookup, clock) | `k3sm/pkg/keystore::TestGeneratedUIDLookupDeadlineFailsClosed`; `k3sm/internal/hostacl::TestMbrUIDToUUIDSymbolCanary` (integration) | pending: the user-scope store |
-| U8 | a scope's records open only under its `K_u`; a copied `.user/<uid>/` without the master opens nothing | `k3sm/pkg/keystore::TestScopeCopyWithoutMasterOpensNothing` | pending: the user-scope store |
-| U9 | per-scope fingerprints differ for equal values in two scopes | `k3sm/pkg/keystore::TestFingerprintsDifferAcrossScopes` | pending: the user-scope store |
-| U10 | `user/<other>/…` is `ErrNotFound`, same text as an absent entry; a short name resolves to the uid and is printed | `k3sm/pkg/keystore::TestOtherUserIsNotFound`, `TestShortNameResolvesToUID` | pending: the user-scope store |
-| U11 | the Go resolver takes the grammar from `apis/keystore/entry` and passes the shared entry-grammar vectors; `checkScope` refuses `user/0`; an all-digit second segment resolves as a uid even when an account of that name exists; `pkg/keystore` imports no Kubernetes package; Phase A's `checkName`, as a fourth consumer, gives every valid-scope vector's verdict on its name part | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestEntryGrammarVectorsCheckName`, `TestCheckScopeRefusesUserZero`, `TestAllDigitSegmentIsAlwaysUID`, `TestKeystoreIsKubernetesFree` | pending: the user-scope store |
+| U6 | `scope.key` is sealed under `W`, bound to the GeneratedUID; a mismatch is `ErrScopeOwnerChanged` | `k3sm/pkg/keystore::TestScopeKeyGeneratedUIDMismatch` | checked: the user-scope store |
+| U7 | the GeneratedUID lookup past its deadline, 250 ms everywhere, or in error fails closed; `mbr_uid_to_uuid` is in the symbol canary (seams: GeneratedUID lookup, clock) | `k3sm/pkg/keystore::TestGeneratedUIDLookupDeadlineFailsClosed`; `k3sm/internal/hostacl::TestMbrUIDToUUIDSymbolCanary` (integration) | checked: the user-scope store |
+| U8 | a scope's records open only under its `K_u`; a copied `.user/<uid>/` without the master opens nothing | `k3sm/pkg/keystore::TestScopeCopyWithoutMasterOpensNothing` | checked: the user-scope store |
+| U9 | per-scope fingerprints differ for equal values in two scopes | `k3sm/pkg/keystore::TestFingerprintsDifferAcrossScopes` | checked: the user-scope store |
+| U10 | `user/<other>/…` is `ErrNotFound`, same text as an absent entry; a short name resolves to the uid and is printed | `k3sm/pkg/keystore::TestOtherUserIsNotFound`, `TestShortNameResolvesToUID` | checked: the user-scope store |
+| U11 | the Go resolver takes the grammar from `apis/keystore/entry` and passes the shared entry-grammar vectors; `checkScope` refuses `user/0`; an all-digit second segment resolves as a uid even when an account of that name exists; `pkg/keystore` imports no Kubernetes package; Phase A's `checkName`, as a fourth consumer, gives every valid-scope vector's verdict on its name part | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestEntryGrammarVectorsCheckName`, `TestCheckScopeRefusesUserZero`, `TestAllDigitSegmentIsAlwaysUID`, `TestKeystoreIsKubernetesFree` | checked: the user-scope store |
 | U12 | master Rewrap re-wraps every `scope.key` and leaves user records byte-identical; resumable at every step | `k3sm/pkg/keystore::TestRewrapRewrapsScopeKeysResumable` (fault injection, as G12) | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; the 65th live delivery answers `ErrQuota` to `deliver`; `rm` and `withdraw` still work | `k3sm/pkg/keystore::TestUserScopeQuota`, `TestDeliveryRecordQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
 | U14 | the delivery record stores UID, the full target tuple (`entry`, `namespace`, `secretName`, `items`, `requestedBy`) under its seal, and the target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label; the digest covers `entry`, `namespace`, `secretName` and the key-sorted `items`, and a reorder of `items` leaves it unchanged | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel`, `TestDeliveryDigestCoversTargetAndItems` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
