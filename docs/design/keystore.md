@@ -471,11 +471,13 @@ buried set, oldest first:
   that deleted entry put back under its name is accepted, unless the name's live entry of
   another generation refuses it. The oldest burials are the longest-revoked keys, and any
   root-run churn, bulk puts included, can evict them, so every drop is visible: each prune,
-  the per-name cap's included, logs at Warn through `log/slog` with the count and the names,
-  and a Delete whose own new burial the same write prunes, or that prunes the burial of a
-  generation the Delete names, logs that too and fails with `ErrTombstoneEvicted`: the entry is
-  deleted, its tree removed as usual, but its tombstone was evicted, so a copy of it put back is
-  accepted again, and the floor is at its tombstone budget. 1 MiB holds about 3,500 burials of the
+  the per-name cap's included, logs at Warn through `log/slog` with the count and the names.
+  A Delete whose floor writes drop any burial, its own new one, another name's, or the name's
+  oldest at the per-name cap, fails with `ErrTombstoneEvicted`, naming the count (the floor
+  lock collects every burial its writes' prunes drop): the entry is deleted, its burial and its
+  tree removal complete as usual, and the error is reported as committed, so `keys rm` prints
+  the deletion and exits 4. A Delete whose own new burial the same write prunes also logs
+  that. `keys floor merge` exits 4 too when its report names a dropped burial. 1 MiB holds about 3,500 burials of the
   longest names and about 16,000 of short ones.
 - *Deletion without the master.* Delete still works without the master. Burying the floor's
   live record needs only that record and the floor lock, never a key. Over a full floor Delete
@@ -932,7 +934,10 @@ undeliver system/<name> --namespace NS [--secret NAME]
 
 Exit codes: 0 success, 1 refused (the sentinel's message), 2 bad usage, the three-value shape
 `secrets-encrypt` uses, plus 3 for `rewrap` alone: it completed an earlier interrupted rewrap
-with a key other than the one supplied (`ErrRewrapResumed`), so it must run again. Every verb
+with a key other than the one supplied (`ErrRewrapResumed`), so it must run again. 4 is `rm` or `floor merge`
+done, but its floor write dropped a recorded deletion to stay within the floor's limits
+(`ErrTombstoneEvicted`, or a merge that reports a drop), so a copy of that deleted entry put
+back is accepted. Every verb
 in this list requires root (the non-root path is under "User scope"). The human output is not
 stable; `list -o json` and the exit codes are the stable surface. Value input is `--in FILE` or
 stdin only, never an argument: argv is visible to every local user via `ps` and lands in shell
@@ -1198,7 +1203,7 @@ included, and each burial dropped is logged at Warn and reported. The verb print
 system/<name>: ...` for each name whose live generation it buried (and whose directory `rm`
 removes), `kept system/<name>: ...` for each name kept and `dropped system/<name>: ...` for each
 burial dropped, and exits 0 once the merge is
-written. The saved floor must come from a
+written, or 4 when it dropped a burial. The saved floor must come from a
 root-owned, root-only location: the floor decides what is live, and a planted floor marks
 revoked entries live. Removing the floor, the older-keystore procedure above, discards every
 burial.
@@ -4480,7 +4485,7 @@ carried by the unit rows.
 | U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
-| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 64 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry; `keys floor merge` carries every burial of the moved-aside floor into a restored one, burying a generation it holds live unless --keep names the entry, pruned and reported | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `TestDeleteIgnoresPlantedGeneration`, `TestPerNameCapIsBackstop`, `TestDeleteWithoutMasterWarnsUnrecorded`, `TestDeleteReportsEvictedTombstone`, `TestDeleteWarnsUnrecordedWithMaster`, `TestFloorMergeSemantics`, `TestFloorMergeCapsAndPrune`, `TestFloorMergeRefusesUntrusted`, `TestFloorMergeBuriesRevokedLive`, `TestMergeFloorKeep`, `FuzzParseFloor` | checked: the floor's tombstone |
+| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 64 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no `tombstones` field parses, and a burial is parsed as strictly as an entry; `keys floor merge` carries every burial of the moved-aside floor into a restored one, burying a generation it holds live unless --keep names the entry, pruned and reported | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `TestDeleteIgnoresPlantedGeneration`, `TestPerNameCapIsBackstop`, `TestDeleteWithoutMasterWarnsUnrecorded`, `TestDeleteReportsEvictedTombstone`, `TestDeleteWarnsUnrecordedWithMaster`, `TestFloorMergeSemantics`, `TestFloorMergeCapsAndPrune`, `TestFloorMergeRefusesUntrusted`, `TestFloorMergeBuriesRevokedLive`, `TestMergeFloorKeep`, `TestDeleteReportsAnyEvictedTombstone`, `FuzzParseFloor`, `k3sm/cmd/k3sm::TestKeysEvictionExitsCommitted` | checked: the floor's tombstone |
 
 ### Rig legs
 

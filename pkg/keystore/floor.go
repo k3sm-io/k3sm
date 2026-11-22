@@ -817,6 +817,9 @@ type floorLock struct {
 	lock   *os.File
 	locked fs.FileInfo
 	root   *os.Root
+	// dropped is every burial a prune dropped in a write made under this
+	// lock, so a verb checks them all, not only its own (evicted).
+	dropped []pruned
 }
 
 // openDataRoot opens the data root without following a symlink and judges
@@ -1056,6 +1059,7 @@ func (l *floorLock) updatePruned(op func(floor) bool) (floor, []pruned, error) {
 		return nil, nil, err
 	}
 	logPruned(dropped)
+	l.dropped = append(l.dropped, dropped...)
 	return fl, dropped, nil
 }
 

@@ -2207,3 +2207,86 @@ func TestRewrapWarnsWhenUserScopesExist(t *testing.T) {
 		}
 	})
 }
+
+// plantBurials sets name's tombstones in the floor file at p to n
+// generations numbered from start, at delete sequences numbered from start,
+// keeping the file's mode.
+func plantBurials(t *testing.T, p, name string, start, n int) {
+	t.Helper()
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The floor's own encoding, field for field, which parses only in the
+	// form a keys verb writes.
+	type burial struct {
+		Generation string `json:"generation"`
+		Deleted    int    `json:"deleted"`
+	}
+	var f struct {
+		Version    int                        `json:"version"`
+		Scope      string                     `json:"scope"`
+		Entries    map[string]json.RawMessage `json:"entries"`
+		Tombstones map[string][]burial        `json:"tombstones,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.Tombstones == nil {
+		f.Tombstones = map[string][]burial{}
+	}
+	var bs []burial
+	for i := range n {
+		bs = append(bs, burial{fmt.Sprintf("%032x", start+i), start + i})
+	}
+	f.Tombstones[name] = bs
+	out, err := json.Marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// keysPerNameCap is the floor's cap of buried generations a name
+// (pkg/keystore's maxBuriedPerName).
+const keysPerNameCap = 64
+
+// TestKeysEvictionExitsCommitted: rm whose floor write evicts a tombstone,
+// here at the per-name cap, deletes the entry and exits 4, the change made;
+// floor merge whose write drops a burial prints its report and exits 4 too.
+func TestKeysEvictionExitsCommitted(t *testing.T) {
+	t.Run("rm", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		plantBurials(t, recipeFloor(h), "k", 1000, keysPerNameCap)
+		if code := h.run("rm", "system/k", "--yes"); code != keysCommitted {
+			t.Fatalf("rm at the per-name cap: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		}
+		if !strings.Contains(h.stdout.String(), "deleted system/k") || !strings.Contains(h.stderr.String(), "1 tombstone(s) evicted") {
+			t.Fatalf("rm at the per-name cap printed %q, %q; want deleted and the eviction named", h.stdout.String(), h.stderr.String())
+		}
+		h.mustRun(1, "show", "system/k")
+	})
+	t.Run("floor merge", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		h.mustRun(0, "rm", "system/k", "--yes")
+		aside := recipeFloor(h) + ".pre-restore"
+		raw, err := os.ReadFile(recipeFloor(h))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(aside, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		plantBurials(t, aside, "k", 1000, keysPerNameCap)
+		if code := h.run("floor", "merge", aside); code != keysCommitted {
+			t.Fatalf("floor merge that drops a burial: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		}
+		if got := h.stdout.String(); !strings.Contains(got, "dropped 1\n") || !strings.Contains(got, "dropped system/k:") {
+			t.Fatalf("floor merge printed %q, want the drop reported", got)
+		}
+	})
+}

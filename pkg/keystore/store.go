@@ -30,7 +30,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -576,8 +575,9 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // live one, only when the master is loaded and the directory's pointer
 // authenticates under it. A Delete that buries nothing (no live record, and
 // no master or no pointer that authenticates) logs that (warnUnrecorded).
-// A Delete whose floor write prunes a burial it recorded or names fails
-// with ErrTombstoneEvicted, though the entry is deleted.
+// A Delete whose floor writes drop any burial, its own or another name's,
+// to the tombstone budget or the per-name cap, fails with
+// ErrTombstoneEvicted, though the entry is deleted.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -608,7 +608,9 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		return err
 	}
 	var gs []string
-	var dropped []pruned
+	// capDropped is every burial a bury in this Delete dropped at the
+	// per-name cap; fdir.dropped holds what the writes' prunes dropped.
+	var dropped, capDropped []pruned
 	after, err := fdir.update(func(fl floor) bool {
 		gs, dropped = fl.bury(name, nil)
 		return len(gs) > 0
@@ -616,6 +618,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	capDropped = append(capDropped, dropped...)
 	logBuried(name, gs, dropped, after)
 	root, done, err := s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -624,10 +627,10 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 			return ErrNotFound
 		}
 		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
-		return evicted(name, gs, nil, after, nil)
+		return evicted(fdir, capDropped, nil)
 	}
 	if err != nil {
-		return evicted(name, gs, nil, after, treeNotRemoved(name, gs, err))
+		return evicted(fdir, capDropped, treeNotRemoved(name, gs, err))
 	}
 	defer done()
 	// Delete must work without the master, so the other entries' floors are
@@ -643,7 +646,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		case err == nil:
 			after = synced
 		case ctx.Err() != nil:
-			return evicted(name, gs, nil, after, treeNotRemoved(name, gs, err))
+			return evicted(fdir, capDropped, treeNotRemoved(name, gs, err))
 		default:
 			slog.Warn("keystore: could not raise the other entries' floors before the delete; the deletion is recorded from the floor alone", "name", name, "err", err)
 		}
@@ -655,7 +658,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// crashed after its pointer, before its floor write).
 	fi, lerr := root.Lstat(name)
 	if lerr != nil && !errors.Is(lerr, fs.ErrNotExist) {
-		return evicted(name, gs, nil, after, treeNotRemoved(name, gs, lerr))
+		return evicted(fdir, capDropped, treeNotRemoved(name, gs, lerr))
 	}
 	present := lerr == nil
 	var authentic *[generationSize]byte
@@ -677,8 +680,9 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 			return len(more) > 0
 		})
 		if err != nil {
-			return evicted(name, gs, nil, after, treeNotRemoved(name, gs, err))
+			return evicted(fdir, capDropped, treeNotRemoved(name, gs, err))
 		}
+		capDropped = append(capDropped, dropped...)
 		logBuried(name, more, dropped, after)
 		gs = append(gs, more...)
 	}
@@ -691,14 +695,14 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 			return ErrNotFound
 		}
 		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
-		return evicted(name, gs, authentic, after, nil)
+		return evicted(fdir, capDropped, nil)
 	}
 	if err := s.step("remove " + name); err != nil {
-		return evicted(name, gs, authentic, after, leftBehind(name, after, err))
+		return evicted(fdir, capDropped, leftBehind(name, after, err))
 	}
 	interrupted, err := s.removeEntry(root, name, fi, after)
 	if err != nil {
-		return evicted(name, gs, authentic, after, leftBehind(name, after, err))
+		return evicted(fdir, capDropped, leftBehind(name, after, err))
 	}
 	if interrupted && !buried {
 		// Not an entry, and nothing recorded for it: the answer is
@@ -708,7 +712,7 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if buried && interrupted {
 		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
 	}
-	return evicted(name, gs, authentic, after, nil)
+	return evicted(fdir, capDropped, nil)
 }
 
 // treeNotRemoved is the error of a Delete whose burial landed and whose
@@ -724,27 +728,22 @@ func treeNotRemoved(name string, buried []string, err error) error {
 }
 
 // evicted is the error of a Delete that would otherwise return err (nil
-// for success), given the generations it buried, the directory's
-// authenticated generation (nil for none) and the floor as written. When
-// the floor no longer buries one of them, the write pruned it: the entry is
-// deleted, but a copy of it put back is accepted again, so the Delete fails
-// with ErrTombstoneEvicted (joined with err, if any) rather than only
-// logging it.
-func evicted(name string, buried []string, authentic *[generationSize]byte, after floor, err error) error {
-	named := buried
-	if authentic != nil {
-		named = append(slices.Clone(buried), hex.EncodeToString(authentic[:]))
+// for success), given the burials its buries dropped at the per-name cap and
+// the floor lock it wrote under, which holds every burial its writes' prunes
+// dropped, its own or any other name's. Each dropped burial loses its
+// refusal: a copy of that deleted entry put back is accepted again. So when
+// any was dropped the Delete fails with ErrTombstoneEvicted, naming the
+// count, though the entry is deleted: alone, it is reported as committed
+// (errCommitted); with err, it is joined to it.
+func evicted(l *floorLock, capDropped []pruned, err error) error {
+	n := len(capDropped) + len(l.dropped)
+	if n == 0 {
+		return err
 	}
-	f := after[name]
-	for _, g := range named {
-		if !f.buries(g) && f.Generation != g {
-			if err == nil {
-				return ErrTombstoneEvicted
-			}
-			return fmt.Errorf("%w; and: %w", ErrTombstoneEvicted, err)
-		}
+	if err == nil {
+		return fmt.Errorf("%w: %w: %d tombstone(s) evicted", errCommitted, ErrTombstoneEvicted, n)
 	}
-	return err
+	return fmt.Errorf("%w: %d tombstone(s) evicted; and: %w", ErrTombstoneEvicted, n, err)
 }
 
 // warnUnrecorded logs, at Warn, a Delete that buries nothing of a directory

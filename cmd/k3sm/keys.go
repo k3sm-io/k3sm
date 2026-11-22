@@ -108,7 +108,9 @@ Flags:
                     data root is its parent
 
 Exit codes: 0 done; 1 refused or failed; 2 usage; 3 rewrap completed an
-earlier interrupted rewrap instead (run it again with a new key).
+earlier interrupted rewrap instead (run it again with a new key); 4 rm or
+floor merge is done, but the floor dropped a recorded deletion to stay within
+its limits, so a copy of that deleted entry put back is accepted.
 `
 
 // Exit codes of `k3sm keys`.
@@ -119,6 +121,10 @@ const (
 	// keysResumed is rewrap's ErrRewrapResumed: it finished an earlier
 	// rewrap under a key the operator did not supply, so it must run again.
 	keysResumed = 3
+	// keysCommitted is a change that was made, but whose floor write
+	// dropped a recorded deletion to stay within the floor's limits: rm's
+	// keystore.ErrTombstoneEvicted, or a floor merge that reports a drop.
+	keysCommitted = 4
 )
 
 // The keystore's two directories in the server work dir. pkg/keystore's
@@ -877,12 +883,18 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
+	code = keysOK
 	if err := s.Delete(ctx, name); err != nil {
-		return v.failf(keysRefused, "%v", err)
+		// A Delete whose floor write evicted tombstones deleted the entry:
+		// it is reported as done, and exits keysCommitted.
+		if !keystore.Committed(err) || !errors.Is(err, keystore.ErrTombstoneEvicted) {
+			return v.failf(keysRefused, "%v", err)
+		}
+		code = v.failf(keysCommitted, "%v", err)
 	}
 	fmt.Fprintf(env.stdout, "deleted %s\n", qualify(name))
 	v.warnDeclared(name)
-	return keysOK
+	return code
 }
 
 // keepFlag is floor merge's repeatable --keep system/<name>: the names whose
@@ -915,7 +927,8 @@ func (k *keepFlag) Set(q string) error {
 //
 // then one line per entry buried live ("buried live system/<name>: ..."),
 // kept ("kept system/<name>: ...") and per burial dropped ("dropped
-// system/<name>: ..."). It exits 0 when the merge is written.
+// system/<name>: ..."). It exits 0 when the merge is written, and
+// keysCommitted when it is written but dropped a burial.
 func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if len(args) == 0 || args[0] != "merge" {
 		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge FLOOR [--keep system/<name>]...")
@@ -956,6 +969,9 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	}
 	for _, name := range r.Dropped {
 		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
+	}
+	if len(r.Dropped) > 0 {
+		return v.failf(keysCommitted, "the merge is written, but it dropped %d deleted generation(s) to keep the floor within its caps", len(r.Dropped))
 	}
 	return keysOK
 }

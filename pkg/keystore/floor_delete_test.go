@@ -250,3 +250,45 @@ func TestDeleteWarnsUnrecordedWithMaster(t *testing.T) {
 		t.Fatalf("log of a Delete that buried nothing with the master = %q, want a Warn naming k and that its pointer does not authenticate", got)
 	}
 }
+
+// TestDeleteReportsAnyEvictedTombstone (U192): a Delete whose floor writes
+// drop any burial, another name's to the tombstone budget or the name's own
+// oldest to the per-name cap, completes its burial and removal and fails
+// with ErrTombstoneEvicted, naming the count and reported as committed.
+func TestDeleteReportsAnyEvictedTombstone(t *testing.T) {
+	ctx := context.Background()
+	t.Run("another name's burial pruned", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		fl := floorOf(t, server)
+		ob := []burial{{Generation: mgen(7), Deleted: 1}}
+		fl["other"] = floorEntry{Buried: ob}
+		putFloorFile(t, server, fl)
+		// Room for other's burial alone, or k's, never both.
+		setFloorLimits(t, smallFloorSize, tombstonesSize(1, buriedSize("other", ob)))
+		err := s.Delete(ctx, "k")
+		if !errors.Is(err, ErrTombstoneEvicted) || !errors.Is(err, errCommitted) || !strings.Contains(err.Error(), "1 tombstone") {
+			t.Fatalf("Delete whose write pruned another name's burial: %v, want ErrTombstoneEvicted, committed, naming 1", err)
+		}
+		if _, err := os.Lstat(filepath.Join(server, "keystore", "k")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("entry after the evicting Delete: %v, want it removed", err)
+		}
+		if after := floorOf(t, server); !after["k"].buries(fl["k"].Generation) || len(after["other"].burials()) != 0 {
+			t.Fatalf("floor after the Delete = %+v, want k buried and other's burial pruned", after)
+		}
+	})
+	t.Run("the per-name cap", func(t *testing.T) {
+		setSeam(t, &buriedPerNameLimit, smallBuriedPerName)
+		s, _ := newTestStore(t)
+		for range buriedPerNameLimit {
+			mustPut(t, s, "k", KindOpaque, []byte("v"))
+			if err := s.Delete(ctx, "k"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		mustPut(t, s, "k", KindOpaque, []byte("v"))
+		if err := s.Delete(ctx, "k"); !errors.Is(err, ErrTombstoneEvicted) || !errors.Is(err, errCommitted) {
+			t.Fatalf("Delete at the per-name cap: %v, want ErrTombstoneEvicted, committed", err)
+		}
+	})
+}

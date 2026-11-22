@@ -286,8 +286,9 @@ func pruneLogsAtWarn(t *testing.T) {
 			t.Fatalf("logged before the cap: %s", buf)
 		}
 		mustPut(t, s, "k", KindOpaque, []byte("v"))
-		if err := s.Delete(ctx, "k"); err != nil {
-			t.Fatal(err)
+		// The cap's drop is an eviction: the Delete completes and says so.
+		if err := s.Delete(ctx, "k"); !errors.Is(err, ErrTombstoneEvicted) {
+			t.Fatalf("Delete at the per-name cap: %v, want ErrTombstoneEvicted", err)
 		}
 		if got := buf.String(); !strings.Contains(got, "level=WARN") || !strings.Contains(got, "count=1") || !strings.Contains(got, "names=[k]") {
 			t.Fatalf("log at the per-name cap = %q, want a Warn with count=1 and names=[k]", got)
