@@ -793,11 +793,15 @@ func floorGeneration(name, gen string) bool {
 // info, judged on its own descriptor; and root the os.Root the floor is read
 // and written through, checked to be the same directory.
 //
-// Lock order: a verb takes the store's .lock (openLocked) first and
-// keystore-lock second, each with the bounded wait lockWait, and releases
-// them in reverse; readers take only .lock. keystore-lock defends the floor
-// against a writer under a swapped .lock, which .lock does not serialize
-// with.
+// Lock order: a verb that writes the floor (Put, Rotate, Delete, RaiseFloor,
+// Rewrap) takes keystore-lock first and the store's .lock (openLocked)
+// second, each with the bounded wait lockWait, and releases them in reverse;
+// readers take only .lock, and no verb takes .lock before keystore-lock, so
+// two verbs never wait on each other's lock. keystore-lock comes first
+// because only root can hold it: Delete buries under it before it touches
+// .lock, which the service user owns and can hold or replace. keystore-lock
+// also defends the floor against a writer under a swapped .lock, which .lock
+// does not serialize with.
 //
 // keystore-lock is root:wheel 0600 and refused unless it is a regular file
 // owned by root (floorUID) that grants no group or other access, so only
@@ -873,8 +877,8 @@ func (s *FileStore) checkFloorWritable() error {
 // lockFloor takes the floor lock, keystore-lock, waiting at most lockWait
 // or until ctx is done, and reads the floor under it. The data root is
 // opened and judged by openDataRoot, and the lock file by openFloorLock
-// through that same directory. The caller holds .lock, and releases the
-// returned lock with unlock.
+// through that same directory. The caller takes .lock after it, never
+// before (the lock order above), and releases the returned lock with unlock.
 func (s *FileStore) lockFloor(ctx context.Context) (*floorLock, floor, error) {
 	f, fi, lockRoot, err := s.openFloorLock()
 	if err != nil {

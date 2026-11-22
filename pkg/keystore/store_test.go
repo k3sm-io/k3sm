@@ -1708,7 +1708,7 @@ func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 					swapped = true
 				}
 				var chowned []string
-				s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }
+				s.chown = chownedExceptFloorLock(&chowned)
 
 				if _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); !errors.Is(err, ErrCorrupt) {
 					t.Fatalf("Put over a directory swapped in after its mkdir: %v, want ErrCorrupt", err)
@@ -1729,7 +1729,7 @@ func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 		s, server := newTestStore(t)
 		s.euid = func() int { return os.Geteuid() + 1 }
 		var chowned []string
-		s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }
+		s.chown = chownedExceptFloorLock(&chowned)
 		if _, err := s.Put(ctx, "a", KindOpaque, []byte("a")); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("Put: %v, want ErrCorrupt", err)
 		}
@@ -1740,6 +1740,19 @@ func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 			t.Fatalf("the refused Put went on to create cred/: %v", err)
 		}
 	})
+}
+
+// chownedExceptFloorLock is a chown seam that records each file it is asked
+// to chown in *chowned, except keystore-lock: root's own lock file, which a
+// write verb creates under the data root before it touches keystore/ (the
+// lock order), and which is never in a tree the service user controls.
+func chownedExceptFloorLock(chowned *[]string) func(f *os.File, uid, gid int) error {
+	return func(f *os.File, uid, gid int) error {
+		if filepath.Base(f.Name()) != floorLockName {
+			*chowned = append(*chowned, f.Name())
+		}
+		return nil
+	}
 }
 
 // dirContents maps each name in dir to its content.

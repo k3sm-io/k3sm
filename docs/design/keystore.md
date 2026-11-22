@@ -356,10 +356,15 @@ first Put mints no master.
 - **Put:** write `generation`, `v1`, `current` (sequence 1), then set the floor entry.
 - **Rotate:** write the new version file, flip `current` (sequence + 1), then raise the
   floor to that sequence.
-- **Delete:** bury, then remove `current`, then the entry directory. The burial comes
-  first, under the keystore lock and the floor lock, because the service user owns the
-  entry's files and can make their removal fail (a `uchg` flag makes unlink fail even for
-  root). Before removing, Delete clears the BSD user flags (`UF_*` only, through the opened
+- **Delete:** bury, then take `keystore/.lock` and judge `keystore/`, then remove
+  `current`, then the entry directory. The burial of the floor's live record comes first,
+  under `keystore-lock` alone, because the service user controls everything after it: it
+  owns `keystore/.lock` and can hold or replace it, it owns `keystore/` and can give it a
+  refused mode, and it owns the entry's files and can make their removal fail (a `uchg`
+  flag makes unlink fail even for root). If the `.lock` or `keystore/` step fails after the
+  burial, Delete returns an error saying the entry is already deleted and refused, its tree
+  was not removed, and `rm` should be rerun once the lock is free. Once `.lock` is held,
+  Delete buries the directory's authenticated generation, when there is one (below). Before removing, Delete clears the BSD user flags (`UF_*` only, through the opened
   descriptor, never following a symlink) on the entry's files; root may clear those. A
   removal that still fails, or a crash during it, leaves the entry already deleted and
   refused: Delete returns an error saying so and that the directory is left behind, and
@@ -664,8 +669,16 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   and must still be the held file. Its link count is not judged: macOS lets any local user
   hard-link a file it cannot read, so refusing a second link would let anyone block every
   floor verb, and a link elsewhere is the same file, so it changes nothing about the lock.
-  The order is `keystore/.lock` first, then `keystore-lock`, each with the same bounded
-  wait. Under it each verb re-reads
+  The order is `keystore-lock` first, then `keystore/.lock`, each with the same bounded
+  wait, for every verb that takes both (Put, Rotate, Delete, RaiseFloor, Rewrap); readers
+  take only `.lock`, and no verb takes `.lock` before `keystore-lock`, so no two verbs wait
+  on each other's lock. `keystore-lock` comes first because only root can hold it: Delete
+  buries the floor's live record for the name under it before it takes `.lock` or judges
+  `keystore/`, both of which the service user controls. If that later step fails (the lock
+  wait times out, `.lock` is not a regular file, `keystore/` is refused), Delete returns an
+  error saying the entry is already deleted and refused, its tree was not removed, and `rm`
+  should be rerun once the lock is free; it then buries the directory's authenticated
+  generation and removes the tree as usual. Under the lock each verb re-reads
   `keystore-floor.json` and applies only its own change to what it read (Rotate and the
   start of a verb raise a sequence of the same generation, Put sets sequence 1 for a new
   generation and keeps the name's burials, Delete buries the floor's live generation and prunes burials to fit), holding
@@ -676,9 +689,11 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   but no verb takes that lock, so holding it blocks nothing (U119). This closes the denial
   of service for every local process except the service user, and every native Pod runs as
   the service user ("Threat model"). It owns `keystore/.lock`, which every root write verb
-  takes first, so any native Pod can hold that lock and keep revocation and rotation
-  failing: each Delete and Rotate fails with the lock timeout after the bounded wait, again
-  and again, and the failure does not clear until the holder lets go or exits. That residual
+  takes after `keystore-lock`, so any native Pod can hold that lock and keep rotation failing,
+  and keep revocation from removing the entry's tree: each Rotate fails with the lock timeout
+  after the bounded wait, again and again, and the failure does not clear until the holder
+  lets go or exits. A Delete under a held `.lock` still records the deletion first, so the
+  revoked entry is refused while its tree waits for the rerun. That residual
   is accepted, since every native Pod is the service user, one trust domain with the master.
   Holding the lock costs no integrity, because holding a lock writes nothing; that covers a
   held `.lock`, not a replaced one, whose limits are the swapped-`.lock` caveat above (the
@@ -4209,7 +4224,7 @@ last pull request lands and no row is pending.
 | G20 | The reconciler only Gets, creates and updates its labelled `Opaque` Secrets, and leaves an unlabelled or foreign Secret alone | unit over a fake client that records every call |
 | G21 | The rollback recipe in this document runs as written and is a byte-exact round trip | a script test that pipes `show --reveal` into `rotate --in -`, then compares the new current version's value byte for byte (`cmp`) with version N's, for an opaque entry and an Ed25519 entry |
 | G22 | `hack/ci.sh` passes | the gate runs it |
-| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current`; a directory planted with a changed generation file and removed by `rm`, a delete, re-create, delete cycle, a decoy swapped in before `rm`, the entry's directory or `keystore/` hidden during `rm` and moved back, a symlink or an incomplete Put in its place, a Delete crashed before its floor write and run again, a crashed Delete followed by a Put and a Delete, a Delete faulted after its burial and before its removal (an error naming the directory left behind; a retried `rm` removes it with no floor change), a `uchg` flag on an entry file or the entry directory, and more planted names under `keystore/` than a read takes, each leaving the original copy refused |
+| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current`; a directory planted with a changed generation file and removed by `rm`, a delete, re-create, delete cycle, a decoy swapped in before `rm`, the entry's directory or `keystore/` hidden during `rm` and moved back, a symlink or an incomplete Put in its place, a Delete crashed before its floor write and run again, a crashed Delete followed by a Put and a Delete, a Delete faulted after its burial and before its removal (an error naming the directory left behind; a retried `rm` removes it with no floor change), a `uchg` flag on an entry file or the entry directory, `keystore/.lock` held past the bounded wait or replaced by a directory (the burial lands first; a retry once the lock is free removes the tree), and more planted names under `keystore/` than a read takes, each leaving the original copy refused |
 
 Phase A is complete when the gate passes with no row pending. A row can be reworded or dropped only by a change
 to this document, reviewed like any other.
