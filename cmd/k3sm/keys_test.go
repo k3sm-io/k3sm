@@ -2571,3 +2571,34 @@ func TestKeysFloorMergeCommittedRerun(t *testing.T) {
 	}
 	h.put("system/n", []byte("n"))
 }
+
+// keysEvictingRaiseStore's RaiseFloor reports a floor raise whose write
+// evicted a tombstone, as the store does after making it.
+type keysEvictingRaiseStore struct{ keysStore }
+
+func (s keysEvictingRaiseStore) RaiseFloor(ctx context.Context) error {
+	if err := s.keysStore.RaiseFloor(ctx); err != nil {
+		return err
+	}
+	return fmt.Errorf("raise the floor: %w: 1 tombstone(s) evicted", keystore.ErrTombstoneEvicted)
+}
+
+// TestKeysReadVerbsWarnEviction: list and show change nothing the operator
+// asked for, so a floor raise before them whose write evicted a tombstone
+// is a warning on stderr, and they exit 0.
+func TestKeysReadVerbsWarnEviction(t *testing.T) {
+	for _, verb := range [][]string{{"list"}, {"show", "system/k"}} {
+		t.Run(verb[0], func(t *testing.T) {
+			h := newKeysHarness(t)
+			h.put("system/k", []byte("v"))
+			h.wrap = func(s keysStore) keysStore { return keysEvictingRaiseStore{s} }
+			h.mustRun(0, verb...)
+			if got := h.stderr.String(); !strings.Contains(got, "warning") || !strings.Contains(got, "tombstone(s) evicted") {
+				t.Fatalf("%s after an evicting raise: stderr %q, want the eviction as a warning", verb[0], got)
+			}
+			if !strings.Contains(h.stdout.String(), "system/k") && verb[0] == "list" {
+				t.Fatalf("list printed %q, want the entry", h.stdout.String())
+			}
+		})
+	}
+}

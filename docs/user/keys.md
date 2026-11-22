@@ -65,11 +65,12 @@ name.
 `/var/lib/k3sm/server`. The data root is its parent.
 
 Exit codes: 0 done, 1 refused or failed, 2 usage error, 3 `rewrap` finished an earlier
-interrupted rewrap instead of yours (run it again with a new key), 4 `put`, `rotate`, `rm`,
-`list`, `show` or `floor merge` is done, but the floor dropped a recorded deletion to stay
-within its limits, so a copy of that deleted entry put back is accepted. An `rm` that exits 4
-deleted the entry even when it says its files were left behind. Delete entries you no longer
-use to make room.
+interrupted rewrap instead of yours (run it again with a new key), 4 `put`, `rotate`, `rm` or
+`floor merge` wrote the floor, but the floor dropped a recorded deletion to stay within its
+limits, so a copy of that deleted entry put back is accepted. An `rm` that exits 4 and prints
+`deleted` deleted the entry, even when it says its files were left behind; one that prints no
+`deleted` found nothing to delete. `list` and `show` print such a drop as a warning and exit 0.
+Delete entries you no longer use to make room.
 
 ## Giving a Value
 

@@ -126,9 +126,10 @@ const (
 	keysResumed = 3
 	// keysCommitted is a change that was made, but whose floor write
 	// dropped a recorded deletion to stay within the floor's limits: a
-	// committed keystore.ErrTombstoneEvicted from put, rotate, rm (its tree
-	// left behind included) or the floor raise list and show make, or a
-	// floor merge that reports a drop.
+	// committed keystore.ErrTombstoneEvicted from put, rotate or rm (its
+	// tree left behind, or nothing found after a raise that pruned,
+	// included), or a floor merge that reports a drop. list and show warn
+	// of their floor raise's eviction on stderr and exit 0.
 	keysCommitted = 4
 )
 
@@ -333,6 +334,22 @@ func (v *keysVerb) failf(code int, format string, a ...any) int {
 func (v *keysVerb) evictedCode(err error) int {
 	if keystore.Committed(err) && errors.Is(err, keystore.ErrTombstoneEvicted) {
 		return v.failf(keysCommitted, "%v", err)
+	}
+	return v.failf(keysRefused, "%v", err)
+}
+
+// raiseForRead runs the floor raise list and show make first. Its write is
+// not the change the operator asked for, so an eviction it made
+// (keystore.ErrTombstoneEvicted) is a warning on stderr and keysOK; any
+// other failure refuses the verb.
+func (v *keysVerb) raiseForRead(ctx context.Context, s keysStore) int {
+	err := s.RaiseFloor(ctx)
+	switch {
+	case err == nil:
+		return keysOK
+	case errors.Is(err, keystore.ErrTombstoneEvicted):
+		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: %s\n", v.name, scrubPaths(err, v.roots...))
+		return keysOK
 	}
 	return v.failf(keysRefused, "%v", err)
 }
@@ -771,11 +788,9 @@ func keysList(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	v.warnMergePending(s)
-	raised := keysOK
-	if err := s.RaiseFloor(ctx); err != nil {
-		if raised = v.evictedCode(err); raised == keysRefused {
-			return raised
-		}
+	raised := v.raiseForRead(ctx, s)
+	if raised != keysOK {
+		return raised
 	}
 	entries, err := s.List(ctx)
 	if err != nil {
@@ -839,11 +854,9 @@ func keysShow(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	v.warnMergePending(s)
-	raised := keysOK
-	if err := s.RaiseFloor(ctx); err != nil {
-		if raised = v.evictedCode(err); raised == keysRefused {
-			return raised
-		}
+	raised := v.raiseForRead(ctx, s)
+	if raised != keysOK {
+		return raised
 	}
 	if !*reveal {
 		ver, err := showMetadata(ctx, s, name, *version)

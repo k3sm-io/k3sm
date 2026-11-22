@@ -483,7 +483,13 @@ buried set, oldest first:
   oldest at the per-name cap, fails with `ErrTombstoneEvicted`, naming the count (the floor
   lock collects every burial its writes' prunes drop): the entry is deleted, its burial and its
   tree removal complete as usual, and the error is reported as committed, so `keys rm` prints
-  the deletion and exits 4. A Delete whose own new burial the same write prunes also logs
+  the deletion and exits 4. Every return of Delete reports a pruning write it made, so a
+  Delete that finds nothing to delete after a floor raise that pruned is a committed
+  `ErrTombstoneEvicted` joined to `ErrNotFound`: `keys rm` exits 4 without printing a
+  deletion (`DeleteDone`, `TestDeleteNotFoundReportsEviction`). `keys list` and `keys show`
+  print the eviction of the floor raise they make first as a warning on stderr and exit 0,
+  since that write is not the change the operator asked for (`TestKeysReadVerbsWarnEviction`).
+  A Delete whose own new burial the same write prunes also logs
   that. `keys floor merge` exits 4 too when its report names a dropped burial. A `--keep` name
   the merge keeps nothing for refuses it, with nothing written, and each kept name is warned
   about on stderr as well as listed. 1 MiB holds about 3,500 burials of the
