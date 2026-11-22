@@ -1581,7 +1581,7 @@ service user can only add to.
   parse, and resets every uid's share ("Rebuild carries the old floor forward"); its cost is
   the user-scope downtime of the run and the lines it drops because they do not parse (the
   torn tail among them), which it counts and names, never a tombstone or a sequence that
-  parses, so a crash followed by a rebuild brings back no deleted entry (U192).
+  parses, so a crash followed by a rebuild brings back no deleted entry (U193).
 - **Write order.** Phase A's: the record, the pointer, then the floor line. A crash between
   the last two leaves the floor one behind, which the rule accepts, and the next user-scope
   write to that entry appends the line. A `put` refuses, before its first write, a floor
@@ -1680,7 +1680,7 @@ That wait is the store `.lock`
   damage done to the file while its flag was clear, which the count names. A deliberate
   restore that lowers is the matched-set restore ("Backup and snapshots"): the restored floor
   log is the old floor rebuild carries forward, so the floor lowers to the backup's. A floor
-  that cannot be opened or read at all refuses the rebuild, which changes nothing (U192).
+  that cannot be opened or read at all refuses the rebuild, which changes nothing (U193).
 - **Rebuild never lowers.** Rebuild opens every scope under `.user/` before it writes the new
   file's first line, and a line it cannot write is a floor it would lower:
   - *Rebuild skips the owner check.* Rebuild reads every scope whose `scope.key` opens under
@@ -4565,7 +4565,7 @@ carried by the unit rows.
 | U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
-| U192 | `floor --rebuild` carries the old floor forward: over an old floor holding tombstones, sequence lines and a torn last line, it keeps every tombstone and every key's highest sequence that parses, writes the higher of that and the sequence on disk, drops only the lines that do not parse and names their count; a tree copied back after an `rm`, a crash and a rebuild is refused as deleted, and a copied-back older record is refused; a floor that cannot be read refuses the rebuild, changing nothing | `k3sm/cmd/k3sm::TestRebuildCarriesTombstonesForward` | pending: the append-only files (the rebuild verb) |
+| U193 | `floor --rebuild` carries the old floor forward: over an old floor holding tombstones, sequence lines and a torn last line, it keeps every tombstone and every key's highest sequence that parses, writes the higher of that and the sequence on disk, drops only the lines that do not parse and names their count; a tree copied back after an `rm`, a crash and a rebuild is refused as deleted, and a copied-back older record is refused; a floor that cannot be read refuses the rebuild, changing nothing | `k3sm/cmd/k3sm::TestRebuildCarriesTombstonesForward` | pending: the append-only files (the rebuild verb) |
 
 ### Rig legs
 

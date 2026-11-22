@@ -4,7 +4,7 @@
 #
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
 # rows G1 to G22, the user-scope rows U1 to U137 (U15, U39 and U117 are unused),
-# the typed-credential rows U138 to U191, the user-scope row U192, and the rig legs E1 to E36. Every row
+# the typed-credential rows U138 to U191, the rebuild row U193, and the rig legs E1 to E36. Every row
 # is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -41,7 +41,7 @@
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66, U108, U127, U129, U132.
 #   --scope-store   the user-scope store: U12 to U14, U63, U97, U101, U128.
 #   --files         the append-only files: U20, U21, U23 to U25, U50, U52, U60, U61,
-#                   U68, U80, U88, U90, U91, U105, U118, U119, U192, and in the helper variant
+#                   U68, U80, U88, U90, U91, U105, U118, U119, U193, and in the helper variant
 #                   only U70, U71.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54, U82, U99, U104, U113,
 #                   U120, U121, U122, U131, U137.
@@ -159,8 +159,8 @@ EXPECTED_ROWS="$EXPECTED_ROWS U150 U151 U152 U153 U154 U155 U156 U157 U158 U159 
 EXPECTED_ROWS="$EXPECTED_ROWS U162 U163 U164 U165 U166 U167 U168 U169 U170 U171 U172 U173"
 EXPECTED_ROWS="$EXPECTED_ROWS U174 U175 U176 U177 U178 U179 U180 U181 U182 U183 U184 U185"
 EXPECTED_ROWS="$EXPECTED_ROWS U186 U187 U188 U189 U190 U191"
-EXPECTED_ROWS="$EXPECTED_ROWS U192"
-# >>> ADD NEW U ROWS (U193 upward) HERE <<<
+EXPECTED_ROWS="$EXPECTED_ROWS U193"
+# >>> ADD NEW U ROWS (U194 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25 E26 E27"
 EXPECTED_ROWS="$EXPECTED_ROWS E28 E29 E30 E31 E32 E33 E34 E35 E36"
@@ -192,7 +192,7 @@ mode_rows() {
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66 U108 U127 U129 U132" ;;
 	scope-store) echo "U12 U13 U14 U63 U97 U101 U128" ;;
-	files) echo "U20 U21 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U105 U118 U119 U192" ;;
+	files) echo "U20 U21 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U105 U118 U119 U193" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82 U99 U104 U113 U120 U121 U122 U131 U137" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84 U112 U136" ;;
 	exec) echo "U36 U37 U38 U69 U92" ;;
@@ -891,9 +891,9 @@ pend U190 "the refresher doctor rows; every state change logs at Warn or Error u
 	k3sm/cmd/k3sm::TestDoctorRefresherRows k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn
 pend U191 "examples/keydelivery-github.yaml validates against the apis CRD schema; limitations.md lists the typed-credential residuals (the typed-credential docs)" \
 	k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD TestLimitationsListTypedResiduals
-pend U192 "floor --rebuild carries the old floor forward: over an old floor holding tombstones, sequence lines and a torn last line, it keeps every tombstone and every key's highest sequence that parses, writes the higher of that and the sequence on disk, drops only the lines that do not parse and names their count; a tree copied back after an rm, a crash and a rebuild is refused as deleted, and a copied-back older record is refused; a floor that cannot be read refuses the rebuild, changing nothing (append-only files: the rebuild verb)" \
+pend U193 "floor --rebuild carries the old floor forward: over an old floor holding tombstones, sequence lines and a torn last line, it keeps every tombstone and every key's highest sequence that parses, writes the higher of that and the sequence on disk, drops only the lines that do not parse and names their count; a tree copied back after an rm, a crash and a rebuild is refused as deleted, and a copied-back older record is refused; a floor that cannot be read refuses the rebuild, changing nothing (append-only files: the rebuild verb)" \
 	k3sm/cmd/k3sm::TestRebuildCarriesTombstonesForward
-# >>> ADD NEW U ROWS (U193 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
+# >>> ADD NEW U ROWS (U194 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
 leg E2 "socket-ops" "the user, no sudo, puts user/<me>/e2e-token (short-name form): exit 0; the CLI prints the resolved user/<uid>; k3sm keys list shows it; the audit log has a put line with no value" "the socket operations"
@@ -1028,7 +1028,7 @@ U84|overshoot
 U67|one uid's revocations are never refused because of another uid
 U73|an indeterminate sweep keeps the claim
 U25|a damaged entry stays ErrCorrupt
-U192|it keeps every tombstone and every key's highest sequence that parses
+U193|it keeps every tombstone and every key's highest sequence that parses
 U81|keydelivery
 U81|k3sm.io/keystore-entry
 U77|only then removes the scope
