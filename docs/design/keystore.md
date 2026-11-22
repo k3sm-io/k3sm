@@ -839,11 +839,15 @@ root server). It is read on the opened descriptor, O_NOFOLLOW: the file must be 
 the server's euid and not group- or other-writable, and the directory owned by that euid, by
 root or, for a root server, by the service user, and not group- or other-writable. That owner
 adds no trust: a process running as the server's uid already holds the admin kubeconfig and
-can write any Secret without forging the file, and pods running as that uid are kept off it by
-Seatbelt (the `keystore-` prefix puts it under the runtime's pod deny for `keystore-*` names in
-the work dir). A service-user-owned parent can only rename or delete the file, which is
-denial, never forgery: the reconciler then cannot prove it created the Secret and skips it,
-failing closed. Ownership is checked by reading the existing Secret first: present and
+can write any Secret without forging the file. Pods are kept off it by the runtime's
+whole-tree pod deny on the server work dir (`runtimed/pkg/sandbox::TestStateDirDeniedUnderACustomLeaf`,
+`TestStateDirEnforcedAcrossCaseAndNormalization`); the `keystore-` prefix, which the runtime's
+`keystore-*` deny also covers, is defence in depth only. A service-user-owned parent can rename
+or delete the file: a missing record makes the reconciler skip a Secret it cannot prove it
+created, failing closed, and a file the service user wrote is refused because it is not root's.
+The residual is replay: on a root server the service user can put back an older state file
+root wrote, which restores records only for Secrets this server created, in targets root
+declared. Ownership is checked by reading the existing Secret first: present and
 carrying the recorded UID → update, relabelling it if its label is missing or names another
 entry (a tenant's edit, or root re-pointing the Secret at another entry with `deliver`), since
 the UID alone decides; anything else (no recorded UID, or a different UID because the Secret

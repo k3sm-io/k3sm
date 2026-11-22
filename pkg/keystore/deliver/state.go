@@ -33,14 +33,15 @@ import (
 
 // StateFileName is the reconciler's record of the Secrets it created, in the
 // server's work dir (/var/lib/k3sm/server/keystore-delivery-state.json on an
-// install). The keystore- prefix puts it under the runtime's pod deny for
-// keystore-* names in the work dir.
+// install). Pods are kept off it by the runtime's whole-tree pod deny on the
+// server work dir (runtimed/pkg/sandbox TestStateDirDeniedUnderACustomLeaf,
+// TestStateDirEnforcedAcrossCaseAndNormalization); the keystore- prefix,
+// which the runtime's keystore-* deny also covers, is defence in depth only.
 //
 // The server writes it, so it is owned by the server's euid (_k3sm on an
 // install, root on a root server), not by root. That adds no trust: a
 // process running as the server's uid already holds the admin kubeconfig,
-// and so can write any Secret without forging this file; pods running as
-// that uid are kept off the file by the Seatbelt profile.
+// and so can write any Secret without forging this file.
 const StateFileName = "keystore-delivery-state.json"
 
 // StateFileMode is the state file's mode, 0600: it names no value, but it is
@@ -67,11 +68,12 @@ func StateFileCheck(uid uint32) FileCheck {
 // other-writable.
 //
 // A root server names the service user in also, since its work dir is the
-// service user's. That owner can rename or delete the file in it, which is
-// denial, never forgery: the file itself must still be owned by root (the
-// euid, StateFileCheck), so a replacement is refused, and a missing record
-// only makes the reconciler skip a Secret it cannot prove it created, failing
-// closed.
+// service user's. That owner can rename or delete the file in it. A missing
+// record only makes the reconciler skip a Secret it cannot prove it created,
+// failing closed. A file it wrote itself is refused, since the file must be
+// owned by root (the euid, StateFileCheck). The residual is replay: it can
+// put back an older state file root wrote, which restores records only for
+// Secrets this server created, in targets root declared.
 func StateDirCheck(uid uint32, also ...uint32) FileCheck {
 	return func(fi fs.FileInfo) error {
 		st, ok := fi.Sys().(*syscall.Stat_t)

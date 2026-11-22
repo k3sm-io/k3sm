@@ -199,6 +199,8 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
   again, is "not created by this server". The server leaves it alone and logs why: delete it, or
   pick another `--secret`. The server never lists Secrets, and deletes one only to re-create an
   immutable Secret it created.
+- **A namespace that does not exist yet.** Delivering into it goes to whoever later creates that
+  namespace.
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
   declaration (with `--secret S`, only the one into Secret `S`), and prints: the Secret stays; delete it with kubectl, and rotate the entry to
   revoke. A Pod that read the value still has it, which is why revoking it means rotating.
