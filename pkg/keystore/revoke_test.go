@@ -22,6 +22,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -166,4 +167,90 @@ func TestWithdrawFloorFaults(t *testing.T) {
 			t.Fatalf("the repeat re-sealed the record (sequence %d, was %d)", again, seq)
 		}
 	})
+}
+
+// putBackDeliveries writes b, an earlier copy of uid 1001's deliveries
+// file, back over the live one, as a restore or a copy would.
+func putBackDeliveries(t *testing.T, server string, b []byte) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(scopeDir(server, "1001"), deliveriesName), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// readDeliveriesBytes returns uid 1001's deliveries file as it is on disk.
+func readDeliveriesBytes(t *testing.T, server string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(scopeDir(server, "1001"), deliveriesName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// A withdraw with the floor unreadable still refuses a record older than
+// one this store has read or written: the tombstone at sequence N, then
+// the copy at N-1 put back, then a withdraw of another UID must not
+// re-seal the copy at N and so lose the tombstone.
+func TestWithdrawRefusesRollbackBelowSeen(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := newDeliveryScope(t)
+	for _, n := range []int{1, 2} {
+		if err := u.addDelivery(ctx, testDelivery(n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	older := readDeliveriesBytes(t, server)
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil {
+		t.Fatal(err)
+	}
+	_, tomb := recordedDelivery(t, s, server, 1)
+	putBackDeliveries(t, server, older)
+	fl, _ := userLogs(s)
+	fl.failRead = true
+	err := u.withdrawDelivery(ctx, testDelivery(2).uid)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("withdraw over a put-back copy with the floor unreadable: %v, want ErrCorrupt", err)
+	}
+	if !strings.Contains(err.Error(), "older than one this store has already read or written") {
+		t.Fatalf("refusal %q does not name the rollback", err)
+	}
+	fl.failRead = false
+	if d, seq := recordedDelivery(t, s, server, 1); seq != tomb-1 || d.withdrawn {
+		t.Fatalf("the put-back copy was re-sealed: sequence %d (tombstone at %d), withdrawn %v", seq, tomb, d.withdrawn)
+	}
+	if got, _ := fl.floor("user/1001", deliveriesFloorName, guid(0xA1)); got != tomb {
+		t.Fatalf("floor %d, want the tombstone's %d", got, tomb)
+	}
+	// With the floor readable again, the copy is refused as below it.
+	if _, err := u.lookupDelivery(ctx, testDelivery(1).uid); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("read of the put-back copy: %v, want ErrCorrupt", err)
+	}
+}
+
+// A withdraw of a record below a floor that can be read stays refused,
+// naming floor --rebuild for a deliberate restore: the second residual of
+// "Revocation always succeeds".
+func TestWithdrawBelowReadableFloorRefused(t *testing.T) {
+	ctx := context.Background()
+	_, server, u := newDeliveryScope(t)
+	for _, n := range []int{1, 2} {
+		if err := u.addDelivery(ctx, testDelivery(n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	older := readDeliveriesBytes(t, server)
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil {
+		t.Fatal(err)
+	}
+	putBackDeliveries(t, server, older)
+	err := u.withdrawDelivery(ctx, testDelivery(2).uid)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("withdraw below a readable floor: %v, want ErrCorrupt", err)
+	}
+	for _, want := range []string{"is older than the user-scope floor", "sudo k3sm keys floor --rebuild"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal %q does not say %q", err, want)
+		}
+	}
 }

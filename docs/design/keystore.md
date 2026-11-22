@@ -1358,24 +1358,35 @@ store refuses to read or write a sealed record over 1,056 KiB.
 
 - *`deliver` is refused at the bound.* It adds an entry, and answers `quota` when the record
   has 64 live entries or 320 in all.
-- *Revocation always succeeds.* A withdrawal turns a live entry into a tombstone in place, so
-  it never adds an entry, never grows the record and is never refused for the bound. It is
+- *Revocation always succeeds,* with the two residuals below. A withdrawal turns a live entry
+  into a tombstone in place, so it never adds an entry, never grows the record and is never
+  refused for the bound. It is
   monotone, so it needs nothing a grant needs: it opens `scope.key` with the generation the
   record authenticates under `W`, never the live GeneratedUID lookup (a lookup that times out,
   fails or answers for a new owner of the uid does not stop it), it opens `scope.key` under the
   live `W` or `master.next`'s, so it runs at every step of a Rewrap, and a floor it cannot read
   does not stop it: it writes the tombstone at the record's sequence plus 1 and appends the
-  floor line it can. A withdrawal of a UID already withdrawn appends the record's floor line
+  floor line it can. In place of the floor it checks the record against the highest sequence
+  the store process has read or written for that scope and generation, an in-memory mark
+  raised on every successful read and write, and refuses (`ErrCorrupt`) to re-seal a record
+  below it, so a copied-back older record does not come back at a later sequence with a later
+  tombstone lost. A withdrawal of a UID already withdrawn appends the record's floor line
   again, so a floor line an earlier withdrawal could not append is written by the next one; the
   floor keeps the highest sequence, so the repeat is idempotent. `rm` is a revocation too: it
   only removes files, so it needs neither `W` nor `K_u`, and is never refused for the lookup
   or for `ErrRewrapInProgress`.
   *Residual (floor unreadable at a withdrawal).* With the floor unreadable, the withdrawal
-  cannot check the record against it, so a copied-back older record is re-sealed with the
+  cannot check the record against it, only against the process's in-memory mark. A copy put
+  back below a sequence this process has not seen (after a restart, say) is re-sealed with the
   tombstone at its own sequence plus 1. That record is at or below the floor, so the next read
   with a readable floor refuses it, except when it was exactly one behind, where the re-sealed
   copy is accepted and a later tombstone or a grant the copy predates is lost; the reconciler's
   target-matching delete and `doctor`'s floor check are what notice it.
+  *Residual (record below a readable floor).* A withdrawal whose record is below a floor it
+  can read is refused (`ErrCorrupt`, the user-scope floor message): re-sealing it would bring
+  back a list the floor already says was replaced. The withdrawal waits on the root remedy:
+  restore the current record, or, for a deliberate restore, `sudo k3sm keys floor --rebuild`,
+  then withdraw again.
 - *A tombstone is pruned once its target is no longer its Secret.* The reconciler removes a
   withdrawn entry when its recorded target is not this UID's owned Secret, gone or held by a
   Secret that fails the ownership test for this UID, on two observations at least 60 s apart

@@ -140,6 +140,9 @@ type FileStore struct {
 	// (userlogs.go). New installs ones that refuse every call.
 	userFloor userFloorLog
 	auditSink auditSink
+	// deliveriesSeen is the highest delivery-record sequence this store has
+	// read or written, per scope and generation (deliveries.go).
+	deliveriesSeen *deliverySeqs
 }
 
 var _ Store = (*FileStore)(nil)
@@ -167,6 +170,7 @@ func New(cfg Config) *FileStore {
 		euid:           os.Geteuid,
 		userFloor:      unbuiltUserFloor{},
 		auditSink:      unbuiltAudit{},
+		deliveriesSeen: &deliverySeqs{},
 	}
 }
 

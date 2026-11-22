@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"k3sm.io/apis/keystore/credential"
 	keyentry "k3sm.io/apis/keystore/entry"
@@ -460,9 +461,11 @@ func (u *UserScope) readDeliveries(o *openedScope) ([]delivery, uint64, error) {
 
 // readDeliveriesFloor is readDeliveries. With revoke set, a floor that
 // cannot be read skips the floor check rather than refuse: a withdraw only
-// adds a tombstone, so it goes ahead without the floor (the residual is
-// named in docs/design/keystore.md § "Quotas", "Revocation always
-// succeeds").
+// adds a tombstone, so it goes ahead without the floor, checking the record
+// against the highest sequence this store has read or written instead (the
+// residuals are named in docs/design/keystore.md § "Quotas", "Revocation
+// always succeeds"). A record below a floor that can be read is refused,
+// revoke or not.
 func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) ([]delivery, uint64, error) {
 	b, fi, err := readFile(o.dir, deliveriesName, maxDeliveriesRecordSize)
 	switch {
@@ -487,6 +490,14 @@ func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) ([]delivery
 	if err != nil && !revoke {
 		return nil, 0, err
 	}
+	if err != nil {
+		// No floor to check against: the sequence this store last read or
+		// wrote stands in for it, so a copy put back below it is not
+		// re-sealed at a later sequence with a tombstone lost.
+		if seen := u.s.deliveriesSeen.high(u.scope, o.gen); r.version < seen {
+			return nil, 0, fmt.Errorf("%w: the %s record (sequence %d) is older than one this store has already read or written (sequence %d), and the user-scope floor cannot be read (%v); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, seen, err)
+		}
+	}
 	if err == nil && r.version < fl {
 		return nil, 0, fmt.Errorf("%w: the %s record (sequence %d) is older than the user-scope floor (sequence %d); an older copy was put back. For a deliberate restore, run sudo k3sm keys floor --rebuild", ErrCorrupt, deliveriesName, r.version, fl)
 	}
@@ -503,7 +514,40 @@ func (u *UserScope) readDeliveriesFloor(o *openedScope, revoke bool) ([]delivery
 			return nil, 0, fmt.Errorf("%w: %s names another scope's entry", ErrCorrupt, deliveriesName)
 		}
 	}
+	u.s.deliveriesSeen.note(u.scope, o.gen, r.version)
 	return ds, r.version, nil
+}
+
+// deliverySeqs is the highest delivery-record sequence a store has read or
+// written, per scope and generation, in memory. A withdraw that cannot read
+// the floor refuses a record below it: the process's own high-water mark is
+// the floor it can still trust.
+type deliverySeqs struct {
+	mu sync.Mutex
+	m  map[string]uint64
+}
+
+func deliverySeqKey(scope string, gen [generationSize]byte) string {
+	return scope + "\x00" + string(gen[:])
+}
+
+// note raises the mark for scope and gen to seq.
+func (d *deliverySeqs) note(scope string, gen [generationSize]byte, seq uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.m == nil {
+		d.m = map[string]uint64{}
+	}
+	if k := deliverySeqKey(scope, gen); seq > d.m[k] {
+		d.m[k] = seq
+	}
+}
+
+// high returns the mark for scope and gen, 0 when none.
+func (d *deliverySeqs) high(scope string, gen [generationSize]byte) uint64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.m[deliverySeqKey(scope, gen)]
 }
 
 // writeDeliveries seals ds at seq and writes the record, then its floor
@@ -525,6 +569,7 @@ func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSiz
 	if err := u.s.writeFile(dir, deliveriesName, b); err != nil {
 		return err
 	}
+	u.s.deliveriesSeen.note(u.scope, gen, seq)
 	if err := u.s.userFloor.append(u.scope, deliveriesFloorName, gen, seq); err != nil {
 		return fmt.Errorf("%w, and its floor line was not written: %w", errCommitted, err)
 	}
@@ -620,8 +665,10 @@ func (u *UserScope) lookupDelivery(ctx context.Context, uid string) (delivery, e
 
 // withdrawDelivery turns the live delivery uid into a tombstone in place. It
 // never adds an entry, so it is never refused for a quota, and it runs while
-// a Rewrap is half done: revocation always succeeds. An already withdrawn
-// UID is no change; an absent one is ErrNotFound. As a revocation it
+// a Rewrap is half done. It is refused only for a record put back below the
+// floor, or, with the floor unreadable, below the highest sequence this store
+// has read or written (docs/design/keystore.md § "Quotas", the residuals of
+// "Revocation always succeeds"). An already withdrawn UID is no change; an absent one is ErrNotFound. As a revocation it
 // commits first and audits after: a failed append is reported (errCommitted)
 // and the tombstone stands.
 func (u *UserScope) withdrawDelivery(ctx context.Context, uid string) error {
