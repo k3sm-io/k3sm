@@ -968,7 +968,8 @@ func (k *keepFlag) Set(q string) error {
 //	fenced N
 //
 // then one line per entry buried live ("buried live system/<name>: ..."),
-// kept ("kept system/<name>: ...") and per burial dropped ("dropped
+// kept ("kept system/<name>: ..."), retired ("retired system/<name>: ...")
+// and per burial dropped ("dropped
 // system/<name>: ..."), preceded by "already merged" when the live floor
 // already held everything the input records (a rerun: nothing is written,
 // the input is only renamed). It exits 0 when the merge is written, and
@@ -1008,7 +1009,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if r.AlreadyMerged {
 		fmt.Fprintln(env.stdout, "already merged")
 	}
-	fmt.Fprintf(env.stdout, "merged %d\nalready present %d\nburied live %d\nkept %d\nretired %d\ndropped %d\nfenced %d\n", r.Merged, r.AlreadyPresent, len(r.BuriedLive), len(r.Kept), r.Retired, len(r.Dropped), len(r.Fenced))
+	fmt.Fprintf(env.stdout, "merged %d\nalready present %d\nburied live %d\nkept %d\nretired %d\ndropped %d\nfenced %d\n", r.Merged, r.AlreadyPresent, len(r.BuriedLive), len(r.Kept), len(r.Retired), len(r.Dropped), len(r.Fenced))
 	for _, name := range r.BuriedLive {
 		fmt.Fprintf(env.stdout, "buried live %s: deleted since the backup, so the restored entry is deleted again and refused; run sudo k3sm keys rm %s --yes to remove it\n", qualify(name), qualify(name))
 	}
@@ -1016,6 +1017,9 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		fmt.Fprintf(env.stdout, "kept %s: deleted since the backup, and kept live as --keep asked\n", qualify(name))
 		// A downgrade of what the floor refuses, so on stderr too.
 		fmt.Fprintf(env.stderr, "k3sm keys floor merge: warning: %s is kept live as --keep asked, though the floor moved aside records it as deleted since the backup; if that deletion revoked the key, the revoked key is live again\n", qualify(name))
+	}
+	for _, name := range r.Retired {
+		fmt.Fprintf(env.stdout, "retired %s: its version current before the restore is not the restored one, so a copy of it put back is refused\n", qualify(name))
 	}
 	for _, name := range r.Unverified {
 		fmt.Fprintf(env.stdout, "unverified %s: the restored pointer did not authenticate under the master, so its recorded sequence is left as the restored floor holds it\n", qualify(name))

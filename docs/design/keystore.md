@@ -1292,7 +1292,8 @@ leaving its input in place, so the guard stays (`TestMergeFloorRefusesDroppingIt
 fence is a mark on a live record, which no prune removes. The verb prints `merged N`,
 `already present N`, `buried live N`, `kept N`, `retired N`, `dropped N` and `fenced N`, one per line, then `buried live
 system/<name>: ...` for each name whose live generation it buried (and whose directory `rm`
-removes), `kept system/<name>: ...` for each name kept and `dropped system/<name>: ...` for each
+removes), `kept system/<name>: ...` for each name kept, `retired system/<name>: ...` for each
+name whose moved-aside live generation it retired and `dropped system/<name>: ...` for each
 burial dropped, and exits 0 once the merge is
 written, or 4 when it dropped a burial. The saved floor must come from a
 root-owned, root-only location: the floor decides what is live, and a planted floor marks

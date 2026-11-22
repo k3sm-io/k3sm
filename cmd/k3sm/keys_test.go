@@ -971,8 +971,8 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		h.mustRun(0, "rm", "system/n", "--yes")
 		copyTree(t, g2, filepath.Join(h.keystoreDir(), "n"))
 		refusedDeleted(t, h, "system/n")
-		if !strings.Contains(merged, "retired 1\n") {
-			t.Fatalf("floor merge printed %q, want G2 retired", merged)
+		if !strings.Contains(merged, "retired 1\n") || !strings.Contains(merged, "\nretired system/n:") {
+			t.Fatalf("floor merge printed %q, want G2 retired and named", merged)
 		}
 	})
 	// --keep keeps only the restored generation: with N live as G1 at the
@@ -990,7 +990,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			t.Fatalf("restore: %v", err)
 		}
 		h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "system/n")
-		if got := h.stdout.String(); !strings.Contains(got, "kept 1\nretired 1\n") {
+		if got := h.stdout.String(); !strings.Contains(got, "kept 1\nretired 1\n") || !strings.Contains(got, "\nretired system/n:") {
 			t.Fatalf("floor merge --keep printed %q, want n kept and G2 retired", got)
 		}
 		h.mustRun(0, "show", "system/n", "--reveal")

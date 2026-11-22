@@ -70,8 +70,8 @@ func TestFloorMergeSemantics(t *testing.T) {
 	if e := kept["live"]; e.Generation != mgen(1) || e.Seq != 3 || len(e.burials()) != 0 {
 		t.Errorf("live after the merge keeping it = %+v, want its live record kept and nothing buried", e)
 	}
-	if e := restored["other"]; e.Generation != mgen(2) || !e.buries(mgen(4)) || !e.buries(mgen(9)) || r.Retired != 1 {
-		t.Errorf("other after the merge = %+v (retired %d), want its live record kept, the burial merged and the aside's live generation retired", e, r.Retired)
+	if e := restored["other"]; e.Generation != mgen(2) || !e.buries(mgen(4)) || !e.buries(mgen(9)) || !slices.Equal(r.Retired, []string{"other"}) {
+		t.Errorf("other after the merge = %+v (retired %v), want its live record kept, the burial merged and the aside's live generation retired", e, r.Retired)
 	}
 	bs := restored["revoked"].burials()
 	if len(bs) != 2 || bs[0].Generation != mgen(5) || bs[1].Generation != mgen(6) || bs[0].Deleted <= 1 || bs[1].Deleted <= bs[0].Deleted {
@@ -268,8 +268,8 @@ func TestFloorMergeRetiresAsideLive(t *testing.T) {
 		"spare": {Generation: mgen(8), Seq: 1},
 	}
 	r, _ := restored.merge(aside, map[string]bool{"kept": true, "spare": true}, nil)
-	if r.Retired != 3 || !slices.Equal(r.Kept, []string{"spare"}) {
-		t.Fatalf("merge = %+v; want 3 retired and only spare kept", r)
+	if !slices.Equal(r.Retired, []string{"kept", "new", "other"}) || !slices.Equal(r.Kept, []string{"spare"}) {
+		t.Fatalf("merge = %+v; want kept, new and other retired and only spare kept", r)
 	}
 	if e := restored["other"]; e.Generation != mgen(1) || !e.buries(mgen(2)) {
 		t.Errorf("other after the merge = %+v, want its live record kept and the aside's buried", e)

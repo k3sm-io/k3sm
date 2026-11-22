@@ -142,8 +142,8 @@ func FuzzMergeFloor(f *testing.F) {
 				added++ // added by the merge, then dropped
 			}
 		}
-		if added != r.Merged+r.Retired {
-			t.Fatalf("merge reports %d merged and %d retired, and added %d burials", r.Merged, r.Retired, added)
+		if added != r.Merged+len(r.Retired) {
+			t.Fatalf("merge reports %d merged and %d retired, and added %d burials", r.Merged, len(r.Retired), added)
 		}
 		b, err := marshalFloor(restored)
 		if err != nil {
@@ -192,7 +192,7 @@ func FuzzMergeFloor(f *testing.F) {
 			}
 		}
 		if len(d) == 0 {
-			if r2, d2 := restored.merge(aside, keepSet, nil); r2.Merged+r2.Retired != 0 || len(r2.Fenced) != 0 || len(d2) != 0 {
+			if r2, d2 := restored.merge(aside, keepSet, nil); r2.Merged+len(r2.Retired) != 0 || len(r2.Fenced) != 0 || len(d2) != 0 {
 				t.Fatalf("a second merge of the same floors = %+v, dropped %v; want nothing added", r2, d2)
 			}
 		}

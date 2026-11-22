@@ -83,11 +83,11 @@ type MergeReport struct {
 	// the restored floor does not record gets the moved-aside live record,
 	// at its sequence, fenced one past it (fenceMark).
 	Kept []string
-	// Retired is how many live generations of the moved-aside floor the
-	// merge buried: each one the restored floor does not hold live, under
-	// another generation or not at all. Choosing the backup retired it, so
-	// its directory put back is refused.
-	Retired int
+	// Retired names, sorted, each entry whose moved-aside live generation
+	// the merge buried: each one the restored floor does not hold live,
+	// under another generation or not at all. Choosing the backup retired
+	// it, so its directory put back is refused.
+	Retired []string
 	// Fenced names, sorted, each entry whose generation the restored floor
 	// holds live at a lower sequence than the moved-aside floor did: the
 	// merge set the live record's high-water mark to the moved-aside
@@ -272,7 +272,7 @@ func mergeLoses(live, merged floor, capDropped []pruned) []string {
 
 // changes reports whether the merge r reports changed the floor.
 func (r MergeReport) changes() bool {
-	return r.Merged > 0 || r.Retired > 0 || len(r.Fenced) > 0 || r.raised > 0 || r.recorded > 0
+	return r.Merged > 0 || len(r.Retired) > 0 || len(r.Fenced) > 0 || r.raised > 0 || r.recorded > 0
 }
 
 // errMergeLiveFloor refuses a merge whose input is the data root's live
@@ -522,7 +522,7 @@ func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) 
 			continue
 		}
 		add(name, a.Generation)
-		r.Retired++
+		r.Retired = append(r.Retired, name)
 	}
 	r.BuriedLive, r.Kept, r.Fenced = sortedNames(buriedLive), sortedNames(kept), sortedNames(fenced)
 	return r, out
