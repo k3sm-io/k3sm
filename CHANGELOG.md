@@ -21,9 +21,9 @@ pin, its date, and the tarball's sha256.
   to @zxdev for the keystore design and the store it uses.
 - `sudo k3sm keys deliver system/<name> --namespace NS` delivers a keystore entry into the cluster
   as an `Opaque` Secret, and the server keeps that Secret at the entry's current version, so a
-  `rotate` reaches it within a minute. The server only creates and updates Secrets it labelled
-  for that entry: one that already exists without its label is left alone, and nothing is ever
-  listed or deleted, so `undeliver` leaves the Secret in place. While secrets encryption is off,
+  `rotate` reaches it within a minute. The server only updates a Secret it created itself,
+  recognised by the object's UID: one that already exists under that name is left alone, and
+  nothing is ever listed or deleted, so `undeliver` leaves the Secret in place. While secrets encryption is off,
   delivery is refused unless the server is started with `--allow-plaintext-secrets-delivery`. See
   [Keys](docs/user/keys.md#delivering-an-entry-as-a-secret).
 - New unpinned Pods prefer a node whose Mac is not CPU-busy. Each node reports a `HostCPUBusy`
