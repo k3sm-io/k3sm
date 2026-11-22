@@ -1673,3 +1673,63 @@ func TestReconcilerUpdateCarriesUIDAndResourceVersion(t *testing.T) {
 		t.Fatalf("update sent uid %q resourceVersion %q, want the Get's ours-1 and 42", sent.UID, sent.ResourceVersion)
 	}
 }
+
+// staleImmutableOwned is an immutable Secret the server created at version 1
+// with value "one", for a store that now holds a later version.
+func staleImmutableOwned() *corev1.Secret {
+	s := secretObj("payments", "api-token", map[string]string{LabelKey: "api-token"}, map[string][]byte{DefaultDataKey: []byte("one")})
+	s.UID = "ours-1"
+	sum := sha256.Sum256([]byte("one"))
+	s.Annotations = map[string]string{VersionAnnotation: "1", FingerprintAnnotation: hex.EncodeToString(sum[:8])}
+	yes := true
+	s.Immutable = &yes
+	return s
+}
+
+// deletes counts the recorded deletes of Secrets.
+func (h *harness) deletes() int {
+	n := 0
+	for _, v := range h.verbs() {
+		if v == "delete/secrets" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestStateWriteFailureDeletesNothing: an owned immutable Secret that needs a
+// rotation is not deleted when the state file cannot be written, since the
+// Secret created after the delete could not be recorded (G20).
+func TestStateWriteFailureDeletesNothing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only directory")
+	}
+	ours := staleImmutableOwned()
+	h := newHarness(t, true, false, ours)
+	stateDir := filepath.Join(h.dir, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h.r.statePath = filepath.Join(stateDir, StateFileName)
+	var st State
+	st.Set(ours.Namespace, ours.Name, string(ours.UID))
+	if err := WriteState(h.r.statePath, st, StateDirCheck(uint32(os.Geteuid())), chownNone); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) }) // let TempDir's cleanup remove it
+	h.store.set("api-token", 2, []byte("two"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	h.r.Sweep(context.Background())
+	if n := h.deletes(); n != 0 {
+		t.Fatalf("the immutable Secret was deleted though the state file could not be written: %v", h.verbs())
+	}
+	if got := h.secret(t, "payments", "api-token"); got.UID != "ours-1" || string(got.Data[DefaultDataKey]) != "one" {
+		t.Fatalf("the Secret changed: uid %q, data %q", got.UID, got.Data[DefaultDataKey])
+	}
+	if !strings.Contains(h.logs.String(), "cannot write the state file") {
+		t.Fatalf("the refusal is not logged\n%s", h.logs.String())
+	}
+}

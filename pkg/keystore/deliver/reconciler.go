@@ -335,7 +335,7 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 }
 
 // sweep is one Sweep's working state: the ownership record, and whether it
-// was written this sweep (so the first create proves it can be).
+// was written this sweep (so the first create or delete proves it can be).
 type sweep struct {
 	state    State
 	recorded bool
@@ -443,9 +443,14 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 // recreateImmutable re-delivers an immutable Secret this server owns, which
 // cannot be updated: it deletes it under a precondition on the recorded UID,
 // so only that object can go, then creates it again and records the new UID.
-// It is the only delete the reconciler makes. A refused delete (the
+// It is the only delete the reconciler makes. The state file is proven
+// writable first, so the Secret created after the delete can be recorded; a
+// state file that cannot be written deletes nothing. A refused delete (the
 // precondition failed, or any error) creates nothing.
 func (r *Reconciler) recreateImmutable(ctx context.Context, sw *sweep, t Target, cur *corev1.Secret, ver keystore.Version, want string, value []byte) {
+	if !r.proveState(sw, t, "cannot write the state file, so the immutable Secret is not deleted to re-deliver it; will retry") {
+		return
+	}
 	uid := cur.UID
 	err := r.client.CoreV1().Secrets(t.Namespace).Delete(ctx, t.Secret(), metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -488,12 +493,8 @@ func (r *Reconciler) notOurs(sw *sweep, t Target, cur *corev1.Secret) string {
 // before the first create of a sweep, so a Secret is never created that
 // could not then be recorded, and again after the create with the new UID.
 func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keystore.Version, want string, value []byte) bool {
-	if !sw.recorded {
-		if err := WriteState(r.statePath, sw.state, r.stateDirCheck, r.chown); err != nil {
-			r.note(t, "error:state:"+err.Error(), slog.LevelWarn, "cannot write the state file, so the Secret is not created; will retry", "file", r.statePath, "err", err)
-			return false
-		}
-		sw.recorded = true
+	if !r.proveState(sw, t, "cannot write the state file, so the Secret is not created; will retry") {
+		return false
 	}
 	secrets := r.client.CoreV1().Secrets(t.Namespace)
 	s := &corev1.Secret{
@@ -521,6 +522,21 @@ func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keysto
 		return false
 	}
 	r.note(t, "ok:"+want, slog.LevelInfo, "delivered", "version", ver.Version, "plaintext", !r.encryptionOn)
+	return true
+}
+
+// proveState writes the state file once per sweep, before the first create
+// or delete, so no Secret is created that could not then be recorded. On
+// failure it logs msg once per state for t and reports false.
+func (r *Reconciler) proveState(sw *sweep, t Target, msg string) bool {
+	if sw.recorded {
+		return true
+	}
+	if err := WriteState(r.statePath, sw.state, r.stateDirCheck, r.chown); err != nil {
+		r.note(t, "error:state:"+err.Error(), slog.LevelWarn, msg, "file", r.statePath, "err", err)
+		return false
+	}
+	sw.recorded = true
 	return true
 }
 
