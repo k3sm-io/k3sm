@@ -146,6 +146,11 @@ var (
 	errFloorTooManyKeys = errors.New("the user-scope floor holds more distinct keys than its key bound")
 	// errLogTorn is a last line with no newline: damage.
 	errLogTorn = errors.New("the last line has no newline")
+	// errLogTornTail refuses an append to the floor whose last byte is not a
+	// newline: the line would complete the torn one into a line that does
+	// not parse. Nothing was written; root must run sudo k3sm keys floor
+	// --rebuild.
+	errLogTornTail = errors.New("the keystore log's last line has no newline (a torn tail), so the line was not appended; root must run sudo k3sm keys floor --rebuild")
 	// errLogLineTooLong is a line over maxLogLine, which is never written.
 	errLogLineTooLong = fmt.Errorf("a keystore log line is at most %d bytes", maxLogLine)
 	// errFloorLogMalformed is a user-scope floor whose bytes do not parse:
@@ -616,14 +621,17 @@ func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64)
 // appendLine appends line, which ends in a newline, charged to uid. Past
 // the hard cap only a line that may draw on uid's revocation budget
 // (budget) is written, and only while the budget has room for it. It never
-// writes what the reader would refuse for its size: a line past
-// logReadBound, or a floor line that adds a key past the key bound.
+// writes what the reader would refuse: a line past logReadBound, a floor
+// line that adds a key past the key bound, or a floor line after a torn
+// tail, which it would merge with. After a torn tail in the audit log it
+// writes a newline first, so the torn bytes read as a line of their own,
+// which the tolerant audit reader drops, and line reads back whole.
 func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 	if len(line) > maxLogLine {
 		return fmt.Errorf("%w: refused a %d-byte line for %s", errLogLineTooLong, len(line), l.name)
 	}
-	// Read-write, so the floor's keys are read on the descriptor the line
-	// is appended through.
+	// Read-write, so the tail and, for the floor, the keys are read on the
+	// descriptor the line is appended through.
 	f, st, err := l.open(unix.O_RDWR | unix.O_APPEND)
 	if err != nil {
 		l.forgetUnflagged(err, false)
@@ -632,7 +640,17 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 	defer func() { _ = f.Close() }() // each append is fsynced below
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	torn, err := l.tornTail(f, st.Size)
+	if err != nil {
+		return err
+	}
 	out := line
+	if torn {
+		if l.addsKey != nil {
+			return fmt.Errorf("%w (%s, %d bytes)", errLogTornTail, l.name, st.Size)
+		}
+		out = append([]byte{'\n'}, line...)
+	}
 	if bound := l.s.logReadBound(); st.Size+int64(len(out)) > bound {
 		// Never make the damage the reader refuses.
 		return fmt.Errorf("%w (%s is %d bytes, the reader's bound %d)", ErrLogFull, l.name, st.Size, bound)
@@ -647,7 +665,8 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 		if err != nil {
 			return err
 		}
-		if state.bad != nil {
+		// The torn verdict is the tail the newline above closes.
+		if state.bad != nil && !(torn && state.tornSize == st.Size) {
 			return fmt.Errorf("%s: %w", l.name, state.bad)
 		}
 		return nil
@@ -659,7 +678,9 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 		if err := read(); err != nil {
 			return err
 		}
-		if err := l.revokeRoom(state, st.Size, uid, int64(len(line))); err != nil {
+		// The newline closing a torn tail ends the torn line, which is
+		// charged to no uid; line is uid's.
+		if err := l.revokeRoom(state, st.Size+int64(len(out)-len(line)), uid, int64(len(line))); err != nil {
 			return err
 		}
 	}
@@ -680,8 +701,9 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 	}
 	// One write(2) of the whole line. An ENOSPC or EIO between the
 	// preflight and the write, or a crash mid-write, can still leave a
-	// torn tail the flag keeps: damage, which floor --rebuild repairs
-	// (docs/design/keystore.md § "The user-scope floor").
+	// torn tail the flag keeps: damage in the floor, which floor --rebuild
+	// repairs (docs/design/keystore.md § "The user-scope floor"), and a
+	// dropped line in the audit log once the next append closes it.
 	_, err = f.Write(out)
 	if err == nil {
 		err = f.Sync()
@@ -690,6 +712,23 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 		return fmt.Errorf("append to %s: %w", l.name, err)
 	}
 	return nil
+}
+
+// tornTail reports whether f, size bytes long, is non-empty and its last
+// byte is not a newline, read by pread on f's descriptor.
+func (l *appendLog) tornTail(f *os.File, size int64) (bool, error) {
+	if size == 0 {
+		return false, nil
+	}
+	var b [1]byte
+	var src io.ReaderAt = f
+	if l.readAt != nil {
+		src = l.readAt(f)
+	}
+	if _, err := src.ReadAt(b[:], size-1); err != nil {
+		return false, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, size-1, err)
+	}
+	return b[0] != '\n', nil
 }
 
 // preflight refuses, as errLogNoSpace, an append of n bytes while the

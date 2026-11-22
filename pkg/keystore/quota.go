@@ -242,7 +242,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		return err
 	}
 	if buryErr != nil {
-		return fmt.Errorf("%w, and its tombstone was not written to the user-scope floor: %w", errCommitted, buryErr)
+		return fmt.Errorf("%w, with its tombstone unwritten: the user-scope floor did not take it: %w", errCommitted, buryErr)
 	}
 	return nil
 }

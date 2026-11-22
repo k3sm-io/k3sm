@@ -24,6 +24,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // freshFloorVerdict reads the floor from scratch, as a new process would,
@@ -211,4 +213,90 @@ func TestWithdrawUnverifiedFloorSealsNothing(t *testing.T) {
 	if d, err := u.lookupDelivery(ctx, testDelivery(1).uid); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("the delivery withdrawn after the backup reads as %+v, %v; want the restored copy refused (ErrCorrupt)", d, err)
 	}
+}
+
+// U20: an rm over a floor whose last line has no newline still removes the
+// tree, and reports the tombstone unwritten (errCommitted): the append reads
+// the tail first and refuses to merge the tombstone into the torn line. The
+// floor is unchanged, so the next read refuses it as damage, and a grant
+// over it is refused before any write.
+func TestRmOverTornFloorTailTombstoneUnwritten(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := fileLogScope(t)
+	userPut(t, u, "user/1001/keep", "kept")
+	appendLogBytes(t, s, userFloorLogName, []byte("user/1001 tok"))
+	before := readLog(t, s, userFloorLogName)
+	err := u.Delete(ctx, "user/1001/token")
+	if !errors.Is(err, errCommitted) || !errors.Is(err, errLogTornTail) || !strings.Contains(err.Error(), "tombstone unwritten") {
+		t.Fatalf("rm over a torn floor tail: %v, want errCommitted with the tombstone unwritten", err)
+	}
+	checkEntryGone(t, server, "token")
+	if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
+		t.Fatal("rm appended to a floor with a torn tail")
+	}
+	if _, _, err := u.Current(ctx, "user/1001/keep"); !errors.Is(err, errFloorLogMalformed) {
+		t.Fatalf("the next read over the torn floor: %v, want errFloorLogMalformed", err)
+	}
+	snap := treeSnapshot(t, server)
+	if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v")); !errors.Is(err, errFloorLogMalformed) {
+		t.Fatalf("a grant over the torn floor: %v, want errFloorLogMalformed", err)
+	}
+	checkTreeUnchanged(t, snap, treeSnapshot(t, server))
+	if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
+		t.Fatal("a grant appended to a floor with a torn tail")
+	}
+}
+
+// U23: a grant over an audit log whose last line has no newline records a
+// whole, parseable ok line: the append writes a newline first, so the torn
+// bytes are a line of their own, which the tolerant reader drops. Past the
+// hard cap the same holds for a revocation, and the reader charges its line
+// and reports no damage.
+func TestAuditTornTailAppendParses(t *testing.T) {
+	ctx := context.Background()
+	lastLine := func(t *testing.T, s *FileStore) auditRecord {
+		t.Helper()
+		lines := bytes.Split(bytes.TrimSuffix(readLog(t, s, auditLogName), []byte("\n")), []byte("\n"))
+		r, err := parseAuditLine(lines[len(lines)-1])
+		if err != nil {
+			t.Fatalf("the last audit line %q does not parse: %v", lines[len(lines)-1], err)
+		}
+		return r
+	}
+	t.Run("a grant", func(t *testing.T) {
+		s, _, u := fileLogScope(t)
+		appendLogBytes(t, s, auditLogName, []byte(`{"v":1,"op":"pu`))
+		if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v")); err != nil {
+			t.Fatalf("put over a torn audit tail: %v", err)
+		}
+		if r := lastLine(t, s); r.Op != "put" || r.Result != "ok" || r.Name != "other" {
+			t.Fatalf("the last audit line is %+v, want put other ok", r)
+		}
+	})
+	t.Run("a revocation past the hard cap", func(t *testing.T) {
+		s, _, u := fileLogScope(t)
+		s.logSoftCap, s.logHardCap = 1, 1
+		appendLogBytes(t, s, auditLogName, []byte(`{"v":1,"op":"rm","scope":"user/1001"`))
+		if err := u.Delete(ctx, "user/1001/token"); err != nil {
+			t.Fatalf("rm over a torn audit tail past the hard cap: %v", err)
+		}
+		if r := lastLine(t, s); r.Op != "rm" || r.Result != "ok" {
+			t.Fatalf("the last audit line is %+v, want rm ok", r)
+		}
+		l := newFileAuditLog(s).log
+		f, st, err := l.open(unix.O_RDONLY)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		state, err := l.sync(f, st)
+		if err != nil || state.bad != nil {
+			t.Fatalf("a fresh reader of the audit log: %v, %v", err, state.bad)
+		}
+		if state.pastCap[1001] == 0 {
+			t.Fatal("the rm line past the hard cap was not charged to uid 1001")
+		}
+	})
 }
