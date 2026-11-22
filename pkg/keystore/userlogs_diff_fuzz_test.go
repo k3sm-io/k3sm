@@ -1,0 +1,195 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package keystore
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"os"
+	"testing"
+
+	"golang.org/x/sys/unix"
+)
+
+// diffInput is a cursor over the fuzz input: each next is one byte, 0
+// once the input is spent.
+type diffInput struct{ b []byte }
+
+func (d *diffInput) next() int {
+	if len(d.b) == 0 {
+		return 0
+	}
+	c := d.b[0]
+	d.b = d.b[1:]
+	return int(c)
+}
+
+// diffItem is one append: the floor's and the audit log's rendering of the
+// same operation.
+type diffItem struct{ floor, audit []byte }
+
+// diffStream decodes d into batches of appends: live floor lines, rm
+// tombstones (some naming the delivery record, which a tombstone may not),
+// lines that do not parse, overlong lines, torn lines with no newline, and
+// long lines that straddle the small hard cap.
+func diffStream(d *diffInput) [][]diffItem {
+	names := []string{"k0", "k1", "k2", "k3", deliveriesFloorName}
+	var (
+		out   [][]diffItem
+		batch []diffItem
+	)
+	for len(d.b) > 0 {
+		op := d.next() % 8
+		uid := 1001 + d.next()%3
+		scope := fmt.Sprintf("user/%d", uid)
+		name := names[d.next()%len(names)]
+		gen := guid(byte(d.next() % 3))
+		live := fmt.Appendf(nil, "%s %s %x %d\n", scope, name, gen[:], d.next())
+		audit := func(op string, pad int) []byte {
+			return fmt.Appendf(nil, `{"v":1,"op":%q,"scope":%q,"name":%q,"pad":%q,"result":"ok"}`+"\n", op, scope, name, bytes.Repeat([]byte("p"), pad))
+		}
+		var it diffItem
+		switch op {
+		case 0, 1:
+			it = diffItem{live, audit("put", 0)}
+		case 2:
+			it = diffItem{fmt.Appendf(nil, "%s %s %x rm\n", scope, name, gen[:]), audit("rm", 0)}
+		case 3:
+			n := d.next() % 40
+			g := bytes.ReplaceAll(append([]byte(nil), d.b[:min(len(d.b), n)]...), []byte("\n"), []byte(" "))
+			g = append(g, '\n')
+			it = diffItem{g, g}
+		case 4:
+			long := append(bytes.Repeat([]byte("y"), maxLogLine+d.next()%64), '\n')
+			it = diffItem{long, long}
+		case 5:
+			n := d.next()
+			it = diffItem{live[:min(n, len(live)-1)], audit("put", 0)[:min(n, 60)]}
+		case 6:
+			// A long audit line, so one straddles the cap; for the floor a
+			// live line, which straddles it as often as its offset says.
+			it = diffItem{live, audit("put", 3*d.next())}
+		case 7:
+			out, batch = append(out, batch), nil
+			continue
+		}
+		batch = append(batch, it)
+	}
+	return append(out, batch)
+}
+
+// diffLog is one log read from an in-memory file through the readAt seam.
+type diffLog struct {
+	l   *appendLog
+	buf *[]byte
+}
+
+func newDiffLog(s *FileStore, floor bool, maxKeys int, buf *[]byte) diffLog {
+	var l *appendLog
+	if floor {
+		l = newFileFloorLog(s).log
+	} else {
+		l = newFileAuditLog(s).log
+	}
+	l.maxKeys = maxKeys
+	l.readAt = func(*os.File) io.ReaderAt { return bytes.NewReader(*buf) }
+	return diffLog{l, buf}
+}
+
+func (d diffLog) sync(t *testing.T) *logState {
+	t.Helper()
+	d.l.mu.Lock()
+	defer d.l.mu.Unlock()
+	state, err := d.l.sync(nil, unix.Stat_t{Dev: 1, Ino: 1, Size: int64(len(*d.buf))})
+	if err != nil {
+		t.Fatalf("sync of an in-memory log: %v", err)
+	}
+	return state
+}
+
+// diffClass names the kind of a bad verdict.
+func diffClass(err error) string {
+	for _, c := range []struct {
+		err  error
+		name string
+	}{{errLogTorn, "torn"}, {errLogLineTooLong, "long"}, {errFloorTooManyKeys, "keys"}, {errLogTooLarge, "size"}} {
+		if errors.Is(err, c.err) {
+			return c.name
+		}
+	}
+	if err != nil {
+		return "parse"
+	}
+	return ""
+}
+
+// FuzzLogSyncDifferential checks the incremental reader against a reading
+// from scratch: after every batch of appends, sync of a log read on from
+// where it stopped must agree with sync of the same bytes by a reader that
+// has read nothing, on the floor's highest seqs, tombstones, key count and
+// verdict, and on both logs' past-cap charges per uid and the revocation
+// room they leave, under small caps, budget and key bound. The seeds are
+// committed under testdata/fuzz/FuzzLogSyncDifferential.
+func FuzzLogSyncDifferential(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		d := &diffInput{data}
+		s := &FileStore{logHardCap: int64(1 + 4*d.next()), logRevokeBudget: int64(1 + 8*d.next())}
+		s.logSoftCap = s.logHardCap
+		maxKeys := 1 + d.next()%8
+		var floorBuf, auditBuf []byte
+		incFloor, incAudit := newDiffLog(s, true, maxKeys, &floorBuf), newDiffLog(s, false, maxKeys, &auditBuf)
+		for i, batch := range diffStream(d) {
+			for _, it := range batch {
+				floorBuf = append(floorBuf, it.floor...)
+				auditBuf = append(auditBuf, it.audit...)
+			}
+			for _, lg := range []struct {
+				name string
+				inc  diffLog
+			}{{"floor", incFloor}, {"audit", incAudit}} {
+				got := lg.inc.sync(t)
+				want := newDiffLog(s, lg.inc.l.whole, maxKeys, lg.inc.buf).sync(t)
+				where := fmt.Sprintf("%s after batch %d (%d bytes, hard cap %d)", lg.name, i, len(*lg.inc.buf), s.logHardCap)
+				if gc, wc := diffClass(got.bad), diffClass(want.bad); gc != wc {
+					t.Fatalf("%s: incremental verdict %q (%v), from scratch %q (%v)", where, gc, got.bad, wc, want.bad)
+				}
+				if want.bad != nil {
+					continue
+				}
+				if got.off != want.off || got.keys != want.keys {
+					t.Fatalf("%s: incremental read to %d with %d keys, from scratch to %d with %d", where, got.off, got.keys, want.off, want.keys)
+				}
+				if !maps.Equal(got.maxSeq, want.maxSeq) || !maps.Equal(got.buried, want.buried) {
+					t.Fatalf("%s: incremental seqs %v tombstones %v, from scratch %v %v", where, got.maxSeq, got.buried, want.maxSeq, want.buried)
+				}
+				if !maps.Equal(got.pastCap, want.pastCap) {
+					t.Fatalf("%s: incremental past-cap charges %v, from scratch %v", where, got.pastCap, want.pastCap)
+				}
+				size := int64(len(*lg.inc.buf))
+				for uid := uint32(1001); uid <= 1003; uid++ {
+					ge, we := lg.inc.l.revokeRoom(got, size, uid, maxLogLine), lg.inc.l.revokeRoom(want, size, uid, maxLogLine)
+					if (ge == nil) != (we == nil) {
+						t.Fatalf("%s: uid %d revocation room incremental %v, from scratch %v", where, uid, ge, we)
+					}
+				}
+			}
+		}
+	})
+}

@@ -288,6 +288,10 @@ type logState struct {
 	// bad is the error of a line that did not parse, which sticks for this
 	// file.
 	bad error
+	// tornSize, when not 0, is the size of the file whose last line had no
+	// newline: bad then holds only for that size, since an append completes
+	// the line, and reading resumes at off, the torn line's start.
+	tornSize int64
 }
 
 // floorKey is one floor line's key.
@@ -392,8 +396,9 @@ func (l *appendLog) forgetUnflagged(err error, held bool) {
 
 // sync reads f (which st describes) on from where reading stopped, under
 // l.mu, and returns the state. A line that does not parse is state.bad,
-// which sticks; a read I/O error is errLogUnreadable, returned and not
-// kept, and reading resumes past the last whole line read.
+// which sticks; a last line with no newline is state.bad only while the
+// file keeps its size; a read I/O error is errLogUnreadable, returned and
+// not kept, and reading resumes past the last whole line read.
 func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 	s := &l.state
 	bound := l.s.logReadBound()
@@ -418,6 +423,10 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		if !bytes.Equal(got[:n], s.last) {
 			fresh()
 		}
+	}
+	if s.tornSize != 0 && st.Size != s.tornSize {
+		// The torn line has been appended to: read it again.
+		s.bad, s.tornSize = nil, 0
 	}
 	if s.bad != nil || st.Size == s.off {
 		return s, nil
@@ -453,7 +462,8 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 			case errors.Is(err, bufio.ErrBufferFull):
 				continue
 			case errors.Is(err, io.EOF):
-				s.bad = fmt.Errorf("at byte %d: %w", off, errLogTorn)
+				// s.off stays before the cap, so the skip runs again.
+				s.bad, s.tornSize = fmt.Errorf("at byte %d: %w", off, errLogTorn), st.Size
 				return s, nil
 			}
 			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, err)
@@ -467,6 +477,10 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		if err != nil && !errors.Is(err, errLogLineTooLong) && !errors.Is(err, errLogTorn) {
 			s.off = off
 			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, err)
+		}
+		if errors.Is(err, errLogTorn) {
+			s.off, s.bad, s.tornSize = off, fmt.Errorf("at byte %d: %w", off, err), st.Size
+			return s, nil
 		}
 		if err != nil {
 			s.bad = fmt.Errorf("at byte %d: %w", off, err)
