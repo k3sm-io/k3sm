@@ -547,6 +547,22 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 			s.off, s.bad, s.tornSize = off, fmt.Errorf("at byte %d: %w", off, err), st.Size
 			return s, nil
 		}
+		if errors.Is(err, errLogLineTooLong) && !l.whole {
+			// The tolerant audit reader drops an over-long line, charged to
+			// no uid, as it drops any line it cannot read; only the floor
+			// is strict. It is read through to its newline.
+			n, serr := skipRestOfLine(r, line)
+			switch {
+			case errors.Is(serr, io.EOF):
+				s.off, s.bad, s.tornSize = off, fmt.Errorf("at byte %d: %w", off, errLogTorn), st.Size
+				return s, nil
+			case serr != nil:
+				s.off = off
+				return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, serr)
+			}
+			off += n
+			continue
+		}
 		if err != nil {
 			s.bad = fmt.Errorf("at byte %d: %w", off, err)
 			return s, nil
@@ -568,14 +584,14 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 
 // readLogLine reads one whole line, its newline included, of at most
 // maxLogLine bytes. A last line with no newline is an error, as is a
-// longer one.
+// longer one, for which it returns the bytes it read of it.
 func readLogLine(r *bufio.Reader) ([]byte, error) {
 	var line []byte
 	for {
 		chunk, err := r.ReadSlice('\n')
 		line = append(line, chunk...)
 		if len(line) > maxLogLine {
-			return nil, errLogLineTooLong
+			return line, errLogLineTooLong
 		}
 		switch {
 		case err == nil:
@@ -587,6 +603,27 @@ func readLogLine(r *bufio.Reader) ([]byte, error) {
 		default:
 			return line, err
 		}
+	}
+}
+
+// skipRestOfLine reads through the rest of a line of which read is the
+// start, to and including its newline, a buffer at a time, and returns the
+// whole line's length. A line with no newline before the end is io.EOF.
+func skipRestOfLine(r *bufio.Reader, read []byte) (int64, error) {
+	n := int64(len(read))
+	if len(read) > 0 && read[len(read)-1] == '\n' {
+		return n, nil
+	}
+	for {
+		chunk, err := r.ReadSlice('\n')
+		n += int64(len(chunk))
+		switch {
+		case err == nil:
+			return n, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		}
+		return n, err
 	}
 }
 
