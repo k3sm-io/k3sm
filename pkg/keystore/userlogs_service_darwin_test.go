@@ -243,7 +243,14 @@ func defeatChild(t *testing.T, p, kind string) {
 		{"link to a new name", true, func() error { return unix.Link(p, filepath.Join(dir, "linked")) }},
 		{"fclonefileat then rename over the original", true, func() error {
 			clone := "clone"
-			if err := unix.Fclonefileat(fd, unix.AT_FDCWD, filepath.Join(dir, clone), 0); err != nil {
+			// fclonefileat needs a readable source; the append descriptor
+			// is write-only.
+			src, err := unix.Open(p, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = unix.Close(src) }()
+			if err := unix.Fclonefileat(src, unix.AT_FDCWD, filepath.Join(dir, clone), 0); err != nil {
 				return err
 			}
 			defer func() { _ = unix.Unlink(filepath.Join(dir, clone)) }() // the clone is not the log
@@ -255,12 +262,17 @@ func defeatChild(t *testing.T, p, kind string) {
 		{"unlink", true, func() error { return unix.Unlink(p) }},
 	} {
 		t.Run(a.name, func(t *testing.T) {
-			wantErr := unix.EPERM
+			// In the root-owned directory a name operation is refused by
+			// the flag (EPERM, checked first by the kernel) or by the
+			// directory (EACCES); either is a refusal. In the service
+			// user's own directory only the flag can refuse it.
+			err := a.attempt()
+			ok := errors.Is(err, unix.EPERM)
 			if a.dirOp && kind == defeatDirRoot {
-				wantErr = unix.EACCES
+				ok = ok || errors.Is(err, unix.EACCES)
 			}
-			if err := a.attempt(); !errors.Is(err, wantErr) {
-				t.Errorf("%s of a flagged log as the service user in the %s directory: %v, want %v", a.name, kind, err, wantErr)
+			if !ok {
+				t.Errorf("%s of a flagged log as the service user in the %s directory: %v, want a refusal (EPERM, or EACCES from a root-owned directory)", a.name, kind, err)
 			}
 			if b, err := os.ReadFile(p); err != nil || string(b) != want {
 				t.Fatalf("after the %s attempt the log holds %q (%v), want %q", a.name, b, err, want)
