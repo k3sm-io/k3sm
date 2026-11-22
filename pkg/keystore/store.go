@@ -234,6 +234,9 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: a log cap or budget is negative", errInvalidConfig)
 	case s.logSoftCap > s.logHardCap:
 		return fmt.Errorf("%w: LogSoftCap %d is over LogHardCap %d", errInvalidConfig, s.logSoftCap, s.logHardCap)
+	case s.logHardCap > maxLogHardCap || s.logRevokeBudget > maxLogRevokeBudget:
+		// Bounded so logReadBound cannot overflow.
+		return fmt.Errorf("%w: LogHardCap %d is over %d, or LogRevocationBudget %d is over %d", errInvalidConfig, s.logHardCap, int64(maxLogHardCap), s.logRevokeBudget, int64(maxLogRevokeBudget))
 	}
 	for _, p := range []struct{ field, path string }{{"Dir", s.dir}, {"MasterDir", s.masterDir}, {"DataRoot", s.dataRoot}} {
 		if !filepath.IsAbs(p.path) {

@@ -26,6 +26,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -115,6 +116,11 @@ const (
 	// logFreeMargin is the free space an append leaves on the log's file
 	// system beyond its own line.
 	logFreeMargin = 1 << 20
+	// maxLogHardCap and maxLogRevokeBudget bound the configured hard cap
+	// (and so the soft cap) and the per-uid revocation budget from above, so
+	// logReadBound, at most 2^40 + 1024 × 2^30 + 2^20, cannot overflow.
+	maxLogHardCap      = 1 << 40
+	maxLogRevokeBudget = 1 << 30
 	// revokeFreeSlack replaces logFreeMargin for a revocation's line: the
 	// minimal check, so a nearly full volume still records a revocation.
 	revokeFreeSlack = 4 << 10
@@ -178,6 +184,16 @@ func (s *FileStore) logReadBound() int64 {
 	return s.logHardCap + maxRevokeUIDs*s.logRevokeBudget + logBoundMargin
 }
 
+// logMissingScopesError is errLogMissingScopes: it matches errLogMissing,
+// and its text names the matched-set restore, never install.
+type logMissingScopesError struct{}
+
+func (logMissingScopesError) Error() string {
+	return "the keystore append-only log is missing while user scopes exist, so a new one would lower their floor: restore the matched set (keystore/, keystore/.user/ and both logs) from one backup, then run sudo k3sm keys floor --rebuild"
+}
+
+func (logMissingScopesError) Is(target error) bool { return target == errLogMissing }
+
 // ErrLogFull refuses an operation because an append-only log is past its
 // hard cap, or, for a revocation past the hard cap, because the uid's
 // revocation budget in that log is spent. Nothing was changed.
@@ -187,6 +203,10 @@ var (
 	// errLogMissing is a log that does not exist: the data root has not been
 	// through sudo k3sm install.
 	errLogMissing = errors.New("the keystore append-only log is missing: sudo k3sm install creates it")
+	// errLogMissingScopes is errLogMissing while user scopes exist: a log
+	// created now would lower every scope's floor, so install refuses to
+	// create one and the remedy is the matched-set restore.
+	errLogMissingScopes error = logMissingScopesError{}
 	// errLogNotAppendOnly is a log whose SF_APPEND flag is clear.
 	errLogNotAppendOnly = errors.New("the keystore append-only log is not flagged append-only (SF_APPEND is clear), so it could be truncated or rewritten: a restore must end with sudo k3sm keys floor --rebuild and sudo k3sm keys audit --rotate")
 	// errLogUntrusted is a log, or the data root holding it, that is not
@@ -456,7 +476,11 @@ func (l *appendLog) open(flag int) (*os.File, unix.Stat_t, error) {
 	// its descriptor, rather than blocking the open.
 	fd, err := unix.Openat(dfd, l.name, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if errors.Is(err, unix.ENOENT) {
-		return nil, st, fmt.Errorf("%w: %s: %w", errLogMissing, l.name, fs.ErrNotExist)
+		missing := errLogMissing
+		if _, err := os.Lstat(filepath.Join(l.s.dir, userScopesName)); err == nil {
+			missing = errLogMissingScopes
+		}
+		return nil, st, fmt.Errorf("%w: %s: %w", missing, l.name, fs.ErrNotExist)
 	}
 	if errors.Is(err, unix.ELOOP) {
 		return nil, st, fmt.Errorf("%w: %s is a symlink", errLogUntrusted, l.name)
