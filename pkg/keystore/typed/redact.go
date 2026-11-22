@@ -17,6 +17,9 @@ limitations under the License.
 package typed
 
 import (
+	"encoding"
+	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -27,10 +30,18 @@ import (
 )
 
 // Envelope and Credential carry secrets (RefreshToken, AccessToken, Value,
-// Seed), so every way the standard library formats a value prints a
-// redaction instead: String and GoString, Format for every fmt verb, and
-// LogValue for log/slog. The redaction names the kind, and each present
-// field with its length, and never a byte of any field.
+// Seed), so every way the standard library formats or encodes a value
+// produces a redaction instead: String and GoString, Format for every fmt
+// verb, LogValue for log/slog, and for the reflection encoders MarshalJSON
+// (encoding/json, and so slog's JSON handler for a slice or map of them),
+// MarshalText and GobEncode. The redaction names the kind, and each present
+// field with its length, and never a byte of any field. There is no
+// matching decoder: nothing round-trips a secret through these encoders.
+//
+// One path no method can close: fmt and the reflection encoders cannot call
+// a method on an unexported struct field, so a struct with an unexported
+// field of either type prints its bytes under %v. pkg/keystore declares no
+// such field, and TestNoUnexportedSecretField holds it to that.
 
 // kindOrder is the order redact tries the typed kinds in.
 var kindOrder = []credential.Kind{credential.KindToken, credential.KindSSH, credential.KindOAuth}
@@ -91,13 +102,37 @@ func (c Credential) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, c.Str
 // LogValue is String, for log/slog.
 func (c Credential) LogValue() slog.Value { return slog.StringValue(c.String()) }
 
+// MarshalJSON returns String as a JSON string.
+func (e Envelope) MarshalJSON() ([]byte, error) { return json.Marshal(e.String()) }
+
+// MarshalText returns String.
+func (e Envelope) MarshalText() ([]byte, error) { return []byte(e.String()), nil }
+
+// GobEncode returns String.
+func (e Envelope) GobEncode() ([]byte, error) { return []byte(e.String()), nil }
+
+// MarshalJSON returns String as a JSON string.
+func (c Credential) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// MarshalText returns String.
+func (c Credential) MarshalText() ([]byte, error) { return []byte(c.String()), nil }
+
+// GobEncode returns String.
+func (c Credential) GobEncode() ([]byte, error) { return []byte(c.String()), nil }
+
 var (
-	_ fmt.Stringer   = Envelope{}
-	_ fmt.GoStringer = Envelope{}
-	_ fmt.Formatter  = Envelope{}
-	_ slog.LogValuer = Envelope{}
-	_ fmt.Stringer   = Credential{}
-	_ fmt.GoStringer = Credential{}
-	_ fmt.Formatter  = Credential{}
-	_ slog.LogValuer = Credential{}
+	_ json.Marshaler         = Envelope{}
+	_ encoding.TextMarshaler = Envelope{}
+	_ gob.GobEncoder         = Envelope{}
+	_ json.Marshaler         = Credential{}
+	_ encoding.TextMarshaler = Credential{}
+	_ gob.GobEncoder         = Credential{}
+	_ fmt.Stringer           = Envelope{}
+	_ fmt.GoStringer         = Envelope{}
+	_ fmt.Formatter          = Envelope{}
+	_ slog.LogValuer         = Envelope{}
+	_ fmt.Stringer           = Credential{}
+	_ fmt.GoStringer         = Credential{}
+	_ fmt.Formatter          = Credential{}
+	_ slog.LogValuer         = Credential{}
 )

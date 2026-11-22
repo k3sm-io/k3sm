@@ -3478,8 +3478,14 @@ them meaning.
   and `%x` included, inside a slice or map too, and in a wrapped error) and `LogValue` (a
   `log/slog` attribute) print the kind, each present field's name and its length, and never a
   byte of `RefreshToken`, `AccessToken`, `Value` or `Seed`. A value logged by mistake shows its
-  shape, not its secret. `encoding/json` of a slice or map of them is not covered: no
-  formatting method reaches it, so nothing marshals them to JSON.
+  shape, not its secret. The reflection encoders get the same redaction: `MarshalJSON`
+  (`encoding/json`, and so `slog`'s JSON handler for a slice or map of them), `MarshalText` and
+  `GobEncode`, with no matching decoder, so nothing round-trips a secret through them. One
+  path no method closes: `fmt` and the encoders cannot call a method on an unexported struct
+  field, so a struct with an unexported field of either type prints its bytes under `%v`.
+  No file in `pkg/keystore` declares one, and an AST test (`TestNoUnexportedSecretField`)
+  fails the build on one: an unexported field of either type, or a pointer, slice, array or
+  map of one.
 - The full envelope comes back only from an opener in `pkg/keystore/internal/refreshopen`.
   `pkg/keystore` installs the opener at init, and only `pkg/keystore/refresh` calls it. Go's
   internal-package rule keeps every package outside `pkg/keystore/...` from importing it, and an

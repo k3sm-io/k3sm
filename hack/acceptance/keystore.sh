@@ -808,7 +808,7 @@ check U147 "token needs expiresAt; oauth needs access token, access expiry, refr
 check U148 "SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed ssh-keygen -l vector" \
 	k3sm/pkg/keystore/typed::TestSSHGenerateAndImport TestSSHFingerprintMatchesOpenSSH k3sm/pkg/keystore::TestStoreGenerateSSHUsesRandomSeam
 partial U149 "write-only, structurally: a planted refresh token appears in no result of any exported method of pkg/keystore, raw, hex, base64 or URL-encoded; a typed entry reads back only as a typed.Credential (CurrentCredential, GetCredential), and Current and Get refuse it" "the consumer interfaces and only refresh (and the installing pkg/keystore) imports internal/refreshopen (the refresher)" \
-	k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned TestGetReturnsRedactedCredential k3sm/pkg/keystore/typed::TestEnvelopeRefusalsNeverCarryRefreshToken TestSecretTypesRedactWhenFormatted
+	k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned TestGetReturnsRedactedCredential k3sm/pkg/keystore/typed::TestEnvelopeRefusalsNeverCarryRefreshToken TestSecretTypesRedactWhenFormatted TestNoUnexportedSecretField
 check U150 "RotateIf refuses a stale version, and a version read from an entry since deleted and put again; a rotation never changes an oauth entry's refresh owner" \
 	k3sm/pkg/keystore::TestRotateIfStaleVersionRefused TestRotateIfRefusesRecreatedEntry TestRefreshOwnerFixedPerEntry
 check U151 "oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means low = 1); crash-safe at every step, prune included (the prune cases of the crash test); a failure after the pointer flip reports the commit" \
