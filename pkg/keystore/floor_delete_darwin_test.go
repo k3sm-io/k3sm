@@ -70,6 +70,9 @@ func TestDeleteKeepsHardLinkedFlags(t *testing.T) {
 	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The service user plants the link, so the file is its own: under root the
+	// owner check would otherwise refuse it before the link count is read.
+	giveToService(t, outside)
 	if err := os.Link(outside, filepath.Join(server, "keystore", "k", "planted")); err != nil {
 		t.Fatal(err)
 	}
