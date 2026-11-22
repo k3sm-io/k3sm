@@ -92,12 +92,19 @@ var (
 	// errLogUntrusted is a log, or the data root holding it, that is not
 	// what install makes.
 	errLogUntrusted = errors.New("the keystore append-only log is not trusted: it must be a regular file with one link, owned by the service user, mode 0600, in a data root owned by root and not group- or other-writable")
+	// errLogTorn is a last line with no newline: damage.
+	errLogTorn = errors.New("the last line has no newline")
 	// errLogLineTooLong is a line over maxLogLine, which is never written.
 	errLogLineTooLong = fmt.Errorf("a keystore log line is at most %d bytes", maxLogLine)
 	// errFloorLogMalformed is a user-scope floor whose bytes do not parse:
 	// damage, which refuses every user-scope operation that reads the floor,
 	// revocations included, until root rebuilds it.
 	errFloorLogMalformed = fmt.Errorf("%w: the user-scope floor %s does not parse; root must run sudo k3sm keys floor --rebuild", ErrCorrupt, userFloorLogName)
+	// errLogUnreadable is a log whose bytes could not be read: an I/O
+	// error, transient and never damage. It is never kept, matches no
+	// ErrCorrupt, and so refuses a grant or read and lets a revocation go
+	// ahead.
+	errLogUnreadable = errors.New("the keystore append-only log could not be read")
 	// errFloorBuried is a generation the user-scope floor holds a tombstone
 	// for: rm deleted it. A reader turns it into userDeletedError.
 	errFloorBuried = errors.New("the user-scope floor buries this generation: the entry was deleted")
@@ -199,6 +206,9 @@ type appendLog struct {
 	// whole reports whether every line must be read (the floor), or only
 	// those past the hard cap (the audit log).
 	whole bool
+	// readAt, when set, is the source sync reads f through: the test seam
+	// for a read I/O error.
+	readAt func(f *os.File) io.ReaderAt
 
 	// mu guards state: reads under the shared store lock run together.
 	mu    sync.Mutex
@@ -305,7 +315,9 @@ func (s *FileStore) judgeLog(f *os.File, st *unix.Stat_t) error {
 }
 
 // sync reads f (which st describes) on from where reading stopped, under
-// l.mu, and returns the state. A line that does not parse is state.bad.
+// l.mu, and returns the state. A line that does not parse is state.bad,
+// which sticks; a read I/O error is errLogUnreadable, returned and not
+// kept, and reading resumes past the last whole line read.
 func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 	s := &l.state
 	if s.dev != uint64(st.Dev) || s.ino != st.Ino || s.hardCap != l.s.logHardCap || st.Size < s.off {
@@ -325,10 +337,17 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		// hardCap-1.
 		start = s.hardCap - 1
 	}
-	r := bufio.NewReaderSize(io.NewSectionReader(f, start, st.Size-start), 64<<10)
+	var src io.ReaderAt = f
+	if l.readAt != nil {
+		src = l.readAt(f)
+	}
+	r := bufio.NewReaderSize(io.NewSectionReader(src, start, st.Size-start), 64<<10)
 	off := start
 	if !l.whole && s.off < s.hardCap {
 		skipped, err := r.ReadSlice('\n')
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, bufio.ErrBufferFull) {
+			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, err)
+		}
 		if err != nil {
 			// No newline yet past the cap: a line straddles it, and nothing
 			// starts past it.
@@ -340,6 +359,10 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		line, err := readLogLine(r)
 		if errors.Is(err, io.EOF) && len(line) == 0 {
 			break
+		}
+		if err != nil && !errors.Is(err, errLogLineTooLong) && !errors.Is(err, errLogTorn) {
+			s.off = off
+			return nil, fmt.Errorf("%w: %s at byte %d: %w", errLogUnreadable, l.name, off, err)
 		}
 		if err != nil {
 			s.bad = fmt.Errorf("at byte %d: %w", off, err)
@@ -376,7 +399,7 @@ func readLogLine(r *bufio.Reader) ([]byte, error) {
 		case errors.Is(err, bufio.ErrBufferFull):
 			continue
 		case errors.Is(err, io.EOF) && len(line) > 0:
-			return nil, errors.New("the last line has no newline")
+			return nil, errLogTorn
 		default:
 			return line, err
 		}
