@@ -913,9 +913,11 @@ func TestPointerCanonicalForm(t *testing.T) {
 	if _, _, err := s.CurrentCredential(ctx, "pair"); !errors.Is(err, ErrCorrupt) {
 		t.Errorf("a 24-byte oauth pointer with low 1: %v, want ErrCorrupt", err)
 	}
+	// At version 2 the writer records low 1, so the 16-byte form is the
+	// only one (TestOAuthRetentionWindowOnRead).
 	sealPointer(t, s, server, "pair", binary.BigEndian.AppendUint64(pointerPlaintext(2, 2), 2))
-	if v, _, err := s.CurrentCredential(ctx, "pair"); err != nil || v.Version != 2 {
-		t.Errorf("a 24-byte oauth pointer with low 2: %+v, %v", v, err)
+	if _, _, err := s.CurrentCredential(ctx, "pair"); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("a 24-byte oauth pointer with low 2 at version 2: %v, want ErrCorrupt", err)
 	}
 	sealPointer(t, s, server, "tok", binary.BigEndian.AppendUint64(pointerPlaintext(2, 2), 2))
 	if _, _, err := s.CurrentCredential(ctx, "tok"); !errors.Is(err, ErrCorrupt) {
@@ -933,5 +935,43 @@ func TestPointerCanonicalForm(t *testing.T) {
 		if (e.Name == "tok" || e.Name == "raw") && !errors.Is(e.Err, ErrCorrupt) {
 			t.Errorf("List %s with a 24-byte pointer: %+v, want ErrCorrupt", e.Name, e)
 		}
+	}
+}
+
+// TestOAuthRetentionWindowOnRead is U151's read half of the retention
+// window: an oauth pointer reads only in the form a rotation writes, low =
+// version-1 in the 24-byte form from version 3, and the 16-byte form only at
+// versions 1 and 2. A pointer widening or narrowing the window is ErrCorrupt
+// on read, not only once List opens a missing version.
+func TestOAuthRetentionWindowOnRead(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	for i := 2; i <= 4; i++ {
+		mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope(fmt.Sprintf("a%d", i), fmt.Sprintf("r%d", i)))
+	}
+	written := readString(t, entryPath(server, "pair", currentName))
+	for _, c := range []struct {
+		name string
+		pt   []byte
+		ok   bool
+	}{
+		{"the writer's form, low 3", rangePlaintext(4, 4, 3), true},
+		{"the 16-byte form at version 4", pointerPlaintext(4, 4), false},
+		{"low 2 at version 4", rangePlaintext(4, 4, 2), false},
+		{"low 4 at version 4", rangePlaintext(4, 4, 4), false},
+	} {
+		sealPointer(t, s, server, "pair", c.pt)
+		v, _, err := s.CurrentCredential(ctx, "pair")
+		if c.ok && (err != nil || v.Version != 4) {
+			t.Errorf("%s: %+v, %v; want version 4", c.name, v, err)
+		}
+		if !c.ok && !errors.Is(err, ErrCorrupt) {
+			t.Errorf("%s: %+v, %v; want ErrCorrupt", c.name, v, err)
+		}
+	}
+	writeFile(t, entryPath(server, "pair", currentName), written)
+	if v, _ := mustCredential(t, s, "pair"); v.Version != 4 {
+		t.Fatalf("the written pointer reads version %d", v.Version)
 	}
 }

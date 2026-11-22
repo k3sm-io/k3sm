@@ -1229,17 +1229,31 @@ func (e *entry) pointer(k keys) (version, seq uint64, err error) {
 	return version, seq, err
 }
 
-// pointerRange is pointer with low, the oldest committed version: 1 for a
-// 16-byte pointer, and the recorded mark for a 24-byte one, which only an
-// oauth prune writes. Any other size, or a low outside 1..version, is
-// ErrCorrupt, and so is a pointer not in its one canonical form: a 24-byte
-// pointer recording low 1, which the 16-byte form says, or one over a
-// version that is not oauth, which never prunes.
+// pointerRange is pointer with low, the oldest committed version. It
+// opens the pointer and decodes it with decodePointer, which takes the kind
+// of the version it names from that version's record header when the form
+// depends on it.
 func (e *entry) pointerRange(k keys) (version, seq, low uint64, err error) {
 	_, pt, err := e.openRecord(k, currentName, true, 0)
 	if err != nil {
 		return 0, 0, 0, err
 	}
+	return decodePointer(pt, e.isOAuth)
+}
+
+// decodePointer is the one decoder of a pointer's plaintext, which accepts
+// exactly what the writers produce (rangePlaintext as Put and Rotate call
+// it): version and sequence, both nonzero, the version at most maxVersion,
+// and low, the oldest committed version. Every other plaintext is
+// ErrCorrupt. isOAuth reports whether the version named is oauth, the one
+// kind that prunes; it is asked only when the form depends on it.
+//
+// An oauth rotation records low = version-1, which rangePlaintext writes in
+// the 16-byte form (low 1) at versions 1 and 2 and in the 24-byte form from
+// version 3. So a 24-byte pointer must be oauth with low = version-1 and
+// low at least 2, and a 16-byte pointer at version 3 or above must not be
+// oauth. Every other kind never prunes and is always 16 bytes.
+func decodePointer(pt []byte, isOAuth func(version uint64) (bool, error)) (version, seq, low uint64, err error) {
 	low = 1
 	switch len(pt) {
 	case pointerSize:
@@ -1256,39 +1270,39 @@ func (e *entry) pointerRange(k keys) (version, seq, low uint64, err error) {
 	if version > maxVersion {
 		return 0, 0, 0, fmt.Errorf("%w: the pointer names version %d, over the %d-version limit", ErrCorrupt, version, maxVersion)
 	}
-	if low == 0 || low > version {
-		return 0, 0, 0, fmt.Errorf("%w: the pointer's oldest retained version %d is outside 1 to %d", ErrCorrupt, low, version)
+	pruned := len(pt) == prunedPointerSize
+	if !pruned && version <= 2 {
+		return version, seq, low, nil
 	}
-	if len(pt) == prunedPointerSize {
-		if low == 1 {
-			return 0, 0, 0, fmt.Errorf("%w: the pointer records oldest retained version 1 in its 24-byte form", ErrCorrupt)
-		}
-		if err := e.checkPrunedKind(version); err != nil {
-			return 0, 0, 0, err
-		}
+	oauth, err := isOAuth(version)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	switch {
+	case pruned && !oauth:
+		return 0, 0, 0, fmt.Errorf("%w: the pointer records a prune of an entry that is not oauth, which never prunes", ErrCorrupt)
+	case pruned && (low < 2 || low != version-1):
+		return 0, 0, 0, fmt.Errorf("%w: the pointer records oldest retained version %d at version %d; an oauth rotation records %d, in the 24-byte form from version 3", ErrCorrupt, low, version, version-1)
+	case !pruned && oauth:
+		return 0, 0, 0, fmt.Errorf("%w: the oauth pointer at version %d records no prune; an oauth rotation records oldest retained version %d", ErrCorrupt, version, version-1)
 	}
 	return version, seq, low, nil
 }
 
-// checkPrunedKind refuses, as ErrCorrupt, a 24-byte pointer naming version
-// of e when that version's record is not oauth: only an oauth rotation
-// prunes. It reads the record's kind header without opening it; a header
-// relabelled to oauth fails the record's open, since the kind is in its
-// additional data.
-func (e *entry) checkPrunedKind(version uint64) error {
+// isOAuth reports whether version of e is oauth, from its record's kind
+// header, without opening it. A header relabelled to or from oauth fails the
+// record's open, since the kind is in its additional data.
+func (e *entry) isOAuth(version uint64) (bool, error) {
 	name := versionName(version)
 	b, _, err := readFile(e.root, name, maxRecordSize)
 	if err != nil {
-		return readError(name, err)
+		return false, readError(name, err)
 	}
 	r, err := parseRecord(b)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if Kind(r.kind) != KindOAuth {
-		return fmt.Errorf("%w: the pointer records a prune of a %s entry, which never prunes", ErrCorrupt, Kind(r.kind))
-	}
-	return nil
+	return Kind(r.kind) == KindOAuth, nil
 }
 
 // checkedPointer is pointer, refused (a staleError, matching ErrCorrupt)
