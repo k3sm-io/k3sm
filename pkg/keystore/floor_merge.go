@@ -77,9 +77,11 @@ type MergeReport struct {
 	// Kept names, sorted, each entry the keep set named that the merge
 	// would otherwise have buried a generation of: its restored live
 	// generation, or the moved-aside floor's live one when the restored
-	// floor holds no live record of the name. It is left as restored, the
-	// entry restored on purpose; a restored live record keeps only its own
-	// generation, and the moved-aside one is retired regardless.
+	// floor holds no live record of the name. A restored live record is
+	// left as restored, the entry restored on purpose, and keeps only its
+	// own generation: the moved-aside one is retired regardless. A name
+	// the restored floor does not record gets the moved-aside live record,
+	// at its sequence, fenced one past it (fenceMark).
 	Kept []string
 	// Retired is how many live generations of the moved-aside floor the
 	// merge buried: each one the restored floor does not hold live, under
@@ -111,6 +113,9 @@ type MergeReport struct {
 	// raised is how many restored live records the merge raised to their
 	// authenticated restored pointer before fencing.
 	raised int
+	// recorded is how many kept names the restored floor did not record
+	// the merge wrote a live record of the moved-aside generation for.
+	recorded int
 }
 
 // MergeFloor merges every burial the floor file at path records (the live
@@ -267,7 +272,7 @@ func mergeLoses(live, merged floor, capDropped []pruned) []string {
 
 // changes reports whether the merge r reports changed the floor.
 func (r MergeReport) changes() bool {
-	return r.Merged > 0 || r.Retired > 0 || len(r.Fenced) > 0 || r.raised > 0
+	return r.Merged > 0 || r.Retired > 0 || len(r.Fenced) > 0 || r.raised > 0 || r.recorded > 0
 }
 
 // errMergeLiveFloor refuses a merge whose input is the data root's live
@@ -402,7 +407,8 @@ func (s *FileStore) readFloorAt(path string) (*mergeInput, error) {
 // records are kept. Then, by name, each live generation in from that fl
 // neither holds live nor buries is buried after them (Retired), unless keep
 // names the entry and fl holds no live record of it (keep keeps the restored
-// generation, never a second one). A live generation in from that fl holds
+// generation, never a second one), which records from's live record in fl,
+// at its sequence and fenced (fenceMark). A live generation in from that fl holds
 // live at a sequence at or below from's gets a high-water mark (below)
 // (Fenced). At maxBuriedPerName, add drops the name's oldest, returned. It
 // does not prune: update does.
@@ -484,9 +490,12 @@ func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) 
 				fl[name] = f
 				r.raised++
 			}
-			hw := max(a.Seq, a.HighWater)
-			if hw < math.MaxUint64 {
-				hw++
+			hw := fenceMark(a)
+			if keep[name] && f.Seq == a.Seq && f.HighWater == hw {
+				// The record a keep of a name the restored floor did not
+				// record wrote (below): a rerun keeps it again.
+				kept[name] = true
+				continue
 			}
 			if hw > f.Seq && hw > f.HighWater {
 				f.HighWater = hw
@@ -499,8 +508,17 @@ func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) 
 		case keep[name] && !f.live():
 			// keep keeps the restored generation, never a second one: a
 			// name the restored floor holds live has the moved-aside live
-			// generation retired whatever keep says.
+			// generation retired whatever keep says. With no live record,
+			// the moved-aside one is recorded, fenced one past it, so an
+			// older copy of that generation, or one from the history
+			// above the moved-aside record, is refused.
+			f.Generation, f.Seq, f.HighWater = a.Generation, a.Seq, 0
+			if hw := fenceMark(a); hw > a.Seq {
+				f.HighWater = hw
+			}
+			fl[name] = f
 			kept[name] = true
+			r.recorded++
 			continue
 		}
 		add(name, a.Generation)
@@ -508,6 +526,17 @@ func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) 
 	}
 	r.BuriedLive, r.Kept, r.Fenced = sortedNames(buriedLive), sortedNames(kept), sortedNames(fenced)
 	return r, out
+}
+
+// fenceMark is the high-water mark a merge fences a live record of a's
+// generation at: one above the higher of a's sequence and mark, saturating
+// at the sequence limit.
+func fenceMark(a floorEntry) uint64 {
+	hw := max(a.Seq, a.HighWater)
+	if hw < math.MaxUint64 {
+		hw++
+	}
+	return hw
 }
 
 // unmatchedKeep is each name in keep that kept, the names the merge kept,

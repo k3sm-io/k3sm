@@ -1228,7 +1228,11 @@ generation live, or none), the merge buries that generation after the merged bur
 counts it as retired. `--keep` spares it only when the restored floor holds no live record of
 the name: `--keep` keeps the restored generation, never a second one, so a name kept live as
 G1 still has its moved-aside G2 retired, and a copy of G2 stays refused after a later `rm`.
-Root retired it by choosing the backup:
+A name kept that the restored floor does not record is recorded live from the moved-aside
+floor: its generation at its sequence, with the high-water mark below (one above the higher of
+its sequence and mark), so an older copy of that generation is refused, and so is a copy from
+the history above the moved-aside record; a rerun keeps it again and writes nothing
+(`TestFloorMergeKeepRecordsAsideLive`). Root retired it by choosing the backup:
 a name live as G1 at the backup, deleted and put again as G2, has G1 buried (the deletion) and
 G2 retired, so neither directory put back is accepted. When the restored floor holds the
 moved-aside live generation itself at a lower sequence (the entry rotated since the backup),

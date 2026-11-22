@@ -372,7 +372,8 @@ deleting it since the backup: by restoring the backup you chose its version, so 
 newer one put back is refused. `--keep` keeps only the restored version: an entry you deleted and
 put again since the backup comes back as the backup's version, and the version you put since is
 still retired, so a copy of it stays refused even after you remove the entry. Only an entry the
-backup does not hold at all keeps its newer version when `--keep` names it. An entry you rotated since the
+backup does not hold at all keeps its newer version when `--keep` names it: the merge records
+that version as current, so a copy of an older one put back is refused. An entry you rotated since the
 backup is restored at its older version, and the merge records how far it had been rotated, so a
 copy of a newer version from before the restore is refused, before and after the next `rotate`
 (which numbers past it). The merge prints how many

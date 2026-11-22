@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -282,8 +283,8 @@ func TestFloorMergeRetiresAsideLive(t *testing.T) {
 	if e := restored["kept"]; e.Generation != mgen(5) || !e.buries(mgen(6)) || len(e.burials()) != 1 {
 		t.Errorf("kept after the merge = %+v, want its restored generation live and the aside's buried", e)
 	}
-	if e, ok := restored["spare"]; ok {
-		t.Errorf("spare after the merge = %+v, want nothing recorded: keep spares a generation the restored floor does not hold", e)
+	if e := restored["spare"]; e.Generation != mgen(8) || e.Seq != 1 || e.HighWater != 2 || len(e.burials()) != 0 {
+		t.Errorf("spare after the merge = %+v, want the aside's generation recorded live at its seq 1, fenced at 2", e)
 	}
 	if e := restored["gone"]; len(e.burials()) != 1 {
 		t.Errorf("gone after the merge = %+v, want its one burial", e)
@@ -395,4 +396,55 @@ func TestMergeFloorRefusesDroppingItsOwnBurials(t *testing.T) {
 	if err := s.MergePending(); !errors.Is(err, errMergePending) {
 		t.Errorf("MergePending after the refused merge = %v, want the guard in place", err)
 	}
+}
+
+// TestFloorMergeKeepRecordsAsideLive (U192): --keep on a name the restored
+// floor does not record writes a live record of the moved-aside generation
+// at its sequence, fenced one past the higher of its sequence and mark, so
+// an older copy of that generation is refused and the copy at the recorded
+// sequence is read; a rerun keeps the name again and changes nothing.
+func TestFloorMergeKeepRecordsAsideLive(t *testing.T) {
+	restored := floor{"other": {Generation: mgen(1), Seq: 1}}
+	aside := floor{"spare": {Generation: mgen(8), Seq: 4, HighWater: 6}}
+	keep := map[string]bool{"spare": true}
+	r, _ := restored.merge(aside, keep, nil)
+	if !slices.Equal(r.Kept, []string{"spare"}) || !r.changes() {
+		t.Fatalf("merge keeping spare = %+v (changes %v), want spare kept and the floor changed", r, r.changes())
+	}
+	e := restored["spare"]
+	if e.Generation != mgen(8) || e.Seq != 4 || e.HighWater != 7 {
+		t.Fatalf("spare after the merge = %+v, want generation %s at seq 4, fenced at 7", e, mgen(8))
+	}
+	var gen [generationSize]byte
+	copy(gen[:], mustHex(t, mgen(8)))
+	if err := restored.check("spare", gen, 3); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("check of an older copy of the kept generation = %v, want it refused", err)
+	}
+	if err := restored.check("spare", gen, 7); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("check of a copy inside the fence = %v, want it refused", err)
+	}
+	if err := restored.check("spare", gen, 4); err != nil {
+		t.Errorf("check of the kept generation at its recorded seq = %v, want it read", err)
+	}
+	b, err := marshalFloor(restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseFloor(b); err != nil {
+		t.Fatalf("the merged floor does not parse: %v", err)
+	}
+	again, _ := restored.merge(aside, keep, nil)
+	if !slices.Equal(again.Kept, []string{"spare"}) || again.changes() {
+		t.Errorf("rerun keeping spare = %+v, want spare kept and nothing changed", again)
+	}
+}
+
+// mustHex decodes the hex string h.
+func mustHex(t *testing.T, h string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
