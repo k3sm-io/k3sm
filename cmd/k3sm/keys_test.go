@@ -625,10 +625,11 @@ func checkRecipeSum(b recipeBackup) error {
 	return nil
 }
 
-// recipePreRestore is h's server/pre-restore.d, the root-only directory the
-// recipe moves the live keystore/ into.
+// recipePreRestore is h's pre-restore.d in the data root (a parent only
+// root can write), the root-only directory the recipe moves the live
+// keystore/ into.
 func recipePreRestore(h *keysHarness) string {
-	return filepath.Join(filepath.Dir(h.keystoreDir()), "pre-restore.d")
+	return filepath.Join(filepath.Dir(recipeFloor(h)), "pre-restore.d")
 }
 
 // restoreRecipeBackup restores b over h as the recipe does, with the saved
@@ -811,15 +812,28 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			"sudo shasum -a 256 /var/root/keystore-floor-backup/$B/keystore-floor.json | sudo tee /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
 			"Never keep the saved floor on a volume that ignores ownership",
 			"sudo k3sm stop",
-			"sudo ls -d /var/lib/k3sm/server/pre-restore.d /var/lib/k3sm/keystore-floor.json.pre-restore",
+			"sudo ls -d /var/lib/k3sm/pre-restore.d /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
-			"sudo mkdir -m 0700 /var/lib/k3sm/server/pre-restore.d || exit 1",
-			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/pre-restore.d/keystore",
+			"sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1",
+			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore",
 			"test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json",
 			"sudo k3sm keys floor merge",
 			"sudo k3sm keys rm system/<name> --yes",
+			"sudo k3sm start",
+			// The undo: the floors moved back, then the reverse merge, the
+			// restored floor as the input, so a deletion made after the
+			// restore survives the undo.
+			"sudo k3sm stop",
+			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.restored",
+			"sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/server/keystore",
+			"sudo rmdir /var/lib/k3sm/pre-restore.d",
+			"sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo",
+			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore",
+			"sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json",
+			"sudo k3sm keys floor merge --dry-run",
+			"sudo k3sm keys floor merge",
 			"sudo k3sm start",
 		}
 		at := 0
@@ -1106,24 +1120,41 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			t.Fatalf("restored rb = %q, want old", got)
 		}
 	})
-	// The undo steps: the restored keystore/ and floor are renamed out of
-	// the way first, since mv onto a directory that exists moves the source
-	// inside it, then the moved-aside copies go back, and the live state,
-	// rb deleted, is what the CLI sees.
+	// The undo steps: the restored keystore/ is renamed out of the way
+	// first, since mv onto a directory that exists moves the source inside
+	// it, then the moved-aside copy goes back; the floors swap places, the
+	// restored one becoming the guard file, and the merge runs in reverse.
+	// The live state, rb deleted, is what the CLI sees, and other, deleted
+	// after the restore, stays deleted.
 	t.Run("save rm restore, then undo", func(t *testing.T) {
 		h := newKeysHarness(t)
+		h.put("system/other", []byte("o"))
 		_, aside := saveRmRestore(t, h, true)
+		h.mustRun(0, "floor", "merge", "--keep", "system/rb")
+		h.mustRun(0, "rm", "system/other", "--yes")
 		floor := recipeFloor(h)
+		merged, err := filepath.Glob(floor + ".merged-*")
+		if err != nil || len(merged) != 1 {
+			t.Fatalf("the merged floor: %v, %v; want one", merged, err)
+		}
 		for _, mv := range [][2]string{
 			{h.keystoreDir(), h.keystoreDir() + ".restored"},
 			{aside, h.keystoreDir()},
-			{floor, floor + ".restored"},
-			{floor + ".pre-restore", floor},
+			{merged[0], floor + ".undo"},
+			{floor, floor + ".pre-restore"},
+			{floor + ".undo", floor},
 		} {
 			if err := os.Rename(mv[0], mv[1]); err != nil {
 				t.Fatal(err)
 			}
 		}
+		h.mustRun(0, "floor", "merge", "--dry-run")
+		if out := h.stdout.String(); !strings.Contains(out, "buried live system/other:") {
+			t.Fatalf("the reverse merge --dry-run printed %q, want other buried live", out)
+		}
+		h.mustRun(0, "floor", "merge")
+		refusedDeleted(t, h, "system/other")
+		h.mustRun(0, "rm", "system/other", "--yes")
 		// rmdir: the moved-aside tree went back out, its files never
 		// re-owned, so pre-restore.d is empty.
 		if err := os.Remove(recipePreRestore(h)); err != nil {
@@ -1134,8 +1165,8 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		}
 		h.mustRun(0, "list")
 		h.mustRun(1, "show", "system/rb", "--reveal")
-		if b, err := os.ReadFile(floor); err != nil || !strings.Contains(string(b), `"tombstones":{"rb":`) {
-			t.Fatalf("floor after the undo = %s, %v; want the live floor with rb's tombstone", b, err)
+		if b, err := os.ReadFile(floor); err != nil || !strings.Contains(string(b), `"rb":[{"generation"`) || !strings.Contains(string(b), `"other":[{"generation"`) {
+			t.Fatalf("floor after the undo = %s, %v; want the live floor with rb's tombstone and other's from after the restore", b, err)
 		}
 	})
 	// Without its floor, the restored entry is the deleted one put back, and

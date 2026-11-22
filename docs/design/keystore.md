@@ -1298,10 +1298,15 @@ that publishes a value, is: each sweep first asks `FileStore.MergePending` (a Ls
 set the sweep delivers nothing, reads no entry and makes no apiserver call, logs at Error and
 tries again on the next sweep (`TestDeliveryRefusedWhileMergePending`). `list` and `show` still
 read, and print a warning on stderr. The
-recipe moves the live `keystore/` into `server/pre-restore.d/`, a directory it creates root:wheel
-0700 with `mkdir` (which fails on an existing name), so the service user cannot reach the
-moved-aside entries to copy one back. It changes no file inside: a rename changes no inode's
-owner, so the undo moves the tree back out with no ownership change. No recipe changes owner,
+recipe moves the live `keystore/` into `pre-restore.d/` in the data root, a directory it creates
+root:wheel 0700 with `mkdir` (which fails on an existing name) under a parent only root can
+write, so the service user cannot reach the moved-aside entries to copy one back, nor rename the
+directory, as it could under `server/`. It changes no file inside: a rename changes no inode's
+owner, so the undo moves the tree back out with no ownership change. The undo swaps the floors:
+the moved-aside floor goes back in place and the restored floor becomes
+`keystore-floor.json.pre-restore`, then runs the merge in that reverse direction, so a deletion
+made after the restore survives the undo; its `--dry-run` report shows each entry the restored
+floor records as deleted, and `--keep` spares a version the first merge retired. No recipe changes owner,
 mode or flags recursively (`chown -R`, `chmod -R`, `chflags -R`) over a tree the service user
 wrote: root would follow a hard link planted in it to an unrelated inode
 (`TestKeysRollbackRoundTrip`). The merge keeps every live record of

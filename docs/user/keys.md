@@ -313,7 +313,7 @@ the saved floor against its SHA-256, as root:
 ```
 sudo k3sm stop
 B=2026-11-22
-sudo ls -d /var/lib/k3sm/server/pre-restore.d /var/lib/k3sm/keystore-floor.json.pre-restore
+sudo ls -d /var/lib/k3sm/pre-restore.d /var/lib/k3sm/keystore-floor.json.pre-restore
 sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256
 ```
 
@@ -322,7 +322,7 @@ restore was never finished or undone, and moving the live copies aside now would
 finish or undo that restore first, as below, and do not go on. `shasum` must print `OK`. If it
 does not, the saved floor has changed since you saved it: do not use it. Then move the live
 copies aside and put the backup in place. `mkdir` makes a new directory that only root can
-open, and fails if the name already exists. `mv` then moves the live `keystore/` into it, so
+open, in `/var/lib/k3sm`, which root owns, and fails if the name already exists. `mv` then moves the live `keystore/` into it, so
 nothing running as the service user can reach the moved-aside entries or copy one back into the
 restored keystore. The files inside are not changed: they keep their owner and mode, so an undo
 needs no ownership change. Never run `chown -R` or `chmod -R` as root over the moved-aside
@@ -331,8 +331,8 @@ change a file somewhere else. The `mkdir` line and the `test` line each stop the
 the shell) if a copy is set aside after all, so `mv` never moves a live copy into or over it:
 
 ```
-sudo mkdir -m 0700 /var/lib/k3sm/server/pre-restore.d || exit 1
-sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/pre-restore.d/keystore
+sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore
 test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
 sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/server/keystore
@@ -434,26 +434,38 @@ A restore puts back the whole keystore as it was when you saved it, not one entr
 Only when `list` shows every entry `ok`, delete the copies you moved aside:
 
 ```
-sudo rm -rf /var/lib/k3sm/server/pre-restore.d
+sudo rm -rf /var/lib/k3sm/pre-restore.d
 sudo rm /var/lib/k3sm/keystore-floor.json.merged-*
 ```
 
 To undo the restore instead, stop the server, move what you restored out of the way, then move
 both copies back. Rename the restored `keystore/` first: `mv` onto a directory that exists moves
 the source inside it rather than replacing it. The moved-back files are still the service user's:
-moving them aside did not change their owner. If you already ran the merge, the floor you
-moved aside is now `keystore-floor.json.merged-<time>`: move that file back in the last `mv`
-instead.
+moving them aside did not change their owner. The floors swap places: the floor you moved aside
+goes back in place, and the restored floor becomes `keystore-floor.json.pre-restore`, so the
+merge runs in reverse and keeps every deletion you made after the restore. If you already ran
+the merge, the floor you moved aside is now `keystore-floor.json.merged-<time>`: use that name
+in the first floor `mv` instead.
 
 ```
 sudo k3sm stop
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.restored
-sudo mv /var/lib/k3sm/server/pre-restore.d/keystore /var/lib/k3sm/server/keystore
-sudo rmdir /var/lib/k3sm/server/pre-restore.d
-sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.restored
-sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json
+sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/server/keystore
+sudo rmdir /var/lib/k3sm/pre-restore.d
+sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo
+sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
+sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json
+sudo k3sm keys floor merge --dry-run
+sudo k3sm keys floor merge
 sudo k3sm start
 ```
+
+Read the `--dry-run` report before you run the merge. A `buried live` line names an entry that
+the restored floor records as deleted. That is either an entry you deleted after the restore,
+which stays deleted, or a version the first merge retired, which is live again in the keystore
+you moved back. Name each entry of the second kind with `--keep system/<name>` in the merge.
+Then remove the files of each entry the merge deleted again with `sudo k3sm keys rm
+system/<name> --yes` before you start the server.
 
 The values come back byte for byte: `show --reveal` prints exactly what it printed before. Restore
 the master key the same way, from its own backup, if it was lost too.
