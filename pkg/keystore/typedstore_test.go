@@ -304,13 +304,14 @@ func leaks(secret []byte, vals ...any) string {
 
 // TestPlantedRefreshTokenNeverReturned is U149: a planted refresh token
 // appears in no result, value or error of any exported method of *FileStore
-// or *UserScope. Every exported method is enumerated by reflection, so a new
+// or *UserScope, nor in any audit or user-scope floor line they wrote. Every
+// exported method is enumerated by reflection, so a new
 // one cannot escape: it must be called by hand below (each check names the
 // method it called first), be callable with arguments reflection builds, or
 // be allowlisted with the reason it returns no secret data.
 func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newTypedStore(t)
+	s, server := newTypedStore(t)
 	fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
 	planted := []byte("planted-refresh+token/7f3a9c==")
 	second := []byte("second-refresh+token/0b1d2e==")
@@ -358,6 +359,23 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	check("CurrentCredential (2)", read, err)
 	v, err = s.RotateIf(ctx, "pair", KindOAuth, read, oauthEnvelope("access-3", string(second)))
 	check("RotateIf", v, err)
+	// A crashed rotation leaves the planted token in an orphan above the
+	// pointer: the refusals that name it, Orphan and Adopt return none of it.
+	crashAfterVersionWrite(t, s, server, "pair", func() error {
+		_, err := s.RotateCredential(ctx, "pair", KindOAuth, oauthEnvelope("access-o", string(planted)))
+		return err
+	})
+	v, c, err = s.CurrentCredential(ctx, "pair")
+	check("CurrentCredential (orphan)", v, c, err)
+	v, err = s.RotateCredential(ctx, "pair", KindOAuth, oauthEnvelope("access-y", string(second)))
+	check("RotateCredential (orphan)", v, err)
+	info, err := s.Orphan(ctx, "pair")
+	check("Orphan", info, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err = s.Adopt(ctx, "pair", info.Orphan.Version)
+	check("Adopt", v, err)
 	v, err = s.PutCredential(ctx, "pair", KindOAuth, oauthEnvelope("access-4", string(planted)))
 	check("PutCredential (exists)", v, err)
 	err = s.RaiseFloor(ctx)
@@ -422,6 +440,19 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 
 	err = s.Delete(ctx, "pair")
 	check("Delete", err)
+
+	// The audit sink and the user-scope floor saw every user-scope write
+	// above; no line carries the token.
+	floorLog, audit := userLogs(s)
+	lines := audit.all()
+	if len(lines) == 0 {
+		t.Fatal("the audit sink recorded no line: the user-scope writes above were not audited")
+	}
+	for _, sec := range [][]byte{planted, second} {
+		if enc := leaks(sec, lines, floorLog.lines); enc != "" {
+			t.Errorf("the audit sink or the user-scope floor carries the refresh token as %q", enc)
+		}
+	}
 
 	// allow lists the methods that return no secret data and are not
 	// called above, each with its reason. It is empty: every method is
