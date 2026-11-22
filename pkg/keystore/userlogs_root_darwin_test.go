@@ -17,20 +17,30 @@ limitations under the License.
 package keystore
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
+// fpunchhole is struct fpunchhole (<sys/fcntl.h>), F_PUNCHHOLE's argument,
+// which x/sys does not define.
+type fpunchhole struct {
+	flags, reserved uint32
+	offset, length  int64
+}
+
 // TestAppendOnlyFlagHoldsAsRoot sets the real SF_APPEND flag (chflags
 // sappnd) on a log the service user owns at 0600, and proves what the
 // flag variant of the user-scope floor rests on: an O_APPEND write lands,
-// while a truncate, an unlink, a rename over the file and an O_TRUNC open
-// all fail and leave every byte in place. The store's own check, through
-// the real flag source, admits the flagged file and refuses it once the
-// flag is cleared. Only root can set SF_APPEND, so it skips unless root.
+// while every attempt of the defeat list (docs/design/keystore.md § "The
+// user-scope floor") fails with EPERM exactly and leaves every byte in
+// place. The store's own check, through the real flag source, admits the
+// flagged file and refuses it as errLogNotAppendOnly once the flag is
+// cleared. Only root can set SF_APPEND, so it skips unless root.
 func TestAppendOnlyFlagHoldsAsRoot(t *testing.T) {
 	if !asRoot() {
 		t.Skip("root-only: SF_APPEND can only be set by root")
@@ -50,11 +60,9 @@ func TestAppendOnlyFlagHoldsAsRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open O_APPEND on a flagged file: %v", err)
 	}
+	defer func() { _ = f.Close() }()
 	if _, err := f.Write([]byte("second\n")); err != nil {
 		t.Fatalf("append to a flagged file: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
 	}
 	want := "first\nsecond\n"
 
@@ -62,24 +70,93 @@ func TestAppendOnlyFlagHoldsAsRoot(t *testing.T) {
 	if err := os.WriteFile(other, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for name, attempt := range map[string]func() error{
-		"truncate":    func() error { return os.Truncate(p, 0) },
-		"unlink":      func() error { return os.Remove(p) },
-		"rename over": func() error { return os.Rename(other, p) },
-		"O_TRUNC open": func() error {
-			g, err := os.OpenFile(p, os.O_WRONLY|os.O_TRUNC, 0)
+	link := filepath.Join(s.dataRoot, "floor-link")
+	// rw is the O_RDWR|O_APPEND descriptor, when the open is allowed: the
+	// pwrite, mmap and punch-hole attempts go through it.
+	rw := -1
+	t.Cleanup(func() {
+		if rw >= 0 {
+			_ = unix.Close(rw)
+		}
+	})
+	openRW := func() error {
+		fd, err := unix.Open(p, unix.O_RDWR|unix.O_APPEND, 0)
+		if err != nil {
+			return err
+		}
+		rw = fd
+		return nil
+	}
+	needRW := func(t *testing.T) {
+		if rw < 0 {
+			if err := openRW(); err != nil {
+				t.Skipf("the O_RDWR|O_APPEND open was refused (%v), so there is no descriptor to attempt this through", err)
+			}
+		}
+	}
+	for _, a := range []struct {
+		name    string
+		attempt func(t *testing.T) error
+	}{
+		{"ftruncate on the O_APPEND descriptor", func(*testing.T) error { return unix.Ftruncate(int(f.Fd()), 0) }},
+		{"O_RDWR open", func(*testing.T) error {
+			fd, err := unix.Open(p, unix.O_RDWR, 0)
 			if err == nil {
-				_ = g.Close() // the open itself is the failure
+				_ = unix.Close(fd) // the open itself is the failure
 			}
 			return err
-		},
+		}},
+		{"pwrite at offset 0 through O_RDWR|O_APPEND", func(t *testing.T) error {
+			if err := openRW(); err != nil {
+				return err
+			}
+			_, err := unix.Pwrite(rw, []byte("XXXXX"), 0)
+			return err
+		}},
+		{"pwrite at offset 3 through O_RDWR|O_APPEND", func(t *testing.T) error {
+			needRW(t)
+			_, err := unix.Pwrite(rw, []byte("XXXXX"), 3)
+			return err
+		}},
+		{"mmap MAP_SHARED|PROT_WRITE", func(t *testing.T) error {
+			needRW(t)
+			b, err := unix.Mmap(rw, 0, len(want), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+			if err == nil {
+				_ = unix.Munmap(b) // the mapping itself is the failure
+			}
+			return err
+		}},
+		{"F_PUNCHHOLE", func(t *testing.T) error {
+			needRW(t)
+			ph := fpunchhole{offset: 0, length: int64(len(want))}
+			_, _, errno := unix.Syscall(unix.SYS_FCNTL, uintptr(rw), unix.F_PUNCHHOLE, uintptr(unsafe.Pointer(&ph)))
+			if errno != 0 {
+				return errno
+			}
+			return nil
+		}},
+		{"renamex_np RENAME_SWAP", func(*testing.T) error { return unix.RenamexNp(other, p, unix.RENAME_SWAP) }},
+		{"exchangedata", func(*testing.T) error { return unix.Exchangedata(other, p, 0) }},
+		{"link", func(*testing.T) error { return unix.Link(p, link) }},
+		{"unlink after the link attempt", func(*testing.T) error { return unix.Unlink(p) }},
+		{"rename over", func(*testing.T) error { return unix.Rename(other, p) }},
+		{"O_TRUNC open", func(*testing.T) error {
+			fd, err := unix.Open(p, unix.O_WRONLY|unix.O_TRUNC, 0)
+			if err == nil {
+				_ = unix.Close(fd) // the open itself is the failure
+			}
+			return err
+		}},
+		{"unlink", func(*testing.T) error { return unix.Unlink(p) }},
 	} {
-		if err := attempt(); err == nil {
-			t.Errorf("%s of a flagged file succeeded", name)
-		}
-		if b, err := os.ReadFile(p); err != nil || string(b) != want {
-			t.Fatalf("after the %s attempt the file holds %q (%v), want %q", name, b, err, want)
-		}
+		t.Run(a.name, func(t *testing.T) {
+			if err := a.attempt(t); !errors.Is(err, unix.EPERM) {
+				t.Errorf("%s of a flagged file: %v, want EPERM", a.name, err)
+			}
+			if b, err := os.ReadFile(p); err != nil || string(b) != want {
+				t.Fatalf("after the %s attempt the file holds %q (%v), want %q", a.name, b, err, want)
+			}
+		})
 	}
 
 	s.logFlags = fileFlags
@@ -88,11 +165,12 @@ func TestAppendOnlyFlagHoldsAsRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the store refused the flagged log: %v", err)
 	}
-	_ = g.Close() // read-only
+	defer func() { _ = g.Close() }() // read-only
 	if err := unix.Chflags(p, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := l.open(unix.O_RDONLY); err == nil {
-		t.Fatal("the store admitted the log with its flag cleared")
+	var st unix.Stat_t
+	if err := s.judgeLog(g, &st); !errors.Is(err, errLogNotAppendOnly) {
+		t.Fatalf("judgeLog with the flag cleared: %v, want errLogNotAppendOnly", err)
 	}
 }
