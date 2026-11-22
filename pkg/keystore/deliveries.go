@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"regexp"
 	"slices"
@@ -603,6 +604,11 @@ func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSiz
 	return nil
 }
 
+// errDeliveriesLastSeq refuses a change to a delivery record already at the
+// last sequence, before anything is written: the next would wrap to 0, as
+// Rotate refuses a pointer at the last sequence.
+var errDeliveriesLastSeq = fmt.Errorf("%w: the %s record is at the last sequence, so no change to it can be sealed", ErrCorrupt, deliveriesName)
+
 // errWithdrawUnsealed refuses a withdrawal of a live delivery while the
 // user-scope floor cannot be verified (absent, untrusted, unflagged or
 // unreadable): the record on disk may be an older copy put back, and
@@ -734,6 +740,9 @@ func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery, g *grantA
 		sort.Slice(d.items, func(i, j int) bool { return d.items[i].Key < d.items[j].Key })
 		d.digest = deliveryDigest(d.entry, d.namespace, d.secretName, d.items)
 		d.withdrawn, d.delivered = false, 0
+		if seq == math.MaxUint64 {
+			return errDeliveriesLastSeq
+		}
 		// Refuse, before the grant's first write, a deliver whose floor line
 		// would be refused after its commit, as put does.
 		if err := u.s.floorDeliverRoom(u.scope, o.gen); err != nil {
@@ -874,6 +883,9 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 				return ns, false, nil
 			}
 			return ns, true, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq, true)
+		}
+		if seq == math.MaxUint64 {
+			return ns, false, errDeliveriesLastSeq
 		}
 		ds[i].withdrawn = true
 		return ns, true, u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1, true)
