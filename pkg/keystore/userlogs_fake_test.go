@@ -17,7 +17,9 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"errors"
+	"slices"
 	"sync"
 )
 
@@ -86,6 +88,36 @@ func (f *memFloor) bury(scope, name string, gen [generationSize]byte) error {
 	}
 	f.lines = append(f.lines, memFloorLine{scope: scope, name: name, gen: gen, tomb: true})
 	return nil
+}
+
+func (f *memFloor) liveGens(scope, name string) ([][generationSize]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failRead {
+		return nil, errors.New("injected floor read failure")
+	}
+	live := map[[generationSize]byte]bool{}
+	for _, l := range f.lines {
+		if l.scope != scope || l.name != name {
+			continue
+		}
+		switch {
+		case l.tomb:
+			live[l.gen] = false
+		case l.seq > 0:
+			if _, seen := live[l.gen]; !seen {
+				live[l.gen] = true
+			}
+		}
+	}
+	var out [][generationSize]byte
+	for g, ok := range live {
+		if ok {
+			out = append(out, g)
+		}
+	}
+	slices.SortFunc(out, func(a, b [generationSize]byte) int { return bytes.Compare(a[:], b[:]) })
+	return out, nil
 }
 
 // memAudit is an in-memory audit sink. fail, when set, fails every append.

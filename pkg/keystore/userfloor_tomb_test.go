@@ -152,3 +152,34 @@ func TestUserRmAbsentFloorProceeds(t *testing.T) {
 		t.Fatalf("the entry is still there: %v", err)
 	}
 }
+
+// rm does not trust the generation file, which a tree-writer without the
+// master can swap to another valid value: it buries the generation the floor
+// holds a live line for and the one the pointer header carries as well, so
+// the original tree copied back is still refused as deleted, and rm reports
+// the mismatch after removing the tree.
+func TestUserRmSwappedGenerationStillBuries(t *testing.T) {
+	ctx := context.Background()
+	_, server, u := fileLogScope(t)
+	dir := filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "token")
+	saved := filepath.Join(t.TempDir(), "token")
+	copyTree(t, dir, saved)
+	genPath := filepath.Join(dir, generationName)
+	if err := os.Remove(genPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(genPath, []byte(strings.Repeat("ab", generationSize)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	giveToService(t, genPath)
+	err := u.Delete(ctx, "user/1001/token")
+	if !errors.Is(err, errCommitted) || !strings.Contains(err.Error(), "disagree") {
+		t.Fatalf("rm of an entry with a swapped generation file: %v, want the mismatch reported after the commit", err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the entry is still there: %v", err)
+	}
+	restoreTree(t, saved, dir)
+	_, _, err = u.Current(ctx, "user/1001/token")
+	checkUserDeleted(t, "current", err)
+}

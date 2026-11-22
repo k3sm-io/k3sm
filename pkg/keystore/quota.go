@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
+	"strings"
 )
 
 // This file is the user scope's entry quotas and its rm:
@@ -205,21 +207,19 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	}
 	var buryErr error
 	if fi.IsDir() {
-		// The tombstone first, under the lock and before any removal, so an
+		// The tombstones first, under the lock and before any removal, so an
 		// rm that fails part way, and a copy of the tree put back after it,
 		// are refused as deleted (docs/design/keystore.md § "The user-scope
-		// floor"). A floor that cannot take the line does not stop the
-		// revocation: it is reported as after a commit. A generation that
-		// cannot be read has no tombstone; its tree is removed all the same.
+		// floor"). The generation file is not authenticated, so rm buries
+		// every generation it can name: the floor's live ones for the name,
+		// the generation file's and the pointer header's. A floor that cannot
+		// take a line does not stop the revocation: it is reported as after a
+		// commit, as is a disagreement between the three.
 		e, err := openEntryDirRaw(entries, name)
 		if err != nil {
 			return err
 		}
-		if gen, gerr := readGeneration(e.root); gerr == nil {
-			buryErr = u.s.userFloor.bury(u.scope, name, gen)
-		} else {
-			buryErr = fmt.Errorf("read the generation to bury: %w", gerr)
-		}
+		buryErr = u.buryAll(e, name)
 		// Then the pointer, so a crash leaves a directory the user scope
 		// reads as damage, never an older entry; RemoveAll removes a symlink
 		// itself, never what it names.
@@ -242,9 +242,74 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		return err
 	}
 	if buryErr != nil {
-		return fmt.Errorf("%w, with its tombstone unwritten: the user-scope floor did not take it: %w", errCommitted, buryErr)
+		return fmt.Errorf("%w, but %w", errCommitted, buryErr)
 	}
 	return nil
+}
+
+// buryAll buries, for rm, every generation of name it can find: those the
+// user-scope floor holds a live line for, the one e's generation file holds
+// and the one e's pointer header carries, parsed without a key. A source
+// that cannot be read adds nothing, since a tree a crashed Put left has no
+// pointer; one that reads and disagrees with another is reported, after
+// every generation is buried, as is a floor that did not take a line and an
+// entry with no generation to bury at all.
+func (u *UserScope) buryAll(e *entry, name string) error {
+	var (
+		gens    [][generationSize]byte
+		sources []string
+		errs    []error // the floor's: a tombstone unwritten
+	)
+	add := func(source string, g [generationSize]byte) {
+		sources = append(sources, fmt.Sprintf("%s %x", source, g[:]))
+		if !slices.Contains(gens, g) {
+			gens = append(gens, g)
+		}
+	}
+	live, err := u.s.userFloor.liveGens(u.scope, name)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("read the floor's generations: %w", err))
+	}
+	for _, g := range live {
+		add("the floor", g)
+	}
+	if g, err := readGeneration(e.root); err == nil {
+		add("the generation file", g)
+	}
+	if g, ok := pointerHeaderGeneration(e.root, name); ok {
+		add("the pointer header", g)
+	}
+	if len(gens) == 0 {
+		errs = append(errs, errors.New("no generation to bury: the floor holds none for the name and neither the generation file nor the pointer header reads"))
+	}
+	for _, g := range gens {
+		if err := u.s.userFloor.bury(u.scope, name, g); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	var out []error
+	if len(errs) > 0 {
+		out = append(out, fmt.Errorf("with its tombstone unwritten: the user-scope floor did not take it: %w", errors.Join(errs...)))
+	}
+	if len(gens) > 1 {
+		out = append(out, fmt.Errorf("the entry's generations disagree (%s), so its tree was altered; rm buried every one it could write", strings.Join(sources, ", ")))
+	}
+	return errors.Join(out...)
+}
+
+// pointerHeaderGeneration is the generation in the header of dir's current
+// pointer, read without a key and so unauthenticated, when the file parses
+// as a pointer record of name.
+func pointerHeaderGeneration(dir *os.Root, name string) ([generationSize]byte, bool) {
+	b, _, err := readFile(dir, currentName, maxRecordSize)
+	if err != nil {
+		return [generationSize]byte{}, false
+	}
+	r, err := parseRecord(b)
+	if err != nil || r.kind != kindPointer || r.name != name {
+		return [generationSize]byte{}, false
+	}
+	return r.generation, true
 }
 
 // openEntriesForRevoke opens the scope's entries/ for an rm: the scope

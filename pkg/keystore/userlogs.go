@@ -25,6 +25,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -184,6 +185,10 @@ type userFloorLog interface {
 	append(scope, name string, gen [generationSize]byte, seq uint64) error
 	// bury records the tombstone of scope, name and gen.
 	bury(scope, name string, gen [generationSize]byte) error
+	// liveGens returns, in byte order, every generation of scope and name
+	// the floor holds a live line for and no tombstone buries: what rm
+	// buries beside the generations the entry's tree names.
+	liveGens(scope, name string) ([][generationSize]byte, error)
 	// check judges the floor as a grant needs it: present, trusted,
 	// flagged, readable and parsing. A grant calls it before its first
 	// write.
@@ -848,6 +853,22 @@ func (f *fileFloorLog) floor(scope, name string, gen [generationSize]byte) (uint
 		return 0, errFloorBuried
 	}
 	return seq, nil
+}
+
+func (f *fileFloorLog) liveGens(scope, name string) ([][generationSize]byte, error) {
+	var out [][generationSize]byte
+	err := f.read(func(state *logState) {
+		for k := range state.maxSeq {
+			if k.scope == scope && k.name == name && !state.buried[k] {
+				out = append(out, k.gen)
+			}
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(out, func(a, b [generationSize]byte) int { return bytes.Compare(a[:], b[:]) })
+	return out, nil
 }
 
 func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq uint64) error {
