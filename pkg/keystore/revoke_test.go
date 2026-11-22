@@ -189,7 +189,7 @@ func readDeliveriesBytes(t *testing.T, server string) []byte {
 }
 
 // A withdraw with the floor unreadable still refuses a record older than
-// one this store has read or written: the tombstone at sequence N, then
+// one this process has read or written: the tombstone at sequence N, then
 // the copy at N-1 put back, then a withdraw of another UID must not
 // re-seal the copy at N and so lose the tombstone.
 func TestWithdrawRefusesRollbackBelowSeen(t *testing.T) {
@@ -212,7 +212,7 @@ func TestWithdrawRefusesRollbackBelowSeen(t *testing.T) {
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("withdraw over a put-back copy with the floor unreadable: %v, want ErrCorrupt", err)
 	}
-	if !strings.Contains(err.Error(), "older than one this store has already read or written") {
+	if !strings.Contains(err.Error(), "older than one this process has already read or written") {
 		t.Fatalf("refusal %q does not name the rollback", err)
 	}
 	fl.failRead = false
@@ -345,5 +345,34 @@ func TestRmLookupRefusalKinds(t *testing.T) {
 				t.Fatal("the delivery is still live")
 			}
 		})
+	}
+}
+
+// The delivery-record high-water mark is process-wide: a second FileStore on
+// the same keystore, which has read nothing itself, still refuses to
+// withdraw over an older copy put back below a sequence the first one wrote,
+// when the floor cannot be read.
+func TestDeliveriesSeenIsProcessWide(t *testing.T) {
+	ctx := context.Background()
+	s1, server, u1 := newDeliveryScope(t)
+	path := filepath.Join(scopeDir(server, "1001"), deliveriesName)
+	if err := u1.addDelivery(ctx, testDelivery(1)); err != nil {
+		t.Fatal(err)
+	}
+	older, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := u1.addDelivery(ctx, testDelivery(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, older, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s2 := New(Config{Dir: s1.dir, MasterDir: s1.masterDir, UID: s1.uid, GID: s1.gid, DataRoot: s1.dataRoot, FloorUID: s1.floorUID, FloorGID: s1.floorGID})
+	s2.userFloor, s2.auditSink = &memFloor{failRead: true}, &memAudit{}
+	u2 := userScope(t, s2, 1001)
+	if err := u2.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("withdraw on a second store over a copied-back record: %v, want ErrCorrupt from the shared mark", err)
 	}
 }

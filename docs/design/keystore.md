@@ -1385,7 +1385,8 @@ store refuses to read or write a sealed record over 1,056 KiB.
   does not stop it: it writes the tombstone at the record's sequence plus 1 and appends the
   floor line it can. In place of the floor it checks the record against the highest sequence
   the store process has read or written for that scope and generation, an in-memory mark
-  raised on every successful read and write, and refuses (`ErrCorrupt`) to re-seal a record
+  raised on every successful read and write and shared by every store handle in the process
+  (keyed by the keystore directory too, so two keystores keep apart), and refuses (`ErrCorrupt`) to re-seal a record
   below it, so a copied-back older record does not come back at a later sequence with a later
   tombstone lost. A withdrawal of a UID already withdrawn appends the record's floor line
   again, so a floor line an earlier withdrawal could not append is written by the next one; the
