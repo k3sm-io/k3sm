@@ -385,7 +385,7 @@ is corruption, not a restore.
 # 1. Stop the control plane.
 sudo launchctl bootout system/io.k3sm.server
 
-# 2. Move the current datastore aside — do NOT delete it. Take its sidecars too; a stale
+# 2. Move the current datastore aside: do NOT delete it. Take its sidecars too; a stale
 #    -wal/-shm beside a restored database is exactly how a "successful" restore comes back
 #    with the state you were trying to discard.
 cd /var/lib/k3sm/server/db
