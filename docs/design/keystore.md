@@ -1419,7 +1419,7 @@ store refuses to read or write a sealed record over 1,056 KiB.
   sequence 1, so it needs no sequence catch-up, but a `put` can lose the line itself after its
   commit (a crash between the pointer and the floor line, or a floor that refused it), and
   then the entry's generation rests only on its tree, which a tree-writer can rewrite before
-  the user runs `rm`. So the server-start catch-up (`CatchUpUser`, below) also appends, scope
+  the user runs `rm`. So the server-start catch-up (`catchUpUser`, below) also appends, scope
   by scope and best effort, a live floor line at the pointer's sequence for every user entry
   whose pointer authenticates under `K_u` and whose authenticated generation has no floor
   line; a generation a tombstone buries is never given one, and a line the floor refuses is
@@ -1860,11 +1860,18 @@ That wait is the store `.lock`
   only if its body calls `t.Error*` or `t.Fatal*` and never `t.Skip`, `t.SkipNow` or
   `t.Skipf`, so an empty or skipped stub does not satisfy the gate. An exported identifier
   reaches the user scope when a file outside `pkg/keystore` references a banned name, and
-  also when an exported function or method declared in `pkg/keystore` has a body that
-  references `UserScope`, `startUserScopes`, `ResolveEntry`, `ParseEntry`, `Deliver`,
-  `Withdraw` or `Delivery`, so an in-package wrapper is an export too; the names that
-  already do (the scope's constructor, the entry resolver, and the `Delivery` method on the
-  scope) are an explicit allowlist in the test, each with its reason. The socket slice lifts
+  also when an exported function, method, or package-level `var`, `const` or type declared
+  in `pkg/keystore` references `UserScope`, `startUserScopes`, `catchUpUser`, `ResolveEntry`,
+  `ParseEntry`, `Deliver`, `Withdraw` or `Delivery`, directly or through same-package calls
+  (a call graph built with `go/ast` alone, functions resolved by name and method calls on
+  package types by name, a call on the method's own receiver to its own type first), so an
+  in-package wrapper at any depth is an export too, and so is a dot-import of the package
+  outside it; the names that already do (the scope's constructor and the entry resolver)
+  are an explicit allowlist in the test, each with its reason, and the methods on
+  `UserScope` are left out by their receiver. A prerequisite test counts only if it calls
+  `t.Error*` or `t.Fatal*` on its `*testing.T` parameter outside a constant-false branch.
+  The scan is a guardrail, not a proof; the socket slice's mandatory security review is the
+  backstop. The socket slice lifts
   its ban on references, never that check. The
   `ErrLogFull` texts name the log and which bound was met (the hard cap, the key bound, the
   reader's bound or the caller's revocation budget), never a size, a key count, a cap or a
@@ -1882,7 +1889,7 @@ That wait is the store `.lock`
   the caps were lowered) is refused at store open by `FileStore.CheckLogBounds`, as an invalid
   configuration whose root-only error names the current figures, rather than reading that
   log as damage. **Server start owes two calls before the listener serves:**
-  `FileStore.CheckLogBounds`, then `FileStore.CatchUpUser`, which, under the exclusive store
+  `FileStore.CheckLogBounds`, then `catchUpUser` (unexported), which, under the exclusive store
   lock, appends the catch-up floor line of every user scope whose authenticated delivery
   record sits above its floor line (a withdraw whose floor line failed leaves one behind, and
   the process's own mark of the record's sequence does not survive a restart), so the
@@ -1890,14 +1897,14 @@ That wait is the store `.lock`
   user entry whose authenticated pointer's generation has none (a `put` that lost it). `New` only constructs the store and
   reads neither log, so neither call runs there; the server start that exports the user
   scope makes both, through the unexported `startUserScopes`, which runs `CheckLogBounds`
-  and then `CatchUpUser`, in that order, and then marks the user scope started. Until it
+  and then `catchUpUser`, in that order, and then marks the user scope started. Until it
   has, the store's user-scope accessor refuses every uid (`errUserScopesNotStarted`), so the
   order is held by the code, not by the caller's care: a refused `CheckLogBounds`, or a
   catch-up that could not run at all, leaves the user scope unstarted, while a scope the
   catch-up could not open is named in its error and holds no other scope. Every test that
   builds a user scope runs the start step first, and `TestUserScopeIsUnexported` holds the
   export until the server start calls it.
-  `CatchUpUser` is best effort per scope: a scope it cannot open, or whose floor does not
+  `catchUpUser` is best effort per scope: a scope it cannot open, or whose floor does not
   take the line, is logged at Warn and named in its error, and the others are caught up; a
   refused catch-up line during any operation is logged at Warn too, never dropped unseen.
   `FileStore.LogSizes` gives the sizes and caps to the

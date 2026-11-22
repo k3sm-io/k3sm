@@ -98,7 +98,7 @@ func TestDeliverCatchesUpFloor(t *testing.T) {
 
 // The restart case with no mutation in between: a withdraw whose floor line
 // failed leaves the floor one behind the record; the process restarts (its
-// mark gone) and, before it serves, CatchUpUser appends the catch-up line,
+// mark gone) and, before it serves, catchUpUser appends the catch-up line,
 // so the earlier record copied back is refused, not re-sealed.
 func TestCatchUpUserAtStartSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
@@ -116,8 +116,8 @@ func TestCatchUpUserAtStartSurvivesRestart(t *testing.T) {
 	}
 	fl.freeSpace = nil
 	forgetDeliveriesSeen(s)
-	if err := s.CatchUpUser(ctx); err != nil {
-		t.Fatalf("CatchUpUser: %v", err)
+	if scopeErrs, err := s.catchUpUser(ctx); err != nil || scopeErrs != nil {
+		t.Fatalf("catchUpUser: %v, %v", err, scopeErrs)
 	}
 	putBackDeliveries(t, server, old)
 	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, ErrCorrupt) {

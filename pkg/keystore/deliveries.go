@@ -929,28 +929,12 @@ func (u *UserScope) catchUpDeliveries(gen [generationSize]byte, rd deliveriesRea
 	return true
 }
 
-// CatchUpUser appends, under the exclusive store lock, the catch-up floor
-// line of every user scope whose authenticated delivery record sits above
-// its floor line (catchUpDeliveries): what a withdraw whose floor line
-// failed left behind, and which the process's own mark no longer covers
-// after a restart. The server owes it at start, with CheckLogBounds, before
-// the listener serves (docs/design/keystore.md § "The user-scope floor"). It
-// opens each scope.key under W with no GeneratedUID check, as a revocation
-// does. It is best effort per scope: a scope that does not open, or whose
-// floor does not take the line, is logged at Warn and named in the joined
-// error it returns, and the rest are still caught up. A keystore with no
-// directory or no user scope has nothing to catch up.
-func (s *FileStore) CatchUpUser(ctx context.Context) error {
-	scopeErrs, err := s.catchUpUser(ctx)
-	return errors.Join(err, scopeErrs)
-}
-
 // startUserScopes is the server's user-scope start step, owed before the
-// listener serves: CheckLogBounds, then CatchUpUser, in that order. Once
+// listener serves: CheckLogBounds, then catchUpUser, in that order. Once
 // both have run it marks the user scope started, and only then does
 // UserScope build one (errUserScopesNotStarted). A refused CheckLogBounds,
 // or a catch-up that could not run at all (no lock, no master), leaves it
-// unstarted. CatchUpUser is best effort per scope, so a scope it could not
+// unstarted. catchUpUser is best effort per scope, so a scope it could not
 // catch up does not hold the others: the user scope starts, and the error
 // names that scope.
 //
@@ -974,8 +958,19 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 // step (startUserScopes) has run.
 var errUserScopesNotStarted = errors.New("the user scope is not started: the server's start step (the log bounds check, then the delivery catch-up) has not run")
 
-// catchUpUser is CatchUpUser's work: err when the catch-up could not run at
-// all, and scopeErrs naming each scope it could not catch up.
+// catchUpUser appends, under the exclusive store lock, the catch-up floor
+// line of every user scope whose authenticated delivery record sits above
+// its floor line (catchUpDeliveries): what a withdraw whose floor line
+// failed left behind, and which the process's own mark no longer covers
+// after a restart. The server's start step (startUserScopes) runs it, after
+// CheckLogBounds, before the listener serves (docs/design/keystore.md §
+// "The user-scope floor"); it is unexported, so nothing outside the package
+// reaches it. It opens each scope.key under W with no GeneratedUID check, as
+// a revocation does. It is best effort per scope: a scope that does not
+// open, or whose floor does not take the line, is logged at Warn and named
+// in scopeErrs, and the rest are still caught up; err is a catch-up that
+// could not run at all. A keystore with no directory or no user scope has
+// nothing to catch up.
 func (s *FileStore) catchUpUser(ctx context.Context) (scopeErrs, err error) {
 	if err := s.checkConfig(); err != nil {
 		return nil, err
