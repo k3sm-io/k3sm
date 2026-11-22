@@ -75,14 +75,20 @@ func FuzzParseFloor(f *testing.F) {
 }
 
 // FuzzMergeFloor drives merge over any two floors parseFloor accepts (the
-// restored one and the moved-aside one) and any keep name, followed by the
-// prune its write makes, and checks: it never panics; it never un-buries,
-// so each of the restored floor's burials is still buried or reported
-// dropped; every burial it adds names a generation the moved-aside floor
-// buries or holds live; a live record is buried only when the moved-aside
-// floor buries its generation and keep does not name it; its counts add up;
-// and the result encodes to bytes that parse back to it. The seeds are
-// committed under testdata/fuzz/FuzzMergeFloor.
+// restored one and the moved-aside one) and any keep set (keep, split at
+// commas, so a seed names several), followed by the prune its write makes,
+// and checks: it never panics; it never un-buries, so each of the restored
+// floor's burials is still buried or reported dropped; every burial it adds
+// names a generation the moved-aside floor buries or holds live; a live
+// record is buried only when the moved-aside floor buries its generation and
+// keep does not name it; its counts add up; the result encodes to bytes that
+// parse back to it. And it is complete: every moved-aside burial ends up
+// buried or reported dropped, unless keep kept it as the restored live
+// generation; every moved-aside live generation ends up buried, reported
+// dropped, kept (keep names it and the restored floor holds the name not
+// live), or live already; and, when nothing was dropped, a second merge of
+// the same floors adds nothing. The seeds are committed under
+// testdata/fuzz/FuzzMergeFloor.
 func FuzzMergeFloor(f *testing.F) {
 	type key struct{ name, gen string }
 	f.Fuzz(func(t *testing.T, restoredB, asideB []byte, keep string) {
@@ -95,7 +101,11 @@ func FuzzMergeFloor(f *testing.F) {
 			return
 		}
 		before := maps.Clone(restored)
-		r, d := restored.merge(aside, map[string]bool{keep: true})
+		keepSet := map[string]bool{}
+		for _, k := range strings.Split(keep, ",") {
+			keepSet[k] = true
+		}
+		r, d := restored.merge(aside, keepSet)
 		d = append(d, restored.prune()...)
 		dropped := map[key]bool{}
 		for _, x := range d {
@@ -110,7 +120,7 @@ func FuzzMergeFloor(f *testing.F) {
 			if !e.live() || restored[name].Generation == e.Generation {
 				continue
 			}
-			if name == keep || !aside[name].buries(e.Generation) {
+			if keepSet[name] || !aside[name].buries(e.Generation) {
 				t.Fatalf("merge cleared %s's live record %+v, which the moved-aside floor does not bury or keep names", name, e)
 			}
 		}
@@ -141,6 +151,32 @@ func FuzzMergeFloor(f *testing.F) {
 		back, err := parseFloor(b)
 		if err != nil || !floorsEqual(back, restored) {
 			t.Fatalf("the merged floor does not parse back: %v", err)
+		}
+		for name, a := range aside {
+			was, now := before[name], restored[name]
+			gone := func(g string) bool { return now.buries(g) || dropped[key{name, g}] }
+			for _, b := range a.burials() {
+				if keepSet[name] && was.live() && was.Generation == b.Generation {
+					if now.Generation != b.Generation {
+						t.Fatalf("merge kept %s %s and then cleared it: %+v", name, b.Generation, now)
+					}
+					continue
+				}
+				if !gone(b.Generation) {
+					t.Fatalf("merge left the moved-aside burial %s %s neither buried nor reported dropped: %+v", name, b.Generation, now)
+				}
+			}
+			if !a.live() || gone(a.Generation) || (now.live() && now.Generation == a.Generation) {
+				continue
+			}
+			if !keepSet[name] || was.live() || !slices.Contains(r.Kept, name) {
+				t.Fatalf("merge left the moved-aside live generation %s %s neither buried, dropped, kept nor live: %+v", name, a.Generation, now)
+			}
+		}
+		if len(d) == 0 {
+			if r2, d2 := restored.merge(aside, keepSet); r2.Merged+r2.Retired != 0 || len(r2.Fenced) != 0 || len(d2) != 0 {
+				t.Fatalf("a second merge of the same floors = %+v, dropped %v; want nothing added", r2, d2)
+			}
 		}
 	})
 }
