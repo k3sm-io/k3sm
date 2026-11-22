@@ -244,6 +244,9 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	defer fdir.unlock()
+	if err := fdir.mergePending(); err != nil {
+		return Version{}, err
+	}
 	root, done, err := s.openLocked(ctx, true, true)
 	if err != nil {
 		return Version{}, err
@@ -604,6 +607,9 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		return err
 	}
 	defer fdir.unlock()
+	if err := fdir.mergePending(); err != nil {
+		return err
+	}
 	if err := s.step("bury " + name); err != nil {
 		return err
 	}
@@ -897,6 +903,9 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 		return Version{}, err
 	}
 	defer fdir.unlock()
+	if err := fdir.mergePending(); err != nil {
+		return Version{}, err
+	}
 	root, done, err := s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Version{}, ErrNotFound
@@ -1025,7 +1034,9 @@ func parseVersionName(n string) (uint64, bool) {
 // RaiseFloor at their start to raise a floor that lags its pointers; until
 // they do, nothing raises it on read: Current, Get and List only check it. It
 // takes the exclusive lock and the floor's lock, and runs as root. A keystore
-// with no entries directory or no master has nothing to raise.
+// with no entries directory or no master has nothing to raise. While a
+// restore is unfinished (keystore-floor.json.pre-restore in the data root)
+// it raises nothing and logs that at Warn.
 func (s *FileStore) RaiseFloor(ctx context.Context) error {
 	if err := s.raiseFloor(ctx); err != nil {
 		return fmt.Errorf("raise the keystore floor: %w", err)
@@ -1045,6 +1056,14 @@ func (s *FileStore) raiseFloor(ctx context.Context) error {
 		return err
 	}
 	defer fdir.unlock()
+	if fdir.mergePending() != nil {
+		// The read verbs raise first; refusing them would hide the
+		// restored entries the operator checks before the merge. Raising
+		// the restored floor before the merge could only record a pointer
+		// put back since, so nothing is raised until the merge has run.
+		slog.Warn("keystore floor: a restore is unfinished (keystore-floor.json.pre-restore is in the data root), so the floor is not raised; run sudo k3sm keys floor merge on it")
+		return nil
+	}
 	root, done, err := s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil

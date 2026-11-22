@@ -113,3 +113,49 @@ func TestMergeFloorRefusesWrongInput(t *testing.T) {
 		})
 	}
 }
+
+// TestPendingMergeGuard (U192): while keystore-floor.json.pre-restore is in
+// the data root, a restore is unfinished, so Put, Rotate, Delete and Rewrap
+// refuse, naming keys floor merge, and RaiseFloor writes nothing; a
+// successful merge renames its input to keystore-floor.json.merged-<unix>,
+// which clears the guard.
+func TestPendingMergeGuard(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	path := writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
+	before, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for verb, run := range map[string]func() error{
+		"Put":    func() error { _, err := s.Put(ctx, "n", KindOpaque, []byte("v")); return err },
+		"Rotate": func() error { _, err := s.Rotate(ctx, "k", []byte("two")); return err },
+		"Delete": func() error { return s.Delete(ctx, "k") },
+		"Rewrap": func() error { return s.Rewrap(ctx, rewrapKey(1)) },
+	} {
+		if err := run(); !errors.Is(err, errMergePending) || !strings.Contains(err.Error(), "keys floor merge") {
+			t.Errorf("%s with a merge pending: %v, want errMergePending naming keys floor merge", verb, err)
+		}
+	}
+	if err := s.RaiseFloor(ctx); err != nil {
+		t.Errorf("RaiseFloor with a merge pending: %v, want nil", err)
+	}
+	if after, err := os.ReadFile(floorPath(server)); err != nil || string(after) != string(before) {
+		t.Fatalf("floor after the refused verbs = %s, %v; want it unchanged", after, err)
+	}
+	mustCurrent(t, s, "k", "one")
+	at := time.Unix(1795370000, 0)
+	s.now = func() time.Time { return at }
+	if _, err := s.MergeFloor(ctx, path, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the merged input after the merge: %v, want it renamed", err)
+	}
+	if _, err := os.Lstat(floorPath(server) + ".merged-1795370000"); err != nil {
+		t.Fatalf("the renamed input: %v", err)
+	}
+	mustPut(t, s, "n", KindOpaque, []byte("v"))
+	mustRotate(t, s, "k", "two")
+}

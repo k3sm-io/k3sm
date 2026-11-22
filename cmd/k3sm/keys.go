@@ -79,7 +79,9 @@ const keysUsage = `Usage:
         into the restored floor, so keys revoked since the backup stay
         refused. A restored entry deleted since the backup is deleted again
         (buried live); --keep, repeatable, keeps that entry's restored
-        version live instead, for an entry you are restoring on purpose
+        version live instead, for an entry you are restoring on purpose.
+        Until it runs, put, rotate, rm and rewrap refuse; once written,
+        FLOOR is renamed to keystore-floor.json.merged-<unix>
   sudo k3sm keys deliver system/<name> --namespace NS [--secret S] [--data-key K]
         declare that the server delivers the entry's current version as an
         Opaque Secret S (default: <name>) in NS, under data key K

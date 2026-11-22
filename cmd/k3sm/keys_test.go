@@ -2345,3 +2345,38 @@ func TestKeysEvictionExitsCommitted(t *testing.T) {
 		}
 	})
 }
+
+// TestKeysPendingMergeGuard (U192): while the restore's
+// keystore-floor.json.pre-restore is in the data root, put, rotate and rm
+// refuse, naming keys floor merge, and list still reads; floor merge renames
+// it to keystore-floor.json.merged-<unix>, and the verbs work again.
+func TestKeysPendingMergeGuard(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	for _, args := range [][]string{
+		{"put", "system/n", "--in", "-"},
+		{"rotate", "system/k", "--in", "-"},
+		{"rm", "system/k", "--yes"},
+	} {
+		h.stdin = strings.NewReader("value")
+		if code := h.run(args...); code != keysRefused || !strings.Contains(h.stderr.String(), "keys floor merge") {
+			t.Fatalf("%s with a merge pending: exit %d, stderr %q; want %d naming keys floor merge", args[0], code, h.stderr.String(), keysRefused)
+		}
+	}
+	h.mustRun(0, "list")
+	h.mustRun(0, "floor", "merge", recipeFloor(h)+".pre-restore", "--keep", "system/k")
+	matches, err := filepath.Glob(recipeFloor(h) + ".merged-*")
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("renamed merge input = %v, %v; want one keystore-floor.json.merged-<unix>", matches, err)
+	}
+	if _, err := os.Lstat(recipeFloor(h) + ".pre-restore"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("keystore-floor.json.pre-restore after the merge: %v, want it renamed", err)
+	}
+	h.put("system/n", []byte("n"))
+	h.mustRun(0, "rm", "system/k", "--yes")
+}

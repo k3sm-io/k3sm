@@ -21,11 +21,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 )
+
+// floorPreRestoreName is the live floor as the restore recipe moves it
+// aside, directly under the data root. While it is there the restore is
+// unfinished: the merge has not run.
+const floorPreRestoreName = floorName + ".pre-restore"
+
+// errMergePending refuses a verb that changes the keystore while the
+// restore's moved-aside floor is in the data root: the merge has not run, so
+// the restored floor still lacks every deletion since the backup.
+var errMergePending = errors.New("a restore is unfinished: keystore-floor.json.pre-restore, the floor moved aside before it, is still in the data root, and the deletions it records are not merged yet. Run sudo k3sm keys floor merge on it first, as docs/user/keys.md describes (it renames the file when it is done); this verb changes nothing until then")
 
 // MergeReport is what MergeFloor did with the moved-aside floor's burials.
 type MergeReport struct {
@@ -82,9 +93,17 @@ type MergeReport struct {
 // restored one, never a second, moved-aside one. keep holds
 // entry names, each checked as a name is. The write is pruned as every
 // floor write is, and each burial it drops is logged at Warn and reported.
+// Once the floor is written, the input is renamed to
+// keystore-floor.json.merged-<unix> beside it (renameMerged), which clears
+// the guard the restore's keystore-floor.json.pre-restore sets on every verb
+// that changes the keystore (errMergePending); a failed rename is reported
+// with the report, as committed (Committed).
 func (s *FileStore) MergeFloor(ctx context.Context, path string, keep []string) (MergeReport, error) {
 	r, err := s.mergeFloor(ctx, path, keep)
 	if err != nil {
+		if Committed(err) {
+			return r, fmt.Errorf("merge the floor: %w", err)
+		}
 		return MergeReport{}, fmt.Errorf("merge the floor: %w", err)
 	}
 	return r, nil
@@ -102,7 +121,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 		}
 		kept[name] = true
 	}
-	from, err := s.readFloorAt(path)
+	from, read, err := s.readFloorAt(path)
 	if err != nil {
 		return r, err
 	}
@@ -137,7 +156,40 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 	for _, name := range r.BuriedLive {
 		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and the restored entry is refused; rm removes its directory", "name", name)
 	}
+	if err := s.renameMerged(path, read); err != nil {
+		return r, fmt.Errorf("%w: the merge is written, but its input was not renamed, so the verbs that change the keystore still refuse; rename it to keystore-floor.json.merged-<time> beside it as root: %w", errCommitted, err)
+	}
 	return r, nil
+}
+
+// renameMerged renames the merged input at path, which readFloorAt read as
+// read, to keystore-floor.json.merged-<unix> in its own directory, which
+// clears the guard (errMergePending) when it is the data root's
+// keystore-floor.json.pre-restore and records which file was merged. The
+// name must still be the file read, and the new name must not exist: a file
+// there is never replaced.
+func (s *FileStore) renameMerged(path string, read fs.FileInfo) error {
+	dir, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }() // the rename is fsynced below
+	base := filepath.Base(path)
+	named, err := dir.Lstat(base)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(named, read) {
+		return fmt.Errorf("%s was replaced during the merge", base)
+	}
+	to := fmt.Sprintf("%s.merged-%d", floorName, s.now().Unix())
+	if _, err := dir.Lstat(to); !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%s already exists", to)
+	}
+	if err := dir.Rename(base, to); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 // checkMergeInput refuses a merge of from into live, the floor read under
@@ -169,51 +221,52 @@ func floorsSame(a, b floor) bool {
 	return aerr == nil && berr == nil && bytes.Equal(ab, bb)
 }
 
-// readFloorAt reads and parses the floor file at path, judged as the live
+// readFloorAt reads and parses the floor file at path, returning it with
+// the file's info, judged as the live
 // floor is: a regular file, not a symlink, owned by root (floorUID), not
 // group- or other-writable, and at most maxFloorSize, in a directory owned
 // by root and not group- or other-writable, judged on its descriptor. An absent file is an
 // error: the merge has nothing to merge.
-func (s *FileStore) readFloorAt(path string) (floor, error) {
+func (s *FileStore) readFloorAt(path string) (floor, fs.FileInfo, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return nil, fmt.Errorf("the floor file to merge must be an absolute, clean path")
+		return nil, nil, fmt.Errorf("the floor file to merge must be an absolute, clean path")
 	}
 	dir, err := os.OpenRoot(filepath.Dir(path))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = dir.Close() }() // read-only
 	// The directory is judged on the opened descriptor as the data root
 	// is: one another user could write lets them swap the file in.
 	opened, err := dir.Stat(".")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := s.floorOwned(opened); err != nil {
-		return nil, fmt.Errorf("%w: the directory holding the floor file to merge: %w", errFloorUntrusted, err)
+		return nil, nil, fmt.Errorf("%w: the directory holding the floor file to merge: %w", errFloorUntrusted, err)
 	}
 	base := filepath.Base(path)
 	// os.Root resolves a symlink it is asked to open, so it is refused by
 	// name first; the open below is O_NOFOLLOW, so one swapped in after this
 	// fails it.
 	if named, err := dir.Lstat(base); err == nil && !named.Mode().IsRegular() {
-		return nil, fmt.Errorf("%w: the floor file to merge has mode %s", errFloorUntrusted, named.Mode())
+		return nil, nil, fmt.Errorf("%w: the floor file to merge has mode %s", errFloorUntrusted, named.Mode())
 	}
 	b, fi, err := readFile(dir, base, int64(floorSizeLimit))
 	if errors.Is(err, errBadFile) {
-		return nil, fmt.Errorf("%w: the floor file to merge: %w", errFloorUntrusted, err)
+		return nil, nil, fmt.Errorf("%w: the floor file to merge: %w", errFloorUntrusted, err)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := s.floorOwned(fi); err != nil {
-		return nil, fmt.Errorf("%w: the floor file to merge: %w", errFloorUntrusted, err)
+		return nil, nil, fmt.Errorf("%w: the floor file to merge: %w", errFloorUntrusted, err)
 	}
 	fl, err := parseFloor(b)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return fl, nil
+	return fl, fi, nil
 }
 
 // merge adds to fl every burial in from that fl lacks, oldest (lowest

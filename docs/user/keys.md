@@ -333,14 +333,16 @@ sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystor
 ```
 
 Before you start the server, carry over every deletion recorded since the backup. The floor you
-moved aside records every entry deleted while it was live. Merge those deletions into the
-restored floor:
+moved aside records every entry deleted while it was live. Until you merge it, `put`, `rotate`,
+`rm` and `rewrap` refuse with a message that names `keys floor merge`, and `list` and `show` read
+the restored entries without updating the floor. Merge those deletions into the restored floor:
 
 ```
 sudo k3sm keys floor merge /var/lib/k3sm/keystore-floor.json.pre-restore
 ```
 
-The merge refuses, and changes nothing, if the restored `keystore-floor.json` is not in place yet
+Once the merge is written, it renames the file to `keystore-floor.json.merged-<time>`, the time in
+seconds since 1970, and the other verbs work again. The merge refuses, and changes nothing, if the restored `keystore-floor.json` is not in place yet
 (put it back with `install` first), or if the file you name is the restored floor rather than the
 one you moved aside: one whose newest deletion is older than the restored floor's, or the live floor
 itself.
@@ -406,13 +408,15 @@ Only when `list` shows every entry `ok`, delete the copies you moved aside:
 
 ```
 sudo rm -rf /var/lib/k3sm/server/keystore.pre-restore
-sudo rm /var/lib/k3sm/keystore-floor.json.pre-restore
+sudo rm /var/lib/k3sm/keystore-floor.json.merged-*
 ```
 
 To undo the restore instead, stop the server, move what you restored out of the way, then move
 both copies back. Rename the restored `keystore/` first: `mv` onto a directory that exists moves
 the source inside it rather than replacing it. The `chown` gives the moved-back `keystore/` to the
-service user again, which the restore took from it.
+service user again, which the restore took from it. If you already ran the merge, the floor you
+moved aside is now `keystore-floor.json.merged-<time>`: move that file back in the last `mv`
+instead.
 
 ```
 sudo k3sm stop

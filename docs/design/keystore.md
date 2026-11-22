@@ -1235,7 +1235,17 @@ unchanged; the parser refuses a mark at or below `seq`. Readers refuse a pointer
 generation above `seq` and at or below the mark, the raise never raises into it, and Rotate
 seals its next sequence at one above `max(seq, highwater)`; the raise to it clears the mark,
 and a Put of a new generation or a burial drops it. The verb counts these as `fenced N`.
-The recipe also makes the moved-aside `keystore.pre-restore` root-only (`chown -R root:wheel`,
+Until the merge runs, the restore is unfinished, and the store enforces that: while
+`keystore-floor.json.pre-restore` is in the data root, Put, Rotate, Delete and Rewrap refuse
+under `keystore-lock`, before they write anything, with a message naming `keys floor merge`
+(`errMergePending`), and RaiseFloor, which the read verbs call first, raises nothing and logs
+that at Warn, so `list` and `show` still read the restored entries and no pointer put back
+before the merge is recorded. A successful merge renames its input to
+`keystore-floor.json.merged-<unix>` beside it (never over an existing file, and only if the name
+is still the file it read), which clears the guard; a rename that fails after the write is
+reported as committed. `k3sm start` is not hooked: its start path has no cheap synchronous
+check of the keystore, which only the delivery reconciler reads, and it writes no floor. The
+recipe also makes the moved-aside `keystore.pre-restore` root-only (`chown -R root:wheel`,
 `chmod 700`) as it moves it, so the service user cannot copy an entry out of it. The merge keeps every live record of
 the restored floor not buried above. The write is pruned as every floor write is, the per-name cap
 included, and each burial dropped is logged at Warn and reported. The verb prints `merged N`,
