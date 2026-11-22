@@ -119,7 +119,7 @@ func TestFloorWriterRefusesKeyPastBound(t *testing.T) {
 		t.Fatalf("the writer made the floor damage: %v", err)
 	}
 	// A line for a key the floor holds still goes through.
-	if err := fl.append("user/1001", "token", entryGenerationOf(t, s), 1); err != nil {
+	if err := fl.append("user/1001", "token", entryGenerationOf(t, s), 1, false); err != nil {
 		t.Fatalf("a line for a held key at the bound: %v", err)
 	}
 }

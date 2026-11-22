@@ -48,3 +48,75 @@ func TestLogAppendPreflightsFreeSpace(t *testing.T) {
 		t.Fatal("a line was appended with too little free space")
 	}
 }
+
+// A revocation's lines (rm's tombstone, a withdraw's floor line, and their
+// audit lines) are exempt from the free-space margin: they keep only a
+// minimal check, the line plus revokeFreeSlack, so a nearly full volume does
+// not stop a revocation from being recorded. Below the minimal check the line
+// is refused and the revocation is reported as after a commit.
+func TestRevocationLinesSkipFreeMargin(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := fileLogScope(t)
+	if err := u.addDelivery(ctx, testDelivery(1)); err != nil {
+		t.Fatal(err)
+	}
+	userPut(t, u, "user/1001/other", "v")
+	avail := uint64(logFreeMargin / 2)
+	free := func(int) (uint64, error) { return avail, nil }
+	s.userFloor.(*fileFloorLog).log.freeSpace = free
+	s.auditSink.(*fileAuditLog).log.freeSpace = free
+	floor, audit := readLog(t, s, userFloorLogName), readLog(t, s, auditLogName)
+	if err := u.Delete(ctx, "user/1001/token"); err != nil {
+		t.Fatalf("rm below the free-space margin: %v, want its tombstone and audit line written", err)
+	}
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil {
+		t.Fatalf("withdraw below the free-space margin: %v, want its lines written", err)
+	}
+	if got := readLog(t, s, userFloorLogName); len(got) <= len(floor) {
+		t.Fatal("no floor line was appended for the revocations")
+	}
+	if got := readLog(t, s, auditLogName); len(got) <= len(audit) {
+		t.Fatal("no audit line was appended for the revocations")
+	}
+	// A grant is still held to the margin.
+	if _, err := u.Put(ctx, "user/1001/third", KindOpaque, []byte("v")); !errors.Is(err, errLogNoSpace) {
+		t.Fatalf("put below the margin: %v, want errLogNoSpace", err)
+	}
+	// Below the minimal check even a revocation's line is refused.
+	avail = 64
+	snap := readLog(t, s, userFloorLogName)
+	err := u.Delete(ctx, "user/1001/other")
+	if !errors.Is(err, errCommitted) || !errors.Is(err, errLogNoSpace) {
+		t.Fatalf("rm with almost no space: %v, want the tombstone refused for space after the commit", err)
+	}
+	if !bytes.Equal(snap, readLog(t, s, userFloorLogName)) {
+		t.Fatal("a tombstone was appended with almost no space")
+	}
+	checkEntryGone(t, server, "other")
+}
+
+// A revocation's line for a key the floor already holds is never refused by
+// the key bound, even with the floor at it.
+func TestRevocationLineAtKeyBound(t *testing.T) {
+	ctx := context.Background()
+	s, _, u := fileLogScope(t)
+	if err := u.addDelivery(ctx, testDelivery(1)); err != nil {
+		t.Fatal(err)
+	}
+	l := s.userFloor.(*fileFloorLog).log
+	if err := s.userFloor.check(); err != nil {
+		t.Fatal(err)
+	}
+	l.mu.Lock()
+	l.maxKeys = l.state.keys
+	l.mu.Unlock()
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil {
+		t.Fatalf("withdraw with the floor at its key bound: %v", err)
+	}
+	if err := u.Delete(ctx, "user/1001/token"); err != nil {
+		t.Fatalf("rm with the floor at its key bound: %v", err)
+	}
+	if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("current after rm: %v", err)
+	}
+}

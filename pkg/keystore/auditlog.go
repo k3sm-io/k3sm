@@ -65,7 +65,7 @@ func (a *fileAuditLog) append(l auditLine) error {
 	if err != nil {
 		return err
 	}
-	return a.log.appendLine(scopeUID(l.scope), line, l.revoke)
+	return a.log.appendLine(scopeUID(l.scope), line, l.revoke, l.revoke)
 }
 
 // marshalAuditLine encodes l as one JSON line at now, its newline

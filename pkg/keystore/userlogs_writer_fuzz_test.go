@@ -114,7 +114,7 @@ func FuzzLogWriter(f *testing.F) {
 			gen := guid(byte(d.next() % 3))
 			switch op {
 			case 0, 1:
-				_ = fl.append(scope, name, gen, uint64(1+d.next()%9))
+				_ = fl.append(scope, name, gen, uint64(1+d.next()%9), d.next()%2 == 0)
 			case 2:
 				if name != deliveriesFloorName {
 					_ = fl.bury(scope, name, gen)
@@ -125,7 +125,7 @@ func FuzzLogWriter(f *testing.F) {
 				revoke := d.next()%2 == 0
 				if fl.log.room(scopeUID(scope), revoke) == nil && !revoke {
 					// Admitted: a grant's new key must be written.
-					if err := fl.append(scope, fmt.Sprintf("g%d", step), gen, 1); err != nil && s.logHardCap > int64(len(readLog(t, s, userFloorLogName))) {
+					if err := fl.append(scope, fmt.Sprintf("g%d", step), gen, 1, false); err != nil && s.logHardCap > int64(len(readLog(t, s, userFloorLogName))) {
 						t.Fatalf("step %d: a grant admitted by room was refused its key: %v", step, err)
 					}
 				}

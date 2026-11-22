@@ -52,7 +52,7 @@ func TestLogReaderSizeBound(t *testing.T) {
 	}
 	// The server refuses to write past the bound.
 	l := s.userFloor.(*fileFloorLog).log
-	if err := l.appendLine(1001, line, true); !errors.Is(err, ErrLogFull) {
+	if err := l.appendLine(1001, line, true, true); !errors.Is(err, ErrLogFull) {
 		t.Fatalf("an append past the bound: %v, want ErrLogFull", err)
 	}
 }

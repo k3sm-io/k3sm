@@ -573,7 +573,7 @@ func (d *deliverySeqs) high(dir, scope string, gen [generationSize]byte) uint64 
 // writeDeliveries seals ds at seq and writes the record, then its floor
 // line: a crash between the two leaves the floor one behind, which a read
 // accepts.
-func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSize]byte, ds []delivery, seq uint64) error {
+func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSize]byte, ds []delivery, seq uint64, revoke bool) error {
 	pt := marshalDeliveries(ds)
 	if len(pt) > maxDeliveriesPlaintext {
 		return fmt.Errorf("the deliveries record would be %d bytes, over %d", len(pt), maxDeliveriesPlaintext)
@@ -590,7 +590,7 @@ func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSiz
 		return err
 	}
 	deliveriesSeen.note(u.s.dir, u.scope, gen, seq)
-	if err := u.s.userFloor.append(u.scope, deliveriesFloorName, gen, seq); err != nil {
+	if err := u.s.userFloor.append(u.scope, deliveriesFloorName, gen, seq, revoke); err != nil {
 		return fmt.Errorf("%w, and its floor line was not written: %w", errCommitted, err)
 	}
 	return nil
@@ -728,7 +728,7 @@ func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery, g *grantA
 		if err := grant(); err != nil {
 			return err
 		}
-		return u.writeDeliveries(o.dir, o.key, o.gen, append(ds, d), seq+1)
+		return u.writeDeliveries(o.dir, o.key, o.gen, append(ds, d), seq+1, false)
 	})
 }
 
@@ -851,10 +851,10 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, error) {
 				// appended.
 				return ns, nil
 			}
-			return ns, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq)
+			return ns, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq, false)
 		}
 		ds[i].withdrawn = true
-		return ns, u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1)
+		return ns, u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1, true)
 	}
 	if err := u.s.admit(u.uid, false); err != nil {
 		return "", err

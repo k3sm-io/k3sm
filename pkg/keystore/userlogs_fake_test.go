@@ -61,7 +61,7 @@ func (f *memFloor) floor(scope, name string, gen [generationSize]byte) (uint64, 
 	return max, nil
 }
 
-func (f *memFloor) append(scope, name string, gen [generationSize]byte, seq uint64) error {
+func (f *memFloor) append(scope, name string, gen [generationSize]byte, seq uint64, _ bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failAppend {

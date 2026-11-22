@@ -237,7 +237,7 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	}
 	// The record, the pointer, then the floor line: a crash between the
 	// last two leaves the floor one behind, which a read accepts.
-	if err := u.s.userFloor.append(u.scope, name, e.generation, 1); err != nil {
+	if err := u.s.userFloor.append(u.scope, name, e.generation, 1, false); err != nil {
 		return v, fmt.Errorf("%w, and its floor line was not written: %w", errCommitted, err)
 	}
 	return v, nil
@@ -712,7 +712,7 @@ func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, 
 	// The empty delivery record, sequence 1, before scope.key: a scope whose
 	// scope.key opens has its record.
 	dk := deliveriesKey(ku, u.scope)
-	err = u.writeDeliveries(dir, dk, g, nil, 1)
+	err = u.writeDeliveries(dir, dk, g, nil, 1, false)
 	clear(dk)
 	if err != nil {
 		return keys{}, nil, err

@@ -110,10 +110,10 @@ func TestUserFloorRefusesCopiedBackCurrent(t *testing.T) {
 	if _, _, err := u.Current(ctx, "user/1001/token"); err != nil {
 		t.Fatalf("current with another generation's line: %v", err)
 	}
-	if err := s.userFloor.append("user/1001", "token", gen, 2); err != nil {
+	if err := s.userFloor.append("user/1001", "token", gen, 2, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.userFloor.append("user/1001", "token", gen, 1); err != nil {
+	if err := s.userFloor.append("user/1001", "token", gen, 1, false); err != nil {
 		t.Fatal(err)
 	}
 	_, _, err = u.Current(ctx, "user/1001/token")
@@ -470,7 +470,7 @@ func TestAuditLineBoundedAtOneKiB(t *testing.T) {
 	if _, err := parseFloorLine(bytes.Repeat([]byte("a"), maxLogLine)); !errors.Is(err, errLogLineTooLong) {
 		t.Fatalf("a floor line over 1 KiB: %v", err)
 	}
-	if err := s.userFloor.append("user/1001", strings.Repeat("a", maxLogLine), guid(1), 1); err == nil {
+	if err := s.userFloor.append("user/1001", strings.Repeat("a", maxLogLine), guid(1), 1, false); err == nil {
 		t.Fatal("a floor line with an over-long name was written")
 	}
 	// The widest line: the longest name, namespace and delivery UID, the

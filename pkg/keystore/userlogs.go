@@ -92,6 +92,9 @@ const (
 	// logFreeMargin is the free space an append leaves on the log's file
 	// system beyond its own line.
 	logFreeMargin = 1 << 20
+	// revokeFreeSlack replaces logFreeMargin for a revocation's line: the
+	// minimal check, so a nearly full volume still records a revocation.
+	revokeFreeSlack = 4 << 10
 )
 
 // minFloorLine is the shortest line that adds a key to the floor: the
@@ -181,8 +184,9 @@ type userFloorLog interface {
 	// floor returns the highest seq recorded for scope, name and gen, or 0
 	// when none is; errFloorBuried when a tombstone buries gen.
 	floor(scope, name string, gen [generationSize]byte) (uint64, error)
-	// append records one line.
-	append(scope, name string, gen [generationSize]byte, seq uint64) error
+	// append records one line; revoke marks the line of an operation that
+	// revokes (a withdraw), which the free-space margin does not hold.
+	append(scope, name string, gen [generationSize]byte, seq uint64, revoke bool) error
 	// bury records the tombstone of scope, name and gen.
 	bury(scope, name string, gen [generationSize]byte) error
 	// liveGens returns, in byte order, every generation of scope and name
@@ -625,13 +629,15 @@ func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64)
 
 // appendLine appends line, which ends in a newline, charged to uid. Past
 // the hard cap only a line that may draw on uid's revocation budget
-// (budget) is written, and only while the budget has room for it. It never
+// (budget) is written, and only while the budget has room for it. A
+// revocation's line (revoke) is held to revokeFreeSlack rather than the
+// free-space margin. It never
 // writes what the reader would refuse: a line past logReadBound, a floor
 // line that adds a key past the key bound, or a floor line after a torn
 // tail, which it would merge with. After a torn tail in the audit log it
 // writes a newline first, so the torn bytes read as a line of their own,
 // which the tolerant audit reader drops, and line reads back whole.
-func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
+func (l *appendLog) appendLine(uid uint32, line []byte, budget, revoke bool) error {
 	if len(line) > maxLogLine {
 		return fmt.Errorf("%w: refused a %d-byte line for %s", errLogLineTooLong, len(line), l.name)
 	}
@@ -701,7 +707,7 @@ func (l *appendLog) appendLine(uid uint32, line []byte, budget bool) error {
 			return fmt.Errorf("%w (%s holds %d distinct keys, its key bound %d)", ErrLogFull, l.name, state.keys, bound)
 		}
 	}
-	if err := l.preflight(f, len(out)); err != nil {
+	if err := l.preflight(f, len(out), revoke); err != nil {
 		return err
 	}
 	// One write(2) of the whole line. An ENOSPC or EIO between the
@@ -738,9 +744,10 @@ func (l *appendLog) tornTail(f *os.File, size int64) (bool, error) {
 
 // preflight refuses, as errLogNoSpace, an append of n bytes while the
 // file system holding f, read with fstatfs on its descriptor, has less than
-// logFreeMargin free beyond them. A file system that cannot be asked is
-// refused the same way.
-func (l *appendLog) preflight(f *os.File, n int) error {
+// logFreeMargin free beyond them, or, for a revocation's line (revoke),
+// less than revokeFreeSlack. A file system that cannot be asked is refused
+// the same way.
+func (l *appendLog) preflight(f *os.File, n int, revoke bool) error {
 	free := l.freeSpace
 	if free == nil {
 		free = logFreeSpace
@@ -749,7 +756,11 @@ func (l *appendLog) preflight(f *os.File, n int) error {
 	if err != nil {
 		return fmt.Errorf("%w: fstatfs %s: %w", errLogNoSpace, l.name, err)
 	}
-	if avail < logFreeMargin+uint64(n) {
+	margin := uint64(logFreeMargin)
+	if revoke {
+		margin = revokeFreeSlack
+	}
+	if avail < margin+uint64(n) {
 		return fmt.Errorf("%w (%s: %d bytes free)", errLogNoSpace, l.name, avail)
 	}
 	return nil
@@ -871,7 +882,7 @@ func (f *fileFloorLog) liveGens(scope, name string) ([][generationSize]byte, err
 	return out, nil
 }
 
-func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq uint64) error {
+func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq uint64, revoke bool) error {
 	line, err := floorLine(scope, name, gen, seq)
 	if err != nil {
 		return err
@@ -879,7 +890,7 @@ func (f *fileFloorLog) append(scope, name string, gen [generationSize]byte, seq 
 	// Past the hard cap only a revocation's floor line, or the last line of
 	// an operation admitted below it, is reached: every other operation was
 	// refused before its first write (FileStore.admit).
-	return f.log.appendLine(scopeUID(scope), line, true)
+	return f.log.appendLine(scopeUID(scope), line, true, revoke)
 }
 
 func (f *fileFloorLog) bury(scope, name string, gen [generationSize]byte) error {
@@ -888,8 +899,9 @@ func (f *fileFloorLog) bury(scope, name string, gen [generationSize]byte) error 
 		return err
 	}
 	// rm is in the revocation class: past the hard cap its tombstone draws
-	// on the uid's revocation budget.
-	return f.log.appendLine(scopeUID(scope), line, true)
+	// on the uid's revocation budget, and the free-space margin does not
+	// hold it.
+	return f.log.appendLine(scopeUID(scope), line, true, true)
 }
 
 // floorLine encodes one floor line: "<scope> <name> <generation> <seq>\n",
