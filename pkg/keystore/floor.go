@@ -427,10 +427,11 @@ type staleError struct {
 
 func (e *staleError) Error() string {
 	if e.deleted {
-		// Never rm or removing the floor: removing the floor discards every
-		// burial, and only the floor saved with the backup brings the
-		// deleted entry back.
-		return fmt.Sprintf("keystore entry %q: the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back. Do not restore from backup. If the put-back was deliberate, restore that backup together with the keystore-floor.json saved with it, as \"Backing Up and Restoring\" in docs/user/keys.md describes", e.name)
+		// The safe default first: rm removes the copy and keeps the burial.
+		// The restore with the floor saved beside the backup is only the
+		// deliberate case, and it revives every deletion since. Never
+		// removing the floor, which discards every burial.
+		return fmt.Sprintf("keystore entry %q: the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back. Do not restore from backup. If you did not put this directory back, remove it with sudo k3sm keys rm system/%s --yes: the floor stays as it is and keeps the entry deleted. Only to bring the deleted entry back on purpose, restore that backup together with the keystore-floor.json saved with it, as \"Backing Up and Restoring\" in docs/user/keys.md describes; that brings back every key deleted since the backup, not only this one", e.name, e.name)
 	}
 	what := fmt.Sprintf("the current pointer (sequence %d) is older than the recorded floor (sequence %d); an older copy of this entry was put back", e.seq, e.floor)
 	switch {

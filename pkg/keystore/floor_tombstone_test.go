@@ -420,9 +420,12 @@ func TestDeleteBuriesFloorGeneration(t *testing.T) {
 }
 
 // TestBuriedErrorPointsToRestore: the refusal of a put-back copy of a
-// deleted entry, from a reader and from Put, points to the same-backup
-// restore recipe in docs/user/keys.md, and suggests neither rm of the entry
-// nor removing the floor, which would discard every burial.
+// deleted entry, from a reader and from Put, leads with the safe default:
+// a copy the operator did not put back is removed with rm, which leaves the
+// floor as it is. Only after that does it give the same-backup restore in
+// docs/user/keys.md, as the deliberate case, warning that it brings back
+// every key deleted since the backup. It never points to the older-keystore
+// recipe, which removes the floor and every burial with it.
 func TestBuriedErrorPointsToRestore(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
@@ -435,15 +438,16 @@ func TestBuriedErrorPointsToRestore(t *testing.T) {
 	putBack(t, server, old, "k")
 	_, _, rerr := s.Current(ctx, "k")
 	_, perr := s.Put(ctx, "k", KindOpaque, []byte("new"))
+	const want = `keystore entry "k": the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back. Do not restore from backup. If you did not put this directory back, remove it with sudo k3sm keys rm system/k --yes: the floor stays as it is and keeps the entry deleted. Only to bring the deleted entry back on purpose, restore that backup together with the keystore-floor.json saved with it, as "Backing Up and Restoring" in docs/user/keys.md describes; that brings back every key deleted since the backup, not only this one`
 	for what, err := range map[string]error{"Current": rerr, "Put": perr} {
 		if err == nil {
 			t.Fatalf("%s of the put-back copy succeeded", what)
 		}
 		msg := err.Error()
-		if !strings.Contains(msg, `"Backing Up and Restoring" in docs/user/keys.md`) {
-			t.Errorf("%s: %q, want it to point to the same-backup restore in docs/user/keys.md", what, msg)
+		if !strings.HasSuffix(msg, want) {
+			t.Errorf("%s: %q, want it to end %q", what, msg, want)
 		}
-		for _, bad := range []string{"rm ", "backup-restore.md", "Restoring an older", "remov"} {
+		for _, bad := range []string{"backup-restore.md", "Restoring an older", "remove keystore-floor", "removing the floor"} {
 			if strings.Contains(msg, bad) {
 				t.Errorf("%s: %q suggests %q", what, msg, bad)
 			}

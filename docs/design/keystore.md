@@ -399,8 +399,10 @@ buried set, oldest first:
   floor's own prune, that a buried generation leaves the floor.
 - *Refusal.* A reader or verb that opens an entry directory whose generation is in the name's
   buried set refuses it as `ErrCorrupt`, with the floor's own message: an older copy of a
-  deleted entry was put back, do not restore from backup, and the same-backup restore recipe
-  in the user docs if the put-back was deliberate. That holds for `Current`, `Get`, `List`
+  deleted entry was put back, and do not restore from backup. It leads with the safe default:
+  a copy the operator did not put back is removed with `rm`, which leaves the floor as it is.
+  Only then does it give the same-backup restore recipe in the user docs, as the deliberate
+  case, and warn that it brings back every key deleted since the backup. That holds for `Current`, `Get`, `List`
   (the entry is listed with `Err`), Rotate, Rewrap (which refuses, as for any entry `List`
   marks corrupt), and the floor raise at the start of every root verb, which never records a
   buried generation, while the name is live under a newer generation and after it is deleted
