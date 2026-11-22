@@ -271,10 +271,18 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	// A new generation replaces whatever an interrupted Delete left recorded
-	// for the name.
-	if _, err := fdir.update(func(fl floor) bool { return fl.set(name, e.generation) }); err != nil {
+	// live for the name, and buries it first (set).
+	var buried string
+	var dropped []pruned
+	after, err := fdir.update(func(fl floor) bool {
+		var changed bool
+		changed, buried, dropped = fl.set(name, e.generation)
+		return changed
+	})
+	if err != nil {
 		return Version{}, fmt.Errorf("the entry is stored, but recording its floor failed (the next keys verb records it): %w", err)
 	}
+	logBuried(name, buried, dropped, after)
 	return v, nil
 }
 
@@ -541,13 +549,17 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // the name is unlinked without being followed.
 //
 // A completed Delete buries the generation the floor records live for the
-// name, or, when the floor has no record for the name at all, the deleted
-// directory's (floor.bury), so an older copy of the entry put back is
-// refused by every reader; it needs no master. It never removes a burial. An interrupted Put's
-// generation never committed a pointer, and a non-directory has none, so
-// removing either leaves the floor alone, and so does a Delete of an absent
-// name. A crash after the directory is gone leaves a live floor for a name
-// with no entry, which the next Put of the name replaces.
+// name (floor.bury), so an older copy of the entry put back is refused by
+// every reader; it needs no master. It never removes a burial. That holds
+// whatever stands under the name: an absent directory (keystore/ itself
+// included), a non-directory and an interrupted Put each have their live
+// record buried, and Delete succeeds, logging that the directory was
+// already gone (buryGone); only a name with no live record and nothing
+// under it is ErrNotFound. So a directory moved away during rm and moved
+// back is refused, and so is one a crash after the directory's removal left
+// a live record for, once rm runs again or a Put of the name replaces that
+// record (floor.set buries it). With no record for the name at all, the
+// deleted directory's generation is buried.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -567,7 +579,14 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	}
 	root, done, err := s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
-		return ErrNotFound
+		// No entries directory, so no .lock to take: keystore-lock alone
+		// serializes the floor write, and the lock order is kept.
+		fdir, _, err := s.lockFloor(ctx)
+		if err != nil {
+			return err
+		}
+		defer fdir.unlock()
+		return buryGone(fdir, name)
 	}
 	if err != nil {
 		return err
@@ -597,7 +616,15 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		if err := root.Remove(name); err != nil {
 			return err
 		}
-		return syncDir(root)
+		if err := syncDir(root); err != nil {
+			return err
+		}
+		// Something was removed, so this succeeds with or without a live
+		// record to bury.
+		if err := buryGone(fdir, name); err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		return nil
 	}
 	// The generation is read before anything is removed: it is the one the
 	// tombstone records.
@@ -621,7 +648,10 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		if err := syncDir(root); err != nil {
 			return err
 		}
-		return ErrNotFound
+		return buryGone(fdir, name)
+	}
+	if errors.Is(err, ErrNotFound) {
+		return buryGone(fdir, name)
 	}
 	if err != nil && !damaged {
 		return err
@@ -647,6 +677,9 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err := syncDir(root); err != nil {
 		return err
 	}
+	if err := s.step("bury " + name); err != nil {
+		return err
+	}
 	// The floor's live generation for the name is buried, so an older copy
 	// of this entry put back is refused. The directory's generation, which
 	// the service user could have written, is buried only when the floor
@@ -664,13 +697,45 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	// The per-name cap's drop is a prune too; and over a full floor the
-	// write may prune the very burial this Delete added.
+	logBuried(name, buried, dropped, after)
+	return nil
+}
+
+// buryGone is Delete of a name with no entry directory under it: absent, or
+// a non-directory or an interrupted Put, which Delete has removed. It buries
+// the generation the floor records live for the name, root's own record,
+// trusting nothing it read under the name (bury with no directory
+// generation), and succeeds, logging that the directory was already gone. A
+// name the floor records nothing live for is ErrNotFound. So an entry
+// directory moved away during rm, or left gone by a Delete that crashed
+// before its floor write and was run again, is refused when it is put back.
+func buryGone(fdir *floorLock, name string) error {
+	var buried string
+	var dropped []pruned
+	after, err := fdir.update(func(fl floor) bool {
+		buried, dropped = fl.bury(name, nil)
+		return buried != ""
+	})
+	if err != nil {
+		return err
+	}
+	if buried == "" {
+		return ErrNotFound
+	}
+	slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
+	logBuried(name, buried, dropped, after)
+	return nil
+}
+
+// logBuried logs what a floor write that buried generation buried ("" for
+// none) for name dropped: the per-name cap's drop is a prune too, and over
+// a full floor the write may prune the very burial it added. after is the
+// floor as written.
+func logBuried(name, buried string, dropped []pruned, after floor) {
 	logPruned(dropped)
 	if buried != "" && !after[name].buries(buried) {
-		slog.Warn("keystore floor: the burial this delete wrote was pruned in the same write, so an old copy of the deleted entry put back is not refused as deleted", "name", name)
+		slog.Warn("keystore floor: the burial this write added was pruned in the same write, so an old copy of the deleted entry put back is not refused as deleted", "name", name)
 	}
-	return nil
 }
 
 // Rotate seals value as the next version of name, of the kind name already

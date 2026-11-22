@@ -288,7 +288,7 @@ func TestPruneLogsAtWarn(t *testing.T) {
 		if !strings.Contains(got, "level=WARN") || !strings.Contains(got, "count=1") || !strings.Contains(got, "names=[k]") {
 			t.Fatalf("log of the prune = %q, want a Warn with count=1 and names=[k]", got)
 		}
-		if !strings.Contains(got, "the burial this delete wrote was pruned") {
+		if !strings.Contains(got, "the burial this write added was pruned") {
 			t.Fatalf("log = %q, want the Delete to say its own burial was pruned", got)
 		}
 	})

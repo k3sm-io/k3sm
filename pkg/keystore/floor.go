@@ -492,20 +492,30 @@ func (fl floor) raise(name string, gen [generationSize]byte, seq uint64) bool {
 }
 
 // set is Put applied to fl: it records sequence 1 for name at generation
-// gen, replacing any live record of another generation, and reports whether
-// it changed anything. The name's burials are kept: a Put never lowers what
-// the floor refuses. The live record of the same generation is left alone:
-// it can only be higher, raised since. A buried gen is never recorded live;
-// a Put mints a fresh generation, so it never asks.
-func (fl floor) set(name string, gen [generationSize]byte) bool {
+// gen and reports whether it changed anything. A live record of another
+// generation, which only a Delete interrupted before its floor write leaves
+// (or an entry directory moved away while the Put ran), is buried first, as
+// that Delete would have (bury), so its copy stays refused after the new
+// generation is deleted too; set returns the generation it buried ("" for
+// none) and what that dropped. The name's burials are kept: a Put never
+// lowers what the floor refuses. The live record of the same generation is
+// left alone: it can only be higher, raised since. A buried gen is never
+// recorded live; a Put mints a fresh generation, so it never asks.
+func (fl floor) set(name string, gen [generationSize]byte) (bool, string, []pruned) {
 	g := hex.EncodeToString(gen[:])
 	f := fl[name]
 	if f.buries(g) || (f.live() && f.Generation == g) {
-		return false
+		return false, "", nil
+	}
+	var buried string
+	var dropped []pruned
+	if f.live() {
+		buried, dropped = fl.bury(name, nil)
+		f = fl[name]
 	}
 	f.Generation, f.Seq = g, 1
 	fl[name] = f
-	return true
+	return true, buried, dropped
 }
 
 // bury is Delete applied to fl. It buries the generation the floor records

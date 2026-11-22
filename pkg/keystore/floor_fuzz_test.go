@@ -150,8 +150,8 @@ func checkFloorEntry(t *testing.T, name string, e floorEntry) {
 // and a lift of every delete sequence to end at maxDeleteSeq (so the next
 // bury renumbers), each followed by the prune every floor write makes, and checks
 // after every step: no record has sequence 0 without a burial; a buried
-// generation leaves only by a drop bury or prune reports; no burial appears
-// but by bury; and the floor encodes to bytes that parse back to it, within
+// generation leaves only by a drop bury, set or prune reports; no burial
+// appears but by bury or set; and the floor encodes to bytes that parse back to it, within
 // the caps. The "full" runs start from live entries that leave the
 // tombstones about 1 KiB, so the prune drops burials too.
 func TestFloorOpsProperty(t *testing.T) {
@@ -189,7 +189,11 @@ func TestFloorOpsProperty(t *testing.T) {
 			switch rng.IntN(5) {
 			case 0:
 				op = "set"
-				fl.set(name, gen)
+				_, g, d := fl.set(name, gen)
+				if g != "" {
+					want[key{name, g}] = true
+				}
+				dropped = d
 			case 1:
 				op = "raise"
 				fl.raise(name, gen, uint64(rng.IntN(5)+1))

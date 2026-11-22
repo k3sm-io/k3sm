@@ -386,6 +386,13 @@ buried set, oldest first:
   file and removed by `rm` therefore leaves the buried set as it was, and a decoy directory
   swapped in under a live name before `rm` buries the floor's live generation, not the
   decoy's. With neither a live record nor a readable generation, Delete records nothing.
+- *No directory to delete.* Delete buries the live record whatever stands under the name: no
+  directory (or no `keystore/` at all), a non-directory it unlinks, or an incomplete Put it
+  removes. It then succeeds and logs at Warn that the entry directory was already gone and
+  the deletion is recorded. Only a name with no live record answers `ErrNotFound`. So an
+  entry directory moved away while root runs `rm` and moved back afterwards is refused, and
+  so is the copy a Delete leaves when it crashes between removing the directory and its
+  floor write, once `rm` runs again.
 - *The per-name cap.* A name keeps at most 8 buried generations. A Delete that buries a ninth
   drops the name's oldest, and that is a prune (below): logged, and the only way, besides the
   floor's own prune, that a buried generation leaves the floor.
@@ -405,9 +412,13 @@ buried set, oldest first:
   its pointer and before its floor write: the raise records it live beside the buried set.
 - *Put keeps the buried set.* A Put of the name mints a fresh generation and records it live
   at sequence 1; the buried set stays. Dropping it would let an old copy of the first
-  generation back once the second is deleted too. `rm` of an absent name answers `ErrNotFound`
-  and writes no floor. Delete of an interrupted Put also answers `ErrNotFound` and buries
-  nothing, since that generation never committed a pointer.
+  generation back once the second is deleted too. A live record of another generation, which
+  only a Delete interrupted before its floor write leaves (or an entry directory moved away),
+  is buried by the Put first, as that Delete would have, so its copy stays refused once the
+  new generation is deleted too. `rm` of an absent name with no live record answers
+  `ErrNotFound` and writes no floor. Delete of an interrupted Put under a name with no live
+  record also answers `ErrNotFound` and buries nothing, since that generation never
+  committed a pointer.
 - *Bound and pruning.* Tombstones share the floor's 4 MiB cap, split this way: live entries
   may use all of it, and the `tombstones` object at most 1 MiB of it, and only what live
   entries leave. Every floor write, after it applies its own change, prunes buried
@@ -449,10 +460,10 @@ opens. Delete must work without the master, and with none it raises nothing: it 
 only its own entry's floor. The read verbs (`k3sm keys list` and `show`) take no lock that
 writes, so they raise the floor by calling `RaiseFloor` at their start; until the CLI that
 does so lands, a floor that lags its pointer is raised by the next write verb or
-`RaiseFloor`, and readers meanwhile accept the lag. A floor entry for a name with no
-directory (a crash during Delete) is overwritten by a later Put, and a retried `rm` of the name
-answers `ErrNotFound` and leaves it, so it stays a live entry rather than a burial until
-that Put.
+`RaiseFloor`, and readers meanwhile accept the lag. A live floor record for a name with no
+directory (a Delete that crashed after removing the directory, before its floor write) is
+buried by a retried `rm`, which succeeds, or by the next Put of the name, which buries it
+before it records its own generation.
 
 **The residual against a process that can read the master.** The pointer's authentication
 is keyed by the master, and the master is a 0600 file owned by the service user. A process
@@ -566,7 +577,8 @@ directory, `generation` alone, and `generation` and `v1`, each with or without t
 files, are incomplete Puts, and only those shapes. `v1` without `generation` is damage, since
 Put cannot leave it. An incomplete Put is not an entry: `List` does not return it, `Current`, `Get` and `Delete` answer `ErrNotFound`
 (Delete removes it too, since a Delete that crashed after removing `current` leaves `generation` and a sealed
-`v1`), and the next Put of the name discards it and starts over. A directory with no `current` that holds
+`v1`; under a name the floor records live, Delete buries that record and succeeds, as for an
+absent directory), and the next Put of the name discards it and starts over. A directory with no `current` that holds
 any other file cannot be an incomplete Put, because Put writes nothing else before `current`.
 That is a pointer lost to damage or to an interrupted Delete, with sealed records still on
 disk. `List` returns it with `Err` set, wrapping `ErrCorrupt`, and `rm` removes the directory
@@ -4158,14 +4170,14 @@ last pull request lands and no row is pending.
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
 | G14 | One lock serializes Rewrap, Rotate, Put and reads, with a bounded wait | unit: a held lock gives a timeout error within the bound, not a hang |
 | G15 | Files a root-run verb writes under `server/` are owned by the service user at the layout's modes | unit with a fake owner seam |
-| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put unless the floor records its generation: not listed, `ErrNotFound` from `Current`, `Get` and `Delete` (Delete removes it too, and leaves the floor alone), discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included), or in one of those shapes with its generation recorded in the floor, is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm`, its floor entry replaced by a tombstone, and `ErrExists` from Put with every file left in place | unit: each incomplete-Put shape with no floor entry, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, no floor file, a floor of another generation; damage: `v1` without `generation`, `v2` without `v1`, a `v1`-and-`v2` directory with `current` removed, and the one-version entry that lost `current` (`generation` and `v1`, or `current` renamed to a temporary name) with its generation in the floor; a retried `rm` after an interrupted one; a CLI exit-code test for `list` and `rm` |
+| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put unless the floor records its generation: not listed, `ErrNotFound` from `Current`, `Get` and `Delete` (Delete removes it too, and leaves the floor alone; with a live record for the name it buries that record and succeeds), discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included), or in one of those shapes with its generation recorded in the floor, is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm`, its floor entry replaced by a tombstone, and `ErrExists` from Put with every file left in place | unit: each incomplete-Put shape with no floor entry, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, no floor file, a floor of another generation; damage: `v1` without `generation`, `v2` without `v1`, a `v1`-and-`v2` directory with `current` removed, and the one-version entry that lost `current` (`generation` and `v1`, or `current` renamed to a temporary name) with its generation in the floor; a retried `rm` after an interrupted one; a CLI exit-code test for `list` and `rm` |
 | G17 | `show` prints a value only with `--reveal`, and then writes exactly the stored bytes with no trailing newline; no verb takes a value as an argument | CLI test over the usage strings; a `--reveal` test comparing stdout to the stored bytes for an opaque value and for 32- and 64-byte Ed25519 values |
 | G18 | Delivery is refused while encryption is off unless the override flag was set at server start; a delivered target stays when the override is removed | unit over the reconciler with a fake client |
 | G19 | The delivery declaration is root-owned and not shared-writable, and is refused otherwise | unit, the same cases as the manifest directory |
 | G20 | The reconciler only Gets, creates and updates its labelled `Opaque` Secrets, and leaves an unlabelled or foreign Secret alone | unit over a fake client that records every call |
 | G21 | The rollback recipe in this document runs as written and is a byte-exact round trip | a script test that pipes `show --reveal` into `rotate --in -`, then compares the new current version's value byte for byte (`cmp`) with version N's, for an opaque entry and an Ed25519 entry |
 | G22 | `hack/ci.sh` passes | the gate runs it |
-| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current`; a directory planted with a changed generation file and removed by `rm`, a delete, re-create, delete cycle, and a decoy swapped in before `rm`, each leaving the original copy refused |
+| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current`; a directory planted with a changed generation file and removed by `rm`, a delete, re-create, delete cycle, a decoy swapped in before `rm`, the entry's directory or `keystore/` hidden during `rm` and moved back, a symlink or an incomplete Put in its place, a Delete crashed before its floor write and run again, and a crashed Delete followed by a Put and a Delete, each leaving the original copy refused |
 
 Phase A is complete when the gate passes with no row pending. A row can be reworded or dropped only by a change
 to this document, reviewed like any other.

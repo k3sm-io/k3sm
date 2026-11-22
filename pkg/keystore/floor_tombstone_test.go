@@ -430,3 +430,144 @@ func TestBuriedErrorPointsToRestore(t *testing.T) {
 		}
 	}
 }
+
+// crashAt makes s's step seam fail at the step named at, as a crash there
+// would, until the returned function restores it.
+func crashAt(s *FileStore, at string) func() {
+	old := s.step
+	s.step = func(name string) error {
+		if name == at {
+			return errors.New("crash at " + at)
+		}
+		return old(name)
+	}
+	return func() { s.step = old }
+}
+
+// TestDeleteBuriesWithDirectoryGone (G23): a Delete that finds no entry
+// directory under a name the floor records live buries that live
+// generation, root's own record, and succeeds; only a name with no live
+// record is ErrNotFound. So the directory hidden during rm, or left gone by
+// a Delete that crashed before its floor write and was run again, is
+// refused when it is put back. A Put over the live record such a crash
+// leaves buries it first.
+func TestDeleteBuriesWithDirectoryGone(t *testing.T) {
+	ctx := context.Background()
+	files := []string{generationName, "v1", currentName}
+	t.Run("the directory hidden during rm", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		hidden := filepath.Join(server, "hidden-k")
+		if err := os.Rename(filepath.Join(server, "keystore", "k"), hidden); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatalf("Delete with the directory hidden: %v, want the deletion recorded", err)
+		}
+		putBack(t, server, hidden, "k")
+		_, _, err := s.Current(ctx, "k")
+		refusedAsDeleted(t, "Current of the directory moved back", err)
+	})
+	t.Run("the keystore directory hidden during rm", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		ks, hidden := filepath.Join(server, "keystore"), filepath.Join(server, "hidden-keystore")
+		if err := os.Rename(ks, hidden); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatalf("Delete with keystore/ hidden: %v, want the deletion recorded", err)
+		}
+		if err := s.Delete(ctx, "other"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Delete of a name with no record, keystore/ hidden: %v, want ErrNotFound", err)
+		}
+		if err := os.Rename(hidden, ks); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := s.Current(ctx, "k")
+		refusedAsDeleted(t, "Current after keystore/ moved back", err)
+	})
+	t.Run("a crash before the floor write, then rm again", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		old := saveEntry(t, server, "k", files...)
+		restore := crashAt(s, "bury k")
+		if err := s.Delete(ctx, "k"); err == nil {
+			t.Fatal("Delete through the crash seam succeeded")
+		}
+		restore()
+		if _, err := os.Lstat(filepath.Join(server, "keystore", "k")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("entry after the crashed Delete: %v, want it gone", err)
+		}
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatalf("Delete run again: %v, want the deletion recorded", err)
+		}
+		putBack(t, server, old, "k")
+		_, _, err := s.Current(ctx, "k")
+		refusedAsDeleted(t, "Current of the copy after the rerun rm", err)
+	})
+	t.Run("a crashed Delete, a Put, then a Delete", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		g1 := saveEntry(t, server, "k", files...)
+		restore := crashAt(s, "bury k")
+		if err := s.Delete(ctx, "k"); err == nil {
+			t.Fatal("Delete through the crash seam succeeded")
+		}
+		restore()
+		mustPut(t, s, "k", KindOpaque, []byte("two"))
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatal(err)
+		}
+		putBack(t, server, g1, "k")
+		_, _, err := s.Current(ctx, "k")
+		refusedAsDeleted(t, "Current of G1 after G2 is deleted", err)
+	})
+	t.Run("a decoy in place of the directory", func(t *testing.T) {
+		for _, decoy := range []string{"symlink", "interrupted put"} {
+			t.Run(decoy, func(t *testing.T) {
+				s, server := newTestStore(t)
+				mustPut(t, s, "k", KindOpaque, []byte("one"))
+				hidden := filepath.Join(server, "hidden-k")
+				at := filepath.Join(server, "keystore", "k")
+				if err := os.Rename(at, hidden); err != nil {
+					t.Fatal(err)
+				}
+				switch decoy {
+				case "symlink":
+					if err := os.Symlink("elsewhere", at); err != nil {
+						t.Fatal(err)
+					}
+				default:
+					if err := os.Mkdir(at, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					writeFile(t, filepath.Join(at, generationName), strings.Repeat("ee", generationSize)+"\n")
+				}
+				if err := s.Delete(ctx, "k"); err != nil {
+					t.Fatalf("Delete of the decoy: %v, want the deletion recorded", err)
+				}
+				putBack(t, server, hidden, "k")
+				_, _, err := s.Current(ctx, "k")
+				refusedAsDeleted(t, "Current of the directory moved back", err)
+			})
+		}
+	})
+	t.Run("no live record", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		if err := s.Delete(ctx, "k"); err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.ReadFile(floorPath(server))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Delete(ctx, "k"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Delete of a buried name with no directory: %v, want ErrNotFound", err)
+		}
+		if after, err := os.ReadFile(floorPath(server)); err != nil || string(after) != string(before) {
+			t.Fatalf("floor after rm of a gone name = %s, %v; want it unchanged", after, err)
+		}
+	})
+}

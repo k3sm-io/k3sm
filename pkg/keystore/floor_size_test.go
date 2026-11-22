@@ -180,7 +180,7 @@ func TestFloorFull(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = l.update(func(fl floor) bool { return fl.set("over", [generationSize]byte{1}) })
+		_, err = l.update(func(fl floor) bool { changed, _, _ := fl.set("over", [generationSize]byte{1}); return changed })
 		l.unlock()
 		if !errors.Is(err, errFloorFull) {
 			t.Fatalf("update over the bound: %v, want errFloorFull", err)

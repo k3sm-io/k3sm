@@ -1309,9 +1309,19 @@ func TestEntryWithNoPointer(t *testing.T) {
 			if _, _, err := s.Get(ctx, "a", 1); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("Get: %v, want ErrNotFound", err)
 			}
-			// Delete answers ErrNotFound, since there is no entry, and still
-			// removes the directory, which may hold a sealed v1.
-			if err := s.Delete(ctx, "a"); !errors.Is(err, ErrNotFound) {
+			// Delete removes the directory, which may hold a sealed v1. With
+			// no live record for the name it answers ErrNotFound, since there
+			// is no entry; a live record (an interrupted Delete's, or one whose
+			// directory a decoy replaced) it buries, and succeeds.
+			server := filepath.Dir(filepath.Dir(dir))
+			live := floorOf(t, server)["a"]
+			err := s.Delete(ctx, "a")
+			switch {
+			case live.live() && err != nil:
+				t.Fatalf("Delete over a live record: %v, want it buried", err)
+			case live.live() && !floorOf(t, server)["a"].buries(live.Generation):
+				t.Fatalf("floor a after Delete = %+v, want %s buried", floorOf(t, server)["a"], live.Generation)
+			case !live.live() && !errors.Is(err, ErrNotFound):
 				t.Fatalf("Delete: %v, want ErrNotFound", err)
 			}
 			if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
