@@ -281,3 +281,68 @@ func TestFloorMergeRetiresAsideLive(t *testing.T) {
 		t.Errorf("gone after the merge = %+v, want its one burial", e)
 	}
 }
+
+// TestFloorMergeRefusesUntrustedPlace (U192): the moved-aside file and the
+// directory holding it are judged as the floor and the data root are: a
+// parent directory group- or other-writable, a file another uid owns (the
+// floorUID seam stands in for root) and a mode-0666 file are each refused,
+// and the live floor is left as it was.
+func TestFloorMergeRefusesUntrustedPlace(t *testing.T) {
+	ctx := context.Background()
+	aside := floor{"k": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}}
+	plant := func(t *testing.T, dirMode, fileMode os.FileMode) string {
+		t.Helper()
+		b, err := marshalFloor(aside)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		p := filepath.Join(dir, "keystore-floor.json.pre-restore")
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for path, mode := range map[string]os.FileMode{p: fileMode, dir: dirMode} {
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return p
+	}
+	for _, tc := range []struct {
+		name              string
+		dirMode, fileMode os.FileMode
+		otherOwner        bool
+		want              string
+	}{
+		{"a trusted place is merged", 0o755, 0o644, false, ""},
+		{"a group-writable parent", 0o775, 0o644, false, "the directory holding the floor file to merge"},
+		{"an other-writable parent", 0o757, 0o644, false, "the directory holding the floor file to merge"},
+		{"a file another uid owns", 0o755, 0o644, true, "owned by uid"},
+		{"a mode-0666 file", 0o755, 0o666, false, "the floor file to merge: mode 0666"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			path := plant(t, tc.dirMode, tc.fileMode)
+			before, err := os.ReadFile(floorPath(server))
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if tc.otherOwner {
+				s.floorUID++
+			}
+			_, err = s.MergeFloor(ctx, path, nil)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("MergeFloor from a trusted place: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, errFloorUntrusted) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("MergeFloor: %v, want errFloorUntrusted naming %q", err, tc.want)
+			}
+			if after, _ := os.ReadFile(floorPath(server)); string(after) != string(before) {
+				t.Errorf("floor after the refused merge changed: %s", after)
+			}
+		})
+	}
+}

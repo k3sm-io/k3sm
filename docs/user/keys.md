@@ -363,7 +363,9 @@ sudo k3sm keys list
 Restore the floor file with `install` as shown. The floor is refused unless root owns it,
 and on a volume that ignores ownership, such as an external drive set to ignore
 ownership or a network share, `cp -p` gives the copy a non-root owner. `install -o root -g wheel
--m 0644` sets the owner and mode whatever the volume reports.
+-m 0644` sets the owner and mode whatever the volume reports. The merge reads the floor you
+moved aside only from a directory root owns that group and others cannot write, such as
+`/var/lib/k3sm`, where the recipe leaves it.
 
 Restore the floor file too, or the entry stays refused. When you delete an entry, root's record
 notes the deletion, and any copy of that entry put back later is refused with a message saying

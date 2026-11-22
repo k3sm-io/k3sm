@@ -132,7 +132,8 @@ func (s *FileStore) mergeFloor(ctx context.Context, path string, keep []string) 
 
 // readFloorAt reads and parses the floor file at path, judged as the live
 // floor is: a regular file, not a symlink, owned by root (floorUID), not
-// group- or other-writable, and at most maxFloorSize. An absent file is an
+// group- or other-writable, and at most maxFloorSize, in a directory owned
+// by root and not group- or other-writable, judged on its descriptor. An absent file is an
 // error: the merge has nothing to merge.
 func (s *FileStore) readFloorAt(path string) (floor, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -143,6 +144,15 @@ func (s *FileStore) readFloorAt(path string) (floor, error) {
 		return nil, err
 	}
 	defer func() { _ = dir.Close() }() // read-only
+	// The directory is judged on the opened descriptor as the data root
+	// is: one another user could write lets them swap the file in.
+	opened, err := dir.Stat(".")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.floorOwned(opened); err != nil {
+		return nil, fmt.Errorf("%w: the directory holding the floor file to merge: %w", errFloorUntrusted, err)
+	}
 	base := filepath.Base(path)
 	// os.Root resolves a symlink it is asked to open, so it is refused by
 	// name first; the open below is O_NOFOLLOW, so one swapped in after this
