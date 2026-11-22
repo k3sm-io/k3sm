@@ -249,7 +249,7 @@ func TestUserScopeRefusesIneligibleUIDs(t *testing.T) {
 	}
 	// mint checks it too, for a UserScope built around the constructor.
 	u := &UserScope{s: s, uid: s.uid, scope: userScopeOf(s.uid)}
-	if _, _, err := u.mint(nil, nil); err == nil {
+	if _, _, err := u.mint(nil, nil, func() error { return nil }); err == nil {
 		t.Fatal("mint made a scope for the service uid")
 	}
 }

@@ -62,6 +62,7 @@ func newTestStore(t *testing.T) (*FileStore, string) {
 		FloorUID:  floorUID,
 		FloorGID:  floorGID,
 	})
+	s.userFloor, s.auditSink = &memFloor{}, &memAudit{}
 	return s, server
 }
 

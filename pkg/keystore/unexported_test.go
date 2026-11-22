@@ -31,8 +31,10 @@ import (
 // TestUserScopeIsUnexported holds the user scope inside this package until
 // the socket slice, which lifts this test: no package outside pkg/keystore
 // (its sub-packages and cmd/k3sm included) may reference UserScope,
-// ResolveEntry or ParseEntry. ParseEntry is held whole, since a reference
-// cannot be told to use only its system form without types.
+// ResolveEntry or ParseEntry, nor the delivery verbs Deliver, Withdraw and
+// Delivery (which also names their parameter type). ParseEntry is held
+// whole, since a reference cannot be told to use only its system form
+// without types.
 //
 // The order is what makes the hold matter. The socket is the first
 // production caller of the user scope, and it lands after the change that
@@ -41,7 +43,6 @@ import (
 // build's mint wrote without one; it also keeps the floor gap
 // (userscope.go) out of reach until the user-scope floor lands.
 func TestUserScopeIsUnexported(t *testing.T) {
-	banned := map[string]bool{"UserScope": true, "ResolveEntry": true, "ParseEntry": true}
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -72,36 +73,10 @@ func TestUserScopeIsUnexported(t *testing.T) {
 			return err
 		}
 		files++
-		// The names this file gives the keystore package, if it imports it.
-		var local []string
-		for _, imp := range f.Imports {
-			path, _ := strconv.Unquote(imp.Path.Value)
-			if path != "k3sm.io/k3sm/pkg/keystore" {
-				continue
-			}
-			name := "keystore"
-			if imp.Name != nil {
-				name = imp.Name.Name
-			}
-			local = append(local, name)
+		rel, _ := filepath.Rel(root, p)
+		for _, name := range bannedRefs(f) {
+			t.Errorf("%s references %s: the user scope stays inside pkg/keystore until the socket slice", rel, name)
 		}
-		if len(local) == 0 {
-			return nil
-		}
-		ast.Inspect(f, func(n ast.Node) bool {
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok || !banned[sel.Sel.Name] {
-				return true
-			}
-			// A package-qualified reference, or a method call on a value
-			// (FileStore.UserScope), in a file that imports the package.
-			if id, ok := sel.X.(*ast.Ident); ok && !contains(local, id.Name) && sel.Sel.Name != "UserScope" {
-				return true
-			}
-			rel, _ := filepath.Rel(root, p)
-			t.Errorf("%s references %s: the user scope stays inside pkg/keystore until the socket slice", rel, sel.Sel.Name)
-			return true
-		})
 		return nil
 	})
 	if err != nil {
@@ -109,6 +84,88 @@ func TestUserScopeIsUnexported(t *testing.T) {
 	}
 	if files < 100 {
 		t.Fatalf("scanned only %d files under %s", files, root)
+	}
+}
+
+// bannedRefs returns the banned names f references: a .UserScope selector
+// in any file; a package-qualified ResolveEntry or ParseEntry in a file
+// that imports the keystore package (or any such selector there whose
+// receiver is not a plain name); and, in such a file, any .Deliver,
+// .Withdraw or .Delivery selector, whatever its receiver, since the verbs
+// are methods on a *UserScope value that need not be named there.
+func bannedRefs(f *ast.File) []string {
+	banned := map[string]bool{"UserScope": true, "ResolveEntry": true, "ParseEntry": true}
+	verbs := map[string]bool{"Deliver": true, "Withdraw": true, "Delivery": true}
+	// The names this file gives the keystore package, if it imports it.
+	var local []string
+	for _, imp := range f.Imports {
+		path, _ := strconv.Unquote(imp.Path.Value)
+		if path != "k3sm.io/k3sm/pkg/keystore" {
+			continue
+		}
+		name := "keystore"
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		local = append(local, name)
+	}
+	var out []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if verbs[sel.Sel.Name] {
+			if len(local) > 0 {
+				out = append(out, sel.Sel.Name)
+			}
+			return true
+		}
+		if !banned[sel.Sel.Name] {
+			return true
+		}
+		// A .UserScope selector anywhere: a *FileStore reaches a file that
+		// does not import the package through another package's API, so
+		// the import is no guard for it. ResolveEntry and ParseEntry only
+		// package-qualified, in a file that imports the package.
+		if sel.Sel.Name != "UserScope" {
+			if len(local) == 0 {
+				return true
+			}
+			if id, ok := sel.X.(*ast.Ident); ok && !contains(local, id.Name) {
+				return true
+			}
+		}
+		out = append(out, sel.Sel.Name)
+		return true
+	})
+	return out
+}
+
+// TestBannedRefsFlagsUserScopeEverywhere: the gate flags a .UserScope
+// selector in a file that does not import the keystore package, since a
+// value of *FileStore reaches it through another package's API; and still
+// flags the package-qualified names where the package is imported.
+func TestBannedRefsFlagsUserScopeEverywhere(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		want string
+	}{
+		{"package p\nfunc f(s interface{ UserScope(uint32) }) { s.UserScope(1001) }\n", "UserScope"},
+		{"package p\nimport ks \"k3sm.io/k3sm/pkg/keystore\"\nvar _ = ks.ParseEntry\n", "ParseEntry"},
+		{"package p\nimport \"k3sm.io/k3sm/pkg/keystore\"\nfunc f(s *keystore.FileStore) { s.UserScope(1001) }\n", "UserScope"},
+		{"package p\nfunc f(e struct{ ParseEntry int }) int { return e.ParseEntry }\n", ""},
+		{"package p\nimport \"k3sm.io/k3sm/pkg/keystore\"\nfunc f(u interface{ Withdraw(string) }) { u.Withdraw(\"x\") }\nvar _ keystore.Delivery\n", "Withdraw,Delivery"},
+		{"package p\nimport ks \"k3sm.io/k3sm/pkg/keystore\"\nfunc f(u interface{ Deliver(ks.FileStore) }) { u.Deliver(ks.FileStore{}) }\n", "Deliver"},
+		{"package p\nfunc f(u interface{ Deliver() }) { u.Deliver() }\n", ""},
+	} {
+		f, err := parser.ParseFile(token.NewFileSet(), "x.go", tc.src, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(bannedRefs(f), ","); got != tc.want {
+			t.Errorf("bannedRefs(%q) = %q, want %q", tc.src, got, tc.want)
+		}
 	}
 }
 

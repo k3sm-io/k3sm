@@ -134,6 +134,7 @@ type keysStore interface {
 	RaiseFloor(ctx context.Context) error
 	InterruptedRewrap(ctx context.Context) (fingerprint [sha256.Size]byte, ok bool, err error)
 	RecordsSealedUnder(ctx context.Context, key []byte) (bool, error)
+	UserScopesExist(ctx context.Context) (bool, error)
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -1063,6 +1064,24 @@ func keysRewrap(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
+	// U101: while user scopes exist, say before the run and again after it
+	// that Rewrap does not re-key them. The closing check is made again once
+	// Rewrap returns, so a .user that appeared during the run is warned of.
+	users, err := s.UserScopesExist(ctx)
+	if err != nil {
+		return v.failf(keysRefused, "%v; nothing was changed", err)
+	}
+	if users {
+		fmt.Fprintln(env.stderr, keystore.UserScopeRewrapWarning)
+	}
+	defer func() {
+		if !users {
+			users, _ = s.UserScopesExist(ctx) // a check that fails warns of nothing new
+		}
+		if users {
+			fmt.Fprintln(env.stderr, keystore.UserScopeRewrapWarning)
+		}
+	}()
 	keyPath := *keyIn
 	var key []byte
 	var out *keyOutFile

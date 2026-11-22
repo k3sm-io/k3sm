@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -55,9 +54,15 @@ const newSuffix = ".new"
 // retire it. A Rewrap whose master.next was replaced or removed after some
 // record moved under its key is completed by a rerun with that same key.
 //
-// It refuses, writing nothing, while the name reserved for user scopes exists
-// in the entries' directory (ErrScopeUnsupported), while the floor cannot be
-// written, and while any entry does not open: an entry List reports with Err
+// Each user scope's scope.key is re-sealed under the new master's
+// scope-wrap key W in the same two phases, as one more record; every other
+// user record stays sealed under its scope key, byte for byte unchanged
+// (docs/design/keystore.md § "User scope", "Rewrap of scope keys").
+//
+// It refuses, writing nothing, while .user, or a scope directory in it, is
+// not a directory it can trust, or a scope.key does not open
+// (ErrCorrupt), while the floor cannot be written, and while any entry does
+// not open: an entry List reports with Err
 // would otherwise be left sealed under a master that no longer exists, so it
 // is removed (rm) or restored first. An interrupted Put is not an entry and is
 // not re-sealed; the next Put of its name discards it. A version above the one
@@ -125,19 +130,11 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, p *rewrapProgr
 		return err
 	}
 	defer func() { _ = root.Close() }() // every write below is fsynced
-	// Checked before the lock too, whose first acquisition creates .lock, so
-	// the refusal writes nothing at all; and again under it.
-	if err := refuseUserScopes(root); err != nil {
-		return err
-	}
 	unlock, err := s.lock(ctx, root, true)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	if err := refuseUserScopes(root); err != nil {
-		return err
-	}
 	fdir, fl, err := s.lockFloor(ctx)
 	if err != nil {
 		return err
@@ -212,12 +209,8 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, p *rewrapProgr
 	if err := s.commitNew(ctx, root, fl, plan, old, next); err != nil {
 		return err
 	}
-	// .user is checked once more, last thing before the swap: one created
-	// during the run stops it here, with every record readable (under the
-	// master or master.next) and master.next agreeing, so a rerun with the
-	// same key completes it once .user is gone.
-	if err := refuseUserScopes(root); err != nil {
-		return fmt.Errorf("records were re-sealed under %s, but the master was not swapped: %w", masterNextName, err)
+	if err := s.checkScopesPlanned(ctx, root, plan, next); err != nil {
+		return err
 	}
 	if swapped, err := s.swapMaster(mroot, next); err != nil {
 		// A swap that went through and then failed (its last sync or step)
@@ -334,12 +327,12 @@ func (s *FileStore) recordsSealedUnder(ctx context.Context, key []byte) (bool, e
 		return false, err
 	}
 	old.next = nil
-	k, err := deriveKeys(key, s.scope)
+	k, err := deriveMasterKeys(key, s.scope)
 	if err != nil {
 		return false, err
 	}
 	defer k.wipe()
-	_, committed, err := rewrapPlan(ctx, root, fl, old, &k)
+	_, committed, err := s.rewrapPlan(ctx, root, fl, old, &k)
 	if errors.Is(err, ErrCorrupt) {
 		// Some record opens under neither key: not a Rewrap to key.
 		return false, nil
@@ -368,6 +361,7 @@ func resumed(live keys, newMaster []byte) error {
 func (k *keys) wipe() {
 	clear(k.seal)
 	clear(k.fingerprint)
+	clear(k.wrap)
 }
 
 // refuseLive refuses a newMaster that is the live master k.
@@ -379,20 +373,6 @@ func refuseLive(k keys, newMaster []byte) error {
 	defer nk.wipe()
 	if hmac.Equal(nk.seal, k.seal) {
 		return errors.New("the new master is the live one")
-	}
-	return nil
-}
-
-// refuseUserScopes is ErrScopeUnsupported when the name reserved for user
-// scopes exists in the entries' directory, whatever its type: a symlink is not
-// followed, and a dangling one counts.
-func refuseUserScopes(root *os.Root) error {
-	_, err := root.Lstat(userScopesName)
-	if err == nil {
-		return fmt.Errorf("%w (%s)", ErrScopeUnsupported, filepath.Join(root.Name(), userScopesName))
-	}
-	if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("check for %s: %w", userScopesName, err)
 	}
 	return nil
 }
@@ -420,12 +400,12 @@ func refuseUserScopes(root *os.Root) error {
 func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte, started *bool) (keys, []planned, bool, error) {
 	raw, err := s.readNext(mroot)
 	if err == nil {
-		k, derr := deriveKeys(raw, s.scope)
+		k, derr := deriveMasterKeys(raw, s.scope)
 		clear(raw)
 		if derr != nil {
 			return keys{}, nil, false, derr
 		}
-		plan, committed, perr := rewrapPlan(ctx, root, fl, old, &k)
+		plan, committed, perr := s.rewrapPlan(ctx, root, fl, old, &k)
 		if perr != nil {
 			k.wipe()
 			return keys{}, nil, false, perr
@@ -448,14 +428,14 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 			return keys{}, nil, false, lerr
 		}
 	}
-	found, ferr := anyNew(ctx, root)
+	found, ferr := s.anyNew(ctx, root)
 	if ferr != nil {
 		return keys{}, nil, false, ferr
 	}
 	if found {
 		return keys{}, nil, false, fmt.Errorf("%w: %s is missing or does not match its fingerprint, and records were already re-sealed under it: restore the master directory and keystore/ from one matched backup (%w)", ErrMasterUntrusted, masterNextName, err)
 	}
-	plan, _, perr := rewrapPlan(ctx, root, fl, old, nil)
+	plan, _, perr := s.rewrapPlan(ctx, root, fl, old, nil)
 	if perr != nil {
 		if bad {
 			return keys{}, nil, false, fmt.Errorf("%w: %s does not match its fingerprint, and a record does not open under the live master, so it may be sealed under %s: restore the master directory and keystore/ from one matched backup (%w; %w)", ErrMasterUntrusted, masterNextName, masterNextName, err, perr)
@@ -466,7 +446,7 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 	if err := s.writeNext(mroot, newMaster); err != nil {
 		return keys{}, nil, false, err
 	}
-	next, err := deriveKeys(newMaster, s.scope)
+	next, err := deriveMasterKeys(newMaster, s.scope)
 	if err != nil {
 		return keys{}, nil, false, err
 	}
@@ -483,11 +463,11 @@ func (s *FileStore) prepareNext(ctx context.Context, root, mroot *os.Root, fl fl
 // reports !ok, and the caller keeps prepareNext's refusal. A record under any
 // third key fails the plan, so this never orphans one.
 func (s *FileStore) adoptSupplied(ctx context.Context, root, mroot *os.Root, fl floor, old keys, newMaster []byte, started *bool) (keys, []planned, bool, error) {
-	k, err := deriveKeys(newMaster, s.scope)
+	k, err := deriveMasterKeys(newMaster, s.scope)
 	if err != nil {
 		return keys{}, nil, false, err
 	}
-	plan, committed, err := rewrapPlan(ctx, root, fl, old, &k)
+	plan, committed, err := s.rewrapPlan(ctx, root, fl, old, &k)
 	if err != nil && !errors.Is(err, ErrCorrupt) {
 		// Not "a record does not open": a cancelled ctx, an I/O error or a
 		// listing bound. Report it as itself, never as the refusal that
@@ -550,6 +530,19 @@ func (s *FileStore) discardNext(ctx context.Context, root, mroot *os.Root) error
 	if err != nil {
 		return err
 	}
+	err = s.eachScopeDir(ctx, root, func(_ string, dir *os.Root) error {
+		err := dir.Remove(scopeKeyName + newSuffix)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return syncDir(dir)
+	})
+	if err != nil {
+		return err
+	}
 	for _, n := range []string{masterNextFingerprintName, masterNextName} {
 		if err := mroot.Remove(n); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("discard %s: %w", n, err)
@@ -591,9 +584,9 @@ func eachEntryDir(ctx context.Context, root *os.Root, fn func(e *entry, files []
 	return nil
 }
 
-// anyNew reports whether any entry directory holds a .new file: whether step 3
-// of some Rewrap had started.
-func anyNew(ctx context.Context, root *os.Root) (bool, error) {
+// anyNew reports whether any entry directory holds a .new file, or any user
+// scope a scope.key.new: whether step 3 of some Rewrap had started.
+func (s *FileStore) anyNew(ctx context.Context, root *os.Root) (bool, error) {
 	found := false
 	err := eachEntryDir(ctx, root, func(_ *entry, files []string) error {
 		for _, f := range files {
@@ -603,6 +596,20 @@ func anyNew(ctx context.Context, root *os.Root) (bool, error) {
 		}
 		return nil
 	})
+	if err != nil {
+		return false, err
+	}
+	err = s.eachScopeDir(ctx, root, func(_ string, dir *os.Root) error {
+		_, err := dir.Lstat(scopeKeyName + newSuffix)
+		if err == nil {
+			found = true
+			return nil
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	})
 	return found, err
 }
 
@@ -611,6 +618,12 @@ func anyNew(ctx context.Context, root *os.Root) (bool, error) {
 type planned struct {
 	name string
 	cur  uint64
+	// scope, when set, makes this the scope.key of the user scope whose
+	// directory is .user/<scope> (rewrapscope.go), and name and cur unused.
+	scope string
+	// pin is, for a scope, what its scope.key held when it was planned,
+	// which its commit and the final check require it still holds.
+	pin scopePin
 }
 
 // rewrapPlan lists, sorted by name, every entry with the version its pointer
@@ -620,7 +633,7 @@ type planned struct {
 // an entry (an interrupted Put) is left out; one that List would report with
 // Err refuses the Rewrap, which would otherwise leave it sealed under a master
 // that no longer exists.
-func rewrapPlan(ctx context.Context, root *os.Root, fl floor, old keys, next *keys) ([]planned, bool, error) {
+func (s *FileStore) rewrapPlan(ctx context.Context, root *os.Root, fl floor, old keys, next *keys) ([]planned, bool, error) {
 	names, err := readDirNames(root, maxDirNames)
 	if err != nil {
 		return nil, false, err
@@ -645,9 +658,13 @@ func rewrapPlan(ctx context.Context, root *os.Root, fl floor, old keys, next *ke
 			return nil, false, fmt.Errorf("entry %q does not open, and a rewrap would leave it sealed under a master that no longer exists: remove it with rm, or restore it, first: %w", name, err)
 		}
 		committed = committed || underNext
-		out = append(out, planned{name, cur})
+		out = append(out, planned{name: name, cur: cur})
 	}
-	return out, committed, nil
+	scopes, underNext, err := s.planScopes(ctx, root, old, next)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(out, scopes...), committed || underNext, nil
 }
 
 // planEntry opens name's pointer, checked against the floor, and every
@@ -719,6 +736,12 @@ func (s *FileStore) sealNew(ctx context.Context, root *os.Root, fl floor, plan [
 		if err := loopCtx(ctx, i); err != nil {
 			return err
 		}
+		if p.scope != "" {
+			if err := s.sealScopeKey(root, p.scope, old, next); err != nil {
+				return err
+			}
+			continue
+		}
 		e, err := openEntry(root, p.name, fl)
 		if err != nil {
 			return err
@@ -759,6 +782,12 @@ func (s *FileStore) commitNew(ctx context.Context, root *os.Root, fl floor, plan
 	for i, p := range plan {
 		if err := loopCtx(ctx, i); err != nil {
 			return err
+		}
+		if p.scope != "" {
+			if err := s.commitScopeKey(root, p, old, next); err != nil {
+				return err
+			}
+			continue
 		}
 		e, err := openEntry(root, p.name, fl)
 		if err != nil {

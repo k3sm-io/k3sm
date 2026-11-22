@@ -136,6 +136,10 @@ type FileStore struct {
 	// euid is the effective uid that creates the store's directories, which
 	// a new directory must be owned by before it is handed over.
 	euid func() int
+	// userFloor and auditSink are the user-scope floor and the audit log
+	// (userlogs.go). New installs ones that refuse every call.
+	userFloor userFloorLog
+	auditSink auditSink
 }
 
 var _ Store = (*FileStore)(nil)
@@ -161,6 +165,8 @@ func New(cfg Config) *FileStore {
 		dirMade:        func(string) {},
 		dataRootLocked: func() {},
 		euid:           os.Geteuid,
+		userFloor:      unbuiltUserFloor{},
+		auditSink:      unbuiltAudit{},
 	}
 }
 

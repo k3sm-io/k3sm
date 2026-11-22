@@ -437,17 +437,18 @@ per-user delivery list. No record carries either yet, and a reader refuses them,
 kind byte not in "Record encoding", as `ErrCorrupt`. The entries'-directory name `.user` is
 reserved for user scopes too, and nothing creates it yet. The first-Put mint counts it as an
 entry, whatever its type, so a missing master with only `.user` present is
-`ErrMasterMissing`, never a new master. Rewrap refuses with `ErrScopeUnsupported`, writing
-nothing, while `.user` exists, whatever its type: this build cannot re-wrap user scopes, and a
-master rewrapped under them would leave them unreadable. The refusal names the reserved path,
-and says that a `.user` that is not a user scope must be removed by root. A user scope's store, its own key wrapped by the master, its
+`ErrMasterMissing`, never a new master. History: Phase A's Rewrap refused with
+`ErrScopeUnsupported`, writing nothing, while `.user` existed, whatever its type, since that
+build could not re-wrap user scopes and a master rewrapped under them would have left them
+unreadable; the refusal named the reserved path. The change that re-wraps scope keys lifted
+it (below). A user scope's store, its own key wrapped by the master, its
 non-root API, RBAC, delivery and on-disk location are specified under "User scope"; the
 scope is in the format now so that adding one needs no format change.
 
 Amended by the user scope: the user-scope store writes kind `0xFE` records (`scope.key`)
 and creates `.user`; the change that adds the sealed delivery record writes kind `0xFD`.
-The same change that adds the delivery record re-wraps scope keys in Rewrap and lifts the
-`ErrScopeUnsupported` refusal; every build before it keeps the refusal, so a rollback to one
+The same change that adds the delivery record re-wraps scope keys in Rewrap and lifted the
+`ErrScopeUnsupported` refusal; every build before it kept the refusal, so a rollback to one
 cannot rewrap the master out from under user scopes ("User scope", "Rewrap of scope keys").
 
 ### Master file trust
@@ -654,11 +655,12 @@ the conservative way:
   key; otherwise it is `ErrCorrupt` and is not renamed. Before step 5 `master.next` is read
   again, and after its rename `master` is read back; each must be the key the records were
   sealed under, or the Rewrap stops with `ErrMasterUntrusted` before the fingerprint rename.
-- *A `.user` created during the run* is caught by one more check, right before step 5: the
-  Rewrap stops with `ErrScopeUnsupported`, the master not swapped and `master.next` still
-  agreeing, every record readable, and a rerun with the same key completes it once `.user`
-  is gone. This refusal, and the `.user` refusal in the list below, are lifted by the change
-  that re-wraps scope keys ("User scope", "Rewrap of scope keys").
+- *A `.user` created during the run* was, in Phase A, caught by one more check right before
+  step 5: the Rewrap stopped with `ErrScopeUnsupported`, the master not swapped. That check,
+  and the `.user` refusal in the list below, are history: the change that re-wraps scope keys
+  lifted them ("User scope", "Rewrap of scope keys"). In their place, right before step 5, the
+  Rewrap walks `.user` again and refuses with `ErrCorrupt`, the master not swapped, unless the
+  scopes holding a `scope.key` are exactly those it re-sealed.
 - *Recovery for a stuck `master.next`.* If the service user replaces or removes
   `master.next` mid-run, after some record has moved, those records are sealed under the
   caller's new key, which then exists only as the caller's input; the next run's step 2
@@ -1306,9 +1308,33 @@ record at the previous sequence plus 1; the empty record the mint writes is sequ
 **Rewrap of scope keys.** The change that adds quotas and the delivery record extends
 Rewrap's two-phase procedure with one class of record: each `scope.key`, re-sealed under the
 new `W`. User records stay sealed under their `K_u`, byte for byte unchanged, and the run is
-resumable at every step as G12 requires (U12). Until that change, Rewrap refuses with
-`ErrScopeUnsupported` while a `.user` directory exists (U5), which is what keeps a rollback
-to an earlier build from orphaning user scopes.
+resumable at every step as G12 requires (U12). Before that change, Rewrap refused with
+`ErrScopeUnsupported` while a `.user` directory existed (U5), which is what keeps a rollback
+to an earlier build from orphaning user scopes. No user scope existed outside the package
+before that change: the user scope was reachable only from inside `pkg/keystore`, a gate a
+test enforces (`TestUserScopeIsUnexported`), so no build ever shipped a scope without its
+`deliveries` record, and none needs a migration.
+
+**One damaged scope blocks Rewrap.** Rewrap refuses, writing nothing, while any scope's
+`scope.key` does not open, a scope directory or `.user` is not one the store trusts, a
+`scope.key.new` is not a file Rewrap wrote, `.user` holds a stray directory named for a uid that
+can never own a scope (below 501, the service uid, or above 2147483647), which root removes by
+hand, or `.user` lists past its name bound: re-wrapping
+past it would leave that scope sealed under a master that no longer exists. The refusal is
+`ErrCorrupt` and names the scope. After committing every `scope.key`, and before it swaps
+the master, Rewrap re-opens each planned `scope.key` under the new `W`; one swapped back to an
+old copy or damaged since its commit refuses the swap, so the old master is not retired under
+it. Rewrap pins each scope's `K_u` (by a fingerprint, never the key), generation and created
+time when it plans the scope, and its commit and that last check refuse (`ErrCorrupt`) a
+`scope.key` that no longer holds them, even one that opens under the new `W`. The recovery is root's: restore the scope from a backup, then run `rewrap` again. Removing
+that scope's directory `.user/<uid>/` by hand recovers only a user who never delivered (its
+owner loses its values and re-puts them): for one who did, the user-scope floor records the
+`deliveries` record past its first sequence, and the owner's next put refuses to mint a fresh
+scope over it. For that user the recovery is `rm-scope`, which a later change builds. Until it
+lands, root removes `.user/<uid>/` and runs `sudo k3sm keys floor --rebuild`, and the cost is
+the whole store's: rebuild writes the floor from what is on disk, so it lowers every record's
+floor, for every user, to the sequence on disk at that moment, and a copied-back older record
+already in place is accepted from then on. Rewrap's refusal is correct either way and stays.
 
 **Rewrap does not re-key `K_u`.** It re-seals each `scope.key` under the new `W`, but the
 `K_u` inside is the same 32 bytes, and every user record stays sealed under it. So an old master
@@ -1323,7 +1349,11 @@ that each user re-puts their values, with new credentials from each value's issu
 
 Each user scope holds at most 256 entries, 16 MiB of sealed records and 64 live entries in its
 `deliveries` record. Over the first two, `put` and `rotate` answer `ErrQuota`; over the third,
-`deliver` does; `rm` and `withdraw` still work (U13).
+`deliver` does; `rm` and `withdraw` still work (U13). The byte budget counts every file in every
+entry directory, each entry's `generation` file included, and the `deliveries` record. `rm`
+makes room; a `withdraw` does not, since its tombstone counts until its Secret is gone, when the
+reconciler's pruning (a later change) reclaims it. The `quota` error says so and never claims a
+withdrawal frees room.
 
 **When `rotate` gets `ErrQuota`.** Retention is unbounded, so an entry rotated often fills the
 byte budget. The recovery is `rm` then `put`: `rm` frees every version of the entry and `put`
@@ -1345,8 +1375,57 @@ store refuses to read or write a sealed record over 1,056 KiB.
 
 - *`deliver` is refused at the bound.* It adds an entry, and answers `quota` when the record
   has 64 live entries or 320 in all.
-- *Revocation always succeeds.* A withdrawal turns a live entry into a tombstone in place, so
-  it never adds an entry, never grows the record and is never refused for the bound.
+- *Revocation always succeeds,* with the residuals below. A withdrawal turns a live entry
+  into a tombstone in place, so it never adds an entry, never grows the record and is never
+  refused for the bound. It is
+  monotone, so it needs nothing a grant needs: it opens `scope.key` with the generation the
+  record authenticates under `W`, never the live GeneratedUID lookup (a lookup that times out,
+  fails or answers for a new owner of the uid does not stop it), it opens `scope.key` under the
+  live `W` or `master.next`'s, so it runs at every step of a Rewrap, and a floor it cannot read
+  does not stop it: it writes the tombstone at the record's sequence plus 1 and appends the
+  floor line it can. In place of the floor it checks the record against the highest sequence
+  the store process has read or written for that scope and generation, an in-memory mark
+  raised on every successful read and write and shared by every store handle in the process
+  (keyed by the keystore directory too, so two keystores keep apart), and refuses (`ErrCorrupt`) to re-seal a record
+  below it, so a copied-back older record does not come back at a later sequence with a later
+  tombstone lost. A withdrawal of a UID already withdrawn appends the record's floor line
+  again, so a floor line an earlier withdrawal could not append is written by the next one; the
+  floor keeps the highest sequence, so the repeat is idempotent. `rm` is a revocation too: it
+  only removes files, so it needs neither `W` nor `K_u`, and is never refused for a lookup
+  that ran and failed or timed out, or for `ErrRewrapInProgress`. A lookup refused at once for
+  capacity, where none ran (eight already outstanding, or an earlier call for the uid stuck past
+  its deadline), refuses `rm` with a retryable error and removes nothing: going ahead on it would
+  let a burst of stuck lookups stand in for the owner check. A withdrawal does no lookup, so it
+  goes ahead in every case. A lookup that answers a real
+  GeneratedUID other than the one `scope.key` records refuses it with `ErrScopeOwnerChanged`:
+  the uid was reused, and its new holder must not delete the former owner's values (root
+  removes such a scope).
+  *Residual (floor unreadable at a withdrawal).* With the floor unreadable, the withdrawal
+  cannot check the record against it, only against the process's in-memory mark. A copy put
+  back below a sequence this process has not seen (after a restart, say) is re-sealed with the
+  tombstone at its own sequence plus 1. That record is at or below the floor, so the next read
+  with a readable floor refuses it, except when it was exactly one behind, where the re-sealed
+  copy is accepted and a later tombstone or a grant the copy predates is lost; the reconciler's
+  target-matching delete and `doctor`'s floor check are what notice it.
+  *Residual (record below a readable floor).* A withdrawal whose record is below a floor it
+  can read is refused (`ErrCorrupt`, the user-scope floor message): re-sealing it would bring
+  back a list the floor already says was replaced. The withdrawal waits on the root remedy:
+  restore the current record, or, for a deliberate restore, `sudo k3sm keys floor --rebuild`,
+  then withdraw again.
+  *Residual (a refused revocation).* A withdrawal or an `rm` can still be refused: by the store
+  lock held past its wait, or by damage a process running as the service uid did to the scope
+  (a `scope.key` or record it rewrote, a directory it replaced). The store cannot rule out the
+  service uid, so the remedy is the reconciler's: it treats a withdrawal that is refused or
+  errors as "delete the delivered Secret anyway", so the value leaves the cluster whatever the
+  record says. That rule is owed by the reconciler change, not this one.
+  *Residual (withdrawal ignores ownership).* A withdrawal does no GeneratedUID lookup, by
+  design, so when a uid is reused its new holder can withdraw the former owner's deliveries.
+  That costs availability (a delivered Secret is deleted), never access: a withdrawal only
+  adds a tombstone, and opens and returns no value.
+  *Residual (no lines in this build).* Until the real append-only floor and audit log land,
+  `New` installs ones that refuse every call, and a revocation commits regardless: its tombstone
+  or removal stands, and it is reported (`errCommitted`) with no audit line and no floor line
+  written for it.
 - *A tombstone is pruned once its target is no longer its Secret.* The reconciler removes a
   withdrawn entry when its recorded target is not this UID's owned Secret, gone or held by a
   Secret that fails the ownership test for this UID, on two observations at least 60 s apart
@@ -1690,7 +1769,12 @@ refused before its first frame:
   their whole run, so no line can land in a file they are replacing. An append waits at most
   2 seconds for the lock: past that, a socket operation fails with `busy`, the reconciler reads
   `ErrBusy` as `Indeterminate` (a revocation first retries, below), and a pre-frame refusal
-  still closes the connection and counts its line as dropped (U22).
+  still closes the connection and counts its line as dropped (U22). In `pkg/keystore` a grant
+  appends inside the hold it writes under, a revocation commits and then appends inside the
+  same hold, and a refusal after the lock was taken appends before it is released; a refusal
+  that came before the lock takes it briefly to append, and one for which the lock cannot be
+  had (the keystore directory missing, the lock held past its wait, an invalid configuration)
+  is not audited rather than appended without it.
 - **Lock modes and fairness.** Reads (`list`, `read-for-exec`, `deliveries` and the
   reconciler's reads) take the store lock shared, and their audit lines are appended under that
   shared hold, which excludes the maintenance verbs as an exclusive hold does; the server
@@ -1714,11 +1798,18 @@ refused before its first frame:
     the lock exclusively for at most 250 ms in any second. Many uids together can push another
     uid's wait past the 2-second bound, which is `busy`, never a refusal for the share and
     never a deletion.
-- **Order: commit, then append, then reply.** A socket operation commits its change to the
-  store, then appends its audit line, then replies. If the append fails after the commit, the
-  change stands and the reply says so: `ok` with the warning `committed; audit failed`, which
-  the CLI prints. The server counts every such unaudited operation in memory, and `doctor`
-  shows the count (U112).
+- **Order: a grant appends first; a revocation commits first.** A grant (a user `put`, and
+  `deliver`, each with the scope's mint) appends its audit line before its first write, after
+  every refusal it can give, and only then commits: a failed append refuses it and nothing is
+  written, the mint's directories included, so no grant takes effect unrecorded. A refusal
+  before that point is audited best effort with its result, and a commit that fails after the
+  line gets a second line with its result. Every other socket operation, and the revocation
+  class above all (`withdraw`, `rm`, `rotate`), commits its change to the store, then appends
+  its audit line, then replies. If the append fails after the commit, the change stands and the
+  reply says so: `ok` with the warning `committed; audit failed`, which the CLI prints. The
+  server counts every such unaudited operation in memory, and `doctor` shows the count (U112).
+  An audit line carries only validated fields; a field that failed its grammar is a fixed
+  placeholder.
 - **Fail closed, except for revocations.** While appends fail (a full disk, an I/O error), the
   server refuses user mutations and reads (`list`, `read-for-exec`, `deliveries`) until an
   append succeeds (U32). The revocation class is the exception: a socket `withdraw`, `rm` or
@@ -2300,7 +2391,13 @@ default from "Typed credentials", refusing an `ssh` entry).
   each `LP(field) ‖ LP(key)` ("Typed credentials", U14, U41, U161). The digest is over those
   values only, as the live object's spec gives them, never over the object's serialised shape,
   so a field the API server adds changes no digest, and a reorder of `items` changes none
-  either. `requestedBy` is not in the digest and needs no place there: check 1 below holds
+  either. The store holds each field to its KeyDelivery grammar when it adds an entry and
+  again when it parses the record, so a record a writer could not have produced is
+  `ErrCorrupt`: `metadata.uid` UUID-shaped, `metadata.name` and `secretName` DNS-1123
+  subdomains (at most 253), `namespace` a DNS-1123 label (at most 63), `entry` a user entry,
+  `requestedBy` matching `RequestedByPattern` and equal to `k3sm:local:<the entry's uid>`,
+  each item's `field` in the Fields table and its `key` a Secret data key. A refused add's
+  audit line carries a fixed placeholder for the fields, never the values. `requestedBy` is not in the digest and needs no place there: check 1 below holds
   `requestedBy` to the owner of the entry the digest binds, and the CRD's cross-field rule ties
   it to the entry's uid, so an object whose requester is changed under its UID fails check 1
   (`EntryUnavailable`) while a retargeted one fails the digest. The record keeps `requestedBy`
@@ -4010,16 +4107,16 @@ carried by the unit rows.
 | U2 | AAD scope: a record moved between scopes fails to open, and two users derive different keys; a record opened as another user is refused | `k3sm/pkg/keystore::TestScopeBindsRecords`, `TestDerivedKeysDifferByScope` | partial: the first two checked (the core store's scope binding); pending: a record opened as another user is refused (the user-scope store) |
 | U3 | KDF labels take the scope; `checkScope` accepts only `system` and `user/<decimal uid>`; kinds 0xFE and 0xFD are reserved | `k3sm/pkg/keystore::TestDerivedKeysDifferByScope`, `TestCheckScope`, `TestParseRecordRefusesMalformed` | checked: the core store's scope binding |
 | U4 | the first-Put mint refuses with `.user` present and the master missing | `k3sm/pkg/keystore::TestMintCountsReservedUserName` | checked: the core store's scope binding |
-| U5 | Rewrap refuses with `ErrScopeUnsupported` while `.user` exists (replaced by U12 when scope keys are re-wrapped) | `k3sm/pkg/keystore::TestRewrapRefusesWhileUserScopesExist` | checked: Rewrap |
+| U5 | replaced by U12: Rewrap no longer refuses with `ErrScopeUnsupported` while `.user` exists; a `.user` that is a file or a symlink, which no user scope can be, refuses with `ErrCorrupt`, writing nothing | `k3sm/pkg/keystore::TestRewrapRefusesDamagedUserScopes` | checked: scope-key Rewrap |
 | U6 | `scope.key` is sealed under `W`, bound to the GeneratedUID; a mismatch is `ErrScopeOwnerChanged` | `k3sm/pkg/keystore::TestScopeKeyGeneratedUIDMismatch` | checked: the user-scope store |
 | U7 | the GeneratedUID lookup past its deadline, 250 ms everywhere, or in error fails closed; `mbr_uid_to_uuid` is in the symbol canary (seams: GeneratedUID lookup, clock) | `k3sm/pkg/keystore::TestGeneratedUIDLookupDeadlineFailsClosed`; `k3sm/internal/hostacl::TestMbrUIDToUUIDSymbolCanary` (integration) | checked: the user-scope store |
 | U8 | a scope's records open only under its `K_u`; a copied `.user/<uid>/` without the master opens nothing | `k3sm/pkg/keystore::TestScopeCopyWithoutMasterOpensNothing` | checked: the user-scope store |
 | U9 | per-scope fingerprints differ for equal values in two scopes | `k3sm/pkg/keystore::TestFingerprintsDifferAcrossScopes` | checked: the user-scope store |
 | U10 | `user/<other>/…` is `ErrNotFound`, same text as an absent entry; a short name resolves to the uid and is printed | `k3sm/pkg/keystore::TestOtherUserIsNotFound`, `TestShortNameResolvesToUID` | checked: the user-scope store |
 | U11 | the Go resolver takes the grammar from `apis/keystore/entry` and passes the shared entry-grammar vectors; `checkScope` refuses `user/0`; an all-digit second segment resolves as a uid even when an account of that name exists; `pkg/keystore` imports no Kubernetes package; Phase A's `checkName`, as a fourth consumer, gives every valid-scope vector's verdict on its name part | `k3sm/pkg/keystore::TestEntryGrammarVectorsResolver`, `TestEntryGrammarVectorsCheckName`, `TestCheckScopeRefusesUserZero`, `TestAllDigitSegmentIsAlwaysUID`, `TestKeystoreIsKubernetesFree` | checked: the user-scope store |
-| U12 | master Rewrap re-wraps every `scope.key` and leaves user records byte-identical; resumable at every step | `k3sm/pkg/keystore::TestRewrapRewrapsScopeKeysResumable` (fault injection, as G12) | pending: user-scope quotas, scope-key Rewrap and the delivery record |
-| U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; the 65th live delivery answers `ErrQuota` to `deliver`; `rm` and `withdraw` still work | `k3sm/pkg/keystore::TestUserScopeQuota`, `TestDeliveryRecordQuota` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
-| U14 | the delivery record stores UID, the full target tuple (`entry`, `namespace`, `secretName`, `items`, `requestedBy`) under its seal, and the target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label; the digest covers `entry`, `namespace`, `secretName` and the key-sorted `items`, and a reorder of `items` leaves it unchanged | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel`, `TestDeliveryDigestCoversTargetAndItems` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U12 | master Rewrap re-wraps every `scope.key` and leaves user records byte-identical; resumable at every step | `k3sm/pkg/keystore::TestRewrapRewrapsScopeKeysResumable` (fault injection, as G12), `TestRewrapRefusesDamagedScopeTree`, `TestRewrapVerifiesScopeKeysBeforeSwap`, `TestRewrapRefusesStrayScopeDirs`, `TestRewrapPinsScopeKeyFromPlan` | checked: user-scope quotas, scope-key Rewrap and the delivery record |
+| U13 | quotas: the 257th entry and the byte budget answer `ErrQuota`; the 65th live delivery answers `ErrQuota` to `deliver`; `rm` and `withdraw` still work | `k3sm/pkg/keystore::TestUserScopeQuota`, `TestUserScopeQuotaCountsDeliveriesAndGeneration`, `TestDeliveryRecordQuota`, `TestRevocationIsUnconditional`, `TestWithdrawFloorFaults`, `TestWithdrawRefusesRollbackBelowSeen`, `TestWithdrawBelowReadableFloorRefused`, `TestDeleteOwnerChanged`, `TestRmLookupRefusalKinds`, `TestDeliveriesSeenIsProcessWide` | checked: user-scope quotas, scope-key Rewrap and the delivery record |
+| U14 | the delivery record stores UID, the full target tuple (`entry`, `namespace`, `secretName`, `items`, `requestedBy`) under its seal, and the target digest; add, look up and withdraw round-trip under the floor; the plaintext starts with the format version byte and the digest with the `k3sm-keystore-delivery-target/v1` label; the digest covers `entry`, `namespace`, `secretName` and the key-sorted `items`, and a reorder of `items` leaves it unchanged | `k3sm/pkg/keystore::TestDeliveryRecordDigestRoundTrip`, `TestDeliveryRecordVersionByteAndDigestLabel`, `TestDeliveryDigestCoversTargetAndItems`, `TestDeliveryFieldGrammarAtAdd`, `TestDeliveryFieldGrammarAtParse` | checked: user-scope quotas, scope-key Rewrap and the delivery record |
 | U15 | (reserved for the K0 amendment if leg 5 finds a second Pod-uid path) | none | pending: K0 amendment |
 | U16 | every Pod profile variant (native, vm, container-vm, xcode, expose-paths, wasm (a native Pod whose process is the `k3sm-wasmhost` helper, `runtimed/pkg/wasmhost/doc.go:20`), the profile an exec-session process runs under (`runtimed/pkg/execsession/doc.go:17`), a custom Pod root distinct from the data root) denies every `keystore-*` name in the data root and the `keystore-sock/` tree; the keystore names are in `DataRootDenyTrees` and so in `protectedPrefixes`; `ReadOnlyPaths`, `ExposePaths` or a hostPath naming the data root or a keystore path is refused; an empty `Posture.DataRoot` still gets the denies under the work dir; a vm or container-vm guest gets no data-root share; over the whole rendered profile of every variant, including a Pod root equal to the data root and a Pod root that is a parent of it, no emitted allow matches any keystore path; the keystore stanza is the profile's last rule, written in the `/var`, `/private/var` and `/System/Volumes/Data` spellings, and the `keystore-` prefix deny is a regex rule in either letter case; a caller path naming a keystore path is refused with `ErrProtectedPath` and a pods root under a `keystore-*` name is refused; beside the read and connect cases, a file write, create, unlink and rename and a `network-bind` on `keystore-sock/`, on `keys.sock` and on every `keystore-*` name are each refused; every case also holds through `/System/Volumes/Data/private/var/lib/k3sm/...` and through the data volume's mount path | `runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile`, `TestShimProfileKeepsTheKeystoreDeniesLast`, `TestKeystoreDenyStanzaShape`, `TestDataRootRefusesPodRootUnderKeystoreName`, `TestValidateRefusesKeystoreExtraPaths`, `TestEmptyDataRootFailsClosed`, `TestDataRootRefusesWhatCannotHoldTheDeny`, `TestKeystoreDeniesUnderSandboxExec`; rig leg E10 | checked: runtimed's sandbox change |
 | U17 | runtimed refuses a Pod identity it may not hold through `Credential.CheckPodIdentity` (`pkg/supervisor/privdrop.go`), not in `resolveCredential`: at `startContainer`, at `Exec` (an exec session), at the resident shim's `dropShim` and in `RunLaunchSequence`. A drop target uid is refused if it is 0, negative, 501 or above, or the service uid; groups are refused if they are 0, 20, 80, the privileged system groups (wheel, daemon, kmem, sys, tty, operator, procview, procmod, _developer), the service gid, negative or out of range, and a gid of 501 or above is refused unless it is an admitted `fsGroup`; a missing group defaults to `nobody`; a gid-only drop that leaves uid 0 is refused; an inherited uid with no drop (the daemon's own euid: the service uid, a rootless server's login uid or root on a root daemon) is allowed. The system gids (1, 2, 3, 4, 5, 8, 9, 204) are refused as the primary gid and as a supplemental gid (`runtimed/pkg/supervisor::TestRunLaunchSequenceRefusesPodGroups`, `runtimed/pkg/runtime::TestPodGroupsRefused`, `runtimed/pkg/supervisor::TestFSGroupGidAllowList`). A gid in 1..500 is refused for a Pod drop, as the primary or a supplemental group, when the host assigns it; an unassigned gid is allowed, and so is `nobody`; the never-list is always refused, a lookup error refuses, and an operator-admitted `fsGroup` the host assigns is still refused (`runtimed/pkg/supervisor::TestPodGroupsHostAssigned`). The service identity (the `_k3sm` lookup and the owners of the installed directories) is resolved again on every drop check (`runtimed/pkg/runtime::TestStartContainerResolvesTheServiceOwnerEachStart`), and a symlink at an installed path refuses every drop (`runtimed/pkg/runtime::TestSymlinkedWorkDirRefusesDrops`). When the account lookup returns not-found, a drop to the owner of the installed work dir or the keystore socket dir is refused (the installed service-uid fallback: `runtimed/pkg/supervisor::TestResolveServiceIdentityInstalledOwner`, `runtimed/pkg/runtime::TestServiceUIDFromInstalledDirs`). The live check is strict, a denial is an EPERM and planting is included (`runtimed/pkg/sandbox::TestKeystoreDeniesUnderSandboxExec`, `runtimed/pkg/sandbox::TestShimProfileKeepsTheKeystoreDeniesLast`) | `runtimed/pkg/runtime::TestStartContainerRefusesAPodIdentity`, `TestExecRefusesAPodIdentity`, `TestPodUIDInLoginRangeRefused`, `TestPodGroupsRefused`, `TestServiceUIDFromInstalledDirs`; `runtimed/internal/execshim::TestDropShim`; `runtimed/pkg/runtime::TestStartContainerResolvesTheServiceOwnerEachStart`, `TestSymlinkedWorkDirRefusesDrops`; `runtimed/pkg/supervisor::TestRunLaunchSequenceRefusesPodUID`, `TestRunLaunchSequenceRefusesPodGroups`, `TestFSGroupGidAllowList`, `TestResolveServiceIdentityInstalledOwner`, `TestPodGroupsHostAssigned`; `runtimed/pkg/sandbox::TestKeystoreDeniesUnderSandboxExec`, `TestShimProfileKeepsTheKeystoreDeniesLast`; rig legs E21, E22 | checked: runtimed's sandbox change |
@@ -4106,7 +4203,7 @@ carried by the unit rows.
 | U98 | the sealed `deliveries` record stores each delivery's KeyDelivery `metadata.name`; the orphan sweep checks the object with a live Get by that name sent to the API server, never an informer cache and never a List; not found, or another UID, deletes only on two consecutive observations at least 60 s apart, and any other answer in between resets the count; no sweep runs before the KeyDelivery and Secret informers sync | `k3sm/pkg/keystore/reconcile::TestOrphanSweepUsesLiveGetByName`, `TestOrphanSweepNeedsTwoObservations` | pending: the KeyDelivery reconciler (lifecycle) |
 | U99 | under the store lock, before every audit or floor append, the server compares its descriptor's `(dev, ino)` with the canonical name's and reopens on a mismatch, recounting the per-uid shares from the new file; `audit --rotate` and `floor --rebuild` each complete while the server never saw the marker, and every later line lands in the new canonical file, none in an archive or an unlinked file (seam: chflags flag source) | `k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch` | pending: the socket listener (the server append path) |
 | U100 | a departed account with an unreused uid is reported, not acted on: `doctor` lists every scope whose uid has no directory record (a synthesized GeneratedUID) with its delivery count; each of that scope's deliveries gets `SecretRetained=True` with reason `OwnerUnresolvable`, and no Secret is deleted (seam: GeneratedUID lookup) | `k3sm/cmd/k3sm::TestDoctorListsUnresolvableScopes`, `k3sm/pkg/keystore/reconcile::TestOwnerUnresolvableRetainedCondition` | pending: the KeyDelivery reconciler (lifecycle) |
-| U101 | `rewrap` prints a warning whenever `.user/` exists, before it starts and when it finishes, saying Rewrap does not re-key `K_u` and naming the procedure: each user re-puts their values after a suspected master exposure; with no `.user/` it prints none (seam: euid source) | `k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist` | pending: user-scope quotas, scope-key Rewrap and the delivery record |
+| U101 | `rewrap` prints a warning whenever `.user/` exists, before it starts and when it finishes, saying Rewrap does not re-key `K_u` and naming the procedure: each user re-puts their values after a suspected master exposure; with no `.user/` it prints none (seam: euid source) | `k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist` | checked: user-scope quotas, scope-key Rewrap and the delivery record |
 | U102 | the sealed record stores the last delivered version per delivery, raised after the Secret write succeeds; the repair-versus-owner classifier uses only that recorded version: a Secret whose version annotation is rewritten and a KeyDelivery whose `status.deliveredVersion` is rewritten each leave the charge unchanged, a repair stays on the reconciler budget and an owner's new version stays charged to the owner | `k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus` | pending: the KeyDelivery reconciler (lifecycle) |
 | U103 | a Secret at a recorded target whose label or owner annotation was removed is never overwritten or deleted, under a revocation, the object's deletion and `rm-scope` alike; the KeyDelivery gets `SecretRetained=True` with reason `LabelRemoved`, and `doctor` names the Secret and the KeyDelivery | `k3sm/pkg/keystore/reconcile::TestStrippedLabelReportedNotDeleted` | pending: the KeyDelivery reconciler (lifecycle) |
 | U104 | the socket's directory is root's: run as root (a root-run row, `--root`), install creates `keystore-sock/` root:wheel 0755 and the server plist carries a `Sockets` listener for `keystore-sock/keys.sock`; a process running as the service uid cannot unlink, replace or bind `keys.sock`, whether or not the server runs, and gets `EACCES` | `k3sm/pkg/install::TestSocketDirRootOwnedServiceUIDCannotBind` (integration, root-run); rig leg E24 | pending: the socket listener |

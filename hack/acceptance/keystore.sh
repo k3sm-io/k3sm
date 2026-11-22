@@ -463,8 +463,8 @@ check G10 "the master is minted only by the first put, never over entries; rewra
 check G11 "the master is judged on the open descriptor" TestMasterTrust
 check G12 "Rewrap resumes after a crash at every step, old key then new, nothing unreadable; a bad master.next is discarded only with no .new file" \
 	TestRewrapCrashAtEveryStep TestRewrapKeyReuse TestRewrapRefusesStalePointer TestRewrapVerifiesCommit TestRewrapGuards \
-	TestRewrapRefusesLiveMasterFirst TestRewrapUserScopesBeforeSwap TestRewrapRecoversReplacedNext \
-	TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata TestRewrapUserScopesUnderLock \
+	TestRewrapRefusesLiveMasterFirst TestRewrapRecoversReplacedNext \
+	TestRewrapRemovesStaleNew TestRewrapOverFullFloor TestRewrapCommitChecksMetadata \
 	TestInterruptedRewrap TestRecordsSealedUnder TestRewrapNotStarted
 check G13 "a crash between the master renames leaves a trusted master, and the next verb completes the swap" \
 	TestRewrapMasterRenameCompleted TestFinishSwapLeavesUnmatchedFingerprint
@@ -514,8 +514,8 @@ check U3 "KDF labels take the scope; checkScope accepts only system and user/<de
 	TestDerivedKeysDifferByScope TestCheckScope TestParseRecordRefusesMalformed
 check U4 "the first-Put mint refuses with .user present and the master missing" \
 	TestMintCountsReservedUserName
-check U5 "Rewrap refuses with ErrScopeUnsupported, writing nothing, while .user exists as a directory, a file or a symlink" \
-	TestRewrapRefusesWhileUserScopesExist
+check U5 "replaced by U12: Rewrap no longer refuses with ErrScopeUnsupported while .user exists; a .user that is a file or a symlink refuses with ErrCorrupt, writing nothing" \
+	TestRewrapRefusesDamagedUserScopes
 check U6 "scope.key is sealed under W, bound to the GeneratedUID; a mismatch is ErrScopeOwnerChanged" \
 	TestScopeKeyGeneratedUIDMismatch
 check U7 "the GeneratedUID lookup past its deadline, 250 ms everywhere, or in error fails closed; mbr_uid_to_uuid is in the symbol canary" \
@@ -528,12 +528,14 @@ check U10 "user/<other>/... is ErrNotFound, same text as an absent entry; a shor
 	TestOtherUserIsNotFound TestShortNameResolvesToUID
 check U11 "the Go resolver and Phase A's checkName pass the shared entry-grammar vectors; pkg/keystore imports no Kubernetes package" \
 	TestEntryGrammarVectorsResolver TestEntryGrammarVectorsCheckName TestCheckScopeRefusesUserZero TestAllDigitSegmentIsAlwaysUID TestKeystoreIsKubernetesFree
-pend U12 "master Rewrap re-wraps every scope.key and leaves user records byte-identical; resumable at every step, by fault injection as G12 (user-scope store)" \
-	TestRewrapRewrapsScopeKeysResumable
-pend U13 "quotas: the 257th entry and the byte budget answer ErrQuota, and so does the 65th live delivery; rm and withdraw still work (user-scope store)" \
-	TestUserScopeQuota TestDeliveryRecordQuota
-pend U14 "the delivery record stores UID, the full target tuple under its seal, and target digest; add, look up and withdraw round-trip under the floor; the digest covers entry, namespace, secretName and the key-sorted items, a reorder leaving it unchanged (user-scope store)" \
-	TestDeliveryRecordDigestRoundTrip TestDeliveryRecordVersionByteAndDigestLabel TestDeliveryDigestCoversTargetAndItems
+check U12 "master Rewrap re-wraps every scope.key and leaves user records byte-identical; resumable at every step, by fault injection as G12" \
+	TestRewrapRewrapsScopeKeysResumable TestRewrapRefusesDamagedScopeTree TestRewrapVerifiesScopeKeysBeforeSwap TestRewrapRefusesStrayScopeDirs TestRewrapPinsScopeKeyFromPlan
+check U13 "quotas: the 257th entry and the byte budget answer ErrQuota, and so does the 65th live delivery; rm and withdraw still work" \
+	TestUserScopeQuota TestUserScopeQuotaCountsDeliveriesAndGeneration TestDeliveryRecordQuota TestRevocationIsUnconditional TestWithdrawFloorFaults TestWithdrawRefusesRollbackBelowSeen TestWithdrawBelowReadableFloorRefused TestDeleteOwnerChanged TestRmLookupRefusalKinds TestDeliveriesSeenIsProcessWide
+check U14 "the delivery record stores UID, the full target tuple under its seal, and target digest; add, look up and withdraw round-trip under the floor; the digest covers entry, namespace, secretName and the key-sorted items, a reorder leaving it unchanged" \
+	TestDeliveryRecordDigestRoundTrip TestDeliveryRecordVersionByteAndDigestLabel TestDeliveryDigestCoversTargetAndItems TestDeliveryFieldGrammarAtAdd TestDeliveryFieldGrammarAtParse
+check U101 "rewrap prints a warning whenever .user/ exists, before it starts and when it finishes, saying Rewrap does not re-key K_u and naming the procedure: each user re-puts their values after a suspected master exposure; with no .user/ it prints none" \
+	k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist
 check U16 "every pod profile variant (native, vm, container-vm, xcode, expose-paths, wasm, the profile an exec-session process runs under, a custom pod root distinct from the data root) denies every keystore path, the keystore-sock/ tree included, the protected-prefix validator refusing any re-allow onto one, since the order of denies and allows protects nothing; a hostPath or expose path onto the data root is refused; an empty data root fails closed; over the whole rendered profile, a pod root equal to or a parent of the data root included, no emitted allow matches a keystore path; the keystore stanza is the profile's last rule, in the /var, /private/var and /System/Volumes/Data spellings, with a case-folded regex keystore- prefix deny; a caller path naming a keystore path is refused with ErrProtectedPath; a write, create, unlink, rename and network-bind on keystore-sock/, keys.sock and every keystore-* name are refused; each also through /System/Volumes/Data/private/var/lib/k3sm and the data volume's mount path; rig leg E10 (sandbox denies)" \
 	runtimed/pkg/sandbox::TestDataRootDeniesKeystorePathsEveryProfile TestShimProfileKeepsTheKeystoreDeniesLast TestKeystoreDenyStanzaShape TestDataRootRefusesPodRootUnderKeystoreName TestValidateRefusesKeystoreExtraPaths TestEmptyDataRootFailsClosed TestDataRootRefusesWhatCannotHoldTheDeny TestKeystoreDeniesUnderSandboxExec
 check U17 "runtimed refuses a pod identity it may not hold through Credential.CheckPodIdentity (pkg/supervisor/privdrop.go), not in resolveCredential: at startContainer, at Exec (an exec session), at the resident shim's dropShim and in RunLaunchSequence; a drop target uid is refused if it is 0, negative, 501 or above, or the service uid; groups are refused if they are 0, 20, 80, the privileged system groups (wheel, daemon, kmem, sys, tty, operator, procview, procmod, _developer), the service gid, negative or out of range, and a gid of 501 or above unless it is an admitted fsGroup; a missing group defaults to nobody; a gid-only drop that leaves uid 0 is refused; an inherited uid with no drop is allowed; a gid in 1..500 is refused for a pod drop, as the primary or a supplemental group, when the host assigns it (an unassigned gid is allowed, and so is nobody; the never-list is always refused, a lookup error refuses, and an operator-admitted fsGroup the host assigns is still refused); the service identity (the _k3sm lookup and the owners of the installed directories) is resolved again on every drop check; a symlink at an installed path refuses every drop; the system gids (1, 2, 3, 4, 5, 8, 9, 204) are refused as the primary gid and as a supplemental gid; when the account lookup returns not-found, a drop to the owner of the installed work dir or the keystore socket dir is refused (the installed service-uid fallback); the live check is strict, a denial is an EPERM and planting is included; rig legs E21, E22 (sandbox denies)" \
@@ -711,8 +713,6 @@ pend U99 "under the store lock, before every audit or floor append, the server c
 	k3sm/pkg/keystore/socket::TestAppendReopensOnInodeMismatch
 pend U100 "a departed account with an unreused uid is reported, not acted on: doctor lists every scope whose uid has no directory record (a synthesized GeneratedUID); each of that scope's deliveries gets SecretRetained=True with reason OwnerUnresolvable, and no Secret is deleted (KeyDelivery lifecycle)" \
 	k3sm/cmd/k3sm::TestDoctorListsUnresolvableScopes k3sm/pkg/keystore/reconcile::TestOwnerUnresolvableRetainedCondition
-pend U101 "rewrap prints a warning whenever .user/ exists, before it starts and when it finishes, saying Rewrap does not re-key K_u and naming the procedure: each user re-puts their values after a suspected master exposure; with no .user/ it prints none (user-scope quotas, scope-key Rewrap and the delivery record)" \
-	k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist
 pend U102 "the sealed record stores the last delivered version per delivery, raised after the Secret write succeeds; the repair-versus-owner classifier uses only that recorded version: a rewritten version annotation and a rewritten status.deliveredVersion each leave the charge unchanged (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus
 pend U103 "a Secret at a recorded target whose label or owner annotation was removed is never overwritten or deleted, under a revocation, the object's deletion and rm-scope alike; the KeyDelivery gets SecretRetained=True with reason LabelRemoved, and doctor names the Secret and the KeyDelivery (KeyDelivery lifecycle)" \
