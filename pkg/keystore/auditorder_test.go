@@ -162,3 +162,22 @@ func TestWithdrawAuditNamesDelivery(t *testing.T) {
 		t.Fatalf("malformed withdraw audit lines %+v", lines)
 	}
 }
+
+// A mint refused for an entries/ that holds names and no scope.key writes
+// one audit line, the refusal, and no grant line before it: the grant line
+// follows the mint's own refusals.
+func TestMintRefusalAuditsOnce(t *testing.T) {
+	ctx := context.Background()
+	s, server := newMasteredStore(t)
+	fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
+	_, audit := userLogs(s)
+	if err := os.MkdirAll(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "orphan"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := userScope(t, s, 1001).Put(ctx, "user/1001/token", KindOpaque, []byte("v")); !errors.Is(err, ErrScopeAbsent) {
+		t.Fatalf("put over an orphaned entries/: %v, want ErrScopeAbsent", err)
+	}
+	if lines := audit.all(); len(lines) != 1 || lines[0].result != "scope-absent" {
+		t.Fatalf("refused mint audit lines %+v, want the one refusal", lines)
+	}
+}

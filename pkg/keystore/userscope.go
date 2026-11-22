@@ -644,6 +644,17 @@ func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, 
 	} else if fl > 1 {
 		return keys{}, nil, fmt.Errorf("%w: the user-scope floor records %s writes under a scope key that is gone; restore scope.key", ErrScopeAbsent, deliveriesName)
 	}
+	// Its own refusals come before the grant line, which is appended only
+	// for a mint that goes ahead, and still before its first write.
+	if dir, err := u.openScopeDir(root, false); err == nil {
+		err = u.checkMintable(dir)
+		_ = dir.Close() // read-only
+		if err != nil {
+			return keys{}, nil, err
+		}
+	} else if !errors.Is(err, errNoScopeKey) {
+		return keys{}, nil, err
+	}
 	if err := grant(); err != nil {
 		return keys{}, nil, err
 	}
@@ -698,4 +709,30 @@ func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, 
 	}
 	ok = true
 	return uk, entries, nil
+}
+
+// checkMintable refuses a mint into the existing scope directory dir: a
+// scope.key there (ErrCorrupt), or an entries/ that holds names and no
+// scope.key, a scope whose key was lost (ErrScopeAbsent). It writes
+// nothing; mint checks again once the directories are made.
+func (u *UserScope) checkMintable(dir *os.Root) error {
+	if _, err := dir.Lstat(scopeKeyName); !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: %s appeared while the scope was minted: %v", ErrCorrupt, scopeKeyName, err)
+	}
+	entries, err := u.s.openSubdir(dir, scopeEntriesName, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err)
+	}
+	defer func() { _ = entries.Close() }() // read-only
+	names, err := readDirNames(entries, maxDirNames)
+	if err != nil {
+		return err
+	}
+	if len(names) > 0 {
+		return fmt.Errorf("%w: entries/ holds %d names and there is no scope key, so a new key would orphan them; restore scope.key", ErrScopeAbsent, len(names))
+	}
+	return nil
 }
