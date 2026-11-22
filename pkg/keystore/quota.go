@@ -554,6 +554,11 @@ func (b *burial) bury(u *UserScope) error {
 		switch {
 		case err == nil:
 			return nil
+		case errors.As(err, &landed) && landed.unsynced:
+			// The tombstones are visible, so every reader holds them in
+			// force and the entry is revoked, but the fsync failed: a crash
+			// could lose them, so a retry makes them durable.
+			return fmt.Errorf("%w, but the user-scope floor's fsync failed after %d of the entry's %d tombstones were visible, so the entry is refused as deleted and its tree stays; durability uncertain; run rm again: %w", errCommitted, landed.lines, len(b.gens), err)
 		case errors.As(err, &landed):
 			// Whole tombstones landed before the write failed: they are in
 			// force, so the entry is revoked and the rm committed.

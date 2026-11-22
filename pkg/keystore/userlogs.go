@@ -1173,13 +1173,19 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 	if err == nil && n < len(out) {
 		err = io.ErrShortWrite
 	}
-	// An fsync that fails leaves nothing known durable: whatever the write
-	// put in the file is counted as no line landed, so the caller refuses
-	// (an rm: nothing removed, run it again) rather than report a commit
-	// that a crash could undo. Only a write that failed or landed short,
-	// followed by an fsync that succeeded, counts the whole lines it left.
+	// An fsync that fails leaves nothing known durable, but the lines the
+	// write left visible are what every reader reads and holds in force:
+	// when whole lines of ours are visible in the file, re-read from its
+	// real end, they are counted as landed with their durability uncertain
+	// (an rm: committed, run it again); when none is, nothing landed and
+	// the caller refuses (an rm: nothing removed, run it again). The bytes
+	// the write reported are not trusted here: only the file's tail.
 	if serr := fsync(f); serr != nil {
-		return fmt.Errorf("append to %s: fsync: %w", l.name, errors.Join(err, serr))
+		serr = fmt.Errorf("append to %s: fsync: %w", l.name, errors.Join(err, serr))
+		if k := l.landedLines(f, st.Size, out, int(lead), -1); k > 0 {
+			return &linesLanded{lines: k, unsynced: true, err: serr}
+		}
+		return serr
 	}
 	if err != nil {
 		err = fmt.Errorf("append to %s: %w", l.name, err)
@@ -1191,11 +1197,19 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 	return nil
 }
 
+// maxLandedSearch bounds how far before the real end of the file
+// landedLines looks for the caller's bytes, beyond their own length: room
+// for foreign appends racing the write.
+const maxLandedSearch = 64 << 10
+
 // linesLanded is an append that failed after lines of its buffer reached
 // the file whole: the reader reads them, so what they record is in force.
+// unsynced is set when the fsync after the write failed: the lines are
+// visible, but not known durable.
 type linesLanded struct {
-	lines int // whole lines of the caller's that landed, in order
-	err   error
+	lines    int // whole lines of the caller's that landed, in order
+	unsynced bool
+	err      error
 }
 
 func (e *linesLanded) Error() string {
@@ -1204,14 +1218,24 @@ func (e *linesLanded) Error() string {
 
 func (e *linesLanded) Unwrap() error { return e.err }
 
-// landedLines counts the caller's lines of out, appended at size after
-// lead bytes (the leading newline), that reached f whole and
-// newline-terminated after a write that failed or landed short. It re-reads
-// the tail on f's descriptor, since a failed write(2) may not report what
-// it wrote; a tail that cannot be read falls back to n, the bytes the write
-// reported. A fragment after the last whole line is a torn tail the reader
-// skips as damage.
+// landedLines counts the caller's lines of out (lead bytes, the leading
+// newline, then the lines) that reached f whole and newline-terminated,
+// in order, after a write that failed or landed short or an fsync that
+// failed. It re-reads the tail on f's descriptor from the file's real end,
+// a fresh fstat, never from size, where the open saw it end: a foreign
+// append between the open and the write moves the caller's bytes on, and
+// one after it puts bytes past them. It searches the tail, from its end
+// back to size, for the latest place the leading newline and the first
+// whole line stand, and counts the whole lines that match from there. A
+// tail that cannot be read falls back to n, the bytes the write reported,
+// at size; n < 0 trusts no report and counts nothing. A fragment after the
+// last whole line is a torn tail the reader skips as damage.
 func (l *appendLog) landedLines(f *os.File, size int64, out []byte, lead, n int) int {
+	first := bytes.IndexByte(out[lead:], '\n')
+	if first < 0 {
+		return 0
+	}
+	anchor := out[:lead+first+1]
 	got := out[:max(0, min(n, len(out)))]
 	var fst unix.Stat_t
 	if err := unix.Fstat(int(f.Fd()), &fst); err == nil && fst.Size > size {
@@ -1219,14 +1243,18 @@ func (l *appendLog) landedLines(f *os.File, size int64, out []byte, lead, n int)
 		if l.readAt != nil {
 			src = l.readAt(f)
 		}
-		buf := make([]byte, min(fst.Size-size, int64(len(out))))
-		if k, err := src.ReadAt(buf, size); err == nil || k == len(buf) {
-			// The bytes on disk that match the buffer, from its start.
-			m := 0
-			for m < k && buf[m] == out[m] {
-				m++
+		from := max(size, fst.Size-int64(len(out))-maxLandedSearch)
+		buf := make([]byte, fst.Size-from)
+		if k, err := src.ReadAt(buf, from); err == nil || k == len(buf) {
+			got = nil
+			if at := bytes.LastIndex(buf, anchor); at >= 0 {
+				// The bytes on disk that match the buffer, from its start.
+				m := 0
+				for at+m < len(buf) && m < len(out) && buf[at+m] == out[m] {
+					m++
+				}
+				got = out[:m]
 			}
-			got = out[:m]
 		}
 	}
 	if len(got) <= lead {
