@@ -63,15 +63,23 @@ func StateFileCheck(uid uint32) FileCheck {
 }
 
 // StateDirCheck is the check on the directory holding the state file: owned
-// by uid (the server's euid) or by root, and not group- or other-writable.
-func StateDirCheck(uid uint32) FileCheck {
+// by uid (the server's euid), by root, or by one of also, and not group- or
+// other-writable.
+//
+// A root server names the service user in also, since its work dir is the
+// service user's. That owner can rename or delete the file in it, which is
+// denial, never forgery: the file itself must still be owned by root (the
+// euid, StateFileCheck), so a replacement is refused, and a missing record
+// only makes the reconciler skip a Secret it cannot prove it created, failing
+// closed.
+func StateDirCheck(uid uint32, also ...uint32) FileCheck {
 	return func(fi fs.FileInfo) error {
 		st, ok := fi.Sys().(*syscall.Stat_t)
 		if !ok || st == nil {
 			return errors.New("owner unknown")
 		}
-		if st.Uid != uid && st.Uid != 0 {
-			return fmt.Errorf("owned by uid %d, neither the server's uid %d nor root", st.Uid, uid)
+		if st.Uid != uid && st.Uid != 0 && !slices.Contains(also, st.Uid) {
+			return fmt.Errorf("owned by uid %d, neither the server's uid %d, root, nor the service user", st.Uid, uid)
 		}
 		return addons.NotShared(fi)
 	}

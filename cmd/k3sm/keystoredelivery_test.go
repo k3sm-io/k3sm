@@ -81,6 +81,10 @@ func TestKeysDeliveryServerConfig(t *testing.T) {
 	if cfg.EncryptionOn || !cfg.AllowPlaintext {
 		t.Errorf("EncryptionOn %v AllowPlaintext %v, want false and true as given", cfg.EncryptionOn, cfg.AllowPlaintext)
 	}
+	if root, err := keystoreDeliveryConfig("/var/lib/k3sm/server", true, false, cs, ids(0, nil), nil); err != nil ||
+		root.StateOwner != 0 || len(root.StateDirOwners) != 1 || root.StateDirOwners[0] != 777 {
+		t.Errorf("a root server: state owner %d, directory owners %v (%v), want root and the service user 777", root.StateOwner, root.StateDirOwners, err)
+	}
 	if _, err := keystoreDeliveryConfig("/var/lib/k3sm/server", true, false, cs, ids(0, errors.New("no _k3sm")), nil); err == nil {
 		t.Error("a root server with no service user built a reconciler")
 	}

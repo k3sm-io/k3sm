@@ -253,7 +253,7 @@ check G19 "the delivery declaration is root-owned and not group- or other-writab
 	deliver:TestDeclarationRootOwned deliver:TestDeclarationOpenedWithNoFollow cmd:TestKeysDeliverRefusals \
 	deliver:TestLockRefusesUntrustedFile deliver:TestLockBoundedWait cmd:TestKeysDeliverWritersSerialize \
 	deliver:TestNewDefaultsBindRoot cmd:TestKeysEnvDefaultsBindRoot deliver:TestDataRootDirectoryChecked \
-	deliver:TestStateFileOtherOwnerRefused
+	deliver:TestStateFileOtherOwnerRefused deliver:TestStateDirServiceUserOwner
 check G20 "the reconciler only gets, creates and updates the Opaque Secrets it created, proven by the UID it recorded, not the label: an unlabelled, foreign, pre-created or recreated Secret is untouched, and no list or delete is ever made; rm of a declared entry warns that its Secret keeps the value; no stored value reaches the log or the verbs' output" \
 	deliver:TestReconcilerTouchesOnlyLabelledSecrets deliver:TestReconcilerRedeliversOnRotation \
 	deliver:TestReconcilerSkipsLabelledNonOpaque deliver:TestReconcilerContinuesAfterTargetFailure \

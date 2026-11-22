@@ -1329,3 +1329,43 @@ func TestStateFileOtherOwnerRefused(t *testing.T) {
 		t.Fatalf("a group-writable state file: %v, want ErrRefused", err)
 	}
 }
+
+// TestStateDirServiceUserOwner: a root server also accepts a state-file
+// directory the service user owns, and the sweep delivers through it; the
+// file must still be the server's, and without the service user named the
+// same directory is refused (G19).
+func TestStateDirServiceUserOwner(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.declare(t, Target{Name: "api-token", Namespace: "payments"})
+	euid := uint32(os.Geteuid())
+	// The test user stands in for the service user owning the work dir;
+	// another uid stands in for the server's euid.
+	server := euid + 1
+	r := New(Config{Path: h.path, StatePath: filepath.Join(h.dir, StateFileName), StateOwner: server, StateDirOwners: []uint32{euid},
+		Client: h.client, Store: h.store, EncryptionOn: true, Logger: slog.New(slog.NewTextHandler(h.logs, nil))})
+	r.check = testCheck
+	r.stateCheck = StateFileCheck(euid) // the file this test creates is the test user's
+	r.Sweep(context.Background())
+	if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "tok" {
+		t.Fatalf("a service-user-owned work dir refused delivery: %q\n%s", got, h.logs.String())
+	}
+	if err := StateDirCheck(server)(mustStat(t, h.dir)); err == nil {
+		t.Fatal("without the service user, a directory owned by neither the euid nor root was accepted")
+	}
+	if err := StateDirCheck(server, euid)(mustStat(t, h.dir)); err != nil {
+		t.Fatalf("with the service user, its directory was refused: %v", err)
+	}
+	if err := StateFileCheck(server)(mustStat(t, filepath.Join(h.dir, StateFileName))); err == nil {
+		t.Fatal("a state file the service user owns was accepted for a root server")
+	}
+}
+
+func mustStat(t *testing.T, path string) fs.FileInfo {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi
+}

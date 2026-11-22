@@ -83,6 +83,9 @@ type Config struct {
 	// StateOwner the server's euid, which owns it.
 	StatePath  string
 	StateOwner uint32
+	// StateDirOwners are further uids the state file's directory may be
+	// owned by: the service user, for a root server (see StateDirCheck).
+	StateDirOwners []uint32
 	// Client is the server's admin client, the one the embedded add-on
 	// reconciler uses. The reconciler only Gets, creates and updates Secrets
 	// through it.
@@ -163,7 +166,7 @@ func New(cfg Config) *Reconciler {
 		open:           OpenNoFollow,
 		check:          RootCheck,
 		stateCheck:     StateFileCheck(cfg.StateOwner),
-		stateDirCheck:  StateDirCheck(cfg.StateOwner),
+		stateDirCheck:  StateDirCheck(cfg.StateOwner, cfg.StateDirOwners...),
 		chown:          chownNone,
 		interval:       addons.ManifestSweepInterval,
 		targetTimeout:  targetTimeout,

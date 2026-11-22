@@ -49,6 +49,10 @@ func keystoreDeliveryConfig(workDir string, encryptionOn, allowPlaintext bool, c
 		return keydeliver.Config{}, errors.New("the work dir is not absolute")
 	}
 	storeCfg := keystoreLayout(work)
+	// A root server's work dir is the service user's, so the state file's
+	// directory may be owned by it too; an unresolved service user fails
+	// closed, building no reconciler.
+	var stateDirOwners []uint32
 	if euid := ids.euid(); euid != 0 {
 		storeCfg.UID, storeCfg.GID = uint32(euid), uint32(ids.egid())
 	} else {
@@ -57,11 +61,13 @@ func keystoreDeliveryConfig(workDir string, encryptionOn, allowPlaintext bool, c
 			return keydeliver.Config{}, err
 		}
 		storeCfg.UID, storeCfg.GID = uid, gid
+		stateDirOwners = []uint32{uid}
 	}
 	cfg := keydeliver.Config{
 		Path:           filepath.Join(executor.RuntimeRoot(work), keydeliver.FileName),
 		StatePath:      filepath.Join(work, keydeliver.StateFileName),
 		StateOwner:     uint32(ids.euid()),
+		StateDirOwners: stateDirOwners,
 		Client:         cs,
 		Store:          keystore.New(storeCfg),
 		EncryptionOn:   encryptionOn,
