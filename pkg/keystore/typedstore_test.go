@@ -571,6 +571,34 @@ func TestRotateIfStaleVersionRefused(t *testing.T) {
 	}
 }
 
+// TestRotateIfRefusesVersionBuiltOutside is U150's limit of the identity: a
+// caller outside the package can set only a Version's exported fields, so
+// even a copy of every exported field of the current version, as read, has
+// no identity and is refused as stale. Only the Version a read returned is
+// accepted.
+func TestRotateIfRefusesVersionBuiltOutside(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTypedStore(t)
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	read, _ := mustCredential(t, s, "pair")
+	var built Version
+	rv, bv := reflect.ValueOf(read), reflect.ValueOf(&built).Elem()
+	for i := 0; i < rv.NumField(); i++ {
+		if rv.Type().Field(i).IsExported() {
+			bv.Field(i).Set(rv.Field(i))
+		}
+	}
+	if built.Version != read.Version || built.Fingerprint != read.Fingerprint || built == read {
+		t.Fatalf("the copy %+v is not every exported field of %+v and nothing else", built, read)
+	}
+	if _, err := s.RotateIf(ctx, "pair", KindOAuth, built, oauthEnvelope("a2", "r2")); !errors.Is(err, ErrVersionStale) {
+		t.Fatalf("RotateIf with a Version built from the exported fields: %v, want ErrVersionStale", err)
+	}
+	if v, err := s.RotateIf(ctx, "pair", KindOAuth, read, oauthEnvelope("a2", "r2")); err != nil || v.Version != 2 {
+		t.Fatalf("RotateIf with the Version read = %+v, %v", v, err)
+	}
+}
+
 // TestRotateIfRefusesRecreatedEntry is U150: an entry deleted and put again
 // restarts at version 1, so a refresher holding a version of the old entry
 // whose number the new one reaches again is refused; the identity of a
