@@ -106,7 +106,9 @@ Flags:
                     data root is its parent
 
 Exit codes: 0 done; 1 refused or failed; 2 usage; 3 rewrap completed an
-earlier interrupted rewrap instead (run it again with a new key).
+earlier interrupted rewrap instead (run it again with a new key);
+4 the change was made (put, rotate or adopt) but a step after it failed: the
+new version is current, and the next keys verb finishes what was left.
 `
 
 // Exit codes of `k3sm keys`.
@@ -117,6 +119,9 @@ const (
 	// keysResumed is rewrap's ErrRewrapResumed: it finished an earlier
 	// rewrap under a key the operator did not supply, so it must run again.
 	keysResumed = 3
+	// keysCommitted is a write's ErrCommitted: put, rotate or adopt made its
+	// change, and a step after the commit point failed.
+	keysCommitted = 4
 )
 
 // The keystore's two directories in the server work dir. pkg/keystore's
@@ -618,6 +623,10 @@ func keysPut(ctx context.Context, args []string, env keysEnv) int {
 	}
 	defer clear(value)
 	ver, err := s.Put(ctx, name, kind, value)
+	if errors.Is(err, keystore.ErrCommitted) {
+		fmt.Fprintf(env.stdout, "created %s at version %d (%s, fingerprint %s)\n", qualify(name), ver.Version, ver.Kind, ver.Fingerprint)
+		return v.failf(keysCommitted, "%v", err)
+	}
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
@@ -666,6 +675,10 @@ func keysRotate(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	ver, err := s.Rotate(ctx, name, value)
+	if errors.Is(err, keystore.ErrCommitted) {
+		fmt.Fprintf(env.stdout, "rotated %s to version %d (fingerprint %s)\n", qualify(name), ver.Version, ver.Fingerprint)
+		return v.failf(keysCommitted, "%v", err)
+	}
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
@@ -929,7 +942,7 @@ func keysAdopt(ctx context.Context, args []string, env keysEnv) int {
 	ver, err := s.Adopt(ctx, name, info.Orphan)
 	if errors.Is(err, keystore.ErrCommitted) {
 		fmt.Fprintf(env.stdout, "adopted %s version %d: it is current\n", qualify(name), ver.Version)
-		return v.failf(keysRefused, "%v", err)
+		return v.failf(keysCommitted, "%v", err)
 	}
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)

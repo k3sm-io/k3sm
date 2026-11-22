@@ -1857,3 +1857,74 @@ func TestKeysAdopt(t *testing.T) {
 		t.Fatal("adopt printed a value")
 	}
 }
+
+// committedStore reports every write it makes as committed with a failed
+// step after the commit point, which the real store reaches only through a
+// failing fsync or floor write a test cannot cause from outside.
+type committedStore struct{ keysStore }
+
+func (c committedStore) Put(ctx context.Context, name string, kind keystore.Kind, value []byte) (keystore.Version, error) {
+	v, err := c.keysStore.Put(ctx, name, kind, value)
+	if err != nil {
+		return v, err
+	}
+	return v, fmt.Errorf("%w: injected failure after the commit point", keystore.ErrCommitted)
+}
+
+func (c committedStore) Rotate(ctx context.Context, name string, value []byte) (keystore.Version, error) {
+	v, err := c.keysStore.Rotate(ctx, name, value)
+	if err != nil {
+		return v, err
+	}
+	return v, fmt.Errorf("%w: injected failure after the commit point", keystore.ErrCommitted)
+}
+
+func (c committedStore) Adopt(ctx context.Context, name string, orphan keystore.Version) (keystore.Version, error) {
+	v, err := c.keysStore.Adopt(ctx, name, orphan)
+	if err != nil {
+		return v, err
+	}
+	return v, fmt.Errorf("%w: injected failure after the commit point", keystore.ErrCommitted)
+}
+
+// TestKeysCommittedExitCode is review round 4, item 6: put, rotate and adopt
+// exit keysCommitted, not keysRefused, when the write committed and a step
+// after it failed, and the usage text names the code.
+func TestKeysCommittedExitCode(t *testing.T) {
+	h := newKeysHarness(t)
+	h.wrap = func(s keysStore) keysStore { return committedStore{s} }
+	h.stdin = strings.NewReader("one")
+	h.mustRun(keysCommitted, "put", "system/alpha", "--in", "-")
+	cur := filepath.Join(h.keystoreDir(), "alpha", "current")
+	saved, err := os.ReadFile(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.stdin = strings.NewReader("two")
+	h.mustRun(keysCommitted, "rotate", "system/alpha", "--in", "-")
+	if got := h.value("alpha", 2); string(got) != "two" {
+		t.Fatalf("alpha v2 = %q after the committed rotate", got)
+	}
+	// A copied-back pointer behind a lagging floor leaves version 2 to adopt.
+	if err := os.WriteFile(cur, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	floorPath := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+	b, err := os.ReadFile(floorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(floorPath, []byte(strings.Replace(string(b), `"seq":2`, `"seq":1`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun(keysCommitted, "adopt", "system/alpha", "--yes")
+	if !strings.Contains(h.stdout.String(), "adopted system/alpha version 2") {
+		t.Fatalf("committed adopt output:\n%s", h.stdout.String())
+	}
+	if keysCommitted == keysRefused || keysCommitted == keysBadUsage || keysCommitted == keysResumed {
+		t.Fatalf("keysCommitted %d is not distinct", keysCommitted)
+	}
+	if !strings.Contains(keysUsage, fmt.Sprintf("%d the change was made", keysCommitted)) {
+		t.Fatalf("usage does not name exit code %d:\n%s", keysCommitted, keysUsage)
+	}
+}
