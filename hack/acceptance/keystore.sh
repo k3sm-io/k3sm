@@ -456,7 +456,7 @@ check G7 "the floor is raised by Put, Rotate, RaiseFloor and Delete when the mas
 	TestFloorRaised TestFloorWriteRereads TestFloorLockBoundedWait k3sm/cmd/k3sm::TestKeysReadVerbsRaiseFloor
 check G8 "Rotate flips the pointer last; a crash before the flip leaves the old version current" \
 	TestRotateCrashAtEveryStep TestRotate
-check G9 "a Rotate retry discards the orphan and seals the value it was given" TestRotateRetryDiscardsOrphan TestParseVersionName
+check G9 "a Rotate retry never promotes an orphan: a failed Rotate removes its own, a sealed one a crash left is refused, an unauthenticated one is discarded, and the retry seals the value it was given" TestRotateRetryDiscardsOrphan TestParseVersionName
 check G10 "the master is minted only by the first put, never over entries; rewrap --key-in accepts only a key an interrupted rewrap recorded or sealed records under" \
 	TestMasterMint TestMintCountsReservedUserName \
 	k3sm/cmd/k3sm::TestKeysRewrapKeyInRecoveryOnly TestKeysRewrapKeyInRecoversReplacedNext
@@ -809,7 +809,7 @@ partial U149 "write-only, structurally: a planted refresh token appears in no re
 check U150 "RotateIf refuses a stale version, and a version read from an entry since deleted and put again; a rotation never changes an oauth entry's refresh owner" \
 	k3sm/pkg/keystore::TestRotateIfStaleVersionRefused TestRotateIfRefusesRecreatedEntry TestRefreshOwnerFixedPerEntry
 check U151 "oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means low = 1); crash-safe at every step, prune included (the prune cases of the crash test); a failure after the pointer flip reports the commit" \
-	k3sm/pkg/keystore::TestOAuthPruneKeepsTwo TestPointerLowWaterMark TestRotateCrashAtEveryStep TestRotateReportsCommitAfterFlip TestCommitPointReported TestPointerCanonicalForm
+	k3sm/pkg/keystore::TestOAuthPruneKeepsTwo TestPointerLowWaterMark TestRotateCrashAtEveryStep TestRotateReportsCommitAfterFlip TestCommitPointReported TestFloorLagNeverDeletesCommittedVersion TestPointerCanonicalForm
 check U152 "a pruned oauth entry: List shows it healthy, Rewrap re-seals low..current, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught" \
 	k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt TestRewrapHandlesPrunedOAuth TestDeletePrunedOAuthEntry TestGapInsideCommittedRangeIsCorrupt TestCopyBackAcrossPruneCaught
 check U153 "--from-version is refused for oauth" \

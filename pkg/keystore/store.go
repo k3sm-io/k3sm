@@ -748,11 +748,13 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 
 // Rotate seals value as the next version of name, of the kind name already
 // has, then flips the current pointer to it at the next sequence, then raises
-// the floor: docs/design/keystore.md § "Rotation and rollback". A crash
-// before the flip leaves the old version current and an unreferenced next
-// version, which the next Rotate discards before sealing the value it was
-// given; it never promotes it. A failure after the flip returns the new
-// version with an error matching ErrCommitted.
+// the floor: docs/design/keystore.md § "Rotation and rollback". A failure
+// before the flip leaves the old version current and removes the next
+// version it wrote. A crash there leaves that sealed version above the
+// pointer, which the next Rotate refuses as ErrCorrupt, since a newer
+// committed version behind a copied-back pointer looks the same; it never
+// promotes or unlinks it. A failure after the flip returns the new version
+// with an error matching ErrCommitted.
 func (s *FileStore) Rotate(ctx context.Context, name string, value []byte) (Version, error) {
 	v, err := s.rotate(ctx, name, func(_ *entry, _ keys, old Version) ([]byte, error) {
 		if err := checkValue(old.Kind, value); err != nil {
@@ -832,7 +834,7 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(e.generation[:]), Seq: seq + 1}); err != nil {
 		return Version{}, err
 	}
-	if err := discardOrphans(ctx, e, low, cur); err != nil {
+	if err := discardOrphans(ctx, e, k, low, cur); err != nil {
 		return Version{}, err
 	}
 	next := cur + 1
@@ -851,11 +853,19 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 		return Version{}, err
 	}
 	ptr := record{kind: kindPointer, name: name, generation: e.generation, created: created}
-	if err := ptr.seal(k.seal, k.scope, rangePlaintext(next, seq+1, newLow), s.rand); err != nil {
-		return Version{}, err
+	err = ptr.seal(k.seal, k.scope, rangePlaintext(next, seq+1, newLow), s.rand)
+	flipped := false
+	if err == nil {
+		flipped, err = s.commitPointer(e, ptr.marshal())
 	}
-	flipped, err := s.commitPointer(e, ptr.marshal())
 	if !flipped {
+		// Nothing committed: the version just written is removed, best
+		// effort, since the next Rotate refuses a sealed version above the
+		// pointer rather than discard it (discardOrphans). Only a crash
+		// leaves it.
+		if e.root.Remove(versionName(next)) == nil {
+			_ = syncDir(e.root) // best effort: a left version is refused, never promoted
+		}
 		return Version{}, err
 	}
 	// The pointer's rename was the commit point: from here a failure
@@ -875,31 +885,35 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 		if err := s.step("prune " + name); err != nil {
 			return committed, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)", next, newLow)
 		}
-		if err := discardOrphans(ctx, e, newLow, next); err != nil {
+		if err := discardOrphans(ctx, e, k, newLow, next); err != nil {
 			return committed, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)", next, newLow)
 		}
 	}
 	return committed, nil
 }
 
-// discardOrphans removes every version file of e numbered above cur, or
-// below low: what a Rotate interrupted before its pointer flip leaves, and
-// what an oauth prune interrupted after it leaves. Each holds the value the
-// interrupted attempt carried, so none is ever promoted. It stops with ctx's
-// error when ctx is done (see loopCtx); what it removed stays removed, and the
-// next Rotate removes the rest.
+// discardOrphans removes every version file of e numbered below low, and
+// every true orphan numbered above cur: a file that does not open, under k,
+// as this entry's sealed record of the version its name says. A version
+// below low is what an oauth prune interrupted after its pointer flip
+// leaves, and it is unlinked unopened. It stops with ctx's error when ctx is
+// done (see loopCtx); what it removed stays removed, and the next Rotate
+// removes the rest.
 //
-// While the floor lags its pointer (a Rotate whose floor write failed), an
-// older pointer copied back passes the floor check, and the version the live
-// pointer named is then discarded here as an orphan. docs/design/keystore.md
-// § "Rotation and rollback" accepts that window: a crash before the flip
-// leaves the same state, and its orphan must be discarded.
-func discardOrphans(ctx context.Context, e *entry, low, cur uint64) error {
+// A version above cur that does authenticate as this generation's is never
+// unlinked: either an older pointer was copied back over a newer committed
+// one, inside the window a failed floor write leaves (the floor lags its
+// pointer, so the copied-back pointer passes the floor check), or a Rotate
+// crashed between writing that version and its pointer flip. The two leave
+// the same files, and only the first holds a committed version, for oauth
+// the only valid refresh token, so both are refused as ErrCorrupt, before
+// anything is unlinked. docs/design/keystore.md § "Rotation and rollback".
+func discardOrphans(ctx context.Context, e *entry, k keys, low, cur uint64) error {
 	names, err := readDirNames(e.root, maxDirNames)
 	if err != nil {
 		return err
 	}
-	removed := false
+	var doomed []string
 	for i, n := range names {
 		if err := loopCtx(ctx, i); err != nil {
 			return err
@@ -908,12 +922,29 @@ func discardOrphans(ctx context.Context, e *entry, low, cur uint64) error {
 		if !ok || (v >= low && v <= cur) {
 			continue
 		}
+		if v > cur {
+			_, pt, err := e.openRecord(k, n, false, v)
+			clear(pt) // only whether it opens is wanted
+			switch {
+			case err == nil:
+				return fmt.Errorf("%w: version %d, above the version %d the current pointer names, is a sealed version of this entry; "+
+					"either an older current pointer was copied back over a newer one (restore the newer current pointer from backup), "+
+					"or a rotation crashed before its pointer flip (then remove %s); nothing was removed", ErrCorrupt, v, cur, n)
+			case !errors.Is(err, ErrCorrupt):
+				return fmt.Errorf("check the orphaned %s: %w", n, err)
+			}
+		}
+		doomed = append(doomed, n)
+	}
+	for i, n := range doomed {
+		if err := loopCtx(ctx, i); err != nil {
+			return err
+		}
 		if err := e.root.Remove(n); err != nil {
 			return fmt.Errorf("discard the orphaned %s: %w", n, err)
 		}
-		removed = true
 	}
-	if !removed {
+	if len(doomed) == 0 {
 		return nil
 	}
 	return syncDir(e.root)

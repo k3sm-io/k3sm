@@ -932,13 +932,18 @@ a running server's flag, so it says "unless the server was started with the over
 ## Rotation and rollback
 
 **Crash-safe write order:** Rotate writes the new version file first (durable, not yet
-referenced), flips the current pointer, then raises the floor. A crash before the flip
-leaves the old version current and an unreferenced next-version file. **A retry always
-discards that orphan and seals fresh from the value it was given**; it never reuses it,
-because the orphan holds whatever value the interrupted attempt carried, and promoting it
-would publish a value the retry did not supply. The same applies to any version file
-numbered above the one `current` names. Seeing the orphan and removing it happens under
-the exclusive lock.
+referenced), flips the current pointer, then raises the floor. A Rotate that fails before
+the flip leaves the old version current and removes the next-version file it wrote (best
+effort), so the retry seals fresh from the value it was given. **A version file above the
+one `current` names is never reused**: it holds whatever value an interrupted attempt
+carried, and promoting it would publish a value the retry did not supply. Before it writes,
+a Rotate looks at every such file under the exclusive lock. One that does not open as this
+entry's sealed record of the version its name says (it fails authentication, is another
+generation's or another version's) is a true orphan and is unlinked. One that does open is
+refused, as `ErrCorrupt`, and nothing is unlinked: see the floor-lag window below. A real
+crash between the version write and the flip leaves such a file, so the retry after that
+crash is refused, and the refusal names both causes: if no pointer was copied back, the
+operator removes the named version file and retries.
 
 **A write reports its commit outcome without ambiguity.** The pointer's rename is the
 commit point, for a Put (`Put`, `PutCredential`, `GenerateSSH`) as for a rotation (`Rotate`,
@@ -956,17 +961,18 @@ the provider may already have rotated. A failed prune is reported the same way r
 swallowed as best-effort: the change still stands and the next write prunes, but one rule for
 every post-commit step is simpler for a caller than a step that is silently skipped.
 
-**Accepted window: a discard while the floor lags.** If a Rotate flips `current` and then
-fails to write the floor, the floor is one behind the pointer until the next root-run verb
-raises it. If, inside that window, a writer that cannot read the master copies the previous
-`current` back, the floor check passes it (its sequence equals the floor's), and the next
-Rotate takes the newer version, which the live pointer named, for an orphan and discards
-it before sealing its own value. Nothing forged is ever accepted, but the newer version is
-lost. This needs a failed floor write and a swap before any root verb runs, and it is
-accepted for this phase. No cheap guard tells it apart: a Rotate that crashed before its
-flip leaves the same state (a version above `current` that authenticates, a pointer at the
-floor's sequence, and no newer pointer anywhere, since the swap's rename replaces it), and
-that orphan must be discarded.
+**The floor-lag window can no longer delete a newer committed version.** If a Rotate flips
+`current` and then fails to write the floor (`ErrCommitted`), the floor is one behind the
+pointer until the next root-run verb raises it. If, inside that window, a writer that cannot
+read the master copies the previous `current` back, the floor check passes it (its sequence
+equals the floor's). The next Rotate then finds the newer version, which the live pointer
+named, above `current`, and it authenticates as this entry's, so the Rotate refuses with
+`ErrCorrupt`, naming the copied-back pointer, and unlinks nothing, for every kind. For oauth
+that version holds the only valid refresh token. Restoring the newer `current` from backup
+and raising the floor reads it again. A Rotate that crashed before its flip leaves the same
+files (a version above `current` that authenticates, a pointer at the floor's sequence), and
+no cheap guard tells the two apart, so that crash is refused the same way rather than have
+its orphan discarded.
 
 **Retention:** every version is kept indefinitely in Phase A; nothing deletes a single old
 version short of `rm` of the whole entry. Settled in this document: the simplest correct
@@ -4119,7 +4125,7 @@ last pull request lands and no row is pending.
 | G6 | The floor is root-owned and checked on the opened descriptor; a floor that is group- or other-writable, a symlink, or not root-owned is refused. The floor file names the `system` scope and is parsed strictly, and a verb that cannot write it changes nothing | unit with a fake FS for each case; a missing, other or unknown-field scope; a fuzz target over the parser with committed seeds; a read-only data root on a first Put |
 | G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock` |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
-| G9 | A Rotate retry discards an orphaned next version and seals the value it was given | unit: orphan with value A, retry with value B, expect B |
+| G9 | A Rotate retry never promotes an orphaned next version: a failed Rotate removes its own, a sealed one a crash left is refused (`ErrCorrupt`, nothing removed), one that does not authenticate is discarded, and the retry seals the value it was given | unit: orphan with value A, refused; removed, retry with value B, expect B |
 | G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts an operator-made key: `rewrap --key-in` refuses a key that is neither the recorded `master.next.sha256` nor one some record already opens under |
 | G11 | The master is opened with O_NOFOLLOW and judged by fstat on the open descriptor; wrong mode, owner or fingerprint is `ErrMasterUntrusted` | unit: one case each |
 | G12 | Rewrap resumes after a crash at every step, trying the old then the new key, and leaves no record readable by neither; a `master.next` that disagrees with its fingerprint is discarded only when no `.new` file exists, and refused with `ErrMasterUntrusted` otherwise | unit: fault injection at each of steps 2 to 5, then rerun; a corrupted `master.next` with and without a `.new` file |
@@ -4309,7 +4315,7 @@ carried by the unit rows.
 | U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH`, `k3sm/pkg/keystore::TestStoreGenerateSSHUsesRandomSeam` | checked: the typed envelope and the typed store |
 | U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential`, `k3sm/pkg/keystore/typed::TestEnvelopeRefusalsNeverCarryRefreshToken` | partial: every exported method of `*FileStore` and `*UserScope`, enumerated by reflection (a method neither called by hand, callable with built arguments nor allowlisted with a reason fails the test), the typed reads and the deliveries path checked (the typed store); pending: the consumer interfaces and `internal/refreshopen`'s import graph, `TestRefreshOpenerImportGraph` (the refresher) |
 | U150 | `RotateIf` refuses a stale version, and a version read from an entry since deleted and put again; a rotation never changes an oauth entry's refresh owner | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused`, `TestRotateIfRefusesRecreatedEntry`, `TestRefreshOwnerFixedPerEntry` | checked: the typed store |
-| U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test); a failure after the pointer flip reports the commit | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep`; a failure after the flip returns the new version with `ErrCommitted`, `TestRotateReportsCommitAfterFlip`, and so does a failure after any write's pointer rename (the directory fsync, the floor, the prune; put, rotate and generate alike), never also `ErrCorrupt`, `TestCommitPointReported`; the pointer has one canonical form, `TestPointerCanonicalForm` | checked: the typed store |
+| U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test); a failure after the pointer flip reports the commit | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep`; a failure after the flip returns the new version with `ErrCommitted`, `TestRotateReportsCommitAfterFlip`, and so does a failure after any write's pointer rename (the directory fsync, the floor, the prune; put, rotate and generate alike), never also `ErrCorrupt`, `TestCommitPointReported`; the floor-lag window refuses rather than unlink a newer committed version, `TestFloorLagNeverDeletesCommittedVersion`; the pointer has one canonical form, `TestPointerCanonicalForm` | checked: the typed store |
 | U152 | a pruned oauth entry: List shows it healthy, Rewrap re-seals `low..current`, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught | `k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt`, `TestRewrapHandlesPrunedOAuth`, `TestDeletePrunedOAuthEntry`, `TestGapInsideCommittedRangeIsCorrupt`, `TestCopyBackAcrossPruneCaught` | checked: the typed store |
 | U153 | `--from-version` is refused for oauth | `k3sm/pkg/keystore::TestFromVersionRefusedForOAuth` | checked: the typed store |
 | U154 | every `Fuzz*` target in the keystore packages has a non-empty committed seed directory | `k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds` | checked: the typed envelope |

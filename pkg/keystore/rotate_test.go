@@ -576,26 +576,54 @@ func rotateCrashOAuthPrune(t *testing.T) {
 	}
 }
 
-// TestRotateRetryDiscardsOrphan is G9: a Rotate interrupted after writing
-// its version but before the flip leaves an orphan holding the value it was
-// given; the retry discards it and seals its own value.
+// TestRotateRetryDiscardsOrphan is G9: a Rotate that fails before its
+// pointer flip removes the version it wrote, and the retry seals the value
+// it was given. A crash there leaves that sealed version above the pointer,
+// which the files cannot tell from a newer committed version behind a
+// copied-back pointer, so the retry refuses it (ErrCorrupt) and removes
+// nothing; once the operator removes it, the retry discards what does not
+// authenticate (a stray copy) and seals its own value. It never promotes
+// the orphan.
 func TestRotateRetryDiscardsOrphan(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
 	mustPut(t, s, "k", KindOpaque, []byte("one"))
-	s.step = failAt("write current")
+	// The step seam fires once v2 is in place: a copy of it taken there is
+	// what a crash at that point leaves.
+	var orphan []byte
+	s.step = func(name string) error {
+		if name != "write current" {
+			return nil
+		}
+		b, err := os.ReadFile(entryPath(server, "k", "v2"))
+		if err != nil {
+			t.Errorf("v2 at the pointer write: %v", err)
+		}
+		orphan = b
+		return fmt.Errorf("injected crash at %s", name)
+	}
 	if _, err := s.Rotate(ctx, "k", []byte("A")); err == nil {
 		t.Fatal("Rotate succeeded through a crash")
 	}
 	s.step = func(string) error { return nil }
-	orphan, err := os.ReadFile(entryPath(server, "k", "v2"))
-	if err != nil {
-		t.Fatalf("the interrupted Rotate left no v2: %v", err)
+	if _, err := os.Lstat(entryPath(server, "k", "v2")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the failed Rotate left its v2: %v", err)
 	}
-	// An orphan further out, as a second interrupted attempt could not leave
-	// but a stray copy could, is discarded too.
-	copyFile(t, entryPath(server, "k", "v2"), entryPath(server, "k", "v7"))
 
+	// What a crash leaves: the sealed v2, and a stray copy further out.
+	writeFile(t, entryPath(server, "k", "v2"), string(orphan))
+	copyFile(t, entryPath(server, "k", "v2"), entryPath(server, "k", "v7"))
+	if v, err := s.Rotate(ctx, "k", []byte("B")); !errors.Is(err, ErrCorrupt) || v != (Version{}) {
+		t.Fatalf("Rotate over a sealed orphan = %+v, %v; want the ErrCorrupt refusal", v, err)
+	}
+	for _, n := range []string{"v2", "v7"} {
+		if _, err := os.Lstat(entryPath(server, "k", n)); err != nil {
+			t.Fatalf("the refused Rotate removed %s: %v", n, err)
+		}
+	}
+	mustCurrent(t, s, "k", "one")
+
+	remove(t, entryPath(server, "k", "v2"))
 	v := mustRotate(t, s, "k", "B")
 	if v.Version != 2 {
 		t.Fatalf("retried Rotate made version %d, want 2", v.Version)

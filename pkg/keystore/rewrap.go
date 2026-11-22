@@ -834,7 +834,9 @@ func (s *FileStore) commitNew(ctx context.Context, root *os.Root, fl floor, plan
 		if err == nil && p.low > 1 {
 			// What an interrupted oauth prune left below low is not
 			// committed, and is not re-sealed: it is unlinked.
-			err = discardOrphans(ctx, e, p.low, math.MaxUint64)
+			// No version is above math.MaxUint64, so no record is
+			// opened and no key is needed.
+			err = discardOrphans(ctx, e, keys{}, p.low, math.MaxUint64)
 		}
 		e.close()
 		if err != nil {
