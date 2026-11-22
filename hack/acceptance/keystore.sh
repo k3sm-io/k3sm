@@ -1082,7 +1082,7 @@ U96|a withdrawal still succeeds
 U96|seen gone (Get not found) on two sweeps
 U45|withdraw and deliveries
 U7|250 ms everywhere
-U20|names floor --rebuild, not removing keystore-floor.json
+U20|names the matched-set restore, not removing keystore-floor.json
 U77|unauthenticated (annotation only)
 U86|k3sm.io/keystore-digest
 U86|a substituted data under an intact version annotation is drift
