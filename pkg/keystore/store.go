@@ -1393,13 +1393,18 @@ func versionOf(r record, value, fpKey []byte) Version {
 		Created:     time.Unix(r.created, 0).UTC(),
 		Fingerprint: fingerprint(kind, value, fpKey),
 		identity:    versionIdentity(r),
+		digest:      r.digest(),
 	}
 }
 
 // versionIdentity is the identity of the version r seals: a domain-separated
-// SHA-256 of its name, generation and version number, truncated. The
-// generation is 16 random bytes fresh for every life of a name, so no two
-// lives share an identity, and the digest does not reveal it.
+// SHA-256 of its name, generation, version number and record digest,
+// truncated. The generation is 16 random bytes fresh for every life of a
+// name, so no two lives share an identity, and the digest does not reveal
+// it. The record digest makes two different records of one version (a
+// failed attempt's file copied over its retry) two identities, so RotateIf
+// and Adopt cannot pass across them; a Rewrap, which re-seals every record,
+// changes every identity too.
 func versionIdentity(r record) [identitySize]byte {
 	h := sha256.New()
 	h.Write([]byte("k3sm keystore version identity\x00"))
@@ -1407,6 +1412,8 @@ func versionIdentity(r record) [identitySize]byte {
 	h.Write([]byte{0})
 	h.Write(r.generation[:])
 	h.Write(binary.BigEndian.AppendUint64(nil, r.version))
+	d := r.digest()
+	h.Write(d[:])
 	var id [identitySize]byte
 	copy(id[:], h.Sum(nil))
 	return id

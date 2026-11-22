@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -89,17 +90,33 @@ type Version struct {
 	Fingerprint string
 
 	// identity names this version of this entry's life, and no other: a
-	// digest of the entry's generation, name and version number. An entry
+	// digest of the entry's generation, name, version number and record
+	// digest (see versionIdentity). An entry
 	// deleted and put again restarts at version 1 under a fresh generation,
 	// so its versions never share an identity with the old entry's. It is
 	// opaque and unexported: RotateIf compares the identity of the Version
 	// a writer read with the current one, and pkg/keystore exposes no
 	// generation.
 	identity [identitySize]byte
+	// digest is the record digest of the sealed file the version was read
+	// from (RecordDigest).
+	digest [digestSize]byte
 }
 
 // identitySize is the length of a Version's identity.
 const identitySize = 16
+
+// RecordDigest is the hex digest of the exact sealed record the version was
+// read from: the first 16 bytes of the SHA-256 of its nonce and ciphertext.
+// It reveals nothing about the value. Two records of one version number
+// (a failed rotation's file and its retry's) have different digests, and a
+// Rewrap changes it. It is empty for a Version not read from the store.
+func (v Version) RecordDigest() string {
+	if v.digest == ([digestSize]byte{}) {
+		return ""
+	}
+	return hex.EncodeToString(v.digest[:])
+}
 
 // Entry is the metadata of a named entry: its current version and every
 // version still stored. Like Version, it never carries a value.

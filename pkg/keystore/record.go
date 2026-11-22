@@ -245,6 +245,23 @@ func parseRecordOf(b []byte, kindOK func(byte) bool) (record, error) {
 	return r, nil
 }
 
+// digestSize is the length of a record's digest.
+const digestSize = 16
+
+// digest identifies r's exact sealed contents: the first 16 bytes of the
+// SHA-256 of its nonce and ciphertext. Two seals of one version (a failed
+// attempt and its retry) share a version number but never a digest, since
+// each takes a fresh nonce. It reveals nothing a reader of the file does not
+// already have, and it changes when a Rewrap re-seals the record.
+func (r *record) digest() [digestSize]byte {
+	h := sha256.New()
+	h.Write(r.nonce[:])
+	h.Write(r.ciphertext)
+	var d [digestSize]byte
+	copy(d[:], h.Sum(nil))
+	return d
+}
+
 // seal encrypts plaintext into r under key and scope with a fresh nonce from
 // random. A failed read of random is an error, never a reused or zero nonce.
 func (r *record) seal(key []byte, scope string, plaintext []byte, random io.Reader) error {
