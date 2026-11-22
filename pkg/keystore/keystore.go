@@ -177,6 +177,23 @@ var (
 	// would leave them unreadable; Rewrap writes nothing. A .user that is not
 	// a user scope (a stray file or link) is root's to remove.
 	ErrScopeUnsupported = errors.New("the keystore holds user scopes at the reserved path keystore/.user, which this build of k3sm cannot re-wrap: the master was not swapped and every record still opens; upgrade k3sm, then run rewrap again. If keystore/.user is not a user scope, root must remove it before rewrap can run")
+	// ErrScopeAbsent reports a user scope, or a container of it, that is not
+	// there: .user, .user/<uid>/, its scope.key or its entries/ directory. It
+	// is not a definitive absence, and never matches ErrNotFound: a scope a
+	// restore left out, a volume not yet mounted or a directory moved aside
+	// must not read as "every entry gone". A read never mints a scope, so a
+	// read of a uid that has stored nothing answers it.
+	ErrScopeAbsent = errors.New("the user scope is absent: its directory, its scope.key or its entries/ directory is missing; a read creates nothing, and a missing scope is not an empty one")
+	// ErrScopeOwnerChanged reports a user scope whose uid's live
+	// GeneratedUID is a real answer that differs from the one its scope.key is
+	// bound to: the account was deleted and its uid reused, so nothing of the
+	// old account's opens. Root removes such a scope.
+	ErrScopeOwnerChanged = errors.New("the user scope belongs to another account: the uid's GeneratedUID differs from the one its scope key is bound to, so the uid was reused; root must remove the scope")
+	// ErrScopeOwnerUnknown reports that the uid's live GeneratedUID could not
+	// be read: the lookup failed, passed its deadline, or answered a
+	// synthesized value for a uid with no directory record. Nothing in the
+	// scope opens and no scope key is minted.
+	ErrScopeOwnerUnknown = errors.New("the user scope's owner could not be confirmed: the uid's GeneratedUID lookup failed, timed out or found no directory record, so nothing in the scope was opened or created")
 	// ErrRewrapResumed reports that Rewrap found an earlier, interrupted
 	// rewrap whose new key was already live for some record, completed it
 	// under that key rather than the one supplied, and stopped. The master is

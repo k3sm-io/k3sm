@@ -37,7 +37,7 @@ const (
 	masterNextName            = "master.next"
 	masterNextFingerprintName = "master.next.sha256"
 	// userScopesName is the name in the entries' directory reserved for user
-	// scopes. Nothing creates it yet.
+	// scopes; the user-scope store (userscope.go) creates it.
 	userScopesName = ".user"
 	// masterSize is the master key's size.
 	masterSize = 32
@@ -90,7 +90,7 @@ func (s *FileStore) loadMaster() (keys, error) {
 	if err != nil {
 		return keys{}, err
 	}
-	k, err := deriveKeys(master, s.scope)
+	k, err := deriveMasterKeys(master, s.scope)
 	clear(master) // only the derived keys are kept
 	if err != nil {
 		return keys{}, err
@@ -312,5 +312,5 @@ func (s *FileStore) mintMaster() (keys, error) {
 	if err := s.writeFile(root, masterFingerprintName, []byte(masterFingerprint(master))); err != nil {
 		return keys{}, err
 	}
-	return deriveKeys(master, s.scope)
+	return deriveMasterKeys(master, s.scope)
 }

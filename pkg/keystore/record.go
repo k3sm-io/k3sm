@@ -46,10 +46,11 @@ const (
 	recordFormat = 1
 	// kindPointer is the kind byte of a current-pointer record. Version
 	// records carry a Kind (1 or 2).
-	// Kind bytes 0xFE (a wrapped scope key) and 0xFD (a sealed per-user
-	// delivery list) are reserved for user scopes. No record carries them yet,
-	// so parseRecord refuses them with every other unknown kind.
-	kindPointer = 0xFF
+	// kindScopeKey is a user scope's wrapped scope key, scope.key; only
+	// parseScopeKey accepts it. Kind 0xFD (a sealed per-user delivery list) is
+	// reserved, and no reader accepts it yet.
+	kindPointer  = 0xFF
+	kindScopeKey = 0xFE
 	// headerSize is the size of a record's fixed fields: everything but the
 	// name and the ciphertext. See the offset table in the design.
 	headerSize = 52
@@ -77,6 +78,9 @@ const (
 const (
 	sealKeyLabel        = "k3sm-keystore-seal-v1"
 	fingerprintKeyLabel = "k3sm-keystore-fingerprint-v1"
+	// scopeWrapLabel derives W, the key each user scope's scope.key is sealed
+	// under. It takes no scope: W wraps every scope's key.
+	scopeWrapLabel = "k3sm-keystore-scope-wrap-v1"
 )
 
 // Scopes. A store seals and opens every record under one scope, supplied from
@@ -95,15 +99,16 @@ const (
 // errInvalidScope reports a scope checkScope refuses.
 var errInvalidScope = errors.New("invalid keystore scope")
 
-// checkScope accepts "system", or "user/" followed by a decimal uid: digits
-// only, no leading zero unless it is "0", and fitting in a uint32. It refuses
-// anything else, so each uid has exactly one scope string. A scope holds no
+// checkScope accepts "system", or "user/" followed by a decimal uid from 1 to
+// 4294967295: digits only, no leading zero, and fitting in a uint32. It
+// refuses anything else, user/0 included (root has no user scope), so each
+// uid has exactly one scope string. A scope holds no
 // zero byte, so scopedLabel is unambiguous.
 func checkScope(scope string) error {
 	if scope == scopeSystem {
 		return nil
 	}
-	if uid, ok := strings.CutPrefix(scope, userScopePrefix); ok && decimalUID(uid) {
+	if uid, ok := strings.CutPrefix(scope, userScopePrefix); ok && uid != "0" && decimalUID(uid) {
 		return nil
 	}
 	return fmt.Errorf("%w: %q", errInvalidScope, scope)
@@ -177,6 +182,13 @@ func (r *record) marshal() []byte {
 // anything else is ErrCorrupt. It does not
 // check that the record belongs where it was found; openRecord does.
 func parseRecord(b []byte) (record, error) {
+	return parseRecordOf(b, func(kind byte) bool {
+		return kind == byte(KindEd25519) || kind == byte(KindOpaque) || kind == kindPointer
+	})
+}
+
+// parseRecordOf is parseRecord accepting only the kinds kindOK accepts.
+func parseRecordOf(b []byte, kindOK func(byte) bool) (record, error) {
 	var r record
 	if len(b) < headerSize {
 		return r, fmt.Errorf("%w: %d bytes is shorter than a record header", ErrCorrupt, len(b))
@@ -185,9 +197,7 @@ func parseRecord(b []byte) (record, error) {
 		return r, fmt.Errorf("%w: record format %d, want %d", ErrCorrupt, b[0], recordFormat)
 	}
 	r.kind = b[1]
-	switch r.kind {
-	case byte(KindEd25519), byte(KindOpaque), kindPointer:
-	default:
+	if !kindOK(r.kind) {
 		return r, fmt.Errorf("%w: unknown record kind %#02x", ErrCorrupt, r.kind)
 	}
 	n := int(binary.BigEndian.Uint16(b[2:4]))
@@ -260,6 +270,9 @@ type keys struct {
 	scope       string
 	seal        []byte
 	fingerprint []byte
+	// wrap is the scope-wrap key W, which seals each user scope's scope.key.
+	// Only keys derived from the master carry it (deriveMasterKeys).
+	wrap []byte
 	// next is the keys of master.next, when a Rewrap that crashed left one
 	// that agrees with its fingerprint: a record its step 4 already moved
 	// opens under them (see open). Nil otherwise, and always nil on the keys
@@ -296,6 +309,18 @@ func deriveKeys(master []byte, scope string) (keys, error) {
 		seal:        hmacSHA256(master, scopedLabel(sealKeyLabel, scope)),
 		fingerprint: hmacSHA256(master, scopedLabel(fingerprintKeyLabel, scope)),
 	}, nil
+}
+
+// deriveMasterKeys is deriveKeys from the master, with the scope-wrap key
+// W = HMAC(M, "k3sm-keystore-scope-wrap-v1") beside them: docs/design/
+// keystore.md § "User scope", "Key hierarchy".
+func deriveMasterKeys(master []byte, scope string) (keys, error) {
+	k, err := deriveKeys(master, scope)
+	if err != nil {
+		return keys{}, err
+	}
+	k.wrap = hmacSHA256(master, []byte(scopeWrapLabel))
+	return k, nil
 }
 
 // scopedLabel is a derivation label for scope: the label, a zero byte, then

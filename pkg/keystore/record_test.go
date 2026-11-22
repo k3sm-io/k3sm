@@ -371,7 +371,7 @@ func TestCheckScope(t *testing.T) {
 	}{
 		{"system", true},
 		{"user/501", true},
-		{"user/0", true},
+		{"user/0", false}, // root has no user scope
 		{"user/1", true},
 		{"user/4294967295", true}, // the largest uint32
 		{"", false},
