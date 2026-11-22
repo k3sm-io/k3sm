@@ -358,6 +358,16 @@ func (s *logState) unattributedAt() (int64, bool) {
 	return at, ok
 }
 
+// unattributableLines is the count of unattributable damaged lines, the
+// torn last line included, acknowledged or not.
+func (s *logState) unattributableLines() int {
+	n := s.unattribN
+	if s.tornSize != 0 && (s.tornKind == taintUnattributable || s.tornKind == taintNameFlip) {
+		n++
+	}
+	return n
+}
+
 // fileID is one file's identity, as logState keeps it.
 type fileID struct {
 	dev, ino uint64

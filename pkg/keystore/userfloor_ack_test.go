@@ -42,11 +42,11 @@ func TestFloorDamageAckLiftsOnlyUnattributable(t *testing.T) {
 	}
 	euid := s.euid
 	s.euid = func() int { return int(s.floorUID) + 1 }
-	if err := s.ackFloorDamage(ctx); !errors.Is(err, errAckNotRoot) {
+	if err := ackReviewed(t, s); !errors.Is(err, errAckNotRoot) {
 		t.Fatalf("an acknowledgement by a caller that is not root: %v, want errAckNotRoot", err)
 	}
 	s.euid = euid
-	if err := s.ackFloorDamage(ctx); err != nil {
+	if err := ackReviewed(t, s); err != nil {
 		t.Fatalf("ackFloorDamage: %v", err)
 	}
 	if err := put("a"); err != nil {
@@ -62,7 +62,7 @@ func TestFloorDamageAckLiftsOnlyUnattributable(t *testing.T) {
 	if err := put("b"); !errors.Is(err, errFloorDegraded) {
 		t.Fatalf("put over damage past the watermark: %v, want errFloorDegraded", err)
 	}
-	if err := s.ackFloorDamage(ctx); err != nil {
+	if err := ackReviewed(t, s); err != nil {
 		t.Fatalf("ackFloorDamage: %v", err)
 	}
 	if err := put("b"); err != nil {

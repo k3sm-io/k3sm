@@ -1576,8 +1576,14 @@ service user can only add to.
   never lifted, so a torn tombstone stays in force; damage at or past the watermark counts
   again; and an acknowledgement for another file is ignored
   (`TestFloorDamageAckLiftsOnlyUnattributable`). It is written by the unexported,
-  root-only `ackFloorDamage`, which then runs the catch-up again so a scope quarantined only
-  by acknowledged damage is served; no verb writes it yet, and `errFloorDegraded` names it
+  root-only `ackFloorDamage`, a compare-and-set under the exclusive store lock and the
+  floor's mutex: it refuses unless the floor's size and its count of unattributable damaged
+  lines are still the figures root reviewed, and writes through the data-root descriptor it
+  judged, never a second open by path (`TestFloorDamageAckRefusesChangedFloor`). Still under
+  the store lock it then runs the catch-up again so a scope quarantined only by acknowledged
+  damage is served; that catch-up writes a live line only for a generation with an
+  authenticated pointer and no damaged line that could name its key
+  (`TestFloorDamageAckCatchUpSkipsAttributable`); no verb writes it yet, and `errFloorDegraded` names it
   only as root maintenance. The audit log's damage gates nothing (it is counted and logged,
   never refused on), so it has no acknowledgement. Only a floor past the reader's bounds (larger than its size bound, or holding
   more keys than its key bound), which the server never writes, is damage that refuses with

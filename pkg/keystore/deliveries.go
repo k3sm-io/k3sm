@@ -1064,6 +1064,13 @@ func (s *FileStore) catchUpUser(ctx context.Context) (quarantined map[uint32]boo
 		return quarantined, nil, err
 	}
 	defer done()
+	return s.catchUpUserLocked(ctx, root)
+}
+
+// catchUpUserLocked is catchUpUser under the exclusive store lock the
+// caller holds on root.
+func (s *FileStore) catchUpUserLocked(ctx context.Context, root *os.Root) (quarantined map[uint32]bool, scopeErrs, err error) {
+	quarantined = map[uint32]bool{}
 	if exists, err := rootHasUserScopes(root); err != nil || !exists {
 		return quarantined, nil, err
 	}

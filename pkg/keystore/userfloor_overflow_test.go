@@ -78,7 +78,7 @@ func TestFloorTaintOverflowRefusesEveryKey(t *testing.T) {
 		}
 	}
 	check("overflowed")
-	if err := s.ackFloorDamage(ctx); err != nil {
+	if err := ackReviewed(t, s); err != nil {
 		t.Fatalf("ackFloorDamage: %v", err)
 	}
 	check("after the acknowledgement")

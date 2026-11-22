@@ -119,15 +119,52 @@ func (s *FileStore) readFloorAck() (floorAck, bool) {
 // errAckNotRoot refuses ackFloorDamage for a caller that is not root.
 var errAckNotRoot = errors.New("acknowledging the user-scope floor's damage is root maintenance")
 
+// errAckStale refuses ackFloorDamage when the floor is not the one root
+// reviewed: its size or its count of unattributable damaged lines changed.
+var errAckStale = errors.New("the user-scope floor changed since its damage was reviewed; review it again before acknowledging")
+
+// floorAckView is what root reviews before it acknowledges the floor's
+// damage: the floor's size and its count of unattributable damaged lines,
+// the torn last line included, which ackFloorDamage compares again under
+// the lock.
+func (s *FileStore) floorAckView(ctx context.Context) (size int64, unattributable int, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	ff, ok := s.userFloor.(*fileFloorLog)
+	if !ok {
+		return 0, 0, errors.New("the store has no file-backed user-scope floor to acknowledge")
+	}
+	f, st, err := ff.log.open(unix.O_RDONLY)
+	if err != nil {
+		ff.log.forgetUnflagged(err, false)
+		return 0, 0, err
+	}
+	defer func() { _ = f.Close() }() // read-only
+	ff.log.mu.Lock()
+	defer ff.log.mu.Unlock()
+	state, err := ff.log.sync(f, st)
+	if err != nil {
+		return 0, 0, err
+	}
+	return st.Size, state.unattributableLines(), nil
+}
+
 // ackFloorDamage records, as root, the acknowledgement of the floor's damage
-// as it stands: the floor file's inode and birth time and its size as the
-// watermark. It then runs the start step's catch-up again, when the user
-// scope is started, so a scope quarantined only by acknowledged damage is
-// served; a scope a taint still refuses stays quarantined. It is root
-// maintenance with no verb yet.
+// as it stands, compare-and-set: under the exclusive store lock and the
+// floor's mutex it refuses (errAckStale) unless the floor's size is
+// wantSize and its count of unattributable damaged lines is wantDamage, the
+// figures root reviewed (floorAckView), then writes the floor file's inode
+// and birth time and that size as the watermark through the data-root
+// descriptor it judged. Still under the store lock it then runs the start
+// step's catch-up again, when the user scope is started, so a scope
+// quarantined only by acknowledged damage is served; a scope a taint still
+// refuses stays quarantined, and no catch-up line is written for a
+// generation whose key a damaged line could name. It is root maintenance
+// with no verb yet.
 //
 //lint:ignore U1000 root maintenance calls it once its verb lands; until then the tests hold it.
-func (s *FileStore) ackFloorDamage(ctx context.Context) error {
+func (s *FileStore) ackFloorDamage(ctx context.Context, wantSize int64, wantDamage int) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -138,34 +175,107 @@ func (s *FileStore) ackFloorDamage(ctx context.Context) error {
 	if !ok {
 		return errors.New("the store has no file-backed user-scope floor to acknowledge")
 	}
-	f, st, err := ff.log.open(unix.O_RDONLY)
-	if err != nil {
-		ff.log.forgetUnflagged(err, false)
+	if err := s.checkConfig(); err != nil {
 		return err
 	}
-	_ = f.Close() // only its identity and size are needed
-	a := floorAck{ino: st.Ino, birth: logBirth(&st), watermark: st.Size}
-	dfd, err := s.openLogDataRoot()
+	root, done, err := s.openLocked(ctx, false, true)
 	if err != nil {
 		return err
 	}
-	_ = unix.Close(dfd) // judged; the write goes through an os.Root
-	root, err := os.OpenRoot(s.dataRoot)
-	if err != nil {
-		return fmt.Errorf("open the data root: %w", err)
-	}
-	defer func() { _ = root.Close() }() // the write is fsynced by writeFileAs
-	if err := s.writeFileAs(root, floorAckName, a.encode(), uint32(s.floorUID), uint32(s.floorGID), floorFileMode); err != nil {
+	defer done()
+	if err := s.writeFloorAck(ff, wantSize, wantDamage); err != nil {
 		return err
 	}
 	if s.userScopesStarted == nil || !s.userScopesStarted.Load() {
 		return nil
 	}
-	quarantined, scopeErrs, err := s.catchUpUser(ctx)
+	quarantined, scopeErrs, err := s.catchUpUserLocked(ctx, root)
 	if err != nil {
 		return errors.Join(err, scopeErrs)
 	}
 	s.quarantined.Store(&quarantined)
+	return nil
+}
+
+// writeFloorAck is ackFloorDamage's compare and write, under the floor's
+// mutex. The caller holds the exclusive store lock.
+func (s *FileStore) writeFloorAck(ff *fileFloorLog, wantSize int64, wantDamage int) error {
+	f, st, err := ff.log.open(unix.O_RDONLY)
+	if err != nil {
+		ff.log.forgetUnflagged(err, false)
+		return err
+	}
+	defer func() { _ = f.Close() }() // read-only
+	ff.log.mu.Lock()
+	defer ff.log.mu.Unlock()
+	state, err := ff.log.sync(f, st)
+	if err != nil {
+		return err
+	}
+	if st.Size != wantSize || state.unattributableLines() != wantDamage {
+		return errAckStale
+	}
+	dfd, err := s.openLogDataRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(dfd) }() // the write is fsynced in writeFileAt
+	// The acknowledgement names the floor file in the directory it is
+	// written to: the judged descriptor's entry must be the file sized.
+	var named unix.Stat_t
+	if err := unix.Fstatat(dfd, userFloorLogName, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("stat the user-scope floor in the data root: %w", err)
+	}
+	if named.Dev != st.Dev || named.Ino != st.Ino {
+		return errAckStale
+	}
+	a := floorAck{ino: st.Ino, birth: logBirth(&st), watermark: st.Size}
+	return s.writeFileAt(dfd, floorAckName, a.encode(), uint32(s.floorUID), uint32(s.floorGID), floorFileMode)
+}
+
+// writeFileAt is writeFileAs through the directory descriptor dfd: a fresh
+// temporary file, owned and moded on its descriptor, written and fsynced,
+// renamed over name, and the directory fsynced.
+func (s *FileStore) writeFileAt(dfd int, name string, data []byte, uid, gid uint32, mode os.FileMode) error {
+	var suffix [tempSuffixSize]byte
+	if err := s.readRandom(suffix[:]); err != nil {
+		return fmt.Errorf("name a temporary file: %w", err)
+	}
+	tmp := tempName(name, suffix)
+	fd, err := unix.Openat(dfd, tmp, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(fileMode))
+	if err != nil {
+		return fmt.Errorf("create %s: %w", tmp, err)
+	}
+	f := os.NewFile(uintptr(fd), tmp)
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = unix.Unlinkat(dfd, tmp, 0) // best effort: a leftover temporary file is ignored by every reader
+		}
+	}()
+	err = s.ownAs(f, uid, gid, mode)
+	if err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = s.step("write " + name)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
+	}
+	if err := unix.Renameat(dfd, tmp, dfd, name); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmp, name, err)
+	}
+	renamed = true
+	if err := unix.Fsync(dfd); err != nil {
+		return fmt.Errorf("sync the data root: %w", err)
+	}
 	return nil
 }
 
