@@ -29,7 +29,7 @@ import (
 // restore or a stray copy can put any bytes there, so the decoder must refuse
 // anything a root verb would not have written, as errFloorMalformed (which
 // matches ErrCorrupt), and
-// never panic. What it accepts must be a floor every check can rely on, and
+// never panic. A tombstone is held to the same rules as an entry. What it accepts must be a floor every check can rely on, and
 // must encode back to the same floor, byte for byte. The seeds are committed under
 // testdata/fuzz/FuzzParseFloor.
 func FuzzParseFloor(f *testing.F) {
@@ -55,8 +55,8 @@ func FuzzParseFloor(f *testing.F) {
 			if err != nil || len(g) != generationSize || hex.EncodeToString(g) != e.Generation {
 				t.Fatalf("accepted generation %q for %q", e.Generation, name)
 			}
-			if e.Seq == 0 {
-				t.Fatalf("accepted sequence 0 for %q", name)
+			if (e.Seq == 0) == (e.Deleted == 0) {
+				t.Fatalf("accepted %+v for %q: want a live entry (a sequence) or a tombstone (a delete sequence), one of the two", e, name)
 			}
 		}
 		again, err := marshalFloor(fl)

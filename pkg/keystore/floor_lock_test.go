@@ -112,8 +112,8 @@ func TestFloorWriteRereads(t *testing.T) {
 		if err := s.Delete(t.Context(), "gone"); err != nil {
 			t.Fatalf("Delete gone: %v", err)
 		}
-		if _, ok := floorOf(t, server)["gone"]; ok {
-			t.Fatal("the Delete left its own generation's floor entry")
+		if f := floorOf(t, server)["gone"]; f.Deleted == 0 {
+			t.Fatalf("the Delete left its own generation's floor entry live: %+v, want a tombstone", f)
 		}
 	})
 }
@@ -227,8 +227,8 @@ func TestDataRootFlockBlocksNoFloorWrite(t *testing.T) {
 			}
 		}
 		fl := floorOf(t, server)
-		if _, ok := fl["a"]; ok {
-			t.Fatalf("floor after the Delete still records a: %+v", fl)
+		if fl["a"].Deleted == 0 {
+			t.Fatalf("floor after the Delete still records a live: %+v, want a tombstone", fl)
 		}
 		if fl["b"].Seq != 1 {
 			t.Fatalf("floor b after the Put = %+v, want sequence 1", fl["b"])

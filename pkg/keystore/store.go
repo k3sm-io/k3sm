@@ -292,7 +292,13 @@ func (s *FileStore) createEntry(root *os.Root, name string, fl floor) (*entry, e
 		old, oerr := openEntryDir(root, name, fl)
 		switch {
 		case oerr == nil:
+			gen, gerr := readGeneration(old.root)
 			old.close()
+			if gerr == nil {
+				if berr := fl.buried(name, gen); berr != nil {
+					return nil, fmt.Errorf("%w: rm it first: %w", ErrExists, berr)
+				}
+			}
 			return nil, ErrExists
 		case errors.Is(oerr, errNoPointer):
 			return nil, fmt.Errorf("%w: the entry is damaged, so rm it first: %w", ErrExists, oerr)
@@ -526,15 +532,17 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // which is not an entry: Delete, called again, removes it and answers
 // ErrNotFound, and so does the next Put of the name. Delete reads nothing
 // inside the entry but its generation, so it removes one List reports as
-// corrupt, whatever is planted at its current, and still removes the floor
-// entry that records its generation. A symlink or any other non-directory at
+// corrupt, whatever is planted at its current, and still turns the floor
+// entry that records its generation into a tombstone. A symlink or any other non-directory at
 // the name is unlinked without being followed.
 //
-// The floor is changed only for an entry it records: an interrupted Put's
-// generation is never recorded (or it would be a lost pointer), and a
-// non-directory has none, so removing either leaves the floor alone. A crash
-// after the directory is gone leaves a floor for a name with no entry, which
-// the next Put of the name replaces.
+// A completed Delete replaces the name's floor record with a tombstone of
+// the deleted generation (floor.bury), so an older copy of the entry put back
+// is refused by every reader; it needs no master. An interrupted Put's
+// generation never committed a pointer, and a non-directory has none, so
+// removing either leaves the floor alone, and so does a Delete of an absent
+// name. A crash after the directory is gone leaves a live floor for a name
+// with no entry, which the next Put of the name replaces.
 func (s *FileStore) Delete(ctx context.Context, name string) error {
 	if err := s.delete(ctx, name); err != nil {
 		return fmt.Errorf("delete %s: %w", name, err)
@@ -586,9 +594,8 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		}
 		return syncDir(root)
 	}
-	// The generation is read before anything is removed: the floor entry is
-	// removed only if it records this one. A directory whose generation does
-	// not read leaves the floor as it is, for the next Put of the name.
+	// The generation is read before anything is removed: it is the one the
+	// tombstone records.
 	gen, genErr := [generationSize]byte{}, error(nil)
 	if raw, err := openEntryDirRaw(root, name); err == nil {
 		gen, genErr = readGeneration(raw.root)
@@ -635,10 +642,14 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	if err := syncDir(root); err != nil {
 		return err
 	}
-	if genErr != nil {
-		return nil
+	// The name's record becomes its tombstone, so an older copy of this
+	// entry put back is refused. A generation that did not read is taken
+	// from the floor's live entry, if it has one (bury).
+	var deleted *[generationSize]byte
+	if genErr == nil {
+		deleted = &gen
 	}
-	_, err = fdir.update(func(fl floor) bool { return fl.remove(name, gen) })
+	_, err = fdir.update(func(fl floor) bool { return fl.bury(name, deleted) })
 	return err
 }
 
@@ -841,13 +852,19 @@ type entry struct {
 	generation [generationSize]byte
 }
 
-// openEntry opens name's directory and reads its generation.
+// openEntry opens name's directory and reads its generation, refusing one
+// the floor's tombstone for name records (floor.buried).
 func openEntry(root *os.Root, name string, fl floor) (*entry, error) {
 	e, err := openEntryDir(root, name, fl)
 	if err != nil {
 		return nil, err
 	}
 	if e.generation, err = readGeneration(e.root); err != nil {
+		e.close()
+		return nil, err
+	}
+	// A generation the floor records as deleted is an older copy put back.
+	if err := fl.buried(name, e.generation); err != nil {
 		e.close()
 		return nil, err
 	}
@@ -915,6 +932,10 @@ func openEntryDir(root *os.Root, name string, fl floor) (*entry, error) {
 // not read while the floor records the name is damage: a crashed Put writes
 // that file whole, by rename. The two are compared as generation bytes, as
 // every reader decodes them, not as text.
+//
+// A tombstone of dir's generation makes it damage too: an older copy of a
+// deleted entry put back, never an interrupted Put. A tombstone of another
+// generation records nothing about dir.
 func committedBefore(dir *os.Root, name string, fl floor) (bool, error) {
 	f, ok := fl[name]
 	if !ok {
@@ -933,8 +954,22 @@ func committedBefore(dir *os.Root, name string, fl floor) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("%w: entry %q", errFloorMalformed, name)
 	}
+	if f.Deleted != 0 {
+		if bytes.Equal(recorded, gen[:]) {
+			return false, buriedShapeError{&staleError{name: name, deleted: true}}
+		}
+		return false, nil
+	}
 	return bytes.Equal(recorded, gen[:]), nil
 }
+
+// buriedShapeError is a directory with no current pointer whose generation
+// the floor's tombstone records: an older copy of a deleted entry put back.
+// It is errNoPointer (List reports it, Put refuses it, Delete clears it), but
+// carries the floor's text, not ErrCorrupt's advice to restore from backup.
+type buriedShapeError struct{ *staleError }
+
+func (buriedShapeError) Unwrap() error { return errNoPointer }
 
 // interruptedPut reports whether dir holds only what a crashed Put leaves
 // before its pointer: nothing, generation, or generation and v1, plus

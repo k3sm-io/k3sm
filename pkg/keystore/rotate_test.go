@@ -221,43 +221,6 @@ func TestFloorRefusesCopiedBackPointer(t *testing.T) {
 	})
 }
 
-// TestDeletedEntryPutBack pins the residual docs/design/keystore.md §
-// "Pointer sequence and floor" accepts for this phase: a completed Delete
-// removes the name's floor entry, so an old copy of the deleted entry put
-// back before any new Put of the name has nothing to be refused against. It
-// opens, and the next root verb records its generation and sequence.
-func TestDeletedEntryPutBack(t *testing.T) {
-	ctx := context.Background()
-	s, server := newTestStore(t)
-	mustPut(t, s, "k", KindOpaque, []byte("one"))
-	mustRotate(t, s, "k", "two")
-	old := filepath.Join(server, "old-entry")
-	if err := os.Mkdir(old, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range []string{generationName, "v1", "v2", currentName} {
-		copyFile(t, entryPath(server, "k", f), filepath.Join(old, f))
-	}
-	recorded := floorOf(t, server)["k"]
-	if err := s.Delete(ctx, "k"); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := floorOf(t, server)["k"]; ok {
-		t.Fatal("the Delete left the name's floor entry")
-	}
-	if err := os.Rename(old, filepath.Join(server, "keystore", "k")); err != nil {
-		t.Fatal(err)
-	}
-	mustCurrent(t, s, "k", "two")
-	if err := s.RaiseFloor(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := floorOf(t, server)["k"]; got != recorded {
-		t.Fatalf("floor after RaiseFloor = %+v, want the put-back entry's %+v", got, recorded)
-	}
-	mustCurrent(t, s, "k", "two")
-}
-
 // TestFloorTrust is G6: the floor, and the data root holding it, are judged
 // on the opened descriptor, and a floor the service user could have written
 // is refused, never read as absent.
@@ -381,8 +344,8 @@ func TestFloorRaised(t *testing.T) {
 		if err := s.Delete(ctx, "k"); err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := floorOf(t, server)["k"]; ok {
-			t.Fatal("floor still records a deleted entry")
+		if f := floorOf(t, server)["k"]; f.Deleted == 0 || f.Seq != 0 {
+			t.Fatalf("floor after Delete = %+v, want the deleted entry's tombstone", f)
 		}
 	})
 	t.Run("a Rotate crash after the flip", func(t *testing.T) {
@@ -469,8 +432,8 @@ func TestFloorRaised(t *testing.T) {
 		if err := s.Delete(ctx, "a"); err != nil {
 			t.Fatalf("Delete without the master: %v", err)
 		}
-		if fl := floorOf(t, server); len(fl) != 1 || fl["b"].Seq != 1 {
-			t.Fatalf("floor = %+v, want only b", fl)
+		if fl := floorOf(t, server); len(fl) != 2 || fl["b"].Seq != 1 || fl["a"].Deleted != 1 {
+			t.Fatalf("floor = %+v, want b live and a's tombstone", fl)
 		}
 	})
 	t.Run("nothing to raise", func(t *testing.T) {

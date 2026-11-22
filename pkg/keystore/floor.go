@@ -61,6 +61,13 @@ const (
 	// maxFloorEntries is the most entries a floor file under maxFloorSize can
 	// hold. A keystore with more cannot have them all recorded.
 	maxFloorEntries = maxFloorSize / minFloorEntrySize
+	// maxTombstoneSize is the most of the floor file its tombstones may take:
+	// the "tombstones" object, with the comma before it. Live entries may use
+	// all of maxFloorSize, and tombstones only this much of what they leave;
+	// every floor write prunes tombstones, oldest first, to fit both (prune).
+	// A tombstone costs under 330 bytes, so this holds some 3,500 of the
+	// longest names and some 16,000 short ones.
+	maxTombstoneSize = 1 << 20
 )
 
 var (
@@ -80,24 +87,41 @@ var (
 	errFloorFull = fmt.Errorf("the keystore floor is full: recording this change would make keystore-floor.json larger than %d bytes; delete entries that are no longer used to make room", maxFloorSize)
 )
 
-// floor is the recorded floor, by entry name. A nil floor is an absent file:
-// nothing is checked against it.
+// floor is the recorded floor, by entry name: each name's live entry or its
+// tombstone, never both. A nil floor is an absent file: nothing is checked
+// against it.
 type floor map[string]floorEntry
 
-// floorEntry is one entry's recorded floor.
+// floorEntry is one name's record in the floor: a live entry (Seq set,
+// Deleted 0) or a tombstone (Deleted set, Seq 0), which records that a Delete
+// removed the entry of that generation (docs/design/keystore.md § "Pointer
+// sequence and floor", "A deleted entry put back is refused").
 type floorEntry struct {
 	// Generation is the entry's generation, hex.
 	Generation string `json:"generation"`
 	// Seq is the highest pointer sequence committed for it.
 	Seq uint64 `json:"seq"`
+	// Deleted is a tombstone's delete sequence, which orders tombstones for
+	// pruning: one more than the highest in the floor when it was written. It
+	// is encoded in the tombstones object, never in an entry.
+	Deleted uint64 `json:"-"`
+}
+
+// tombstone is the encoding of a tombstone in the floor file.
+type tombstone struct {
+	Generation string `json:"generation"`
+	Deleted    uint64 `json:"deleted"`
 }
 
 // floorFile is the floor's encoding. Scope names the scope whose entries it
-// records, always scopeSystem: the floor is the system store's.
+// records, always scopeSystem: the floor is the system store's. Tombstones is
+// written only when the floor holds one, so a floor from before tombstones
+// is still the encoding of a floor with none.
 type floorFile struct {
-	Version int    `json:"version"`
-	Scope   string `json:"scope"`
-	Entries floor  `json:"entries"`
+	Version    int                  `json:"version"`
+	Scope      string               `json:"scope"`
+	Entries    floor                `json:"entries"`
+	Tombstones map[string]tombstone `json:"tombstones,omitempty"`
 }
 
 // floorMalformedError is errFloorMalformed's type. It matches ErrCorrupt
@@ -112,10 +136,18 @@ func (*floorMalformedError) Unwrap() error { return ErrCorrupt }
 
 // marshalFloor encodes fl as the floor file, newline-terminated.
 func marshalFloor(fl floor) ([]byte, error) {
-	if fl == nil {
-		fl = floor{}
+	f := floorFile{Version: floorFormat, Scope: scopeSystem, Entries: floor{}}
+	for name, e := range fl {
+		if e.Deleted != 0 {
+			if f.Tombstones == nil {
+				f.Tombstones = map[string]tombstone{}
+			}
+			f.Tombstones[name] = tombstone{Generation: e.Generation, Deleted: e.Deleted}
+			continue
+		}
+		f.Entries[name] = e
 	}
-	b, err := json.Marshal(floorFile{Version: floorFormat, Scope: scopeSystem, Entries: fl})
+	b, err := json.Marshal(f)
 	if err != nil {
 		return nil, err
 	}
@@ -126,14 +158,58 @@ func marshalFloor(fl floor) ([]byte, error) {
 // encoding it: an entry's name is a checkName name and its generation hex, so
 // neither is escaped.
 func (fl floor) size() int {
-	n := len(`{"version":`) + len(strconv.Itoa(floorFormat)) + len(`,"scope":"`) + len(scopeSystem) + len(`","entries":{}}`) + 1
+	dead, sum := 0, 0
 	for name, e := range fl {
-		n += floorEntrySize(name, e)
+		if e.Deleted != 0 {
+			dead++
+			sum += tombstoneSize(name, e)
+		}
 	}
-	if len(fl) > 0 {
-		n += len(fl) - 1 // the commas between entries
+	return fl.liveSize() + tombstonesSize(dead, sum)
+}
+
+// liveSize is the length fl's encoding would have with no tombstones: what
+// its live entries need, since every tombstone can be pruned to make room.
+func (fl floor) liveSize() int {
+	n := len(`{"version":`) + len(strconv.Itoa(floorFormat)) + len(`,"scope":"`) + len(scopeSystem) + len(`","entries":{}}`) + 1
+	live := 0
+	for name, e := range fl {
+		if e.Deleted == 0 {
+			n += floorEntrySize(name, e)
+			live++
+		}
+	}
+	if live > 0 {
+		n += live - 1 // the commas between entries
 	}
 	return n
+}
+
+// liveCount is how many live entries fl holds.
+func (fl floor) liveCount() int {
+	n := 0
+	for _, e := range fl {
+		if e.Deleted == 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// tombstoneSize is the length of name's tombstone e in the floor's encoding,
+// without the comma that separates it from the one before.
+func tombstoneSize(name string, e floorEntry) int {
+	return len(`"":{"generation":"`) + len(name) + len(e.Generation) + len(`","deleted":}`) + len(strconv.FormatUint(e.Deleted, 10))
+}
+
+// tombstonesSize is the length of the tombstones object, with the comma
+// before it, holding n tombstones whose tombstoneSize sums to sum: nothing
+// for none, since marshalFloor then leaves the field out.
+func tombstonesSize(n, sum int) int {
+	if n == 0 {
+		return 0
+	}
+	return len(`,"tombstones":{}`) + sum + n - 1
 }
 
 // floorEntrySize is the length of name's entry e in the floor's encoding,
@@ -142,45 +218,88 @@ func floorEntrySize(name string, e floorEntry) int {
 	return len(`"":{"generation":"`) + len(name) + len(e.Generation) + len(`","seq":}`) + len(strconv.FormatUint(e.Seq, 10))
 }
 
-// grow is how many bytes recording e for name would add to fl's encoding.
+// grow is how many bytes recording the live entry e for name would add to
+// fl's live entries' encoding (liveSize). A tombstone for name is replaced,
+// and counts as nothing, like every tombstone: prune makes room by them.
 func (fl floor) grow(name string, e floorEntry) int {
-	if old, ok := fl[name]; ok {
+	if old, ok := fl[name]; ok && old.Deleted == 0 {
 		return floorEntrySize(name, e) - floorEntrySize(name, old)
 	}
-	if len(fl) == 0 {
+	if fl.liveCount() == 0 {
 		return floorEntrySize(name, e)
 	}
 	return floorEntrySize(name, e) + 1
 }
 
-// room refuses, as errFloorFull, recording e for name when the floor would
-// then be larger than maxFloorSize. A verb asks it before it writes anything,
-// so a full floor refuses the verb rather than a write after its entry files.
+// room refuses, as errFloorFull, recording e for name when the floor's live
+// entries would then be larger than maxFloorSize. Tombstones do not count:
+// the write prunes them to make room, so a tombstone never refuses a Put or
+// a Rotate. A verb asks it before it writes anything, so a full floor
+// refuses the verb rather than a write after its entry files.
 func (fl floor) room(name string, e floorEntry) error {
-	if n := fl.size() + fl.grow(name, e); n > maxFloorSize {
+	if n := fl.liveSize() + fl.grow(name, e); n > maxFloorSize {
 		return fmt.Errorf("%w (%d bytes)", errFloorFull, n)
 	}
 	return nil
+}
+
+// prune removes tombstones, oldest first (the lowest Deleted, then by name),
+// until they fit in maxTombstoneSize and the whole floor in maxFloorSize. It
+// never removes a live entry. A pruned tombstone's name loses its refusal: an
+// old copy of that deleted entry put back is accepted again, until a Put of
+// the name records a new generation.
+func (fl floor) prune() {
+	var names []string
+	sum := 0
+	for name, e := range fl {
+		if e.Deleted != 0 {
+			names = append(names, name)
+			sum += tombstoneSize(name, e)
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	sort.Slice(names, func(i, j int) bool {
+		a, b := fl[names[i]], fl[names[j]]
+		if a.Deleted != b.Deleted {
+			return a.Deleted < b.Deleted
+		}
+		return names[i] < names[j]
+	})
+	live, n := fl.liveSize(), len(names)
+	for _, name := range names {
+		if t := tombstonesSize(n, sum); t <= maxTombstoneSize && live+t <= maxFloorSize {
+			return
+		}
+		sum -= tombstoneSize(name, fl[name])
+		n--
+		delete(fl, name)
+	}
 }
 
 // staleError refuses a current pointer the floor rules out. It matches
 // ErrCorrupt but carries its own text, because ErrCorrupt's advice to restore
 // from backup is the opposite of the fix: an older copy is what produced it.
 //
-// The generation case is refused only once a Put after the Delete has
-// recorded a new generation for the name. A completed Delete removes the
-// name's floor entry, so an older copy of the deleted entry put back before
-// any new Put has nothing to be refused against and is accepted
-// (docs/design/keystore.md § "Pointer sequence and floor").
+// A completed Delete leaves a tombstone of the deleted generation, so an
+// older copy of the deleted entry put back is refused (deleted) until the
+// tombstone is pruned; after a new Put of the name, the new generation
+// refuses it (generation) (docs/design/keystore.md § "Pointer sequence and
+// floor").
 type staleError struct {
 	name       string
 	seq, floor uint64
 	generation bool
+	deleted    bool
 }
 
 func (e *staleError) Error() string {
 	what := fmt.Sprintf("the current pointer (sequence %d) is older than the recorded floor (sequence %d); an older copy of this entry was put back", e.seq, e.floor)
-	if e.generation {
+	switch {
+	case e.deleted:
+		what = "the entry directory belongs to a generation of this entry that the floor records as deleted; an older copy of a deleted entry was put back, and rm removes it"
+	case e.generation:
 		what = "the current pointer belongs to another generation of this entry than the recorded floor; an older copy of a deleted entry was put back after a newer put of the name, or a delete and the put after it were both interrupted"
 	}
 	return fmt.Sprintf("keystore entry %q: %s. Do not restore from backup. If that was deliberate, follow \"Restoring an older keystore/\" in docs/user/backup-restore.md", e.name, what)
@@ -189,11 +308,14 @@ func (e *staleError) Error() string {
 func (e *staleError) Unwrap() error { return ErrCorrupt }
 
 // check refuses a pointer of name at generation gen and sequence seq unless
-// the floor has no entry for name, or records the same generation at a
-// sequence no higher than seq.
+// the floor has no live entry for name and no tombstone of gen, or records
+// the same generation at a sequence no higher than seq.
 func (fl floor) check(name string, gen [generationSize]byte, seq uint64) error {
+	if err := fl.buried(name, gen); err != nil {
+		return err
+	}
 	f, ok := fl[name]
-	if !ok {
+	if !ok || f.Deleted != 0 {
 		return nil
 	}
 	if f.Generation != hex.EncodeToString(gen[:]) {
@@ -205,15 +327,31 @@ func (fl floor) check(name string, gen [generationSize]byte, seq uint64) error {
 	return nil
 }
 
+// buried refuses (a staleError, matching ErrCorrupt) an entry directory of
+// name at generation gen when the floor's tombstone for name records gen: an
+// older copy of a deleted entry put back.
+func (fl floor) buried(name string, gen [generationSize]byte) error {
+	if f, ok := fl[name]; ok && f.Deleted != 0 && f.Generation == hex.EncodeToString(gen[:]) {
+		return &staleError{name: name, deleted: true}
+	}
+	return nil
+}
+
 // raise is Raise applied to fl: it records seq for name at generation gen
-// when the floor has no entry for name or holds a lower sequence of the same
-// generation (the maximum of the two), and reports whether it changed
-// anything. A floor of another generation is left alone: readers refuse that
-// pointer, and only a Put, which mints a new generation, replaces it (set).
+// when the floor has no entry for name, a tombstone of another generation
+// (a Put that crashed before its floor write), or a lower sequence of the
+// same generation (the maximum of the two), and reports whether it changed
+// anything. A live floor of another generation is left alone: readers refuse
+// that pointer, and only a Put, which mints a new generation, replaces it
+// (set). A tombstone of gen is never raised over: that is a deleted entry.
 func (fl floor) raise(name string, gen [generationSize]byte, seq uint64) bool {
 	g := hex.EncodeToString(gen[:])
 	f, ok := fl[name]
-	if ok && (f.Generation != g || f.Seq >= seq) {
+	if ok && f.Deleted != 0 {
+		if f.Generation == g {
+			return false
+		}
+	} else if ok && (f.Generation != g || f.Seq >= seq) {
 		return false
 	}
 	fl[name] = floorEntry{Generation: g, Seq: seq}
@@ -221,26 +359,50 @@ func (fl floor) raise(name string, gen [generationSize]byte, seq uint64) bool {
 }
 
 // set is Put applied to fl: it records sequence 1 for name at generation
-// gen when the floor has no entry for name or one of another generation, and
-// reports whether it changed anything. The entry of the same generation is
-// left alone: it can only be higher, raised since.
+// gen when the floor has no entry for name, a tombstone (which the new
+// generation clears), or a live entry of another generation, and reports
+// whether it changed anything. The live entry of the same generation is left
+// alone: it can only be higher, raised since.
 func (fl floor) set(name string, gen [generationSize]byte) bool {
 	g := hex.EncodeToString(gen[:])
-	if f, ok := fl[name]; ok && f.Generation == g {
+	if f, ok := fl[name]; ok && f.Deleted == 0 && f.Generation == g {
 		return false
 	}
 	fl[name] = floorEntry{Generation: g, Seq: 1}
 	return true
 }
 
-// remove is Delete applied to fl: it removes name's entry when it records
-// generation gen, and reports whether it changed anything. An entry of
-// another generation belongs to a Put after the Delete, and stays.
-func (fl floor) remove(name string, gen [generationSize]byte) bool {
-	if f, ok := fl[name]; !ok || f.Generation != hex.EncodeToString(gen[:]) {
+// bury is Delete applied to fl: it replaces name's record with a tombstone
+// of gen, the deleted directory's generation, or, when gen is nil (the
+// generation file did not read), of the generation the floor records live
+// for name, and reports whether it changed anything. A live entry of another
+// generation than gen is kept and no tombstone written: it is a newer Put's,
+// recorded while this Delete ran, and its generation already refuses gen. A
+// tombstone of the same generation is kept as it is, and with no generation
+// to record nothing changes. The new tombstone's delete sequence is one more
+// than the highest in the floor.
+func (fl floor) bury(name string, gen *[generationSize]byte) bool {
+	f, ok := fl[name]
+	var g string
+	switch {
+	case gen != nil:
+		g = hex.EncodeToString(gen[:])
+	case ok && f.Deleted == 0:
+		g = f.Generation
+	default:
 		return false
 	}
-	delete(fl, name)
+	if ok && f.Generation == g && f.Deleted != 0 {
+		return false
+	}
+	if ok && f.Generation != g && f.Deleted == 0 {
+		return false
+	}
+	var last uint64
+	for _, e := range fl {
+		last = max(last, e.Deleted)
+	}
+	fl[name] = floorEntry{Generation: g, Deleted: last + 1}
 	return true
 }
 
@@ -346,10 +508,15 @@ func parseFloor(b []byte) (floor, error) {
 		f.Entries = floor{}
 	}
 	for name, e := range f.Entries {
-		g, err := hex.DecodeString(e.Generation)
-		if checkName(name) != nil || err != nil || len(g) != generationSize || hex.EncodeToString(g) != e.Generation || e.Seq == 0 {
+		if !floorGeneration(name, e.Generation) || e.Seq == 0 {
 			return nil, fmt.Errorf("%w: entry %q", errFloorMalformed, name)
 		}
+	}
+	for name, t := range f.Tombstones {
+		if _, live := f.Entries[name]; live || !floorGeneration(name, t.Generation) || t.Deleted == 0 {
+			return nil, fmt.Errorf("%w: tombstone %q", errFloorMalformed, name)
+		}
+		f.Entries[name] = floorEntry{Generation: t.Generation, Deleted: t.Deleted}
 	}
 	canon, err := marshalFloor(f.Entries)
 	if err != nil {
@@ -359,6 +526,13 @@ func parseFloor(b []byte) (floor, error) {
 		return nil, fmt.Errorf("%w: not in the form a keys verb writes (a duplicate or differently cased key, reordered fields or extra whitespace)", errFloorMalformed)
 	}
 	return f.Entries, nil
+}
+
+// floorGeneration reports whether name is a name put accepts and gen the
+// canonical hex of a generation.
+func floorGeneration(name, gen string) bool {
+	g, err := hex.DecodeString(gen)
+	return checkName(name) == nil && err == nil && len(g) == generationSize && hex.EncodeToString(g) == gen
 }
 
 // floorLock is the floor held under its lock, which every floor write
@@ -586,7 +760,8 @@ func (l *floorLock) read() (floor, error) {
 
 // update re-reads the floor under the lock, applies op to what it read, and
 // writes the result if op reports a change, returning the floor as it now
-// is. The lock is held through the rename and the directory fsync. op sees
+// is. A change is pruned (prune) before it is written, so tombstones never
+// take a live entry's room. The lock is held through the rename and the directory fsync. op sees
 // a non-nil floor; an absent file it leaves unchanged stays absent.
 func (l *floorLock) update(op func(floor) bool) (floor, error) {
 	fl, err := l.read()
@@ -603,6 +778,7 @@ func (l *floorLock) update(op func(floor) bool) (floor, error) {
 		}
 		return fl, nil
 	}
+	fl.prune()
 	b, err := marshalFloor(fl)
 	if err != nil {
 		return nil, err
@@ -688,7 +864,8 @@ func (s *FileStore) syncFloor(ctx context.Context, entries *os.Root, l *floorLoc
 	}
 	return l.update(func(fl floor) bool {
 		changed := false
-		size := fl.size()
+		// Sized by the live entries alone: update prunes tombstones to fit.
+		size, live := fl.liveSize(), fl.liveCount()
 		for _, r := range found {
 			old, had := fl[r.name]
 			if !fl.raise(r.name, r.gen, r.seq) {
@@ -700,12 +877,22 @@ func (s *FileStore) syncFloor(ctx context.Context, entries *os.Root, l *floorLoc
 			} else {
 				delete(fl, r.name)
 			}
-			grow := fl.grow(r.name, raised)
+			replaces := had && old.Deleted == 0
+			grow := floorEntrySize(r.name, raised)
+			switch {
+			case replaces:
+				grow -= floorEntrySize(r.name, old)
+			case live > 0:
+				grow++ // the comma before it
+			}
 			if size+grow > maxFloorSize {
 				continue // left where it was: see above
 			}
 			fl[r.name] = raised
 			size += grow
+			if !replaces {
+				live++
+			}
 			changed = true
 		}
 		return changed
