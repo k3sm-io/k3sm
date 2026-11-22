@@ -127,7 +127,7 @@ func entriesEqual(x, y floorEntry) bool {
 // checkFloorEntry fails t unless e, name's record, is one every check can
 // rely on: a live record (a canonical generation and a sequence) or none,
 // at least one burial when there is no live record, at most
-// maxBuriedPerName burials of canonical generations, oldest first, none of
+// buriedPerNameLimit burials of canonical generations, oldest first, none of
 // them the live generation and every delete sequence in 1 to maxDeleteSeq.
 func checkFloorEntry(t *testing.T, name string, e floorEntry) {
 	t.Helper()
@@ -142,8 +142,8 @@ func checkFloorEntry(t *testing.T, name string, e floorEntry) {
 	if !e.live() && len(bs) == 0 {
 		t.Fatalf("record %q has sequence 0 and buries nothing", name)
 	}
-	if len(bs) > maxBuriedPerName {
-		t.Fatalf("record %q holds %d burials, over %d", name, len(bs), maxBuriedPerName)
+	if len(bs) > buriedPerNameLimit {
+		t.Fatalf("record %q holds %d burials, over %d", name, len(bs), buriedPerNameLimit)
 	}
 	var prev uint64
 	for _, b := range bs {
@@ -161,8 +161,11 @@ func checkFloorEntry(t *testing.T, name string, e floorEntry) {
 // generation leaves only by a drop bury, set or prune reports; no burial
 // appears but by bury or set; and the floor encodes to bytes that parse back to it, within
 // the caps. The "full" runs start from live entries that leave the
-// tombstones about 1 KiB, so the prune drops burials too.
+// tombstones about 1 KiB, so the prune drops burials too. It lowers the
+// floor's limits (setSmallFloorLimits), so a full floor is a few dozen
+// entries.
 func TestFloorOpsProperty(t *testing.T) {
+	setSmallFloorLimits(t)
 	names := []string{"a", "b", "c", strings.Repeat("n", maxNameLen)}
 	var gens [][generationSize]byte
 	for i := range 12 {
@@ -177,7 +180,7 @@ func TestFloorOpsProperty(t *testing.T) {
 		fl := floor{}
 		if full {
 			e := floorEntry{Generation: strings.Repeat("ab", generationSize), Seq: 1}
-			for i, size := 0, fl.liveSize(); size < maxFloorSize-1024; i++ {
+			for i, size := 0, fl.liveSize(); size < floorSizeLimit-1024; i++ {
 				name := fmt.Sprintf("fill-%s-%06d", strings.Repeat("f", 200), i)
 				size += floorEntrySize(name, e) + 1
 				fl[name] = e
@@ -260,7 +263,7 @@ func TestFloorOpsProperty(t *testing.T) {
 			if n != len(want) {
 				t.Fatalf("run %d step %d (%s): %d burials, want %d", run, step, op, n, len(want))
 			}
-			if fl.deadSize() > maxTombstoneSize || fl.size() > maxFloorSize {
+			if fl.deadSize() > tombstoneSizeLimit || fl.size() > floorSizeLimit {
 				t.Fatalf("run %d step %d (%s): tombstones %d bytes, floor %d", run, step, op, fl.deadSize(), fl.size())
 			}
 			if full && step%25 != 0 {

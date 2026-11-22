@@ -18,6 +18,42 @@ package keystore
 
 import "testing"
 
+// The floor's limits in tests. A test that would otherwise write a floor of
+// megabytes, or plant more than maxDirNames files, lowers the limit it
+// reaches to one of these and checks the same boundary there.
+// TestFloorProductionLimits runs those tests at the production limits.
+const (
+	// smallDirNames is the sync's directory bound a test lowers
+	// floorDirNamesBound to.
+	smallDirNames = 256
+	// smallFloorSize is the floor size a test lowers floorSizeLimit to.
+	smallFloorSize = 16 << 10
+	// smallTombstoneSize is the tombstone budget a test lowers
+	// tombstoneSizeLimit to: a quarter of smallFloorSize, as maxTombstoneSize
+	// is of maxFloorSize.
+	smallTombstoneSize = 4 << 10
+	// smallBuriedPerName is the per-name cap a test lowers buriedPerNameLimit
+	// to.
+	smallBuriedPerName = 4
+)
+
+// setFloorLimits sets the floor's size limits for the rest of t: the floor
+// size, the entry count that size holds, and the tombstone budget. t must
+// not run in parallel with a test that reads them.
+func setFloorLimits(t *testing.T, size, tombstones int) {
+	t.Helper()
+	setSeam(t, &floorSizeLimit, size)
+	setSeam(t, &floorEntriesLimit, size/minFloorEntrySize)
+	setSeam(t, &tombstoneSizeLimit, tombstones)
+}
+
+// setSmallFloorLimits is setFloorLimits at smallFloorSize and
+// smallTombstoneSize.
+func setSmallFloorLimits(t *testing.T) {
+	t.Helper()
+	setFloorLimits(t, smallFloorSize, smallTombstoneSize)
+}
+
 // TestFloorLimitsDefault: with no test lowering them, a store reads the
 // floor's limits at their production constants, so a lowered limit in one
 // test never stands in for production.

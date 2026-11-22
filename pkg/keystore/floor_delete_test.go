@@ -75,18 +75,24 @@ func TestDeleteFaultAfterBurial(t *testing.T) {
 // TestDeleteBuriesPastPlantedNames (G23): more names under keystore/ than a
 // directory read takes, which the service user can plant, make the sync of
 // the other entries' floors fail; the Delete still buries from the floor
-// alone and removes the entry.
+// alone and removes the entry. It lowers the sync's bound to smallDirNames,
+// so it plants smallDirNames+1 names; TestFloorProductionLimits plants
+// maxDirNames+1.
 func TestDeleteBuriesPastPlantedNames(t *testing.T) {
-	if testing.Short() {
-		t.Skip("plants over maxDirNames files")
-	}
+	setSeam(t, &floorDirNamesBound, smallDirNames)
+	deleteBuriesPastPlantedNames(t)
+}
+
+// deleteBuriesPastPlantedNames is TestDeleteBuriesPastPlantedNames at the
+// sync's bound as it stands, floorDirNamesBound: it plants one name more.
+func deleteBuriesPastPlantedNames(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
 	mustPut(t, s, "k", KindOpaque, []byte("one"))
 	gen := generationOf(t, server, "k")
 	old := saveEntry(t, server, "k", generationName, "v1", currentName)
 	ks := filepath.Join(server, "keystore")
-	for i := range maxDirNames + 1 {
+	for i := range floorDirNamesBound + 1 {
 		f, err := os.Create(filepath.Join(ks, fmt.Sprintf("planted-%06d", i)))
 		if err != nil {
 			t.Fatal(err)

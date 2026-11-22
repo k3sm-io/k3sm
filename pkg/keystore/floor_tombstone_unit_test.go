@@ -122,14 +122,22 @@ func TestTombstonePrune(t *testing.T) {
 // TestTombstoneNeverRefusesPut (U192): a floor full only because of its
 // tombstones refuses no Put and no Rotate: the write prunes the oldest
 // tombstone and records the live entry. A Delete over a full floor still
-// runs.
+// runs. It lowers the floor's limits (setSmallFloorLimits);
+// TestFloorProductionLimits runs it at maxFloorSize.
 func TestTombstoneNeverRefusesPut(t *testing.T) {
+	setSmallFloorLimits(t)
+	tombstoneNeverRefusesPut(t)
+}
+
+// tombstoneNeverRefusesPut is TestTombstoneNeverRefusesPut at the floor's
+// limits as they stand.
+func tombstoneNeverRefusesPut(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
 	mustPut(t, s, "k", KindOpaque, []byte("one"))
 	gen := strings.Repeat("cd", generationSize)
 	keep := floor{"k": floorOf(t, server)["k"], "old": buriedEntry(gen, 1), "older": buriedEntry(gen, 2)}
-	fillFloor(t, server, keep, maxFloorSize)
+	fillFloor(t, server, keep, floorSizeLimit)
 	if _, err := s.Put(ctx, "new", KindOpaque, []byte("new")); err != nil {
 		t.Fatalf("Put over a floor full of tombstones: %v", err)
 	}
@@ -140,18 +148,18 @@ func TestTombstoneNeverRefusesPut(t *testing.T) {
 	if _, ok := fl["old"]; ok {
 		t.Fatal("the oldest tombstone was kept, want it pruned first")
 	}
-	if fl.size() > maxFloorSize {
+	if fl.size() > floorSizeLimit {
 		t.Fatalf("floor is %d bytes", fl.size())
 	}
 	mustRotate(t, s, "k", "two")
 	if err := s.Delete(ctx, "new"); err != nil {
 		t.Fatalf("Delete over a full floor: %v", err)
 	}
-	if fl := floorOf(t, server); fl["k"].Seq != 2 || fl.size() > maxFloorSize {
+	if fl := floorOf(t, server); fl["k"].Seq != 2 || fl.size() > floorSizeLimit {
 		t.Fatalf("floor k after the Delete = %+v, size %d", fl["k"], fl.size())
 	}
 	// The live entries alone not fitting is still errFloorFull.
-	fillFloor(t, server, floor{"k": floorOf(t, server)["k"]}, maxFloorSize)
+	fillFloor(t, server, floor{"k": floorOf(t, server)["k"]}, floorSizeLimit)
 	if _, err := s.Put(ctx, "more", KindOpaque, []byte("x")); !errors.Is(err, errFloorFull) {
 		t.Fatalf("Put over a floor full of live entries: %v, want errFloorFull", err)
 	}
@@ -252,13 +260,23 @@ func captureWarn(t *testing.T) *bytes.Buffer {
 // TestPruneLogsAtWarn (U192): every burial a floor write drops is logged at
 // Warn with the count and the names: the per-name cap's drop, and the
 // floor's prune. A Delete whose own new burial the same write prunes says
-// so.
+// so. It lowers the per-name cap to smallBuriedPerName and the floor's
+// limits (setSmallFloorLimits); TestFloorProductionLimits runs it at
+// maxBuriedPerName and maxFloorSize.
 func TestPruneLogsAtWarn(t *testing.T) {
+	setSeam(t, &buriedPerNameLimit, smallBuriedPerName)
+	setSmallFloorLimits(t)
+	pruneLogsAtWarn(t)
+}
+
+// pruneLogsAtWarn is TestPruneLogsAtWarn at the per-name cap and the
+// floor's limits as they stand.
+func pruneLogsAtWarn(t *testing.T) {
 	ctx := context.Background()
 	t.Run("the per-name cap", func(t *testing.T) {
 		s, _ := newTestStore(t)
 		buf := captureWarn(t)
-		for range maxBuriedPerName {
+		for range buriedPerNameLimit {
 			mustPut(t, s, "k", KindOpaque, []byte("v"))
 			if err := s.Delete(ctx, "k"); err != nil {
 				t.Fatal(err)
@@ -278,7 +296,7 @@ func TestPruneLogsAtWarn(t *testing.T) {
 	t.Run("Delete's own burial pruned", func(t *testing.T) {
 		s, server := newTestStore(t)
 		mustPut(t, s, "k", KindOpaque, []byte("v"))
-		fillFloor(t, server, floor{"k": floorOf(t, server)["k"]}, maxFloorSize)
+		fillFloor(t, server, floor{"k": floorOf(t, server)["k"]}, floorSizeLimit)
 		buf := captureWarn(t)
 		if err := s.Delete(ctx, "k"); err != nil {
 			t.Fatalf("Delete over a full floor: %v", err)
