@@ -708,10 +708,11 @@ rewrap --key-out FILE | --key-in FILE
       under, and refuses any other. Takes no value.
       Prints that entry backups taken earlier no longer open.
 
-deliver <name> --namespace NS [--secret NAME] [--data-key KEY] [--remove]
-      Declare (or, with --remove, withdraw) delivery of an existing entry as
-      a Secret. Refuses a name that does not exist. Warns when secrets
-      encryption is off on this data root.
+deliver <name> --namespace NS [--secret-name NAME] [--data-key KEY]
+      Declare delivery of an existing entry as a Secret. Refuses a name that
+      does not exist. Warns when secrets encryption is off on this data root.
+undeliver <name> --namespace NS
+      Withdraw every delivery of the entry into NS. The Secret stays.
 ```
 
 Exit codes: 0 success, 1 refused (the sentinel's message), 2 bad usage — the same
@@ -727,8 +728,12 @@ labelled Secret per declared target, never LISTs, never prunes anything it did n
 apply, log-and-continue on a per-target failure (the same posture `pkg/addons/doc.go`
 already documents and justifies).
 
-**Target declaration.** `k3sm keys deliver` writes `/var/lib/k3sm/keystore-delivery.json`,
-root:wheel 0644, atomically (temp-and-rename), and nothing else writes it:
+**Target declaration.** `k3sm keys deliver` and `undeliver` write
+`/var/lib/k3sm/keystore-delivery.json`, root:wheel 0644, atomically (temp-and-rename), and
+nothing else writes it. The two verbs serialize their read-modify-write on an exclusive flock
+of `/var/lib/k3sm/.keystore-delivery.lock`, a root-owned 0600 file opened O_NOFOLLOW and
+judged on its descriptor like the declaration, with a bounded wait; the data root directory
+itself is never flocked:
 
 ```json
 {"version": 1, "targets": [
@@ -768,10 +773,14 @@ is checked by reading the existing Secret first: present and labelled for this e
 → update; present without the label or for a different entry → left alone, skipped with a
 logged reason, never forced.
 
-**Re-delivery on rotation:** the sweep compares the target's current version
-(`Store.Current`) against the version recorded in the Secret's own
-`k3sm.io/keystore-version` annotation; a mismatch re-applies `data` and bumps the
-annotation — content-derived, like the embedded reconciler's own checksum-skip.
+**Re-delivery on rotation:** the sweep compares the target's current version and
+fingerprint (`Store.Current`'s `Version.Version` and `Version.Fingerprint`) against the
+Secret's own `k3sm.io/keystore-version` and `k3sm.io/keystore-fingerprint` annotations, and
+checks that `data` holds exactly the declared `dataKey`; any mismatch re-applies `data` and
+both annotations — content-derived, like the embedded reconciler's own checksum-skip. The
+version alone is not enough: an entry deleted and put back starts at version 1 again with a
+new value, and `pkg/keystore` exposes no generation, so the value's fingerprint is what
+tells the two apart. A changed `dataKey` re-applies too, and the stale key leaves `data`.
 
 **Refusal while secrets encryption is off.** Delivery is refused by default; the override
 is explicit, as the maintainer answered on the issue. Two facts the first revision got
