@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"regexp"
 	"slices"
@@ -894,12 +895,99 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 // across a restart, where the process's own mark (deliveriesSeen) is not. It
 // runs before the operation serves, and is best effort: a line the floor
 // refuses leaves the floor behind, as before, and the operation's own floor
-// line meets the same floor. It reports whether it appended the line.
+// line meets the same floor. It reports whether it appended the line; a
+// line the floor refused is logged at Warn, never dropped unseen.
 func (u *UserScope) catchUpDeliveries(gen [generationSize]byte, rd deliveriesRead) bool {
 	if rd.unverified != nil || rd.seq <= rd.floor {
 		return false
 	}
-	return u.s.userFloor.append(u.scope, deliveriesFloorName, gen, rd.seq, true) == nil
+	if err := u.s.userFloor.append(u.scope, deliveriesFloorName, gen, rd.seq, true); err != nil {
+		slog.Warn("the user-scope floor did not take the delivery record's catch-up line; the floor stays behind the record", "scope", u.scope, "err", err)
+		return false
+	}
+	return true
+}
+
+// CatchUpUser appends, under the exclusive store lock, the catch-up floor
+// line of every user scope whose authenticated delivery record sits above
+// its floor line (catchUpDeliveries): what a withdraw whose floor line
+// failed left behind, and which the process's own mark no longer covers
+// after a restart. The server owes it at start, with CheckLogBounds, before
+// the listener serves (docs/design/keystore.md § "The user-scope floor"). It
+// opens each scope.key under W with no GeneratedUID check, as a revocation
+// does. It is best effort per scope: a scope that does not open, or whose
+// floor does not take the line, is logged at Warn and named in the joined
+// error it returns, and the rest are still caught up. A keystore with no
+// directory or no user scope has nothing to catch up.
+func (s *FileStore) CatchUpUser(ctx context.Context) error {
+	if err := s.checkConfig(); err != nil {
+		return err
+	}
+	root, done, err := s.openLocked(ctx, false, true)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer done()
+	if exists, err := rootHasUserScopes(root); err != nil || !exists {
+		return err
+	}
+	k, err := s.loadMaster()
+	if err != nil {
+		return err
+	}
+	var errs []error
+	err = s.eachScopeDir(ctx, root, func(name string, _ *os.Root) error {
+		id, _ := strconv.ParseUint(name, 10, 32) // eachScopeDir passes only decimal uids
+		u := &UserScope{s: s, uid: uint32(id), scope: userScopeOf(uint32(id))}
+		if err := u.catchUpScope(root, k); err != nil {
+			slog.Warn("the user-scope delivery catch-up did not run for a scope", "scope", u.scope, "err", err)
+			errs = append(errs, fmt.Errorf("%s: %w", u.scope, err))
+		}
+		return nil
+	})
+	if err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// catchUpScope runs catchUpDeliveries for u's scope, opened for a
+// revocation. A scope with no delivery record has nothing to catch up.
+func (u *UserScope) catchUpScope(root *os.Root, k keys) error {
+	o, err := u.openScopeForRevoke(root, k)
+	if err != nil {
+		return err
+	}
+	defer o.close()
+	rd, err := u.readDeliveriesFloor(o, true)
+	if errors.Is(err, ErrScopeAbsent) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if rd.unverified != nil || rd.seq <= rd.floor {
+		return nil
+	}
+	if !u.catchUpDeliveries(o.gen, rd) {
+		return errors.New("the user-scope floor did not take the delivery record's catch-up line")
+	}
+	return nil
+}
+
+// rootHasUserScopes reports whether root holds a .user name.
+func rootHasUserScopes(root *os.Root) (bool, error) {
+	_, err := root.Lstat(userScopesName)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check for keystore/%s: %w", userScopesName, err)
+	}
+	return true, nil
 }
 
 // grantLocked runs fn on the opened scope under the exclusive lock, minting
