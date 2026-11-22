@@ -36,6 +36,41 @@ import (
 // byte. The owner's live GeneratedUID is not read: the binding is the
 // record's generation, which the re-seal keeps.
 
+// UserScopeRewrapWarning is what rewrap prints, before it starts and when
+// it finishes, while the keystore has a .user directory (U101): Rewrap
+// re-seals each scope.key under the new master and does not re-key the
+// scope key inside it.
+const UserScopeRewrapWarning = "warning: user scopes exist. Rewrap re-seals each user scope's key under the new master but does not re-key it, so an old master together with an old copy of a user's scope.key still opens that user's records, old and new. After a suspected master exposure, each user must re-put their values, with new credentials from each value's issuer."
+
+// UserScopesExist reports whether the entries' directory holds a .user
+// name, whatever its type: whether rewrap prints UserScopeRewrapWarning. A
+// missing entries' directory holds none. It reads one name and writes
+// nothing.
+func (s *FileStore) UserScopesExist(ctx context.Context) (bool, error) {
+	if err := s.checkConfig(); err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	root, err := s.openDir(s.dir, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = root.Close() }() // read-only
+	_, err = root.Lstat(userScopesName)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check for keystore/%s: %w", userScopesName, err)
+	}
+	return true, nil
+}
+
 // eachScopeDir calls fn with every user scope directory under root's .user,
 // by its uid name, in sorted order. A missing .user is no scope; a .user, or
 // a scope directory, that is not a directory the store trusts is ErrCorrupt,

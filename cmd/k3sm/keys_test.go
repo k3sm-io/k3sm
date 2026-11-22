@@ -1731,3 +1731,34 @@ func (r failReaderRand) Read([]byte) (int, error) {
 	r.t.Error("rand was read")
 	return 0, io.EOF
 }
+
+// U101: rewrap prints the user-scope warning while keystore/.user exists,
+// before it starts and again when it finishes: Rewrap re-seals each
+// scope.key but does not re-key K_u. With no .user it prints none.
+func TestRewrapWarnsWhenUserScopesExist(t *testing.T) {
+	for _, users := range []bool{false, true} {
+		t.Run(fmt.Sprintf("user scopes %v", users), func(t *testing.T) {
+			h := newKeysHarness(t)
+			h.put("system/a", []byte("a-value"))
+			if users {
+				p := filepath.Join(h.keystoreDir(), ".user")
+				if err := os.Mkdir(p, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				keysGiveToService(t, p)
+			}
+			h.mustRun(0, "rewrap", "--key-out", filepath.Join(t.TempDir(), "new-master"))
+			got := strings.Count(h.stderr.String(), keystore.UserScopeRewrapWarning)
+			want := 0
+			if users {
+				want = 2
+			}
+			if got != want {
+				t.Fatalf("rewrap printed the user-scope warning %d times, want %d:\n%s", got, want, h.stderr.String())
+			}
+			if users && !strings.Contains(keystore.UserScopeRewrapWarning, "re-put") {
+				t.Fatalf("the warning does not name the procedure: %q", keystore.UserScopeRewrapWarning)
+			}
+		})
+	}
+}
