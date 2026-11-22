@@ -1856,3 +1856,48 @@ func TestMissingDeclarationWarnsOnce(t *testing.T) {
 		t.Fatalf("a second absence is warned %d times in all, want 2\n%s", n, h.logs.String())
 	}
 }
+
+// TestReconcilerImmutableDeleteNotFound: a Delete that finds the owned
+// immutable Secret already gone goes on to create it; when a foreign Secret
+// took the name in between, the create is refused and the foreign Secret is
+// not overwritten (G20).
+func TestReconcilerImmutableDeleteNotFound(t *testing.T) {
+	ours := staleImmutableOwned()
+	h := newHarness(t, true, false, ours)
+	h.own(t, ours)
+	h.store.set("api-token", 2, []byte("two"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	foreign := secretObj("payments", "api-token", map[string]string{LabelKey: "api-token"}, map[string][]byte{DefaultDataKey: []byte("tenant's")})
+	foreign.UID = "tenant-1"
+	gvr := corev1.SchemeGroupVersion.WithResource("secrets")
+	h.client.PrependReactor("delete", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		// Ours went away and someone else's took its name before the delete.
+		if err := h.client.Tracker().Delete(gvr, "payments", "api-token"); err != nil {
+			return true, nil, err
+		}
+		if err := h.client.Tracker().Add(foreign); err != nil {
+			return true, nil, err
+		}
+		return true, nil, apierrors.NewNotFound(corev1.Resource("secrets"), "api-token")
+	})
+	h.r.Sweep(context.Background())
+	var creates int
+	for _, v := range h.verbs() {
+		switch v {
+		case "create/secrets":
+			creates++
+		case "update/secrets":
+			t.Fatalf("the foreign Secret drew an update: %v", h.verbs())
+		}
+	}
+	if creates != 1 {
+		t.Fatalf("a NotFound delete drew %d creates, want 1: %v", creates, h.verbs())
+	}
+	if got := h.secret(t, "payments", "api-token"); got.UID != "tenant-1" || string(got.Data[DefaultDataKey]) != "tenant's" {
+		t.Fatalf("the foreign Secret was overwritten: uid %q data %q", got.UID, got.Data[DefaultDataKey])
+	}
+	st, err := ReadState(filepath.Join(h.dir, StateFileName), OpenNoFollow, StateDirCheck(uint32(os.Geteuid())), StateFileCheck(uint32(os.Geteuid())))
+	if err != nil || st.UID("payments", "api-token") == "tenant-1" {
+		t.Fatalf("the foreign UID was recorded (%q, %v)", st.UID("payments", "api-token"), err)
+	}
+}
