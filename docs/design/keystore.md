@@ -1742,7 +1742,12 @@ refused before its first frame:
   their whole run, so no line can land in a file they are replacing. An append waits at most
   2 seconds for the lock: past that, a socket operation fails with `busy`, the reconciler reads
   `ErrBusy` as `Indeterminate` (a revocation first retries, below), and a pre-frame refusal
-  still closes the connection and counts its line as dropped (U22).
+  still closes the connection and counts its line as dropped (U22). In `pkg/keystore` a grant
+  appends inside the hold it writes under, a revocation commits and then appends inside the
+  same hold, and a refusal after the lock was taken appends before it is released; a refusal
+  that came before the lock takes it briefly to append, and one for which the lock cannot be
+  had (the keystore directory missing, the lock held past its wait, an invalid configuration)
+  is not audited rather than appended without it.
 - **Lock modes and fairness.** Reads (`list`, `read-for-exec`, `deliveries` and the
   reconciler's reads) take the store lock shared, and their audit lines are appended under that
   shared hold, which excludes the maintenance verbs as an exclusive hold does; the server

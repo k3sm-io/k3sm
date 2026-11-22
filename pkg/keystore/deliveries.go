@@ -595,23 +595,22 @@ func (u *UserScope) addDelivery(ctx context.Context, d delivery) error {
 	if err := u.checkDelivery("deliver", d); err != nil {
 		// A refused add audits the placeholder: its fields are not known
 		// to be in their grammar.
-		_ = u.audit("deliver", auditPlaceholder, auditPlaceholder, err) // already refused
+		u.auditBriefly(ctx, auditLine{op: "deliver", name: auditPlaceholder, namespace: auditPlaceholder}, err)
 		return fail("deliver", err)
 	}
 	e, _ := ParseEntry(d.entry) // checked by checkDelivery
-	g := u.grant("deliver", e.Name, d.namespace)
-	if err := u.addDeliveryLocked(ctx, d, g.take); err != nil {
-		g.refused(err)
+	if err := u.addDeliveryLocked(ctx, d, u.grant("deliver", e.Name, d.namespace)); err != nil {
 		return fail("deliver", err)
 	}
 	return nil
 }
 
-func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery, grant func() error) error {
+func (u *UserScope) addDeliveryLocked(ctx context.Context, d delivery, g *grantAudit) error {
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
-	return u.grantLocked(ctx, grant, func(o *openedScope) error {
+	grant := g.take
+	return u.grantLocked(ctx, g, func(o *openedScope) error {
 		ds, seq, err := u.readDeliveries(o)
 		if err != nil {
 			return err
@@ -675,15 +674,7 @@ func (u *UserScope) lookupDelivery(ctx context.Context, uid string) (delivery, e
 // Its audit line names the delivery UID (auditPlaceholder for one outside
 // the grammar) and the namespace the record holds for it, when found.
 func (u *UserScope) withdrawDelivery(ctx context.Context, uid string) error {
-	ns, err := u.withdrawLocked(ctx, uid)
-	id := auditPlaceholder
-	if uuidShaped(uid) {
-		id = uid
-	}
-	if aerr := u.appendAudit(auditLine{op: "withdraw", namespace: ns, delivery: id}, err); err == nil {
-		err = aerr
-	}
-	if err != nil {
+	if err := u.withdrawLocked(ctx, uid); err != nil {
 		return fail("withdraw", err)
 	}
 	return nil
@@ -693,20 +684,38 @@ func (u *UserScope) withdrawDelivery(ctx context.Context, uid string) error {
 // can read, and runs with master.next present (openScopeForRevoke). An
 // already withdrawn UID re-appends the record's floor line, in case the
 // withdraw that wrote the tombstone could not: the floor keeps the highest
-// sequence, so a repeat is idempotent. It returns the recorded namespace
-// of the delivery it found, for the audit line.
-func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (string, error) {
+// sequence, so a repeat is idempotent. It commits, then appends its audit
+// line, which names the namespace of the delivery it found, before it
+// releases the store lock (auditSink).
+func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (err error) {
 	if err := u.s.checkConfig(); err != nil {
-		return "", err
+		return err
 	}
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
+		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
 	}
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer done()
+	id := auditPlaceholder
+	if uuidShaped(uid) {
+		id = uid
+	}
+	var ns string
+	defer func() { // before done: the line is appended under the lock
+		if aerr := u.appendAudit(auditLine{op: "withdraw", namespace: ns, delivery: id}, err); err == nil {
+			err = aerr
+		}
+	}()
+	ns, err = u.withdrawBody(root, uid)
+	return err
+}
+
+// withdrawBody is withdrawLocked's work under the lock. It returns the
+// recorded namespace of the delivery it found, for the audit line.
+func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, error) {
 	k, err := u.s.loadMaster()
 	if err != nil {
 		return "", err
@@ -740,7 +749,7 @@ func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (string, err
 // audit line; it is called before the mint's first write, and fn calls it
 // before its own first write, so a failed append writes nothing. It
 // appends at most once.
-func (u *UserScope) grantLocked(ctx context.Context, grant func() error, fn func(*openedScope) error) error {
+func (u *UserScope) grantLocked(ctx context.Context, g *grantAudit, fn func(*openedScope) error) (err error) {
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)
@@ -749,6 +758,12 @@ func (u *UserScope) grantLocked(ctx context.Context, grant func() error, fn func
 		return err
 	}
 	defer done()
+	defer func() { // before done: the refusal's line is appended under the lock
+		if err != nil {
+			g.refused(err)
+		}
+	}()
+	grant := g.take
 	k, err := u.masterForWrite()
 	if err != nil {
 		return err
@@ -809,6 +824,31 @@ func (g *grantAudit) refused(err error) {
 		return
 	}
 	_ = g.u.s.auditSink.append(auditLine{op: g.op, scope: g.u.scope, name: g.name, namespace: g.ns, result: auditResult(err)}) // already refused
+}
+
+// refusedBriefly audits err, a refusal before the grant took the store
+// lock, under the lock taken briefly (auditBriefly).
+func (g *grantAudit) refusedBriefly(ctx context.Context, err error) {
+	g.u.auditBriefly(ctx, auditLine{op: g.op, name: g.name, namespace: g.ns}, err)
+}
+
+// auditBriefly appends l, the audit line of a refusal that came before its
+// operation took the store lock, under the exclusive lock taken for the
+// append alone (auditSink). A refusal for which the lock cannot be had is
+// not audited: a store whose configuration is invalid, a keystore directory
+// that is missing (no lock file and no log to append to), a lock held past
+// its wait, or a done context. Appending such a line without the lock is
+// what the contract forbids, and a refusal line is best effort.
+func (u *UserScope) auditBriefly(ctx context.Context, l auditLine, err error) {
+	if u.s.checkConfig() != nil {
+		return
+	}
+	_, done, lerr := u.s.openLocked(ctx, false, true)
+	if lerr != nil {
+		return
+	}
+	defer done()
+	_ = u.appendAudit(l, err) // already refused
 }
 
 // errAuditRefused is a grant refused because its audit line could not be

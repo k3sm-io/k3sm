@@ -165,23 +165,24 @@ func (u *UserScope) own(op, input string) (string, error) {
 func (u *UserScope) Put(ctx context.Context, input string, kind Kind, value []byte) (Version, error) {
 	name, err := u.own("put", input)
 	if err != nil {
-		_ = u.audit("put", auditPlaceholder, "", err) // already refused
+		u.auditBriefly(ctx, auditLine{op: "put", name: auditPlaceholder}, err)
 		return Version{}, fail("put", err)
 	}
-	g := u.grant("put", name, "")
-	v, err := u.put(ctx, name, kind, value, g.take)
+	v, err := u.put(ctx, name, kind, value, u.grant("put", name, ""))
 	if err != nil {
-		g.refused(err)
 		return Version{}, fail("put", err)
 	}
 	return v, nil
 }
 
-func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byte, grant func() error) (Version, error) {
+// put audits its refusal while it holds the store lock (auditSink), or, for
+// a refusal before it takes the lock, takes the lock briefly to audit it.
+func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byte, g *grantAudit) (_ Version, err error) {
 	if err := u.s.checkConfig(); err != nil {
 		return Version{}, err
 	}
 	if err := checkValue(kind, value); err != nil {
+		g.refusedBriefly(ctx, err)
 		return Version{}, err
 	}
 	// The entries' directory is never created here: a root put creates it
@@ -194,6 +195,12 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	defer done()
+	defer func() { // before done: the refusal's line is appended under the lock
+		if err != nil {
+			g.refused(err)
+		}
+	}()
+	grant := g.take
 	k, err := u.masterForWrite()
 	if err != nil {
 		return Version{}, err

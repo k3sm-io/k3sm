@@ -138,20 +138,18 @@ func entryBytes(entries *os.Root, name string) (int64, error) {
 func (u *UserScope) Delete(ctx context.Context, input string) error {
 	name, err := u.own("rm", input)
 	if err != nil {
-		_ = u.audit("rm", auditPlaceholder, "", err) // already refused
+		u.auditBriefly(ctx, auditLine{op: "rm", name: auditPlaceholder}, err)
 		return fail("rm", err)
 	}
-	err = u.delete(ctx, name)
-	if aerr := u.audit("rm", name, "", err); err == nil {
-		err = aerr
-	}
-	if err != nil {
+	if err := u.delete(ctx, name); err != nil {
 		return fail("rm", err)
 	}
 	return nil
 }
 
-func (u *UserScope) delete(ctx context.Context, name string) error {
+// delete commits, then appends its audit line before it releases the store
+// lock (auditSink).
+func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
@@ -163,6 +161,16 @@ func (u *UserScope) delete(ctx context.Context, name string) error {
 		return err
 	}
 	defer done()
+	defer func() { // before done: the line is appended under the lock
+		if aerr := u.audit("rm", name, "", err); err == nil {
+			err = aerr
+		}
+	}()
+	return u.deleteBody(root, name)
+}
+
+// deleteBody is delete's work under the lock.
+func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	entries, gen, err := u.openEntriesForRevoke(root)
 	if err != nil {
 		return err
