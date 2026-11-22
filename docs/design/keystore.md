@@ -1775,12 +1775,21 @@ That wait is the store `.lock`
   without limit: a log larger than the hard cap plus 1024 uids' revocation budgets plus 1 MiB
   (321 MiB at the defaults) is damage, and so is a floor holding more distinct
   `(scope, name, generation)` keys than its key bound: that size bound over the shortest line
-  that adds a key (46 bytes), held to a ceiling of 2^20 (1,048,576) keys whatever the caps are
-  configured to, plus the revocation headroom of 1/16 of that ("Per-uid fairness"). The size alone would allow about 7.3 million keys at the defaults, so the
-  ceiling is met first there, and it is what bounds the reader's memory: a floor at the bound
-  (52 MiB of lines) read from scratch holds about 145 MiB of heap and takes about 0.65 s
-  (`BenchmarkFloorReadAtKeyBound`, measured on an M1 Ultra). The writer refuses a new key at
-  that bound, so a floor the server wrote never reaches it as damage.
+  that adds a key (46 bytes), held to a ceiling of 2^18 (262,144) keys whatever the caps are
+  configured to, plus the revocation headroom of 1/16 of that ("Per-uid fairness"): 278,528
+  keys for the reader. The size alone would allow about 7.3 million keys at the defaults, so
+  the ceiling is met first there, and it is what bounds the reader's memory. The reader
+  interns scope strings and indexes each key's generations by `(scope, name)`, so `rm`'s
+  read of a name's live generations does not scan the floor. Measured on an M1 Ultra, read
+  from scratch: the heap worst case, 278,528 keys with 253-byte names and the longest scope
+  (86 MiB of lines), holds about 128 MiB of heap and takes about 0.41 s
+  (`BenchmarkFloorReadLongNames`); the time worst case, the most lines the size bound holds
+  (about 7.3 million, 321 MiB), holds about 69 MiB and takes about 3.9 s
+  (`BenchmarkFloorReadLineCount`); 262,144 keys of the shortest lines hold about 64 MiB and
+  take about 0.23 s (`BenchmarkFloorReadAtKeyBound`). At a ceiling of 2^20 the long-name case
+  held about 494 MiB, over the 200 MiB the reader is allowed, so the ceiling was lowered. The
+  writer refuses a new key at that bound, so a floor the server wrote never reaches it as
+  damage.
   The server never appends past either bound itself: an append that would take the log past
   the size bound, or a floor line that would add a key past the key bound, is refused
   (`ErrLogFull`), and the floor's key count is the one the reader keeps, read on the append's

@@ -88,11 +88,15 @@ const (
 	logBoundMargin = 1 << 20
 	// maxFloorKeysCeiling is the absolute ceiling on the floor's key bound,
 	// whatever the caps are configured to: what bounds the reader's memory.
-	// At the default caps the size alone would allow about 7.3M keys; at
-	// this ceiling a floor read from scratch measured about 145 MiB of heap
-	// and 0.65 s (BenchmarkFloorReadAtKeyBound; docs/design/keystore.md §
-	// "Size caps").
-	maxFloorKeysCeiling = 1 << 20
+	// At the default caps the size alone would allow about 7.3M keys. The
+	// reader's worst case at this ceiling plus the revocation headroom
+	// (278,528 keys), read from scratch on an M1 Ultra: 253-byte names and
+	// the longest scope, about 128 MiB of heap and 0.41 s
+	// (BenchmarkFloorReadLongNames); the most lines the size bound holds,
+	// about 7.3M, about 69 MiB and 3.9 s (BenchmarkFloorReadLineCount). At
+	// 1<<20 the long-name case held about 494 MiB, so the ceiling was
+	// lowered to stay under 200 MiB (docs/design/keystore.md § "Size caps").
+	maxFloorKeysCeiling = 1 << 18
 	// maxKeyShareDivisor bounds one uid's floor keys: a grant line that adds
 	// a key is refused once its scope's uid holds keyBound/maxKeyShareDivisor
 	// keys (docs/design/keystore.md § "Per-uid fairness").
@@ -364,6 +368,14 @@ type logState struct {
 	// maxSeq is the floor's highest seq per key, and buried its tombstones.
 	maxSeq map[floorKey]uint64
 	buried map[floorKey]bool
+	// scopes interns the floor's scope strings, so each key shares its
+	// scope's one copy. firstGen and moreGens index every key's generation
+	// by (scope, name), in the order the keys were first read, for
+	// liveGens: the first inline, since nearly every name has one, and the
+	// rest in moreGens.
+	scopes   map[string]string
+	firstGen map[nameKey][generationSize]byte
+	moreGens map[nameKey][][generationSize]byte
 	// bad is the error of a line that did not parse, which sticks for this
 	// file.
 	bad error
@@ -378,6 +390,9 @@ type floorKey struct {
 	scope, name string
 	gen         [generationSize]byte
 }
+
+// nameKey is the (scope, name) a floor key's generations are indexed by.
+type nameKey struct{ scope, name string }
 
 // openLogDataRoot opens the data root as a directory without following a
 // symlink and judges it on the descriptor, as the system floor's is.
@@ -514,7 +529,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 		src = l.readAt(f)
 	}
 	fresh := func() {
-		*s = logState{dev: uint64(st.Dev), ino: st.Ino, birth: logBirth(&st), hardCap: l.s.logHardCap, bound: bound, pastCap: map[uint32]int64{}, uidKeys: map[uint32]int{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
+		*s = logState{dev: uint64(st.Dev), ino: st.Ino, birth: logBirth(&st), hardCap: l.s.logHardCap, bound: bound, pastCap: map[uint32]int64{}, uidKeys: map[uint32]int{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}, scopes: map[string]string{}, firstGen: map[nameKey][generationSize]byte{}, moreGens: map[nameKey][][generationSize]byte{}}
 	}
 	if s.pastCap == nil || s.dev != uint64(st.Dev) || s.ino != st.Ino || s.birth != logBirth(&st) || s.hardCap != l.s.logHardCap || s.bound != bound || st.Size < s.off {
 		fresh()
@@ -937,6 +952,11 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		// A key is recorded on its first line, even at sequence 0: floor
 		// --rebuild writes 0 for an entry with no authenticated pointer, and
 		// that line is what keeps the entry damage, so it is present.
+		if sc, ok := st.scopes[r.key.scope]; ok {
+			r.key.scope = sc
+		} else {
+			st.scopes[r.key.scope] = r.key.scope
+		}
 		seq, inSeq := st.maxSeq[r.key]
 		uid := scopeUID(r.key.scope)
 		if !inSeq && !st.buried[r.key] {
@@ -945,6 +965,12 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 			}
 			st.keys++
 			st.uidKeys[uid]++
+			nk := nameKey{r.key.scope, r.key.name}
+			if _, ok := st.firstGen[nk]; ok {
+				st.moreGens[nk] = append(st.moreGens[nk], r.key.gen)
+			} else {
+				st.firstGen[nk] = r.key.gen
+			}
 		}
 		switch {
 		case r.tomb:
@@ -1008,9 +1034,15 @@ func (f *fileFloorLog) floor(scope, name string, gen [generationSize]byte) (uint
 func (f *fileFloorLog) liveGens(scope, name string) ([][generationSize]byte, error) {
 	var out [][generationSize]byte
 	err := f.read(func(state *logState) {
-		for k := range state.maxSeq {
-			if k.scope == scope && k.name == name && !state.buried[k] {
-				out = append(out, k.gen)
+		nk := nameKey{scope, name}
+		first, ok := state.firstGen[nk]
+		if !ok {
+			return
+		}
+		for _, g := range append([][generationSize]byte{first}, state.moreGens[nk]...) {
+			k := floorKey{scope, name, g}
+			if _, live := state.maxSeq[k]; live && !state.buried[k] {
+				out = append(out, g)
 			}
 		}
 	})
