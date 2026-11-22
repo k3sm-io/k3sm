@@ -794,25 +794,25 @@ pend U142 "the CRD descriptions list the CredentialValid reasons and ProjectionI
 	apis/config/crd::TestKeyDeliveryReasonDescriptions TestConditionsCarryObservedGeneration
 check U143 "the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is ErrCorrupt; the fuzz invariants hold" \
 	k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors TestEnvelopeRejectsUnknownTagDuplicateAndOrder FuzzEnvelopeParse
-pend U144 "token and oauth require a sealed issuedAt/accessIssuedAt stamped from the clock seam; editing the created header changes no typed time (the typed store)" \
+check U144 "token and oauth require a sealed issuedAt/accessIssuedAt stamped from the clock seam; editing the created header changes no typed time" \
 	k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed TestCreatedHeaderEditChangesNoTypedTime
-partial U145 "a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are ErrKindUnsupported, 0xFD and 0xFE ErrCorrupt" "list shows unsupported (the typed store)" \
-	k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen TestKindByteTable
-pend U146 "rotate and put over an existing entry cannot change its kind (ErrKindMismatch) (the typed store)" \
+check U145 "a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are ErrKindUnsupported, 0xFD and 0xFE ErrCorrupt; list shows unsupported" \
+	k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen TestKindByteTable TestListShowsUnsupportedKind
+check U146 "rotate and put over an existing entry cannot change its kind (ErrKindMismatch)" \
 	k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind
-pend U147 "token needs expiresAt; oauth needs access token, access expiry, refresh token and an owner in the grammar (the typed store)" \
+check U147 "token needs expiresAt; oauth needs access token, access expiry, refresh token and an owner in the grammar" \
 	k3sm/pkg/keystore::TestTypedPutValidation
 check U148 "SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed ssh-keygen -l vector" \
-	k3sm/pkg/keystore/typed::TestSSHGenerateAndImport TestSSHFingerprintMatchesOpenSSH
-pend U149 "write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; Get returns a typed.Credential for kinds 3 to 5; only refresh (and the installing pkg/keystore) imports internal/refreshopen (the typed store)" \
-	k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned TestGetReturnsRedactedCredential TestRefreshOpenerImportGraph
-pend U150 "RotateIf refuses a stale version (the typed store)" \
+	k3sm/pkg/keystore/typed::TestSSHGenerateAndImport TestSSHFingerprintMatchesOpenSSH k3sm/pkg/keystore::TestStoreGenerateSSHUsesRandomSeam
+partial U149 "write-only, structurally: a planted refresh token appears in no result of any exported method of pkg/keystore, raw, hex, base64 or URL-encoded; a typed entry reads back only as a typed.Credential (CurrentCredential, GetCredential), and Current and Get refuse it" "the consumer interfaces and only refresh (and the installing pkg/keystore) imports internal/refreshopen (the refresher)" \
+	k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned TestGetReturnsRedactedCredential
+check U150 "RotateIf refuses a stale version" \
 	k3sm/pkg/keystore::TestRotateIfStaleVersionRefused
-pend U151 "oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means low = 1); crash-safe at every step, prune included (the prune cases of the crash test) (the typed store)" \
+check U151 "oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means low = 1); crash-safe at every step, prune included (the prune cases of the crash test)" \
 	k3sm/pkg/keystore::TestOAuthPruneKeepsTwo TestPointerLowWaterMark TestRotateCrashAtEveryStep
-pend U152 "a pruned oauth entry: List shows it healthy, Rewrap re-seals low..current, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught (the typed store)" \
+check U152 "a pruned oauth entry: List shows it healthy, Rewrap re-seals low..current, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught" \
 	k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt TestRewrapHandlesPrunedOAuth TestDeletePrunedOAuthEntry TestGapInsideCommittedRangeIsCorrupt TestCopyBackAcrossPruneCaught
-pend U153 "--from-version is refused for oauth (the typed store)" \
+check U153 "--from-version is refused for oauth" \
 	k3sm/pkg/keystore::TestFromVersionRefusedForOAuth
 check U154 "every Fuzz* target in the keystore packages has a non-empty committed seed directory" \
 	k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds
