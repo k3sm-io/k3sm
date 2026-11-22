@@ -356,8 +356,17 @@ first Put mints no master.
 - **Put:** write `generation`, `v1`, `current` (sequence 1), then set the floor entry.
 - **Rotate:** write the new version file, flip `current` (sequence + 1), then raise the
   floor to that sequence.
-- **Delete:** remove `current`, then the entry directory, then bury the floor's live
-  generation for the name.
+- **Delete:** bury, then remove `current`, then the entry directory. The burial comes
+  first, under the keystore lock and the floor lock, because the service user owns the
+  entry's files and can make their removal fail (a `uchg` flag makes unlink fail even for
+  root). Before removing, Delete clears the BSD user flags (`UF_*` only, through the opened
+  descriptor, never following a symlink) on the entry's files; root may clear those. A
+  removal that still fails, or a crash during it, leaves the entry already deleted and
+  refused: Delete returns an error saying so and that the directory is left behind, and
+  `rm` run again removes the directory without changing the floor. A floor raise at the
+  start that cannot complete (more names under `keystore/` than a read takes, which the
+  service user can plant, or a keystore larger than the floor holds) does not stop the
+  burial: Delete buries from the floor alone and logs the failure at Warn.
 
 **A deleted entry put back is refused: the tombstone.** A completed Delete does not remove
 the name's floor record. In the same floor write it buries a generation: it adds it to the
@@ -392,8 +401,8 @@ buried set, oldest first:
   removes. It then succeeds and logs at Warn that the entry directory was already gone and
   the deletion is recorded. Only a name with no live record answers `ErrNotFound`. So an
   entry directory moved away while root runs `rm` and moved back afterwards is refused, and
-  so is the copy a Delete leaves when it crashes between removing the directory and its
-  floor write, once `rm` runs again.
+  so is the copy an earlier build's Delete, which removed the directory before its floor
+  write, left when it crashed between the two, once `rm` runs again.
 - *The per-name cap.* A name keeps at most 8 buried generations. A Delete that buries a ninth
   drops the name's oldest, and that is a prune (below): logged, and the only way, besides the
   floor's own prune, that a buried generation leaves the floor.
@@ -4184,7 +4193,7 @@ last pull request lands and no row is pending.
 | G20 | The reconciler only Gets, creates and updates its labelled `Opaque` Secrets, and leaves an unlabelled or foreign Secret alone | unit over a fake client that records every call |
 | G21 | The rollback recipe in this document runs as written and is a byte-exact round trip | a script test that pipes `show --reveal` into `rotate --in -`, then compares the new current version's value byte for byte (`cmp`) with version N's, for an opaque entry and an Ed25519 entry |
 | G22 | `hack/ci.sh` passes | the gate runs it |
-| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current`; a directory planted with a changed generation file and removed by `rm`, a delete, re-create, delete cycle, a decoy swapped in before `rm`, the entry's directory or `keystore/` hidden during `rm` and moved back, a symlink or an incomplete Put in its place, a Delete crashed before its floor write and run again, and a crashed Delete followed by a Put and a Delete, each leaving the original copy refused |
+| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current`; a directory planted with a changed generation file and removed by `rm`, a delete, re-create, delete cycle, a decoy swapped in before `rm`, the entry's directory or `keystore/` hidden during `rm` and moved back, a symlink or an incomplete Put in its place, a Delete crashed before its floor write and run again, a crashed Delete followed by a Put and a Delete, a Delete faulted after its burial and before its removal (an error naming the directory left behind; a retried `rm` removes it with no floor change), a `uchg` flag on an entry file or the entry directory, and more planted names under `keystore/` than a read takes, each leaving the original copy refused |
 
 Phase A is complete when the gate passes with no row pending. A row can be reworded or dropped only by a change
 to this document, reviewed like any other.

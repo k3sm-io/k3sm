@@ -600,99 +600,53 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	}
 	defer fdir.unlock()
 	// Delete must work without the master, so the other entries' floors are
-	// raised only when it opens. A keystore with more entries than the floor
-	// holds is not raised, but Delete still runs: it is how room is made.
+	// raised only when it opens. A sync that cannot complete (a keystore with
+	// more entries than the floor holds, or more names under keystore/ than a
+	// read takes, which the service user can plant) does not stop the
+	// deletion: it buries from the floor alone, and the failure is logged.
 	k, kerr := s.loadMasterLocked()
 	if kerr == nil {
 		synced, err := s.syncFloor(ctx, root, fdir, fl, k)
 		switch {
 		case err == nil:
 			fl = synced
-		case !errors.Is(err, errFloorFull):
+		case ctx.Err() != nil:
 			return err
+		default:
+			slog.Warn("keystore: could not raise the other entries' floors before the delete; the deletion is recorded from the floor alone", "name", name, "err", err)
 		}
 	}
-	// Anything but a directory at the name was planted there, since Put makes
-	// only directories: it is unlinked, and a symlink is removed itself,
-	// never followed.
-	if fi, err := root.Lstat(name); err == nil && !fi.IsDir() {
-		if err := root.Remove(name); err != nil {
-			return err
-		}
-		if err := syncDir(root); err != nil {
-			return err
-		}
-		// Something was removed, so this succeeds with or without a live
-		// record to bury.
-		if err := buryGone(fdir, name); err != nil && !errors.Is(err, ErrNotFound) {
-			return err
-		}
-		return nil
+	// What stands under the name is read before anything changes. The
+	// directory's generation is kept only when the master is loaded and the
+	// directory's pointer authenticates under it: the generation file is in
+	// the service user's tree, and only a pointer sealed under the master
+	// shows the generation is real (a Put that crashed after its pointer,
+	// before its floor write).
+	fi, lerr := root.Lstat(name)
+	if lerr != nil && !errors.Is(lerr, fs.ErrNotExist) {
+		return lerr
 	}
-	// The generation is read before anything is removed, and kept only
-	// when the master is loaded and the directory's pointer authenticates
-	// under it: the generation file is in the service user's tree, and only
-	// a pointer sealed under the master shows the generation is real (a Put
-	// that crashed after its pointer, before its floor write).
+	present := lerr == nil
 	var authentic *[generationSize]byte
-	if raw, err := openEntryDirRaw(root, name); err == nil {
-		if gen, gerr := readGeneration(raw.root); gerr == nil && kerr == nil {
-			raw.generation = gen
-			if _, _, perr := raw.pointer(k); perr == nil {
-				authentic = &gen
+	if present && fi.IsDir() && kerr == nil {
+		if raw, err := openEntryDirRaw(root, name); err == nil {
+			if gen, gerr := readGeneration(raw.root); gerr == nil {
+				raw.generation = gen
+				if _, _, perr := raw.pointer(k); perr == nil {
+					authentic = &gen
+				}
 			}
-		}
-		raw.close()
-	}
-	e, err := openEntryDir(root, name, fl)
-	damaged := errors.Is(err, errNoPointer)
-	if errors.Is(err, errInterruptedPut) {
-		// Not an entry, so the answer is ErrNotFound, but the directory may
-		// hold a sealed v1 (a Delete that crashed after removing the pointer,
-		// with no floor file to record the entry, leaves one), so it is
-		// removed first.
-		if err := root.RemoveAll(name); err != nil {
-			return err
-		}
-		if err := syncDir(root); err != nil {
-			return err
-		}
-		return buryGone(fdir, name)
-	}
-	if errors.Is(err, ErrNotFound) {
-		return buryGone(fdir, name)
-	}
-	if err != nil && !damaged {
-		return err
-	}
-	if !damaged {
-		defer e.close()
-		// RemoveAll, not Remove: anything may be planted at current, and a
-		// non-empty directory there would fail Remove on every retry.
-		// RemoveAll removes a symlink itself, never what it names.
-		if err := e.root.RemoveAll(currentName); err != nil {
-			return err
-		}
-		if err := syncDir(e.root); err != nil {
-			return err
-		}
-		if err := s.step("delete " + name); err != nil {
-			return err
+			raw.close()
 		}
 	}
-	if err := root.RemoveAll(name); err != nil {
-		return err
-	}
-	if err := syncDir(root); err != nil {
-		return err
-	}
+	// Bury first, before the tree is touched: the service user owns the
+	// entry's files and can make their removal fail, so a removal that fails
+	// or a crash during it must find the entry already deleted. The floor's
+	// live generation is buried, root's own record; with no live record, the
+	// directory's generation only when its pointer authenticated (bury).
 	if err := s.step("bury " + name); err != nil {
 		return err
 	}
-	// The floor's live generation for the name is buried, so an older copy
-	// of this entry put back is refused. With no live record, the
-	// directory's generation is buried only when its pointer authenticated
-	// under it (bury).
 	var buried string
 	var dropped []pruned
 	after, err := fdir.update(func(fl floor) bool {
@@ -703,7 +657,90 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 		return err
 	}
 	logBuried(name, buried, dropped, after)
+	if !present {
+		if buried == "" {
+			return ErrNotFound
+		}
+		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
+		return nil
+	}
+	if err := s.step("remove " + name); err != nil {
+		return leftBehind(name, after, err)
+	}
+	interrupted, err := s.removeEntry(root, name, fi, fl)
+	if err != nil {
+		return leftBehind(name, after, err)
+	}
+	if interrupted && buried == "" {
+		// Not an entry, and nothing recorded for it: the answer is
+		// ErrNotFound, though its directory is removed.
+		return ErrNotFound
+	}
+	if buried != "" && interrupted {
+		slog.Warn("keystore: the entry directory was already gone; its deletion is recorded in the floor", "name", name)
+	}
 	return nil
+}
+
+// removeEntry removes what stands under name, after the burial: a
+// non-directory is unlinked (a symlink itself, never what it names), and an
+// entry directory loses current first and then the whole directory. The
+// BSD user flags on the entry's files are cleared first (clearUserFlags), so
+// a uchg the service user planted does not block the removal. fl, the floor
+// before the burial, tells an interrupted Put from an entry, which only
+// changes the answer, so it reports one (interrupted): an interrupted Put
+// with nothing buried is ErrNotFound, after its directory is removed (it may
+// hold a sealed v1 a Delete that crashed after removing the pointer left).
+func (s *FileStore) removeEntry(root *os.Root, name string, fi fs.FileInfo, fl floor) (interrupted bool, err error) {
+	clearUserFlags(root, name)
+	if !fi.IsDir() {
+		// Anything but a directory at the name was planted there, since Put
+		// makes only directories.
+		if err := root.Remove(name); err != nil {
+			return false, err
+		}
+		return false, syncDir(root)
+	}
+	e, err := openEntryDir(root, name, fl)
+	interrupted = errors.Is(err, errInterruptedPut)
+	switch {
+	case err == nil:
+		// RemoveAll, not Remove: anything may be planted at current, and a
+		// non-empty directory there would fail Remove on every retry.
+		// RemoveAll removes a symlink itself, never what it names.
+		rerr := e.root.RemoveAll(currentName)
+		if rerr == nil {
+			rerr = syncDir(e.root)
+		}
+		e.close()
+		if rerr != nil {
+			return false, rerr
+		}
+		if err := s.step("delete " + name); err != nil {
+			return false, err
+		}
+	case interrupted, errors.Is(err, errNoPointer):
+	case errors.Is(err, ErrNotFound):
+		return false, nil // gone since the Lstat
+	default:
+		return false, err
+	}
+	if err := root.RemoveAll(name); err != nil {
+		return interrupted, err
+	}
+	return interrupted, syncDir(root)
+}
+
+// leftBehind is the error of a Delete whose removal failed after its
+// burial. When the floor now records the name as deleted with no live
+// record, the entry is already deleted and any copy of it refused, and the
+// error says so: the directory is left behind, and rm run again removes it
+// without changing the floor.
+func leftBehind(name string, after floor, err error) error {
+	if f := after[name]; f.live() || len(f.burials()) == 0 {
+		return err
+	}
+	return fmt.Errorf("the entry is already deleted: the floor records it as deleted and refuses any copy of it, but its directory could not be removed and is left behind; run rm again to remove it: %w", err)
 }
 
 // buryGone is Delete of a name with no entry directory under it: absent, or

@@ -1555,12 +1555,12 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 			t.Fatal("Delete succeeded through a crash")
 		}
 		s.step = func(string) error { return nil }
-		// The floor still records the entry, so what the interrupted Delete
-		// left is a committed entry without its pointer, which a retried
-		// Delete clears, not a crashed Put that would hide the sealed v1 from
-		// rm until the next Put.
-		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, errLostPointer) {
-			t.Fatalf("Current after an interrupted Delete: %v, want the lost-pointer refusal", err)
+		// The Delete buried the entry before it removed anything, so what the
+		// interrupted Delete left is a deleted entry without its pointer,
+		// refused as deleted, which a retried Delete clears, not a crashed
+		// Put that would hide the sealed v1 from rm until the next Put.
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, errNoPointer) || !strings.Contains(err.Error(), "records as deleted") {
+			t.Fatalf("Current after an interrupted Delete: %v, want the refusal of a deleted entry", err)
 		}
 		if _, err := s.Put(ctx, "k", KindOpaque, []byte("again")); !errors.Is(err, ErrExists) {
 			t.Fatalf("Put over an interrupted Delete: %v, want ErrExists", err)

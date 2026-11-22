@@ -511,18 +511,27 @@ func TestDeleteBuriesWithDirectoryGone(t *testing.T) {
 		_, _, err := s.Current(ctx, "k")
 		refusedAsDeleted(t, "Current after keystore/ moved back", err)
 	})
-	t.Run("a crash before the floor write, then rm again", func(t *testing.T) {
-		s, server := newTestStore(t)
-		mustPut(t, s, "k", KindOpaque, []byte("one"))
-		old := saveEntry(t, server, "k", files...)
+	// goneWithLiveRecord crashes a Delete of k before its floor write, which
+	// now comes before any removal, so nothing changed and k still reads;
+	// then it removes k's directory by hand: the state an earlier build's
+	// Delete, which removed the directory first, left when it crashed there.
+	goneWithLiveRecord := func(t *testing.T, s *FileStore, server string) {
+		t.Helper()
 		restore := crashAt(s, "bury k")
 		if err := s.Delete(ctx, "k"); err == nil {
 			t.Fatal("Delete through the crash seam succeeded")
 		}
 		restore()
-		if _, err := os.Lstat(filepath.Join(server, "keystore", "k")); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("entry after the crashed Delete: %v, want it gone", err)
+		mustCurrent(t, s, "k", "one")
+		if err := os.RemoveAll(filepath.Join(server, "keystore", "k")); err != nil {
+			t.Fatal(err)
 		}
+	}
+	t.Run("a crash before the floor write, then rm again", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		old := saveEntry(t, server, "k", files...)
+		goneWithLiveRecord(t, s, server)
 		if err := s.Delete(ctx, "k"); err != nil {
 			t.Fatalf("Delete run again: %v, want the deletion recorded", err)
 		}
@@ -534,11 +543,7 @@ func TestDeleteBuriesWithDirectoryGone(t *testing.T) {
 		s, server := newTestStore(t)
 		mustPut(t, s, "k", KindOpaque, []byte("one"))
 		g1 := saveEntry(t, server, "k", files...)
-		restore := crashAt(s, "bury k")
-		if err := s.Delete(ctx, "k"); err == nil {
-			t.Fatal("Delete through the crash seam succeeded")
-		}
-		restore()
+		goneWithLiveRecord(t, s, server)
 		mustPut(t, s, "k", KindOpaque, []byte("two"))
 		if err := s.Delete(ctx, "k"); err != nil {
 			t.Fatal(err)

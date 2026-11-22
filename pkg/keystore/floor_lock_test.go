@@ -92,10 +92,10 @@ func TestFloorWriteRereads(t *testing.T) {
 		mustPut(t, s, "other", KindOpaque, []byte("one"))
 		start := floorOf(t, server)
 		newer := floorEntry{Generation: strings.Repeat("11", generationSize), Seq: 1}
-		// After the Delete removed the pointer, a Put of a new generation of
-		// k records its floor.
+		// After the Delete read the floor, before its burial, a Put of a new
+		// generation of k records its floor.
 		s.step = func(name string) error {
-			if name == "delete k" {
+			if name == "bury k" {
 				putFloorFile(t, server, floor{"k": newer, "other": start["other"]})
 			}
 			return nil
