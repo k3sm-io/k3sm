@@ -529,7 +529,7 @@ check U10 "user/<other>/... is ErrNotFound, same text as an absent entry; a shor
 check U11 "the Go resolver and Phase A's checkName pass the shared entry-grammar vectors; pkg/keystore imports no Kubernetes package" \
 	TestEntryGrammarVectorsResolver TestEntryGrammarVectorsCheckName TestCheckScopeRefusesUserZero TestAllDigitSegmentIsAlwaysUID TestKeystoreIsKubernetesFree
 check U12 "master Rewrap re-wraps every scope.key and leaves user records byte-identical; resumable at every step, by fault injection as G12" \
-	TestRewrapRewrapsScopeKeysResumable
+	TestRewrapRewrapsScopeKeysResumable TestRewrapRefusesDamagedScopeTree
 check U13 "quotas: the 257th entry and the byte budget answer ErrQuota, and so does the 65th live delivery; rm and withdraw still work" \
 	TestUserScopeQuota TestDeliveryRecordQuota TestRevocationIsUnconditional TestWithdrawFloorFaults
 check U14 "the delivery record stores UID, the full target tuple under its seal, and target digest; add, look up and withdraw round-trip under the floor; the digest covers entry, namespace, secretName and the key-sorted items, a reorder leaving it unchanged" \

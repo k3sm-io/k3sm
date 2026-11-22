@@ -209,6 +209,9 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, p *rewrapProgr
 	if err := s.commitNew(ctx, root, fl, plan, old, next); err != nil {
 		return err
 	}
+	if err := s.checkScopesPlanned(ctx, root, plan); err != nil {
+		return err
+	}
 	if swapped, err := s.swapMaster(mroot, next); err != nil {
 		// A swap that went through and then failed (its last sync or step)
 		// left the rewrap complete: under the earlier key on a resume, under

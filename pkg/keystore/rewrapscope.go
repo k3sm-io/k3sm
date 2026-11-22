@@ -24,6 +24,7 @@ import (
 	"io/fs"
 	"os"
 	"sort"
+	"syscall"
 )
 
 // This file is Rewrap's one class of user record: each scope.key, re-sealed
@@ -85,9 +86,9 @@ func (s *FileStore) eachScopeDir(ctx context.Context, root *os.Root, fn func(uid
 		return fmt.Errorf("%w: keystore/%s is not a user-scope directory the store trusts, so its scope keys cannot be re-wrapped; root must restore or remove it: %w", ErrCorrupt, userScopesName, err)
 	}
 	defer func() { _ = users.Close() }() // each write is fsynced in its own directory
-	names, err := readDirNames(users, maxDirNames)
+	names, err := readDirNames(users, scopeDirNamesBound)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: keystore/%s cannot be listed within the bound (%w); root must remove the names in it that are not user scopes, then run rewrap again", ErrCorrupt, userScopesName, err)
 	}
 	sort.Strings(names)
 	for i, n := range names {
@@ -97,17 +98,78 @@ func (s *FileStore) eachScopeDir(ctx context.Context, root *os.Root, fn func(uid
 		if n == "0" || !decimalUID(n) {
 			continue
 		}
+		// A scope listed and then missing is damage, never a scope to skip:
+		// skipping it could strand its scope.key under the old master.
 		dir, err := s.openSubdir(users, n, false)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
 		if err != nil {
 			return fmt.Errorf("%w: keystore/%s/%s: %w", ErrCorrupt, userScopesName, n, err)
+		}
+		if err := checkScopeKeyNew(dir, n); err != nil {
+			_ = dir.Close() // read-only so far
+			return err
 		}
 		err = fn(n, dir)
 		_ = dir.Close() // each write is fsynced by writeFile or syncDir
 		if err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// scopeDirNamesBound bounds a listing of .user. It is maxDirNames; a test
+// lowers it.
+var scopeDirNamesBound = maxDirNames
+
+// checkScopeKeyNew refuses a scope.key.new that is there and not a regular
+// file: Rewrap only ever writes one as a file, and a directory or other
+// name there would make every retry fail on it.
+func checkScopeKeyNew(dir *os.Root, uid string) error {
+	fi, err := dir.Lstat(scopeKeyName + newSuffix)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%w: keystore/%s/%s/%s%s is a %s, not a file Rewrap wrote; root must remove it, then run rewrap again", ErrCorrupt, userScopesName, uid, scopeKeyName, newSuffix, fi.Mode().Type())
+	}
+	return nil
+}
+
+// checkScopesPlanned re-walks .user after the commit and refuses, as
+// ErrCorrupt, unless the scopes with a scope.key are exactly those plan
+// re-sealed: a scope that appeared or went missing during the run would
+// be left under a master about to be retired.
+func (s *FileStore) checkScopesPlanned(ctx context.Context, root *os.Root, plan []planned) error {
+	want := map[string]bool{}
+	for _, p := range plan {
+		if p.scope != "" {
+			want[p.scope] = true
+		}
+	}
+	got := map[string]bool{}
+	err := s.eachScopeDir(ctx, root, func(uid string, dir *os.Root) error {
+		if _, err := dir.Lstat(scopeKeyName); errors.Is(err, fs.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		got[uid] = true
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for uid := range want {
+		if !got[uid] {
+			return fmt.Errorf("%w: the scope key of user/%s was re-sealed and is gone; restore keystore/%s/%s from a backup, then run rewrap again", ErrCorrupt, uid, userScopesName, uid)
+		}
+	}
+	for uid := range got {
+		if !want[uid] {
+			return fmt.Errorf("%w: user/%s has a scope key this rewrap did not plan; root must remove keystore/%s/%s, then run rewrap again", ErrCorrupt, uid, userScopesName, uid)
 		}
 	}
 	return nil
@@ -235,6 +297,11 @@ func (s *FileStore) commitScopeKey(root *os.Root, uid string, old, next keys) er
 		}
 		if err := s.checkOwned(fi, fileMode); err != nil {
 			return fmt.Errorf("%w: %s%s: %w", ErrCorrupt, scopeKeyName, newSuffix, err)
+		}
+		// Renamed in, a second link would keep a copy the store does not
+		// know of, which readScopeKeyRecord then refuses.
+		if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Nlink != 1 {
+			return fmt.Errorf("%w: %s%s has more than one link; root must remove it, then run rewrap again", ErrCorrupt, scopeKeyName, newSuffix)
 		}
 		nr, err := parseScopeKey(b)
 		if err != nil {
