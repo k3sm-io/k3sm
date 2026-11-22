@@ -62,7 +62,7 @@ func TestMergeFloorIgnoresEntryLock(t *testing.T) {
 			s.lockWait = 200 * time.Millisecond
 			writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
 			tc.plant(t, filepath.Join(server, "keystore", lockName))
-			r, err := s.MergeFloor(ctx, MergeOptions{})
+			r, err := mergeStaged(t, s, ctx, MergeOptions{})
 			if err != nil || r.Merged != 1 {
 				t.Fatalf("MergeFloor under a %s .lock = %+v, %v; want 1 merged", tc.name, r, err)
 			}
@@ -109,7 +109,7 @@ func TestMergeFloorRefusesWrongInput(t *testing.T) {
 				}
 			}
 			before, _ := os.ReadFile(floorPath(server))
-			_, err := s.MergeFloor(ctx, MergeOptions{})
+			_, err := mergeStaged(t, s, ctx, MergeOptions{})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("MergeFloor: %v, want a refusal saying %q", err, tc.want)
 			}
@@ -160,7 +160,7 @@ func TestPendingMergeGuard(t *testing.T) {
 	mustCurrent(t, s, "k", "one")
 	at := time.Unix(1795370000, 0)
 	s.now = func() time.Time { return at }
-	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
@@ -255,7 +255,7 @@ func TestMergeFloorRefusesUnmatchedKeep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeFloor(ctx, MergeOptions{Keep: []string{"a", "typo"}}); err == nil || !strings.Contains(err.Error(), "typo") {
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{Keep: []string{"a", "typo"}}); err == nil || !strings.Contains(err.Error(), "typo") {
 		t.Fatalf("MergeFloor keeping an unmatched name: %v, want a refusal naming it", err)
 	}
 	if after, _ := os.ReadFile(floorPath(server)); string(after) != string(before) {
@@ -284,7 +284,7 @@ func TestMergeFloorCommittedRerun(t *testing.T) {
 	if err := os.WriteFile(taken, []byte("earlier\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r, err := s.MergeFloor(ctx, MergeOptions{})
+	r, err := mergeStaged(t, s, ctx, MergeOptions{})
 	if !Committed(err) || r.Merged != 1 {
 		t.Fatalf("MergeFloor with the merged name taken = %+v, %v; want the report, committed", r, err)
 	}
@@ -299,7 +299,7 @@ func TestMergeFloorCommittedRerun(t *testing.T) {
 		t.Fatal(err)
 	}
 	at = at.Add(time.Second)
-	r, err = s.MergeFloor(ctx, MergeOptions{})
+	r, err = mergeStaged(t, s, ctx, MergeOptions{})
 	if err != nil || !r.AlreadyMerged || r.Merged != 0 || r.AlreadyPresent != 1 {
 		t.Fatalf("the rerun = %+v, %v; want it already merged", r, err)
 	}
@@ -317,7 +317,7 @@ func TestMergeFloorCommittedRerun(t *testing.T) {
 		}
 		writeAsideFloor(t, server, floor{"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}}})
 		at = at.Add(time.Second)
-		r, err := s.MergeFloor(ctx, MergeOptions{})
+		r, err := mergeStaged(t, s, ctx, MergeOptions{})
 		if err != nil || !r.AlreadyMerged {
 			t.Fatalf("the rerun after a Delete = %+v, %v; want it already merged", r, err)
 		}

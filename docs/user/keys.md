@@ -327,22 +327,27 @@ nothing running as the service user can reach the moved-aside entries or copy on
 restored keystore. The files inside are not changed: they keep their owner and mode, so an undo
 needs no ownership change. Never run `chown -R` or `chmod -R` as root over the moved-aside
 `keystore/`. The service user wrote that tree, and a hard link it placed there would make root
-change a file somewhere else. The `mkdir` line and the `test` line each stop the steps (and close
-the shell) if a copy is set aside after all, so `mv` never moves a live copy into or over it:
+change a file somewhere else. `ditto` copies the backup into `pre-restore.d/restored`, beside
+the moved-aside copy, not into `server/`: the merge below moves it into place and hands it to the
+service user itself, one file at a time, never following a link. Leave
+`/var/lib/k3sm/server/keystore` absent; the merge refuses if anything is there. Every line ends in
+`|| exit 1`, so the first one that fails stops the steps (and closes the shell), and no later
+line moves a copy into or over one that is set aside:
 
 ```
 sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1
-sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
 test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
-sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
-sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/server/keystore
-sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json
+sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json || exit 1
 ```
 
 Before you start the server, carry over every deletion recorded since the backup. The floor you
 moved aside records every entry deleted while it was live. Until you merge it, `put`, `rotate`
-and `rewrap` refuse with a message that names `keys floor merge`, and `list` and `show` read the
-restored entries without updating the floor, with a warning on stderr. `rm` still deletes, with
+and `rewrap` refuse with a message that names `keys floor merge`, and `list` and `show` run with a
+warning on stderr but find no entries, since the restored ones are not in place yet. `rm` still deletes, with
 the same warning, and the merge keeps each deletion it records. A server started
 before the merge delivers no keys to the cluster: it logs an error and tries again until the
 merge has run. Merge those deletions into the restored floor:
@@ -351,10 +356,12 @@ merge has run. Merge those deletions into the restored floor:
 sudo k3sm keys floor merge
 ```
 
-Once the merge is written, it renames the file to `keystore-floor.json.merged-<time>`, the time in
+Once the merge is written, it moves `pre-restore.d/restored` to `/var/lib/k3sm/server/keystore`,
+then renames the file to `keystore-floor.json.merged-<time>`, the time in
 seconds since 1970, and the other verbs work again. If it prints its report and exits 5, the merge is
-written, but the file was not renamed: run the same command again to clear the guard. The second run writes
-nothing more, prints `already merged` and renames the file. The merge takes no file name: it reads only `/var/lib/k3sm/keystore-floor.json.pre-restore`,
+written, but the restored copy was not moved into place or the file was not renamed: run the same
+command again. The second run writes nothing more, prints `already merged`, moves the restored copy
+if it is still staged and renames the file. The merge takes no file name: it reads only `/var/lib/k3sm/keystore-floor.json.pre-restore`,
 the floor the steps above moved aside, so it never reads the floor saved with the backup or any
 other copy. It refuses, and changes nothing, if that file is missing, if the restored
 `keystore-floor.json` is not in place yet (put it back with `install` first), if the file is
@@ -438,10 +445,10 @@ sudo rm -rf /var/lib/k3sm/pre-restore.d
 sudo rm /var/lib/k3sm/keystore-floor.json.merged-*
 ```
 
-To undo the restore instead, stop the server, move what you restored out of the way, then move
-both copies back. Rename the restored `keystore/` first: `mv` onto a directory that exists moves
-the source inside it rather than replacing it. The moved-back files are still the service user's:
-moving them aside did not change their owner. The floors swap places: the floor you moved aside
+To undo the restore instead, stop the server and stage the two copies the other way round inside
+`pre-restore.d`: the copy you moved aside becomes `restored`, which the merge moves into place,
+and the restored `keystore/` becomes the moved-aside copy. Every line ends in `|| exit 1`, as
+above. The floors swap places: the floor you moved aside
 goes back in place, and the restored floor becomes `keystore-floor.json.pre-restore`, so the
 merge runs in reverse and keeps every deletion you made after the restore. If you already ran
 the merge, the floor you moved aside is now `keystore-floor.json.merged-<time>`: use that name
@@ -449,16 +456,19 @@ in the first floor `mv` instead.
 
 ```
 sudo k3sm stop
-sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.restored
-sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/server/keystore
-sudo rmdir /var/lib/k3sm/pre-restore.d
-sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo
-sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
-sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json
+sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1
 sudo k3sm keys floor merge --dry-run
 sudo k3sm keys floor merge
+sudo rm -rf /var/lib/k3sm/pre-restore.d
 sudo k3sm start
 ```
+
+The last `rm -rf` removes the restored copy, which the steps above left in `pre-restore.d`.
 
 Read the `--dry-run` report before you run the merge. A `buried live` line names an entry that
 the restored floor records as deleted. That is either an entry you deleted after the restore,

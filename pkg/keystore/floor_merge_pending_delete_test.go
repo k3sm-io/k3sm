@@ -61,7 +61,7 @@ func TestPendingMergeDeleteMakesRoom(t *testing.T) {
 	// burials it adds, and there are no others to drop.
 	size := len(b) - 200
 	setFloorLimits(t, size, size)
-	_, err = s.MergeFloor(ctx, MergeOptions{})
+	_, err = mergeStaged(t, s, ctx, MergeOptions{})
 	if !errors.Is(err, errFloorFull) || !strings.Contains(err.Error(), "sudo k3sm keys rm system/<name> --yes") || !strings.Contains(err.Error(), "run the merge again") {
 		t.Fatalf("MergeFloor over a full floor: %v, want errFloorFull naming keys rm and running the merge again", err)
 	}
@@ -82,10 +82,10 @@ func TestPendingMergeDeleteMakesRoom(t *testing.T) {
 	if len(gens) != removed {
 		t.Fatalf("guard-era burials %v, want one per rm", gens)
 	}
-	if _, err := s.MergeFloor(ctx, MergeOptions{}); !errors.Is(err, errFloorFull) {
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); !errors.Is(err, errFloorFull) {
 		t.Fatalf("MergeFloor after the deletes: %v, want it still refused: each rm's burial is kept", err)
 	}
-	r, err := s.MergeFloor(ctx, MergeOptions{AcceptDrops: true})
+	r, err := mergeStaged(t, s, ctx, MergeOptions{AcceptDrops: true})
 	if err != nil {
 		t.Fatalf("MergeFloor --accept-drops after the deletes: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestPendingMergeDeleteBurialSurvivesMerge(t *testing.T) {
 	if err := s.Delete(ctx, "k"); err != nil {
 		t.Fatalf("Delete with a merge pending: %v, want nil", err)
 	}
-	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); err != nil {
 		t.Fatalf("MergeFloor after the delete: %v", err)
 	}
 	if fl := floorOf(t, server); !fl["k"].buries(gen) || fl["k"].live() {

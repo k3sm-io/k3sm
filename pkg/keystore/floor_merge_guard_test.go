@@ -66,14 +66,14 @@ func TestGuardEraBurialSurvivesPressuredMerge(t *testing.T) {
 	probe := floorOf(t, server)
 	probe.merge(aside, nil, nil)
 	setFloorLimits(t, smallFloorSize, probe.deadSize()-1)
-	_, err := s.MergeFloor(ctx, MergeOptions{})
+	_, err := mergeStaged(t, s, ctx, MergeOptions{})
 	if !errors.Is(err, errFloorFull) {
 		t.Fatalf("MergeFloor that must drop a merged burial: %v, want errFloorFull", err)
 	}
 	if fl := floorOf(t, server); !fl["k"].buries(gen) {
 		t.Fatalf("k after the refused merge = %+v, want the guard-era burial of %s kept", fl["k"], gen)
 	}
-	r, err := s.MergeFloor(ctx, MergeOptions{AcceptDrops: true})
+	r, err := mergeStaged(t, s, ctx, MergeOptions{AcceptDrops: true})
 	if err != nil || len(r.Dropped) != 1 || r.Dropped[0] != "gone-00" {
 		t.Fatalf("MergeFloor --accept-drops = %+v, %v; want the oldest merged burial, gone-00's, dropped", r, err)
 	}
@@ -105,7 +105,7 @@ func TestGuardEraTombstoneBudget(t *testing.T) {
 	setFloorLimits(t, smallFloorSize, probe.deadSize()-1)
 	refused := func(when string) {
 		t.Helper()
-		_, err := s.MergeFloor(ctx, MergeOptions{})
+		_, err := mergeStaged(t, s, ctx, MergeOptions{})
 		if !errors.Is(err, errFloorFull) || !strings.Contains(err.Error(), "tombstone budget binds") || !strings.Contains(err.Error(), "--accept-drops") || strings.Contains(err.Error(), "keys rm") {
 			t.Fatalf("MergeFloor %s: %v, want errFloorFull naming the tombstone budget and --accept-drops, not keys rm", when, err)
 		}
@@ -120,17 +120,17 @@ func TestGuardEraTombstoneBudget(t *testing.T) {
 	otherGen := floorOf(t, server)["other"].burials()[0].Generation
 	refused("after an rm under the guard")
 	before := floorOf(t, server)
-	dry, err := s.MergeFloor(ctx, MergeOptions{AcceptDrops: true, DryRun: true})
+	dry, err := mergeStaged(t, s, ctx, MergeOptions{AcceptDrops: true, DryRun: true})
 	if err != nil || len(dry.Dropped) == 0 {
 		t.Fatalf("MergeFloor --accept-drops --dry-run = %+v, %v; want the drops reported", dry, err)
 	}
-	if dry, err := s.MergeFloor(ctx, MergeOptions{DryRun: true}); !errors.Is(err, errFloorFull) || len(dry.Dropped) == 0 {
+	if dry, err := mergeStaged(t, s, ctx, MergeOptions{DryRun: true}); !errors.Is(err, errFloorFull) || len(dry.Dropped) == 0 {
 		t.Fatalf("MergeFloor --dry-run = %+v, %v; want the drops reported with the refusal", dry, err)
 	}
 	if !floorsEqual(floorOf(t, server), before) || s.MergePending() == nil {
 		t.Fatal("a dry run wrote the floor or cleared the guard")
 	}
-	r, err := s.MergeFloor(ctx, MergeOptions{AcceptDrops: true})
+	r, err := mergeStaged(t, s, ctx, MergeOptions{AcceptDrops: true})
 	if err != nil || len(r.Dropped) == 0 {
 		t.Fatalf("MergeFloor --accept-drops = %+v, %v; want it written with drops reported", r, err)
 	}
@@ -172,14 +172,14 @@ func TestGuardEraBurialPerNameCap(t *testing.T) {
 	if err := s.Delete(ctx, "k"); err != nil {
 		t.Fatalf("Delete under the guard: %v", err)
 	}
-	_, err := s.MergeFloor(ctx, MergeOptions{})
+	_, err := mergeStaged(t, s, ctx, MergeOptions{})
 	if !errors.Is(err, errFloorFull) || !strings.Contains(err.Error(), "per-name cap") || !strings.Contains(err.Error(), "--accept-drops") || strings.Contains(err.Error(), "keys rm") {
 		t.Fatalf("MergeFloor at the per-name cap: %v, want errFloorFull naming the per-name cap and --accept-drops, not keys rm", err)
 	}
 	if fl := floorOf(t, server); !fl["k"].buries(gen) {
 		t.Fatalf("k after the refused merge = %+v, want the guard-era burial kept", fl["k"])
 	}
-	r, err := s.MergeFloor(ctx, MergeOptions{AcceptDrops: true})
+	r, err := mergeStaged(t, s, ctx, MergeOptions{AcceptDrops: true})
 	if err != nil || len(r.Dropped) != 1 || r.Dropped[0] != "k" {
 		t.Fatalf("MergeFloor --accept-drops at the cap = %+v, %v; want one of k's merged burials dropped", r, err)
 	}
@@ -224,13 +224,13 @@ func TestMergeFloorRefusesRetiringEverything(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeFloor(ctx, MergeOptions{}); err == nil || !strings.Contains(err.Error(), "would retire every entry") {
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); err == nil || !strings.Contains(err.Error(), "would retire every entry") {
 		t.Fatalf("MergeFloor retiring every moved-aside live record: %v, want a refusal", err)
 	}
 	if after, _ := os.ReadFile(floorPath(server)); string(after) != string(before) {
 		t.Fatalf("floor after the refused merge changed: %s", after)
 	}
-	r, err := s.MergeFloor(ctx, MergeOptions{Keep: []string{"a"}})
+	r, err := mergeStaged(t, s, ctx, MergeOptions{Keep: []string{"a"}})
 	if err != nil || !slices.Equal(r.Retired, []string{"b"}) || !slices.Equal(r.Kept, []string{"a"}) {
 		t.Fatalf("MergeFloor keeping a = %+v, %v; want a kept and b retired", r, err)
 	}

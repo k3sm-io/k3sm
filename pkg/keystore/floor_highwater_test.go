@@ -171,7 +171,7 @@ func TestFloorMergeFencesAbandonedHistory(t *testing.T) {
 	if err := os.WriteFile(floorPath(server), backupFloor, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r, err := s.MergeFloor(ctx, MergeOptions{})
+	r, err := mergeStaged(t, s, ctx, MergeOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestFloorMergeFenceLaggingFloors(t *testing.T) {
 		if err := os.WriteFile(floorPath(server), backupFloor, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
+		if _, err := mergeStaged(t, s, ctx, MergeOptions{}); err != nil {
 			t.Fatal(err)
 		}
 		if e := floorOf(t, server)["k"]; e.Seq != 5 || e.HighWater != 10 {
@@ -308,7 +308,7 @@ func TestFloorMergeFenceLaggingFloors(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		r, err := s.MergeFloor(ctx, MergeOptions{})
+		r, err := mergeStaged(t, s, ctx, MergeOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}

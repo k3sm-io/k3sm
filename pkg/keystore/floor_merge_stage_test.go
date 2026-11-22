@@ -1,0 +1,283 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package keystore
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+)
+
+// merge is mergeFenced with no moved-aside tree pointers.
+func (fl floor) merge(from floor, keep map[string]bool, ptrs map[string]uint64) (MergeReport, []pruned) {
+	return fl.mergeFenced(from, keep, ptrs, nil)
+}
+
+// stagePath is s's pre-restore.d, or the tree name inside it.
+func stagePath(s *FileStore, name ...string) string {
+	return filepath.Join(append([]string{s.dataRoot, preRestoreDirName}, name...)...)
+}
+
+// stageTree stages s's keystore/ as the restore recipe does: a root-only
+// pre-restore.d (made if absent) and the tree in it as restored, moved from
+// the store's Dir, or an empty one when Dir is absent. A tree already staged
+// is left. Failures are reported with Errorf, so a goroutine may call it.
+func stageTree(tb testing.TB, s *FileStore) {
+	tb.Helper()
+	if err := os.Mkdir(stagePath(s), 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		tb.Errorf("stage: %v", err)
+		return
+	}
+	if _, err := os.Lstat(stagePath(s, stagedTreeName)); err == nil {
+		return
+	}
+	err := os.Rename(s.dir, stagePath(s, stagedTreeName))
+	if errors.Is(err, fs.ErrNotExist) {
+		if err = os.Mkdir(stagePath(s, stagedTreeName), 0o700); err == nil {
+			giveToService(tb, stagePath(s, stagedTreeName))
+		}
+	}
+	if err != nil && !errors.Is(err, fs.ErrExist) {
+		tb.Errorf("stage: %v", err)
+	}
+}
+
+// unstageTree puts a tree a refused or dry-run merge left staged back at
+// the store's Dir, and removes pre-restore.d once it is empty, so the test
+// goes on as before the recipe staged anything.
+func unstageTree(tb testing.TB, s *FileStore) {
+	tb.Helper()
+	if _, err := os.Lstat(s.dir); errors.Is(err, fs.ErrNotExist) {
+		if err := os.Rename(stagePath(s, stagedTreeName), s.dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			tb.Errorf("unstage: %v", err)
+		}
+	}
+	_ = os.Remove(stagePath(s)) // only when empty
+}
+
+// mergeStaged is MergeFloor run as the restore recipe leaves the data root:
+// s's keystore/ staged in pre-restore.d (stageTree), and put back after a
+// merge that did not move it (unstageTree).
+func mergeStaged(tb testing.TB, s *FileStore, ctx context.Context, opts MergeOptions) (MergeReport, error) {
+	tb.Helper()
+	stageTree(tb, s)
+	defer unstageTree(tb, s)
+	return s.MergeFloor(ctx, opts)
+}
+
+// stageRecipe sets s's data root up as the restore recipe leaves it after a
+// backup of k at seq 1, k rotated to seq 4 since, and the restore: the live
+// floor moved aside (asideSeq, when nonzero, overrides its record of k, a
+// floor that lagged its pointer), the live keystore/ in pre-restore.d as
+// keystore, the backup's in pre-restore.d as restored, and the backup's
+// floor in place. It returns the seq-4 copy of k's directory.
+func stageRecipe(t *testing.T, s *FileStore, server string, asideSeq uint64) string {
+	t.Helper()
+	mustPut(t, s, "k", KindOpaque, []byte("v1"))
+	tmp := t.TempDir()
+	backup := filepath.Join(tmp, "backup")
+	copyEntryDir(t, filepath.Join(server, "keystore", "k"), backup)
+	backupFloor, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 2; i <= 4; i++ {
+		mustRotate(t, s, "k", fmt.Sprintf("v%d", i))
+	}
+	late := filepath.Join(tmp, "late")
+	copyEntryDir(t, filepath.Join(server, "keystore", "k"), late)
+	aside := readFloorFile(t, server)
+	if asideSeq != 0 {
+		e := aside["k"]
+		e.Seq = asideSeq
+		aside["k"] = e
+	}
+	writeAsideFloor(t, server, aside)
+	remove(t, floorPath(server))
+	if err := os.Mkdir(stagePath(s), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(s.dir, stagePath(s, asideTreeName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(stagePath(s, stagedTreeName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	copyEntryDir(t, backup, stagePath(s, stagedTreeName, "k"))
+	if err := os.WriteFile(floorPath(server), backupFloor, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return late
+}
+
+// TestFloorMergeRefusesExistingTarget (U192): with the restored tree staged,
+// anything at the store's Dir refuses the merge, nothing written: a
+// pointer the service user planted there one past the restored record is
+// never read, and a symlink there is never written through.
+func TestFloorMergeRefusesExistingTarget(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		plant func(t *testing.T, s *FileStore, late, elsewhere string)
+	}{
+		{"a planted pointer one past the restored record", func(t *testing.T, s *FileStore, late, _ string) {
+			if err := os.Mkdir(s.dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			giveToService(t, s.dir)
+			copyEntryDir(t, late, filepath.Join(s.dir, "k"))
+		}},
+		{"a symlink", func(t *testing.T, s *FileStore, _, elsewhere string) {
+			if err := os.Symlink(elsewhere, s.dir); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			late := stageRecipe(t, s, server, 0)
+			elsewhere := t.TempDir()
+			tc.plant(t, s, late, elsewhere)
+			before, err := os.ReadFile(floorPath(server))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, dry := range []bool{true, false} {
+				if _, err := s.MergeFloor(ctx, MergeOptions{DryRun: dry}); err == nil || !strings.Contains(err.Error(), "exists, a symlink counted") {
+					t.Fatalf("MergeFloor (dry run %v) with %s at Dir: %v, want it refused", dry, tc.name, err)
+				}
+			}
+			if after, err := os.ReadFile(floorPath(server)); err != nil || !bytes.Equal(after, before) {
+				t.Fatalf("live floor after the refused merge = %s, %v; want it unchanged", after, err)
+			}
+			if names, err := os.ReadDir(elsewhere); err != nil || len(names) != 0 {
+				t.Fatalf("symlink target after the refused merge holds %v, %v; want nothing written through it", names, err)
+			}
+			if _, err := os.Lstat(stagePath(s, stagedTreeName)); err != nil {
+				t.Fatalf("staged tree after the refused merge: %v, want it left staged", err)
+			}
+			if _, err := os.Lstat(floorPath(server) + ".pre-restore"); err != nil {
+				t.Fatalf("guard after the refused merge: %v, want it left", err)
+			}
+		})
+	}
+}
+
+// TestFloorMergeFencesAboveAsidePointer (U192): a moved-aside floor that
+// lagged its own entry's pointer by more than one (floor at seq 2, pointer
+// at 4) is fenced above that authenticated pointer, read from the
+// moved-aside tree in pre-restore.d, so the seq-4 copy put back after the
+// merge is refused.
+func TestFloorMergeFencesAboveAsidePointer(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	late := stageRecipe(t, s, server, 2)
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if e := floorOf(t, server)["k"]; e.Seq != 1 || e.HighWater != 5 {
+		t.Fatalf("k after the merge = %+v, want seq 1 fenced at 5, one past the moved-aside pointer", e)
+	}
+	mustCurrent(t, s, "k", "v1")
+	replaceEntryDir(t, server, "k", late)
+	var stale *staleError
+	if _, _, err := s.Current(ctx, "k"); !errors.As(err, &stale) {
+		t.Fatalf("Current over the seq-4 copy: %v, want it refused by the fence", err)
+	}
+}
+
+// TestFloorMergeMovesStagedTree (U192): the merge writes the floor, hands
+// the staged tree to the service user through descriptors, and moves it to
+// the store's Dir; a failed move after the floor write is committed, the
+// tree left staged and the guard in place, and a rerun moves it and renames
+// the guard.
+func TestFloorMergeMovesStagedTree(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	stageRecipe(t, s, server, 0)
+	fail := true
+	s.step = func(name string) error {
+		if name == "merge tree rename" && fail {
+			fail = false
+			return errors.New("injected")
+		}
+		return nil
+	}
+	r, err := s.MergeFloor(ctx, MergeOptions{})
+	if !Committed(err) || len(r.Fenced) != 1 {
+		t.Fatalf("MergeFloor with the move failing: %+v, %v; want committed with k fenced", r, err)
+	}
+	if e := floorOf(t, server)["k"]; e.HighWater != 5 {
+		t.Fatalf("k after the committed merge = %+v, want the fence written", e)
+	}
+	if _, err := os.Lstat(s.dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Dir after the failed move: %v, want it absent", err)
+	}
+	if _, err := os.Lstat(floorPath(server) + ".pre-restore"); err != nil {
+		t.Fatalf("guard after the failed move: %v, want it left", err)
+	}
+	r, err = s.MergeFloor(ctx, MergeOptions{})
+	if err != nil || !r.AlreadyMerged {
+		t.Fatalf("rerun: %+v, %v; want already merged", r, err)
+	}
+	if _, err := os.Lstat(stagePath(s, stagedTreeName)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("staged tree after the rerun: %v, want it moved", err)
+	}
+	if _, err := os.Lstat(floorPath(server) + ".pre-restore"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("guard after the rerun: %v, want it renamed", err)
+	}
+	uid, _ := serviceIDs(t)
+	for _, p := range []string{s.dir, filepath.Join(s.dir, "k"), filepath.Join(s.dir, "k", generationName)} {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := fi.Sys().(*syscall.Stat_t); st.Uid != uid {
+			t.Fatalf("%s owned by %d after the move, want the service user %d", p, st.Uid, uid)
+		}
+	}
+	mustCurrent(t, s, "k", "v1")
+}
+
+// TestFloorMergeNeedsStagedTree (U192): a merge that would change the floor
+// with no tree staged in pre-restore.d refuses, nothing written.
+func TestFloorMergeNeedsStagedTree(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	stageRecipe(t, s, server, 0)
+	remove(t, stagePath(s, stagedTreeName, "k", generationName))
+	if err := os.RemoveAll(stagePath(s, stagedTreeName)); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(floorPath(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); !errors.Is(err, errNotStaged) {
+		t.Fatalf("MergeFloor with nothing staged: %v, want errNotStaged", err)
+	}
+	if after, _ := os.ReadFile(floorPath(server)); !bytes.Equal(after, before) {
+		t.Fatal("live floor changed by the refused merge")
+	}
+}

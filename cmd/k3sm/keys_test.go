@@ -660,7 +660,18 @@ func restoreRecipeBackup(t *testing.T, h *keysHarness, b recipeBackup, withFloor
 	if err := os.Rename(h.keystoreDir(), aside); err != nil {
 		t.Fatal(err)
 	}
-	copyTree(t, b.keystore, h.keystoreDir())
+	// test ! -e, then the root ditto into the staging directory; the merge
+	// moves it into place.
+	staged := filepath.Join(recipePreRestore(h), "restored")
+	if !withFloor {
+		// A restore without the floor never merges: the copy goes
+		// straight into place, where the floor refuses it.
+		staged = h.keystoreDir()
+	}
+	if _, err := os.Lstat(staged); !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("%s exists (%v)", staged, err)
+	}
+	copyTree(t, b.keystore, staged)
 	if withFloor {
 		if err := os.Rename(floor, floor+".pre-restore"); err != nil {
 			t.Fatal(err)
@@ -679,6 +690,19 @@ func restoreRecipeBackup(t *testing.T, h *keysHarness, b recipeBackup, withFloor
 		}
 	}
 	return aside, nil
+}
+
+// stageKeystore stages h's live keystore/ as the restore recipe leaves the
+// restored one, in a root-only pre-restore.d as restored, for a test that
+// sets the guard file up by hand: the merge moves it back into place.
+func stageKeystore(t *testing.T, h *keysHarness) {
+	t.Helper()
+	if err := os.Mkdir(recipePreRestore(h), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(h.keystoreDir(), filepath.Join(recipePreRestore(h), "restored")); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // refusedDeleted fails t unless show of name is refused as a deleted entry
@@ -815,10 +839,12 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			"sudo ls -d /var/lib/k3sm/pre-restore.d /var/lib/k3sm/keystore-floor.json.pre-restore",
 			"sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
 			"sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1",
-			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore",
+			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
 			"test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
-			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore",
-			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json",
+			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
+			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json || exit 1",
 			"sudo k3sm keys floor merge",
 			"sudo k3sm keys rm system/<name> --yes",
 			"sudo k3sm start",
@@ -826,14 +852,15 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			// restored floor as the input, so a deletion made after the
 			// restore survives the undo.
 			"sudo k3sm stop",
-			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.restored",
-			"sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/server/keystore",
-			"sudo rmdir /var/lib/k3sm/pre-restore.d",
-			"sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo",
-			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore",
-			"sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json",
+			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1",
 			"sudo k3sm keys floor merge --dry-run",
 			"sudo k3sm keys floor merge",
+			"sudo rm -rf /var/lib/k3sm/pre-restore.d",
 			"sudo k3sm start",
 		}
 		at := 0
@@ -876,6 +903,13 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if got := recipeDeletedNames(t, h); !slices.Equal(got, []string{"rb"}) {
 			t.Fatalf("names the moved-aside floor records as deleted = %q, want rb", got)
 		}
+		if fi, err := os.Stat(recipePreRestore(h)); err != nil || fi.Mode().Perm() != 0o700 {
+			t.Fatalf("pre-restore.d = %v, %v; want mode 0700", fi, err)
+		}
+		if _, err := os.Lstat(h.keystoreDir()); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("keystore/ before the merge: %v, want it absent, the restored tree staged", err)
+		}
+		h.mustRun(0, "floor", "merge", "--keep", "system/rb")
 		h.mustRun(0, "list")
 		h.mustRun(0, "show", "system/rb", "--reveal")
 		if !bytes.Equal(h.stdout.Bytes(), value) {
@@ -1114,6 +1148,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if _, err := restoreRecipeBackup(t, h, older, true); err != nil {
 			t.Fatalf("restore of the older backup: %v", err)
 		}
+		h.mustRun(0, "floor", "merge", "--keep", "system/rb")
 		h.mustRun(0, "list")
 		h.mustRun(0, "show", "system/rb", "--reveal")
 		if got := h.stdout.String(); got != "old" {
@@ -1137,9 +1172,13 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if err != nil || len(merged) != 1 {
 			t.Fatalf("the merged floor: %v, %v; want one", merged, err)
 		}
+		staged := filepath.Join(recipePreRestore(h), "restored")
+		if _, err := os.Lstat(staged); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("test ! -e %s: %v", staged, err)
+		}
 		for _, mv := range [][2]string{
-			{h.keystoreDir(), h.keystoreDir() + ".restored"},
-			{aside, h.keystoreDir()},
+			{aside, staged},
+			{h.keystoreDir(), aside},
 			{merged[0], floor + ".undo"},
 			{floor, floor + ".pre-restore"},
 			{floor + ".undo", floor},
@@ -1155,9 +1194,12 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		h.mustRun(0, "floor", "merge")
 		refusedDeleted(t, h, "system/other")
 		h.mustRun(0, "rm", "system/other", "--yes")
-		// rmdir: the moved-aside tree went back out, its files never
-		// re-owned, so pre-restore.d is empty.
-		if err := os.Remove(recipePreRestore(h)); err != nil {
+		// The merge moved the staged tree into place; the restored tree is
+		// left in pre-restore.d as keystore, and rm -rf removes it.
+		if _, err := os.Lstat(staged); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("staged tree after the reverse merge: %v, want it moved", err)
+		}
+		if err := os.RemoveAll(recipePreRestore(h)); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "keystore")); !errors.Is(err, os.ErrNotExist) {
@@ -2501,6 +2543,7 @@ func TestKeysEvictionExitsCommitted(t *testing.T) {
 			t.Fatal(err)
 		}
 		plantBurials(t, aside, "k", 1000, keysPerNameCap)
+		stageKeystore(t, h)
 		if code := h.run("floor", "merge"); code != keysCommitted {
 			t.Fatalf("floor merge that drops a burial: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
 		}
@@ -2513,7 +2556,8 @@ func TestKeysEvictionExitsCommitted(t *testing.T) {
 // TestKeysPendingMergeGuard (U192): while the restore's
 // keystore-floor.json.pre-restore is in the data root, put and rotate
 // refuse, naming keys floor merge, and list, show and rm still run, with a
-// warning on stderr; floor merge renames it to
+// warning on stderr (show finds nothing: the restored tree is staged until
+// the merge moves it into place); floor merge renames it to
 // keystore-floor.json.merged-<unix>, and the verbs work again.
 func TestKeysPendingMergeGuard(t *testing.T) {
 	h := newKeysHarness(t)
@@ -2537,7 +2581,9 @@ func TestKeysPendingMergeGuard(t *testing.T) {
 	if !strings.Contains(h.stderr.String(), "warning: a restore is unfinished") {
 		t.Fatalf("list with a merge pending: stderr %q; want the warning", h.stderr.String())
 	}
-	h.mustRun(0, "show", "system/k")
+	// The restored tree is staged until the merge moves it into place, so
+	// show finds no entry yet, with the same warning.
+	h.mustRun(1, "show", "system/k")
 	if !strings.Contains(h.stderr.String(), "warning: a restore is unfinished") {
 		t.Fatalf("show with a merge pending: stderr %q; want the warning", h.stderr.String())
 	}
@@ -2689,6 +2735,7 @@ func TestKeysFloorMergeAcceptDrops(t *testing.T) {
 	}
 	plantBurials(t, aside, "k", 1000, keysPerNameCap)
 	h.mustRun(0, "rm", "system/k", "--yes")
+	stageKeystore(t, h)
 	if code := h.run("floor", "merge"); code != keysRefused || !strings.Contains(h.stderr.String(), "per-name cap") || !strings.Contains(h.stderr.String(), "--accept-drops") {
 		t.Fatalf("floor merge at the per-name cap: exit %d, stderr %q; want %d naming the cap and --accept-drops", code, h.stderr.String(), keysRefused)
 	}

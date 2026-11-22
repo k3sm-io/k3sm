@@ -53,7 +53,7 @@ func TestMergeFloorReadsOnlyTheGuardFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeFloor(ctx, MergeOptions{}); !errors.Is(err, errNoGuard) {
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); !errors.Is(err, errNoGuard) {
 		t.Errorf("MergeFloor with no guard file: %v, want errNoGuard", err)
 	}
 	if after, _ := os.ReadFile(floorPath(server)); string(after) != string(before) {
@@ -74,7 +74,7 @@ func TestMergeFloorReadsOnlyTheGuardFile(t *testing.T) {
 			return os.Rename(tmp, guard)
 		}
 		t.Cleanup(func() { s.step = func(string) error { return nil } })
-		if _, err := s.MergeFloor(ctx, MergeOptions{}); err == nil || Committed(err) {
+		if _, err := mergeStaged(t, s, ctx, MergeOptions{}); err == nil || Committed(err) {
 			t.Fatalf("MergeFloor over a replaced guard file: %v, want a refusal, not committed", err)
 		}
 		if after, _ := os.ReadFile(floorPath(server)); string(after) != string(before) {

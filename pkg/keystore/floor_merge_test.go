@@ -119,7 +119,7 @@ func TestFloorMergeCapsAndPrune(t *testing.T) {
 	// floor's own burials it does not.
 	setFloorLimits(t, smallFloorSize, 3100)
 	buf := captureWarn(t)
-	got, err := s.MergeFloor(ctx, MergeOptions{})
+	got, err := mergeStaged(t, s, ctx, MergeOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,14 +158,14 @@ func TestFloorMergeRefusesUntrusted(t *testing.T) {
 	if err := os.WriteFile(guard, []byte(`{"version":1,"scope":"system","entries":{},"tombstones":{"k":[]}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeFloor(ctx, MergeOptions{}); !errors.Is(err, ErrCorrupt) {
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); !errors.Is(err, ErrCorrupt) {
 		t.Errorf("MergeFloor of a malformed floor: %v, want ErrCorrupt", err)
 	}
 	remove(t, guard)
 	if err := os.Symlink(floorPath(server), guard); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeFloor(ctx, MergeOptions{}); !errors.Is(err, errFloorUntrusted) {
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); !errors.Is(err, errFloorUntrusted) {
 		t.Errorf("MergeFloor of a symlink: %v, want errFloorUntrusted", err)
 	}
 	if after, err := os.ReadFile(floorPath(server)); err != nil || string(after) != string(before) {
@@ -225,10 +225,10 @@ func TestMergeFloorKeep(t *testing.T) {
 		"a": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}},
 		"b": {Buried: []burial{{Generation: mgen(2), Deleted: 2}}},
 	})
-	if _, err := s.MergeFloor(ctx, MergeOptions{Keep: []string{"Bad Name"}}); !errors.Is(err, ErrInvalidName) {
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{Keep: []string{"Bad Name"}}); !errors.Is(err, ErrInvalidName) {
 		t.Fatalf("MergeFloor with an invalid keep name: %v, want ErrInvalidName", err)
 	}
-	r, err := s.MergeFloor(ctx, MergeOptions{Keep: []string{"a"}})
+	r, err := mergeStaged(t, s, ctx, MergeOptions{Keep: []string{"a"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ func TestFloorMergeRefusesUntrustedPlace(t *testing.T) {
 					s.floorUID++
 				}
 			}
-			_, err = s.MergeFloor(ctx, MergeOptions{})
+			_, err = mergeStaged(t, s, ctx, MergeOptions{})
 			if tc.want == "" {
 				if err != nil {
 					t.Fatalf("MergeFloor from a trusted place: %v", err)
@@ -376,7 +376,7 @@ func TestMergeFloorRefusesDroppingItsOwnBurials(t *testing.T) {
 	// The moved-aside floor parses under the tombstone budget, but its
 	// live generations, each retired by the merge, take the burials over it.
 	setFloorLimits(t, smallFloorSize, 1000)
-	r, err := s.MergeFloor(ctx, MergeOptions{})
+	r, err := mergeStaged(t, s, ctx, MergeOptions{})
 	if !errors.Is(err, errFloorFull) || Committed(err) {
 		t.Fatalf("MergeFloor dropping its own burials = %+v, %v; want errFloorFull, not committed", r, err)
 	}
