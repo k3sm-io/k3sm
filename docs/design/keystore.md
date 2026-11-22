@@ -3209,6 +3209,17 @@ the uid throughout.
     or make the real owner look changed (`ErrScopeOwnerChanged`, which deletes nothing in
     this release). The binding closes uid reuse by local accounts; it is no defence against
     the directory itself.
+20. **The service user is trusted for availability.** A process running as the service uid
+    can append to the user-scope floor, so it can block every `withdraw` with one malformed
+    line (a floor that does not parse refuses a re-sealing revocation until root's
+    `floor --rebuild`), spend a victim uid's revocation budget past the hard cap with lines
+    naming that uid's scope, and bury any entry with a tombstone, so the entry reads as
+    deleted. None of this reaches a value, and nothing narrower is promised: the service user
+    holds `M`, so it could delete the records outright. Per-uid shares, which keep one uid's
+    lines from spending another's budget for writers other than the server, arrive with the
+    socket (U51). A `withdraw` of an already withdrawn delivery appends no floor line once the
+    floor holds the record's sequence ("Revocation always succeeds"), so repeating one costs
+    no budget.
 ### What the user scope does not do
 
 Phase B direct mounts; a ServiceAccount rotate transport, deferred to a new endpoint with its
