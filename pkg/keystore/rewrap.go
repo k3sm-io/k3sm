@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -618,6 +619,8 @@ func (s *FileStore) anyNew(ctx context.Context, root *os.Root) (bool, error) {
 type planned struct {
 	name string
 	cur  uint64
+	// low is the oldest committed version: 1, or an oauth prune's mark.
+	low uint64
 	// scope, when set, makes this the scope.key of the user scope whose
 	// directory is .user/<scope> (rewrapscope.go), and name and cur unused.
 	scope string
@@ -650,7 +653,7 @@ func (s *FileStore) rewrapPlan(ctx context.Context, root *os.Root, fl floor, old
 		if checkName(name) != nil {
 			continue
 		}
-		cur, underNext, err := planEntry(ctx, root, name, fl, old, next)
+		cur, low, underNext, err := planEntry(ctx, root, name, fl, old, next)
 		if errors.Is(err, ErrNotFound) {
 			continue
 		}
@@ -658,7 +661,7 @@ func (s *FileStore) rewrapPlan(ctx context.Context, root *os.Root, fl floor, old
 			return nil, false, fmt.Errorf("entry %q does not open, and a rewrap would leave it sealed under a master that no longer exists: remove it with rm, or restore it, first: %w", name, err)
 		}
 		committed = committed || underNext
-		out = append(out, planned{name: name, cur: cur})
+		out = append(out, planned{name: name, cur: cur, low: low})
 	}
 	scopes, underNext, err := s.planScopes(ctx, root, old, next)
 	if err != nil {
@@ -668,13 +671,13 @@ func (s *FileStore) rewrapPlan(ctx context.Context, root *os.Root, fl floor, old
 }
 
 // planEntry opens name's pointer, checked against the floor, and every
-// version it covers, each under old
+// version it covers (low to cur), each under old
 // or, failing that and with next set, under next, and reports whether any
 // opened only under next.
-func planEntry(ctx context.Context, root *os.Root, name string, fl floor, old keys, next *keys) (uint64, bool, error) {
+func planEntry(ctx context.Context, root *os.Root, name string, fl floor, old keys, next *keys) (uint64, uint64, bool, error) {
 	e, err := openEntry(root, name, fl)
 	if err != nil {
-		return 0, false, err
+		return 0, 0, false, err
 	}
 	defer e.close()
 	both := old
@@ -691,31 +694,32 @@ func planEntry(ctx context.Context, root *os.Root, name string, fl floor, old ke
 		}
 		return err
 	}
-	var cur uint64
+	var cur, low uint64
 	// The pointer is the floor-checked one: a copied-back pointer readers
 	// refuse is refused here too, never re-sealed as it is.
-	if err := either(func(k keys) (err error) { cur, _, err = e.checkedPointer(k, fl); return err }); err != nil {
-		return 0, false, err
+	if err := either(func(k keys) (err error) { cur, _, low, err = e.checkedRange(k, fl); return err }); err != nil {
+		return 0, 0, false, err
 	}
-	for n := uint64(1); n <= cur; n++ {
+	for n := low; n <= cur; n++ {
 		if err := loopCtx(ctx, int(n)); err != nil {
-			return 0, false, err
+			return 0, 0, false, err
 		}
 		if err := either(func(k keys) error {
 			_, pt, err := e.version(k, n)
 			defer clear(pt)
 			return err
 		}); err != nil {
-			return 0, false, fmt.Errorf("version %d: %w", n, err)
+			return 0, 0, false, fmt.Errorf("version %d: %w", n, err)
 		}
 	}
-	return cur, underNext, nil
+	return cur, low, underNext, nil
 }
 
-// eachRecord calls fn for every record of an entry whose pointer names cur:
-// each version file, then the pointer.
-func eachRecord(ctx context.Context, cur uint64, fn func(file string, pointer bool, version uint64) error) error {
-	for n := uint64(1); n <= cur; n++ {
+// eachRecord calls fn for every record of an entry whose pointer names cur
+// with the oldest committed version low: each version file from low to cur,
+// then the pointer.
+func eachRecord(ctx context.Context, low, cur uint64, fn func(file string, pointer bool, version uint64) error) error {
+	for n := low; n <= cur; n++ {
 		if err := loopCtx(ctx, int(n)); err != nil {
 			return err
 		}
@@ -746,7 +750,7 @@ func (s *FileStore) sealNew(ctx context.Context, root *os.Root, fl floor, plan [
 		if err != nil {
 			return err
 		}
-		err = eachRecord(ctx, p.cur, func(file string, pointer bool, version uint64) error {
+		err = eachRecord(ctx, p.low, p.cur, func(file string, pointer bool, version uint64) error {
 			r, pt, err := e.openRecord(old, file, pointer, version)
 			if err != nil {
 				if !errors.Is(err, ErrCorrupt) {
@@ -793,7 +797,7 @@ func (s *FileStore) commitNew(ctx context.Context, root *os.Root, fl floor, plan
 		if err != nil {
 			return err
 		}
-		err = eachRecord(ctx, p.cur, func(file string, pointer bool, version uint64) error {
+		err = eachRecord(ctx, p.low, p.cur, func(file string, pointer bool, version uint64) error {
 			r, pt, err := e.openRecord(old, file, pointer, version)
 			if err == nil {
 				defer clear(pt)
@@ -826,6 +830,11 @@ func (s *FileStore) commitNew(ctx context.Context, root *os.Root, fl floor, plan
 		})
 		if err == nil {
 			err = syncDir(e.root)
+		}
+		if err == nil && p.low > 1 {
+			// What an interrupted oauth prune left below low is not
+			// committed, and is not re-sealed: it is unlinked.
+			err = discardOrphans(ctx, e, p.low, math.MaxUint64)
 		}
 		e.close()
 		if err != nil {

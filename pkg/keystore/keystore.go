@@ -40,6 +40,14 @@ const (
 	// KindOpaque is an opaque byte string the keystore stores but does not
 	// interpret.
 	KindOpaque
+	// KindToken is a bearer token that always carries an expiry. Its value
+	// is a typed envelope (pkg/keystore/typed), read as a typed.Credential.
+	KindToken
+	// KindSSH is an ed25519 SSH key, a typed envelope holding its seed.
+	KindSSH
+	// KindOAuth is an OAuth access and refresh pair, a typed envelope whose
+	// refresh token no read returns.
+	KindOAuth
 )
 
 // String returns the lowercase name of k, as the CLI prints it.
@@ -49,6 +57,12 @@ func (k Kind) String() string {
 		return "ed25519"
 	case KindOpaque:
 		return "opaque"
+	case KindToken:
+		return "token"
+	case KindSSH:
+		return "ssh"
+	case KindOAuth:
+		return "oauth"
 	default:
 		return "unknown"
 	}
@@ -164,6 +178,22 @@ var (
 	// upgrade. It is typed.ErrKindUnsupported, so the envelope decoder's
 	// refusal matches it unmapped.
 	ErrKindUnsupported = typed.ErrKindUnsupported
+	// ErrKindMismatch reports a rotate, or a put over an existing name, of
+	// a kind other than the entry's: an entry's kind is fixed when it is
+	// created, and changing kind means a new entry name.
+	ErrKindMismatch = errors.New("the keystore entry holds another kind: an entry's kind is fixed when it is created; store the new kind under a new name")
+	// ErrTypedCredential reports a raw-value read (Current, Get) of a
+	// typed entry, token, ssh or oauth, whose value is read only as a
+	// typed.Credential (CurrentCredential, GetCredential), so no raw read
+	// can carry an oauth refresh token.
+	ErrTypedCredential = errors.New("the keystore entry is a typed credential: read it as a typed credential, not as raw bytes")
+	// ErrVersionStale reports a RotateIf whose expected current version is
+	// not the entry's current version: another write came first.
+	ErrVersionStale = errors.New("the keystore entry's current version is not the one expected: another write came first; read it again")
+	// ErrFromVersionOAuth reports a rotate from an earlier version of an
+	// oauth entry: resurrecting a rotated refresh token can trip the
+	// provider's reuse detection and revoke the whole grant.
+	ErrFromVersionOAuth = errors.New("an oauth entry cannot be rotated from an earlier version: reusing a rotated refresh token can make the provider revoke the whole grant")
 	// ErrVersionNotFound reports that the entry exists but holds no such
 	// version.
 	ErrVersionNotFound = errors.New("keystore entry version not found")

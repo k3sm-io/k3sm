@@ -1,0 +1,639 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package keystore
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"k3sm.io/k3sm/pkg/keystore/typed"
+)
+
+// typedNow is the clock the typed tests stamp from.
+var typedNow = time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
+
+func tokenEnvelope(value string) typed.Envelope {
+	return typed.Envelope{Credential: typed.Credential{Value: []byte(value), ExpiresAt: typedNow.Add(time.Hour)}}
+}
+
+func oauthEnvelope(access, refresh string) typed.Envelope {
+	return typed.Envelope{
+		Credential: typed.Credential{
+			AccessToken:     []byte(access),
+			AccessExpiresAt: typedNow.Add(time.Hour),
+			RefreshOwner:    "local",
+		},
+		RefreshToken: []byte(refresh),
+	}
+}
+
+func newTypedStore(t *testing.T) (*FileStore, string) {
+	t.Helper()
+	s, server := newTestStore(t)
+	s.now = func() time.Time { return typedNow }
+	return s, server
+}
+
+func mustPutCredential(t *testing.T, s *FileStore, name string, kind Kind, e typed.Envelope) Version {
+	t.Helper()
+	v, err := s.PutCredential(context.Background(), name, kind, e)
+	if err != nil {
+		t.Fatalf("PutCredential %s: %v", name, err)
+	}
+	return v
+}
+
+func mustRotateCredential(t *testing.T, s *FileStore, name string, kind Kind, e typed.Envelope) Version {
+	t.Helper()
+	v, err := s.RotateCredential(context.Background(), name, kind, e)
+	if err != nil {
+		t.Fatalf("RotateCredential %s: %v", name, err)
+	}
+	return v
+}
+
+func mustCredential(t *testing.T, s *FileStore, name string) (Version, typed.Credential) {
+	t.Helper()
+	v, c, err := s.CurrentCredential(context.Background(), name)
+	if err != nil {
+		t.Fatalf("CurrentCredential %s: %v", name, err)
+	}
+	return v, c
+}
+
+// TestTypedIssuedAtStampedAndSealed is U144: a token's issuedAt and an oauth
+// pair's accessIssuedAt come from the store's clock at put and rotate,
+// whatever the caller passed.
+func TestTypedIssuedAtStampedAndSealed(t *testing.T) {
+	s, _ := newTypedStore(t)
+	e := tokenEnvelope("t1")
+	e.Credential.IssuedAt = time.Unix(1, 0) // the caller's is ignored
+	mustPutCredential(t, s, "tok", KindToken, e)
+	if _, c := mustCredential(t, s, "tok"); !c.IssuedAt.Equal(typedNow) {
+		t.Fatalf("token issuedAt %v, want the clock's %v", c.IssuedAt, typedNow)
+	}
+	o := oauthEnvelope("a1", "r1")
+	o.Credential.AccessIssuedAt = time.Unix(1, 0)
+	mustPutCredential(t, s, "pair", KindOAuth, o)
+	if _, c := mustCredential(t, s, "pair"); !c.AccessIssuedAt.Equal(typedNow) {
+		t.Fatalf("oauth accessIssuedAt %v, want the clock's %v", c.AccessIssuedAt, typedNow)
+	}
+	later := typedNow.Add(90 * time.Minute)
+	s.now = func() time.Time { return later }
+	mustRotateCredential(t, s, "tok", KindToken, tokenEnvelope("t2"))
+	if _, c := mustCredential(t, s, "tok"); !c.IssuedAt.Equal(later) {
+		t.Fatalf("rotated token issuedAt %v, want %v", c.IssuedAt, later)
+	}
+	if _, err := s.RotateIf(context.Background(), "pair", KindOAuth, 1, oauthEnvelope("a2", "r2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, c := mustCredential(t, s, "pair"); !c.AccessIssuedAt.Equal(later) {
+		t.Fatalf("refreshed accessIssuedAt %v, want %v", c.AccessIssuedAt, later)
+	}
+}
+
+// TestCreatedHeaderEditChangesNoTypedTime is U144: the record's created
+// header is unauthenticated display metadata, so editing it moves Created
+// and no sealed time.
+func TestCreatedHeaderEditChangesNoTypedTime(t *testing.T) {
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "tok", KindToken, tokenEnvelope("t1"))
+	p := entryPath(server, "tok", "v1")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := 4 + len("tok") + 8 + generationSize
+	binary.BigEndian.PutUint64(b[off:], uint64(time.Unix(1, 0).Unix()))
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	v, c := mustCredential(t, s, "tok")
+	if v.Created.Unix() != 1 {
+		t.Fatalf("Created %v: the edit did not reach the header", v.Created)
+	}
+	if !c.IssuedAt.Equal(typedNow) || !c.ExpiresAt.Equal(typedNow.Add(time.Hour)) {
+		t.Fatalf("typed times moved with the header: issued %v, expires %v", c.IssuedAt, c.ExpiresAt)
+	}
+}
+
+// TestListShowsUnsupportedKind is U145's store half: an entry holding a
+// record of an unassigned kind lists with ErrKindUnsupported, not
+// ErrCorrupt, which the CLI shows as unsupported.
+func TestListShowsUnsupportedKind(t *testing.T) {
+	s, server := newTypedStore(t)
+	mustPut(t, s, "newer", KindOpaque, []byte("one"))
+	mustPutCredential(t, s, "tok", KindToken, tokenEnvelope("t"))
+	if err := os.WriteFile(entryPath(server, "newer", "v1"), []byte{recordFormat, 0x10, 0, 0}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.List(context.Background())
+	if err != nil || len(list) != 2 {
+		t.Fatalf("List = %+v, %v", list, err)
+	}
+	if err := list[0].Err; !errors.Is(err, ErrKindUnsupported) || errors.Is(err, ErrCorrupt) {
+		t.Fatalf("the newer entry lists with %v, want ErrKindUnsupported and not ErrCorrupt", err)
+	}
+	if list[1].Err != nil || list[1].Current.Kind != KindToken {
+		t.Fatalf("the token entry lists as %+v", list[1])
+	}
+}
+
+// TestRotateAndPutCannotChangeKind is U146.
+func TestRotateAndPutCannotChangeKind(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTypedStore(t)
+	mustPut(t, s, "raw", KindOpaque, []byte("v"))
+	mustPutCredential(t, s, "tok", KindToken, tokenEnvelope("t"))
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a", "r"))
+	checks := []struct {
+		name string
+		fn   func() error
+	}{
+		{"put token over opaque", func() error { _, err := s.PutCredential(ctx, "raw", KindToken, tokenEnvelope("t")); return err }},
+		{"put opaque over token", func() error { _, err := s.Put(ctx, "tok", KindOpaque, []byte("v")); return err }},
+		{"put oauth over token", func() error { _, err := s.PutCredential(ctx, "tok", KindOAuth, oauthEnvelope("a", "r")); return err }},
+		{"rotate opaque as token", func() error { _, err := s.RotateCredential(ctx, "raw", KindToken, tokenEnvelope("t")); return err }},
+		{"rotate token with a raw value", func() error { _, err := s.Rotate(ctx, "tok", []byte("v")); return err }},
+		{"rotate oauth as token", func() error { _, err := s.RotateCredential(ctx, "pair", KindToken, tokenEnvelope("t")); return err }},
+		{"rotateIf token as oauth", func() error { _, err := s.RotateIf(ctx, "tok", KindOAuth, 1, oauthEnvelope("a", "r")); return err }},
+		{"raw put of a typed kind", func() error { _, err := s.Put(ctx, "fresh", KindToken, []byte("v")); return err }},
+	}
+	for _, c := range checks {
+		if err := c.fn(); !errors.Is(err, ErrKindMismatch) {
+			t.Errorf("%s: %v, want ErrKindMismatch", c.name, err)
+		}
+	}
+	if _, err := s.PutCredential(ctx, "tok", KindToken, tokenEnvelope("t")); !errors.Is(err, ErrExists) || errors.Is(err, ErrKindMismatch) {
+		t.Errorf("put of the same kind over an entry: %v, want ErrExists", err)
+	}
+	for _, n := range []string{"raw", "tok", "pair"} {
+		if v, _, err := s.Get(ctx, n, 2); !errors.Is(err, ErrVersionNotFound) {
+			t.Errorf("%s gained a version: %+v, %v", n, v, err)
+		}
+	}
+}
+
+// TestTypedPutValidation is U147.
+func TestTypedPutValidation(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTypedStore(t)
+	noExpiry := tokenEnvelope("t")
+	noExpiry.Credential.ExpiresAt = time.Time{}
+	without := func(f func(*typed.Envelope)) typed.Envelope {
+		e := oauthEnvelope("a", "r")
+		f(&e)
+		return e
+	}
+	refused := []struct {
+		name string
+		kind Kind
+		e    typed.Envelope
+	}{
+		{"token without expiresAt", KindToken, noExpiry},
+		{"token without a value", KindToken, typed.Envelope{Credential: typed.Credential{ExpiresAt: typedNow}}},
+		{"oauth without the access token", KindOAuth, without(func(e *typed.Envelope) { e.Credential.AccessToken = nil })},
+		{"oauth without the access expiry", KindOAuth, without(func(e *typed.Envelope) { e.Credential.AccessExpiresAt = time.Time{} })},
+		{"oauth without the refresh token", KindOAuth, without(func(e *typed.Envelope) { e.RefreshToken = nil })},
+		{"oauth without an owner", KindOAuth, without(func(e *typed.Envelope) { e.Credential.RefreshOwner = "" })},
+		{"oauth with an owner outside the grammar", KindOAuth, without(func(e *typed.Envelope) { e.Credential.RefreshOwner = "Not An Owner!" })},
+		{"a token field on oauth", KindOAuth, without(func(e *typed.Envelope) { e.Credential.Value = []byte("v") })},
+		{"ssh with a short seed", KindSSH, typed.Envelope{Credential: typed.Credential{Algorithm: typed.SSHAlgorithmEd25519, Seed: make([]byte, 31)}}},
+	}
+	for i, r := range refused {
+		name := fmt.Sprintf("e%d", i)
+		if _, err := s.PutCredential(ctx, name, r.kind, r.e); !errors.Is(err, typed.ErrInvalidCredential) {
+			t.Errorf("%s: %v, want ErrInvalidCredential", r.name, err)
+		}
+		if _, err := s.RotateCredential(ctx, name, r.kind, r.e); !errors.Is(err, typed.ErrInvalidCredential) {
+			t.Errorf("rotate %s: %v, want ErrInvalidCredential", r.name, err)
+		}
+	}
+	if list, err := s.List(ctx); err != nil || len(list) != 0 {
+		t.Fatalf("a refused put stored something: %+v, %v", list, err)
+	}
+	if _, err := s.PutCredential(ctx, "ok", KindOpaque, tokenEnvelope("t")); !errors.Is(err, ErrKindMismatch) {
+		t.Errorf("PutCredential of opaque: %v, want ErrKindMismatch", err)
+	}
+}
+
+// TestStoreGenerateSSHUsesRandomSeam is U148's store half: the seed comes
+// from the store's random seam, and only the public key comes back.
+func TestStoreGenerateSSHUsesRandomSeam(t *testing.T) {
+	s, _ := newTypedStore(t)
+	seed := bytes.Repeat([]byte{0x42}, 32)
+	s.rand = io.MultiReader(bytes.NewReader(seed), rand.Reader)
+	v, line, err := s.GenerateSSH(context.Background(), "deploy", "ci@k3sm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := typed.SSHAuthorizedKey(seed, "ci@k3sm")
+	fp, _ := typed.SSHFingerprint(seed)
+	if line != want || v.Fingerprint != fp || v.Kind != KindSSH {
+		t.Fatalf("GenerateSSH = %+v, %q; want the seam's key %q, %s", v, line, want, fp)
+	}
+	if _, c := mustCredential(t, s, "deploy"); !bytes.Equal(c.Seed, seed) || c.Comment != "ci@k3sm" {
+		t.Fatalf("stored ssh credential %+v", c)
+	}
+}
+
+// encodings are the forms U149 scans every result for.
+func encodings(secret []byte) []string {
+	return []string{
+		string(secret),
+		hex.EncodeToString(secret),
+		base64.StdEncoding.EncodeToString(secret),
+		base64.RawStdEncoding.EncodeToString(secret),
+		base64.URLEncoding.EncodeToString(secret),
+		base64.RawURLEncoding.EncodeToString(secret),
+		url.QueryEscape(string(secret)),
+		url.PathEscape(string(secret)),
+	}
+}
+
+// leaks reports which encoding of secret appears in any rendering of vals.
+func leaks(secret []byte, vals ...any) string {
+	var b strings.Builder
+	for _, v := range vals {
+		fmt.Fprintf(&b, "%v|%+v|%#v|%s|%x|%q\n", v, v, v, v, v, v)
+		if bs, ok := v.([]byte); ok {
+			b.Write(bs)
+		}
+	}
+	out := b.String()
+	for _, enc := range encodings(secret) {
+		if strings.Contains(out, enc) {
+			return enc
+		}
+	}
+	return ""
+}
+
+// TestPlantedRefreshTokenNeverReturned is U149: a planted refresh token
+// appears in no result, value or error of any exported method.
+func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTypedStore(t)
+	planted := []byte("planted-refresh+token/7f3a9c==")
+	second := []byte("second-refresh+token/0b1d2e==")
+	check := func(what string, vals ...any) {
+		t.Helper()
+		for _, sec := range [][]byte{planted, second} {
+			if enc := leaks(sec, vals...); enc != "" {
+				t.Errorf("%s returned the refresh token as %q", what, enc)
+			}
+		}
+	}
+	v, err := s.PutCredential(ctx, "pair", KindOAuth, oauthEnvelope("access-1", string(planted)))
+	check("PutCredential", v, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, raw, err := s.Current(ctx, "pair")
+	check("Current", v, raw, err)
+	v, raw, err = s.Get(ctx, "pair", 1)
+	check("Get", v, raw, err)
+	list, err := s.List(ctx)
+	check("List", list, err)
+	v, c, err := s.CurrentCredential(ctx, "pair")
+	check("CurrentCredential", v, c, err)
+	v, c, err = s.GetCredential(ctx, "pair", 1)
+	check("GetCredential", v, c, err)
+	v, err = s.RotateFrom(ctx, "pair", 1)
+	check("RotateFrom", v, err)
+	v, err = s.Rotate(ctx, "pair", planted)
+	check("Rotate", v, err)
+	v, err = s.RotateIf(ctx, "pair", KindOAuth, 9, oauthEnvelope("access-x", string(second)))
+	check("RotateIf (stale)", v, err)
+	v, err = s.RotateCredential(ctx, "pair", KindOAuth, oauthEnvelope("access-2", string(second)))
+	check("RotateCredential", v, err)
+	v, err = s.RotateIf(ctx, "pair", KindOAuth, 2, oauthEnvelope("access-3", string(second)))
+	check("RotateIf", v, err)
+	v, err = s.PutCredential(ctx, "pair", KindOAuth, oauthEnvelope("access-4", string(planted)))
+	check("PutCredential (exists)", v, err)
+	err = s.RaiseFloor(ctx)
+	check("RaiseFloor", err)
+	err = s.Rewrap(ctx, rewrapKey(7))
+	check("Rewrap", err)
+	for n := uint64(0); n <= 4; n++ {
+		v, c, err = s.GetCredential(ctx, "pair", n)
+		check(fmt.Sprintf("GetCredential %d", n), v, c, err)
+		v, raw, err = s.Get(ctx, "pair", n)
+		check(fmt.Sprintf("Get %d", n), v, raw, err)
+	}
+	list, err = s.List(ctx)
+	check("List after rewrap", list, err)
+	err = s.Delete(ctx, "pair")
+	check("Delete", err)
+}
+
+// TestGetReturnsRedactedCredential is U149: a typed entry reads back as a
+// typed.Credential, which has no field a refresh token could fill, and the
+// raw reads refuse it.
+func TestGetReturnsRedactedCredential(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTypedStore(t)
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("access-1", "refresh-1"))
+	mustPutCredential(t, s, "tok", KindToken, tokenEnvelope("t1"))
+	mustPut(t, s, "raw", KindOpaque, []byte("v"))
+	ct := reflect.TypeFor[typed.Credential]()
+	for i := 0; i < ct.NumField(); i++ {
+		if strings.Contains(strings.ToLower(ct.Field(i).Name), "refreshtoken") {
+			t.Fatalf("typed.Credential has a refresh-token field %s", ct.Field(i).Name)
+		}
+	}
+	for _, n := range []string{"pair", "tok"} {
+		if _, val, err := s.Current(ctx, n); !errors.Is(err, ErrTypedCredential) || val != nil {
+			t.Errorf("Current %s: %q, %v, want ErrTypedCredential", n, val, err)
+		}
+		if _, val, err := s.Get(ctx, n, 1); !errors.Is(err, ErrTypedCredential) || val != nil {
+			t.Errorf("Get %s: %q, %v, want ErrTypedCredential", n, val, err)
+		}
+	}
+	v, c, err := s.GetCredential(ctx, "pair", 1)
+	if err != nil || v.Kind != KindOAuth || string(c.AccessToken) != "access-1" || c.RefreshOwner != "local" || c.TokenTypeOrDefault() != "Bearer" {
+		t.Fatalf("GetCredential = %+v, %+v, %v", v, c, err)
+	}
+	if _, _, err := s.CurrentCredential(ctx, "raw"); !errors.Is(err, ErrKindMismatch) {
+		t.Errorf("CurrentCredential of opaque: %v, want ErrKindMismatch", err)
+	}
+	if _, _, err := s.GetCredential(ctx, "pair", 2); !errors.Is(err, ErrVersionNotFound) {
+		t.Errorf("GetCredential of an uncommitted version: %v", err)
+	}
+}
+
+// TestRotateIfStaleVersionRefused is U150.
+func TestRotateIfStaleVersionRefused(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTypedStore(t)
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a2", "r2"))
+	for _, stale := range []uint64{0, 1, 3} {
+		if _, err := s.RotateIf(ctx, "pair", KindOAuth, stale, oauthEnvelope("ax", "rx")); !errors.Is(err, ErrVersionStale) {
+			t.Errorf("RotateIf at %d: %v, want ErrVersionStale", stale, err)
+		}
+	}
+	if v, c := mustCredential(t, s, "pair"); v.Version != 2 || string(c.AccessToken) != "a2" {
+		t.Fatalf("a stale RotateIf wrote: %+v %q", v, c.AccessToken)
+	}
+	v, err := s.RotateIf(ctx, "pair", KindOAuth, 2, oauthEnvelope("a3", "r3"))
+	if err != nil || v.Version != 3 {
+		t.Fatalf("RotateIf at the current version: %+v, %v", v, err)
+	}
+	if _, err := s.RotateIf(ctx, "absent", KindOAuth, 1, oauthEnvelope("a", "r")); !errors.Is(err, ErrNotFound) {
+		t.Errorf("RotateIf of a missing entry: %v", err)
+	}
+}
+
+// pointerBytes is the size of name's pointer plaintext, from its file.
+func pointerBytes(t *testing.T, server, name string) int {
+	t.Helper()
+	fi, err := os.Stat(entryPath(server, name, currentName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return int(fi.Size()) - headerSize - len(name) - tagSize
+}
+
+// versionFiles lists the version files of name on disk.
+func versionFiles(t *testing.T, server, name string) []uint64 {
+	t.Helper()
+	des, err := os.ReadDir(entryPath(server, name, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []uint64
+	for _, de := range des {
+		if v, ok := parseVersionName(de.Name()); ok {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// prunedPair stores an oauth entry rotated twice: v2 and v3 retained, v1
+// pruned, low = 2.
+func prunedPair(t *testing.T) (*FileStore, string) {
+	t.Helper()
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a2", "r2"))
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a3", "r3"))
+	return s, server
+}
+
+// TestOAuthPruneKeepsTwo is U151: oauth keeps the current version and one
+// previous; token and ssh keep every version.
+func TestOAuthPruneKeepsTwo(t *testing.T) {
+	s, server := prunedPair(t)
+	if got := versionFiles(t, server, "pair"); fmt.Sprint(got) != "[2 3]" {
+		t.Fatalf("oauth versions on disk %v, want [2 3]", got)
+	}
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a4", "r4"))
+	if got := versionFiles(t, server, "pair"); fmt.Sprint(got) != "[3 4]" {
+		t.Fatalf("oauth versions on disk %v, want [3 4]", got)
+	}
+	if _, _, err := s.GetCredential(context.Background(), "pair", 2); !errors.Is(err, ErrVersionNotFound) {
+		t.Errorf("a pruned version reads: %v", err)
+	}
+	if _, c, err := s.GetCredential(context.Background(), "pair", 3); err != nil || string(c.AccessToken) != "a3" {
+		t.Errorf("the previous version: %v", err)
+	}
+	mustPutCredential(t, s, "tok", KindToken, tokenEnvelope("t1"))
+	for i := 2; i <= 4; i++ {
+		mustRotateCredential(t, s, "tok", KindToken, tokenEnvelope(fmt.Sprintf("t%d", i)))
+	}
+	if got := versionFiles(t, server, "tok"); fmt.Sprint(got) != "[1 2 3 4]" {
+		t.Fatalf("token versions %v, want all four", got)
+	}
+}
+
+// TestPointerLowWaterMark is U151: a pointer is 16 bytes until a prune and
+// 24 bytes, carrying low, after one; a sealed low out of range is corrupt.
+func TestPointerLowWaterMark(t *testing.T) {
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a2", "r2"))
+	if n := pointerBytes(t, server, "pair"); n != pointerSize {
+		t.Fatalf("pointer before any prune is %d bytes, want %d", n, pointerSize)
+	}
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a3", "r3"))
+	if n := pointerBytes(t, server, "pair"); n != prunedPointerSize {
+		t.Fatalf("pointer after a prune is %d bytes, want %d", n, prunedPointerSize)
+	}
+	if got := rangePlaintext(5, 9, 1); len(got) != pointerSize || !bytes.Equal(got, pointerPlaintext(5, 9)) {
+		t.Fatalf("low = 1 does not encode as the 16-byte pointer: %x", got)
+	}
+	// A pointer sealed with a low outside 1..version, or of another size,
+	// is corrupt.
+	k, err := s.loadMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen, err := hex.DecodeString(strings.TrimSpace(readString(t, entryPath(server, "pair", generationName))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pt := range [][]byte{
+		binary.BigEndian.AppendUint64(pointerPlaintext(3, 3), 0),
+		binary.BigEndian.AppendUint64(pointerPlaintext(3, 3), 4),
+		append(pointerPlaintext(3, 3), 1, 2, 3),
+	} {
+		ptr := record{kind: kindPointer, name: "pair", created: 1}
+		copy(ptr.generation[:], gen)
+		if err := ptr.seal(k.seal, k.scope, pt, rand.Reader); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(entryPath(server, "pair", currentName), ptr.marshal(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.CurrentCredential(context.Background(), "pair"); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("pointer plaintext %x: %v, want ErrCorrupt", pt, err)
+		}
+	}
+}
+
+func readString(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestListPrunedOAuthEntryNotCorrupt is U152: a pruned entry lists healthy,
+// with its committed range only, even with a leftover below low.
+func TestListPrunedOAuthEntryNotCorrupt(t *testing.T) {
+	s, server := prunedPair(t)
+	copyFile(t, entryPath(server, "pair", "v2"), entryPath(server, "pair", "v1"))
+	list, err := s.List(context.Background())
+	if err != nil || len(list) != 1 || list[0].Err != nil {
+		t.Fatalf("List = %+v, %v", list, err)
+	}
+	if e := list[0]; e.Current.Version != 3 || len(e.Versions) != 2 || e.Versions[0].Version != 2 {
+		t.Fatalf("pruned entry lists as %+v, want versions 2 and 3", e)
+	}
+}
+
+// TestRewrapHandlesPrunedOAuth is U152: Rewrap re-seals low..current and
+// unlinks a leftover below low.
+func TestRewrapHandlesPrunedOAuth(t *testing.T) {
+	s, server := prunedPair(t)
+	copyFile(t, entryPath(server, "pair", "v2"), entryPath(server, "pair", "v1"))
+	if err := s.Rewrap(context.Background(), rewrapKey(3)); err != nil {
+		t.Fatal(err)
+	}
+	if got := versionFiles(t, server, "pair"); fmt.Sprint(got) != "[2 3]" {
+		t.Fatalf("versions after rewrap %v, want [2 3]", got)
+	}
+	for n, want := range map[uint64]string{2: "a2", 3: "a3"} {
+		if _, c, err := s.GetCredential(context.Background(), "pair", n); err != nil || string(c.AccessToken) != want {
+			t.Errorf("version %d after rewrap: %q, %v", n, c.AccessToken, err)
+		}
+	}
+	if n := pointerBytes(t, server, "pair"); n != prunedPointerSize {
+		t.Errorf("rewrap lost the mark: pointer is %d bytes", n)
+	}
+}
+
+// TestDeletePrunedOAuthEntry is U152: Delete removes a pruned entry and its
+// leftovers.
+func TestDeletePrunedOAuthEntry(t *testing.T) {
+	s, server := prunedPair(t)
+	copyFile(t, entryPath(server, "pair", "v2"), entryPath(server, "pair", "v1"))
+	if err := s.Delete(context.Background(), "pair"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(entryPath(server, "pair", "")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the entry directory survived Delete: %v", err)
+	}
+	if _, _, err := s.CurrentCredential(context.Background(), "pair"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("after Delete: %v", err)
+	}
+}
+
+// TestGapInsideCommittedRangeIsCorrupt is U152: a version missing inside
+// low..current is damage.
+func TestGapInsideCommittedRangeIsCorrupt(t *testing.T) {
+	s, server := prunedPair(t)
+	remove(t, entryPath(server, "pair", "v2"))
+	list, err := s.List(context.Background())
+	if err != nil || len(list) != 1 || !errors.Is(list[0].Err, ErrCorrupt) {
+		t.Fatalf("List with a gap = %+v, %v; want the entry corrupt", list, err)
+	}
+	if err := s.Rewrap(context.Background(), rewrapKey(4)); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Rewrap with a gap: %v, want ErrCorrupt", err)
+	}
+}
+
+// TestCopyBackAcrossPruneCaught is U152: a pointer copied back from before a
+// prune fails the floor's sequence check.
+func TestCopyBackAcrossPruneCaught(t *testing.T) {
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a2", "r2"))
+	saved := readString(t, entryPath(server, "pair", currentName))
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a3", "r3"))
+	writeFile(t, entryPath(server, "pair", currentName), saved)
+	if _, _, err := s.CurrentCredential(context.Background(), "pair"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("a copied-back pointer read: %v, want ErrCorrupt", err)
+	}
+	list, err := s.List(context.Background())
+	if err != nil || len(list) != 1 || !errors.Is(list[0].Err, ErrCorrupt) {
+		t.Fatalf("List with a copied-back pointer = %+v, %v", list, err)
+	}
+}
+
+// TestFromVersionRefusedForOAuth is U153; token keeps the rollback.
+func TestFromVersionRefusedForOAuth(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTypedStore(t)
+	mustPutCredential(t, s, "pair", KindOAuth, oauthEnvelope("a1", "r1"))
+	mustRotateCredential(t, s, "pair", KindOAuth, oauthEnvelope("a2", "r2"))
+	if _, err := s.RotateFrom(ctx, "pair", 1); !errors.Is(err, ErrFromVersionOAuth) {
+		t.Fatalf("RotateFrom oauth: %v, want ErrFromVersionOAuth", err)
+	}
+	if v, _ := mustCredential(t, s, "pair"); v.Version != 2 {
+		t.Fatalf("a refused RotateFrom wrote version %d", v.Version)
+	}
+	mustPutCredential(t, s, "tok", KindToken, tokenEnvelope("t1"))
+	mustRotateCredential(t, s, "tok", KindToken, tokenEnvelope("t2"))
+	v, err := s.RotateFrom(ctx, "tok", 1)
+	if err != nil || v.Version != 3 {
+		t.Fatalf("RotateFrom token: %+v, %v", v, err)
+	}
+	if _, c := mustCredential(t, s, "tok"); string(c.Value) != "t1" {
+		t.Fatalf("RotateFrom token wrote %q, want t1", c.Value)
+	}
+	if _, err := s.RotateFrom(ctx, "tok", 9); !errors.Is(err, ErrVersionNotFound) {
+		t.Fatalf("RotateFrom an uncommitted version: %v", err)
+	}
+}

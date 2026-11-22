@@ -349,7 +349,7 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 			return err
 		}
 		v, val, err = e.version(uk, cur)
-		return err
+		return rawOnly(v, err)
 	})
 	if err != nil {
 		return Version{}, nil, fail("current", err)

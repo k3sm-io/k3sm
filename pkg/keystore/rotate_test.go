@@ -522,6 +522,58 @@ func TestRotateCrashAtEveryStep(t *testing.T) {
 			}
 		})
 	}
+	t.Run("oauth prune", func(t *testing.T) { rotateCrashOAuthPrune(t) })
+}
+
+// rotateCrashOAuthPrune is U151's crash cases: an oauth rotation that
+// prunes, crashed at every step, prune included, leaves a readable entry
+// whose committed range is either the old one or the new one, and the next
+// write finishes the prune.
+func rotateCrashOAuthPrune(t *testing.T) {
+	ctx := context.Background()
+	var steps []string
+	{
+		s, _ := newTypedStore(t)
+		mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+		mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+		s.step = func(name string) error { steps = append(steps, name); return nil }
+		mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a3", "r3"))
+	}
+	want := "write v3,write current,write " + floorName + ",prune k"
+	if strings.Join(steps, ",") != want {
+		t.Fatalf("pruning Rotate steps = %v, want %s", steps, want)
+	}
+	for i, step := range steps {
+		t.Run(step, func(t *testing.T) {
+			s, server := newTypedStore(t)
+			mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+			mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+			s.step = failAt(step)
+			if _, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a3", "r3")); err == nil {
+				t.Fatal("Rotate succeeded through a crash")
+			}
+			s.step = func(string) error { return nil }
+			flipped := i >= 2 // the pointer is written before the floor and the prune
+			wantCur, wantAccess, wantVersions := uint64(2), "a2", 2
+			if flipped {
+				wantCur, wantAccess = 3, "a3"
+			}
+			v, c := mustCredential(t, s, "k")
+			if v.Version != wantCur || string(c.AccessToken) != wantAccess {
+				t.Fatalf("after the crash: version %d %q, want %d %q", v.Version, c.AccessToken, wantCur, wantAccess)
+			}
+			list, err := s.List(ctx)
+			if err != nil || len(list) != 1 || list[0].Err != nil || len(list[0].Versions) != wantVersions {
+				t.Fatalf("List after the crash = %+v, %v", list, err)
+			}
+			// The next write finishes whatever the crash left: the entry ends
+			// at the current version and one previous.
+			next := mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a9", "r9"))
+			if got, want := fmt.Sprint(versionFiles(t, server, "k")), fmt.Sprintf("[%d %d]", next.Version-1, next.Version); got != want {
+				t.Fatalf("versions after the next write %s, want %s", got, want)
+			}
+		})
+	}
 }
 
 // TestRotateRetryDiscardsOrphan is G9: a Rotate interrupted after writing

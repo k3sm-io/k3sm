@@ -30,6 +30,10 @@ import (
 	"io"
 	"strconv"
 	"strings"
+
+	"k3sm.io/apis/keystore/credential"
+
+	"k3sm.io/k3sm/pkg/keystore/typed"
 )
 
 // This file is the record layer: the binary encoding of a sealed record, the
@@ -51,14 +55,12 @@ const (
 	// record, is accepted only by parseDeliveriesRecord (deliveries.go).
 	kindPointer  = 0xFF
 	kindScopeKey = 0xFE
-	// kindToken, kindSSH and kindOAuth are the typed kinds, whose sealed
-	// plaintext is a typed envelope (pkg/keystore/typed). parseRecord
-	// accepts them, so the AAD's kind field is what refuses a relabelled
-	// one; no store verb writes or returns them yet, and openRecord still
-	// refuses them as not belonging to an entry.
-	kindToken = 3
-	kindSSH   = 4
-	kindOAuth = 5
+	// kindToken, kindSSH and kindOAuth are the typed kinds' bytes, whose
+	// sealed plaintext is a typed envelope (pkg/keystore/typed). The AAD's
+	// kind field is what refuses a relabelled one.
+	kindToken = byte(KindToken)
+	kindSSH   = byte(KindSSH)
+	kindOAuth = byte(KindOAuth)
 	// kindFirstUnassigned and kindLastUnassigned bound the kind bytes no
 	// build has given a meaning yet: a record carrying one was written by a
 	// newer k3sm, so it is ErrKindUnsupported, not ErrCorrupt.
@@ -73,8 +75,10 @@ const (
 	// associated data of every record of that entry.
 	generationSize = 16
 	// pointerSize is a pointer record's plaintext: the version it names, then
-	// its sequence, both big-endian uint64.
-	pointerSize = 16
+	// its sequence, both big-endian uint64. prunedPointerSize is a pointer
+	// that records a prune: then low, the oldest retained version.
+	pointerSize       = 16
+	prunedPointerSize = 24
 	// MaxValueSize is the largest value Put accepts.
 	MaxValueSize = 64 << 10
 	// maxNameLen bounds an entry name: a Kubernetes object name's limit, and
@@ -364,6 +368,19 @@ func hmacSHA256(key, msg []byte) []byte {
 // fingerprint key truncated to 16 bytes, so List is not a guessing oracle for
 // a low-entropy value.
 func fingerprint(kind Kind, value []byte, fpKey []byte) string {
+	if kind == KindSSH {
+		// An ssh entry's fingerprint is OpenSSH's, the string a forge shows.
+		// The envelope was checked before it got here (checkStored).
+		e, err := typed.Decode(credential.KindSSH, value)
+		if err != nil {
+			return ""
+		}
+		fp, err := typed.SSHFingerprint(e.Credential.Seed)
+		if err != nil {
+			return ""
+		}
+		return fp
+	}
 	if kind == KindEd25519 {
 		pub := ed25519.NewKeyFromSeed(value[:ed25519.SeedSize]).Public().(ed25519.PublicKey)
 		sum := sha256.Sum256(pub)
@@ -372,7 +389,34 @@ func fingerprint(kind Kind, value []byte, fpKey []byte) string {
 	return hex.EncodeToString(hmacSHA256(fpKey, value)[:16])
 }
 
-// checkValue validates a value for kind before it is sealed.
+// credentialKind is kind's name in the typed envelope's table, for the
+// typed kinds only.
+func credentialKind(kind Kind) (credential.Kind, bool) {
+	switch kind {
+	case KindToken:
+		return credential.KindToken, true
+	case KindSSH:
+		return credential.KindSSH, true
+	case KindOAuth:
+		return credential.KindOAuth, true
+	}
+	return "", false
+}
+
+// checkStored validates a value a record of kind sealed: checkValue for
+// ed25519 and opaque, the envelope's decode for a typed kind.
+func checkStored(kind Kind, value []byte) error {
+	ck, ok := credentialKind(kind)
+	if !ok {
+		return checkValue(kind, value)
+	}
+	_, err := typed.Decode(ck, value)
+	return err
+}
+
+// checkValue validates a raw value for kind before it is sealed. A typed
+// kind has no raw value: it is written from a typed.Envelope, whose times
+// the store stamps.
 func checkValue(kind Kind, value []byte) error {
 	switch kind {
 	case KindEd25519:
@@ -397,6 +441,8 @@ func checkValue(kind Kind, value []byte) error {
 			return fmt.Errorf("the value is %d bytes, over the %d-byte limit", len(value), MaxValueSize)
 		}
 		return nil
+	case KindToken, KindSSH, KindOAuth:
+		return fmt.Errorf("%w: a %s entry is written as a typed credential, not a raw value", ErrKindMismatch, kind)
 	default:
 		return fmt.Errorf("unknown kind %d", int(kind))
 	}
