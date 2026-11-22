@@ -25,12 +25,16 @@ import (
 
 // memFloor is an in-memory user-scope floor: the lines in order, read by
 // the floor's rule (the highest seq per scope, name and generation). failAppend,
-// when set, fails every append, and failRead every read.
+// when set, fails every append, and failRead every read. buryLimit, when
+// not 0, fails every tombstone once that many have landed (buried counts
+// them): a burial that fails part way.
 type memFloor struct {
 	mu         sync.Mutex
 	lines      []memFloorLine
 	failAppend bool
 	failRead   bool
+	buryLimit  int
+	buried     int
 }
 
 type memFloorLine struct {
@@ -86,6 +90,10 @@ func (f *memFloor) bury(scope, name string, gen [generationSize]byte) error {
 	if f.failAppend {
 		return errors.New("injected floor append failure")
 	}
+	if f.buryLimit != 0 && f.buried >= f.buryLimit {
+		return errors.New("injected tombstone failure")
+	}
+	f.buried++
 	f.lines = append(f.lines, memFloorLine{scope: scope, name: name, gen: gen, tomb: true})
 	return nil
 }

@@ -756,21 +756,26 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 	return l.revokeRoom(state, st.Size, uid, maxLogLine)
 }
 
-// roomBytes refuses, as ErrLogFull, n bytes of revocation lines of uid's,
-// all of an operation's lines, that would start past the hard cap without
-// room in uid's revocation budget or the reader's bound for all of them:
-// so an operation that writes several lines (rm's tombstones) is refused
-// before the first rather than part way. A log that cannot be opened or read
-// is no answer here, as in room.
-func (l *appendLog) roomBytes(uid uint32, n int64) error {
+// reserveRevocation refuses, before the first of a revocation's lines
+// (rm's tombstones, each with its newline), lines the log would refuse part
+// way: bytes that would start past the hard cap without room in uid's
+// revocation budget or the reader's bound for all of them (ErrLogFull), the
+// keys the lines add past the key bound plus the revocation headroom
+// (ErrLogFull), and their bytes plus revokeFreeSlack past the free space
+// (errLogNoSpace). So such an operation is refused before its first line
+// rather than part way. A log that cannot be opened or read is no answer
+// here, as in room: the first line's own append refuses it, with nothing
+// written.
+func (l *appendLog) reserveRevocation(uid uint32, lines [][]byte) error {
 	f, st, err := l.open(unix.O_RDONLY)
 	if err != nil {
 		l.forgetUnflagged(err, false)
 		return nil
 	}
 	defer func() { _ = f.Close() }() // read-only
-	if st.Size+n <= l.s.logHardCap {
-		return nil
+	var n int64
+	for _, line := range lines {
+		n += int64(len(line))
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -778,7 +783,29 @@ func (l *appendLog) roomBytes(uid uint32, n int64) error {
 	if err != nil || state.bad != nil {
 		return nil
 	}
-	return l.revokeRoom(state, st.Size, uid, n)
+	if st.Size+n > l.s.logHardCap {
+		if err := l.revokeRoom(state, st.Size, uid, n); err != nil {
+			return err
+		}
+	}
+	if l.addsKey != nil {
+		keys := 0
+		for _, line := range lines {
+			adds, err := l.addsKey(state, line)
+			if err != nil {
+				return fmt.Errorf("%s: %w", l.name, err)
+			}
+			if adds {
+				keys++
+			}
+		}
+		if keys > 0 {
+			if err := l.addKeyRoom(state, uid, keys, true); err != nil {
+				return err
+			}
+		}
+	}
+	return l.preflight(f, int(n), true)
 }
 
 // grantKeys is the most keys one grant adds to the floor: a put that mints

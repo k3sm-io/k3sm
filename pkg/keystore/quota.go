@@ -471,34 +471,43 @@ func (b *burial) addTree(e *entry, name string) {
 	}
 }
 
-// bury appends a tombstone for every generation, and refuses, before the
-// caller removes anything, when the floor did not take one: the rm is then
-// retryable, and the tree stays.
+// bury appends a tombstone for every generation. Everything the burial
+// needs is reserved before the first is written (reserveRevocation): a
+// refusal there, or a first tombstone the floor does not take, refuses the
+// rm with nothing written, retryable, and the tree stays. Once any
+// tombstone has landed the entry is revoked, so a later one that fails is
+// reported after the commit (errCommitted): the rm is audited as a
+// revocation, the tree stays, and a retry buries the rest.
 func (b *burial) bury(u *UserScope) error {
-	// Every tombstone line is charged before the first is written.
 	if ff, ok := u.s.userFloor.(*fileFloorLog); ok {
-		var n int64
+		var lines [][]byte
 		for _, g := range b.gens {
 			line, err := tombLine(u.scope, b.name, g)
 			if err != nil {
 				return err
 			}
-			n += int64(len(line))
+			lines = append(lines, line)
 		}
-		if err := ff.log.roomBytes(u.uid, n); err != nil {
+		if err := ff.log.reserveRevocation(u.uid, lines); err != nil {
 			return fmt.Errorf("rm refused, nothing removed: %w", err)
 		}
 	}
+	landed := false
 	var errs []error
 	for _, g := range b.gens {
 		if err := u.s.userFloor.bury(u.scope, b.name, g); err != nil {
 			errs = append(errs, err)
+			continue
 		}
+		landed = true
 	}
-	if len(errs) > 0 {
-		return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstone: %w", errors.Join(errs...))
+	switch {
+	case len(errs) == 0:
+		return nil
+	case landed:
+		return fmt.Errorf("%w, but only in part: the user-scope floor took some of the entry's tombstones and not the rest, so the entry is refused as deleted and its tree stays; run rm again to bury the rest: %w", errCommitted, errors.Join(errs...))
 	}
-	return nil
+	return fmt.Errorf("rm refused, nothing removed: the user-scope floor did not take its tombstone: %w", errors.Join(errs...))
 }
 
 // report is what rm reports after its commit: generations that disagree,
