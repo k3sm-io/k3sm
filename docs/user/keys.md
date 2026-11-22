@@ -188,8 +188,10 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
 - **Edits are undone.** The server compares the Secret's data with the stored value, so a hand
   edit is put back within a minute, and logged without the value.
 - **An immutable Secret is re-created.** If someone sets `immutable: true` on a Secret the server
-  delivered, the server cannot update it. At the next change it deletes that Secret, only if
-  its UID is still the recorded one, creates it again with the current value, and logs both steps.
+  created, the server cannot update its data. After a rotation, or if its data drifted from the
+  stored value, the server deletes that Secret, only if its UID is still the recorded one,
+  creates it again with the current value, and logs both steps. If only its label or
+  annotations changed, the server puts them back without deleting it.
 - **Only its own Secrets.** The server labels each Secret it creates
   `k3sm.io/keystore-delivery: <entry>`, and records the Secret's UID in
   `/var/lib/k3sm/server/keystore-delivery-state.json` (owned by the server's user, mode 0600).
@@ -198,7 +200,7 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
   label alone does not count: a Secret of that name that someone else created first, or that was deleted and created
   again, is "not created by this server". The server leaves it alone and logs why: delete it, or
   pick another `--secret`. The server never lists Secrets, and deletes one only to re-create an
-  immutable Secret it created.
+  immutable Secret it created after a rotation or a change to its data.
 - **A namespace that does not exist yet.** Delivering into it goes to whoever later creates that
   namespace.
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
