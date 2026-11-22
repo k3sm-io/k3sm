@@ -63,7 +63,8 @@ func TestRmPartialBurialIsCommitted(t *testing.T) {
 
 // A burial is reserved whole before its first tombstone: with key headroom
 // for only one of two tombstones that each add a key, or free space for only
-// one line beyond the revocation slack, it is refused with nothing written.
+// one line beyond the revocation slack, or for the tombstones but not the
+// audit line that follows them, it is refused with nothing written.
 func TestRmBurialReservedBeforeFirstTombstone(t *testing.T) {
 	gens := [][generationSize]byte{guid(0x41), guid(0x42)}
 	for _, tc := range []struct {
@@ -78,6 +79,17 @@ func TestRmBurialReservedBeforeFirstTombstone(t *testing.T) {
 				t.Fatal(err)
 			}
 			l.freeSpace = func(int) (uint64, error) { return revokeFreeSlack + uint64(len(line)), nil }
+		}, errLogNoSpace},
+		{"audit line space", func(l *appendLog) {
+			var n uint64
+			for _, g := range gens {
+				line, err := tombLine("user/1001", "gone", g)
+				if err != nil {
+					t.Fatal(err)
+				}
+				n += uint64(len(line))
+			}
+			l.freeSpace = func(int) (uint64, error) { return revokeFreeSlack + n, nil }
 		}, errLogNoSpace},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

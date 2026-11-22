@@ -108,3 +108,7 @@ func parseAuditLine(line []byte) (auditRecord, error) {
 	}
 	return r, nil
 }
+
+// committed reports whether r records a change committed part way
+// (auditResultCommitted), as against a whole one's auditResultOK.
+func (r auditRecord) committed() bool { return r.Result == auditResultCommitted }

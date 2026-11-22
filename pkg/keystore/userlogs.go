@@ -788,9 +788,10 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 // way: bytes that would start past the hard cap without room in uid's
 // revocation budget or the reader's bound for all of them (ErrLogFull), the
 // keys the lines add past the key bound plus the revocation headroom
-// (ErrLogFull), and their bytes plus revokeFreeSlack past the free space
-// (errLogNoSpace). So such an operation is refused before its first line
-// rather than part way. A log that cannot be opened or read is no answer
+// (ErrLogFull), and their bytes plus the audit line that follows them
+// (maxLogLine) plus revokeFreeSlack past the free space (errLogNoSpace).
+// So such an operation is refused before its first line rather than part
+// way. A log that cannot be opened or read is no answer
 // here, as in room: the first line's own append refuses it, with nothing
 // written.
 func (l *appendLog) reserveRevocation(uid uint32, lines [][]byte) error {
@@ -832,7 +833,9 @@ func (l *appendLog) reserveRevocation(uid uint32, lines [][]byte) error {
 			}
 		}
 	}
-	return l.preflight(f, int(n), true)
+	// The audit line the revocation appends after its lines lands on the
+	// same volume: its free space is reserved here too.
+	return l.preflight(f, int(n)+maxLogLine, true)
 }
 
 // grantKeys is the most keys one grant adds to the floor: a put that mints

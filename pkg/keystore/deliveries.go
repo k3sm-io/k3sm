@@ -822,9 +822,7 @@ func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (err error) 
 		// line, whether or not its floor line then failed (errCommitted); a
 		// no-op repeat that wrote neither is not, as for rm.
 		l := auditLine{op: "withdraw", namespace: ns, delivery: id, revoke: revoked && (err == nil || errors.Is(err, errCommitted))}
-		if aerr := u.appendAudit(l, err); err == nil {
-			err = aerr
-		}
+		err = u.keepAuditFailure("withdraw", err, u.appendAudit(l, err))
 	}()
 	ns, revoked, err = u.withdrawBody(root, uid)
 	return err
@@ -1176,11 +1174,39 @@ func (u *UserScope) appendAudit(l auditLine, err error) error {
 // grammar: a line carries only validated fields.
 const auditPlaceholder = "-"
 
+// The results of a change that committed: whole (auditResultOK), or part
+// way, a revocation reported after its commit (auditResultCommitted). Any
+// other result names the sentinel the operation was refused with.
+const (
+	auditResultOK        = "ok"
+	auditResultCommitted = "committed"
+)
+
+// keepAuditFailure is the result of a committed operation (err) whose audit
+// append returned aerr: aerr when err is nil; both joined when err is
+// already a partial commit, so the result stays errCommitted, logged at Warn
+// with the scope and verb only; otherwise err.
+func (u *UserScope) keepAuditFailure(op string, err, aerr error) error {
+	if aerr == nil {
+		return err
+	}
+	if err == nil {
+		return aerr
+	}
+	if errors.Is(err, errCommitted) {
+		slog.Warn("the audit line of a change committed in part was not written", "scope", u.scope, "op", op)
+		return errors.Join(err, aerr)
+	}
+	return err
+}
+
 // auditResult names an operation's outcome for its audit line.
 func auditResult(err error) string {
 	switch {
-	case err == nil, errors.Is(err, errCommitted):
-		return "ok"
+	case err == nil:
+		return auditResultOK
+	case errors.Is(err, errCommitted):
+		return auditResultCommitted
 	case errors.Is(err, ErrQuota):
 		return "quota"
 	case errors.Is(err, ErrNotFound):
