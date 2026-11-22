@@ -28,6 +28,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -551,13 +552,168 @@ func copyTree(t *testing.T, src, dst string) {
 	}
 }
 
+// recipeBackup is one backup as the save recipe in docs/user/keys.md leaves
+// it: keystore/ under a directory named after the backup, and the floor
+// saved under the same name in a root-only directory, with its SHA-256 in a
+// file beside it, in the format shasum writes.
+type recipeBackup struct {
+	keystore, floor, sum string
+}
+
+// saveRecipeBackup saves h's keystore/ and floor as the backup named name,
+// its floor under floorRoot (the recipe's /var/root/keystore-floor-backup).
+func saveRecipeBackup(t *testing.T, h *keysHarness, floorRoot, name string) recipeBackup {
+	t.Helper()
+	b := recipeBackup{keystore: filepath.Join(t.TempDir(), name, "keystore")}
+	if err := os.MkdirAll(filepath.Dir(b.keystore), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	copyTree(t, h.keystoreDir(), b.keystore)
+	// install -d -m 0700, then install -m 0644, under the backup's name.
+	dir := filepath.Join(floorRoot, name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b.floor = filepath.Join(dir, "keystore-floor.json")
+	raw, err := os.ReadFile(recipeFloor(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b.floor, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// shasum -a 256 FILE | tee FILE.sha256
+	sum := sha256.Sum256(raw)
+	b.sum = b.floor + ".sha256"
+	if err := os.WriteFile(b.sum, fmt.Appendf(nil, "%x  %s\n", sum, b.floor), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// recipeFloor is h's live floor file.
+func recipeFloor(h *keysHarness) string {
+	return filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+}
+
+// checkRecipeSum is shasum -a 256 -c on b's recorded SHA-256: shasum itself
+// when the host has it, and the same comparison in Go otherwise.
+func checkRecipeSum(b recipeBackup) error {
+	if shasum, err := exec.LookPath("shasum"); err == nil {
+		out, err := exec.Command(shasum, "-a", "256", "-c", b.sum).CombinedOutput()
+		if err != nil || !bytes.HasSuffix(bytes.TrimSpace(out), []byte(": OK")) {
+			return fmt.Errorf("shasum -c: %s, %v", out, err)
+		}
+		return nil
+	}
+	line, err := os.ReadFile(b.sum)
+	if err != nil {
+		return err
+	}
+	f := strings.Fields(string(line))
+	if len(f) != 2 {
+		return fmt.Errorf("%s: malformed", b.sum)
+	}
+	raw, err := os.ReadFile(f[1])
+	if err != nil {
+		return err
+	}
+	if sum := sha256.Sum256(raw); hex.EncodeToString(sum[:]) != f[0] {
+		return fmt.Errorf("%s: FAILED", f[1])
+	}
+	return nil
+}
+
+// restoreRecipeBackup restores b over h as the recipe does, with the saved
+// floor when withFloor is set, and returns the moved-aside keystore/. Before
+// anything moves, it refuses (an error, nothing changed) when a .pre-restore
+// copy of either is still set aside (the ls -d check) or, with the floor,
+// when the saved floor no longer matches its SHA-256 (shasum -c). The live
+// copies are moved aside, never overwritten (mv -n after the check).
+func restoreRecipeBackup(t *testing.T, h *keysHarness, b recipeBackup, withFloor bool) (string, error) {
+	t.Helper()
+	floor := recipeFloor(h)
+	aside := h.keystoreDir() + ".pre-restore"
+	for _, p := range []string{aside, floor + ".pre-restore"} {
+		if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("%s is still set aside from an earlier restore (%v)", p, err)
+		}
+	}
+	if withFloor {
+		if err := checkRecipeSum(b); err != nil {
+			return "", err
+		}
+	}
+	if err := os.Rename(h.keystoreDir(), aside); err != nil {
+		t.Fatal(err)
+	}
+	copyTree(t, b.keystore, h.keystoreDir())
+	if withFloor {
+		if err := os.Rename(floor, floor+".pre-restore"); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := os.ReadFile(b.floor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// install -o root -g wheel -m 0644: the owner is this test's floor
+		// owner, and the mode is set whatever the umask.
+		if err := os.WriteFile(floor, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(floor, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return aside, nil
+}
+
+// recipeDeletedNames is plutil -extract tombstones raw on the moved-aside
+// floor: the names it records as deleted, sorted. It runs plutil itself
+// when the host has it, and reads the same field in Go otherwise.
+func recipeDeletedNames(t *testing.T, h *keysHarness) []string {
+	t.Helper()
+	p := recipeFloor(h) + ".pre-restore"
+	if plutil, err := exec.LookPath("plutil"); err == nil {
+		out, err := exec.Command(plutil, "-extract", "tombstones", "raw", "-o", "-", p).Output()
+		if err != nil {
+			return nil // no tombstones: nothing to delete again
+		}
+		names := strings.Fields(string(out))
+		slices.Sort(names)
+		return names
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Tombstones map[string]json.RawMessage `json:"tombstones"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for n := range f.Tombstones {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	return names
+}
+
 // TestKeysRollbackRoundTrip is G21's CLI test: the rollback recipes in
 // docs/user/keys.md run as written. A restore of a saved keystore/, with the
-// floor saved at the same moment into a directory only its owner can open,
-// brings a deleted entry back, and without the floor it is refused; the undo
-// steps, the restored copies renamed first, put the live state back; and `show --version N --reveal` piped into `rotate --in -`
-// stores a version whose value equals version N's byte for byte
-// (bytes.Equal, the comparison cmp makes), for an opaque and an Ed25519 entry.
+// floor saved at the same moment, under the backup's name, into a directory
+// only its owner can open, brings a deleted entry back, and without the
+// floor it is refused. The restore refuses before it moves anything when a
+// .pre-restore copy is still set aside or the saved floor no longer matches
+// the SHA-256 recorded for it; an older backup keeps its own floor; the
+// names the moved-aside floor records as deleted are listed, and a revoked
+// one deleted again before start stays deleted. The undo steps, the restored
+// copies renamed first, put the live state back; and `show --version N
+// --reveal` piped into `rotate --in -` stores a version whose value equals
+// version N's byte for byte (bytes.Equal, the comparison cmp makes), for an
+// opaque and an Ed25519 entry.
 func TestKeysRollbackRoundTrip(t *testing.T) {
 	// saveRmRestore saves keystore/ and the floor, rm's the entry, then
 	// restores keystore/ as the recipe does, with the saved floor when
@@ -567,59 +723,54 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		t.Helper()
 		value := []byte("rollback\x00value\n")
 		h.put("system/rb", value)
-		backup := filepath.Join(t.TempDir(), "keystore")
-		copyTree(t, h.keystoreDir(), backup)
-		floor := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
-		// The floor is saved in the same run, apart from keystore/, into a
-		// directory of mode 0700 (install -d -m 0700, then install -m 0644).
-		floorDir := filepath.Join(t.TempDir(), "keystore-floor-backup")
-		if err := os.Mkdir(floorDir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		saved := filepath.Join(floorDir, "keystore-floor.json")
-		b, err := os.ReadFile(floor)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(saved, b, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
 		h.mustRun(0, "rm", "system/rb", "--yes")
 		h.mustRun(1, "show", "system/rb", "--reveal")
-		// The recipe moves the live copy aside, never deletes it first.
-		aside := h.keystoreDir() + ".pre-restore"
-		if err := os.Rename(h.keystoreDir(), aside); err != nil {
-			t.Fatal(err)
-		}
-		copyTree(t, backup, h.keystoreDir())
-		if withFloor {
-			// The live floor is moved aside, as root, so the restore can be
-			// undone, and the floor saved with the backup is put in its place.
-			if err := os.Rename(floor, floor+".pre-restore"); err != nil {
-				t.Fatal(err)
-			}
-			b, err := os.ReadFile(saved)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// install -o root -g wheel -m 0644: the owner is this test's
-			// floor owner, and the mode is set whatever the umask.
-			if err := os.WriteFile(floor, b, 0o644); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Chmod(floor, 0o644); err != nil {
-				t.Fatal(err)
-			}
+		aside, err := restoreRecipeBackup(t, h, b, withFloor)
+		if err != nil {
+			t.Fatalf("restore: %v", err)
 		}
 		return value, aside
 	}
+	t.Run("the recipe in docs/user/keys.md has these steps", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "user", "keys.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc := strings.Join(strings.Fields(string(raw)), " ")
+		steps := []string{
+			"sudo install -o root -g wheel -m 0644 /var/lib/k3sm/keystore-floor.json /var/root/keystore-floor-backup/$B/keystore-floor.json",
+			"sudo shasum -a 256 /var/root/keystore-floor-backup/$B/keystore-floor.json | sudo tee /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
+			"Never keep the saved floor on a volume that ignores ownership",
+			"sudo k3sm stop",
+			"sudo ls -d /var/lib/k3sm/server/keystore.pre-restore /var/lib/k3sm/keystore-floor.json.pre-restore",
+			"sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
+			"sudo mv -n /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore",
+			"sudo mv -n /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore",
+			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json",
+			"sudo plutil -extract tombstones raw -o - /var/lib/k3sm/keystore-floor.json.pre-restore",
+			"sudo k3sm keys rm system/<name> --yes",
+			"sudo k3sm start",
+		}
+		at := 0
+		for _, step := range steps {
+			i := strings.Index(doc[at:], step)
+			if i < 0 {
+				t.Fatalf("docs/user/keys.md does not say %q after the step before it", step)
+			}
+			at += i + len(step)
+		}
+	})
 	t.Run("save rm restore", func(t *testing.T) {
 		h := newKeysHarness(t)
 		value, aside := saveRmRestore(t, h, true)
-		floor := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+		floor := recipeFloor(h)
 		// The moved-aside floor is the live one, tombstone and all.
 		if b, err := os.ReadFile(floor + ".pre-restore"); err != nil || !strings.Contains(string(b), `"tombstones":{"rb":`) {
 			t.Fatalf("moved-aside floor = %s, %v; want the live floor with rb's tombstone", b, err)
+		}
+		if got := recipeDeletedNames(t, h); !slices.Equal(got, []string{"rb"}) {
+			t.Fatalf("names the moved-aside floor records as deleted = %q, want rb", got)
 		}
 		h.mustRun(0, "list")
 		h.mustRun(0, "show", "system/rb", "--reveal")
@@ -632,6 +783,100 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			}
 		}
 	})
+	// A key deleted to revoke it is live again after the restore; the
+	// recipe lists it from the moved-aside floor and deletes it again before
+	// start, and it stays deleted.
+	t.Run("save rm restore, the revoked key deleted again before start", func(t *testing.T) {
+		h := newKeysHarness(t)
+		saveRmRestore(t, h, true)
+		h.mustRun(0, "list")
+		listed := h.stdout.String()
+		for _, name := range recipeDeletedNames(t, h) {
+			if strings.Contains(listed, "system/"+name) {
+				h.mustRun(0, "rm", "system/"+name, "--yes")
+			}
+		}
+		h.mustRun(1, "show", "system/rb", "--reveal")
+		if h.stdout.Len() != 0 {
+			t.Fatalf("show printed %q for the key deleted again", h.stdout.Bytes())
+		}
+	})
+	// A .pre-restore copy left by an earlier restore is never replaced:
+	// the check refuses before anything moves.
+	t.Run("a pre-restore copy still set aside refuses", func(t *testing.T) {
+		for _, which := range []string{"keystore", "floor"} {
+			t.Run(which, func(t *testing.T) {
+				h := newKeysHarness(t)
+				h.put("system/rb", []byte("v"))
+				b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+				left := recipeFloor(h) + ".pre-restore"
+				if which == "keystore" {
+					left = h.keystoreDir() + ".pre-restore"
+				}
+				if err := os.WriteFile(left, []byte("earlier\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				live, err := os.ReadFile(recipeFloor(h))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := restoreRecipeBackup(t, h, b, true); err == nil {
+					t.Fatal("restore with a .pre-restore copy set aside went on")
+				}
+				if got, err := os.ReadFile(left); err != nil || string(got) != "earlier\n" {
+					t.Fatalf("the earlier .pre-restore copy = %q, %v; want it untouched", got, err)
+				}
+				if got, err := os.ReadFile(recipeFloor(h)); err != nil || !bytes.Equal(got, live) {
+					t.Fatalf("the live floor = %s, %v; want it untouched", got, err)
+				}
+				h.mustRun(0, "show", "system/rb", "--reveal")
+			})
+		}
+	})
+	// A saved floor changed since the save fails its SHA-256 check, and the
+	// restore stops before anything moves.
+	t.Run("a saved floor changed since the save refuses", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/rb", []byte("v"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		raw, err := os.ReadFile(b.floor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(b.floor, append(raw, ' '), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := restoreRecipeBackup(t, h, b, true); err == nil {
+			t.Fatal("restore with a changed saved floor went on")
+		}
+		if _, err := os.Lstat(h.keystoreDir() + ".pre-restore"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("keystore/ was moved aside before the check: %v", err)
+		}
+		h.mustRun(1, "show", "system/rb", "--reveal")
+	})
+	// Each backup keeps the floor saved under its name, so an older backup
+	// restores with its own floor after a newer one is saved.
+	t.Run("an older backup keeps its own floor", func(t *testing.T) {
+		h := newKeysHarness(t)
+		floorRoot := filepath.Join(t.TempDir(), "keystore-floor-backup")
+		h.put("system/rb", []byte("old"))
+		older := saveRecipeBackup(t, h, floorRoot, "2026-11-01")
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		h.put("system/other", []byte("new"))
+		newer := saveRecipeBackup(t, h, floorRoot, "2026-11-22")
+		if older.floor == newer.floor {
+			t.Fatalf("both backups saved their floor to %s", older.floor)
+		}
+		if _, err := restoreRecipeBackup(t, h, older, true); err != nil {
+			t.Fatalf("restore of the older backup: %v", err)
+		}
+		h.mustRun(0, "list")
+		h.mustRun(0, "show", "system/rb", "--reveal")
+		if got := h.stdout.String(); got != "old" {
+			t.Fatalf("restored rb = %q, want old", got)
+		}
+	})
 	// The undo steps: the restored keystore/ and floor are renamed out of
 	// the way first, since mv onto a directory that exists moves the source
 	// inside it, then the moved-aside copies go back, and the live state,
@@ -639,7 +884,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 	t.Run("save rm restore, then undo", func(t *testing.T) {
 		h := newKeysHarness(t)
 		_, aside := saveRmRestore(t, h, true)
-		floor := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+		floor := recipeFloor(h)
 		for _, mv := range [][2]string{
 			{h.keystoreDir(), h.keystoreDir() + ".restored"},
 			{aside, h.keystoreDir()},

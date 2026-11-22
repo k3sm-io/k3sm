@@ -447,9 +447,13 @@ possible and its **soak** validation is still pending. Factor that into recovery
 ## Restoring an older keystore/
 
 The keystore that `k3sm keys` manages is not in datastore snapshots and is backed up on its own,
-with its master key kept apart from the entries. A restore stops the server, moves the live
-`keystore/` aside rather than deleting it, puts the backup in place with `ditto`, starts the
-server, and checks `sudo k3sm keys list` before the moved-aside copy is deleted.
+with its master key kept apart from the entries, and its floor saved under the backup's name
+in a root-only directory on the Mac, never on a volume that ignores ownership or that others can
+write. A restore stops the server, checks that no copy from an earlier restore is still set
+aside and that the saved floor matches the SHA-256 recorded for it, moves the live `keystore/`
+aside rather than deleting it, puts the backup in place with `ditto`, deletes again every key
+revoked since the backup, starts the server, and checks `sudo k3sm keys list` before the
+moved-aside copy is deleted.
 A restored `keystore/` older than the live one is refused until root removes
 `/var/lib/k3sm/keystore-floor.json`. Removing the floor discards every deletion it recorded, so
 every copy of a deleted entry, a key revoked by deleting it included, is accepted again if it is

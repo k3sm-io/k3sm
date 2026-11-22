@@ -268,36 +268,76 @@ with the master key that was current when they were saved, so take both again af
 Your datastore backups copy `/var/lib/k3sm/server/cred`, which holds the master key directory too.
 Exclude `cred/keystore-master/` from them, and back the master key up on its own, as below.
 
-To save, while no `k3sm keys` verb is running (`ditto` keeps owners and modes):
+To save, while no `k3sm keys` verb is running (`ditto` keeps owners and modes), give the backup a
+name, here `2026-11-22`, and save its floor under that name:
 
 ```
-sudo ditto /var/lib/k3sm/server/keystore /path/to/backup/keystore
+B=2026-11-22
+sudo ditto /var/lib/k3sm/server/keystore /path/to/backup/$B/keystore
 sudo ditto /var/lib/k3sm/server/cred/keystore-master /other/place/keystore-master
-sudo install -d -o root -g wheel -m 0700 /var/root/keystore-floor-backup
-sudo install -o root -g wheel -m 0644 /var/lib/k3sm/keystore-floor.json /var/root/keystore-floor-backup/keystore-floor.json
+sudo install -d -o root -g wheel -m 0700 /var/root/keystore-floor-backup/$B
+sudo install -o root -g wheel -m 0644 /var/lib/k3sm/keystore-floor.json /var/root/keystore-floor-backup/$B/keystore-floor.json
+sudo shasum -a 256 /var/root/keystore-floor-backup/$B/keystore-floor.json | sudo tee /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256
 ```
 
 Save `keystore/` and the floor file in the same run, and keep them as a pair. A floor file saved
 at another moment does not describe the saved entries: some of them are refused, or deletions
-recorded after it are lost.
+recorded after it are lost. Each backup keeps its own floor, in the directory named after it, so
+an older backup still has the floor that matches it. Never save every backup's floor to one
+path: the newest would replace the floor an older backup needs.
 
-The saved floor file goes to a directory owned by root with mode 0700, such as
-`/var/root/keystore-floor-backup` above, not beside `keystore/` in a path your user can write.
+The saved floor file goes to a directory on this Mac owned by root with mode 0700, such as
+`/var/root/keystore-floor-backup/$B` above, not beside `keystore/` in a path your user can write.
 The floor decides which entries are live, so a floor someone else could replace would let them
-mark a revoked entry live again. If you copy it to a backup volume, keep it in a directory only
-root can read and write there too.
+mark a revoked entry live again. Never keep the saved floor on a volume that ignores ownership,
+such as an external drive set to ignore ownership, or on a volume others can write, such as a
+network share. The SHA-256 that the last line records stays in root's directory on this Mac,
+and the restore checks it before it puts the floor back, so a floor changed since you saved it
+is never used. If this Mac is lost, its saved floors are lost with it: restore as in
+"Restoring an older keystore/" below.
 
-To restore the same backup, for example after deleting an entry by mistake, move the live
+To restore a backup, for example after deleting an entry by mistake, you move the live
 `keystore/` and the live `keystore-floor.json` aside rather than deleting or overwriting them, so
-a bad restore can be undone, and put back the `keystore-floor.json` you saved with that backup,
-as root:
+a bad restore can be undone, and put back the `keystore-floor.json` you saved with that backup.
+First stop the server, check that no copy from an earlier restore is still set aside, and check
+the saved floor against its SHA-256, as root:
 
 ```
 sudo k3sm stop
-sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore
-sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
-sudo ditto /path/to/backup/keystore /var/lib/k3sm/server/keystore
-sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/keystore-floor.json /var/lib/k3sm/keystore-floor.json
+B=2026-11-22
+sudo ls -d /var/lib/k3sm/server/keystore.pre-restore /var/lib/k3sm/keystore-floor.json.pre-restore
+sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256
+```
+
+`ls` must report both paths missing ("No such file or directory"). If either exists, an earlier
+restore was never finished or undone, and moving the live copies aside now would replace it:
+finish or undo that restore first, as below, and do not go on. `shasum` must print `OK`. If it
+does not, the saved floor has changed since you saved it: do not use it. Then move the live
+copies aside and put the backup in place:
+
+```
+sudo mv -n /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore
+sudo mv -n /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore
+sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/server/keystore
+sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json
+```
+
+Before you start the server, delete again every key you revoked since the backup. The floor you
+moved aside records every entry deleted while it was live. Print those names and the restored
+entries:
+
+```
+sudo plutil -extract tombstones raw -o - /var/lib/k3sm/keystore-floor.json.pre-restore
+sudo k3sm keys list
+```
+
+A name in both lists was deleted after the backup, or deleted before it and put again, and the
+restore makes it live. For each one you deleted to revoke a key, delete it again now, with
+`sudo k3sm keys rm system/<name> --yes`. When `plutil` prints an error instead of names, the
+moved-aside floor records no deletion, and there is nothing to delete again. Then start the
+server and check the entries:
+
+```
 sudo k3sm start
 sudo k3sm keys list
 ```
@@ -318,7 +358,8 @@ A restore puts back the whole keystore as it was when you saved it, not one entr
 - Every `rotate` since the backup is undone. Each entry's current version is the one it had
   then.
 - Every entry you deleted since the backup comes back, and root's record of those deletions is
-  gone. A key you deleted to revoke it is live again: delete it again with `rm`.
+  gone. A key you deleted to revoke it is live again until you delete it again with `rm`, before
+  `k3sm start`, as above.
 
 Only when `list` shows every entry `ok`, delete the copies you moved aside:
 
