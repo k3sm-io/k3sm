@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -53,8 +54,8 @@ func TestLogDataRootRefusesExtraFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = unix.Chflags(s.dataRoot, 0) })
-	if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, errLogUntrusted) {
-		t.Fatalf("current under a data root flagged uchg: %v, want errLogUntrusted", err)
+	if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, errLogUntrusted) || strings.Contains(err.Error(), s.dataRoot) {
+		t.Fatalf("current under a data root flagged uchg: %v, want errLogUntrusted naming no path", err)
 	}
 	if err := unix.Chflags(s.dataRoot, 0); err != nil {
 		t.Fatal(err)

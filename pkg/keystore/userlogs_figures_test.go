@@ -116,8 +116,8 @@ func TestLogErrorsNameNoFigures(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(s.dataRoot, 0o755) })
 		_, _, err := u.Current(ctx, "user/1001/token")
-		if !errors.Is(err, errLogUntrusted) || strings.Contains(err.Error(), "0777") || strings.Contains(err.Error(), "uid") {
-			t.Fatalf("current under a writable data root: %v, want errLogUntrusted naming no mode or uid", err)
+		if !errors.Is(err, errLogUntrusted) || strings.Contains(err.Error(), "0777") || strings.Contains(err.Error(), "uid") || strings.Contains(err.Error(), s.dataRoot) {
+			t.Fatalf("current under a writable data root: %v, want errLogUntrusted naming no mode, uid or path", err)
 		}
 	})
 }

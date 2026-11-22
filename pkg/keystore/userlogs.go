@@ -543,7 +543,7 @@ func (s *FileStore) openLogDataRoot() (int, error) {
 	var st unix.Stat_t
 	if err := unix.Fstat(dfd, &st); err != nil {
 		_ = unix.Close(dfd) // abandoned
-		return -1, fmt.Errorf("stat the data root %s: %w", s.dataRoot, err)
+		return -1, fmt.Errorf("stat the data root: %w", err)
 	}
 	if int64(st.Uid) != int64(s.floorUID) || st.Mode&0o022 != 0 {
 		_ = unix.Close(dfd) // abandoned
@@ -552,7 +552,8 @@ func (s *FileStore) openLogDataRoot() (int, error) {
 	}
 	if err := judgeFlagsACL(dfd, fdFlags); err != nil {
 		_ = unix.Close(dfd) // abandoned
-		return -1, fmt.Errorf("the data root %s: %w", s.dataRoot, err)
+		slog.Debug("the keystore data root is not trusted", "path", s.dataRoot, "err", err)
+		return -1, fmt.Errorf("the data root: %w", err)
 	}
 	return dfd, nil
 }
