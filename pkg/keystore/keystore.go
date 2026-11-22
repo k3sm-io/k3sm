@@ -228,6 +228,14 @@ var (
 	// oauth entry: resurrecting a rotated refresh token can trip the
 	// provider's reuse detection and revoke the whole grant.
 	ErrFromVersionOAuth = errors.New("an oauth entry cannot be rotated from an earlier version: reusing a rotated refresh token can make the provider revoke the whole grant")
+	// ErrOrphanVersion reports a version of an entry, above the one its
+	// current pointer names, that authenticates as this entry's: a rotation
+	// crashed between writing it and flipping the pointer, or an older
+	// pointer was copied back over a newer one. For oauth it may hold the
+	// provider's newest refresh token, so it is never unlinked, and an oauth
+	// read refuses with it rather than hand out a pair that may already be
+	// spent.
+	ErrOrphanVersion = errors.New("a sealed version of the keystore entry lies above its current pointer, left by a crashed rotation or a copied-back pointer")
 	// ErrVersionNotFound reports that the entry exists but holds no such
 	// version.
 	ErrVersionNotFound = errors.New("keystore entry version not found")

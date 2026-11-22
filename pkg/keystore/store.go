@@ -751,9 +751,10 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 // the floor: docs/design/keystore.md § "Rotation and rollback". A failure
 // before the flip leaves the old version current and removes the next
 // version it wrote. A crash there leaves that sealed version above the
-// pointer, which the next Rotate refuses as ErrCorrupt, since a newer
-// committed version behind a copied-back pointer looks the same; it never
-// promotes or unlinks it. A failure after the flip returns the new version
+// pointer, which the next Rotate refuses as ErrCorrupt and ErrOrphanVersion,
+// since a newer committed version behind a copied-back pointer looks the
+// same; it never promotes or unlinks it, and Adopt is the attended
+// promotion. A failure after the flip returns the new version
 // with an error matching ErrCommitted.
 func (s *FileStore) Rotate(ctx context.Context, name string, value []byte) (Version, error) {
 	v, err := s.rotate(ctx, name, func(_ *entry, _ keys, old Version) ([]byte, error) {
@@ -915,8 +916,9 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 // pointer, so the copied-back pointer passes the floor check), or a Rotate
 // crashed between writing that version and its pointer flip. The two leave
 // the same files, and only the first holds a committed version, for oauth
-// the only valid refresh token, so both are refused as ErrCorrupt, before
-// anything is unlinked. docs/design/keystore.md § "Rotation and rollback".
+// the only valid refresh token, so both are refused as ErrCorrupt and
+// ErrOrphanVersion, before anything is unlinked; Adopt promotes it.
+// docs/design/keystore.md § "Rotation and rollback".
 func discardOrphans(ctx context.Context, e *entry, k keys, low, cur uint64) error {
 	names, err := readDirNames(e.root, maxDirNames)
 	if err != nil {
@@ -932,13 +934,11 @@ func discardOrphans(ctx context.Context, e *entry, k keys, low, cur uint64) erro
 			continue
 		}
 		if v > cur {
-			_, pt, err := e.openRecord(k, n, false, v)
+			r, pt, err := e.openRecord(k, n, false, v)
 			clear(pt) // only whether it opens is wanted
 			switch {
 			case err == nil:
-				return fmt.Errorf("%w: version %d, above the version %d the current pointer names, is a sealed version of this entry; "+
-					"either an older current pointer was copied back over a newer one (restore the newer current pointer from backup), "+
-					"or a rotation crashed before its pointer flip (then remove %s); nothing was removed", ErrCorrupt, v, cur, n)
+				return orphanError(e, Kind(r.kind) == KindOAuth, v, cur)
 			case !errors.Is(err, ErrCorrupt):
 				return fmt.Errorf("check the orphaned %s: %w", n, err)
 			}

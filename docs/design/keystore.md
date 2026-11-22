@@ -942,10 +942,30 @@ carried, and promoting it would publish a value the retry did not supply. Before
 a Rotate looks at every such file under the exclusive lock. One that does not open as this
 entry's sealed record of the version its name says (it fails authentication, is another
 generation's or another version's) is a true orphan and is unlinked. One that does open is
-refused, as `ErrCorrupt`, and nothing is unlinked: see the floor-lag window below. A real
-crash between the version write and the flip leaves such a file, so the retry after that
-crash is refused, and the refusal names both causes: if no pointer was copied back, the
-operator removes the named version file and retries.
+refused, as `ErrCorrupt` and `ErrOrphanVersion`, and nothing is unlinked: see the floor-lag
+window below. A real crash between the version write and the flip leaves such a file, so the
+retry after that crash is refused, and the refusal names both causes. A crash leaves only
+the version after the current one, so a sealed version further out can only be behind a
+copied-back pointer, and the refusal then says only that: restore the newer pointer from
+backup. At the next version it says "inspect with `k3sm keys adopt system/NAME`"; for oauth
+it adds "do not delete the file: it may hold the only valid refresh token", and for the
+other kinds it offers removing the named version file as the alternative to adopting it.
+
+**Adopting an orphaned version.** `FileStore.Orphan(ctx, name)` reports the lowest sealed
+version above the pointer next to the current one: each one's version number, kind and
+created time, and the pointer's sequence, never a value (a version file has no sequence of
+its own; adopting gives it the next pointer sequence, the one its rotation would have
+written). It also lists any further sealed versions. `FileStore.Adopt(ctx, name, version)`
+makes the orphan current: it seals a pointer naming it at the next sequence, raises the
+floor, and for oauth keeps the retention rule (low becomes the old current, and the versions
+below are unlinked). It refuses unless the version is exactly the one after the current one,
+authenticates under this entry's generation, is of the entry's kind, and is the only sealed
+version above the pointer; it is root-only, as every write is (the floor is root's), and a
+failure after its pointer flip returns `ErrCommitted`. Adopting is right for both causes: it
+completes the flip a crash interrupted, and it rewrites the newer pointer a copy-back
+replaced. `sudo k3sm keys adopt system/NAME [--yes]` prints both sides from `Orphan`, then
+adopts with `--yes` or an interactive confirmation; without either, and without a terminal,
+it changes nothing.
 
 **A write reports its commit outcome without ambiguity.** The pointer's rename is the
 commit point, for a Put (`Put`, `PutCredential`, `GenerateSSH`) as for a rotation (`Rotate`,
@@ -4143,7 +4163,7 @@ last pull request lands and no row is pending.
 | G6 | The floor is root-owned and checked on the opened descriptor; a floor that is group- or other-writable, a symlink, or not root-owned is refused. The floor file names the `system` scope and is parsed strictly, and a verb that cannot write it changes nothing | unit with a fake FS for each case; a missing, other or unknown-field scope; a fuzz target over the parser with committed seeds; a read-only data root on a first Put |
 | G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock` |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
-| G9 | A Rotate retry never promotes an orphaned next version: a failed Rotate removes its own, a sealed one a crash left is refused (`ErrCorrupt`, nothing removed), one that does not authenticate is discarded, and the retry seals the value it was given | unit: orphan with value A, refused; removed, retry with value B, expect B |
+| G9 | A Rotate retry never promotes an orphaned next version: a failed Rotate removes its own, the version's fsync failure included, a sealed one a crash left is refused (`ErrCorrupt` and `ErrOrphanVersion`, nothing removed, oauth told not to delete it), one that does not authenticate is discarded, and the retry seals the value it was given; only the attended, root-only `Adopt` (`k3sm keys adopt`) promotes a sealed orphan, at exactly the next version | unit: orphan with value A, refused; removed, retry with value B, expect B; a fault after the version's rename; an oauth crash, then adopt, then the new pair is current; adopt's refusals; the CLI verb |
 | G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts an operator-made key: `rewrap --key-in` refuses a key that is neither the recorded `master.next.sha256` nor one some record already opens under |
 | G11 | The master is opened with O_NOFOLLOW and judged by fstat on the open descriptor; wrong mode, owner or fingerprint is `ErrMasterUntrusted` | unit: one case each |
 | G12 | Rewrap resumes after a crash at every step, trying the old then the new key, and leaves no record readable by neither; a `master.next` that disagrees with its fingerprint is discarded only when no `.new` file exists, and refused with `ErrMasterUntrusted` otherwise | unit: fault injection at each of steps 2 to 5, then rerun; a corrupted `master.next` with and without a `.new` file |
