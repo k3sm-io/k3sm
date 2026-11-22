@@ -508,7 +508,7 @@ check G21 "the rollback recipe is a byte-exact round trip: show --reveal into ro
 	k3sm/cmd/k3sm::TestKeysRollbackRoundTrip
 special g22 G22
 check G23 "a deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by rm, which keeps the tombstone" \
-	TestTombstoneRefusesPutBack TestTombstoneSurvivesPlantedGeneration TestTombstonesKeptAcrossRecreate TestDeleteBuriesFloorGeneration
+	TestTombstoneRefusesPutBack TestTombstoneSurvivesPlantedGeneration TestTombstonesKeptAcrossRecreate TestDeleteBuriesFloorGeneration TestDeleteBuriesWithDirectoryGone
 
 pend U1 "rotate --from-version N writes version N's bytes as a new version server side; no value leaves the store (keys verbs)" \
 	k3sm/cmd/k3sm::TestKeysRotateFromVersionNoValueOut
@@ -894,8 +894,8 @@ pend U190 "the refresher doctor rows; every state change logs at Warn or Error u
 	k3sm/cmd/k3sm::TestDoctorRefresherRows k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn
 pend U191 "examples/keydelivery-github.yaml validates against the apis CRD schema; limitations.md lists the typed-credential residuals (the typed-credential docs)" \
 	k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD TestLimitationsListTypedResiduals
-check U192 "the floor's tombstones: a completed Delete buries the floor's live generation for the name (the directory's only when the floor has no record of the name) with a delete sequence, without the master too; a later Put keeps the buried set; at most 8 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no tombstones field parses, and a burial is parsed as strictly as an entry (the floor's tombstone)" \
-	TestTombstoneKeptByPut TestDeleteWithoutMasterTombstones TestTombstonePrune TestTombstoneNeverRefusesPut TestPruneLogsAtWarn TestParseFloorTombstones TestFloorOpsProperty TestDeleteSequenceNeverWraps FuzzParseFloor
+check U192 "the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 8 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no tombstones field parses, and a burial is parsed as strictly as an entry (the floor's tombstone)" \
+	TestTombstoneKeptByPut TestDeleteWithoutMasterTombstones TestTombstonePrune TestTombstoneNeverRefusesPut TestPruneLogsAtWarn TestParseFloorTombstones TestFloorOpsProperty TestDeleteSequenceNeverWraps TestDeleteIgnoresPlantedGeneration FuzzParseFloor
 # >>> ADD NEW U ROWS (U193 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
