@@ -42,7 +42,8 @@ const (
 )
 
 // clearUserFlags clears the user locking flags (userLockingFlags) on
-// keystore/ itself (root's directory), on name under root and, for a
+// keystore/ itself (the directory the root handle opens, which the service
+// user owns), on name under it and, for a
 // directory, on everything in it, so a flag the service user set on its own
 // files does not make Delete's removal fail: unlink of a uchg file, or of
 // any name in a uchg directory, fails even for root, and root may clear user
