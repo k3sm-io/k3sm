@@ -101,13 +101,14 @@ func TestDeliveryRecordDigestRoundTrip(t *testing.T) {
 	s, server, u := newDeliveryScope(t)
 	fl, audit := userLogs(s)
 	d := testDelivery(1)
-	if err := u.addDelivery(ctx, d); err != nil {
-		t.Fatalf("addDelivery: %v", err)
+	if err := u.Deliver(ctx, exportDelivery(d)); err != nil {
+		t.Fatalf("Deliver: %v", err)
 	}
-	got, err := u.lookupDelivery(ctx, d.uid)
+	exported, err := u.Delivery(ctx, d.uid)
 	if err != nil {
-		t.Fatalf("lookupDelivery: %v", err)
+		t.Fatalf("Delivery: %v", err)
 	}
+	got := exported.internal()
 	want := deliveryDigest(d.entry, d.namespace, d.secretName, d.items)
 	if got.uid != d.uid || got.name != d.name || got.entry != d.entry || got.namespace != d.namespace || got.secretName != d.secretName || got.requestedBy != d.requestedBy || got.withdrawn || got.digest != want {
 		t.Fatalf("looked up %+v, want %+v with digest %x", got, d, want)
@@ -130,22 +131,22 @@ func TestDeliveryRecordDigestRoundTrip(t *testing.T) {
 		t.Fatalf("record kind %#x name %q seq %d generation %x; want 0xfd, deliveries, 2, the GeneratedUID", r.kind, r.name, r.version, r.generation)
 	}
 	older := raw
-	if err := u.withdrawDelivery(ctx, d.uid); err != nil {
-		t.Fatalf("withdrawDelivery: %v", err)
+	if err := u.Withdraw(ctx, d.uid); err != nil {
+		t.Fatalf("Withdraw: %v", err)
 	}
-	if got, err := u.lookupDelivery(ctx, d.uid); err != nil || !got.withdrawn || got.digest != want {
+	if got, err := u.Delivery(ctx, d.uid); err != nil || !got.Withdrawn || got.Digest != want {
 		t.Fatalf("after withdraw: %+v, %v; want the tombstone with its digest", got, err)
 	}
-	if err := u.withdrawDelivery(ctx, d.uid); err != nil {
+	if err := u.Withdraw(ctx, d.uid); err != nil {
 		t.Fatalf("a second withdraw: %v, want no change", err)
 	}
-	if _, err := u.lookupDelivery(ctx, "absent"); !errors.Is(err, ErrNotFound) {
+	if _, err := u.Delivery(ctx, "absent"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("lookup of an unrecorded UID: %v, want ErrNotFound", err)
 	}
-	if err := u.withdrawDelivery(ctx, "absent"); !errors.Is(err, ErrNotFound) {
+	if err := u.Withdraw(ctx, "absent"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("withdraw of an unrecorded UID: %v, want ErrNotFound", err)
 	}
-	if err := u.addDelivery(ctx, d); !errors.Is(err, ErrExists) {
+	if err := u.Deliver(ctx, exportDelivery(d)); !errors.Is(err, ErrExists) {
 		t.Fatalf("a second add of one UID: %v, want ErrExists", err)
 	}
 	if seq, _ := fl.floor("user/1001", deliveriesFloorName, guid(0xA1)); seq != 3 {
@@ -166,19 +167,19 @@ func TestDeliveryRecordDigestRoundTrip(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(scopeDir(server, "1001"), deliveriesName), older, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := u.lookupDelivery(ctx, d.uid); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "floor --rebuild") {
+	if _, err := u.Delivery(ctx, d.uid); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "floor --rebuild") {
 		t.Fatalf("lookup over a copied-back record: %v, want ErrCorrupt with the user-scope floor message", err)
 	}
 	// Another scope's entry, or a requester that is not the caller, is
 	// refused before anything is written.
 	other := testDelivery(2)
 	other.entry = "user/1002/token"
-	if err := u.addDelivery(ctx, other); !errors.Is(err, ErrNotFound) {
+	if err := u.Deliver(ctx, exportDelivery(other)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("add of another scope's entry: %v, want ErrNotFound", err)
 	}
 	other = testDelivery(3)
 	other.requestedBy = "k3sm:local:1002"
-	if err := u.addDelivery(ctx, other); err == nil {
+	if err := u.Deliver(ctx, exportDelivery(other)); err == nil {
 		t.Fatal("add with another uid as requester succeeded")
 	}
 }

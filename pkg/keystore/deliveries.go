@@ -592,6 +592,72 @@ func deliveriesKey(ku []byte, scope string) []byte {
 	return hmacSHA256(ku, scopedLabel(deliveriesKeyLabel, scope))
 }
 
+// Delivery is one KeyDelivery as a user scope records it: its UID and
+// name, its target tuple (Entry, Namespace, SecretName, Items) and its
+// requester; and, as recorded, the target digest, the last delivered
+// version and whether it is withdrawn. Deliver ignores Digest, Delivered
+// and Withdrawn: it computes the digest and records the delivery live and
+// never delivered.
+type Delivery struct {
+	UID         string
+	Name        string
+	Entry       string
+	Namespace   string
+	SecretName  string
+	Items       []credential.Item
+	RequestedBy string
+	Digest      [sha256.Size]byte
+	Delivered   uint64
+	Withdrawn   bool
+}
+
+// exportDelivery is d as a Delivery.
+func exportDelivery(d delivery) Delivery {
+	return Delivery{
+		UID: d.uid, Name: d.name, Entry: d.entry, Namespace: d.namespace,
+		SecretName: d.secretName, Items: d.items, RequestedBy: d.requestedBy,
+		Digest: d.digest, Delivered: d.delivered, Withdrawn: d.withdrawn,
+	}
+}
+
+// internal is d as the record's entry.
+func (d Delivery) internal() delivery {
+	return delivery{
+		uid: d.UID, name: d.Name, entry: d.Entry, namespace: d.Namespace,
+		secretName: d.SecretName, items: d.Items, requestedBy: d.RequestedBy,
+		digest: d.Digest, delivered: d.Delivered, withdrawn: d.Withdrawn,
+	}
+}
+
+// Deliver records d, live, in the caller's delivery record, minting the
+// scope on its first mutating operation (addDelivery). A UID already
+// recorded is ErrExists; a record with 64 live entries, or 320 in all, is
+// ErrQuota. Its audit line is appended before anything is written: a
+// failed append refuses it, and nothing is written.
+func (u *UserScope) Deliver(ctx context.Context, d Delivery) error {
+	return u.addDelivery(ctx, d.internal())
+}
+
+// Delivery returns the recorded delivery with uid, live or withdrawn
+// (lookupDelivery). A UID absent from a record that opened is ErrNotFound;
+// a scope or record that is not there is ErrScopeAbsent. It never mints.
+func (u *UserScope) Delivery(ctx context.Context, uid string) (Delivery, error) {
+	d, err := u.lookupDelivery(ctx, uid)
+	if err != nil {
+		return Delivery{}, err
+	}
+	return exportDelivery(d), nil
+}
+
+// Withdraw turns the live delivery uid into a tombstone in place
+// (withdrawDelivery). It is never refused for a quota and runs while a
+// Rewrap is half done. An already withdrawn UID is no change; an absent one
+// is ErrNotFound. It commits first and audits after: a failed append is
+// reported and the tombstone stands.
+func (u *UserScope) Withdraw(ctx context.Context, uid string) error {
+	return u.withdrawDelivery(ctx, uid)
+}
+
 // addDelivery records d, live, in the caller's delivery record, minting the
 // scope on its first mutating operation. A UID already recorded is
 // ErrExists; a record with 64 live entries, or 320 in all, is ErrQuota. It
