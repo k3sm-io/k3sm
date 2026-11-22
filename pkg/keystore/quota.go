@@ -39,7 +39,8 @@ const (
 )
 
 // checkScopeQuota refuses, as ErrQuota, a put of value as name into
-// entries when the scope already holds maxScopeEntries entries, or when its
+// entries when name is new and the scope already holds maxScopeEntries
+// entries, or when its
 // sealed records and the new entry's two records (version 1 and its
 // pointer) would pass maxScopeBytes.
 func checkScopeQuota(entries *os.Root, name string, value []byte) error {
@@ -48,11 +49,13 @@ func checkScopeQuota(entries *os.Root, name string, value []byte) error {
 		return err
 	}
 	count := 0
+	exists := false
 	var total int64
 	for _, n := range names {
 		if checkName(n) != nil {
 			continue
 		}
+		exists = exists || n == name
 		count++
 		size, err := entryBytes(entries, n)
 		if err != nil {
@@ -60,7 +63,9 @@ func checkScopeQuota(entries *os.Root, name string, value []byte) error {
 		}
 		total += size
 	}
-	if count >= maxScopeEntries {
+	// The count bounds new names: an existing name is the caller's
+	// ErrExists (or a Rotate's version), never ErrQuota.
+	if !exists && count >= maxScopeEntries {
 		return fmt.Errorf("%w: the scope holds %d entries, at most %d", ErrQuota, count, maxScopeEntries)
 	}
 	add := int64(headerSize+len(name)+len(value)+tagSize) + int64(headerSize+len(currentName)+pointerSize+tagSize)

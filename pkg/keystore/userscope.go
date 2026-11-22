@@ -206,10 +206,10 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	defer func() { _ = entries.Close() }() // writes are fsynced by writeFile
-	if err := checkScopeQuota(entries, name, value); err != nil {
+	if err := u.checkNewName(entries, name); err != nil {
 		return Version{}, err
 	}
-	if err := u.checkNewName(entries, name); err != nil {
+	if err := checkScopeQuota(entries, name, value); err != nil {
 		return Version{}, err
 	}
 	if err := grant(); err != nil {

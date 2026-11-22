@@ -345,6 +345,14 @@ func TestUserScopeQuota(t *testing.T) {
 		if _, err := u.Put(ctx, "user/1001/one-more", KindOpaque, []byte("v")); !errors.Is(err, ErrQuota) {
 			t.Fatalf("the 257th entry: %v, want ErrQuota", err)
 		}
+		// An existing name at the bound is ErrExists, as it is below it:
+		// the count bounds new names only.
+		if _, err := u.Put(ctx, "user/1001/e1", KindOpaque, []byte("v")); !errors.Is(err, ErrExists) || errors.Is(err, ErrQuota) {
+			t.Fatalf("put of an existing name at the bound: %v, want ErrExists", err)
+		}
+		if err := checkScopeQuotaAt(t, u, "e1"); err != nil {
+			t.Fatalf("checkScopeQuota of an existing name at the bound: %v, want nil", err)
+		}
 		if err := u.Delete(ctx, "user/1001/e1"); err != nil {
 			t.Fatalf("rm at the bound: %v", err)
 		}
@@ -446,4 +454,15 @@ func FuzzParseDeliveriesRecord(f *testing.F) {
 			t.Fatal("an accepted record does not re-encode to its input")
 		}
 	})
+}
+
+// checkScopeQuotaAt runs checkScopeQuota for name in uid 1001's entries.
+func checkScopeQuotaAt(t *testing.T, u *UserScope, name string) error {
+	t.Helper()
+	root, err := os.OpenRoot(filepath.Join(scopeDir(filepath.Dir(u.s.dir), "1001"), scopeEntriesName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	return checkScopeQuota(root, name, []byte("v"))
 }
