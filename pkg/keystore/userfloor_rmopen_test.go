@@ -80,7 +80,7 @@ func TestUserRmNoGenerationRefusesFirst(t *testing.T) {
 			kept = append(kept, l...)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(s.dataRoot, userFloorLogName), kept, logMode); err != nil {
+	if err := os.WriteFile(filepath.Join(s.dataRoot, logsDirName, userFloorLogName), kept, logMode); err != nil {
 		t.Fatal(err)
 	}
 	for _, f := range []string{generationName, currentName} {

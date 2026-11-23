@@ -105,6 +105,10 @@ type Config struct {
 	// A negative value, or a nonzero one in a process whose effective uid is
 	// 0, makes every operation fail: root's floor belongs to root.
 	FloorUID, FloorGID int
+	// LogFlags is the append-only logs' flag source, for tests only: nil,
+	// as production leaves it, reads each log's st_flags with fstat. A
+	// non-root test, which cannot set SF_APPEND, supplies one.
+	LogFlags func(*os.File) (uint32, error)
 	// LogSoftCap and LogHardCap are each append-only log's soft and hard
 	// caps in bytes (keystore.logSoftCap, keystore.logHardCap), and
 	// LogRevocationBudget each uid's bytes per log for the revocation class
@@ -214,6 +218,9 @@ func New(cfg Config) *FileStore {
 		userScopesStarted: new(atomic.Bool),
 		quarantined:       new(atomic.Pointer[map[uint32]bool]),
 		lostLines:         new(lostEntryLines),
+	}
+	if cfg.LogFlags != nil {
+		s.logFlags = cfg.LogFlags
 	}
 	s.userFloor, s.auditSink = newFileFloorLog(s), newFileAuditLog(s)
 	return s

@@ -25,8 +25,8 @@ import (
 )
 
 // UserFloorLogName, AuditLogName and RunDirName are the names install
-// creates in the data root: the two append-only logs and the keystore's
-// run directory (docs/design/keystore.md § "The user-scope floor").
+// creates: the two append-only logs, in LogsDirName, and the keystore's
+// run directory in the data root (docs/design/keystore.md § "The user-scope floor").
 // UserScopesDirName is the user scopes' directory in the entries'
 // directory, whose presence makes a missing floor a restore, not an
 // install.
@@ -35,6 +35,11 @@ const (
 	AuditLogName      = auditLogName
 	RunDirName        = "keystore-run"
 	UserScopesDirName = userScopesName
+	// LogsDirName is the logs' directory in the data root, root's 0755
+	// (0700 while a swap holds its gate closed), and StagingDirName the
+	// root-only staging directory a new log is written in.
+	LogsDirName    = logsDirName
+	StagingDirName = stagingDirName
 )
 
 // MaintenanceMarkerName is the maintenance marker in the data root:

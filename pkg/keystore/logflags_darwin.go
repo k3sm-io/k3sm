@@ -106,3 +106,6 @@ func fdHasACL(fd int) (bool, error) {
 	count := le.Uint32(sec[filesecEntryCount:])
 	return count != 0 && count != filesecNoACL, nil
 }
+
+// statFlags is st's st_flags.
+func statFlags(st *unix.Stat_t) uint32 { return st.Flags }

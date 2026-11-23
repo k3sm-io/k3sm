@@ -297,9 +297,14 @@ func (s *FileStore) writeFloorAck(ff *fileFloorLog, want floorReview) error {
 	defer func() { _ = unix.Close(dfd) }() // the write is fsynced in writeFileAt
 	// The acknowledgement names the floor file in the directory it is
 	// written to: the judged descriptor's entry must be the file sized.
+	lfd, err := s.openLogsDir(dfd, false)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(lfd) }() // read-only
 	var named unix.Stat_t
-	if err := unix.Fstatat(dfd, userFloorLogName, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return fmt.Errorf("stat the user-scope floor in the data root: %w", err)
+	if err := unix.Fstatat(lfd, userFloorLogName, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("stat the user-scope floor in %s: %w", logsDirName, err)
 	}
 	if named.Dev != st.Dev || named.Ino != st.Ino {
 		return errAckStale

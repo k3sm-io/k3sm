@@ -72,7 +72,7 @@ func TestRmBurialSyncFailureVisibleCommits(t *testing.T) {
 		fl := s.userFloor.(*fileFloorLog).log
 		if foreign {
 			fl.write = func(f *os.File, b []byte) (int, error) {
-				g, err := os.OpenFile(filepath.Join(s.dataRoot, userFloorLogName), os.O_WRONLY|os.O_APPEND, 0)
+				g, err := os.OpenFile(filepath.Join(s.dataRoot, logsDirName, userFloorLogName), os.O_WRONLY|os.O_APPEND, 0)
 				if err != nil {
 					return 0, err
 				}
@@ -116,7 +116,7 @@ func TestRmBurialForeignAppendBeforeShortWriteCommits(t *testing.T) {
 	gen := entryGeneration(t, server, "token")
 	fl := s.userFloor.(*fileFloorLog).log
 	fl.write = func(f *os.File, b []byte) (int, error) {
-		g, err := os.OpenFile(filepath.Join(s.dataRoot, userFloorLogName), os.O_WRONLY|os.O_APPEND, 0)
+		g, err := os.OpenFile(filepath.Join(s.dataRoot, logsDirName, userFloorLogName), os.O_WRONLY|os.O_APPEND, 0)
 		if err != nil {
 			return 0, err
 		}

@@ -178,7 +178,7 @@ func TestRebuildCarriesTombstonesForward(t *testing.T) {
 	}
 
 	// A floor that cannot be read refuses, changing nothing.
-	p := filepath.Join(s.dataRoot, userFloorLogName)
+	p := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
 	before := readLog(t, s, userFloorLogName)
 	aside := p + ".aside"
 	if err := os.Rename(p, aside); err != nil {
@@ -331,8 +331,9 @@ func TestCopiedBackDeliveriesRecordRefused(t *testing.T) {
 }
 
 // U25: a restored tree whose logs lost their flags is refused until floor
-// --rebuild, which flags the new floor on its held descriptor and hands it
-// to the service user only after, then opens.
+// --rebuild, which hands the new floor to the service user in staging,
+// closes the gate, retires the old floor, and flags the new one on its held
+// descriptor after its rename, then opens.
 func TestBackupRestoreRoundTripRebuild(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
@@ -344,7 +345,7 @@ func TestBackupRestoreRoundTripRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	copyTree(t, filepath.Join(backup, "keystore"), ks)
-	p := filepath.Join(s.dataRoot, userFloorLogName)
+	p := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
 	if err := os.Remove(p); err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +370,8 @@ func TestBackupRestoreRoundTripRebuild(t *testing.T) {
 	assertNoMaintenanceLeft(t, s)
 	svc := fmt.Sprintf("fchown %d", s.uid)
 	root := fmt.Sprintf("fchown %d", s.floorUID)
-	want := []string{root, "fchmod 600", "fchflags 0x0", root, "fchmod 600", fmt.Sprintf("fchflags %#x", sfAppend), svc}
+	_ = root
+	want := []string{svc, "fchmod 600", "fchmod 700", "fchflags 0x0", fmt.Sprintf("fchflags %#x", sfAppend), "fchmod 755"}
 	if strings.Join(rec.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("attribute calls %q, want %q", rec.calls, want)
 	}
@@ -391,7 +393,7 @@ func TestRebuildKeepsDamagedEntryCorrupt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The restored floor lost the entry's line.
-	if err := os.WriteFile(filepath.Join(s.dataRoot, userFloorLogName), nil, logMode); err != nil {
+	if err := os.WriteFile(filepath.Join(s.dataRoot, logsDirName, userFloorLogName), nil, logMode); err != nil {
 		t.Fatal(err)
 	}
 	rebuild(t, s)

@@ -46,7 +46,7 @@ func TestAppendOnlyFlagHoldsAsRoot(t *testing.T) {
 		t.Skip("root-only: SF_APPEND can only be set by root")
 	}
 	s, _ := newTestStore(t)
-	p := filepath.Join(s.dataRoot, userFloorLogName)
+	p := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
 	if err := os.WriteFile(p, []byte("first\n"), logMode); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestAppendOnlyFlagHoldsAsRoot(t *testing.T) {
 	if err := os.WriteFile(other, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(s.dataRoot, "floor-link")
+	link := filepath.Join(s.dataRoot, logsDirName, "floor-link")
 	// rw is the O_RDWR|O_APPEND descriptor, when the open is allowed: the
 	// pwrite, mmap and punch-hole attempts go through it.
 	rw := -1

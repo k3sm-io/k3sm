@@ -95,7 +95,7 @@ func TestLogErrorsNameNoFigures(t *testing.T) {
 	})
 	t.Run("log mode", func(t *testing.T) {
 		s, _, u := fileLogScope(t)
-		if err := os.Chmod(filepath.Join(s.dataRoot, userFloorLogName), 0o640); err != nil {
+		if err := os.Chmod(filepath.Join(s.dataRoot, logsDirName, userFloorLogName), 0o640); err != nil {
 			t.Fatal(err)
 		}
 		_, _, err := u.Current(ctx, "user/1001/token")
@@ -105,7 +105,7 @@ func TestLogErrorsNameNoFigures(t *testing.T) {
 	})
 	t.Run("log links", func(t *testing.T) {
 		s, _, u := fileLogScope(t)
-		if err := os.Link(filepath.Join(s.dataRoot, userFloorLogName), filepath.Join(s.dataRoot, "floor-link")); err != nil {
+		if err := os.Link(filepath.Join(s.dataRoot, logsDirName, userFloorLogName), filepath.Join(s.dataRoot, logsDirName, "floor-link")); err != nil {
 			t.Fatal(err)
 		}
 		_, _, err := u.Current(ctx, "user/1001/token")

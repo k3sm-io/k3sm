@@ -71,7 +71,7 @@ func TestLogDataRootRefusesExtraFlags(t *testing.T) {
 func TestLogRefusesExtendedACL(t *testing.T) {
 	ctx := context.Background()
 	s, _, u := fileLogScope(t)
-	for _, p := range []string{filepath.Join(s.dataRoot, userFloorLogName), s.dataRoot} {
+	for _, p := range []string{filepath.Join(s.dataRoot, logsDirName, userFloorLogName), s.dataRoot} {
 		t.Run(filepath.Base(p), func(t *testing.T) {
 			if out, err := exec.Command("/bin/chmod", "+a", "everyone deny delete", p).CombinedOutput(); err != nil {
 				t.Fatalf("chmod +a: %v: %s", err, out)

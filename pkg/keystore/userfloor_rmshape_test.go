@@ -121,7 +121,7 @@ func TestUserRmRetryAfterTreeGoneBuries(t *testing.T) {
 func TestUserRmBuriesVersionHeaderGeneration(t *testing.T) {
 	ctx := context.Background()
 	s, u, dir, saved := rmShapeSetup(t)
-	floorPath := filepath.Join(s.dataRoot, userFloorLogName)
+	floorPath := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
 	var kept []byte
 	for _, l := range bytes.SplitAfter(readLog(t, s, userFloorLogName), []byte{'\n'}) {
 		if !bytes.Contains(l, []byte(" token ")) {

@@ -50,6 +50,13 @@ func newTestStore(t *testing.T) (*FileStore, string) {
 		t.Fatal(err)
 	}
 	giveToService(t, server)
+	// keystore-logs/, root's 0755, as install makes it.
+	if err := os.Mkdir(filepath.Join(data, logsDirName), logsDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(data, logsDirName), logsDirMode); err != nil {
+		t.Fatal(err)
+	}
 	// Non-root, a test cannot create a root-owned file, so the test user
 	// stands in for root as the floor's owner.
 	floorUID, floorGID := floorIDs()

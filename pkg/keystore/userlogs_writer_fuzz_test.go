@@ -64,7 +64,7 @@ func writerFuzzSync(t *testing.T, l *appendLog) *logState {
 // would.
 func rewriteLog(t *testing.T, s *FileStore, name string, b []byte, newInode bool) {
 	t.Helper()
-	p := filepath.Join(s.dataRoot, name)
+	p := filepath.Join(s.dataRoot, logsDirName, name)
 	if newInode {
 		tmp := p + ".new"
 		if err := os.WriteFile(tmp, b, logMode); err != nil {
@@ -100,8 +100,11 @@ func FuzzLogWriter(f *testing.F) {
 			logHardCap: int64(64 + 32*d.next()), logRevokeBudget: int64(1 + 64*d.next())}
 		s.logSoftCap = s.logHardCap
 		maxKeys := 1 + d.next()%8
+		if err := os.Mkdir(filepath.Join(s.dataRoot, logsDirName), logsDirMode); err != nil {
+			t.Fatal(err)
+		}
 		for _, n := range []string{userFloorLogName, auditLogName} {
-			if err := os.WriteFile(filepath.Join(s.dataRoot, n), nil, logMode); err != nil {
+			if err := os.WriteFile(filepath.Join(s.dataRoot, logsDirName, n), nil, logMode); err != nil {
 				t.Fatal(err)
 			}
 		}

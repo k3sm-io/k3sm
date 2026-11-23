@@ -36,17 +36,17 @@ func TestCheckLogBoundsFailsClosed(t *testing.T) {
 		inject func(t *testing.T, s *FileStore)
 	}{
 		{"missing floor", func(t *testing.T, s *FileStore) {
-			if err := os.Remove(filepath.Join(s.dataRoot, userFloorLogName)); err != nil {
+			if err := os.Remove(filepath.Join(s.dataRoot, logsDirName, userFloorLogName)); err != nil {
 				t.Fatal(err)
 			}
 		}},
 		{"missing audit", func(t *testing.T, s *FileStore) {
-			if err := os.Remove(filepath.Join(s.dataRoot, auditLogName)); err != nil {
+			if err := os.Remove(filepath.Join(s.dataRoot, logsDirName, auditLogName)); err != nil {
 				t.Fatal(err)
 			}
 		}},
 		{"untrusted", func(t *testing.T, s *FileStore) {
-			if err := os.Chmod(filepath.Join(s.dataRoot, userFloorLogName), 0o644); err != nil {
+			if err := os.Chmod(filepath.Join(s.dataRoot, logsDirName, userFloorLogName), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}},

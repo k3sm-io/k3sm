@@ -142,7 +142,7 @@ func TestUserRmBuriesBeforeRemoval(t *testing.T) {
 func TestUserRmAbsentFloorRemovesNothing(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
-	floorPath := filepath.Join(s.dataRoot, userFloorLogName)
+	floorPath := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
 	saved, err := os.ReadFile(floorPath)
 	if err != nil {
 		t.Fatal(err)

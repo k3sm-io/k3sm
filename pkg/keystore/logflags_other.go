@@ -21,6 +21,8 @@ package keystore
 import (
 	"errors"
 	"os"
+
+	"golang.org/x/sys/unix"
 )
 
 // fileFlags is the chflags flag source. Off darwin no file carries
@@ -36,3 +38,6 @@ func fdFlags(int) (uint32, error) { return 0, nil }
 // fdHasACL reports an extended ACL. Off darwin it is not read, and every log
 // is refused all the same (fileFlags).
 func fdHasACL(int) (bool, error) { return false, nil }
+
+// statFlags is st's st_flags. Off darwin there are no file flags.
+func statFlags(*unix.Stat_t) uint32 { return 0 }

@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -101,6 +102,9 @@ type keysHarness struct {
 	// cfg is the Config the verb built from the install layout; storeCfg is
 	// the one the store was opened with, cfg with the test's floor owner.
 	cfg, storeCfg keystore.Config
+	// logFlags, when set, is the store's flag source (keystore.Config.LogFlags):
+	// a non-root test cannot set SF_APPEND.
+	logFlags func(*os.File) (uint32, error)
 	// wrap, when set, replaces the store the verbs get; nil is the real
 	// store. Each test that sets it says why the real store will not do.
 	wrap      func(keysStore) keysStore
@@ -154,6 +158,7 @@ func (h *keysHarness) run(args ...string) int {
 			// user stands in for root as the floor's owner.
 			h.storeCfg = cfg
 			h.storeCfg.FloorUID, h.storeCfg.FloorGID = keysFloorIDs()
+			h.storeCfg.LogFlags = h.logFlags
 			var s keysStore = keystore.New(h.storeCfg)
 			if h.wrap != nil {
 				s = h.wrap(s)
@@ -1721,7 +1726,12 @@ func TestKeysStoreConfigFromLayout(t *testing.T) {
 		GID:       gid,
 		DataRoot:  filepath.Dir(h.work),
 	}
-	if h.cfg != want {
+	got := h.cfg
+	if got.LogFlags != nil {
+		t.Fatal("the install layout's config sets a flag source; production reads st_flags")
+	}
+	got.LogFlags = nil
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("store config = %+v, want %+v", h.cfg, want)
 	}
 	if h.cfg.FloorUID != 0 || h.cfg.FloorGID != 0 {

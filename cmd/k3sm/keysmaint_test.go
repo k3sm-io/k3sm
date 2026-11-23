@@ -85,7 +85,11 @@ func TestKeysMaintenanceVerbs(t *testing.T) {
 	}
 
 	h.euid = 0
-	floor := filepath.Join(h.cfg.DataRoot, "keystore-user-floor.log")
+	h.logFlags = keysFlagged
+	if err := os.Mkdir(filepath.Join(h.cfg.DataRoot, keystore.LogsDirName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	floor := filepath.Join(h.cfg.DataRoot, keystore.LogsDirName, "keystore-user-floor.log")
 	if err := os.WriteFile(floor, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -139,6 +143,10 @@ func (r *keysInoRecorder) Fchflags(fd, flags int) error {
 	return nil
 }
 
+// keysFlagged is a flag source that reports SF_APPEND on every log, as the
+// maintenance verbs leave each one: a non-root test cannot set it.
+func keysFlagged(*os.File) (uint32, error) { return 0x00040000, nil }
+
 // keysIno is the inode at path.
 func keysIno(t *testing.T, path string) uint64 {
 	t.Helper()
@@ -181,12 +189,17 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	}
 	h.euid = 0
 
+	h.logFlags = keysFlagged
 	root := h.cfg.DataRoot
+	logs := filepath.Join(root, keystore.LogsDirName)
+	if err := os.Mkdir(logs, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	name := func(n int) string {
 		if n == 0 {
-			return filepath.Join(root, keystore.AuditLogName)
+			return filepath.Join(logs, keystore.AuditLogName)
 		}
-		return filepath.Join(root, fmt.Sprintf("%s.%d", keystore.AuditLogName, n))
+		return filepath.Join(logs, fmt.Sprintf("%s.%d", keystore.AuditLogName, n))
 	}
 	write := func(n int, s string) {
 		t.Helper()
@@ -194,6 +207,9 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// read drops the verb's own audit-rotate line, which AuditRoot appends
+	// to the new log once the verb is done (step 9), and the newline each
+	// append leads with.
 	read := func(n int) string {
 		t.Helper()
 		b, err := os.ReadFile(name(n))
@@ -203,7 +219,14 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return string(b)
+		var out strings.Builder
+		for _, l := range strings.SplitAfter(string(b), "\n") {
+			if l == "\n" || strings.Contains(l, `"op":"audit-rotate"`) {
+				continue
+			}
+			out.WriteString(l)
+		}
+		return out.String()
 	}
 	want := func(step string, contents ...string) {
 		t.Helper()
@@ -233,18 +256,20 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	if got := read(0); got != "" {
 		t.Errorf("the new audit log holds %q, want it empty: every share restarts at 0", got)
 	}
-	cleared := []string{"fchflags 0x0", "fchown", "fchmod 600"}
 	flagged := fmt.Sprintf("fchflags %#x", 0x00040000)
 	for n := 2; n <= 3; n++ {
-		if got := rec.calls[keysIno(t, name(n))]; !slices.Equal(got, append(slices.Clone(cleared), flagged)) {
-			t.Errorf("the archive shifted to .%d saw %q on its descriptor, want %q then %s", n, got, cleared, flagged)
+		if got := rec.calls[keysIno(t, name(n))]; len(got) != 0 {
+			t.Errorf("the archive shifted to .%d saw %q on its descriptor, want none: archives are root's and unflagged", n, got)
 		}
 	}
-	if got := rec.calls[keysIno(t, name(1))]; !slices.Equal(got, append(slices.Clone(cleared), flagged)) {
-		t.Errorf("the old log, now .1, saw %q on its descriptor, want %q then %s", got, cleared, flagged)
+	if got := rec.calls[keysIno(t, name(1))]; !slices.Equal(got, []string{"fchmod 600"}) {
+		t.Errorf("the new archive .1 saw %q on its descriptor, want root's 0600 only", got)
 	}
-	if got := rec.calls[keysIno(t, name(0))]; !slices.Equal(got, []string{"fchown", "fchmod 600", flagged, "fchown"}) {
-		t.Errorf("the new log saw %q, want root's 0600, the flag, then the service user", got)
+	if got := rec.calls[keysIno(t, name(0))]; !slices.Equal(got, []string{"fchown", "fchmod 600", flagged}) {
+		t.Errorf("the new log saw %q, want the service user, 0600, then the flag", got)
+	}
+	if got := rec.calls[keysIno(t, logs)]; !slices.Equal(got, []string{"fchmod 700", "fchmod 755"}) {
+		t.Errorf("%s saw %q, want the gate closed, then opened", keystore.LogsDirName, got)
 	}
 	for _, n := range []string{"keystore-maintenance", "keystore-staging"} {
 		if _, err := os.Lstat(filepath.Join(root, n)); !errors.Is(err, os.ErrNotExist) {

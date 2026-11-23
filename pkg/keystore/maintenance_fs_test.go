@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -103,7 +104,7 @@ func inoOf(t *testing.T, p string) (uint64, uint16) {
 // 0600, as rotate leaves it.
 func placeArchive(t *testing.T, s *FileStore, n int, data string) string {
 	t.Helper()
-	p := filepath.Join(s.dataRoot, auditArchiveName(n))
+	p := filepath.Join(s.dataRoot, logsDirName, auditArchiveName(n))
 	if err := os.WriteFile(p, []byte(data), logMode); err != nil {
 		t.Fatal(err)
 	}
@@ -130,38 +131,52 @@ var maintVerbs = []maintVerb{
 	}},
 }
 
-// TestMaintenanceOwnsBeforeUnflag (U118's order): the old log, and each
-// archive rotate shifts, has its flag cleared and is made root's 0600 in
-// the next two calls on its own descriptor, with no other call between. The
-// flag refuses a change of owner, so the clear comes first.
-func TestMaintenanceOwnsBeforeUnflag(t *testing.T) {
+// TestSwapCallOrder (U118's order): each verb hands the new log to the
+// service user and sets its mode in staging, then closes the gate, then
+// clears the old log's flag (its only call: it is never chowned), then flags
+// the new log after its rename, and opens the gate last. No archive takes
+// an attribute call: archives are root's and unflagged.
+func TestSwapCallOrder(t *testing.T) {
 	for _, v := range maintVerbs {
 		t.Run(v.name, func(t *testing.T) {
 			s, _, _ := fileLogScope(t)
-			watched := map[uint64]string{}
-			ino, _ := inoOf(t, filepath.Join(s.dataRoot, v.log))
-			watched[ino] = "the old " + v.log
+			p := filepath.Join(s.dataRoot, logsDirName, v.log)
+			oldIno, _ := inoOf(t, p)
+			dirIno, _ := inoOf(t, filepath.Join(s.dataRoot, logsDirName))
+			var archives []uint64
 			if v.log == auditLogName {
 				for n := 1; n <= 3; n++ {
 					ino, _ := inoOf(t, placeArchive(t, s, n, fmt.Sprintf("archive %d\n", n)))
-					watched[ino] = auditArchiveName(n)
+					archives = append(archives, ino)
 				}
 			}
 			rec := &inoRecorder{}
 			if err := v.run(s, rec); err != nil {
 				t.Fatal(err)
 			}
-			root := fmt.Sprintf("fchown %d", s.floorUID)
-			for ino, what := range watched {
-				got := rec.of(ino)
-				if len(got) < 3 || got[0] != "fchflags 0x0" || got[1] != root || got[2] != "fchmod 600" {
-					t.Errorf("%s's first calls are %q, want the flag clear, then root's ownership and 0600", what, got)
+			newIno, _ := inoOf(t, p)
+			svc := fmt.Sprintf("fchown %d", s.uid)
+			flag := fmt.Sprintf("fchflags %#x", sfAppend)
+			if got, want := rec.of(newIno), []string{svc, "fchmod 600", flag}; !slices.Equal(got, want) {
+				t.Errorf("the new log's calls %q, want %q", got, want)
+			}
+			if got, want := rec.of(oldIno), []string{"fchflags 0x0"}; !slices.Equal(got, want) {
+				t.Errorf("the old log's calls %q, want %q", got, want)
+			}
+			if got, want := rec.of(dirIno), []string{"fchmod 700", "fchmod 755"}; !slices.Equal(got, want) {
+				t.Errorf("%s's calls %q, want %q", logsDirName, got, want)
+			}
+			for _, a := range archives {
+				if got := rec.of(a); len(got) != 0 {
+					t.Errorf("an archive took calls %q", got)
 				}
 			}
-			for i, c := range rec.calls {
-				if c.call == "fchflags 0x0" && watched[c.ino] != "" && (i+2 >= len(rec.calls) || rec.calls[i+1].ino != c.ino || rec.calls[i+2].ino != c.ino) {
-					t.Errorf("another call came between %s's chown, chmod and flag clear", watched[c.ino])
-				}
+			at := func(ino uint64, call string) int {
+				return slices.IndexFunc(rec.calls, func(c inoCall) bool { return c.ino == ino && c.call == call })
+			}
+			order := []int{at(newIno, svc), at(newIno, "fchmod 600"), at(dirIno, "fchmod 700"), at(oldIno, "fchflags 0x0"), at(newIno, flag), at(dirIno, "fchmod 755")}
+			if !slices.IsSorted(order) || order[0] < 0 || order[len(order)-1] != len(rec.calls)-1 {
+				t.Errorf("call order %v over %d calls, want owner, mode, gate closed, old flag cleared, new flag, gate opened last", order, len(rec.calls))
 			}
 			assertNoMaintenanceLeft(t, s)
 		})
@@ -171,14 +186,14 @@ func TestMaintenanceOwnsBeforeUnflag(t *testing.T) {
 // TestMaintenanceRepairsHardLinkedLog: a hard link planted on a log makes
 // the steady-state check refuse it, naming the verb that repairs it; that
 // verb takes the linked log as input and succeeds, and the new canonical
-// log is a fresh inode with one link. For rotate the old inode is .1,
-// root's 0600, and a second rotate shifts the still-linked .1 with a Warn.
+// log is a fresh inode with one link. For rotate .1 is a fresh root 0600
+// copy of the old log, and the planted link keeps only the retired inode.
 func TestMaintenanceRepairsHardLinkedLog(t *testing.T) {
 	for _, v := range maintVerbs {
 		t.Run(v.name, func(t *testing.T) {
 			s, _, _ := fileLogScope(t)
-			p := filepath.Join(s.dataRoot, v.log)
-			link := filepath.Join(s.dataRoot, "keystore-planted-link")
+			p := filepath.Join(s.dataRoot, logsDirName, v.log)
+			link := filepath.Join(s.dataRoot, logsDirName, "keystore-planted-link")
 			if err := os.Link(p, link); err != nil {
 				t.Fatal(err)
 			}
@@ -204,15 +219,12 @@ func TestMaintenanceRepairsHardLinkedLog(t *testing.T) {
 			if v.log != auditLogName {
 				return
 			}
-			one := filepath.Join(s.dataRoot, auditArchiveName(1))
-			if ino, nl := inoOf(t, one); ino != oldIno || nl != 2 {
-				t.Fatalf(".1 is inode %d with %d links, want the old log (%d), still linked", ino, nl, oldIno)
+			one := filepath.Join(s.dataRoot, logsDirName, auditArchiveName(1))
+			if ino, nl := inoOf(t, one); ino == oldIno || nl != 1 {
+				t.Fatalf(".1 is inode %d with %d links, want a fresh copy, not the old log (%d)", ino, nl, oldIno)
 			}
-			if _, err := s.RotateAudit(context.Background(), &inoRecorder{}, false); err != nil {
-				t.Fatalf("rotate over a linked root 0600 archive: %v, want a Warn only", err)
-			}
-			if ino, _ := inoOf(t, filepath.Join(s.dataRoot, auditArchiveName(2))); ino != oldIno {
-				t.Fatal("the linked archive was not shifted to .2")
+			if ino, nl := inoOf(t, link); ino != oldIno || nl != 1 {
+				t.Fatalf("the planted link is inode %d with %d links, want the retired old log alone", ino, nl)
 			}
 		})
 	}
@@ -355,7 +367,7 @@ func TestMaintenanceJudgesMarkerAndStale(t *testing.T) {
 		if err := os.Chmod(p, logMode); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Link(p, filepath.Join(s.dataRoot, "keystore-archive-alias")); err != nil {
+		if err := os.Link(p, filepath.Join(s.dataRoot, logsDirName, "keystore-archive-alias")); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := s.RotateAudit(context.Background(), &inoRecorder{}, false); err != nil {
@@ -365,35 +377,37 @@ func TestMaintenanceJudgesMarkerAndStale(t *testing.T) {
 }
 
 // TestRotateFinishesAfterCrashBeforeNewLog: a crash after the old audit
-// log was renamed to .1 and before the new log was renamed in leaves the
-// marker, no canonical log and .1; the rerun writes, flags and hands over a
-// fresh log, flags .1 and removes the marker. Without the marker a missing
-// audit log refuses, as before.
+// log was retired and its archive renamed to .1, before the staged new log
+// was renamed in, leaves the marker, no canonical log, .1 and the staged
+// log; the rerun renames, flags and judges the staged log, opens the gate
+// and removes the marker. Without the marker a missing audit log refuses.
 func TestRotateFinishesAfterCrashBeforeNewLog(t *testing.T) {
 	crash := func(t *testing.T, s *FileStore, marker bool) uint64 {
 		t.Helper()
-		p := filepath.Join(s.dataRoot, auditLogName)
-		if err := os.WriteFile(p, []byte("old line\n"), logMode); err != nil {
+		if err := os.Remove(filepath.Join(s.dataRoot, logsDirName, auditLogName)); err != nil {
 			t.Fatal(err)
 		}
-		// The crash left the old log root's 0600, as .1.
-		if err := os.Chown(p, s.floorUID, s.floorGID); err != nil {
-			t.Fatal(err)
-		}
-		ino, _ := inoOf(t, p)
-		if err := os.Rename(p, filepath.Join(s.dataRoot, auditArchiveName(1))); err != nil {
-			t.Fatal(err)
-		}
+		placeArchive(t, s, 1, "old line\n")
 		if marker {
 			if err := os.WriteFile(filepath.Join(s.dataRoot, maintenanceMarkerName), nil, markerMode); err != nil {
 				t.Fatal(err)
 			}
+			if err := os.Mkdir(filepath.Join(s.dataRoot, stagingDirName), stagingDirMode); err != nil {
+				t.Fatal(err)
+			}
+			staged := filepath.Join(s.dataRoot, stagingDirName, auditStagingName)
+			if err := os.WriteFile(staged, nil, logMode); err != nil {
+				t.Fatal(err)
+			}
+			giveToService(t, staged)
+			ino, _ := inoOf(t, staged)
+			return ino
 		}
-		return ino
+		return 0
 	}
 	t.Run("with the marker", func(t *testing.T) {
 		s, _, _ := fileLogScope(t)
-		oneIno := crash(t, s, true)
+		stagedIno := crash(t, s, true)
 		rec := &inoRecorder{}
 		rep, err := s.RotateAudit(context.Background(), rec, false)
 		if err != nil {
@@ -402,18 +416,14 @@ func TestRotateFinishesAfterCrashBeforeNewLog(t *testing.T) {
 		if rep.Archives != 1 {
 			t.Errorf("kept %d archives, want 1", rep.Archives)
 		}
-		newIno, nlink := inoOf(t, filepath.Join(s.dataRoot, auditLogName))
-		if newIno == oneIno || nlink != 1 {
-			t.Fatalf("the canonical log after the rerun is inode %d with %d links", newIno, nlink)
+		newIno, nlink := inoOf(t, filepath.Join(s.dataRoot, logsDirName, auditLogName))
+		if newIno != stagedIno || nlink != 1 {
+			t.Fatalf("the canonical log after the rerun is inode %d with %d links, want the staged %d", newIno, nlink, stagedIno)
 		}
-		svc := fmt.Sprintf("fchown %d", s.uid)
-		if got := rec.of(newIno); len(got) < 2 || got[len(got)-2] != fmt.Sprintf("fchflags %#x", sfAppend) || got[len(got)-1] != svc {
-			t.Errorf("the new log's calls %q, want it flagged and then handed over", got)
+		if got := rec.of(newIno); len(got) != 1 || got[0] != fmt.Sprintf("fchflags %#x", sfAppend) {
+			t.Errorf("the new log's calls %q, want it flagged", got)
 		}
-		if got := rec.of(oneIno); len(got) != 1 || got[0] != fmt.Sprintf("fchflags %#x", sfAppend) {
-			t.Errorf(".1's calls %q, want its flag set", got)
-		}
-		if b, err := os.ReadFile(filepath.Join(s.dataRoot, auditArchiveName(1))); err != nil || string(b) != "old line\n" {
+		if b, err := os.ReadFile(filepath.Join(s.dataRoot, logsDirName, auditArchiveName(1))); err != nil || string(b) != "old line\n" {
 			t.Errorf(".1 holds %q, %v; want the old log", b, err)
 		}
 		assertNoMaintenanceLeft(t, s)
@@ -427,7 +437,7 @@ func TestRotateFinishesAfterCrashBeforeNewLog(t *testing.T) {
 		if _, err := s.RotateAudit(context.Background(), &inoRecorder{}, false); !errors.Is(err, errRotateRefused) {
 			t.Fatalf("rotate with no audit log and no marker: %v, want refused", err)
 		}
-		if _, err := os.Lstat(filepath.Join(s.dataRoot, auditLogName)); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(filepath.Join(s.dataRoot, logsDirName, auditLogName)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("the refused rotate made an audit log: %v", err)
 		}
 		assertNoMaintenanceLeft(t, s)
@@ -441,7 +451,7 @@ func TestRotateFinishesAfterCrashBeforeNewLog(t *testing.T) {
 func TestAuditRootRefusesMissingLogInMaintenance(t *testing.T) {
 	s, _ := newMasteredStore(t)
 	withFileLogs(t, s)
-	if err := os.Remove(filepath.Join(s.dataRoot, auditLogName)); err != nil {
+	if err := os.Remove(filepath.Join(s.dataRoot, logsDirName, auditLogName)); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()

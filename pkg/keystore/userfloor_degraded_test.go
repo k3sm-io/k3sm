@@ -35,7 +35,7 @@ func corruptTombstones(t *testing.T, s *FileStore, scope, name string, gen [gene
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := filepath.Join(s.dataRoot, userFloorLogName)
+	p := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
 	b := readLog(t, s, userFloorLogName)
 	f, err := os.OpenFile(p, os.O_WRONLY, 0)
 	if err != nil {

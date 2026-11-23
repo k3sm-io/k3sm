@@ -33,7 +33,7 @@ import (
 // writer.
 func setFloorBytes(t *testing.T, s *FileStore, b []byte) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(s.dataRoot, userFloorLogName), b, logMode); err != nil {
+	if err := os.WriteFile(filepath.Join(s.dataRoot, logsDirName, userFloorLogName), b, logMode); err != nil {
 		t.Fatal(err)
 	}
 	if ff, ok := s.userFloor.(*fileFloorLog); ok {
