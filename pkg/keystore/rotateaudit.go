@@ -81,7 +81,7 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 	}
 	defer m.end()
 	if m.saved != nil {
-		return RotateReport{Archives: int(m.saved["archives"]), Discarded: m.saved["discarded"] != 0, Earlier: true}, nil
+		return RotateReport{Archives: int(m.saved["archives"]), Discarded: m.saved["discarded"] != 0, Earlier: true}, m.savedErr
 	}
 	if err := m.step(swapStepReadOld); err != nil {
 		return rep, fmt.Errorf("%w: %w", errRotateRefused, err)
