@@ -643,10 +643,47 @@ func pendingSince(rec retiredRecord, live floor, gone map[floorBurial]bool) (boo
 	if rmSince(read, live, gone) {
 		return false, nil
 	}
-	if rerr := buriedSince(read, live, gone); rerr == nil {
+	// Not written only when live holds none of what the merge's write
+	// changed: a fence, a raise, a recorded live record or a burial of the
+	// floor written that the floor read lacks says the merge wrote it, and
+	// something changed it after, which is committed.
+	if rerr := buriedSince(read, live, gone); rerr == nil && !carriesWrite(read, written, live) {
 		return false, &notWrittenError{written: werr}
 	}
 	return false, werr
+}
+
+// carriesWrite reports whether now holds something the floor written
+// changed from the floor read: a live record whose generation, sequence or
+// high-water mark is written's and not read's, or a burial written holds,
+// at written's delete sequence, of a generation read does not bury. rm
+// under the guard makes none of these, so a floor that holds one was
+// written by the merge.
+func carriesWrite(read, written, now floor) bool {
+	for name, w := range written {
+		r, n := read[name], now[name]
+		if w.live() && n.live() && n.Generation == w.Generation {
+			switch {
+			case !r.live() || r.Generation != w.Generation:
+				return true
+			case w.Seq != r.Seq && n.Seq == w.Seq:
+				return true
+			case w.HighWater != r.HighWater && n.HighWater == w.HighWater:
+				return true
+			}
+		}
+		for _, b := range w.burials() {
+			if r.buries(b.Generation) {
+				continue
+			}
+			for _, x := range n.burials() {
+				if x == b {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // notWrittenError is pendingSince's answer for a live floor that holds
