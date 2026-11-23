@@ -122,6 +122,7 @@ type startChecks struct {
 	reopens    int
 	servers    int
 	serversErr error
+	countGate  chan struct{} // when set, a count waits for it to close or its ctx to end
 	listens    int
 	counted    int
 	ln         net.Listener // what the listener source returns
@@ -258,7 +259,17 @@ func (r *supRig) config() SupervisorConfig {
 			return ck.ignores, ck.mountErr
 		},
 		CheckInstall: func(context.Context) error { ck.mu.Lock(); defer ck.mu.Unlock(); ck.boom("install"); return ck.install },
-		ServerCount: func(context.Context) (int, error) {
+		ServerCount: func(ctx context.Context) (int, error) {
+			ck.mu.Lock()
+			gate := ck.countGate
+			ck.mu.Unlock()
+			if gate != nil {
+				select {
+				case <-gate:
+				case <-ctx.Done():
+					return 0, ctx.Err()
+				}
+			}
 			ck.mu.Lock()
 			defer ck.mu.Unlock()
 			ck.counted++
@@ -731,5 +742,75 @@ func TestSandboxSelfCheckKeepsListenerOff(t *testing.T) {
 		r.ck.set(func(c *startChecks) { c.sandboxErr = nil })
 		advance(MinBackoff)
 		r.wantState(t, PhaseServing, "", 0)
+	})
+}
+
+// TestSecondServerStopsServingListener checks a serving listener counts
+// the servers every ServerPoll and stops, cutting its connections and
+// leaving its socket bound, when a second server registers or
+// ServerPollErrors counts in a row fail, with the matching reason.
+func TestSecondServerStopsServingListener(t *testing.T) {
+	t.Run("second server", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			r := newSupRig(t, nil)
+			r.wantState(t, PhaseServing, "", 0)
+			p := r.dial(t, 501)
+			p.admitted(t)
+			advance(ServerPoll)
+			r.wantState(t, PhaseServing, "", 0)
+			r.ck.set(func(c *startChecks) { c.servers = 2 })
+			advance(ServerPoll)
+			st := r.wantState(t, PhaseOff, OffServers, MinBackoff)
+			if !strings.Contains(st.Detail, "2 servers registered") {
+				t.Fatalf("detail %q", st.Detail)
+			}
+			p.cut(t)
+			if r.ln.accepting() || r.ln.closeCount() != 0 {
+				t.Fatal("the listener accepts, or its socket was closed, after a second server registered")
+			}
+			if n := r.log.count("level=WARN", "stopped by the server count", "more than one server registered"); n != 1 {
+				t.Fatalf("%d Warn lines for the stop, want 1", n)
+			}
+			advance(MinBackoff)
+			r.wantState(t, PhaseOff, OffServers, 2*MinBackoff)
+			r.ck.set(func(c *startChecks) { c.servers = 1 })
+			advance(2 * MinBackoff)
+			r.wantState(t, PhaseServing, "", 0)
+		})
+	})
+	t.Run("count errors", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			r := newSupRig(t, nil)
+			r.ck.set(func(c *startChecks) { c.serversErr = errors.New("fake: apiserver unreachable") })
+			advance((ServerPollErrors - 1) * ServerPoll)
+			r.wantState(t, PhaseServing, "", 0)
+			// One good count resets the run of errors.
+			r.ck.set(func(c *startChecks) { c.serversErr = nil })
+			advance(ServerPoll)
+			r.ck.set(func(c *startChecks) { c.serversErr = errors.New("fake: apiserver unreachable") })
+			advance((ServerPollErrors - 1) * ServerPoll)
+			r.wantState(t, PhaseServing, "", 0)
+			advance(ServerPoll)
+			st := r.wantState(t, PhaseOff, OffServersUnknown, MinBackoff)
+			if !strings.Contains(st.Detail, "apiserver unreachable") {
+				t.Fatalf("detail %q", st.Detail)
+			}
+		})
+	})
+	t.Run("a slow count never delays the marker poll", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			r := newSupRig(t, nil)
+			gate := make(chan struct{})
+			r.ck.set(func(c *startChecks) { c.countGate = gate })
+			advance(ServerPoll) // the count is now waiting on the apiserver
+			r.wantState(t, PhaseServing, "", 0)
+			r.ck.set(func(c *startChecks) { c.marked = true })
+			advance(MaintenancePoll)
+			r.wantState(t, PhaseOff, OffMaintenance, MaintenancePoll)
+			r.ck.set(func(c *startChecks) { c.marked, c.countGate = false, nil })
+			close(gate)
+			advance(MaintenancePoll)
+			r.wantState(t, PhaseServing, "", 0)
+		})
 	})
 }

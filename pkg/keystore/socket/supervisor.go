@@ -46,6 +46,14 @@ const (
 	// retried at MaintenancePoll, so the listener is back within a poll of
 	// a maintenance verb's end, before the doubling backoff takes over.
 	ReopenRetries = 15
+	// ServerPoll is how often a serving listener counts the cluster's
+	// servers again: a second server stops it ("Single-server clusters
+	// only"). Each count is bounded by the count's own timeout and runs in
+	// its own poller, so a slow apiserver never delays the marker poll.
+	ServerPoll = 30 * time.Second
+	// ServerPollErrors is how many failed serving counts in a row stop the
+	// listener, as a count that cannot be read keeps it from starting.
+	ServerPollErrors = 3
 )
 
 // OffReason says why the user scope's listener is not serving. The set is
@@ -283,7 +291,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 		}
 		cur = ln
 		started := s.cfg.Clock.Now()
-		end, err := s.serve(ctx, ln)
+		end, stopped, err := s.serve(ctx, ln)
 		if _, pausable := ln.(deadliner); !pausable {
 			_ = ln.Close() // it cannot be paused, so its run ends it; Serve may have closed it already
 			cur = nil
@@ -293,6 +301,17 @@ func (s *Supervisor) Run(ctx context.Context) {
 			return
 		case endMarker:
 			runBackoff = MinBackoff
+		case endServers:
+			// Not a failure of the listener: the start checks decide, after
+			// the start-check backoff, whether it may serve again.
+			runBackoff = MinBackoff
+			wait := checkBackoff
+			checkBackoff = nextBackoff(checkBackoff)
+			s.off(stopped, err.Error(), last, wait)
+			last = stopped
+			if !s.wait(ctx, wait) {
+				return
+			}
 		case endFailed:
 			if s.cfg.Clock.Now().Sub(started) >= HealthyPeriod {
 				runBackoff = MinBackoff
@@ -480,10 +499,38 @@ func nextBackoff(d time.Duration) time.Duration {
 type runEnd int
 
 const (
-	endDone   runEnd = iota // ctx is done
-	endMarker               // the maintenance marker stands, or cannot be read
-	endFailed               // a panic, an accept error or a failed restart
+	endDone    runEnd = iota // ctx is done
+	endMarker                // the maintenance marker stands, or cannot be read
+	endServers               // a serving count found a second server, or failed ServerPollErrors times
+	endFailed                // a panic, an accept error or a failed restart
 )
+
+// serverCount is one serving count's result.
+type serverCount struct {
+	n   int
+	err error
+}
+
+// pollServers counts the servers every ServerPoll until ctx is done,
+// sending each result on out. It is serve's poller: serve cancels ctx and
+// waits for it before returning.
+func (s *Supervisor) pollServers(ctx context.Context, out chan<- serverCount) {
+	for {
+		tick, stop := s.cfg.Clock.After(ServerPoll)
+		select {
+		case <-ctx.Done():
+			stop()
+			return
+		case <-tick:
+		}
+		n, err := guard(func() (int, error) { return s.cfg.ServerCount(ctx) })
+		select {
+		case out <- serverCount{n: n, err: err}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
 
 // deadliner is a listening socket whose Accept can be stopped without
 // closing it.
@@ -503,19 +550,20 @@ type pauseOnClose struct {
 func (p pauseOnClose) Close() error { return p.d.SetDeadline(time.Unix(1, 0)) }
 
 // serve runs one Listener on ln until ctx is done, the Listener panics or
-// fails to accept, or the maintenance marker is seen. Its connections are
-// cut before it returns.
-func (s *Supervisor) serve(ctx context.Context, ln net.Listener) (runEnd, error) {
+// fails to accept, the maintenance marker is seen, or a serving count finds
+// a second server or fails ServerPollErrors times in a row (endServers,
+// with the off reason). Its connections are cut before it returns.
+func (s *Supervisor) serve(ctx context.Context, ln net.Listener) (runEnd, OffReason, error) {
 	served := ln
 	if d, ok := ln.(deadliner); ok {
 		if err := d.SetDeadline(time.Time{}); err != nil {
-			return endFailed, fmt.Errorf("clear the listener's deadline: %w", err)
+			return endFailed, "", fmt.Errorf("clear the listener's deadline: %w", err)
 		}
 		served = pauseOnClose{Listener: ln, d: d}
 	}
 	l, err := NewListener(served, s.cfg.Creds, s.cfg.Sandbox, s.cfg.ServiceUID, s.cfg.Clock, s.cfg.Audit, s.cfg.Handler)
 	if err != nil {
-		return endFailed, err
+		return endFailed, "", err
 	}
 	l.log = s.cfg.Log
 	runCtx, cut := context.WithCancel(ctx)
@@ -530,29 +578,60 @@ func (s *Supervisor) serve(ctx context.Context, ln net.Listener) (runEnd, error)
 		}()
 		done <- l.Serve(runCtx)
 	}()
+	counts := make(chan serverCount)
+	var poller sync.WaitGroup
+	poller.Go(func() { s.pollServers(runCtx, counts) })
+	defer func() {
+		cut()
+		poller.Wait()
+	}()
 	s.set(State{Phase: PhaseServing})
 	s.cfg.Log.Info("keystore socket: listener serving")
+	countErrs := 0
+	tick, stop := s.cfg.Clock.After(MaintenancePoll)
+	defer func() { stop() }()
 	for {
-		tick, stop := s.cfg.Clock.After(MaintenancePoll)
 		select {
 		case err := <-done:
-			stop()
 			if ctx.Err() != nil {
-				return endDone, nil
+				return endDone, "", nil
 			}
 			if err == nil {
 				err = errors.New("the listener returned")
 			}
-			return endFailed, err
+			return endFailed, "", err
 		case <-ctx.Done():
-			stop()
 			cut()
 			<-done
-			return endDone, nil
+			return endDone, "", nil
+		case c := <-counts:
+			var reason OffReason
+			var why error
+			switch {
+			case c.err == nil && c.n == 1:
+				countErrs = 0
+				continue
+			case c.err == nil && c.n > 1:
+				reason, why = OffServers, fmt.Errorf("%d servers registered", c.n)
+			default:
+				if countErrs++; countErrs < ServerPollErrors {
+					continue
+				}
+				why = c.err
+				if why == nil {
+					why = fmt.Errorf("%d servers registered", c.n)
+				}
+				reason, why = OffServersUnknown, fmt.Errorf("%d serving counts in a row failed: %w", countErrs, why)
+			}
+			cut()
+			<-done
+			s.cfg.Log.Warn("keystore socket: listener stopped by the server count", "reason", string(reason), "err", why.Error())
+			return endServers, reason, why
 		case <-tick:
 		}
 		marked, err := guard(s.cfg.MaintenanceMarked)
 		if err == nil && !marked {
+			tick, stop = s.cfg.Clock.After(MaintenancePoll)
 			continue
 		}
 		// Fail closed: an unreadable marker stops the listener too, and the
@@ -560,6 +639,6 @@ func (s *Supervisor) serve(ctx context.Context, ln net.Listener) (runEnd, error)
 		cut()
 		<-done
 		s.cfg.Log.Info("keystore socket: listener stopped for the maintenance marker")
-		return endMarker, nil
+		return endMarker, "", nil
 	}
 }
