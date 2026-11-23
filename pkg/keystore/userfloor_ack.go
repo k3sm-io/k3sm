@@ -141,10 +141,7 @@ func (s *FileStore) readFloorAck() (floorAck, bool) {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return floorAck{}, false
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || int64(st.Uid) != int64(s.floorUID) || st.Mode&0o022 != 0 {
-		return floorAck{}, false
-	}
-	if fl, err := fdFlags(fd); err != nil || fl != 0 || judgeFlagsACL(fd, fdFlags) != nil {
+	if s.judgeRootFile(fd, &st, floorAckName) != nil {
 		return floorAck{}, false
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxFloorAckSize+1))

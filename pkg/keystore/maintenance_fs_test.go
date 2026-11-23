@@ -308,8 +308,8 @@ func fcntlGetPath(fd int, buf []byte) error {
 	return nil
 }
 
-// TestMaintenanceJudgesMarkerAndStale: a marker with a second link, or a
-// staging file a crash left with a second link, refuses the verb; an
+// TestMaintenanceJudgesMarkerAndStale: a root marker with a second link is
+// read, with a Warn; a staging file a crash left is cleaned; an
 // archive that is not 0600 refuses rotate, and one with a second link does
 // not.
 func TestMaintenanceJudgesMarkerAndStale(t *testing.T) {
@@ -322,11 +322,8 @@ func TestMaintenanceJudgesMarkerAndStale(t *testing.T) {
 		if err := os.Link(m, m+".alias"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.RebuildFloor(context.Background(), &inoRecorder{}); !errors.Is(err, errLogUntrusted) {
-			t.Fatalf("rebuild over a linked marker: %v, want untrusted", err)
-		}
-		if _, err := os.Lstat(m); err != nil {
-			t.Fatalf("the refused verb removed a marker it did not write: %v", err)
+		if _, err := s.RebuildFloor(context.Background(), &inoRecorder{}); err != nil {
+			t.Fatalf("rebuild over a linked root marker: %v, want it read (a second link is a Warn)", err)
 		}
 	})
 	t.Run("stale staging left by a crash is cleaned", func(t *testing.T) {

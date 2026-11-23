@@ -2319,8 +2319,8 @@ service user can only add to.
   `TestUnattributableDamageKeepsFloorWideRefusal`, `TestFloorDamageDegradesLiveLines`).
   **The damage acknowledgement** is the exit that keeps revocations: root writes
   `keystore-user-floor.ack` in the data root, root-owned, not group- or other-writable,
-  a regular file with one link, no file flag and no extended ACL, judged like
-  `keystore-floor.json` (anything else is ignored, which fails closed). It is one line,
+  a regular file, no file flag and no extended ACL (anything else is ignored, which fails
+  closed); a second link is a Warn, never a refusal (§ "Root-written files and hard links"). It is one line,
   `k3sm-user-floor-ack v1 <ino> <birth-sec> <birth-nsec> <watermark>`, in canonical
   decimal: the floor file's inode and birth time and its size when root acknowledged it.
   For that file, unattributable damage that starts before the watermark no longer counts,
@@ -2675,8 +2675,9 @@ service user can only add to.
   `keystore-removed-scopes.json` in the data root before it removes the directory: root's,
   mode 0644 (the service user's opens read it; it is closed to group and other writes),
   written to a temporary name, fsynced and renamed through the judged data-root descriptor, the
-  data root fsynced; read with `O_NOFOLLOW` and judged on its descriptor (a regular file with
-  one link, the data root's owner's, not group- or other-writable, at most 256 KiB); parsed
+  data root fsynced; read with `O_NOFOLLOW` and judged on its descriptor (a regular file of the
+  data root's owner, not group- or other-writable, no file flag, no extended ACL, at most
+  256 KiB; a second link is a Warn, never a refusal); parsed
   strictly (one JSON object `{"version":1,"scopes":[{"uid":…,"keys":[…],"floor_size":…}]}`,
   no unknown field, no trailing data, each uid listed once, each key 64 lowercase hex digits
   listed once, at most 1024 keys in all, `floor_size` not negative and 0 when absent). A record
@@ -2840,8 +2841,17 @@ service user can only add to.
   whose swap committed: the rerun prints that marker's saved report (a rebuild that dropped
   lines exits 4 with the same counts) and does not run again. Any other marker, the other
   verb's or one whose swap never committed, is replaced: the live set is valid, and the rerun
-  runs from step 1. A marker that is not a regular file with one link, of the data root's
-  owner, refuses the verb. A planted symlink, FIFO or directory at the marker, at
+  runs from step 1. A marker that is not a regular file of the data root's owner, closed to
+  group and other writes, with no file flag and no extended ACL, refuses the verb, naming
+  `sudo k3sm install`, which removes it unread; a second link on it is a Warn.
+  *Root-written files and hard links.* Any local user can `link(2)` a root-owned unflagged
+  file into a directory of its own (measured, U195). The removed-scopes record, the marker
+  and the floor acknowledgement are root's, written only by rename and closed to group and
+  other writes, so an alias gives nobody write power: it keeps an old copy, never a way in.
+  Their judge (type, owner, mode, flags, ACL) therefore never refuses on the link count, and
+  warns once per process of an extra link; refusing would let any user block every scope
+  open, every maintenance verb and the acknowledgement. The service-owned flagged logs keep
+  their one-link rule: a flagged file cannot be linked. A planted symlink, FIFO or directory at the marker, at
   `keystore-staging/` or at a log's directory refuses the verb before anything changes; one
   inside `keystore-staging/` is removed unread (U68).
 - **Install builds a missing log the same way.** Install builds each missing log's directory
@@ -5874,7 +5884,7 @@ carried by the unit rows.
 | U88 | `floor --rebuild` never lowers: it reads every scope whose `scope.key` opens under `W` without the GeneratedUID check, so an owner change or a departed account is rebuilt from its pointers (U129); if any scope's `scope.key` does not open under `W` or any other error stops it (`ErrBusy` included), it refuses to finish, names the scope and changes nothing; the `deliveries` record's AAD is scope, kind 0xFD, name `deliveries`, generation and sequence, its floor key is `(user/<uid>, .deliveries, generation, seq)`, and the rebuild writes that key's line; a copied-back older `deliveries` record is refused against the floor, before and after a rebuild | `k3sm/pkg/keystore::TestRebuildRefusesOnUnopenableScope`, `k3sm/pkg/keystore::TestCopiedBackDeliveriesRecordRefused` | done: the append-only files (floor --rebuild) |
 | U89 | reads take the store lock shared and mutations exclusive, through a writer-preferring in-process lock; a server exclusive hold does at most 50 ms of work per operation, larger work chunked, no hold across an API call (the bound measured in K7a); a reconciler revocation that gets `ErrBusy` retries up to 3 times with jitter in the same sweep before it is `Indeterminate`; under a sustained read load from other uids a revocation completes | `k3sm/pkg/keystore/reconcile::TestRevocationCompletesUnderOtherUIDReadLoad` | pending: the KeyDelivery reconciler (lifecycle) |
 | U90 | root-run: the directory swap. A process running as the service user holds, from before floor --rebuild, audit --rotate or install's log creation, an O_APPEND descriptor on the old log, a descriptor on the log's live directory and one on keystore-logs/. Before every step and after, by path on the canonical log its open(O_WRONLY), open(O_WRONLY\|O_TRUNC) and link() into its own directory each fail EPERM, and through the held descriptors F_SETFL clearing O_APPEND, pwrite and ftruncate fail EPERM while the file is flagged and openat for write fails EPERM, or ENOENT once the name is gone; at every hook the canonical log by path is a complete judged log, the whole old content or the whole new content, flags exactly SF_APPEND, the service user's, 0600, one link; at the end the new log holds what the verb wrote and the service user's O_APPEND lines, nothing the held descriptors did reaches the new log, and staging and the retired directory are empty. A crash at every step and a rerun of the same verb end valid, a rebuild that dropped lines exiting 4 with the same counts; the other verb run first harms nothing, and the first verb's rerun still finishes; the maintenance wait is the exclusive .lock, bounded at 30 s (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceSwapRefusesServiceUser`, `TestMaintenanceCrashAtEverySwapStepReruns`, `k3sm/pkg/install::TestKeystoreLogCreationRefusesServiceUserAtEveryStep`, `k3sm/pkg/keystore::TestStoreReadsSwappedLogDirAsRoot` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
-| U91 | audit --rotate keeps four archives, .1 to .4, and refuses, changing nothing, when .4 exists unless --discard-oldest; the replacement directory holds an empty flagged log, a fresh root 0600 .1 holding the old log's bytes read once, and the older archives carried by hard link as .2 to .4; every archive is root's 0600, unflagged, and a second link on one is a Warn; a marker or a stale staging file with a second link refuses; a rerun after a crash past the swap prints the crashed run's report and does not rotate twice, and while the marker stands a missing audit log is never skipped; the doctor hint says to export first; rotation resets the shares, bounded by the archive count | `k3sm/cmd/k3sm::TestAuditRotateKeepsFourArchives`, `k3sm/pkg/keystore::TestMaintenanceJudgesMarkerAndStale`, `TestSwapRerunFromEachStep`, `TestAuditRootRefusesMissingLogInMaintenance` | checked: the append-only files |
+| U91 | audit --rotate keeps four archives, .1 to .4, and refuses, changing nothing, when .4 exists unless --discard-oldest; the replacement directory holds an empty flagged log, a fresh root 0600 .1 holding the old log's bytes read once, and the older archives carried by hard link as .2 to .4; every archive is root's 0600, unflagged, and a second link on one is a Warn; a marker with a second link is read, with a Warn, and a stale staging file is cleaned; a rerun after a crash past the swap prints the crashed run's report and does not rotate twice, and while the marker stands a missing audit log is never skipped; the doctor hint says to export first; rotation resets the shares, bounded by the archive count | `k3sm/cmd/k3sm::TestAuditRotateKeepsFourArchives`, `k3sm/pkg/keystore::TestMaintenanceJudgesMarkerAndStale`, `TestSwapRerunFromEachStep`, `TestAuditRootRefusesMissingLogInMaintenance` | checked: the append-only files |
 | U92 | a `rotate` whose delivery will stall (owner past share, the delivery's rotation write used) is stored and answered `stored; delivery pending: past your log share`; the CLI prints the warning line and exits 0 | `k3sm/cmd/k3sm::TestRotateReportsDeliveryStall` | pending: the non-root CLI and `exec` |
 | U93 | the sweep period is 30 s by default; two consecutive deleting observations count only when at least 60 s apart on the clock seam, however many sweeps run between them | `k3sm/pkg/keystore/reconcile::TestDeletingObservationsSpacedOnClock` | pending: the KeyDelivery reconciler (lifecycle) |
 | U94 | `withdraw` opens the caller's scope and so runs the GeneratedUID check: a reused uid with a changed GeneratedUID gets `scope-owner-changed` and deletes nothing (seams: GeneratedUID lookup, peer-credential source) | `k3sm/pkg/keystore/socket::TestWithdrawChecksGeneratedUID` | pending: KeyDelivery authoring |
@@ -5982,6 +5992,8 @@ carried by the unit rows.
 | U197 | rm-scope lists the removed scope key's identity in keystore-removed-scopes.json in the data root, with the floor's byte size at the removal (root's, by temp, fsync and rename, parsed strictly, bounded), so the old scope directory copied back is refused at every open (read, put, the start step, rebuild) while a re-minted scope opens; a full record still removes the scope and rebuild keeps its floor keys; a record that does not read fails closed; an rm-scope stopped part-way names the state it left and a rerun finishes it | `k3sm/pkg/keystore::TestRemovedScopeCopiedBackRefused`, `TestRemovedScopesFullKeepsFloorKeys`, `TestRemovedScopesMalformedFailsClosed`, `TestRemovedScopesFloorSizeParse`, `TestRemoveScopeRerunFinishesPartialRemoval` | done: the append-only files (rm-scope) |
 | U198 | the log reader charges at most maxRevokeUIDs plus 64 distinct uids past the hard cap; forged lines of more distinct uids are sticky damage, with no growth of its per-uid map | `k3sm/pkg/keystore::TestAuditReaderBoundsChargedUIDs` | done: the append-only files (the reader) |
 | U199 | floor --rebuild that dropped any line or key exits 4, lists the counts by class and audits committed; doctor's keystore-floor row warns of floor damage naming floor --rebuild | `k3sm/cmd/k3sm::TestKeysMaintenanceVerbs`, `TestDoctorChecksTable` | done: the append-only files (the rebuild verb, doctor) |
+| U200 | a second link on a root-written data-root file (the removed-scopes record, the maintenance marker, the floor acknowledgement) is a Warn, never a refusal: each still reads, judged on type, owner, mode, flags and ACL, so a link any local user can make blocks no scope open, verb or acknowledgement | `k3sm/pkg/keystore::TestRemovedScopesSecondLinkReads`, `TestMarkerSecondLinkReads`, `TestFloorAckSecondLinkReads`, `TestRootFileModeStillJudged`, `TestMaintenanceJudgesMarkerAndStale` | done: the append-only files (root-written files) |
+| U201 | root-run: the service user link(2)s root's removed-scopes record and floor acknowledgement into its own directory; the record still reads and rm-scope still writes it, and the acknowledgement still lifts the damage it acknowledged (integration, a root-run row: `--root`) | `k3sm/pkg/keystore::TestRootFileServiceLinkReadsAsRoot` (integration, root-run) | checked as a root-run row (`--root`): the append-only files (root-written files) |
 
 ### Rig legs
 

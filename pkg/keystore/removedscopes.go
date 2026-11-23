@@ -218,9 +218,9 @@ func isLowerHex(s string) bool {
 }
 
 // readRemovedScopes reads the record through the judged data root dfd
-// with O_NOFOLLOW and judges it on its descriptor: a regular file with one
-// link, the data root's owner's (root), neither group- nor other-writable,
-// within maxRemovedScopesSize, then parses it strictly. A missing record
+// with O_NOFOLLOW and judges it on its descriptor (judgeRootFile: a
+// second link is a Warn, never a refusal), within maxRemovedScopesSize,
+// then parses it strictly. A missing record
 // lists nothing. Anything else is errRemovedScopesBad.
 func (s *FileStore) readRemovedScopes(dfd int) (*removedScopes, error) {
 	fd, err := unix.Openat(dfd, removedScopesName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
@@ -236,8 +236,11 @@ func (s *FileStore) readRemovedScopes(dfd int) (*removedScopes, error) {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return nil, fmt.Errorf("%w: stat: %w", errRemovedScopesBad, err)
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || int64(st.Uid) != int64(s.floorUID) || st.Mode&0o022 != 0 || st.Size > maxRemovedScopesSize {
-		return nil, fmt.Errorf("%w: it is not a regular file with one link, of the data root's owner, closed to group and other writes, within %d bytes", errRemovedScopesBad, maxRemovedScopesSize)
+	if err := s.judgeRootFile(fd, &st, removedScopesName); err != nil {
+		return nil, fmt.Errorf("%w: %w", errRemovedScopesBad, err)
+	}
+	if st.Size > maxRemovedScopesSize {
+		return nil, fmt.Errorf("%w: past %d bytes", errRemovedScopesBad, maxRemovedScopesSize)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxRemovedScopesSize+1))
 	if err != nil {

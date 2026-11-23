@@ -5,7 +5,7 @@
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
 # rows G1 to G23, the user-scope rows U1 to U137 (U15, U39 and U117 are unused),
 # the typed-credential rows U138 to U191, the floor's tombstone row U192, the
-# rebuild rows U193 and U194, the rows U195 to U199, and the rig legs E1 to E36. Every row
+# rebuild rows U193 and U194, the rows U195 to U201, and the rig legs E1 to E36. Every row
 # is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -42,7 +42,7 @@
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66, U108, U127, U129, U132.
 #   --scope-store   the user-scope store: U12 to U14, U63, U97, U101, U128.
 #   --files         the append-only files: U20, U21, U23 to U25, U50, U52, U60, U61,
-#                   U68, U80, U88, U90, U91, U105, U118, U119, U193 to U199, and in the helper
+#                   U68, U80, U88, U90, U91, U105, U118, U119, U193 to U201, and in the helper
 #                   variant
 #                   only U70, U71.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54, U82, U99, U104, U113,
@@ -164,7 +164,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U186 U187 U188 U189 U190 U191"
 EXPECTED_ROWS="$EXPECTED_ROWS U192"
 EXPECTED_ROWS="$EXPECTED_ROWS U193 U194"
 EXPECTED_ROWS="$EXPECTED_ROWS U195"
-EXPECTED_ROWS="$EXPECTED_ROWS U196 U197 U198 U199"
+EXPECTED_ROWS="$EXPECTED_ROWS U196 U197 U198 U199 U200 U201"
 # >>> ADD NEW U ROWS (U200 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25 E26 E27"
@@ -197,7 +197,7 @@ mode_rows() {
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66 U108 U127 U129 U132" ;;
 	scope-store) echo "U12 U13 U14 U63 U97 U101 U128" ;;
-	files) echo "U20 U21 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U105 U118 U119 U193 U194 U195 U196 U197 U198 U199" ;;
+	files) echo "U20 U21 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U105 U118 U119 U193 U194 U195 U196 U197 U198 U199 U200 U201" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82 U99 U104 U113 U120 U121 U122 U131 U137" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84 U112 U136" ;;
 	exec) echo "U36 U37 U38 U69 U92" ;;
@@ -709,7 +709,7 @@ pend U89 "reads take the store lock shared and mutations exclusive, through a wr
 	k3sm/pkg/keystore/reconcile::TestRevocationCompletesUnderOtherUIDReadLoad
 rootcheck U90 "root-run: the directory swap. A process running as the service user holds, from before floor --rebuild, audit --rotate or install's log creation, an O_APPEND descriptor on the old log, a descriptor on the log's live directory and one on keystore-logs/. Before every step and after, by path on the canonical log its open(O_WRONLY), open(O_WRONLY|O_TRUNC) and link() into its own directory each fail EPERM, and through the held descriptors F_SETFL clearing O_APPEND, pwrite and ftruncate fail EPERM while the file is flagged and openat for write fails EPERM, or ENOENT once the name is gone; at every hook the canonical log by path is a complete judged log, the whole old content or the whole new content, flags exactly SF_APPEND, the service user's, 0600, one link; at the end the new log holds what the verb wrote and the service user's O_APPEND lines, nothing the held descriptors did reaches the new log, and staging and the retired directory are empty. A crash at every step and a rerun of the same verb end valid, a rebuild that dropped lines exiting 4 with the same counts; the other verb run first harms nothing, and the first verb's rerun still finishes; the maintenance wait is the exclusive .lock, bounded at 30 s (append-only files)" \
 	k3sm/cmd/k3sm::TestMaintenanceSwapRefusesServiceUser TestMaintenanceCrashAtEverySwapStepReruns k3sm/pkg/install::TestKeystoreLogCreationRefusesServiceUserAtEveryStep k3sm/pkg/keystore::TestStoreReadsSwappedLogDirAsRoot
-check U91 "audit --rotate keeps four archives, .1 to .4, and refuses, changing nothing, when .4 exists unless --discard-oldest; the replacement directory holds an empty flagged log, a fresh root 0600 .1 holding the old log's bytes read once, and the older archives carried by hard link as .2 to .4; every archive is root's 0600, unflagged, and a second link on one is a Warn; a marker or a stale staging file with a second link refuses; a rerun after a crash past the swap prints the crashed run's report and does not rotate twice, and while the marker stands a missing audit log is never skipped; the doctor hint says to export first; rotation resets the shares, bounded by the archive count (append-only files)" \
+check U91 "audit --rotate keeps four archives, .1 to .4, and refuses, changing nothing, when .4 exists unless --discard-oldest; the replacement directory holds an empty flagged log, a fresh root 0600 .1 holding the old log's bytes read once, and the older archives carried by hard link as .2 to .4; every archive is root's 0600, unflagged, and a second link on one is a Warn; a marker with a second link is read, with a Warn, and a stale staging file is cleaned; a rerun after a crash past the swap prints the crashed run's report and does not rotate twice, and while the marker stands a missing audit log is never skipped; the doctor hint says to export first; rotation resets the shares, bounded by the archive count (append-only files)" \
 	k3sm/cmd/k3sm::TestAuditRotateKeepsFourArchives k3sm/pkg/keystore::TestMaintenanceJudgesMarkerAndStale TestSwapRerunFromEachStep TestAuditRootRefusesMissingLogInMaintenance
 pend U92 "a rotate whose delivery will stall (owner past share, the delivery's rotation write used) is stored and answered stored; delivery pending: past your log share; the CLI prints the warning line and exits 0 (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestRotateReportsDeliveryStall
@@ -922,6 +922,10 @@ check U198 "the log reader charges at most maxRevokeUIDs plus 64 distinct uids p
 	k3sm/pkg/keystore::TestAuditReaderBoundsChargedUIDs
 check U199 "floor --rebuild that dropped any line or key exits 4, lists the counts by class and audits committed; doctor's keystore-floor row warns of floor damage naming floor --rebuild (the append-only files (the rebuild verb, doctor))" \
 	k3sm/cmd/k3sm::TestKeysMaintenanceVerbs TestDoctorChecksTable
+check U200 "a second link on a root-written data-root file (the removed-scopes record, the maintenance marker, the floor acknowledgement) is a Warn, never a refusal: each still reads, judged on type, owner, mode, flags and ACL, so a link any local user can make blocks no scope open, verb or acknowledgement (the append-only files (root-written files))" \
+	k3sm/pkg/keystore::TestRemovedScopesSecondLinkReads TestMarkerSecondLinkReads TestFloorAckSecondLinkReads TestRootFileModeStillJudged TestMaintenanceJudgesMarkerAndStale
+rootcheck U201 "root-run: the service user link(2)s root's removed-scopes record and floor acknowledgement into its own directory; the record still reads and rm-scope still writes it, and the acknowledgement still lifts the damage it acknowledged (the append-only files (root-written files))" \
+	k3sm/pkg/keystore::TestRootFileServiceLinkReadsAsRoot
 # >>> ADD NEW U ROWS (U200 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"

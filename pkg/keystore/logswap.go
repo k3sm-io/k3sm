@@ -265,8 +265,8 @@ func (s *FileStore) beginMaintenance(ctx context.Context, verb, logName string, 
 }
 
 // readMarker reads the marker a crashed run left, or returns nil when
-// there is none. A marker that is not a regular file with one link of the
-// data root's owner refuses.
+// there is none. A marker judgeRootFile refuses refuses the verb; a second
+// link is a Warn.
 func (m *maintenance) readMarker() (*marker, error) {
 	fd, err := unix.Openat(m.dfd, maintenanceMarkerName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) {
@@ -281,8 +281,8 @@ func (m *maintenance) readMarker() (*marker, error) {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return nil, fmt.Errorf("stat %s: %w", maintenanceMarkerName, err)
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || int64(st.Uid) != int64(m.s.floorUID) {
-		return nil, fmt.Errorf("%w: %s is not a regular file with one link, of the data root's owner", errLogUntrusted, maintenanceMarkerName)
+	if err := m.s.judgeRootFile(fd, &st, maintenanceMarkerName); err != nil {
+		return nil, fmt.Errorf("%w: %s: %w; root repairs it with sudo k3sm install, which removes a marker it cannot read", errLogUntrusted, maintenanceMarkerName, err)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxMarkerSize))
 	if err != nil {
