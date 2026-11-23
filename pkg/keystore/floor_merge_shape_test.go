@@ -52,10 +52,10 @@ func openTestStaging(t *testing.T, s *FileStore) *mergeStaging {
 func wantShapeRefused(t *testing.T, s *FileStore, want string) {
 	t.Helper()
 	st := openTestStaging(t, s)
-	if err := s.checkStaged(st); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), want) {
+	if err := s.checkStaged(context.Background(), st); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), want) {
 		t.Fatalf("checkStaged: %v, want ErrCorrupt naming %q", err, want)
 	}
-	if err := s.chownStaged(st); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), want) {
+	if err := s.chownStaged(context.Background(), st); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), want) {
 		t.Fatalf("chownStaged: %v, want ErrCorrupt naming %q", err, want)
 	}
 }
@@ -230,7 +230,7 @@ func TestChownStagedRecheckSeam(t *testing.T) {
 		s, server := newTestStore(t)
 		stageRecipe(t, s, server, 0)
 		st := openTestStaging(t, s)
-		if err := s.checkStaged(st); err != nil {
+		if err := s.checkStaged(context.Background(), st); err != nil {
 			t.Fatal(err)
 		}
 		gen := stagePath(s, stagedTreeName, "k", generationName)
@@ -241,7 +241,7 @@ func TestChownStagedRecheckSeam(t *testing.T) {
 		if err := os.Link(outside, gen); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.chownStaged(st); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "k/generation") {
+		if err := s.chownStaged(context.Background(), st); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "k/generation") {
 			t.Fatalf("chownStaged over a swapped-in hard link: %v, want ErrCorrupt naming k/generation", err)
 		}
 	})
@@ -260,7 +260,7 @@ func TestChownStagedRecheckSeam(t *testing.T) {
 			return nil
 		}
 		st := openTestStaging(t, s)
-		if err := s.chownStaged(st); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "k/generation") {
+		if err := s.chownStaged(context.Background(), st); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "k/generation") {
 			t.Fatalf("chownStaged with a link made at the seam: %v, want ErrCorrupt naming k/generation", err)
 		}
 		if fi, err := os.Lstat(gen); err != nil || fi.Mode().Perm() != 0o640 {
@@ -301,10 +301,10 @@ func TestChownStagedSetsModes(t *testing.T) {
 		}
 	}
 	st := openTestStaging(t, s)
-	if err := s.checkStaged(st); err != nil {
+	if err := s.checkStaged(context.Background(), st); err != nil {
 		t.Fatalf("checkStaged: %v", err)
 	}
-	if err := s.chownStaged(st); err != nil {
+	if err := s.chownStaged(context.Background(), st); err != nil {
 		t.Fatalf("chownStaged: %v", err)
 	}
 	err := filepath.Walk(stagePath(s, stagedTreeName), func(p string, fi os.FileInfo, err error) error {

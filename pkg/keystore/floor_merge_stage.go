@@ -17,6 +17,7 @@ limitations under the License.
 package keystore
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -74,6 +75,23 @@ var statDev = func(f *os.File) (uint64, error) {
 // directory: maxDirNames, which tests lower.
 var stagedNameLimit = maxDirNames
 
+// stagedNodeLimit bounds how many nodes one walk of the staged tree visits
+// in all, the tree's own directory included: the per-directory and depth
+// bounds alone allow far more than any keystore holds. It is
+// maxStagedNodes, which tests lower.
+var stagedNodeLimit = maxStagedNodes
+
+// maxStagedNodes is stagedNodeLimit's production value: 2^22 nodes, room
+// for every entry a full floor records with several versions each.
+const maxStagedNodes = 1 << 22
+
+// stagedWalk is one walk's state: its context, checked as it goes, and how
+// many more nodes it visits.
+type stagedWalk struct {
+	ctx  context.Context
+	seen int
+}
+
 // errNotStaged refuses a merge that would change the floor while the
 // restored keystore/ is not staged in pre-restore.d.
 var errNotStaged = errors.New("the restored keystore/ is not staged: the merge reads it only from pre-restore.d/restored in the data root, where the restore recipe's ditto puts it, and moves it into place itself. Nothing is written. Follow the restore steps in docs/user/keys.md")
@@ -93,6 +111,9 @@ type mergeStaging struct {
 	target       string
 	targetExists bool
 	targetType   string
+	// checked is set once checkStaged has walked the tree and found it in
+	// shape, so the handover does not walk it read-only a second time.
+	checked bool
 }
 
 // close releases what openStaging opened.
@@ -401,15 +422,21 @@ func scopeDirName(n string) bool {
 
 // checkStaged walks pre-restore.d/restored read-only and refuses it
 // (ErrCorrupt, naming the path inside the tree) unless every node is one the
-// keystore writes, in the shape it writes it (judgeStaged). Both a dry run
-// and the merge run it before anything changes, so they refuse alike.
-func (s *FileStore) checkStaged(st *mergeStaging) error {
-	return s.walkStaged(st, false)
+// keystore writes, in the shape it writes it (judgeStaged), and the tree
+// holds at most stagedNodeLimit nodes. Both a dry run and the merge run it
+// before anything changes, so they refuse alike; it stops with ctx's error.
+func (s *FileStore) checkStaged(ctx context.Context, st *mergeStaging) error {
+	if err := s.walkStaged(ctx, st, false); err != nil {
+		return err
+	}
+	st.checked = true
+	return nil
 }
 
 // chownStaged hands pre-restore.d/restored and everything in it to the
 // service user, at the modes Put writes (dirMode, fileMode), after
-// checkStaged, and fsyncs each node (syncStaged) before the tree's rename. Each node is opened by descriptor, never followed
+// checkStaged (run here unless it already passed on st), and fsyncs each
+// node (syncStaged) before the tree's rename. Each node is opened by descriptor, never followed
 // (O_NOFOLLOW, O_NONBLOCK so a FIFO cannot block), judged again on that
 // descriptor, and changed through it (fchmod, fchown); an fstat after
 // confirms a file still has one link, or its owner and mode are put back
@@ -417,19 +444,21 @@ func (s *FileStore) checkStaged(st *mergeStaging) error {
 // nothing should change the tree during the walk; the checks on the
 // descriptor are what keep a change from reaching another file if
 // something does.
-func (s *FileStore) chownStaged(st *mergeStaging) error {
-	if err := s.checkStaged(st); err != nil {
-		return err
+func (s *FileStore) chownStaged(ctx context.Context, st *mergeStaging) error {
+	if !st.checked {
+		if err := s.checkStaged(ctx, st); err != nil {
+			return err
+		}
 	}
-	return s.walkStaged(st, true)
+	return s.walkStaged(ctx, st, true)
 }
 
 // walkStaged is the walk of checkStaged (hand unset) and chownStaged.
-func (s *FileStore) walkStaged(st *mergeStaging, hand bool) error {
+func (s *FileStore) walkStaged(ctx context.Context, st *mergeStaging, hand bool) error {
 	if st.dirF == nil {
 		return errNotStaged
 	}
-	return s.stagedNode(int(st.dirF.Fd()), stagedTreeName, ".", stagedTree, 0, 0, hand)
+	return s.stagedNode(&stagedWalk{ctx: ctx}, int(st.dirF.Fd()), stagedTreeName, ".", stagedTree, 0, 0, hand)
 }
 
 // stagedShapeError is the refusal of the staged tree at a path inside it,
@@ -461,8 +490,15 @@ func committedShape(err error) error {
 
 // stagedNode judges name in the directory dirfd, a node of kind k at rel
 // inside the tree, depth levels below it, hands it over when hand is set,
-// and descends into a directory.
-func (s *FileStore) stagedNode(dirfd int, name, rel string, k stagedKind, maxSize int64, depth int, hand bool) error {
+// and descends into a directory. Each node counts against w's budget
+// (stagedNodeLimit), and the walk stops with w.ctx's error.
+func (s *FileStore) stagedNode(w *stagedWalk, dirfd int, name, rel string, k stagedKind, maxSize int64, depth int, hand bool) error {
+	if err := loopCtx(w.ctx, w.seen); err != nil {
+		return err
+	}
+	if w.seen++; w.seen > stagedNodeLimit {
+		return errStagedShape(rel, "is past the %d nodes the walk takes", stagedNodeLimit)
+	}
 	if depth > maxStagedDepth {
 		return errStagedShape(rel, "is more than %d levels deep", maxStagedDepth)
 	}
@@ -531,7 +567,7 @@ func (s *FileStore) stagedNode(dirfd int, name, rel string, k stagedKind, maxSiz
 		if !ok {
 			return errStagedShape(childRel, "is no name the keystore writes there")
 		}
-		if err := s.stagedNode(fd, n, childRel, ck, cmax, depth+1, hand); err != nil {
+		if err := s.stagedNode(w, fd, n, childRel, ck, cmax, depth+1, hand); err != nil {
 			return err
 		}
 	}

@@ -358,12 +358,12 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	// The staged tree's shape is judged read-only before anything is read
 	// from it or planned, so a dry run refuses what the merge refuses.
 	if st.staged {
-		if err := s.checkStaged(st); err != nil {
+		if err := s.checkStaged(ctx, st); err != nil {
 			return r, finish(err)
 		}
 	}
 	if rerun {
-		return s.finishRerun(st, in, live, *pending, gone, opts.DryRun, moveAside)
+		return s.finishRerun(ctx, st, in, live, *pending, gone, opts.DryRun, moveAside)
 	}
 	// A keep of a name rm deleted after the restore would bring back what
 	// the operator revoked under the guard.
@@ -449,7 +449,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if st.staged {
 		// The staged tree is handed to the service user before the floor
 		// is written: a failure here leaves the floor unwritten.
-		if err := s.chownStaged(st); err != nil {
+		if err := s.chownStaged(ctx, st); err != nil {
 			return r, err
 		}
 		// Each staged entry whose generation the merged floor refuses (rm
@@ -522,7 +522,7 @@ func movedErr(err error) error {
 // staged entry whose burial an rm under the guard dropped (gone) has its
 // directory removed with the ones the floor refuses. Every failure is
 // committed.
-func (s *FileStore) finishRerun(st *mergeStaging, in *mergeInput, live floor, rec retiredRecord, gone map[floorBurial]bool, dryRun bool, moveAside func(*MergeReport) error) (MergeReport, error) {
+func (s *FileStore) finishRerun(ctx context.Context, st *mergeStaging, in *mergeInput, live floor, rec retiredRecord, gone map[floorBurial]bool, dryRun bool, moveAside func(*MergeReport) error) (MergeReport, error) {
 	r := MergeReport{AlreadyMerged: true, Retired: rec.Retired, BuriedLive: rec.BuriedLive, Kept: rec.Kept, Recorded: rec.Recorded, Dropped: rec.Dropped}
 	for name, e := range in.fl {
 		for _, b := range e.burials() {
@@ -539,7 +539,7 @@ func (s *FileStore) finishRerun(st *mergeStaging, in *mergeInput, live floor, re
 		if err := moveAside(&r); err != nil {
 			return r, committedShape(err)
 		}
-		if err := s.chownStaged(st); err != nil {
+		if err := s.chownStaged(ctx, st); err != nil {
 			return r, committedShape(err)
 		}
 		names, err := s.refusedStaged(st, live, goneDrops(gone))
