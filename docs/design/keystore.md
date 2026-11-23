@@ -3597,7 +3597,15 @@ service user can only add to.
     may be what the dropped line timed out on. A file that does not parse is reported, never
     reset: the counts stay in memory, the server stops writing the file, and `doctor`'s
     `keystore-logs` row says the persisted count is unreadable. The `others` lines name no uid,
-    so no summary line can carry them; they wait for root's next `audit --rotate`.
+    so no summary line can carry them; they wait for root's next `audit --rotate`. That rotate
+    reads the file through the store directory it judged and holds, and writes at the start of
+    the new audit log one line per class with a count, the server's summary-line form with
+    `"via":"root"` and caller uid 0 (so it is charged to no uid and to no pre-frame part):
+    `{"v":1,…,"op":"refused","via":"root","caller":{"uid":0},…,"result":"dropped","charge":"reconciler","source":"pre-frame","dropped":<total>,"class":"<class>"}`.
+    Only once the swap committed does it take the counts it wrote out of the file, leaving what
+    the server added since; the server's next reopen moves its in-memory counts by what the file
+    lost, so no count is written twice. A run that stops between the swap and that step leaves
+    the counts in the file, and the next rotate writes them again: counted twice, never lost.
   - *The pre-frame part is split so a login user cannot spend it for everyone.* A login user
     can be refused at will (a self-sandboxed process is refused as `sandboxed` under its own
     uid), so the 256 KiB pre-frame part is not one pool. A **login line** is a pre-frame line
