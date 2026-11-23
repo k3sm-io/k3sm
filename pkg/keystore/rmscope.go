@@ -71,6 +71,11 @@ type RemoveScopeResult struct {
 // unlisted, and floor --rebuild keeps its floor keys (fail closed for a
 // copy-back). A record that does not read refuses, changing nothing.
 //
+// The judge (openScopeForRm) does not judge the mode of .user or of the
+// scope directory, which the service user can set: refusing it would let
+// the principal being revoked veto its revocation. Their owner must still
+// be the service user's; the take forces the scope directory to 0700.
+//
 // A scope.key the judge refuses only for its link count or mode, which any
 // local user can cause, is read again without those two checks
 // (openScopeForRmLoose): when it authenticates under the master it is
@@ -147,7 +152,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		r.path = rmPathTaken
 		return r.finish(root, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), nil)
 	}
-	o, err := u.openScopeForRevoke(root, k)
+	o, err := u.openScopeForRm(root, k)
 	var judged string
 	if errors.Is(err, errScopeKeyUntrusted) {
 		// A second link or a wider mode fails the judge, and any local

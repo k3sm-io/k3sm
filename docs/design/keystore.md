@@ -2787,14 +2787,14 @@ service user can only add to.
   | the service user's | a valid key not listed, or not what its path judged (a key on the no-key path, none on the untrusted path), or any unlisted one on the taken path | refuses: nothing in it taken, no rerun offered | exit 1, or exit 4 when this run already wrote the record |
   | nothing (absent at the walk's open) | — | removes nothing | exit 4 "found absent" when this run wrote or rewrote the record, else exit 1 |
 
-  Two limits are known. A key that does not open as this uid's cannot be told from forged
+  One limit is known. A key that does not open as this uid's cannot be told from forged
   bytes: another scope's directory renamed onto this name on the untrusted path is removed and
-  reported as unlisted (exit 4), and the other scope is lost. A take stopped before its first
-  `fchmod`, on a scope directory the service user widened past 0700 after the judge, leaves the
-  service user's directory at that mode: the run stops committed and offers its rerun, but the
-  rerun's judge refuses the scope directory's mode (exit 1, nothing changed) until the mode is
-  restored to 0700. A take stopped at any later step leaves the directory at 0700 (the first
-  `fchmod` comes before the `fchown`), which a rerun finishes. The scope directory's descriptor stays open through
+  reported as unlisted (exit 4), and the other scope is lost. rm-scope's judge does not judge
+  the mode of `.user` or of the scope directory, which the service user can set (a judge that
+  refused it would let the principal being revoked veto its revocation): either is opened by
+  descriptor whatever its mode, its owner still the service user's, and the take forces the
+  scope directory to 0700; the serving path still refuses any mode wider than 0700. So a take
+  stopped at any step, the first `fchmod` included, leaves a directory a rerun finishes. The scope directory's descriptor stays open through
   its final `unlinkat(AT_REMOVEDIR)`, which runs only while the name's `fstatat` matches it;
   since the name can still change between the two, rm-scope then asks the held directory
   whether it was the one removed. On macOS (APFS) `fstat` of a removed directory still held

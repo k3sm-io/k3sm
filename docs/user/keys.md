@@ -143,9 +143,8 @@ scope directory left root's, mode 0700, by an interrupted run is finished by run
 whatever it holds: the server's user cannot make a root-owned directory, and no open serves one.
 If its `scope.key` opens as this user's it is listed first; otherwise the scope is removed with
 exit 4, saying it was removed without being listed, or that it could not confirm its key is
-listed. One limit: if the server's user
-widened the scope directory's mode and the run stopped before it changed that mode, running it
-again refuses on the mode, changing nothing, until the mode is 0700 again. It removes only the
+listed. A mode the server's user set on its scope directory, or on the directory of user scopes
+that holds it, does not stop `rm-scope`: it checks who owns them, not their mode. It removes only the
 scope directory it checked:
 if another directory is at the scope's name by the time it removes it (one renamed there by the
 server's user, for example), it stops, leaves that directory untouched, and says the directory
