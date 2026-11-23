@@ -27,6 +27,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"k3sm.io/k3sm/pkg/keystore"
 )
 
 // serviceUID is the service uid the tests run the listener as.
@@ -180,7 +182,12 @@ type peer struct {
 func startRig(t *testing.T) *rig { t.Helper(); return startRigAs(t, serviceUID) }
 
 // startRigAs starts a rig whose listener runs as service.
-func startRigAs(t *testing.T, service uint32) *rig {
+func startRigAs(t *testing.T, service uint32) *rig { t.Helper(); return startRigWith(t, service, nil) }
+
+// startRigWith starts a rig whose listener runs as service and, when also
+// is not nil, gives every refusal and summary to also as well as to the
+// rig's recorder.
+func startRigWith(t *testing.T, service uint32, also RefusalAuditor) *rig {
 	t.Helper()
 	r := &rig{
 		ln:      newFakeListener(),
@@ -193,7 +200,11 @@ func startRigAs(t *testing.T, service uint32) *rig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l, err := NewListener(r.ln, r.creds, r.sandbox, service, bubbleClock{}, r.audit, h)
+	var audit RefusalAuditor = r.audit
+	if also != nil {
+		audit = teeAuditor{r.audit, also}
+	}
+	l, err := NewListener(r.ln, r.creds, r.sandbox, service, bubbleClock{}, audit, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,8 +311,22 @@ func TestListenerRequiresPeerCredSource(t *testing.T) {
 // is served.
 func checkRefusals(t *testing.T, cases []admissionCase) {
 	t.Helper()
+	checkRefusalsLogged(t, cases, false)
+}
+
+// checkRefusalsLogged is checkRefusals; with logged set the refusals also
+// go through a StoreAuditor to a real audit log, which must then hold
+// exactly the refused lines, each charged to the pre-frame budget.
+func checkRefusalsLogged(t *testing.T, cases []admissionCase, logged bool) {
+	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
-		r := startRig(t)
+		var store *storeRig
+		var also RefusalAuditor
+		if logged {
+			store = newStoreRig(t)
+			also = newStoreAuditor(t, store.logs)
+		}
+		r := startRigWith(t, serviceUID, also)
 		var want []refusal
 		for _, tc := range cases {
 			p := r.dialAs(tc.uid, tc.sandboxed, tc.sandboxFails, tc.unreadable)
@@ -324,7 +349,29 @@ func checkRefusals(t *testing.T, cases []admissionCase) {
 		if len(dropped) != 0 {
 			t.Errorf("dropped summaries %v, want none", dropped)
 		}
+		if store != nil {
+			checkLogged(t, store, want, nil)
+		}
 	})
+}
+
+// checkLogged checks that the rig's audit log holds exactly the refusals
+// and summaries given, as pre-frame lines, and that the budget has
+// charged every one of them: a refusal past the last counts what it
+// holds, then lands too.
+func checkLogged(t *testing.T, store *storeRig, refusals []refusal, drops []drop) {
+	t.Helper()
+	lines, charged := readAudit(t, store.auditPath())
+	rs, ds := refusedOf(t, lines)
+	if !slices.Equal(rs, refusals) || !slices.Equal(ds, drops) {
+		t.Fatalf("audit log refusals %v, summaries %v; want %v and %v", rs, ds, refusals, drops)
+	}
+	if err := store.logs.Refused(t.Context(), 0, ReasonRoot); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.logs.PreFrameUsed(); got != charged {
+		t.Fatalf("pre-frame budget used %d, want the log's %d", got, charged)
+	}
 }
 
 type admissionCase struct {
@@ -411,7 +458,7 @@ func TestListenerRefusesSandboxedPeer(t *testing.T) {
 }
 
 func TestPreFrameRefusalsAudited(t *testing.T) {
-	checkRefusals(t, []admissionCase{
+	checkRefusalsLogged(t, []admissionCase{
 		{uid: 0, reason: ReasonRoot},
 		{uid: serviceUID, reason: ReasonServiceUID},
 		{uid: 77, reason: ReasonSystemUID},
@@ -420,12 +467,13 @@ func TestPreFrameRefusalsAudited(t *testing.T) {
 		{uid: 502, sandboxFails: true, reason: ReasonSandboxUnknown},
 		{uid: 503, unreadable: true, reason: ReasonCredUnreadable},
 		{uid: 504},
-	})
+	}, true)
 }
 
 func TestPreFrameRefusalLinesRateLimited(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		r := startRig(t)
+		store := newStoreRig(t)
+		r := startRigWith(t, serviceUID, newStoreAuditor(t, store.logs))
 		refuse := func(uid uint32, n int) {
 			for range n {
 				r.dial(uid).refused(t)
@@ -483,6 +531,42 @@ func TestPreFrameRefusalLinesRateLimited(t *testing.T) {
 		if _, d := r.audit.lines(); !slices.Equal(d, []drop{{0, 7}, {0, 1}, {0, 2}}) {
 			t.Fatalf("summaries after stop = %v", d)
 		}
+		// The real audit log holds what passed the limit, and the
+		// summaries, each charged to the pre-frame budget.
+		got, d := r.audit.lines()
+		checkLogged(t, store, got, d)
+	})
+	t.Run("past the budget", func(t *testing.T) {
+		// Pre-frame lines another writer appended have spent the budget:
+		// a refusal that passes the limit is still refused at accept,
+		// writes nothing and is counted, and the count reaches the log in
+		// the uid's first summary line written after root rotates.
+		synctest.Test(t, func(t *testing.T) {
+			store := newStoreRig(t)
+			store.writeLog(t, store.auditPath(), fullBudget())
+			r := startRigWith(t, serviceUID, newStoreAuditor(t, store.logs))
+			before := size(t, store.auditPath())
+			for range 3 {
+				r.dial(0).refused(t)
+			}
+			advance(time.Minute) // no summary: nothing was rate-dropped
+			if n := size(t, store.auditPath()); n != before {
+				t.Fatalf("lines past the budget were written: %d -> %d bytes", before, n)
+			}
+			if got := store.logs.PendingDropped(0); got != 3 {
+				t.Fatalf("dropped count = %d, want 3", got)
+			}
+			store.swap(t, keystore.AuditDirName, keystore.AuditLogName, nil)
+			for range RefusalLinesPerMinute + 2 {
+				r.dial(0).refused(t)
+			}
+			advance(time.Minute)
+			if err := r.stop(); err != nil {
+				t.Fatalf("Serve = %v", err)
+			}
+			want := slices.Repeat([]refusal{{0, ReasonRoot}}, RefusalLinesPerMinute)
+			checkLogged(t, store, want, []drop{{0, 2 + 3}})
+		})
 	})
 }
 
