@@ -282,6 +282,7 @@ func rmErrText(err error) string {
 	// A rollback's shared restore advice is a by-hand action over the
 	// tree, with commands: rm-scope says only what it found.
 	s = strings.ReplaceAll(s, " For a deliberate restore, "+restoreRemedy, "")
+	s = strings.ReplaceAll(s, "; root must "+restoreRemedy, "")
 	return safeText(s)
 }
 
@@ -783,7 +784,16 @@ func scopeRemovedJudged(scope, why string, recorded bool) string {
 // checked record. rm-scope holds the floor lock and the store lock; the
 // read takes neither. Tests replace it to inject a failure.
 var rmReadDeliveries = func(u *UserScope, o *openedScope) (deliveriesRead, error) {
-	return u.readDeliveriesFloor(o, true)
+	r, err := u.readDeliveriesFloor(o, true)
+	if errors.Is(err, errFloorLogMalformed) {
+		// The steady-state floor reader refuses a floor past its key bound
+		// (fileFloorLog.read: state.bad), which is the flooded floor rebuild
+		// names rm-scope as the repair for: the record is then read without
+		// the floor, and reported unverified, never as exit 0.
+		seq, ds, uerr := u.readDeliveriesUnfloored(o)
+		return deliveriesRead{ds: ds, seq: seq, unverified: err}, uerr
+	}
+	return r, err
 }
 
 // deliveriesDamaged reports whether err, from rmReadDeliveries, is

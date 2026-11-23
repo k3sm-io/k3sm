@@ -2885,7 +2885,10 @@ service user can only add to.
   withdraw uses: a record below the floor (a rolled-back authentic copy) is a rollback, which
   rm-scope treats as a damaged record (it removes the scope, exit 4, saying the scope's
   deliveries were not checked), and a floor that cannot be read leaves a record naming no
-  delivery unverified: exit 4, saying the deliveries are not confirmed, never exit 0. The
+  delivery unverified: exit 4, saying the deliveries are not confirmed, never exit 0. A floor
+  past the steady-state reader's key bound (the flooded floor rebuild names rm-scope as the
+  repair for) is one that reader refuses, so there the record is read without the floor and is
+  unverified the same way: the repair still lists and removes the scope, with exit 4. The
   no-key, untrusted and taken paths never read the delivery record, and their results say so.
 
   The scope directory's descriptor stays open through
