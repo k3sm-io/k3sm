@@ -272,7 +272,13 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		return r, err
 	}
 	rerun := false
+	var gone map[floorBurial]bool
 	if pending != nil {
+		// What an rm under the guard dropped since the record was written,
+		// which the floor may lack (recordRmDropped).
+		if gone, err = s.rmDroppedOf(fdir, *pending); err != nil {
+			return r, err
+		}
 		switch {
 		case pending.Input != in.sum:
 			return r, fmt.Errorf("%s, the record a merge writes before the floor, is of another input than keystore-floor.json.pre-restore (input sha256 %s, the file's %s): the file was replaced after a merge of another one began. Nothing is written; put back the floor that merge read, or inspect both files", retiredPendingName, pending.Input, in.sum)
@@ -282,7 +288,12 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		default:
 			// rm is never refused while a merge is pending, so the live
 			// floor may be the recorded one plus burials rm added since.
-			if rerun, err = pendingSince(*pending, live); err != nil {
+			rerun, err = pendingSince(*pending, live, gone)
+			var nw *notWrittenError
+			switch {
+			case errors.As(err, &nw):
+				return r, fmt.Errorf("keystore-floor.json (sha256 %s) is neither the floor this merge recorded writing (%s) nor the one it read (%s), in %s, with only rm's burials added since: %w. The merge did not write the floor, and it does not plan a merge over a floor changed by anything but rm, so nothing is written. Inspect keystore-floor.json against the record", liveSum, pending.Floor, pending.Base, retiredPendingName, err)
+			case err != nil:
 				return r, fmt.Errorf("%w: keystore-floor.json (sha256 %s) is neither the floor this merge recorded writing (%s) nor the one it read (%s), in %s, nor either of them with only burials added since (%w): it changed after the merge wrote it, and the merge never plans a written merge again, so nothing more is done. Inspect keystore-floor.json against the record", errCommitted, liveSum, pending.Floor, pending.Base, retiredPendingName, err)
 			}
 		}
@@ -338,7 +349,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		}
 	}
 	if rerun {
-		return s.finishRerun(st, in, live, *pending, opts.DryRun, moveAside)
+		return s.finishRerun(st, in, live, *pending, gone, opts.DryRun, moveAside)
 	}
 	ptrs, unverified, aside, asideUnverified, err := s.stagedPointers(ctx, st, live, from)
 	if err != nil {
@@ -488,9 +499,11 @@ func movedErr(err error) error {
 // finishRerun is a rerun of a merge whose floor is written (rec, the
 // pending retired record, names the live floor): it never plans the floor
 // again, only finishes the steps after it, the staged tree's handover and
-// move and the input's rename, and reports from rec, already merged. Every
-// failure is committed.
-func (s *FileStore) finishRerun(st *mergeStaging, in *mergeInput, live floor, rec retiredRecord, dryRun bool, moveAside func(*MergeReport) error) (MergeReport, error) {
+// move and the input's rename, and reports from rec, already merged. A
+// staged entry whose burial an rm under the guard dropped (gone) has its
+// directory removed with the ones the floor refuses. Every failure is
+// committed.
+func (s *FileStore) finishRerun(st *mergeStaging, in *mergeInput, live floor, rec retiredRecord, gone map[floorBurial]bool, dryRun bool, moveAside func(*MergeReport) error) (MergeReport, error) {
 	r := MergeReport{AlreadyMerged: true, Retired: rec.Retired, BuriedLive: rec.BuriedLive, Kept: rec.Kept, Recorded: rec.Recorded, Dropped: rec.Dropped}
 	for name, e := range in.fl {
 		for _, b := range e.burials() {
@@ -510,7 +523,7 @@ func (s *FileStore) finishRerun(st *mergeStaging, in *mergeInput, live floor, re
 		if err := s.chownStaged(st); err != nil {
 			return r, committedShape(err)
 		}
-		names, err := s.refusedStaged(st, live, nil)
+		names, err := s.refusedStaged(st, live, goneDrops(gone))
 		if err != nil {
 			return r, committedShape(err)
 		}
@@ -531,15 +544,18 @@ func (s *FileStore) finishRerun(st *mergeStaging, in *mergeInput, live floor, re
 // byte. It is a rerun of the written merge (true) when live is the floor
 // rec records writing plus only what rm adds (buriedSince), and a first
 // run that stopped before its floor write (false) when live is the floor
-// rec records reading plus only rm's burials under the guard (rmSince);
-// anything else is an error naming the first difference from the floor
-// written.
-func pendingSince(rec retiredRecord, live floor) (bool, error) {
+// rec records reading plus only rm's burials under the guard (rmSince).
+// gone is each burial an rm under the guard dropped (rmDroppedOf): either
+// floor may lack it. Anything else is an error: committed when live is not
+// the floor read with only what rm adds or what anything else adds (the
+// merge may have written it), and errNotWritten when it is the floor read
+// with a change rm does not make (the merge never wrote its floor).
+func pendingSince(rec retiredRecord, live floor, gone map[floorBurial]bool) (bool, error) {
 	written, err := recordFloor(rec.Written, rec.Floor)
 	if err != nil {
 		return false, err
 	}
-	werr := buriedSince(written, live)
+	werr := buriedSince(written, live, gone)
 	if werr == nil {
 		return true, nil
 	}
@@ -547,23 +563,41 @@ func pendingSince(rec retiredRecord, live floor) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if rmSince(read, live) {
+	if rmSince(read, live, gone) {
 		return false, nil
+	}
+	if rerr := buriedSince(read, live, gone); rerr == nil {
+		return false, &notWrittenError{written: werr}
 	}
 	return false, werr
 }
 
+// notWrittenError is pendingSince's answer for a live floor that holds
+// everything the floor the merge read refuses, but not what the floor it
+// recorded writing refuses, and that differs from the floor read by more
+// than rm's burials: the merge's floor write never happened, and something
+// other than rm changed the floor since it read it.
+type notWrittenError struct{ written error }
+
+func (e *notWrittenError) Error() string {
+	return fmt.Sprintf("it is the floor this merge read, changed since by more than rm's burials (against the floor it recorded writing: %v)", e.written)
+}
+
 // buriedSince reports how now differs from old by more than burials added:
 // a burial of old gone from now or numbered lower, a live record of old
-// with another generation, a lower sequence or a lower high-water mark, or
-// gone without its generation buried, or a live record now that old does
-// not hold. nil means now refuses everything old refuses.
-func buriedSince(old, now floor) error {
+// with another generation, a lower sequence, or a higher one inside old's
+// fence, or gone without its generation buried, or a live record now that
+// old does not hold. A burial of old in gone, the burials an rm under the
+// guard dropped, may be missing from now, and so may the burial of a live
+// generation of old rm buried. nil means now refuses everything old
+// refuses, except for gone.
+func buriedSince(old, now floor, gone map[floorBurial]bool) error {
 	for _, name := range slices.Sorted(maps.Keys(old)) {
 		o, n := old[name], now[name]
 		for _, b := range o.burials() {
 			i := slices.IndexFunc(n.burials(), func(x burial) bool { return x.Generation == b.Generation })
 			switch {
+			case i < 0 && gone[floorBurial{name, b.Generation}]:
 			case i < 0:
 				return fmt.Errorf("the burial of %s generation %s is gone", name, b.Generation)
 			case n.Buried[i].Deleted < b.Deleted:
@@ -573,13 +607,13 @@ func buriedSince(old, now floor) error {
 		switch {
 		case !o.live():
 		case !n.live():
-			if !n.buries(o.Generation) {
+			if !n.buries(o.Generation) && !gone[floorBurial{name, o.Generation}] {
 				return fmt.Errorf("the live record of %s is gone and its generation not buried", name)
 			}
 		case n.Generation != o.Generation:
 			return fmt.Errorf("the live record of %s holds another generation", name)
-		case n.Seq < o.Seq || max(n.Seq, n.HighWater) < max(o.Seq, o.HighWater):
-			return fmt.Errorf("the live record of %s is lowered", name)
+		case !fenceKept(o, n):
+			return fmt.Errorf("the live record of %s is lowered or moved inside its fence", name)
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(now)) {
@@ -590,11 +624,21 @@ func buriedSince(old, now floor) error {
 	return nil
 }
 
+// fenceKept reports whether the live record n, of o's generation, refuses
+// every pointer o refuses: the same sequence with a high-water mark at or
+// above o's, or a sequence above both o's sequence and its mark. A
+// sequence raised into o's fence (above o.Seq, at or below o.HighWater)
+// would accept a copy of the history the fence refuses.
+func fenceKept(o, n floorEntry) bool {
+	return (n.Seq == o.Seq && n.HighWater >= o.HighWater) || n.Seq > max(o.Seq, o.HighWater)
+}
+
 // rmSince reports whether now is old plus only what rm writes under the
 // guard: burials numbered above guardEraSeq, each live record of old kept
-// as it is or buried, and no burial of old gone.
-func rmSince(old, now floor) bool {
-	if buriedSince(old, now) != nil {
+// as it is or buried, and no burial of old gone but those in gone, the
+// burials rm dropped.
+func rmSince(old, now floor, gone map[floorBurial]bool) bool {
+	if buriedSince(old, now, gone) != nil {
 		return false
 	}
 	for name, n := range now {
@@ -609,6 +653,19 @@ func rmSince(old, now floor) bool {
 		}
 	}
 	return true
+}
+
+// goneDrops is gone as the burials a write dropped, sorted, for
+// refusedStaged.
+func goneDrops(gone map[floorBurial]bool) []pruned {
+	out := make([]pruned, 0, len(gone))
+	for b := range gone {
+		out = append(out, pruned{name: b.name, generation: b.generation})
+	}
+	slices.SortFunc(out, func(a, b pruned) int {
+		return strings.Compare(a.name+"\x00"+a.generation, b.name+"\x00"+b.generation)
+	})
+	return out
 }
 
 // floorBurial is one burial by name and generation.
@@ -861,6 +918,11 @@ func (s *FileStore) renameMerged(in *mergeInput) error {
 			return err
 		}
 	case !errors.Is(err, fs.ErrNotExist):
+		return err
+	}
+	// The rm-dropped record is of this merge only: with the guard cleared
+	// no rm writes under it, and no rerun reads it.
+	if err := in.dir.Remove(rmDroppedName); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	if err := in.dir.Rename(in.base, to); err != nil {

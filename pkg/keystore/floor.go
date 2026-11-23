@@ -892,6 +892,12 @@ type floorLock struct {
 	// dropped is every burial a prune dropped in a write made under this
 	// lock, so a verb checks them all, not only its own (evicted).
 	dropped []pruned
+	// beforeWrite, when set, is called by updatePruned with what the
+	// write's prune dropped, after the prune and before the floor is
+	// written; its error refuses the write. Delete under a pending merge
+	// records there each burial the write drops (recordRmDropped), durably,
+	// before the floor that drops it.
+	beforeWrite func(pruned []pruned) error
 }
 
 // openDataRoot opens the data root without following a symlink and judges
@@ -1144,6 +1150,11 @@ func (l *floorLock) updatePruned(op func(floor) bool) (floor, []pruned, error) {
 	}
 	if len(b) > floorSizeLimit {
 		return nil, nil, fmt.Errorf("%w (%d bytes)", errFloorFull, len(b))
+	}
+	if l.beforeWrite != nil {
+		if err := l.beforeWrite(dropped); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := l.s.writeFileAs(l.root, floorName, b, uint32(l.s.floorUID), uint32(l.s.floorGID), floorFileMode); err != nil {
 		return nil, nil, err

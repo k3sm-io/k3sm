@@ -30,6 +30,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -650,6 +651,22 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// capDropped is every burial a bury in this Delete dropped at the
 	// per-name cap; fdir.dropped holds what the writes' prunes dropped.
 	var dropped, capDropped []pruned
+	// With a merge's commit marker written, each burial a write here drops
+	// is recorded first, so the merge's rerun can tell the floor rm left
+	// from one changed by anything else (recordRmDropped, pendingSince).
+	if pending {
+		// A record that does not read already refuses the merge; the
+		// revocation goes on regardless.
+		rec, err := s.readPendingRetired(fdir)
+		if err != nil {
+			slog.Warn("keystore: the pending merge's record does not read, so the burials this delete drops are not recorded for it", "name", name, "err", err)
+		}
+		if rec != nil {
+			fdir.beforeWrite = func(pruned []pruned) error {
+				return s.recordRmDropped(fdir, *rec, append(slices.Clone(dropped), pruned...))
+			}
+		}
+	}
 	after, err := fdir.update(func(fl floor) bool {
 		// With no guard pending, a burial above guardEraSeq is a band left
 		// behind (no keystore-floor.json.pre-restore): it is renumbered back
