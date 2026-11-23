@@ -2608,9 +2608,10 @@ service user can only add to.
 - **Rebuild carries the old floor forward.** Before it writes the new file, rebuild reads the
   old floor line by line, as root, on its own descriptor ("Rebuild reads a flooded floor":
   streamed, with no size bound). It keeps every tombstone and every key's highest sequence that
-  the key bound admits. It drops the lines that do not parse (a torn tail, a line outside the
-  grammar), the lines over 1 KiB, the live lines the key bound leaves no room for, and the keys
-  of scopes root removed and recorded, and counts each class in its output, never their bytes.
+  its admission classes admit. It drops the lines that do not parse (a torn tail, a line
+  outside the grammar), the lines over 1 KiB, the lines past a uid's share, the lines of absent
+  scopes past their share or the key bound, and the keys of scopes root removed and recorded,
+  and counts each class in its output, never their bytes.
   The audit line has no field for a count: a rebuild that dropped anything exits 4 and its
   audit line's result is `committed`, so the counts are in the verb's output. The new file holds, per key, the higher of
   the carried-forward sequence and the one on disk, and every carried tombstone, which the
@@ -2637,17 +2638,33 @@ service user can only add to.
   buffer of the per-line bound (1 KiB), and its memory is the admitted keys, at most the key
   bound, plus that buffer, whatever the file's size. A line over the per-line bound is skipped
   to its newline and counted; a line that does not parse is dropped and counted. It reads the
-  floor in passes and admits keys against the key bound, the keys on disk counted first, in
-  this order: (1) every tombstone and every live line whose key is on disk, except a line of a
-  uid `rm-scope` recorded that starts before the floor offset recorded at its removal; (2) then, only while under the bound, live lines with no key on
-  disk whose entry directory stands (another generation of it); (3) then, only while under the
-  bound, live lines with no entry directory on disk. Live lines of (2) and (3) are the ones the
-  service user can forge, so they are dropped first, and counted separately. Tombstones and
-  live lines of a scope that is absent but not recorded as removed, and every line written
-  after a recorded removal, are kept in the same classes (fail closed: "A removed scope stays
-  removed"). The one refusal left is the
-  tombstones and the keys on disk alone passing the key bound: dropping any of them would lower
-  the floor, so rebuild refuses, changing nothing, and names the scopes with the most keys.
+  floor in passes and admits its lines in four classes: (1) for a scope present on disk, the
+  lines whose key is on disk, all of them; (2) for a scope present on disk, every other line
+  (its tombstones, other generations), oldest first, up to the uid's lifetime key share, the
+  per-uid share the writer already enforces (`uidKeyShare`, 4,112 keys), so a real scope,
+  whose lines the writer never let past it, loses nothing; the excess is dropped and counted
+  as "past the uid's share"; (3) for a scope absent from disk and not recorded as removed,
+  per uid up to the same share, uids in first-appearance order, while the total stays under
+  the key bound; the rest is dropped and counted as "absent scopes"; (4) for a scope root
+  removed and recorded, its lines before the recorded offset are dropped ("Rebuild drops a
+  removed scope's keys"), and later lines, a re-minted scope's, fall in (1) to (3). Any drop
+  exits 4 with the counts by class. The one refusal left is classes (1) and (2) together
+  passing the key bound, too many real scopes: rebuild refuses, changing nothing, names the
+  scopes with the most keys, and `rm-scope` of one is the repair. Rebuild bounds what it
+  collects from disk the same way: while it walks the scopes (a walk bounded by the listing
+  bound of `.user/`), it checks the keys and entry names it has collected against the key
+  bound, stops once they pass it, and refuses before reading the old floor, naming the scopes
+  with the most entries, so its memory is the key bound's whatever the tree holds.
+  *Residual (forged lines).*
+  Floor lines are CRC-checked only, so the service user can write any line. It can no longer
+  block the rebuild with them: forged lines of absent uids are held to a share each and to the
+  key bound, and forged lines of a real uid to that uid's share. What it can still do: fill
+  the room absent scopes may take, so an absent scope's real tombstones (a directory deleted
+  by hand, a record full) can be dropped behind forged uids that appear earlier in the file,
+  and a copy of that scope put back is then served at what is on disk; and spend a real
+  uid's share with forged keys, which the writer already charges to that uid, so its later
+  grants are refused (the self-lockout of "Per-uid fairness"); every line the writer accepted
+  for a real uid is within its share, so rebuild drops none of them.
 - **Rebuild drops a removed scope's keys.** Once root has removed a user scope with
   `rm-scope`, which lists the scope key's identity in `keystore-removed-scopes.json` with the
   floor's byte size at that moment and then deletes the scope directory, `floor --rebuild`
@@ -2666,11 +2683,13 @@ service user can only add to.
   self-lockout) (U194). An absent scope the record does not list (a full record, or a
   directory deleted by hand) keeps its keys, and so does a re-minted scope whose directory is
   later deleted by hand: its tombstones still refuse a copy-back of it. The offset names a
-  position in the floor the swap retires, so before the swap commits (step 4, the report into
-  the marker) rebuild rewrites the record with the offset at 0 for every removal it applied;
-  0 drops nothing. A crash between that rewrite and the swap leaves the old floor live and the
-  offsets at 0, so the rerun keeps those lines rather than dropping them: fail closed, never a
-  drop applied twice against a floor it does not describe.
+  position in one floor file, so each removal records it with that floor log's inode,
+  `(floor_ino, floor_size)`, and rebuild applies a removal's drop only when the old floor it
+  reads has that inode. The floor a rebuild swaps in has a new inode, so an offset never
+  applies to a floor it does not describe, and the record is written only by `rm-scope`:
+  rebuild never rewrites it, so a refused or crashed rebuild has changed nothing and a later
+  rebuild of the same floor still drops the removed scope's lines. A record without
+  `floor_ino` (written before it existed) drops nothing (fail closed).
 - **A removed scope stays removed.** `rm-scope` records the removed scope in
   `keystore-removed-scopes.json` in the data root before it removes the directory: root's,
   mode 0644 (the service user's opens read it; it is closed to group and other writes),
@@ -2678,18 +2697,19 @@ service user can only add to.
   data root fsynced; read with `O_NOFOLLOW` and judged on its descriptor (a regular file of the
   data root's owner, not group- or other-writable, no file flag, no extended ACL, at most
   256 KiB; a second link is a Warn, never a refusal); parsed
-  strictly (one JSON object `{"version":1,"scopes":[{"uid":…,"keys":[…],"floor_size":…}]}`,
+  strictly (one JSON object `{"version":1,"scopes":[{"uid":…,"keys":[…],"floor_size":…,"floor_ino":…}]}`,
   no unknown field, no trailing data, each uid listed once, each key 64 lowercase hex digits
-  listed once, at most 1024 keys in all, `floor_size` not negative and 0 when absent). A record
-  holds per uid the identity of each scope key removed and `floor_size`, the user-scope floor's
-  byte size when rm-scope last listed a key of the uid, which rebuild drops the uid's lines
-  before and then sets to 0 ("Rebuild drops a removed scope's keys"): a labelled
+  listed once, at most 1024 keys in all, `floor_size` not negative and 0 when absent, `floor_ino` 0 when absent). A
+  record holds per uid the identity of each scope key removed and `floor_ino` and
+  `floor_size`, the user-scope floor log's inode and byte size when rm-scope last listed a key
+  of the uid, which rebuild, reading the floor of that inode, drops the uid's lines before
+  ("Rebuild drops a removed scope's keys"): a labelled
   SHA-256 of the scope and K_u, which Rewrap leaves as it is (it re-seals the same K_u) and a
   re-minted scope never shares; rm-scope already holds the master to open `scope.key`. Every
   open of a scope key (a read, a grant, the start step's catch-up, rebuild) refuses one the
   record lists, saying root removed the scope and the directory must be deleted; a record that
   does not read or parse refuses every open, rm-scope and rebuild (fail closed). When the
-  record is full, rm-scope still removes the scope, says so, and leaves it unlisted, and
+  record is full, rm-scope still removes the scope, says so, exits 4, and leaves it unlisted, and
   rebuild keeps that scope's floor keys instead of dropping them, so a copy-back is still held
   to the floor. rm-scope removes the tree by descriptor and cannot be blocked by a name the
   service user plants in it: a regular file, FIFO, symlink, device or socket is removed with
@@ -2706,7 +2726,12 @@ service user can only add to.
   user is still writing there and to stop it (`sudo k3sm stop`). An rm-scope that stops after
   the record is written says so (the scope listed as removed, its directory partly or wholly
   present), and a rerun finishes it: a listed key is removed without the delivery check, and a
-  directory left without `scope.key` is removed as it stands. *Residual (a full record).* An
+  directory left without `scope.key` is removed as it stands. A directory without `scope.key`
+  whose uid the record does not list is an interrupted earlier run that never listed it, or
+  tampering: rm-scope removes the tree but exits 4, saying the scope was removed without being
+  listed because its key file was absent, so a copied-back directory would open, and that its
+  floor lines are kept, so the floor still refuses rolled-back or deleted entries; it never
+  speaks of a full record for this. *Residual (a full record).* An
   unlisted removed scope copied back opens: its floor keys hold it to its last floor, and
   nothing more. *Residual (one uid, two removals).* The offset is per uid, the latest removal's
   size: a removal left unlisted for a full record after a listed one of the same uid is not
@@ -2868,7 +2893,14 @@ service user can only add to.
   `renameatx_np(RENAME_EXCL)`, so nothing is renamed over. A log that passes the judge is left
   alone; anything else, an unflagged log among them, is refused and left as found. Install
   refuses, changing nothing, while a maintenance verb holds `keystore-lock`, and removes a
-  stale marker once the live set is ensured (U21; root-run, U90).
+  stale marker once the live set is ensured (U21; root-run, U90). `keystore-run/` is the
+  service user's, so it can set a user flag (`uchg`, `uappnd`) on it, which would make root's
+  fchmod and fchown fail and wedge install: install clears the user-settable flags (`UF_*`) on
+  its judged descriptor first, for a directory the service user or root owns, and makes the
+  chmod and chown only when the mode or owner is not already right. The logs, the other
+  service-owned paths the step touches, are never chmodded or chowned once they exist: one
+  carrying a user flag fails the judge and is refused and left as found, as any other log the
+  judge refuses is (`floor --rebuild` or `audit --rotate` replaces it).
 - **The hand-over order was not measured before 2026-11-23.** The order this design first
   named, flag the new file and then `fchown` it to the service user, rested on an unmeasured
   assumption (K0 measured the service user's operations on a flagged file, not root's). The
@@ -5997,13 +6029,17 @@ carried by the unit rows.
 | U193 | `floor --rebuild` carries the old floor forward: over an old floor holding tombstones, sequence lines and a torn last line (which the reader already skips as counted damage, so the floor served throughout), it keeps every tombstone and every key's highest sequence that parses, writes the higher of that and the sequence on disk, drops the lines that do not parse and names their count (U196 holds the other classes it drops); a tree copied back after an `rm`, a crash and a rebuild is refused as deleted, and a copied-back older record is refused; a floor that cannot be read refuses the rebuild, changing nothing | `k3sm/pkg/keystore::TestRebuildCarriesTombstonesForward` | done: the append-only files (the rebuild verb) |
 | U194 | once root removes a user scope (`rm-scope`), `floor --rebuild` drops every key of that scope, live or buried, by position: the uid's lines before the floor size rm-scope recorded, keeping every line after it, so a re-minted scope whose directory is later deleted by hand keeps its tombstones and a copy-back of it is refused; a re-minted scope gets a fresh K_u, and rm-scope's record refuses the old scope key (U197); the rebuild frees the uid's lifetime key share and its keys in the global key bound | `k3sm/pkg/keystore::TestRebuildDropsRemovedScopeKeys`, `TestRebuildKeepsReMintedScopeTombstones` | done: the append-only files (the rebuild verb, after rm-scope) |
 | U195 | root-run: the SF_APPEND facts measured on 2026-11-23: on a flagged file root's fchown, fchmod, rename, link, unlink and O_TRUNC open are each EPERM; chown then flag works, and root's fchown back is then EPERM; a descriptor opened without O_APPEND before the flag can neither pwrite nor ftruncate once it is set; the service user's link() of a root-owned 0600 unflagged file into its own directory succeeds, and of a flagged file fails. The second probe: root's rename and RENAME_SWAP of directories holding flagged files work; once the retired log is unflagged a descriptor held from before can clear O_APPEND, pwrite and ftruncate it, and a held directory descriptor can openat it; the new canonical log refuses non-append and O_TRUNC opens with EPERM and takes an O_APPEND write; staging is EACCES (integration, a root-run row: `--root`; § "SF_APPEND, as measured") | `k3sm/pkg/keystore::TestSappndMeasuredFacts`, `TestSappndDirectorySwap` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
-| U196 | floor --rebuild reads a flooded floor: it streams the old floor with no size bound and memory bounded by the key bound and one line, so a floor past the steady-state reader's size bound, which the service user can reach at will, rebuilds; over-long and unparseable lines are dropped and counted, every real tombstone is kept, live lines with no key on disk are admitted only while under the key bound and dropped first, counted; only tombstones and keys on disk past the bound refuse, naming the scopes with the most keys; it sets the record's floor offsets to 0 before its swap commits, so a crash between the two keeps the removed scopes' lines (fail closed) | `k3sm/pkg/keystore::TestRebuildStreamsFloorPastReadBound`, `TestRebuildDropsForgedLiveFlood`, `TestOldFloorReaderMemoryBounded`, `TestOldFloorReaderRefusesTombstonesPastBound`, `TestRebuildCrashAfterRecordRewriteFailsClosed` | done: the append-only files (the rebuild verb) |
-| U197 | rm-scope lists the removed scope key's identity in keystore-removed-scopes.json in the data root, with the floor's byte size at the removal (root's, by temp, fsync and rename, parsed strictly, bounded), so the old scope directory copied back is refused at every open (read, put, the start step, rebuild) while a re-minted scope opens; a full record still removes the scope and rebuild keeps its floor keys; a record that does not read fails closed; an rm-scope stopped part-way names the state it left and a rerun finishes it | `k3sm/pkg/keystore::TestRemovedScopeCopiedBackRefused`, `TestRemovedScopesFullKeepsFloorKeys`, `TestRemovedScopesMalformedFailsClosed`, `TestRemovedScopesFloorSizeParse`, `TestRemoveScopeRerunFinishesPartialRemoval` | done: the append-only files (rm-scope) |
+| U196 | floor --rebuild reads a flooded floor: it streams the old floor with no size bound and memory bounded by the key bound and one line, so a floor past the steady-state reader's size bound, which the service user can reach at will, rebuilds; over-long and unparseable lines are dropped and counted, every real tombstone is kept; a present scope's lines are admitted all for keys on disk, and the rest oldest first up to the uid's key share (excess counted past the share); an absent, unrecorded scope's per uid up to the share, uids in first-appearance order, under the key bound (rest counted as absent scopes); so forged tombstones for uids with no scope, or a flood for one real uid, never wedge it and every real line is kept; only the present scopes' keys past the bound refuse, naming the scopes with the most keys and rm-scope; each removal's floor offset is bound to the floor log's inode it was recorded against, so rebuild never rewrites the record: a refused rebuild leaves it byte-identical and a later rebuild still drops the removed scope's lines, while a committed rebuild's new floor (new inode) gets no stale drop; a record without floor_ino drops nothing | `k3sm/pkg/keystore::TestRebuildStreamsFloorPastReadBound`, `TestRebuildDropsForgedLiveFlood`, `TestOldFloorReaderMemoryBounded`, `TestOldFloorReaderRefusesTombstonesPastBound`, `TestRebuildForgedAbsentTombstoneFlood`, `TestRebuildForgedFloodOneRealUIDTrimmed`, `TestOldFloorReaderAbsentFirstAppearanceOrder`, `TestOldFloorReaderRefusesRealScopesPastBound`, `TestRebuildRefusedLeavesRecordAndStillDrops` | done: the append-only files (the rebuild verb) |
+| U197 | rm-scope lists the removed scope key's identity in keystore-removed-scopes.json in the data root, with the floor log's inode and byte size at the removal (root's, by temp, fsync and rename, parsed strictly, bounded), so the old scope directory copied back is refused at every open (read, put, the start step, rebuild) while a re-minted scope opens; a full record still removes the scope and rebuild keeps its floor keys; a record that does not read fails closed; an rm-scope stopped part-way names the state it left and a rerun finishes it | `k3sm/pkg/keystore::TestRemovedScopeCopiedBackRefused`, `TestRemovedScopesFullKeepsFloorKeys`, `TestRemovedScopesMalformedFailsClosed`, `TestRemovedScopesFloorSizeParse`, `TestRemoveScopeRerunFinishesPartialRemoval` | done: the append-only files (rm-scope) |
 | U198 | the log reader charges at most maxRevokeUIDs plus 64 distinct uids past the hard cap; forged lines of more distinct uids are sticky damage, with no growth of its per-uid map | `k3sm/pkg/keystore::TestAuditReaderBoundsChargedUIDs` | done: the append-only files (the reader) |
 | U199 | floor --rebuild that dropped any line or key exits 4, lists the counts by class and audits committed; doctor's keystore-floor row warns of floor damage naming floor --rebuild | `k3sm/cmd/k3sm::TestKeysMaintenanceVerbs`, `TestDoctorChecksTable` | done: the append-only files (the rebuild verb, doctor) |
 | U200 | a second link on a root-written data-root file (the removed-scopes record, the maintenance marker, the floor acknowledgement) is a Warn, never a refusal: each still reads, judged on type, owner, mode, flags and ACL, so a link any local user can make blocks no scope open, verb or acknowledgement | `k3sm/pkg/keystore::TestRemovedScopesSecondLinkReads`, `TestMarkerSecondLinkReads`, `TestFloorAckSecondLinkReads`, `TestRootFileModeStillJudged`, `TestMaintenanceJudgesMarkerAndStale` | done: the append-only files (root-written files) |
 | U201 | root-run: the service user link(2)s root's removed-scopes record and floor acknowledgement into its own directory; the record still reads and rm-scope still writes it, and the acknowledgement still lifts the damage it acknowledged (integration, a root-run row: `--root`) | `k3sm/pkg/keystore::TestRootFileServiceLinkReadsAsRoot` (integration, root-run) | checked as a root-run row (`--root`): the append-only files (root-written files) |
 | U202 | a maintenance verb that fails after its RENAME_SWAP is committed, never refused: it exits 4, audits committed and still prints its report (a rebuild's drop counts); a later run of the other verb, or install, that finds a marker recording a committed run prints its saved report to stderr as an earlier committed run that was not reported and audits it (op that verb, result committed) before it replaces or removes the marker; a marker whose swap never committed reports nothing | `k3sm/pkg/keystore::TestSwapFailureAfterCommitIsCommitted`, `TestEarlierCommittedRunReported`, `TestSwapRerunFromEachStep`, `k3sm/cmd/k3sm::TestKeysMaintenanceCommittedAfterSwap`, `k3sm/pkg/install::TestKeystoreFilesReportsCommittedMarker` | done: the append-only files (the swap) |
+| U203 | rm-scope of a scope directory with no scope.key, for a uid the record does not list, removes the tree but exits 4, audited committed, saying it was removed without being listed because its key file was absent, so a copied-back directory would open, and that its floor lines are kept; it never says the record is full; a full record also exits 4, with its own text | `k3sm/pkg/keystore::TestRemoveScopeMissingKeyUnlistedCommitted`, `TestRemoveScopeRerunFinishesPartialRemoval`, `TestRemovedScopesFullKeepsFloorKeys`, `k3sm/cmd/k3sm::TestKeysRmScopeUnlistedExitsCommitted` | done: the append-only files (rm-scope) |
+| U204 | floor --rebuild bounds what it collects from disk: it checks the keys and entry names of the scopes on disk against the key bound while collecting, stops once they pass it and refuses before reading the old floor, naming the scopes with the most entries and rm-scope, changing nothing; the scope walk is bounded by the listing bound | `k3sm/pkg/keystore::TestRebuildRefusesDiskPastBound` | done: the append-only files (the rebuild verb) |
+| U205 | install clears a user flag on keystore-run/ on its judged descriptor before any chmod or chown, and makes the chmod and chown only when the mode or owner is not already right, so the service user cannot wedge install with uchg on the directory it owns | `k3sm/pkg/install::TestKeystoreRunDirClearsUserFlag` | done: the append-only files (install) |
+| U206 | root-run: the service user sets uchg on keystore-run/, which makes root's chmod fail EPERM; install clears the flag first and finishes, leaving the directory the service user's 0700 with no user flag (integration, a root-run row: `--root`) | `k3sm/pkg/install::TestKeystoreRunDirUserFlagAsRoot` (integration, root-run) | checked as a root-run row (`--root`): the append-only files (install) |
 
 ### Rig legs
 

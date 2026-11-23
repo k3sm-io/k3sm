@@ -5,7 +5,7 @@
 # The keystore's acceptance gate: docs/design/keystore.md § "Acceptance gate",
 # rows G1 to G23, the user-scope rows U1 to U137 (U15, U39 and U117 are unused),
 # the typed-credential rows U138 to U191, the floor's tombstone row U192, the
-# rebuild rows U193 and U194, the rows U195 to U202, and the rig legs E1 to E36. Every row
+# rebuild rows U193 and U194, the rows U195 to U206, and the rig legs E1 to E36. Every row
 # is listed, on exactly one line. A row runs
 # the tests that deliver it and passes only if each named test ran and passed
 # in its own package; a row whose change has not landed yet prints PENDING,
@@ -42,7 +42,7 @@
 #   --scope         user scopes: U6 to U11, U47, U58, U64, U66, U108, U127, U129, U132.
 #   --scope-store   the user-scope store: U12 to U14, U63, U97, U101, U128.
 #   --files         the append-only files: U20, U21, U23 to U25, U50, U52, U60, U61,
-#                   U68, U80, U88, U90, U91, U105, U118, U119, U193 to U202, and in the helper
+#                   U68, U80, U88, U90, U91, U105, U118, U119, U193 to U206, and in the helper
 #                   variant
 #                   only U70, U71.
 #   --socket        the socket listener: U26 to U31, U46, U48, U54, U82, U99, U104, U113,
@@ -164,7 +164,7 @@ EXPECTED_ROWS="$EXPECTED_ROWS U186 U187 U188 U189 U190 U191"
 EXPECTED_ROWS="$EXPECTED_ROWS U192"
 EXPECTED_ROWS="$EXPECTED_ROWS U193 U194"
 EXPECTED_ROWS="$EXPECTED_ROWS U195"
-EXPECTED_ROWS="$EXPECTED_ROWS U196 U197 U198 U199 U200 U201 U202"
+EXPECTED_ROWS="$EXPECTED_ROWS U196 U197 U198 U199 U200 U201 U202 U203 U204 U205 U206"
 # >>> ADD NEW U ROWS (U200 upward) HERE <<<
 EXPECTED_ROWS="$EXPECTED_ROWS E1 E2 E3 E4 E5 E6 E7 E8 E9 E10 E11 E12 E13 E14 E15 E16 E17 E18 E19 E20"
 EXPECTED_ROWS="$EXPECTED_ROWS E21 E22 E23 E24 E25 E26 E27"
@@ -197,7 +197,7 @@ mode_rows() {
 	api) echo "U18 U19" ;;
 	scope) echo "U6 U7 U8 U9 U10 U11 U47 U58 U64 U66 U108 U127 U129 U132" ;;
 	scope-store) echo "U12 U13 U14 U63 U97 U101 U128" ;;
-	files) echo "U20 U21 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U105 U118 U119 U193 U194 U195 U196 U197 U198 U199 U200 U201 U202" ;;
+	files) echo "U20 U21 U23 U24 U25 U50 U52 U60 U61 U68 U70 U71 U80 U88 U90 U91 U105 U118 U119 U193 U194 U195 U196 U197 U198 U199 U200 U201 U202 U203 U204 U205 U206" ;;
 	socket) echo "U26 U27 U28 U29 U30 U31 U46 U48 U54 U82 U99 U104 U113 U120 U121 U122 U131 U137" ;;
 	socket-ops) echo "U32 U33 U34 U35 U45 U51 U67 U84 U112 U136" ;;
 	exec) echo "U36 U37 U38 U69 U92" ;;
@@ -914,9 +914,9 @@ check U194 "once root removes a user scope (rm-scope), floor --rebuild drops eve
 	k3sm/pkg/keystore::TestRebuildDropsRemovedScopeKeys TestRebuildKeepsReMintedScopeTombstones
 rootcheck U195 "root-run: the SF_APPEND facts measured on 2026-11-23: on a flagged file root's fchown, fchmod, rename, link, unlink and O_TRUNC open are each EPERM; chown then flag works, and root's fchown back is then EPERM; a descriptor opened without O_APPEND before the flag can neither pwrite nor ftruncate once it is set; the service user's link() of a root-owned 0600 unflagged file into its own directory succeeds, and of a flagged file fails. The second probe: root's rename and RENAME_SWAP of directories holding flagged files work; once the retired log is unflagged a descriptor held from before can clear O_APPEND, pwrite and ftruncate it, and a held directory descriptor can openat it; the new canonical log refuses non-append and O_TRUNC opens with EPERM and takes an O_APPEND write; staging is EACCES (append-only files)" \
 	k3sm/pkg/keystore::TestSappndMeasuredFacts TestSappndDirectorySwap
-check U196 "floor --rebuild reads a flooded floor: it streams the old floor with no size bound and memory bounded by the key bound and one line, so a floor past the steady-state reader's size bound, which the service user can reach at will, rebuilds; over-long and unparseable lines are dropped and counted, every real tombstone is kept, live lines with no key on disk are admitted only while under the key bound and dropped first, counted; only tombstones and keys on disk past the bound refuse, naming the scopes with the most keys; it sets the record's floor offsets to 0 before its swap commits, so a crash between the two keeps the removed scopes' lines (fail closed) (the append-only files (the rebuild verb))" \
-	k3sm/pkg/keystore::TestRebuildStreamsFloorPastReadBound TestRebuildDropsForgedLiveFlood TestOldFloorReaderMemoryBounded TestOldFloorReaderRefusesTombstonesPastBound TestRebuildCrashAfterRecordRewriteFailsClosed
-check U197 "rm-scope lists the removed scope key's identity in keystore-removed-scopes.json in the data root, with the floor's byte size at the removal (root's, by temp, fsync and rename, parsed strictly, bounded), so the old scope directory copied back is refused at every open (read, put, the start step, rebuild) while a re-minted scope opens; a full record still removes the scope and rebuild keeps its floor keys; a record that does not read fails closed; an rm-scope stopped part-way names the state it left and a rerun finishes it (the append-only files (rm-scope))" \
+check U196 "floor --rebuild reads a flooded floor: it streams the old floor with no size bound and memory bounded by the key bound and one line, so a floor past the steady-state reader's size bound, which the service user can reach at will, rebuilds; over-long and unparseable lines are dropped and counted, every real tombstone is kept; a present scope's lines are admitted all for keys on disk, and the rest oldest first up to the uid's key share (excess counted past the share); an absent, unrecorded scope's per uid up to the share, uids in first-appearance order, under the key bound (rest counted as absent scopes); so forged tombstones for uids with no scope, or a flood for one real uid, never wedge it and every real line is kept; only the present scopes' keys past the bound refuse, naming the scopes with the most keys and rm-scope; each removal's floor offset is bound to the floor log's inode it was recorded against, so rebuild never rewrites the record: a refused rebuild leaves it byte-identical and a later rebuild still drops the removed scope's lines, while a committed rebuild's new floor (new inode) gets no stale drop; a record without floor_ino drops nothing (the append-only files (the rebuild verb))" \
+	k3sm/pkg/keystore::TestRebuildStreamsFloorPastReadBound TestRebuildDropsForgedLiveFlood TestOldFloorReaderMemoryBounded TestOldFloorReaderRefusesTombstonesPastBound TestRebuildForgedAbsentTombstoneFlood TestRebuildForgedFloodOneRealUIDTrimmed TestOldFloorReaderAbsentFirstAppearanceOrder TestOldFloorReaderRefusesRealScopesPastBound TestRebuildRefusedLeavesRecordAndStillDrops
+check U197 "rm-scope lists the removed scope key's identity in keystore-removed-scopes.json in the data root, with the floor log's inode and byte size at the removal (root's, by temp, fsync and rename, parsed strictly, bounded), so the old scope directory copied back is refused at every open (read, put, the start step, rebuild) while a re-minted scope opens; a full record still removes the scope and rebuild keeps its floor keys; a record that does not read fails closed; an rm-scope stopped part-way names the state it left and a rerun finishes it (the append-only files (rm-scope))" \
 	k3sm/pkg/keystore::TestRemovedScopeCopiedBackRefused TestRemovedScopesFullKeepsFloorKeys TestRemovedScopesMalformedFailsClosed TestRemovedScopesFloorSizeParse TestRemoveScopeRerunFinishesPartialRemoval
 check U198 "the log reader charges at most maxRevokeUIDs plus 64 distinct uids past the hard cap; forged lines of more distinct uids are sticky damage, with no growth of its per-uid map (the append-only files (the reader))" \
 	k3sm/pkg/keystore::TestAuditReaderBoundsChargedUIDs
@@ -928,6 +928,14 @@ rootcheck U201 "root-run: the service user link(2)s root's removed-scopes record
 	k3sm/pkg/keystore::TestRootFileServiceLinkReadsAsRoot
 check U202 "a maintenance verb that fails after its RENAME_SWAP is committed, never refused: it exits 4, audits committed and still prints its report (a rebuild's drop counts); a later run of the other verb, or install, that finds a marker recording a committed run prints its saved report to stderr as an earlier committed run that was not reported and audits it (op that verb, result committed) before it replaces or removes the marker; a marker whose swap never committed reports nothing (the append-only files (the swap))" \
 	k3sm/pkg/keystore::TestSwapFailureAfterCommitIsCommitted TestEarlierCommittedRunReported TestSwapRerunFromEachStep k3sm/cmd/k3sm::TestKeysMaintenanceCommittedAfterSwap k3sm/pkg/install::TestKeystoreFilesReportsCommittedMarker
+check U203 "rm-scope of a scope directory with no scope.key, for a uid the record does not list, removes the tree but exits 4, audited committed, saying it was removed without being listed because its key file was absent, so a copied-back directory would open, and that its floor lines are kept; it never says the record is full; a full record also exits 4, with its own text (the append-only files (rm-scope))" \
+	k3sm/pkg/keystore::TestRemoveScopeMissingKeyUnlistedCommitted TestRemoveScopeRerunFinishesPartialRemoval TestRemovedScopesFullKeepsFloorKeys k3sm/cmd/k3sm::TestKeysRmScopeUnlistedExitsCommitted
+check U204 "floor --rebuild bounds what it collects from disk: it checks the keys and entry names of the scopes on disk against the key bound while collecting, stops once they pass it and refuses before reading the old floor, naming the scopes with the most entries and rm-scope, changing nothing; the scope walk is bounded by the listing bound (the append-only files (the rebuild verb))" \
+	k3sm/pkg/keystore::TestRebuildRefusesDiskPastBound
+check U205 "install clears a user flag on keystore-run/ on its judged descriptor before any chmod or chown, and makes the chmod and chown only when the mode or owner is not already right, so the service user cannot wedge install with uchg on the directory it owns (the append-only files (install))" \
+	k3sm/pkg/install::TestKeystoreRunDirClearsUserFlag
+rootcheck U206 "root-run: the service user sets uchg on keystore-run/, which makes root's chmod fail EPERM; install clears the flag first and finishes, leaving the directory the service user's 0700 with no user flag (the append-only files (install))" \
+	k3sm/pkg/install::TestKeystoreRunDirUserFlagAsRoot
 # >>> ADD NEW U ROWS (U200 upward) HERE, and add each to EXPECTED_ROWS and to mode_rows <<<
 
 leg E1 "files" "preconditions: secrets encryption on; one server; keystore-sock/ root:wheel 0755 with keys.sock from launchd, and both logs present, service-user 0600, SF_APPEND set; the doctor user-scope row on; keystore.sh --check exits 0 on the build" "the append-only files"
