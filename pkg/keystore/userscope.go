@@ -24,6 +24,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 
 	keyentry "k3sm.io/apis/keystore/entry"
@@ -665,6 +666,12 @@ func (u *UserScope) openScopeForRevoke(root *os.Root, k keys) (*openedScope, err
 		}
 		return nil, err
 	}
+	return u.openedFrom(dir, r, ku)
+}
+
+// openedFrom is the opened scope from dir and the K_u ku its scope.key
+// record r opened to; it clears ku, and closes dir on a failure.
+func (u *UserScope) openedFrom(dir *os.Root, r record, ku []byte) (*openedScope, error) {
 	uk, err := deriveKeys(ku, u.scope)
 	dk := deliveriesKey(ku, u.scope)
 	id := scopeKeyID(u.scope, ku)
@@ -675,6 +682,66 @@ func (u *UserScope) openScopeForRevoke(root *os.Root, k keys) (*openedScope, err
 		return nil, err
 	}
 	return &openedScope{dir: dir, key: dk, gen: r.generation, uk: uk, id: id}, nil
+}
+
+// errScopeKeyJudgeOnly is openScopeForRmLoose's refusal of a scope.key the
+// judge refused for something other than its link count or mode.
+var errScopeKeyJudgeOnly = errors.New("scope.key's link count and mode are as the judge wants, so its refusal was for another cause")
+
+// openScopeForRmLoose is rm-scope's second open of a scope.key the judge
+// refused (errScopeKeyUntrusted): a second link or a mode wider than 0600
+// fails the judge, but any local user can cause either, and the content
+// still authenticates under the master, so removing the scope unlisted
+// would let a copy put back open. It reads scope.key by descriptor as
+// readScopeKeyRecord does (O_NOFOLLOW, a regular file, bounded at a scope
+// key record's size, owned by the service user) without the link-count and
+// mode checks, and opens it under W as openScopeForRevoke does. why names
+// what the judge refused (its link count, its mode); a scope.key whose
+// link count and mode pass is errScopeKeyJudgeOnly, and one that does not
+// parse or authenticate is ErrCorrupt: both leave the removal unlisted.
+func (u *UserScope) openScopeForRmLoose(root *os.Root, k keys) (o *openedScope, why string, err error) {
+	dir, err := u.openScopeDir(root, false)
+	if err != nil {
+		return nil, "", err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = dir.Close() // read-only
+		}
+	}()
+	b, fi, err := readFile(dir, scopeKeyName, int64(maxScopeKeyRecordSize))
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeKeyName, err)
+	}
+	st, sok := fi.Sys().(*syscall.Stat_t)
+	if !sok || st.Uid != u.s.uid {
+		return nil, "", fmt.Errorf("%w: %s is not the service user's", ErrCorrupt, scopeKeyName)
+	}
+	var whys []string
+	if st.Nlink != 1 {
+		whys = append(whys, fmt.Sprintf("it had %d links, not 1", st.Nlink))
+	}
+	if perm := fi.Mode().Perm(); perm&^fileMode != 0 {
+		whys = append(whys, fmt.Sprintf("its mode was %04o, wider than %04o", perm, fileMode))
+	}
+	if len(whys) == 0 {
+		return nil, "", errScopeKeyJudgeOnly
+	}
+	r, err := parseScopeKey(b)
+	if err != nil {
+		return nil, "", err
+	}
+	ku, err := u.openScopeKey(r, k)
+	if err != nil {
+		return nil, "", err
+	}
+	ok = true
+	o, err = u.openedFrom(dir, r, ku)
+	if err != nil {
+		return nil, "", err
+	}
+	return o, strings.Join(whys, " and "), nil
 }
 
 // readScopeKeyRecord reads and parses dir's scope.key, unopened. The file

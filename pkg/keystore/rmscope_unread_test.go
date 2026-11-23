@@ -72,43 +72,53 @@ func TestRemoveScopeUnreadableDeliveryRecord(t *testing.T) {
 	}
 }
 
-// rm-scope of a scope whose scope.key is present but cannot be trusted (a
-// second link, a mode wider than 0600, content that does not parse), all
-// of which the service user can cause, removes the tree unlisted, as with
-// no scope.key, and is committed (exit 4), saying the key file could not
-// be trusted and its floor lines are kept; floor --rebuild, which refused
-// the scope naming rm-scope, then runs. No repair loop is left.
+// rm-scope of a scope whose scope.key fails its judge only for a second
+// link or a mode wider than 0600, which any local user can cause, but
+// whose content still authenticates under the master, lists the key and
+// removes the tree, committed (exit 4), noting the link count or mode was
+// wrong: a copy of the directory put back (taken before the damage) is
+// refused at every open. A scope.key whose content does not parse is
+// removed unlisted, committed, saying the key file could not be trusted,
+// that a copy put back would open only if it carries a key the master
+// accepts, and that its floor lines are kept. Floor --rebuild, which
+// refused the scope naming rm-scope, runs after either.
 func TestRemoveScopeUntrustedKeyUnlisted(t *testing.T) {
-	for name, damage := range map[string]func(t *testing.T, p string){
-		"second link": func(t *testing.T, p string) {
+	for name, tc := range map[string]struct {
+		damage func(t *testing.T, p string)
+		listed bool
+		want   []string
+	}{
+		"second link": {func(t *testing.T, p string) {
 			if err := os.Link(p, filepath.Join(filepath.Dir(p), "alias")); err != nil {
 				t.Fatal(err)
 			}
-		},
-		"mode 0640": func(t *testing.T, p string) {
+		}, true, []string{"removed user/1002 and listed it", "link count or mode was wrong", "it had 2 links"}},
+		"mode 0640": {func(t *testing.T, p string) {
 			if err := os.Chmod(p, 0o640); err != nil {
 				t.Fatal(err)
 			}
-		},
-		"bad content": func(t *testing.T, p string) {
+		}, true, []string{"removed user/1002 and listed it", "link count or mode was wrong", "its mode was 0640"}},
+		"bad content": {func(t *testing.T, p string) {
 			if err := os.WriteFile(p, []byte("not a key record"), fileMode); err != nil {
 				t.Fatal(err)
 			}
-		},
+		}, false, []string{"removed user/1002 without listing it", "its scope.key could not be trusted", "would open only if it carries a key the master accepts", "its floor lines are kept"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			s, server, _ := fileLogScope(t)
 			userPut(t, userScope(t, s, 1002), "user/1002/x", "x")
-			damage(t, filepath.Join(scopeDir(server, "1002"), scopeKeyName))
+			saved := filepath.Join(t.TempDir(), "1002")
+			copyTree(t, scopeDir(server, "1002"), saved)
+			tc.damage(t, filepath.Join(scopeDir(server, "1002"), scopeKeyName))
 			if _, err := s.RebuildFloor(ctx, &attrRecorder{}); !errors.Is(err, errRebuildRefused) || !strings.Contains(err.Error(), "rm-scope user/1002") {
 				t.Fatalf("rebuild with scope.key damaged: %v, want a refusal naming rm-scope user/1002", err)
 			}
 			recorded, err := s.RemoveScope(ctx, 1002)
-			if recorded || !Committed(err) {
-				t.Fatalf("rm-scope: recorded %v, %v; want unlisted and committed", recorded, err)
+			if recorded != tc.listed || !Committed(err) {
+				t.Fatalf("rm-scope: recorded %v, %v; want recorded %v and committed", recorded, err, tc.listed)
 			}
-			for _, want := range []string{"removed user/1002 without listing it", "its scope.key could not be trusted", "its floor lines are kept"} {
+			for _, want := range tc.want {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("the error %q does not say %q", err, want)
 				}
@@ -116,10 +126,14 @@ func TestRemoveScopeUntrustedKeyUnlisted(t *testing.T) {
 			if _, err := os.Lstat(scopeDir(server, "1002")); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("the scope directory is still there: %v", err)
 			}
-			if readRecord(t, s).listed(1002) {
-				t.Fatal("a scope with an untrusted scope.key was listed")
+			if got := readRecord(t, s).listed(1002); got != tc.listed {
+				t.Fatalf("the scope is listed %v, want %v", got, tc.listed)
 			}
 			rebuild(t, s)
+			if tc.listed {
+				copyTree(t, saved, scopeDir(server, "1002"))
+				assertScopeRemovedEverywhere(t, s, 1002, errScopeRemoved)
+			}
 		})
 	}
 }

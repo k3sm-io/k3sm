@@ -61,9 +61,14 @@ var errScopeHasDeliveries = errors.New("the scope's delivery record names delive
 // A rerun finishes an rm-scope that stopped part-way: a scope whose key is
 // already listed is removed without reading its delivery record again, and
 // a scope directory left without its scope.key is removed as it stands.
-// A scope.key that is present but cannot be trusted (errScopeKeyUntrusted)
-// is treated as a missing one: the tree is removed unlisted, its floor
-// lines are kept, and the result is errCommitted, saying so.
+// A scope.key the judge refuses only for its link count or mode, which any
+// local user can cause, is read again without those two checks
+// (openScopeForRmLoose): when it authenticates under the master it is
+// listed and the tree removed, and the result is errCommitted, noting the
+// link count or mode. A scope.key that is present but does not parse or
+// authenticate (errScopeKeyUntrusted) is treated as a missing one: the
+// tree is removed unlisted, its floor lines are kept, and the result is
+// errCommitted, saying so.
 func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool, err error) {
 	if err := s.checkConfig(); err != nil {
 		return false, err
@@ -98,6 +103,15 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 	name := strconv.FormatUint(uint64(uid), 10)
 	u := &UserScope{s: s, uid: uid, scope: userScopeOf(uid), allowRemoved: true}
 	o, err := u.openScopeForRevoke(root, k)
+	var judged string
+	if errors.Is(err, errScopeKeyUntrusted) {
+		// A second link or a wider mode fails the judge, and any local
+		// user can cause either; a key that still authenticates under the
+		// master is listed, so a copy put back stays refused.
+		if lo, why, lerr := u.openScopeForRmLoose(root, k); lerr == nil {
+			o, judged, err = lo, why, nil
+		}
+	}
 	if errors.Is(err, errScopeKeyUntrusted) {
 		// scope.key is present but cannot be trusted, which the service
 		// user can cause: there is no key identity to list, so the scope
@@ -170,10 +184,28 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		}
 		return recorded, fmt.Errorf("%w; the scope %s %s, and its directory %s is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, u.scope, state, quoteName("keystore/"+userScopesName+"/"+name), u.scope)
 	}
+	var notes []string
+	if judged != "" {
+		notes = append(notes, scopeRemovedJudged(u.scope, judged, recorded))
+	}
 	if unread != nil {
-		return recorded, fmt.Errorf("%w: %s", errCommitted, scopeRemovedUnread(u.scope, unread))
+		notes = append(notes, scopeRemovedUnread(u.scope, unread))
+	}
+	if len(notes) > 0 {
+		return recorded, fmt.Errorf("%w: %s", errCommitted, strings.Join(notes, "; "))
 	}
 	return recorded, nil
+}
+
+// scopeRemovedJudged is rm-scope's committed note for a scope whose
+// scope.key failed its judge only for its link count or mode (why) and
+// still authenticated under the master, so it was listed when recorded.
+func scopeRemovedJudged(scope, why string, recorded bool) string {
+	state := "listed it in " + removedScopesName + ", so a copy of its directory put back is refused"
+	if !recorded {
+		state = "could not list it in " + removedScopesName + ", which is full"
+	}
+	return "removed " + scope + " and " + state + ", but its scope.key's link count or mode was wrong (" + safeText(why) + "): another name or a reader of the key file may have kept a copy of it"
 }
 
 // rmReadDeliveries is rm-scope's read of the delivery record; tests
@@ -218,13 +250,13 @@ func (s *FileStore) floorSize(dfd int) (floorIdentity, int64, error) {
 // scopeRemovedUnlisted is rm-scope's committed report for a scope
 // directory with no scope.key whose uid the record does not list.
 func scopeRemovedUnlisted(scope string) string {
-	return "removed " + scope + " without listing it in " + removedScopesName + ", because its scope.key was absent (an interrupted earlier rm-scope, or tampering): a copy of its directory put back would open; its floor lines are kept, so the floor still refuses rolled-back or deleted entries"
+	return "removed " + scope + " without listing it in " + removedScopesName + ", because its scope.key was absent (an interrupted earlier rm-scope, or tampering): a copy of its directory put back would open only if it carries a key the master accepts; its floor lines are kept, so the floor still refuses rolled-back or deleted entries"
 }
 
 // scopeRemovedUntrusted is rm-scope's committed report for a scope
 // directory whose scope.key was present but could not be trusted (err).
 func scopeRemovedUntrusted(scope string, err error) string {
-	return "removed " + scope + " without listing it in " + removedScopesName + ", because its scope.key could not be trusted (" + safeText(err.Error()) + "): a copy of its directory put back would open; its floor lines are kept, so the floor still refuses rolled-back or deleted entries"
+	return "removed " + scope + " without listing it in " + removedScopesName + ", because its scope.key could not be trusted (" + safeText(err.Error()) + "): a copy of its directory put back would open only if it carries a key the master accepts; its floor lines are kept, so the floor still refuses rolled-back or deleted entries"
 }
 
 // scopeDirPresent reports whether keystore/.user/<name> names anything.
