@@ -414,11 +414,15 @@ func TestSwapRerunFromEachStep(t *testing.T) {
 					}
 					old := readLog(t, s, v.log)
 					c := &stepCrash{at: at}
-					if err := v.run(s, c); err == nil {
+					err := v.run(s, c)
+					if err == nil {
 						t.Fatalf("the verb did not fail at %s", at)
 					}
 					got := readLog(t, s, v.log)
 					committed := slices.Index(SwapSteps, at) > slices.Index(SwapSteps, swapStepSwap)
+					if Committed(err) != committed {
+						t.Fatalf("a failure at %s: Committed %v, want %v (%v)", at, Committed(err), committed, err)
+					}
 					if committed == bytes.Equal(got, old) {
 						t.Fatalf("after a crash at %s the log holds %q (old %q), want the %s set", at, got, old, map[bool]string{true: "new", false: "old"}[committed])
 					}
@@ -433,7 +437,18 @@ func TestSwapRerunFromEachStep(t *testing.T) {
 						if err := o.run(s, &inoRecorder{}); err != nil {
 							t.Fatalf("%s after a crashed %s: %v", o.name, v.name, err)
 						}
-						if again := readLog(t, s, v.log); !bytes.Equal(again, got) {
+						again := readLog(t, s, v.log)
+						if committed && v.log == auditLogName {
+							// The rebuild reported the committed rotate with
+							// one audit line, before it replaced the marker.
+							line := []byte(`"op":"` + verbRotate + `","via":"root","scope":"system","name":"-","namespace":"","result":"committed"}` + "\n")
+							i := bytes.LastIndexByte(again[:len(again)-1], '\n')
+							if i < 0 || !bytes.HasSuffix(again, line) {
+								t.Fatalf("%s after a committed %s: no committed audit line ending %q", o.name, v.name, again)
+							}
+							again = again[:i]
+						}
+						if !bytes.Equal(again, got) {
 							t.Fatalf("%s changed %s: %q, was %q", o.name, v.log, again, got)
 						}
 					}

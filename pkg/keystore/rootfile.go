@@ -44,10 +44,11 @@ var errRootFileShape = errors.New("it is not a regular file of the data root's o
 var warnedLinks sync.Map
 
 // judgeRootFile judges the root-written file name open at fd, which st
-// describes: type, owner, mode, flags and ACL. A link count above one is
-// warned of once and accepted.
-func (s *FileStore) judgeRootFile(fd int, st *unix.Stat_t, name string) error {
-	if st.Mode&unix.S_IFMT != unix.S_IFREG || int64(st.Uid) != int64(s.floorUID) || st.Mode&0o022 != 0 {
+// describes: type, owner (owner, the data root's: root in production),
+// mode, flags and ACL. A link count above one is warned of once and
+// accepted.
+func judgeRootFile(fd int, st *unix.Stat_t, name string, owner int64) error {
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || int64(st.Uid) != owner || st.Mode&0o022 != 0 {
 		return errRootFileShape
 	}
 	fl, err := fdFlags(fd)

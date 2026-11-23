@@ -19,8 +19,11 @@ package install
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -165,6 +168,11 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 		return err
 	}
 	if stale {
+		// A committed run the marker records was not reported: report it
+		// and audit it before the marker goes.
+		if r := keystore.EarlierRunAtInstall(dfd, g.lfd, rootUID, time.Now()); r != nil {
+			fmt.Fprintf(keystoreStderr, "install: %s\n", r)
+		}
 		if err := unix.Unlinkat(dfd, keystore.MaintenanceMarkerName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			return fmt.Errorf("remove the stale %s: %w", keystore.MaintenanceMarkerName, err)
 		}
@@ -235,6 +243,10 @@ func ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID int) error {
 	}
 	return nil
 }
+
+// keystoreStderr is where install prints a committed maintenance run it
+// finds unreported in the marker it removes.
+var keystoreStderr io.Writer = os.Stderr
 
 // keystoreFstatSeam is the fstat install judges a log by once it set its
 // flag: unix.Fstat. A non-root test, whose fake attribute writer neither

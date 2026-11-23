@@ -49,14 +49,25 @@ func keysFloorRebuild(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	rep, err := s.RebuildFloor(ctx, env.attrWriter())
-	if err != nil {
+	rep, err := s.RebuildFloor(env.earlierRuns(ctx), env.attrWriter())
+	if err != nil && !keystore.Committed(err) {
 		return v.failf(keysRefused, "%v", err)
 	}
 	fmt.Fprintf(env.stdout, "rebuilt the user-scope floor: %d scopes, %d keys\n", rep.Scopes, rep.Keys)
+	if err != nil {
+		printRebuildDrops(env, rep)
+		return v.failf(keysCommitted, "%v", err)
+	}
 	if !rep.Lost() {
 		return keysOK
 	}
+	printRebuildDrops(env, rep)
+	fmt.Fprintln(env.stdout, "the rebuild dropped what is listed above; the new floor is in place (exit 4)")
+	return keysCommitted
+}
+
+// printRebuildDrops prints the rebuild's drop counts, by class.
+func printRebuildDrops(env keysEnv, rep keystore.RebuildReport) {
 	for _, d := range []struct {
 		n    int
 		what string
@@ -70,8 +81,15 @@ func keysFloorRebuild(ctx context.Context, args []string, env keysEnv) int {
 			fmt.Fprintf(env.stdout, "dropped %d %s\n", d.n, d.what)
 		}
 	}
-	fmt.Fprintln(env.stdout, "the rebuild dropped what is listed above; the new floor is in place (exit 4)")
-	return keysCommitted
+}
+
+// earlierRuns returns ctx carrying the report of a committed maintenance
+// run of the other verb that a verb finds in the marker: printed to
+// stderr before the marker is replaced (keystore.WithEarlierRun).
+func (env keysEnv) earlierRuns(ctx context.Context) context.Context {
+	return keystore.WithEarlierRun(ctx, func(r keystore.EarlierRun) {
+		fmt.Fprintf(env.stderr, "k3sm keys: %s\n", r)
+	})
 }
 
 // keysAuditVerb is `k3sm keys audit --rotate [--discard-oldest]`, the root
@@ -95,14 +113,17 @@ func keysAuditVerb(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	rep, err := s.RotateAudit(ctx, env.attrWriter(), *discard)
-	if err != nil {
+	rep, err := s.RotateAudit(env.earlierRuns(ctx), env.attrWriter(), *discard)
+	if err != nil && !keystore.Committed(err) {
 		return v.failf(keysRefused, "%v", err)
 	}
 	if rep.Discarded {
 		fmt.Fprintln(env.stdout, "discarded the oldest audit archive")
 	}
 	fmt.Fprintf(env.stdout, "rotated the audit log: %d archives kept, keystore-audit.log.1 the newest\n", rep.Archives)
+	if err != nil {
+		return v.failf(keysCommitted, "%v", err)
+	}
 	return keysOK
 }
 

@@ -236,7 +236,7 @@ func (s *FileStore) readRemovedScopes(dfd int) (*removedScopes, error) {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return nil, fmt.Errorf("%w: stat: %w", errRemovedScopesBad, err)
 	}
-	if err := s.judgeRootFile(fd, &st, removedScopesName); err != nil {
+	if err := judgeRootFile(fd, &st, removedScopesName, int64(s.floorUID)); err != nil {
 		return nil, fmt.Errorf("%w: %w", errRemovedScopesBad, err)
 	}
 	if st.Size > maxRemovedScopesSize {

@@ -2833,6 +2833,15 @@ service user can only add to.
   unreachable by path; it is never chowned or chmodded and never read again (U118). An archive
   is root's 0600 and unflagged, and an alias of it gives the service user nothing, so a link
   to one is a Warn.
+- **A swap that committed and then failed is committed, never refused.** Every error from
+  the `RENAME_SWAP` on (the parents' fsync, the clean and end steps) is marked committed: the
+  CLI prints the verb's report (a rebuild's drop counts included), exits 4 and audits
+  `committed`. Its marker stays and holds the report. A later run of the *other* verb, or
+  install, that finds a marker recording a committed run (its log's live inode is the one it
+  recorded) first prints that saved report to stderr as "an earlier `<verb>` committed and
+  was not reported: …" and appends its audit line (op that verb, via root, result
+  `committed`), then replaces or removes the marker. A marker whose swap never committed
+  reports nothing.
 - **Crash and rerun.** The live set is always one complete set, so a crash at any step leaves
   a valid log, and the rerun never finishes a half-done swap: it cleans staging, which it
   never trusts, and reads the marker. A failure before step 4 cleans staging, removes the
@@ -5994,6 +6003,7 @@ carried by the unit rows.
 | U199 | floor --rebuild that dropped any line or key exits 4, lists the counts by class and audits committed; doctor's keystore-floor row warns of floor damage naming floor --rebuild | `k3sm/cmd/k3sm::TestKeysMaintenanceVerbs`, `TestDoctorChecksTable` | done: the append-only files (the rebuild verb, doctor) |
 | U200 | a second link on a root-written data-root file (the removed-scopes record, the maintenance marker, the floor acknowledgement) is a Warn, never a refusal: each still reads, judged on type, owner, mode, flags and ACL, so a link any local user can make blocks no scope open, verb or acknowledgement | `k3sm/pkg/keystore::TestRemovedScopesSecondLinkReads`, `TestMarkerSecondLinkReads`, `TestFloorAckSecondLinkReads`, `TestRootFileModeStillJudged`, `TestMaintenanceJudgesMarkerAndStale` | done: the append-only files (root-written files) |
 | U201 | root-run: the service user link(2)s root's removed-scopes record and floor acknowledgement into its own directory; the record still reads and rm-scope still writes it, and the acknowledgement still lifts the damage it acknowledged (integration, a root-run row: `--root`) | `k3sm/pkg/keystore::TestRootFileServiceLinkReadsAsRoot` (integration, root-run) | checked as a root-run row (`--root`): the append-only files (root-written files) |
+| U202 | a maintenance verb that fails after its RENAME_SWAP is committed, never refused: it exits 4, audits committed and still prints its report (a rebuild's drop counts); a later run of the other verb, or install, that finds a marker recording a committed run prints its saved report to stderr as an earlier committed run that was not reported and audits it (op that verb, result committed) before it replaces or removes the marker; a marker whose swap never committed reports nothing | `k3sm/pkg/keystore::TestSwapFailureAfterCommitIsCommitted`, `TestEarlierCommittedRunReported`, `TestSwapRerunFromEachStep`, `k3sm/cmd/k3sm::TestKeysMaintenanceCommittedAfterSwap`, `k3sm/pkg/install::TestKeystoreFilesReportsCommittedMarker` | done: the append-only files (the swap) |
 
 ### Rig legs
 

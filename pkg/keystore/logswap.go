@@ -201,7 +201,8 @@ func (s *FileStore) lockMaintenance(ctx context.Context, root *os.Root) (*floorL
 // and the live log is the inode it recorded for the new log, the swap
 // committed, and m.saved is its report (the verb prints it and does not
 // run again). Otherwise, the other verb's marker among them, the live set
-// is valid and this run writes its own marker and runs from the start.
+// is valid and this run writes its own marker and runs from the start; a
+// committed run of the other verb is first reported (reportEarlierRun).
 func (s *FileStore) beginMaintenance(ctx context.Context, verb, logName string, refusal error, attrs FileAttrWriter) (*maintenance, error) {
 	root, err := s.openDir(s.dir, false)
 	if err != nil {
@@ -251,6 +252,14 @@ func (s *FileStore) beginMaintenance(ctx context.Context, verb, logName string, 
 			return m, nil
 		}
 	}
+	if prior != nil && prior.swapped && prior.verb != verb {
+		// The other verb's report counts only when its swap committed: its
+		// log's live inode is the one it recorded.
+		var st unix.Stat_t
+		if pl := verbLog(prior.verb); pl != "" && s.statLog(m.lfd, pl, &st) == nil && uint64(st.Dev) == prior.dev && st.Ino == prior.ino {
+			s.reportEarlierRun(ctx, prior)
+		}
+	}
 	var run [8]byte
 	if err := s.readRandom(run[:]); err != nil {
 		m.end()
@@ -281,7 +290,7 @@ func (m *maintenance) readMarker() (*marker, error) {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return nil, fmt.Errorf("stat %s: %w", maintenanceMarkerName, err)
 	}
-	if err := m.s.judgeRootFile(fd, &st, maintenanceMarkerName); err != nil {
+	if err := judgeRootFile(fd, &st, maintenanceMarkerName, int64(m.s.floorUID)); err != nil {
 		return nil, fmt.Errorf("%w: %s: %w; root repairs it with sudo k3sm install, which removes a marker it cannot read", errLogUntrusted, maintenanceMarkerName, err)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxMarkerSize))
@@ -576,26 +585,37 @@ func (s *FileStore) swapLogDir(m *maintenance, name string, content func(io.Writ
 	if err := renameSwap(m.sfd, nd, m.lfd, dir); err != nil {
 		return fmt.Errorf("swap %s/%s with %s/%s: %w; rerun the verb", stagingDirName, nd, logsDirName, dir, err)
 	}
+	// The swap committed: the new log is live, so every error from here on
+	// is committed, never a refusal (errSwapCommitted).
 	for _, d := range []struct {
 		fd   int
 		name string
 	}{{m.sfd, stagingDirName}, {m.lfd, logsDirName}} {
 		if err := unix.Fsync(d.fd); err != nil {
-			return fmt.Errorf("fsync %s: %w; rerun the verb, which reports the committed swap", d.name, err)
+			return swapCommitted(fmt.Errorf("fsync %s: %w; rerun the verb, which reports the committed swap", d.name, err))
 		}
 	}
 	if err := m.step(swapStepClean); err != nil {
-		return err
+		return swapCommitted(err)
 	}
 	if err := cleanStaging(m.sfd, attrs); err != nil {
 		slog.Warn("the retired keystore log directory was not removed; the next maintenance verb or install removes it", "dir", stagingDirName+"/"+nd, "err", err)
 	}
 	if err := m.step(swapStepEnd); err != nil {
-		return err
+		return swapCommitted(err)
 	}
 	m.keep = false
 	return nil
 }
+
+// errSwapCommitted marks an error a maintenance verb met after its
+// RENAME_SWAP: the new log is live and the change stands (Committed), so the
+// CLI exits 4 and audits committed, never refused, and prints the verb's
+// report.
+var errSwapCommitted = fmt.Errorf("the swap committed and the new log is in place: %w", errCommitted)
+
+// swapCommitted marks err as met after the swap committed.
+func swapCommitted(err error) error { return fmt.Errorf("%w; %w", errSwapCommitted, err) }
 
 // maxStagingDepth bounds cleanStaging's descent: a replacement directory
 // holds files only.
