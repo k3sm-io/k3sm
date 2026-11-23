@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -64,8 +65,8 @@ func TestRotateAuditClonesArchive(t *testing.T) {
 		return err
 	}
 	t.Cleanup(func() { cloneFileAt = prev })
-	volumeFree = func(int) (int64, error) { return 0, nil } // a clone needs no room
-	t.Cleanup(func() { volumeFree = defaultVolumeFree })
+	volumeSpace = func(int) (int64, int64, error) { return 0, 1 << 40, nil } // a clone needs no room
+	t.Cleanup(func() { volumeSpace = defaultVolumeSpace })
 	if _, err := s.RotateAudit(context.Background(), &inoRecorder{}, false); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
@@ -111,10 +112,11 @@ func TestCloneArchiveTruncatesToSnapshot(t *testing.T) {
 func TestRotateAuditCopyChecksFreeSpace(t *testing.T) {
 	prev := cloneFileAt
 	cloneFileAt = func(int, int, string) error { return unix.ENOTSUP }
-	t.Cleanup(func() { cloneFileAt = prev; volumeFree = defaultVolumeFree })
+	t.Cleanup(func() { cloneFileAt = prev; volumeSpace = defaultVolumeSpace })
 	s, _, _ := fileLogScope(t)
 	want := readLog(t, s, auditLogName)
-	volumeFree = func(int) (int64, error) { return int64(len(want)), nil }
+	// Room for the bytes and a 1 MiB margin is short of the 1 GiB floor.
+	volumeSpace = func(int) (int64, int64, error) { return int64(len(want)) + 1<<20, 10 << 30, nil }
 	_, err := s.RotateAudit(context.Background(), &inoRecorder{}, false)
 	if !errors.Is(err, errRotateRefused) || Committed(err) || !strings.Contains(err.Error(), "bytes free on the data root's volume") || !strings.Contains(err.Error(), "nothing was changed") {
 		t.Fatalf("rotate on a full volume: %v, want a refusal naming the free space", err)
@@ -126,9 +128,66 @@ func TestRotateAuditCopyChecksFreeSpace(t *testing.T) {
 		t.Fatalf("the refused rotate left .1: %v", err)
 	}
 	assertNoMaintenanceLeft(t, s)
-	volumeFree = defaultVolumeFree
+	volumeSpace = func(int) (int64, int64, error) { return int64(len(want)) + 1<<30, 10 << 30, nil }
 	if _, err := s.RotateAudit(context.Background(), &inoRecorder{}, false); err != nil {
 		t.Fatalf("rotate with room: %v", err)
 	}
 	assertArchiveOne(t, s, want)
+}
+
+// The copy's margin is the larger of 1 GiB and 2% of the volume: a small
+// volume needs the log's size plus 1 GiB, a large one the log's size plus
+// 2% of it, and a free space one byte short of either refuses.
+func TestCopyArchiveMarginScalesWithVolume(t *testing.T) {
+	const gib = int64(1) << 30
+	for _, tt := range []struct {
+		name          string
+		size, volSize int64
+		want          int64
+	}{
+		{"an empty volume size", 7, 0, 7 + gib},
+		{"a 10 GiB volume: 1 GiB is larger", 100, 10 * gib, 100 + gib},
+		{"a 50 GiB volume: both are 1 GiB", 100, 50 * gib, 100 + gib},
+		{"a 1 TiB volume: 2% is larger", 100, 1024 * gib, 100 + 1024*gib/100*2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := copyRoom(tt.size, tt.volSize); got != tt.want {
+				t.Fatalf("copyRoom(%d, %d) = %d, want %d", tt.size, tt.volSize, got, tt.want)
+			}
+		})
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "log")
+	if err := os.WriteFile(src, []byte("one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	nad, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(nad) }()
+	t.Cleanup(func() { volumeSpace = defaultVolumeSpace })
+	old := &oldLog{f: f, size: 4}
+	vol := 1024 * gib
+	need := old.size + vol/100*2
+	volumeSpace = func(int) (int64, int64, error) { return need - 1, vol, nil }
+	err = copyArchive(old, nad, "short", unix.ENOTSUP)
+	if !errors.Is(err, errRotateRefused) || !strings.Contains(err.Error(), strconv.FormatInt(need, 10)) || !strings.Contains(err.Error(), "2% of the volume") {
+		t.Fatalf("a copy one byte short of 2%% of a 1 TiB volume: %v, want a refusal naming %d bytes", err, need)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "short")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the refused copy created its file: %v", err)
+	}
+	volumeSpace = func(int) (int64, int64, error) { return need, vol, nil }
+	if err := copyArchive(old, nad, "room", unix.ENOTSUP); err != nil {
+		t.Fatalf("a copy with exactly the room: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "room")); err != nil || string(b) != "one\n" {
+		t.Fatalf("the copy holds %q (%v)", b, err)
+	}
 }

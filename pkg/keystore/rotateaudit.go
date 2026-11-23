@@ -324,35 +324,48 @@ func cloneArchive(old *oldLog, nad int, name string) error {
 	return nil
 }
 
-// copyRoomSlack is the free space a copy leaves on the volume beyond the
-// copied bytes.
-const copyRoomSlack = 1 << 20
+// copyRoomFloor and copyRoomPercent set the free space a copy leaves on the
+// volume beyond the copied bytes: the larger of 1 GiB and 2% of the
+// volume's size (copyRoom), so the margin scales with the volume.
+const (
+	copyRoomFloor   = 1 << 30
+	copyRoomPercent = 2
+)
 
-// volumeFree is the free space, in bytes, of the volume holding the open
-// directory fd. It is a variable so a test can make a volume full.
-var volumeFree = defaultVolumeFree
+// copyRoom is the free space copying size bytes needs on a volume of
+// volSize bytes: size plus the larger of copyRoomFloor and copyRoomPercent
+// percent of volSize.
+func copyRoom(size, volSize int64) int64 {
+	return size + max(int64(copyRoomFloor), volSize/100*copyRoomPercent)
+}
 
-// defaultVolumeFree is volumeFree's fstatfs.
-func defaultVolumeFree(fd int) (int64, error) {
+// volumeSpace is the free space and the size, in bytes, of the volume
+// holding the open directory fd, from one fstatfs. It is a variable so a
+// test can make a volume full.
+var volumeSpace = defaultVolumeSpace
+
+// defaultVolumeSpace is volumeSpace's fstatfs.
+func defaultVolumeSpace(fd int) (free, size int64, err error) {
 	var sf unix.Statfs_t
 	if err := unix.Fstatfs(fd, &sf); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return int64(sf.Bavail) * int64(sf.Bsize), nil
+	return int64(sf.Bavail) * int64(sf.Bsize), int64(sf.Blocks) * int64(sf.Bsize), nil
 }
 
 // copyArchive makes name in nad a copy of the old log's first old.size
 // bytes, root's 0600, when the clone was refused (why). It first checks
-// that the volume has room for the copy and refuses up front, before any
-// byte is written, when it does not: the service user can grow the log,
+// that the volume has room for the copy (copyRoom: the log's size plus the
+// larger of 1 GiB and 2% of the volume's size, from one fstatfs) and
+// refuses up front, before any byte is written, when it does not: the service user can grow the log,
 // and a copy that fills the volume would stall every writer.
 func copyArchive(old *oldLog, nad int, name string, why error) error {
-	free, err := volumeFree(nad)
+	free, volSize, err := volumeSpace(nad)
 	if err != nil {
 		return fmt.Errorf("read the free space of the data root's volume: %w", err)
 	}
-	if free < old.size+copyRoomSlack {
-		return fmt.Errorf("%w: %v, and copying it into %s needs %d bytes free on the data root's volume, which has %d; free space on that volume, then rerun; nothing was changed", errRotateRefused, why, name, old.size+copyRoomSlack, free)
+	if need := copyRoom(old.size, volSize); free < need {
+		return fmt.Errorf("%w: %v, and copying it into %s needs %d bytes free on the data root's volume (the log's size plus the larger of 1 GiB and 2%% of the volume), which has %d; free space on that volume, then rerun; nothing was changed", errRotateRefused, why, name, need, free)
 	}
 	fd, err := unix.Openat(nad, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, logMode)
 	if err != nil {
