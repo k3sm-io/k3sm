@@ -131,11 +131,11 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		unread = derr
 	}
 	if !recorded {
-		ino, size, err := s.floorSize(dfd)
+		fid, size, err := s.floorSize(dfd)
 		if err != nil {
 			return false, fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", userFloorLogName, err)
 		}
-		if removed.add(uid, id, ino, size) {
+		if removed.add(uid, id, fid, size) {
 			if err := writeRemovedScopes(dfd, removed); err != nil {
 				return false, fmt.Errorf("record the removed scope %s in %s: %w; the record may or may not list it, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", u.scope, removedScopesName, err, u.scope)
 			}
@@ -161,23 +161,23 @@ func scopeRemovedUnread(scope string, err error) string {
 	return "removed " + scope + ", but its delivery record could not be read (" + safeText(err.Error()) + "), so deliveries from this scope were not checked: any Secret it delivered stays until it is withdrawn or removed by hand"
 }
 
-// floorSize is the user-scope floor's inode and byte size, through the
-// judged data root dfd: 0 and 0 when there is no floor yet.
-func (s *FileStore) floorSize(dfd int) (uint64, int64, error) {
+// floorSize is the user-scope floor's identity and byte size, through the
+// judged data root dfd: zero when there is no floor yet.
+func (s *FileStore) floorSize(dfd int) (floorIdentity, int64, error) {
 	lfd, err := s.openLogsDir(dfd)
 	if err != nil {
-		return 0, 0, err
+		return floorIdentity{}, 0, err
 	}
 	defer func() { _ = unix.Close(lfd) }() // read-only directory descriptor
 	var st unix.Stat_t
 	err = s.statLog(lfd, userFloorLogName, &st)
 	if errors.Is(err, unix.ENOENT) {
-		return 0, 0, nil
+		return floorIdentity{}, 0, nil
 	}
 	if err != nil {
-		return 0, 0, err
+		return floorIdentity{}, 0, err
 	}
-	return st.Ino, st.Size, nil
+	return floorIdentityOf(&st), st.Size, nil
 }
 
 // scopeRemovedUnlisted is rm-scope's committed report for a scope

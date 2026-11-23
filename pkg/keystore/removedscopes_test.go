@@ -116,7 +116,7 @@ func TestRemovedScopesFullKeepsFloorKeys(t *testing.T) {
 	userPut(t, v, "user/1002/x", "1002's value")
 	full := &removedScopes{Version: removedScopesVersion}
 	for i := range maxRemovedScopeKeys {
-		if !full.add(uint32(5000+i%8), fmt.Sprintf("%064x", i), 0, 0) {
+		if !full.add(uint32(5000+i%8), fmt.Sprintf("%064x", i), floorIdentity{}, 0) {
 			t.Fatal("the record filled early")
 		}
 	}

@@ -111,7 +111,8 @@ var errRebuildRefused = errors.New("floor --rebuild refused and changed nothing"
 // sequence and the one on disk. A line of a uid rm-scope recorded is
 // dropped when it starts before the floor offset recorded at the removal,
 // and kept at or after it (a re-minted scope's lines), but only when the
-// removal was recorded against the inode of the floor it reads. Any scope
+// removal was recorded against the floor it reads: its device, inode and
+// birth time. Any scope
 // that does not open refuses the rebuild, naming the scope, before anything
 // changes.
 //
@@ -267,14 +268,15 @@ func floorLines(r io.Reader, lineBound int, fn func(line []byte, start int64, er
 // lfd and judges it (openOldLog, step 2), and streams it once, bounded by
 // its size at open, with memory bounded by the key bound and one line
 // (readOldFloorFrom). A removal in the record removed applies only when it
-// was recorded against this floor's inode (dropBefore).
+// was recorded against this floor's identity: device, inode and birth
+// time (dropBefore).
 func (s *FileStore) readOldFloor(lfd int, in rebuildInput, removed *removedScopes) (*oldFloor, error) {
 	o, err := s.openOldLog(lfd, userFloorLogName)
 	if err != nil {
 		return nil, err
 	}
 	defer o.close()
-	in.removed = removed.dropBefore(o.ino)
+	in.removed = removed.dropBefore(o.id)
 	return readOldFloorFrom(o.f, o.size, in, s.floorLog().keyBound(), s.floorLog().keyShare(), maxLogLine)
 }
 

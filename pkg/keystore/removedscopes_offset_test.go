@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // floorHasScope reports whether the floor holds any line of scope.
@@ -137,22 +139,37 @@ func TestRebuildRefusedLeavesRecordAndStillDrops(t *testing.T) {
 }
 
 // A record written before the floor offset existed parses with offset 0,
-// which drops nothing; one with an offset and no floor_ino drops nothing;
-// one with both drops only for the floor of that inode; a negative offset
-// does not parse.
+// which drops nothing; one with an offset and no floor identity, or only
+// part of it (an inode alone, as an earlier build wrote), drops nothing;
+// one with the whole identity drops only for the floor whose device, inode
+// and birth time all match; a negative offset does not parse.
 func TestRemovedScopesFloorSizeParse(t *testing.T) {
 	key := bytes.Repeat([]byte("a"), 64)
+	floor := floorIdentity{dev: 3, ino: 9, birth: unix.Timespec{Sec: 100, Nsec: 5}}
 	r, err := parseRemovedScopes([]byte(`{"version":1,"scopes":[{"uid":7,"keys":["` + string(key) + `"]}]}`))
-	if err != nil || r.Scopes[0].FloorSize != 0 || len(r.dropBefore(9)) != 0 {
+	if err != nil || r.Scopes[0].FloorSize != 0 || len(r.dropBefore(floor)) != 0 {
 		t.Fatalf("a record without floor_size: %+v, %v; want offset 0, dropping nothing", r, err)
 	}
 	r, err = parseRemovedScopes([]byte(`{"version":1,"scopes":[{"uid":7,"keys":["` + string(key) + `"],"floor_size":42}]}`))
-	if err != nil || len(r.dropBefore(9)) != 0 || len(r.dropBefore(0)) != 0 {
-		t.Fatalf("a record with floor_size 42 and no floor_ino: %+v, %v; want it to drop nothing", r, err)
+	if err != nil || len(r.dropBefore(floor)) != 0 || len(r.dropBefore(floorIdentity{})) != 0 {
+		t.Fatalf("a record with floor_size 42 and no floor identity: %+v, %v; want it to drop nothing", r, err)
 	}
 	r, err = parseRemovedScopes([]byte(`{"version":1,"scopes":[{"uid":7,"keys":["` + string(key) + `"],"floor_size":42,"floor_ino":9}]}`))
-	if err != nil || r.dropBefore(9)["user/7"] != 42 || len(r.dropBefore(10)) != 0 {
-		t.Fatalf("a record with floor_size 42 at inode 9: %+v, %v", r, err)
+	if err != nil || len(r.dropBefore(floor)) != 0 || len(r.dropBefore(floorIdentity{ino: 9})) != 0 {
+		t.Fatalf("a record with floor_size 42 and only floor_ino: %+v, %v; want it to drop nothing", r, err)
+	}
+	r, err = parseRemovedScopes([]byte(`{"version":1,"scopes":[{"uid":7,"keys":["` + string(key) + `"],"floor_size":42,"floor_ino":9,"floor_dev":3,"floor_birth_sec":100,"floor_birth_nsec":5}]}`))
+	if err != nil || r.dropBefore(floor)["user/7"] != 42 {
+		t.Fatalf("a record with floor_size 42 for the floor %+v: %+v, %v", floor, r, err)
+	}
+	for _, other := range []floorIdentity{
+		{dev: 4, ino: 9, birth: floor.birth},
+		{dev: 3, ino: 10, birth: floor.birth},
+		{dev: 3, ino: 9, birth: unix.Timespec{Sec: 100, Nsec: 6}},
+	} {
+		if len(r.dropBefore(other)) != 0 {
+			t.Fatalf("a record for %+v drops for the floor %+v", floor, other)
+		}
 	}
 	if _, err := parseRemovedScopes([]byte(`{"version":1,"scopes":[{"uid":7,"keys":["` + string(key) + `"],"floor_size":-1}]}`)); err == nil {
 		t.Fatal("a negative floor_size parsed")

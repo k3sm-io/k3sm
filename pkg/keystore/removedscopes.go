@@ -89,20 +89,47 @@ type removedScopes struct {
 	Scopes  []removedScope `json:"scopes"`
 }
 
-// removedScope is one uid's removed scope keys. FloorIno and FloorSize
-// are the user-scope floor log's inode and byte size when rm-scope last
-// listed a key of the uid: floor --rebuild, reading the floor of that
-// inode, drops the uid's floor lines that start before the size, every one
+// removedScope is one uid's removed scope keys. FloorDev, FloorIno,
+// FloorBirthSec/Nsec and FloorSize are the user-scope floor log's device,
+// inode, birth time and byte size when rm-scope last listed a key of the
+// uid: floor --rebuild, reading the floor of that identity (all three
+// match, as the floor ack binds its file), drops the uid's floor lines that start before the size, every one
 // written while a removed scope stood, and keeps those at or after it, a
 // re-minted scope's. The offset belongs to that one floor file: a rebuild
 // swaps in a floor of a new inode, so the offset never applies again, and
-// the record is never rewritten by a rebuild. A record without FloorIno
-// (0) drops nothing.
+// the record is never rewritten by a rebuild. A record without the whole
+// identity (an inode, device or birth time of 0) drops nothing.
 type removedScope struct {
-	UID       uint32   `json:"uid"`
-	Keys      []string `json:"keys"`
-	FloorSize int64    `json:"floor_size"`
-	FloorIno  uint64   `json:"floor_ino,omitempty"`
+	UID            uint32   `json:"uid"`
+	Keys           []string `json:"keys"`
+	FloorSize      int64    `json:"floor_size"`
+	FloorIno       uint64   `json:"floor_ino,omitempty"`
+	FloorDev       uint64   `json:"floor_dev,omitempty"`
+	FloorBirthSec  int64    `json:"floor_birth_sec,omitempty"`
+	FloorBirthNsec int64    `json:"floor_birth_nsec,omitempty"`
+}
+
+// floorIdentity names one floor file: its device, inode and birth time,
+// which tell it apart from a file put at the same inode after it was
+// freed.
+type floorIdentity struct {
+	dev, ino uint64
+	birth    unix.Timespec
+}
+
+// floorIdentityOf is st's identity.
+func floorIdentityOf(st *unix.Stat_t) floorIdentity {
+	return floorIdentity{dev: uint64(st.Dev), ino: st.Ino, birth: logBirth(st)}
+}
+
+// whole reports whether id carries every part: one without drops nothing.
+func (id floorIdentity) whole() bool {
+	return id.ino != 0 && id.dev != 0 && (id.birth.Sec != 0 || id.birth.Nsec != 0)
+}
+
+// identity is the floor identity sc was recorded against.
+func (sc removedScope) identity() floorIdentity {
+	return floorIdentity{dev: sc.FloorDev, ino: sc.FloorIno, birth: unix.Timespec{Sec: sc.FloorBirthSec, Nsec: sc.FloorBirthNsec}}
 }
 
 // has reports whether uid's scope key id is listed.
@@ -120,14 +147,15 @@ func (r *removedScopes) listed(uid uint32) bool {
 	return slices.ContainsFunc(r.Scopes, func(sc removedScope) bool { return sc.UID == uid })
 }
 
-// dropBefore maps each user scope recorded against the floor of inode ino,
-// with a nonzero offset, to its offset: the rebuild reading that floor
-// drops that scope's lines starting before the offset. A removal recorded
-// against another floor, or with no inode, drops nothing.
-func (r *removedScopes) dropBefore(ino uint64) map[string]int64 {
+// dropBefore maps each user scope recorded against the floor id (device,
+// inode and birth time all matching), with a nonzero offset, to its
+// offset: the rebuild reading that floor drops that scope's lines starting
+// before the offset. A removal recorded against another floor, or without
+// the whole identity, drops nothing.
+func (r *removedScopes) dropBefore(id floorIdentity) map[string]int64 {
 	out := map[string]int64{}
 	for _, sc := range r.Scopes {
-		if ino != 0 && sc.FloorIno == ino && sc.FloorSize > 0 {
+		if id.whole() && sc.identity() == id && sc.FloorSize > 0 {
 			out[userScopeOf(sc.UID)] = sc.FloorSize
 		}
 	}
@@ -143,21 +171,27 @@ func (r *removedScopes) keys() int {
 	return n
 }
 
-// add lists uid's scope key id with the floor's inode floorIno and byte
+// add lists uid's scope key id with the floor's identity floor and byte
 // size floorSize at the removal, and reports false, changing nothing, when
 // the record is full.
-func (r *removedScopes) add(uid uint32, id string, floorIno uint64, floorSize int64) bool {
+func (r *removedScopes) add(uid uint32, id string, floor floorIdentity, floorSize int64) bool {
 	if r.keys() >= maxRemovedScopeKeys {
 		return false
+	}
+	set := func(sc *removedScope) {
+		sc.FloorSize, sc.FloorIno, sc.FloorDev = floorSize, floor.ino, floor.dev
+		sc.FloorBirthSec, sc.FloorBirthNsec = floor.birth.Sec, floor.birth.Nsec
 	}
 	for i := range r.Scopes {
 		if r.Scopes[i].UID == uid {
 			r.Scopes[i].Keys = append(r.Scopes[i].Keys, id)
-			r.Scopes[i].FloorSize, r.Scopes[i].FloorIno = floorSize, floorIno
+			set(&r.Scopes[i])
 			return true
 		}
 	}
-	r.Scopes = append(r.Scopes, removedScope{UID: uid, Keys: []string{id}, FloorSize: floorSize, FloorIno: floorIno})
+	sc := removedScope{UID: uid, Keys: []string{id}}
+	set(&sc)
+	r.Scopes = append(r.Scopes, sc)
 	return true
 }
 
@@ -185,8 +219,8 @@ func parseRemovedScopes(b []byte) (*removedScopes, error) {
 		if sc.UID == 0 || uids[sc.UID] || len(sc.Keys) == 0 {
 			return nil, fmt.Errorf("uid %d is zero, listed twice or lists no key", sc.UID)
 		}
-		if sc.FloorSize < 0 {
-			return nil, fmt.Errorf("uid %d has a negative floor offset", sc.UID)
+		if sc.FloorSize < 0 || sc.FloorBirthSec < 0 || sc.FloorBirthNsec < 0 || sc.FloorBirthNsec >= 1e9 {
+			return nil, fmt.Errorf("uid %d has a negative floor offset or a floor birth time out of range", sc.UID)
 		}
 		uids[sc.UID] = true
 		for _, k := range sc.Keys {
