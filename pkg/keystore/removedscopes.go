@@ -61,7 +61,15 @@ const (
 
 // errScopeRemoved refuses a scope whose scope.key root removed with
 // rm-scope: the directory was copied back, or restored, after the removal.
-var errScopeRemoved = fmt.Errorf("%w: this user scope was removed by root (sudo k3sm keys rm-scope), and its scope.key is the removed one: root must delete the scope directory keystore/%s/<uid>/, after which the user's next put mints a fresh scope", ErrCorrupt, userScopesName)
+// It is returned through scopeRemovedErr, which names the repair.
+var errScopeRemoved = fmt.Errorf("%w: this user scope was removed by root, and its scope.key is the removed one", ErrCorrupt)
+
+// scopeRemovedErr is errScopeRemoved for uid, naming the one repair: a
+// rerun of rm-scope, built from the integer uid alone, removes the copied
+// back directory, after which the user's next put mints a fresh scope.
+func scopeRemovedErr(uid uint32) error {
+	return fmt.Errorf("%w: run sudo k3sm keys rm-scope %s --yes to remove the copy, after which the user's next put mints a fresh scope", errScopeRemoved, userScopeOf(uid))
+}
 
 // errRemovedScopesBad is a removed-scopes record that does not judge or
 // parse: every open of a user scope, rm-scope and floor --rebuild refuse
@@ -379,7 +387,7 @@ func (s *FileStore) checkScopeNotRemoved(uid uint32, id string) error {
 		return err
 	}
 	if r.has(uid, id) {
-		return errScopeRemoved
+		return scopeRemovedErr(uid)
 	}
 	return nil
 }

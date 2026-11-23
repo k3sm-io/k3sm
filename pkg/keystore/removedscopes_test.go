@@ -74,6 +74,12 @@ func TestRemovedScopeCopiedBackRefused(t *testing.T) {
 	}
 	copyTree(t, saved, scopeDir(server, "1001"))
 	assertScopeRemovedEverywhere(t, s, 1001, errScopeRemoved)
+	// The refusal names rm-scope's own rerun, built from the integer uid,
+	// and no delete by hand.
+	_, _, rerr := (&UserScope{s: s, uid: 1001, scope: userScopeOf(1001)}).Current(ctx, "user/1001/token")
+	if msg := rerr.Error(); !strings.Contains(msg, "sudo k3sm keys rm-scope user/1001 --yes") || strings.Contains(msg, "delete") || strings.Contains(msg, "rm -") || strings.Contains(msg, userScopesName) {
+		t.Errorf("the refusal %q does not name sudo k3sm keys rm-scope user/1001 --yes, or names a delete by hand", msg)
+	}
 
 	// A rerun of rm-scope on the copied-back directory finishes, and the
 	// record lists the key once.
