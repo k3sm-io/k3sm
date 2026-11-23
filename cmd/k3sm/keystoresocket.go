@@ -42,6 +42,10 @@ import (
 // List the apiserver never answers cannot hold the supervisor's start check.
 const keystoreServerCountTimeout = 10 * time.Second
 
+// keystoreSocketStopTimeout bounds how long the server's shutdown waits for
+// the supervisor's Run to return, so the listener never holds it.
+const keystoreSocketStopTimeout = 10 * time.Second
+
 // countKeystoreServers is the user scope's single-server count
 // (docs/design/keystore.md § "Single-server clusters only"): the nodes the
 // apiserver lists carrying the controlPlaneNodeLabel key, whatever its
@@ -121,9 +125,11 @@ type keystoreSocketDeps struct {
 
 // keystoreSocket is a built supervisor and what it holds open: the data-root
 // descriptor and the server's log descriptors, closed once Run has returned.
+// log receives the stop's line when Run outlives keystoreSocketStopTimeout.
 type keystoreSocket struct {
 	sup   *socket.Supervisor
 	close func()
+	log   *slog.Logger
 }
 
 // newKeystoreSocket builds the user socket's supervisor for this server
@@ -142,7 +148,7 @@ func newKeystoreSocket(deps keystoreSocketDeps) (*keystoreSocket, error) {
 		closeAll()
 		return nil, err
 	}
-	return &keystoreSocket{sup: sup, close: closeAll}, nil
+	return &keystoreSocket{sup: sup, close: closeAll, log: deps.log}, nil
 }
 
 // keystoreSocketConfig is the supervisor's config for this server: the
@@ -207,9 +213,12 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 	}, closeAll, nil
 }
 
-// runKeystoreSocket runs ks's supervisor in its own goroutine and returns
-// the stop that cancels it, waits for Run to return and only then closes
-// what ks holds. A nil ks (a worker) runs nothing and stops at once.
+// runKeystoreSocket runs ks's supervisor in its own goroutine, which closes
+// what ks holds only once Run has returned, and returns the stop that
+// cancels it and waits for Run at most keystoreSocketStopTimeout: past that
+// it logs and returns, so the server's shutdown is never held by the
+// listener, and the descriptors stay open until Run returns or the process
+// exits. A nil ks (a worker) runs nothing and stops at once.
 func runKeystoreSocket(ctx context.Context, ks *keystoreSocket) (stop func()) {
 	if ks == nil {
 		return noStop
@@ -219,11 +228,17 @@ func runKeystoreSocket(ctx context.Context, ks *keystoreSocket) (stop func()) {
 	go func() {
 		defer close(done)
 		ks.sup.Run(rctx)
+		ks.close()
 	}()
 	return func() {
 		cancel()
-		<-done
-		ks.close()
+		t := time.NewTimer(keystoreSocketStopTimeout)
+		defer t.Stop()
+		select {
+		case <-done:
+		case <-t.C:
+			ks.log.Warn("keystore socket: the listener did not stop in time; shutdown goes on without it", "waited", keystoreSocketStopTimeout)
+		}
 	}
 }
 

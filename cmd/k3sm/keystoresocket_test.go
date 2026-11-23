@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -289,7 +290,7 @@ func TestKeystoreSocketWiring(t *testing.T) {
 		runKeystoreSocket(context.Background(), ks)() // stops at once
 	})
 
-	t.Run("shutdown waits for Run", func(t *testing.T) {
+	t.Run("shutdown waits for Run, bounded", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			entered := make(chan struct{})
 			release := make(chan struct{})
@@ -319,7 +320,11 @@ func TestKeystoreSocketWiring(t *testing.T) {
 				t.Fatal(err)
 			}
 			var closed atomic.Bool
-			stop := runKeystoreSocket(context.Background(), &keystoreSocket{sup: sup, close: func() { closed.Store(true) }})
+			logs := &bytes.Buffer{}
+			stop := runKeystoreSocket(context.Background(), &keystoreSocket{
+				sup: sup, close: func() { closed.Store(true) },
+				log: slog.New(slog.NewTextHandler(logs, nil)),
+			})
 			<-entered
 			var stopped atomic.Bool
 			go func() {
@@ -330,10 +335,20 @@ func TestKeystoreSocketWiring(t *testing.T) {
 			if stopped.Load() || closed.Load() {
 				t.Fatal("stop returned, or closed the descriptors, while Run was still running")
 			}
+			// Run outlives the bound: stop logs and returns, and the
+			// descriptors stay open while Run still runs.
+			<-time.NewTimer(keystoreSocketStopTimeout).C // the bubble's clock, not the wall's
+			synctest.Wait()
+			if !stopped.Load() || closed.Load() {
+				t.Fatalf("after the stop bound: stopped %v, closed %v; want stopped and still open", stopped.Load(), closed.Load())
+			}
+			if !strings.Contains(logs.String(), "did not stop in time") {
+				t.Fatalf("no line for the expired stop: %q", logs.String())
+			}
 			close(release)
 			synctest.Wait()
-			if !stopped.Load() || !closed.Load() {
-				t.Fatal("stop did not return and close once Run had")
+			if !closed.Load() {
+				t.Fatal("the descriptors were not closed once Run returned")
 			}
 			if st := sup.State(); st.Phase != socket.PhaseStopped {
 				t.Fatalf("state after stop = %+v, want stopped", st)
