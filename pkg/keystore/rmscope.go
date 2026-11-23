@@ -369,16 +369,17 @@ func (r *rmRun) serviceUserRule(hk heldKey) string {
 // rewritten through the same writer, so the listing a rerun relies on is
 // durable again. A full record lists nothing (full). Its errors are
 // complete (stopErr): a failure before the rename is a refusal, nothing
-// changed, unless this run already wrote or rewrote the record (then it is
-// errCommitted); one after it, or any failure of a rewrite, is
+// changed, unless this run already added a key to the record (wrote; then
+// it is errCommitted); one after it, or any failure of a rewrite, is
 // errCommitted, saying the record lists the scope but its durability is
 // unknown.
 func (r *rmRun) list(id string) error {
 	uid, scope := r.u.uid, r.u.scope
 	// A second list (check's, of a key found at the name other than the
-	// judged one) after this run wrote or rewrote the record is never a
-	// refusal: the record already changed.
-	prior := r.wrote || r.renewed
+	// judged one) after this run wrote the record (added a key) is never a
+	// refusal: the record already changed. A rewrite of identical bytes
+	// (renewed) changed nothing, so it does not count.
+	prior := r.wrote
 	if r.removed.has(uid, id) {
 		if r.wrote || r.renewed {
 			return nil
@@ -502,14 +503,15 @@ func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScope
 		if errors.Is(err, errNotJudgedScope) && r.wrote {
 			err = fmt.Errorf("%w; %s now lists the key of %s that rm-scope judged, so no open serves that key", err, removedScopesName, scope)
 		}
-		return RemoveScopeResult{Recorded: r.proven()}, rmStopped(err, r.wrote || r.renewed || r.aclStripped || tree.changed, state, scope, tree.cleared)
+		return RemoveScopeResult{Recorded: r.proven()}, rmStopped(err, r.wrote || r.aclStripped || tree.changed, state, scope, tree.cleared)
 	}
 	if tree.absent {
 		switch {
 		case r.wrote:
 			return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: rm-scope listed %s in %s, but the directory was not at its name: found absent when it came to remove it, so it removed nothing", errCommitted, scope, removedScopesName)
 		case r.renewed:
-			return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: %s is listed in %s, but the directory was not at its name: found absent when rm-scope came to remove it, so it removed nothing", errCommitted, scope, removedScopesName)
+			// The rewrite changed no byte of the record: a refusal.
+			return RemoveScopeResult{Recorded: true}, fmt.Errorf("%s is listed in %s by an earlier run, but the directory was not at its name: found absent when rm-scope came to remove it, so it removed nothing and changed nothing", scope, removedScopesName)
 		}
 		return RemoveScopeResult{}, fmt.Errorf("rm-scope found the directory of %s absent at its name when it came to remove it: nothing was changed and nothing removed", scope)
 	}
@@ -554,10 +556,13 @@ func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScope
 // (rmRerunCannotHelp): then its own text says what was left. A directory at the name that is not the scope judged
 // (errNotJudgedScope) is not what remains of the scope, so neither state
 // nor a rerun is said. cleared, removeScopeTree's note of a flag it
-// cleared on .user before it stopped, is carried at the end. When this run changed something first (changed: it wrote or
-// rewrote the removed-scopes record, removed an ACL, or the walk unlinked an entry, took a directory or
-// cleared a flag), the removal was made in part and the error is committed
-// (exit 4, audited committed); otherwise it is a refusal.
+// cleared on .user before it stopped, is carried at the end. When this
+// run changed something first (changed: it added a key to the
+// removed-scopes record, removed an ACL, or the walk unlinked an entry,
+// took a directory or cleared a flag), the removal was made in part and
+// the error is committed (exit 4, audited committed); otherwise it is a
+// refusal. A rewrite of a record that already listed the key, to make it
+// durable again, writes identical bytes and does not count.
 func rmStopped(err error, changed bool, state, scope, cleared string) error {
 	switch {
 	case errors.Is(err, errNotJudgedScope):

@@ -31,9 +31,8 @@ import (
 // removed-scopes record and then stopped at the take, and a rerun whose
 // walk removed entries and then met a directory on another device
 // (through the seam), both return the committed class, saying what remains
-// and that a rerun continues. A third run, which changes nothing in the
-// tree before that directory stops it again, still rewrote the record that
-// lists the scope to make it durable again, so it is committed too.
+// and that a rerun continues. A third run, which finds nothing it can
+// change before that directory stops it again, is a refusal.
 func TestRmScopePartialRemovalIsCommitted(t *testing.T) {
 	s, server, _ := fileLogScope(t)
 	dir := scopeDir(server, "1001")
@@ -84,14 +83,13 @@ func TestRmScopePartialRemovalIsCommitted(t *testing.T) {
 		t.Fatalf("the file on the other device: %q, %v; want it untouched", b, rerr)
 	}
 
-	// Run 3: nothing is left in the tree that the walk can change before
-	// it stops, but the run rewrote the record.
+	// Run 3: nothing is left that the walk can change before it stops.
 	_, err = s.RemoveScope(ctx, 1001)
 	if !errors.Is(err, errScopeForeignDir) {
 		t.Fatalf("the rerun over only the foreign directory: %v, want errScopeForeignDir", err)
 	}
-	if !Committed(err) {
-		t.Fatalf("a run that rewrote the record is not committed: %v", err)
+	if Committed(err) {
+		t.Fatalf("a run that changed nothing is committed: %v", err)
 	}
 	if strings.Contains(err.Error(), "sudo") {
 		t.Errorf("the refusal at a foreign directory %q offers a rerun, which cannot help", err)

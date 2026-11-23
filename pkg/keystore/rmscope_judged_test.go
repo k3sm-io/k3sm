@@ -360,9 +360,9 @@ func TestRmScopeListedNeedsThisKey(t *testing.T) {
 
 // A directory gone from its name when the walk opens it (the seam renames
 // it away after the judge) is never reported removed: the judged path that
-// wrote the record, and a listed rerun that made it durable again, are
-// committed, saying it was found absent; a path that changed and wrote
-// nothing refuses.
+// wrote the record is committed, saying it was found absent; a listed
+// rerun that only made the record durable again (identical bytes), and a
+// path that changed and wrote nothing, refuse.
 func TestRmScopeAbsentAtOpenIsNotRemoved(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -378,7 +378,7 @@ func TestRmScopeAbsentAtOpenIsNotRemoved(t *testing.T) {
 			if _, err := s.RemoveScope(t.Context(), 1001); !Committed(err) {
 				t.Fatalf("run 1: %v, want committed", err)
 			}
-		}, true, "user/1001 is listed"},
+		}, false, "user/1001 is listed"},
 		{"no key", func(t *testing.T, _ *FileStore, dir string) {
 			if err := os.Remove(filepath.Join(dir, scopeKeyName)); err != nil {
 				t.Fatal(err)
