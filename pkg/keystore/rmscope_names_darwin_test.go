@@ -68,11 +68,11 @@ func TestRmScopeHostileNameInert(t *testing.T) {
 	assertInert(t, err.Error(), `"a; touch pwned $(id)[2J]0;titleb"`)
 }
 
-// rm-scope prints no command at all: not for a system flag it leaves (only
-// the administrator who set it should clear it), not for a twice-linked
-// flagged entry another user owns (which it does not clear), not for the
-// service user's own twice-linked file (which it cleared, and which was
-// flagged again), not for a tree nested past its depth limit (named
+// rm-scope prints no command at all: not for a system flag it leaves, not
+// for a twice-linked flagged entry another user owns (which it does not
+// clear), neither of which offers any action by hand, not for the service
+// user's own twice-linked file (which it cleared, and which was flagged
+// again: rerun once nothing sets the flag), not for a tree nested past its depth limit (named
 // relative to the scope directory; nothing below it removed), and not for
 // a run that meets its flag budget (which says to run rm-scope again). No
 // message holds sudo, chflags or a stop, and a path appears only inside
@@ -90,20 +90,20 @@ func TestRmScopeOffersNoCommand(t *testing.T) {
 	}{
 		"system flag": {
 			w.flagKept(filepath.Join("entries", "x"), &unix.Stat_t{Mode: unix.S_IFREG, Uid: 0, Nlink: 1, Flags: sfAppend | unix.UF_IMMUTABLE}, unix.EPERM).Error(),
-			[]string{label, "a system flag is set", "only the administrator who set it should clear it"},
-			nil,
+			[]string{label, "carries a system flag (flags", "another user (uid 0) owns it", "rm-scope left the flag in place"},
+			[]string{"administrator", "Root may", "clear the flag", "Rerun"},
 			"",
 		},
 		"linked user flag": {
 			w.flagKept(filepath.Join("entries", "x"), &unix.Stat_t{Mode: unix.S_IFREG, Uid: 0, Nlink: 2, Flags: unix.UF_IMMUTABLE}, unix.EPERM).Error(),
-			[]string{label, "has 2 links", "another user (uid 0) owns it", "rm-scope does not clear it"},
-			[]string{"cleared the flag"},
+			[]string{label, "has 2 links", "another user (uid 0) owns it", "rm-scope does not clear it", "rm-scope left the flag in place"},
+			[]string{"cleared the flag", "Root may", "clear the flag", "its owner may", "Rerun"},
 			"",
 		},
 		"linked user flag, the service user's": {
 			w.flagKept(filepath.Join("entries", "x"), &unix.Stat_t{Mode: unix.S_IFREG, Uid: 501, Nlink: 2, Flags: unix.UF_IMMUTABLE}, unix.EPERM).Error(),
-			[]string{label, "has 2 links", "rm-scope cleared the flag, and it was set again before the removal"},
-			[]string{"does not clear it"},
+			[]string{label, "has 2 links", "the service user (uid 501) owns it", "rm-scope cleared the flag, and it was set again while rm-scope ran", "Rerun once nothing sets the flag"},
+			[]string{"does not clear it", "left the flag in place"},
 			"",
 		},
 		"too deep": {

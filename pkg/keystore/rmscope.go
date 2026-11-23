@@ -453,10 +453,12 @@ func rmStopped(err error, changed bool, state, scope, cleared string) error {
 // same way, so rmStopped offers none: a directory that is not the scope's
 // (errScopeForeignDir), a tree nested too deep (errScopeTreeDeep), an
 // emptied scope directory no longer at its name (errScopeDirMoved), a
-// planted name (errPlanted), or another user's flag on .user
-// (errSharedDirFlag).
+// planted name (errPlanted), another user's flag on .user
+// (errSharedDirFlag), or a flag on an entry that rm-scope leaves
+// (errFlagLeft: a system flag, or a user flag on a multiply-linked entry it
+// does not clear).
 func rmRerunCannotHelp(err error) bool {
-	for _, e := range []error{errScopeForeignDir, errScopeTreeDeep, errScopeDirMoved, errPlanted, errSharedDirFlag} {
+	for _, e := range []error{errScopeForeignDir, errScopeTreeDeep, errScopeDirMoved, errPlanted, errSharedDirFlag, errFlagLeft} {
 		if errors.Is(err, e) {
 			return true
 		}
@@ -738,8 +740,8 @@ const (
 // set to exactly 0 by directory descriptor and name with setattrlistat
 // (clearUnopened). What is left fails its unlinkat with EPERM, and the
 // error names the entry for reading only and offers no command (flagKept):
-// an entry with a system flag, which only root sets, and one another user
-// owns with more than one link. dir is the keystore's path, which the
+// an entry with a system flag, which only root sets, and a multiply-linked
+// one rm-scope does not clear; a rerun meets either the same way. dir is the keystore's path, which the
 // errors name entries under; listed says whether the scope is already
 // listed as removed, which they report.
 //
@@ -793,6 +795,9 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, opts rmTree
 			_ = unix.Close(dfd) // read-only, untouched
 			return rmTree{}, cerr
 		}
+	}
+	if opts.listedNow != nil {
+		w.listed = opts.listedNow()
 	}
 	// The scope directory stays held through its rmdir, which checks on
 	// this descriptor that it was the directory removed.
@@ -1272,42 +1277,49 @@ func (w *rmWalk) tooDeep(rel string) error {
 	return fmt.Errorf("%w: the directory %s below the scope directory (named for reading, not for pasting) is nested more than %d directories deep; rm-scope removed nothing below it", errScopeTreeDeep, quoteName(rel), maxScopeTreeDepth)
 }
 
+// errFlagLeft marks a flagKept stop that every later run meets the same
+// way: a system flag, which rm-scope never clears, or a user flag on a
+// multiply-linked entry it does not clear. rmStopped offers no rerun for it.
+var errFlagLeft = errors.New("rm-scope left the flag in place, and it stops every later run of rm-scope the same way")
+
 // flagKept is the error for the entry rel below the scope directory,
 // which st describes, whose removal failed with err. When it carries a
-// flag rm-scope left, the error names the entry for reading only, quoted
-// with its control bytes removed (quoteName), says why it was left, and
-// offers no command: a system flag is for the administrator who set it to
-// clear, and a command holding a name from the service user's tree, or a
-// recursive flag change over a tree it writes, is what the design bans.
+// flag, the error names the entry for reading only, quoted with its control
+// bytes removed (quoteName), says which flag it carries, who owns it, and
+// that rm-scope left it, and offers no command: a command holding a name
+// from the service user's tree, or a flag change over a tree it writes, is
+// what the design bans. A system flag, and a user flag rm-scope does not
+// clear (a multiply-linked entry it does not open as the service user's),
+// are met again by a rerun (errFlagLeft); a user flag rm-scope cleared and
+// that was set again while it ran is not, so that text says to rerun once
+// nothing sets the flag, and rmStopped appends the rerun line.
 func (w *rmWalk) flagKept(rel string, st *unix.Stat_t, err error) error {
 	p := quoteName(filepath.Join(w.base, rel))
 	fl := statFlags(st)
+	owner := fmt.Sprintf("another user (uid %d) owns it", st.Uid)
+	if st.Uid == w.svc {
+		owner = fmt.Sprintf("the service user (uid %d) owns it", st.Uid)
+	}
+	state := "The scope is not listed as removed, and the directory left behind blocks a fresh scope for this uid"
+	if w.listed {
+		state = "The scope is already listed as removed, so no open serves it, and the directory left behind blocks only a fresh scope for this uid"
+	}
 	switch {
 	case fl&sfFlagsMask != 0:
-		return fmt.Errorf("remove the entry %s (named for reading, not for pasting): %w: a system flag is set on it (flags %#x); only root sets one, and only the administrator who set it should clear it, so rm-scope leaves it; once it is cleared, run rm-scope for this scope again", p, err, fl)
-	case fl&userLockingFlags != 0 && st.Nlink > 1:
-		state := "The scope is not listed as removed, and the directory left behind blocks a fresh scope for this uid"
-		if w.listed {
-			state = "The scope is already listed as removed, so no open serves it, and the directory left behind blocks only a fresh scope for this uid"
-		}
-		if w.clearedKept(st) {
-			// clearable cleared it (the service user's own regular file or
-			// symlink, or a directory), and the flag was set again.
-			return fmt.Errorf("remove the entry %s (named for reading, not for pasting): %w: it carries a user flag (uchg, uappnd or uunlnk) and has %d links; rm-scope cleared the flag, and it was set again before the removal. %s. Run rm-scope for this scope again once nothing sets the flag", p, err, st.Nlink, state)
-		}
-		who := "it"
-		if st.Uid != w.svc {
-			who = fmt.Sprintf("another user (uid %d) owns it, it", st.Uid)
-		}
-		return fmt.Errorf("remove the entry %s (named for reading, not for pasting): %w: %s carries a user flag (uchg, uappnd or uunlnk) and has %d links, so rm-scope does not clear it: another name of the same file may be outside the scope directory. %s. Root may clear the flag on this one file after inspecting it, or its owner may; then run rm-scope for this scope again", p, err, who, st.Nlink, state)
+		return fmt.Errorf("remove the entry %s (named for reading, not for pasting): %w: it carries a system flag (flags %#x), and %s; only root sets a system flag and rm-scope clears none, so %w. %s", p, err, fl, owner, errFlagLeft, state)
+	case fl&userLockingFlags != 0 && w.clearedKept(st):
+		return fmt.Errorf("remove the entry %s (named for reading, not for pasting): %w: it carries a user flag (uchg, uappnd or uunlnk; flags %#x), has %d links, and %s; rm-scope cleared the flag, and it was set again while rm-scope ran. %s. Rerun once nothing sets the flag", p, err, fl, st.Nlink, owner, state)
+	case fl&userLockingFlags != 0:
+		return fmt.Errorf("remove the entry %s (named for reading, not for pasting): %w: it carries a user flag (uchg, uappnd or uunlnk; flags %#x), has %d links, and %s, so rm-scope does not clear it (another name of the same file may be outside the scope directory) and %w. %s", p, err, fl, st.Nlink, owner, errFlagLeft, state)
 	}
 	return fmt.Errorf("remove %s: %w", p, err)
 }
 
 // clearedKept reports whether rm-scope cleared the user locking flags of
-// the entry st describes (before its removal) although it has more than
-// one link: a directory (clearHeld clears it, whoever owns it), or the
-// service user's regular file or symlink (clearable).
+// the entry st describes (no system flag) before its removal: a directory
+// (clearHeld clears it, whoever owns it), a regular file or symlink when
+// clearable allows it opened, and any other entry when clearable allows it
+// unopened (clearUnopened).
 func (w *rmWalk) clearedKept(st *unix.Stat_t) bool {
 	switch st.Mode & unix.S_IFMT {
 	case unix.S_IFDIR:
@@ -1315,7 +1327,7 @@ func (w *rmWalk) clearedKept(st *unix.Stat_t) bool {
 	case unix.S_IFREG, unix.S_IFLNK:
 		return w.clearable(st, true)
 	}
-	return false
+	return w.clearable(st, false)
 }
 
 // clearable reports whether rm-scope clears the user locking flags of the
