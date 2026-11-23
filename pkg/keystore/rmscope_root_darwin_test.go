@@ -55,9 +55,32 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 	}
 	for _, rootPlant := range []bool{false, true} {
 		t.Run(fmt.Sprintf("root-owned plant %v", rootPlant), func(t *testing.T) {
+			// The service user sets its flags by path below, so it must
+			// search every parent of the scope directory: a t.TempDir()
+			// under the run's TMPDIR sits below directories it cannot
+			// search. The store is built under a root-made 0755 directory
+			// in the sticky, world-searchable /private/tmp instead, as the
+			// link probe's files are (TestSappndMeasuredFacts).
+			base, err := os.MkdirTemp("/private/tmp", "k3sm-rmscope-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Remove(base) }) // emptied by TempDir's own cleanup first
+			if err := os.Chmod(base, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TMPDIR", base)
 			s, server, _ := fileLogScope(t)
 			dir := scopeDir(server, "1001")
 			t.Cleanup(func() { unflagScopeTree(dir) })
+			// The data root is root's 0755, as deployed, and so is the
+			// test's temp directory above it.
+			data := filepath.Dir(server)
+			for _, d := range []string{filepath.Dir(data), data} {
+				if err := os.Chmod(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
 			_ = filepath.WalkDir(dir, func(p string, _ fs.DirEntry, err error) error {
 				if err == nil {
 					_ = os.Lchown(p, int(svcUID), int(svcGID))

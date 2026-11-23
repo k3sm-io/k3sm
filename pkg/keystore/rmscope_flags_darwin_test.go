@@ -70,6 +70,24 @@ func unflagScopeTree(dir string) {
 	})
 }
 
+// giveScopeTree hands every name under dir, symlinks themselves included,
+// to the service user, as root (giveToService): rm-scope clears only the
+// service user's flags, and the names the test plants are root's when it
+// runs as root. Non-root the test user is the service user already.
+func giveScopeTree(t *testing.T, dir string) {
+	t.Helper()
+	err := filepath.WalkDir(dir, func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		giveToService(t, p)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // setScopeFlags sets flags on p, a symlink itself when link.
 func setScopeFlags(t *testing.T, p string, flags int, link bool) uint64 {
 	t.Helper()
@@ -102,7 +120,8 @@ func setScopeFlags(t *testing.T, p string, flags int, link bool) uint64 {
 // A flagged file with a link outside the tree is never cleared: the
 // removal fails naming the outside link, and the outside file keeps its
 // flag. Non-root, the test user is the service user and sets the flags
-// itself.
+// itself; as root, the tree and the outside file are handed to the
+// service user first, and root sets the flags.
 func TestRemoveScopeClearsUserFlags(t *testing.T) {
 	const ufNoUnlinkFlag = 0x10
 	t.Run("flags in the tree", func(t *testing.T) {
@@ -125,6 +144,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 		if err := os.Link(twin, filepath.Join(dir, scopeEntriesName, "twin-alias")); err != nil {
 			t.Fatal(err)
 		}
+		giveScopeTree(t, dir)
 		want := map[uint64]string{}
 		names, err := os.ReadDir(entry)
 		if err != nil || len(names) == 0 {
@@ -179,6 +199,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 		if err := os.Link(outside, in); err != nil {
 			t.Skipf("the temp dir is on another volume than the data root: %v", err)
 		}
+		giveToService(t, outside)
 		ino := setScopeFlags(t, outside, unix.UF_IMMUTABLE, false)
 		calls := recordScopeFlags(t)
 		root, err := s.openDir(s.dir, false)
