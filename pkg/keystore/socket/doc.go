@@ -38,4 +38,11 @@ limitations under the License.
 // peer admission at accept (eligible uid, not sandboxed, read through
 // injected sources), the connection caps and the rate-limited refusal
 // lines. It has no store: every operation is answered unknown-op.
+//
+// The Supervisor owns the listener's life: it serves a Listener only while
+// its start checks pass (the service uid, no maintenance marker, a data root
+// that keeps ownership, the installed files, a single server), recovers a
+// panic, restarts after a failure with backoff, and stops while the
+// maintenance marker stands. WithStoreLock bounds an operation's wait for
+// the store lock, and UnlinkStaleSocket is the self-bind form's start step.
 package socket

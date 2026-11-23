@@ -582,9 +582,9 @@ check U27 "framing: an oversize frame, unknown type or missing HELLO closes; an 
 	k3sm/pkg/keystore/socket::FuzzFrameReader TestFramingBounds TestSubLengthsWithinFrame TestHelloReadDeadline TestUnknownHeaderFieldsIgnored TestHelloVersionRange TestHelloReplyCarriesVersionAndMaxFrame TestHelloNoOverlapSendsUnsupportedVersion TestUnknownOpKeepsConnection TestFrameCapCoversMaxValue
 check U28 "64 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after HELLO or between requests is closed (socket listener)" \
 	k3sm/pkg/keystore/socket::TestConnectionCapsPerUID TestRequestTimeout TestIdleTimeoutAfterHelloAndBetweenRequests
-pend U29 "a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request (socket listener)" \
+check U29 "a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerRecoversPanic TestStaleSocketUnlinkChecksOwner TestBoundedLockWait
-pend U30 "with two servers registered, the listener does not start and doctor says why (socket listener)" \
+check U30 "with two servers registered, the listener does not start and doctor says why (socket listener)" \
 	k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers
 pend U31 "a missing or unflagged file logs the install Warn at start and on each retry; doctor reports user scope off (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow
@@ -751,7 +751,7 @@ pend U111 "the owner annotation never decides precedence: a Secret whose owner a
 	k3sm/pkg/keystore/reconcile::TestAnnotationRewriteCannotTakeOverTarget
 pend U112 "the order is commit, then append, then reply: an append that fails after the commit answers ok with the warning committed; audit failed, the server then refuses user mutations except the revocation class, and doctor counts the unaudited operations (socket operations)" \
 	k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps
-pend U113 "the listener refuses to start unless the server's effective uid is the service uid: a rootless k3sm server runs no listener, and the server log and doctor say user scope needs the installed server (socket listener)" \
+check U113 "the listener refuses to start unless the server's effective uid is the service uid: a rootless k3sm server runs no listener, and the server log and doctor say user scope needs the installed server (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerRefusesUnlessServiceUID
 pend U114 "rm-scope writes keystore-removed-scopes.json in the data root, root-owned, through the data-root descriptor rules, before it removes the scope; only a scope listed there counts as removed for the finalizer, and a plain ErrScopeAbsent stays non-definitive and keeps the finalizer (KeyDelivery lifecycle)" \
 	k3sm/cmd/k3sm::TestRmScopeRecordsRemovedScope k3sm/pkg/keystore/reconcile::TestOnlyRecordedRemovalCountsAsWithdrawn
@@ -785,7 +785,7 @@ pend U129 "floor --rebuild reads every scope whose scope.key opens under W witho
 	k3sm/cmd/k3sm::TestRebuildReadsScopeWithoutOwnerCheck
 pend U130 "a scope listed in keystore-removed-scopes.json for its bound GeneratedUID is definitive for claims, so its stale objects lose their claim; rm-scope deletes that scope's KeyDeliveries, each by its recorded namespace and name with a UID precondition (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestRemovedScopeLosesClaim k3sm/cmd/k3sm::TestRmScopeDeletesScopeKeyDeliveries
-pend U131 "the listener refuses to start on a data root mounted with MNT_IGNORE_OWNERSHIP, read with fstatfs on the data-root descriptor (socket listener)" \
+check U131 "the listener refuses to start on a data root mounted with MNT_IGNORE_OWNERSHIP, read with fstatfs on the data-root descriptor (socket listener)" \
 	k3sm/pkg/keystore/socket::TestStartRefusesIgnoreOwnershipMount
 pend U132 ".user/<uid>/ is 0700 and scope.key and deliveries are 0600, all the service user's; a scope whose directory or files have another owner or a wider mode is refused (user scopes)" \
 	k3sm/pkg/keystore::TestUserScopeFileModes

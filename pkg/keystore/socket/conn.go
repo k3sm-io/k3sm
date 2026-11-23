@@ -49,6 +49,20 @@ type Conn interface {
 // Handler serves k3sm-keys/1 on one connection at a time.
 type Handler struct {
 	now func() time.Time
+	ops map[string]opFunc // the operations; an op not here is unknown-op
+}
+
+// opFunc runs one operation on its request header. A nil error is answered
+// with a TypeReply, and an error with the TypeError its code maps to
+// (codeOf); either way the connection stays open.
+type opFunc func(ctx context.Context, header []byte) error
+
+// codeOf maps an operation's error to its reply's code.
+func codeOf(err error) Code {
+	if errors.Is(err, ErrBusy) {
+		return CodeBusy
+	}
+	return CodeInternal
 }
 
 // NewHandler returns a Handler that takes its deadlines from now.
@@ -153,12 +167,20 @@ func (h *Handler) Serve(ctx context.Context, c Conn) error {
 		if req.Op == "" {
 			return protocolErrorf("request names no op")
 		}
+		// An op the server does not have is answered unknown-op, and the
+		// connection stays open so a newer client can fall back.
+		rt, reply := TypeError, any(errorHeader{Code: CodeUnknownOp})
+		if op, ok := h.ops[req.Op]; ok {
+			if err := op(ctx, f.Header); err != nil {
+				reply = errorHeader{Code: codeOf(err)}
+			} else {
+				rt, reply = TypeReply, struct{}{}
+			}
+		}
 		if err := c.SetReadDeadline(h.now().Add(IdleBound)); err != nil {
 			return err
 		}
-		// No operation exists yet: every op is unknown, and the connection
-		// stays open so a newer client can fall back.
-		if err := h.write(ctx, c, end, TypeError, errorHeader{Code: CodeUnknownOp}); err != nil {
+		if err := h.write(ctx, c, end, rt, reply); err != nil {
 			return err
 		}
 	}

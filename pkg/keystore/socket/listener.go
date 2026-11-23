@@ -19,7 +19,10 @@ package socket
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,6 +72,7 @@ type Listener struct {
 	refusals   *refusalLimiter
 	h          *Handler
 	served     atomic.Bool
+	log        *slog.Logger // receives a recovered goroutine panic
 
 	mu     sync.Mutex // guards open and perUID
 	open   int
@@ -103,6 +107,7 @@ func NewListener(ln net.Listener, creds PeerCredSource, sandbox PeerSandboxSourc
 		clock:      clock,
 		refusals:   newRefusalLimiter(audit, clock.Now),
 		h:          h,
+		log:        slog.Default(),
 		perUID:     make(map[uint32]int),
 	}, nil
 }
@@ -124,7 +129,10 @@ func (l *Listener) Serve(ctx context.Context) error {
 	connCtx, cut := context.WithCancel(ctx)
 	defer cut()
 	var wg sync.WaitGroup
-	wg.Go(func() { l.summarizeEvery(connCtx) })
+	wg.Go(func() {
+		defer l.recovered("refusal summary")
+		l.summarizeEvery(connCtx)
+	})
 	var err error
 	for {
 		c, aerr := l.ln.Accept()
@@ -173,12 +181,23 @@ func (l *Listener) admit(ctx context.Context, wg *sync.WaitGroup, c net.Conn) {
 		return
 	}
 	wg.Go(func() {
+		// A panic serving one connection ends that connection only: it is
+		// recovered here, after the deferred close and release have run.
+		defer l.recovered("connection")
 		defer l.release(uid)
 		defer func() { _ = c.Close() }() // the connection is over either way
 		// How the connection ended is its own business: a client that
 		// closes, breaks the protocol or times out has been answered or cut.
 		_ = l.h.Serve(ctx, c)
 	})
+}
+
+// recovered, deferred at the top of a goroutine the Listener starts, stops
+// a panic there and logs it, so it never reaches the process.
+func (l *Listener) recovered(what string) {
+	if v := recover(); v != nil {
+		l.log.Error("keystore socket: recovered a panic", "goroutine", what, "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
+	}
 }
 
 // check reads c's peer and returns the reason it is refused, or "" for an

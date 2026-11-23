@@ -53,6 +53,12 @@ func serve(t *testing.T, now func() time.Time) *session {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return serveWith(t, h)
+}
+
+// serveWith starts h's Serve on a pipe, inside the caller's synctest bubble.
+func serveWith(t *testing.T, h *Handler) *session {
+	t.Helper()
 	client, server := net.Pipe()
 	s := &session{client: client, done: make(chan error, 1), start: time.Now()}
 	go func() {
