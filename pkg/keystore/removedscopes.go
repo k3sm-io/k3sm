@@ -65,8 +65,10 @@ var errScopeRemoved = fmt.Errorf("%w: this user scope was removed by root (sudo 
 
 // errRemovedScopesBad is a removed-scopes record that does not judge or
 // parse: every open of a user scope, rm-scope and floor --rebuild refuse
-// while it stands (fail closed).
-var errRemovedScopesBad = errors.New("the removed-scopes record " + removedScopesName + " in the data root is damaged or untrusted, so no user scope opens: restore it from a backup, or, as root, fix it")
+// while it stands (fail closed). The repair is root restoring the file
+// from a backup, and the text states its cost: a removal made after that
+// backup is no longer listed.
+var errRemovedScopesBad = errors.New("the removed-scopes record " + removedScopesName + " in the data root is damaged or untrusted, so no user scope opens: as root, restore it from a backup (root:wheel, mode 0600); scopes removed after that backup are then no longer listed, so a copy of their directories put back would open, though their floor lines are still kept")
 
 // scopeKeyID is the stable identity of a scope key: a labelled SHA-256 of
 // the scope and K_u, which Rewrap leaves as it is (it re-seals the same

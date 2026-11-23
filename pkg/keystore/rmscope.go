@@ -102,7 +102,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		return false, fmt.Errorf("%w: %s", errCommitted, scopeRemovedUnlisted(u.scope))
 	}
 	if err != nil {
-		return false, fmt.Errorf("open the scope %s: %w; nothing was changed", u.scope, err)
+		return false, fmt.Errorf("open the scope %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", u.scope, err)
 	}
 	id := o.id
 	recorded = removed.has(uid, id)
@@ -119,12 +119,12 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		// An earlier rm-scope, unlisted (a full record), removed entries/
 		// and the record, then stopped.
 	default:
-		return false, fmt.Errorf("read the delivery record of %s: %w; nothing was changed", u.scope, derr)
+		return false, fmt.Errorf("read the delivery record of %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", u.scope, derr)
 	}
 	if !recorded {
 		ino, size, err := s.floorSize(dfd)
 		if err != nil {
-			return false, fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed", userFloorLogName, err)
+			return false, fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", userFloorLogName, err)
 		}
 		if removed.add(uid, id, ino, size) {
 			if err := writeRemovedScopes(dfd, removed); err != nil {
@@ -446,7 +446,7 @@ func (w *rmWalk) clearScopeFlags(pfd int, name, rel string, st *unix.Stat_t) (le
 
 // errPlanted is a name in a service-user tree that the layout does not put
 // there: a symlink, a FIFO, any non-regular file, or a misplaced directory.
-var errPlanted = errors.New("a symlink, FIFO, non-regular file or misplaced directory is in the scope's tree")
+var errPlanted = errors.New("a symlink, FIFO, non-regular file or misplaced directory is in the scope's tree: remove it as root, then rerun")
 
 // openDirAt opens the directory name under parent O_DIRECTORY|O_NOFOLLOW
 // and re-checks that it is the directory fstatat named (SameFile), so a
@@ -491,7 +491,7 @@ func listDir(dfd int) ([]string, error) {
 		batch, err := d.Readdirnames(dirBatch)
 		names = append(names, batch...)
 		if len(names) > maxDirNames {
-			return nil, fmt.Errorf("a directory holds over %d names", maxDirNames)
+			return nil, fmt.Errorf("a directory holds over %d names: remove some as root, then rerun", maxDirNames)
 		}
 		if errors.Is(err, io.EOF) {
 			return names, nil

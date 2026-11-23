@@ -282,7 +282,7 @@ func (m *maintenance) readMarker() (*marker, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: open %s: %w", errLogUntrusted, maintenanceMarkerName, err)
+		return nil, fmt.Errorf("%w: open %s: %w; root repairs it with sudo k3sm install, which removes a marker it cannot read", errLogUntrusted, maintenanceMarkerName, err)
 	}
 	f := os.NewFile(uintptr(fd), maintenanceMarkerName)
 	defer func() { _ = f.Close() }() // read-only
@@ -347,7 +347,7 @@ func (m *maintenance) openStagingDir() (int, error) {
 	}
 	fd, err := unix.Openat(m.dfd, stagingDirName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return -1, fmt.Errorf("%w: %s: %w", errLogUntrusted, stagingDirName, err)
+		return -1, fmt.Errorf("%w: %s: %w; remove keystore-staging/ in the data root as root (sudo chflags -R 0 and sudo rm -rf), then rerun the verb, which makes it afresh", errLogUntrusted, stagingDirName, err)
 	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
@@ -356,15 +356,15 @@ func (m *maintenance) openStagingDir() (int, error) {
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFDIR || int64(st.Uid) != int64(m.s.floorUID) || st.Mode&0o7777 != stagingDirMode {
 		_ = unix.Close(fd) // read-only
-		return -1, fmt.Errorf("%w: %s is not a directory of the data root's owner at mode 0700", errLogUntrusted, stagingDirName)
+		return -1, fmt.Errorf("%w: %s is not a directory of the data root's owner at mode 0700; remove keystore-staging/ in the data root as root (sudo chflags -R 0 and sudo rm -rf), then rerun the verb, which makes it afresh", errLogUntrusted, stagingDirName)
 	}
 	if err := judgeFlagsACL(fd, fdFlags); err != nil {
 		_ = unix.Close(fd) // read-only
-		return -1, fmt.Errorf("%s: %w", stagingDirName, err)
+		return -1, fmt.Errorf("%s: %w; remove keystore-staging/ in the data root as root (sudo chflags -R 0 and sudo rm -rf), then rerun the verb, which makes it afresh", stagingDirName, err)
 	}
 	if fl, _ := fdFlags(fd); fl != 0 {
 		_ = unix.Close(fd) // read-only
-		return -1, fmt.Errorf("%w: %s carries a file flag", errLogUntrusted, stagingDirName)
+		return -1, fmt.Errorf("%w: %s carries a file flag; remove keystore-staging/ in the data root as root (sudo chflags -R 0 and sudo rm -rf), then rerun the verb, which makes it afresh", errLogUntrusted, stagingDirName)
 	}
 	return fd, nil
 }
@@ -410,7 +410,7 @@ func (o *oldLog) close() {
 // errOldLogUnflagged is an old log with its SF_APPEND flag clear that the
 // service user owns: while it was clear any descriptor the service user
 // held could have rewritten it, so no verb takes it as input.
-var errOldLogUnflagged = fmt.Errorf("%w: its SF_APPEND flag is clear and the service user owns it, so it could have been rewritten; an unflagged log is taken as input only when root owns it (a restore)", errLogUntrusted)
+var errOldLogUnflagged = fmt.Errorf("%w: its SF_APPEND flag is clear and the service user owns it, so it could have been rewritten; an unflagged log is taken as input only when root owns it (a restore): as root, restore the log from a backup (root-owned, mode 0600), then rerun the verb", errLogUntrusted)
 
 // openOldLog is step 2's open: the log name, in its judged directory
 // under lfd, opened read-only with O_NOFOLLOW and judged on its
@@ -437,7 +437,7 @@ func (s *FileStore) openOldLog(lfd int, name string) (*oldLog, error) {
 	fl, err := s.logFlags(o.f)
 	if err != nil {
 		o.close()
-		return nil, fmt.Errorf("%w: read the flags of %s: %w", errLogUntrusted, name, err)
+		return nil, fmt.Errorf("%w: read the flags of %s: %w; rerun the verb", errLogUntrusted, name, err)
 	}
 	if err := s.judgeOldLog(name, &st, fl); err != nil {
 		o.close()
@@ -452,7 +452,7 @@ func (s *FileStore) openOldLog(lfd int, name string) (*oldLog, error) {
 // root's (errOldLogUnflagged). More than one link is a Warn.
 func (s *FileStore) judgeOldLog(name string, st *unix.Stat_t, fl uint32) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("%w: %s is not a regular file", errLogUntrusted, name)
+		return fmt.Errorf("%w: %s is not a regular file: as root, move it aside and restore the log from a backup, then rerun the verb", errLogUntrusted, name)
 	}
 	if fl&sfAppend == 0 && int64(st.Uid) != int64(s.floorUID) {
 		return fmt.Errorf("%s: %w", name, errOldLogUnflagged)
@@ -491,7 +491,7 @@ func (s *FileStore) buildLogDir(m *maintenance, name string, content func(io.Wri
 		return 0, 0, fmt.Errorf("stat %s: %w", nd, err)
 	}
 	if dst.Mode&unix.S_IFMT != unix.S_IFDIR || int64(dst.Uid) != int64(s.floorUID) {
-		return 0, 0, fmt.Errorf("%w: %s is not a directory of the data root's owner", errLogUntrusted, nd)
+		return 0, 0, fmt.Errorf("%w: %s is not a directory of the data root's owner; rerun the verb, which cleans keystore-staging/ first", errLogUntrusted, nd)
 	}
 	fd, err := unix.Openat(dir, name, unix.O_WRONLY|unix.O_APPEND|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, logMode)
 	if err != nil {
@@ -678,7 +678,7 @@ func removeEntry(pfd int, name string, attrs FileAttrWriter, depth int) error {
 	switch st.Mode & unix.S_IFMT {
 	case unix.S_IFDIR:
 		if depth >= maxStagingDepth {
-			return fmt.Errorf("%w: %s is nested deeper than a maintenance verb builds", errLogUntrusted, name)
+			return fmt.Errorf("%w: %s is nested deeper than a maintenance verb builds; remove keystore-staging/ in the data root as root (sudo chflags -R 0 and sudo rm -rf), then rerun the verb, which makes it afresh", errLogUntrusted, name)
 		}
 		fd, err := unix.Openat(pfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 		if err != nil {
@@ -696,7 +696,7 @@ func removeEntry(pfd int, name string, attrs FileAttrWriter, depth int) error {
 	case unix.S_IFREG:
 		if statFlags(&st) != 0 {
 			if st.Nlink != 1 {
-				return fmt.Errorf("%w: %s carries a file flag and has more than one link", errLogUntrusted, name)
+				return fmt.Errorf("%w: %s carries a file flag and has more than one link; remove keystore-staging/ in the data root as root (sudo chflags -R 0 and sudo rm -rf), then rerun the verb, which makes it afresh", errLogUntrusted, name)
 			}
 			fd, err := unix.Openat(pfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 			if err != nil {
@@ -722,7 +722,7 @@ func sameFile(fd int, st *unix.Stat_t, name string) error {
 		return fmt.Errorf("stat %s: %w", name, err)
 	}
 	if got.Dev != st.Dev || got.Ino != st.Ino {
-		return fmt.Errorf("%w: %s was replaced while it was removed", errLogUntrusted, name)
+		return fmt.Errorf("%w: %s was replaced while it was removed; rerun the verb", errLogUntrusted, name)
 	}
 	return nil
 }
