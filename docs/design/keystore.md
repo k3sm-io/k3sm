@@ -2787,7 +2787,10 @@ service user can only add to.
   link plus a flag (linked before it was flagged; its other name may be outside the tree), where
   the message says the scope is already listed as removed, that the leftover directory blocks
   only a fresh scope for that uid, and that root may clear the flag on that one file after
-  inspecting it. A recursive flag change over the tree would be the pattern banned above, and stopping the server
+  inspecting it. The service user's own twice-linked regular file or symlink is cleared (above);
+  if its flag is set again before the `unlinkat`, the message says rm-scope cleared it and it
+  was set again. A directory that is not the scope's stops the removal with no rerun offered
+  either: a rerun meets it again. A recursive flag change over the tree would be the pattern banned above, and stopping the server
   does not stop other service-user processes, so none is offered. The flag budget is per run: a
   tree with more flagged entries says to run rm-scope again, each run unlocking up to 4096
   more. A name left in a directory rm-scope emptied after taking it, which only root could put
@@ -2824,7 +2827,10 @@ service user can only add to.
   (a hostile append).* A line the service user appends to the floor, bypassing the store lock,
   before rm-scope reads the size is dropped with the removed scope's; one appended after it is
   kept. *Residual (a deep planted tree).* rm-scope descends at most 32 directories below the
-  scope directory, one descriptor a level, and refuses a deeper tree. The later rows (U114,
+  scope directory, one descriptor a level, and stops at a deeper tree: the error names the
+  directory past the limit relative to the scope directory, for reading only, says rm-scope
+  removed nothing below it, and offers no command, not even a rerun, which would stop there
+  again. The later rows (U114,
   U130, U133) extend this record with the bound GeneratedUID and the delivered Secrets; this
   slice holds only the uid, the key identities and the floor offset.
 - **Rebuild never lowers.** Rebuild opens every scope under `.user/` before it writes the new

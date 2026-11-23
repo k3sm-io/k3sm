@@ -123,7 +123,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		listed := removed.listed(uid)
 		tree, err := removeScopeTree(root, s.dir, name, s.uid, listed)
 		if err != nil {
-			return RemoveScopeResult{Recorded: listed}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
+			return RemoveScopeResult{Recorded: listed}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope)
 		}
 		if listed {
 			return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
@@ -148,7 +148,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		// rm-scope for.
 		tree, rerr := removeScopeTree(root, s.dir, name, s.uid, removed.listed(uid))
 		if rerr != nil {
-			return RemoveScopeResult{}, rmStopped(rerr, tree.changed, fmt.Sprintf("the directory %s has a scope.key that cannot be trusted and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
+			return RemoveScopeResult{}, rmStopped(rerr, tree.changed, fmt.Sprintf("the directory %s has a scope.key that cannot be trusted and is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope)
 		}
 		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUntrusted(u.scope, err), tree.cleared))
 	}
@@ -157,7 +157,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		// serves the directory, and there is no key to list.
 		tree, err := removeScopeTree(root, s.dir, name, s.uid, removed.listed(uid))
 		if err != nil {
-			return RemoveScopeResult{}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s has no scope.key and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
+			return RemoveScopeResult{}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s has no scope.key and is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope)
 		}
 		if removed.listed(uid) {
 			return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
@@ -216,7 +216,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		if !recorded {
 			state = "is not listed in " + removedScopesName + ", which is full"
 		}
-		return RemoveScopeResult{Recorded: recorded}, rmStopped(err, wrote || tree.changed, fmt.Sprintf("the scope %s %s, and its directory %s is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", u.scope, state, quoteName("keystore/"+userScopesName+"/"+name), u.scope))
+		return RemoveScopeResult{Recorded: recorded}, rmStopped(err, wrote || tree.changed, fmt.Sprintf("the scope %s %s, and its directory %s is partly or wholly present", u.scope, state, quoteName("keystore/"+userScopesName+"/"+name)), u.scope)
 	}
 	cleared := tree.cleared
 	var notes []string
@@ -232,13 +232,19 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 	return RemoveScopeResult{Recorded: recorded, Cleared: cleared}, nil
 }
 
-// rmStopped is RemoveScope's error for a removeScopeTree that failed
-// (err), followed by state, which says what remains. When this run changed
-// something first (changed: it wrote the removed-scopes record, or the walk
-// unlinked an entry, took a directory or cleared a flag), the removal was
-// made in part and the error is committed (exit 4, audited committed);
-// otherwise it is a refusal.
-func rmStopped(err error, changed bool, state string) error {
+// rmStopped is RemoveScope's error for a removeScopeTree of scope that
+// failed (err), followed by state, which says what remains, and the rerun
+// that finishes it. A directory that is not the scope's
+// (errScopeForeignDir) or a tree nested too deep (errScopeTreeDeep) stops
+// a rerun the same way, so neither is offered one: their own text says
+// what to do. When this run changed something first (changed: it wrote the
+// removed-scopes record, or the walk unlinked an entry, took a directory or
+// cleared a flag), the removal was made in part and the error is committed
+// (exit 4, audited committed); otherwise it is a refusal.
+func rmStopped(err error, changed bool, state, scope string) error {
+	if !errors.Is(err, errScopeForeignDir) && !errors.Is(err, errScopeTreeDeep) {
+		state += ": rerun sudo k3sm keys rm-scope " + scope + " --yes to finish removing it"
+	}
 	if changed {
 		return fmt.Errorf("%w: rm-scope began removing the scope, then stopped: %w; %s", errCommitted, err, state)
 	}
@@ -799,7 +805,7 @@ func (w *rmWalk) removeName(pfd int, rel, name string, depth int) (rmOutcome, er
 		return rmGone, nil
 	}
 	if depth >= maxScopeTreeDepth {
-		return 0, fmt.Errorf("%w: %s is nested more than %d directories below the scope directory", errPlanted, quoteName(name), maxScopeTreeDepth)
+		return 0, w.tooDeep(rel)
 	}
 	if !w.ours(rel, &st) {
 		return rmLeft, nil
@@ -843,6 +849,18 @@ func (w *rmWalk) removeName(pfd int, rel, name string, depth int) (rmOutcome, er
 	return 0, w.flagKept(rel, &dst, err)
 }
 
+// errScopeTreeDeep is a directory nested deeper below the scope directory
+// than rm-scope descends (maxScopeTreeDepth).
+var errScopeTreeDeep = errors.New("the scope tree is nested deeper than rm-scope descends")
+
+// tooDeep is errScopeTreeDeep for the directory rel below the scope
+// directory, which the walk did not open: it names the directory relative
+// to the scope directory, for reading only, says nothing below it was
+// removed, and offers no command, since the tree is the service user's.
+func (w *rmWalk) tooDeep(rel string) error {
+	return fmt.Errorf("%w: the directory %s below the scope directory (named for reading, not for pasting) is nested more than %d directories deep; rm-scope removed nothing below it", errScopeTreeDeep, quoteName(rel), maxScopeTreeDepth)
+}
+
 // flagKept is the error for the entry rel below the scope directory,
 // which st describes, whose removal failed with err. When it carries a
 // flag rm-scope left, the error names the entry for reading only, quoted
@@ -857,17 +875,36 @@ func (w *rmWalk) flagKept(rel string, st *unix.Stat_t, err error) error {
 	case fl&sfFlagsMask != 0:
 		return fmt.Errorf("remove the entry %s (named for reading, not for pasting): %w: a system flag is set on it (flags %#x); only root sets one, and only the administrator who set it should clear it, so rm-scope leaves it; once it is cleared, run rm-scope for this scope again", p, err, fl)
 	case fl&userLockingFlags != 0 && st.Nlink > 1:
-		who := "it"
-		if st.Uid != w.svc {
-			who = fmt.Sprintf("another user (uid %d) owns it, it", st.Uid)
-		}
 		state := "The scope is not listed as removed, and the directory left behind blocks a fresh scope for this uid"
 		if w.listed {
 			state = "The scope is already listed as removed, so no open serves it, and the directory left behind blocks only a fresh scope for this uid"
 		}
+		if w.clearedKept(st) {
+			// clearable cleared it (the service user's own regular file or
+			// symlink, or a directory), and the flag was set again.
+			return fmt.Errorf("remove the entry %s (named for reading, not for pasting): %w: it carries a user flag (uchg, uappnd or uunlnk) and has %d links; rm-scope cleared the flag, and it was set again before the removal. %s. Run rm-scope for this scope again once nothing sets the flag", p, err, st.Nlink, state)
+		}
+		who := "it"
+		if st.Uid != w.svc {
+			who = fmt.Sprintf("another user (uid %d) owns it, it", st.Uid)
+		}
 		return fmt.Errorf("remove the entry %s (named for reading, not for pasting): %w: %s carries a user flag (uchg, uappnd or uunlnk) and has %d links, so rm-scope does not clear it: another name of the same file may be outside the scope directory. %s. Root may clear the flag on this one file after inspecting it, or its owner may; then run rm-scope for this scope again", p, err, who, st.Nlink, state)
 	}
 	return fmt.Errorf("remove %s: %w", p, err)
+}
+
+// clearedKept reports whether rm-scope cleared the user locking flags of
+// the entry st describes (before its removal) although it has more than
+// one link: a directory (clearHeld clears it, whoever owns it), or the
+// service user's regular file or symlink (clearable).
+func (w *rmWalk) clearedKept(st *unix.Stat_t) bool {
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFDIR:
+		return true
+	case unix.S_IFREG, unix.S_IFLNK:
+		return w.clearable(st, true)
+	}
+	return false
 }
 
 // clearable reports whether rm-scope clears the user locking flags of the

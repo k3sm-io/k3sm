@@ -73,6 +73,9 @@ func TestRmScopePartialRemovalIsCommitted(t *testing.T) {
 	if !Committed(err) || !errors.Is(err, errScopeForeignDir) {
 		t.Fatalf("rm-scope that removed entries, then met a foreign directory: %v, want committed wrapping errScopeForeignDir", err)
 	}
+	if strings.Contains(err.Error(), "sudo") {
+		t.Errorf("the stop at a foreign directory %q offers a rerun, which cannot help", err)
+	}
 	if names, rerr := os.ReadDir(filepath.Join(dir, scopeEntriesName)); rerr != nil || len(names) != 1 || names[0].Name() != "mounted" {
 		t.Fatalf("entries/ holds %v (%v), want only the other device's directory", names, rerr)
 	}
@@ -87,5 +90,8 @@ func TestRmScopePartialRemovalIsCommitted(t *testing.T) {
 	}
 	if Committed(err) {
 		t.Fatalf("a run that changed nothing is committed: %v", err)
+	}
+	if strings.Contains(err.Error(), "sudo") {
+		t.Errorf("the refusal at a foreign directory %q offers a rerun, which cannot help", err)
 	}
 }

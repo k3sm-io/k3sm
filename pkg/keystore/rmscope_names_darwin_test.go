@@ -70,27 +70,49 @@ func TestRmScopeHostileNameInert(t *testing.T) {
 
 // rm-scope prints no command at all: not for a system flag it leaves (only
 // the administrator who set it should clear it), not for a twice-linked
-// flagged entry another user owns, and not for a run that meets its flag
-// budget (which says to run rm-scope again). No message holds sudo,
-// chflags or a stop, and the scope directory's path appears only inside
+// flagged entry another user owns (which it does not clear), not for the
+// service user's own twice-linked file (which it cleared, and which was
+// flagged again), not for a tree nested past its depth limit (named
+// relative to the scope directory; nothing below it removed), and not for
+// a run that meets its flag budget (which says to run rm-scope again). No
+// message holds sudo, chflags or a stop, and a path appears only inside
 // the one quoted name labelled as not for pasting.
 func TestRmScopeOffersNoCommand(t *testing.T) {
 	base := "/data/a$(touch pwned)b/keystore/.user/1001"
 	w := &rmWalk{svc: 501, base: base, scope: "user/1001"}
 	label := quoteName(filepath.Join(base, "entries", "x")) + " (named for reading, not for pasting)"
+	deep := filepath.Join("entries", "d$(id)", "e")
 	for name, tc := range map[string]struct {
-		msg  string
-		want []string
+		msg    string
+		want   []string
+		absent []string
+		label  string
 	}{
 		"system flag": {
 			w.flagKept(filepath.Join("entries", "x"), &unix.Stat_t{Mode: unix.S_IFREG, Uid: 0, Nlink: 1, Flags: sfAppend | unix.UF_IMMUTABLE}, unix.EPERM).Error(),
 			[]string{label, "a system flag is set", "only the administrator who set it should clear it"},
+			nil,
+			"",
 		},
 		"linked user flag": {
 			w.flagKept(filepath.Join("entries", "x"), &unix.Stat_t{Mode: unix.S_IFREG, Uid: 0, Nlink: 2, Flags: unix.UF_IMMUTABLE}, unix.EPERM).Error(),
-			[]string{label, "has 2 links"},
+			[]string{label, "has 2 links", "another user (uid 0) owns it", "rm-scope does not clear it"},
+			[]string{"cleared the flag"},
+			"",
 		},
-		"budget": {errScopeFlagBudget.Error(), []string{"run rm-scope for this scope again", "each run unlocks up to"}},
+		"linked user flag, the service user's": {
+			w.flagKept(filepath.Join("entries", "x"), &unix.Stat_t{Mode: unix.S_IFREG, Uid: 501, Nlink: 2, Flags: unix.UF_IMMUTABLE}, unix.EPERM).Error(),
+			[]string{label, "has 2 links", "rm-scope cleared the flag, and it was set again before the removal"},
+			[]string{"does not clear it"},
+			"",
+		},
+		"too deep": {
+			w.tooDeep(deep).Error(),
+			[]string{quoteName(deep) + " below the scope directory (named for reading, not for pasting)", "nested more than 32 directories deep", "rm-scope removed nothing below it"},
+			[]string{"remove it", "rerun"},
+			quoteName(deep) + " below the scope directory (named for reading, not for pasting)",
+		},
+		"budget": {errScopeFlagBudget.Error(), []string{"run rm-scope for this scope again", "each run unlocks up to"}, nil, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			for _, bad := range []string{"sudo", "chflags", "k3sm stop", "'"} {
@@ -103,7 +125,16 @@ func TestRmScopeOffersNoCommand(t *testing.T) {
 					t.Errorf("the message %q does not say %q", tc.msg, want)
 				}
 			}
-			if rest := strings.Replace(tc.msg, label, "", 1); strings.Contains(rest, "/data") || strings.Contains(rest, "pwned") {
+			for _, bad := range tc.absent {
+				if strings.Contains(tc.msg, bad) {
+					t.Errorf("the message %q says %q", tc.msg, bad)
+				}
+			}
+			lbl := label
+			if tc.label != "" {
+				lbl = tc.label
+			}
+			if rest := strings.Replace(tc.msg, lbl, "", 1); strings.Contains(rest, "/data") || strings.Contains(rest, "pwned") || strings.Contains(rest, "$(id)") {
 				t.Errorf("the message %q holds a path outside the one name labelled not for pasting", tc.msg)
 			}
 		})
