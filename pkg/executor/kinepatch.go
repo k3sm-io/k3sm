@@ -51,11 +51,12 @@ type kineSourcePatch struct {
 // github.com/klauspost/compress v1.20.2, p4 added the compact-commit-returns-error
 // source patch, p5 added compact-rollback-logs-error, p6 is p4 with x/net raised
 // to v0.62.0 together with the golang.org/x/crypto, x/sys, x/term, x/text and
-// x/sync it requires). kineBuildVariant names the whole set: any change to either
+// x/sync it requires, p7 is p6 with the go.opentelemetry.io/otel family raised to
+// v1.47.0 and otel/log added). kineBuildVariant names the whole set: any change to either
 // changes that variant, so every staged kine re-stages. TestKinePatchSetIsMarked
 // enforces that, against an append-only history of digests.
 //
-// p6's source patches are p4's. p5 also replaced compact()'s deferred
+// p6's and p7's source patches are p4's. p5 also replaced compact()'s deferred
 // t.MustRollback() with a closure that only logged a failed rollback. That was
 // reverted: a ROLLBACK that fails with anything but sql.ErrTxDone can return its
 // connection to the pool still inside the transaction and holding the WAL write

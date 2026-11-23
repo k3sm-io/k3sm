@@ -56,18 +56,25 @@ mkwork() {
 # applied with `go get` before the tidy. Each entry is the lowest version that
 # clears a govulncheck finding the wrapper actually calls; drop an entry once the
 # pinned etcd selects that version (or newer) on its own.
-#   go.opentelemetry.io/otel family v1.45.0: GO-2026-6505 (reached through the
+#   go.opentelemetry.io/otel family: GO-2026-6505 (v1.45.0; reached through the
 #   otlptrace exporter etcd's tracing setup initializes).
+#   go.opentelemetry.io/otel family v1.47.0: GO-2026-6975 (baggage.Parse and
+#   propagation.Baggage.Extract in otel) and GO-2026-6974 (attrnorm.Truncate
+#   in otel/sdk, autoSpan in otel/trace), both reached from etcdmain's init.
+#   github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 (the
+#   version the k3sm root module selects): GO-2026-6278 (Upgrader.Upgrade and
+#   Conn reads and writes, reached from etcdmain.Main and etcdutl's main).
 #   github.com/klauspost/compress v1.20.2: GO-2026-6865 (the fse and huff0
 #   panic on two-block frames, reached through zstd from prometheus's promhttp,
 #   which the etcd server links; etcdutl links no compress package).
 OVERRIDES=(
-	go.opentelemetry.io/otel@v1.45.0
-	go.opentelemetry.io/otel/sdk@v1.45.0
-	go.opentelemetry.io/otel/trace@v1.45.0
-	go.opentelemetry.io/otel/metric@v1.45.0
-	go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.45.0
-	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.45.0
+	go.opentelemetry.io/otel@v1.47.0
+	go.opentelemetry.io/otel/sdk@v1.47.0
+	go.opentelemetry.io/otel/trace@v1.47.0
+	go.opentelemetry.io/otel/metric@v1.47.0
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.47.0
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.47.0
+	github.com/gorilla/websocket@v1.5.4-0.20250319132907-e064f32e3674
 	github.com/klauspost/compress@v1.20.2
 )
 
