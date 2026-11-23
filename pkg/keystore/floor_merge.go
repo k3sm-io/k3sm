@@ -278,8 +278,13 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 			return r, fmt.Errorf("%s, the record a merge writes before the floor, is of another input than keystore-floor.json.pre-restore (input sha256 %s, the file's %s): the file was replaced after a merge of another one began. Nothing is written; put back the floor that merge read, or inspect both files", retiredPendingName, pending.Input, in.sum)
 		case pending.Floor == liveSum:
 			rerun = true
-		case pending.Base != liveSum:
-			return r, fmt.Errorf("%w: keystore-floor.json (sha256 %s) is neither the floor this merge recorded writing (%s) nor the one it read (%s), in %s: it changed after the merge wrote it, and the merge never plans a written merge again, so nothing more is done. Inspect keystore-floor.json against the record", errCommitted, liveSum, pending.Floor, pending.Base, retiredPendingName)
+		case pending.Base == liveSum:
+		default:
+			// rm is never refused while a merge is pending, so the live
+			// floor may be the recorded one plus burials rm added since.
+			if rerun, err = pendingSince(*pending, live); err != nil {
+				return r, fmt.Errorf("%w: keystore-floor.json (sha256 %s) is neither the floor this merge recorded writing (%s) nor the one it read (%s), in %s, nor either of them with only burials added since (%w): it changed after the merge wrote it, and the merge never plans a written merge again, so nothing more is done. Inspect keystore-floor.json against the record", errCommitted, liveSum, pending.Floor, pending.Base, retiredPendingName, err)
+			}
 		}
 	}
 	var undo retiredRecord
@@ -402,11 +407,11 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	// later deletions, and the floor it writes, so a rerun finishes this
 	// merge instead of planning another. A first run that stopped before
 	// the floor's write keeps the sets the record holds (unionRecord).
-	rec := retiredRecord{Input: in.sum, Base: liveSum, Floor: sha256Hex(mergedBytes), Retired: pr.Retired, BuriedLive: pr.BuriedLive, Kept: pr.Kept, Recorded: pr.Recorded, Dropped: pr.Dropped}
+	rec := retiredRecord{Input: in.sum, Retired: pr.Retired, BuriedLive: pr.BuriedLive, Kept: pr.Kept, Recorded: pr.Recorded, Dropped: pr.Dropped}
 	if pending != nil {
 		rec = unionRecord(*pending, rec)
-		rec.Floor = sha256Hex(mergedBytes)
 	}
+	rec.setFloors(liveBytes, mergedBytes)
 	if err := s.writeRetiredPending(fdir, rec); err != nil {
 		return r, fmt.Errorf("write %s: %w; nothing is merged, run the merge again", retiredPendingName, err)
 	}
@@ -520,6 +525,90 @@ func (s *FileStore) finishRerun(st *mergeStaging, in *mergeInput, live floor, re
 		return r, fmt.Errorf("%w: the merge is written, but its input was not renamed, so the verbs that change the keystore still refuse; run the same merge again, which writes nothing more and renames it: %w", errCommitted, err)
 	}
 	return r, nil
+}
+
+// pendingSince judges a live floor that is neither of rec's floors byte for
+// byte. It is a rerun of the written merge (true) when live is the floor
+// rec records writing plus only what rm adds (buriedSince), and a first
+// run that stopped before its floor write (false) when live is the floor
+// rec records reading plus only rm's burials under the guard (rmSince);
+// anything else is an error naming the first difference from the floor
+// written.
+func pendingSince(rec retiredRecord, live floor) (bool, error) {
+	written, err := recordFloor(rec.Written, rec.Floor)
+	if err != nil {
+		return false, err
+	}
+	werr := buriedSince(written, live)
+	if werr == nil {
+		return true, nil
+	}
+	read, err := recordFloor(rec.Read, rec.Base)
+	if err != nil {
+		return false, err
+	}
+	if rmSince(read, live) {
+		return false, nil
+	}
+	return false, werr
+}
+
+// buriedSince reports how now differs from old by more than burials added:
+// a burial of old gone from now or numbered lower, a live record of old
+// with another generation, a lower sequence or a lower high-water mark, or
+// gone without its generation buried, or a live record now that old does
+// not hold. nil means now refuses everything old refuses.
+func buriedSince(old, now floor) error {
+	for _, name := range slices.Sorted(maps.Keys(old)) {
+		o, n := old[name], now[name]
+		for _, b := range o.burials() {
+			i := slices.IndexFunc(n.burials(), func(x burial) bool { return x.Generation == b.Generation })
+			switch {
+			case i < 0:
+				return fmt.Errorf("the burial of %s generation %s is gone", name, b.Generation)
+			case n.Buried[i].Deleted < b.Deleted:
+				return fmt.Errorf("the burial of %s generation %s is numbered lower", name, b.Generation)
+			}
+		}
+		switch {
+		case !o.live():
+		case !n.live():
+			if !n.buries(o.Generation) {
+				return fmt.Errorf("the live record of %s is gone and its generation not buried", name)
+			}
+		case n.Generation != o.Generation:
+			return fmt.Errorf("the live record of %s holds another generation", name)
+		case n.Seq < o.Seq || max(n.Seq, n.HighWater) < max(o.Seq, o.HighWater):
+			return fmt.Errorf("the live record of %s is lowered", name)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(now)) {
+		if now[name].live() && !old[name].live() {
+			return fmt.Errorf("%s is live and was not", name)
+		}
+	}
+	return nil
+}
+
+// rmSince reports whether now is old plus only what rm writes under the
+// guard: burials numbered above guardEraSeq, each live record of old kept
+// as it is or buried, and no burial of old gone.
+func rmSince(old, now floor) bool {
+	if buriedSince(old, now) != nil {
+		return false
+	}
+	for name, n := range now {
+		o := old[name]
+		if n.live() && (n.Generation != o.Generation || n.Seq != o.Seq || n.HighWater != o.HighWater) {
+			return false
+		}
+		for _, b := range n.burials() {
+			if !o.buries(b.Generation) && b.Deleted <= guardEraSeq {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // floorBurial is one burial by name and generation.
@@ -713,10 +802,6 @@ func (r MergeReport) changes() bool {
 // errMergeLiveFloor refuses a merge whose input is the data root's live
 // floor itself, the same inode under the guard file's name.
 var errMergeLiveFloor = errors.New("keystore-floor.json.pre-restore is the live floor itself: merging it changes nothing. It must be the floor moved aside before the restore")
-
-// errMergeCommitted refuses a Delete while a merge is written but not
-// finished: its pending retired record is in the data root.
-var errMergeCommitted = errors.New("a floor merge is written but not finished (keystore-floor.json.pre-restore.retired, its record, is in the data root): run sudo k3sm keys floor merge again first, which finishes it without planning it again; nothing is deleted until then")
 
 // errGuardNoFloor refuses a Delete while a restore is unfinished and the
 // live floor is absent.

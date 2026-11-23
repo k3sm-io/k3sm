@@ -52,18 +52,43 @@ const (
 // retiredRecord is the retired record's content, the merge's commit
 // marker: the sha256 of the merge input (the guard file's bytes), of the
 // live floor's bytes the merge read (Base), and of the floor bytes it writes
-// (Floor, Base again when it changes nothing), and what it committed. Each set is
-// sorted, without repeats (Dropped, one name per burial dropped, may
-// repeat), every name a valid entry name.
+// (Floor, Base again when it changes nothing), those two floors themselves
+// (Read and Written, each the floor file without its trailing newline), so
+// a rerun can compare the live floor with them structurally, and what it
+// committed. Each set is sorted, without repeats (Dropped, one name per
+// burial dropped, may repeat), every name a valid entry name.
 type retiredRecord struct {
-	Input      string   `json:"input"`
-	Base       string   `json:"base"`
-	Floor      string   `json:"floor"`
-	Retired    []string `json:"retired"`
-	BuriedLive []string `json:"buriedLive"`
-	Kept       []string `json:"kept"`
-	Recorded   []string `json:"recorded"`
-	Dropped    []string `json:"dropped"`
+	Input      string          `json:"input"`
+	Base       string          `json:"base"`
+	Floor      string          `json:"floor"`
+	Read       json.RawMessage `json:"read"`
+	Written    json.RawMessage `json:"written"`
+	Retired    []string        `json:"retired"`
+	BuriedLive []string        `json:"buriedLive"`
+	Kept       []string        `json:"kept"`
+	Recorded   []string        `json:"recorded"`
+	Dropped    []string        `json:"dropped"`
+}
+
+// retiredSizeLimit bounds a retired record: the two floors it holds and its
+// sets, each no larger than a floor.
+func retiredSizeLimit() int { return 8 * floorSizeLimit }
+
+// setFloors sets rec's Base and Read from read, and its Floor and Written
+// from written, both floor files as marshalFloor writes them.
+func (rec *retiredRecord) setFloors(read, written []byte) {
+	rec.Base, rec.Read = sha256Hex(read), json.RawMessage(bytes.TrimSuffix(read, []byte("\n")))
+	rec.Floor, rec.Written = sha256Hex(written), json.RawMessage(bytes.TrimSuffix(written, []byte("\n")))
+}
+
+// recordFloor parses one of rec's floors, raw, and checks it is the floor
+// file whose sha256 is sum.
+func recordFloor(raw json.RawMessage, sum string) (floor, error) {
+	b := append(slices.Clip([]byte(raw)), '\n')
+	if sha256Hex(b) != sum {
+		return nil, errors.New("does not match its sha256")
+	}
+	return parseFloor(b)
 }
 
 // sha256Hex is the lowercase hex sha256 of b.
@@ -87,7 +112,7 @@ func isSHA256Hex(s string) bool {
 
 // unionRecord is rec with add's sets unioned in: the record a rerun writes
 // when it has to write one, so it never loses what the first run recorded.
-// Input and Floor stay rec's.
+// Input and the floors stay rec's.
 func unionRecord(rec, add retiredRecord) retiredRecord {
 	out := rec
 	out.Retired = unionNames(rec.Retired, add.Retired)
@@ -157,6 +182,12 @@ func parseRetired(b []byte) (retiredRecord, error) {
 	if !isSHA256Hex(rec.Input) || !isSHA256Hex(rec.Base) || !isSHA256Hex(rec.Floor) {
 		return retiredRecord{}, fmt.Errorf("%w: the retired record's input, base and floor are not lowercase hex sha256 digests", ErrCorrupt)
 	}
+	if _, err := recordFloor(rec.Read, rec.Base); err != nil {
+		return retiredRecord{}, fmt.Errorf("%w: the retired record's floor read: %w", ErrCorrupt, err)
+	}
+	if _, err := recordFloor(rec.Written, rec.Floor); err != nil {
+		return retiredRecord{}, fmt.Errorf("%w: the retired record's floor written: %w", ErrCorrupt, err)
+	}
 	for k, set := range [][]string{rec.Retired, rec.BuriedLive, rec.Kept, rec.Recorded, rec.Dropped} {
 		repeats := k == 4
 		for i, n := range set {
@@ -181,12 +212,15 @@ func (s *FileStore) writeRetiredPending(l *floorLock, rec retiredRecord) error {
 	if err != nil {
 		return err
 	}
+	if len(b) > retiredSizeLimit() {
+		return fmt.Errorf("the record would be %d bytes, over %d", len(b), retiredSizeLimit())
+	}
 	return s.writeFileAs(l.root, retiredPendingName, b, uint32(s.floorUID), uint32(s.floorGID), floorFileMode)
 }
 
 // readRetiredFile reads the retired record name through l.root, judged as
 // the floor is: a regular file, never followed, owned by root (floorUID),
-// not group- or other-writable, at most floorSizeLimit, and in its one
+// not group- or other-writable, at most retiredSizeLimit, and in its one
 // encoding.
 func (s *FileStore) readRetiredFile(l *floorLock, name string) (retiredRecord, error) {
 	named, err := l.root.Lstat(name)
@@ -196,7 +230,7 @@ func (s *FileStore) readRetiredFile(l *floorLock, name string) (retiredRecord, e
 	if !named.Mode().IsRegular() {
 		return retiredRecord{}, fmt.Errorf("%w: %s has mode %s", errFloorUntrusted, name, named.Mode())
 	}
-	b, fi, err := readFile(l.root, name, int64(floorSizeLimit))
+	b, fi, err := readFile(l.root, name, int64(retiredSizeLimit()))
 	if errors.Is(err, errBadFile) {
 		return retiredRecord{}, fmt.Errorf("%w: %s: %w", errFloorUntrusted, name, err)
 	}

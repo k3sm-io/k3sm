@@ -399,22 +399,53 @@ func TestFloorMergeRemovesBuriedLiveStaged(t *testing.T) {
 	}
 }
 
+// emptyFloors is rec with the empty floor as both the floor read and the
+// floor written.
+func emptyFloors(t testing.TB, rec retiredRecord) retiredRecord {
+	t.Helper()
+	b, err := marshalFloor(floor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.setFloors(b, b)
+	return rec
+}
+
 // TestParseRetired (U192): the retired record parses only in the one
-// encoding a merge writes.
+// encoding a merge writes, its floors each the floor file its sha256 names.
 func TestParseRetired(t *testing.T) {
 	sum := sha256Hex(nil)
-	good, err := marshalRetired(retiredRecord{Input: sum, Base: sum, Floor: sum, Retired: []string{"a", "b"}, Dropped: []string{"d", "d"}})
+	good, err := marshalRetired(emptyFloors(t, retiredRecord{Input: sum, Retired: []string{"a", "b"}, Dropped: []string{"d", "d"}}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rec, err := parseRetired(good); err != nil || len(rec.Retired) != 2 || len(rec.BuriedLive) != 0 || len(rec.Dropped) != 2 {
 		t.Fatalf("parseRetired(%s) = %+v, %v; want a and b retired and d dropped twice", good, rec, err)
 	}
+	otherFloor := func(written bool) retiredRecord {
+		rec := emptyFloors(t, retiredRecord{Input: sum})
+		b, err := marshalFloor(floor{"a": {Generation: mgen(1), Seq: 1}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if written {
+			rec.Written = bytes.TrimSuffix(b, []byte("\n"))
+		} else {
+			rec.Read = bytes.TrimSuffix(b, []byte("\n"))
+		}
+		return rec
+	}
+	notFloor := emptyFloors(t, retiredRecord{Input: sum})
+	notFloor.Written, notFloor.Floor = []byte(`{}`), sha256Hex([]byte("{}\n"))
 	for _, bad := range []retiredRecord{
-		{Input: "", Base: sum, Floor: sum},
-		{Input: strings.ToUpper(sum), Base: sum, Floor: sum},
-		{Input: sum, Base: sum, Floor: sum, Kept: []string{"a", "a"}},
-		{Input: sum, Base: sum, Floor: sum, Dropped: []string{"b", "a"}},
+		emptyFloors(t, retiredRecord{Input: ""}),
+		emptyFloors(t, retiredRecord{Input: strings.ToUpper(sum)}),
+		emptyFloors(t, retiredRecord{Input: sum, Kept: []string{"a", "a"}}),
+		emptyFloors(t, retiredRecord{Input: sum, Dropped: []string{"b", "a"}}),
+		{Input: sum, Base: sum, Floor: sum},
+		otherFloor(false),
+		otherFloor(true),
+		notFloor,
 	} {
 		b, err := marshalRetired(bad)
 		if err != nil {

@@ -387,8 +387,10 @@ written, but the restored copy was not moved into place or the file was not rena
 command again. The second run never works the merge out again: it checks that the floor is the one
 the first run recorded writing in `keystore-floor.json.pre-restore.retired`, writes nothing more,
 prints `already merged` with the first run's report, moves the restored copy if it is still staged
-and renames the file. If the floor changed since, it refuses and says so. Until that second run,
-`k3sm keys rm` refuses: run the merge again first. The merge takes no file name: it reads only `/var/lib/k3sm/keystore-floor.json.pre-restore`,
+and renames the file. `k3sm keys rm` still works before that second run: the second run accepts
+the floor the first run wrote plus the deletions `rm` recorded since, keeps them, and removes the
+restored files of each entry deleted. If the floor changed in any other way, it refuses, says so
+and exits 5. The merge takes no file name: it reads only `/var/lib/k3sm/keystore-floor.json.pre-restore`,
 the floor the steps above moved aside, so it never reads the floor saved with the backup or any
 other copy. It refuses, and changes nothing, if that file is missing, if the restored
 `keystore-floor.json` is not in place yet (put it back with `install` first), if the file is

@@ -184,8 +184,8 @@ func TestFloorMergePointerOnlyRefusalNotCommitted(t *testing.T) {
 
 // TestFloorMergeRerunKeepsRetiredSets (U192): an rm under the guard before
 // the merge is merged; once the merge is written (its tree move failed) an
-// rm is refused until a rerun finishes it, and the rerun keeps the first
-// run's retired sets in the record renamed with the input.
+// rm still succeeds, and the rerun keeps its burial, writes no floor and
+// keeps the first run's retired sets in the record renamed with the input.
 func TestFloorMergeRerunKeepsRetiredSets(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
@@ -207,12 +207,12 @@ func TestFloorMergeRerunKeepsRetiredSets(t *testing.T) {
 	if rec := readRecordFile(t, s, retiredPendingName); !slices.Equal(rec.Retired, []string{"late"}) {
 		t.Fatalf("the pending record = %+v, want late retired", rec)
 	}
+	if err := s.Delete(ctx, "third"); err != nil {
+		t.Fatalf("Delete with the merge written but not finished: %v, want it to succeed", err)
+	}
 	written, err := os.ReadFile(floorPath(server))
 	if err != nil {
 		t.Fatal(err)
-	}
-	if err := s.Delete(ctx, "third"); !errors.Is(err, errMergeCommitted) {
-		t.Fatalf("Delete with the merge written but not finished: %v, want errMergeCommitted", err)
 	}
 	r, err = s.MergeFloor(ctx, MergeOptions{})
 	if err != nil || !r.AlreadyMerged || !slices.Equal(r.Retired, []string{"late"}) {
@@ -268,7 +268,7 @@ func TestFloorMergeUndoRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	write := func(at int, input string, retired ...string) {
-		b, err := marshalRetired(retiredRecord{Input: input, Base: sha256Hex(nil), Floor: sha256Hex(nil), Retired: retired})
+		b, err := marshalRetired(emptyFloors(t, retiredRecord{Input: input, Retired: retired}))
 		if err != nil {
 			t.Fatal(err)
 		}
