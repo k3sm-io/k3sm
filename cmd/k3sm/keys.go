@@ -1107,7 +1107,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		// Written, but the input was not renamed or the tree not moved: the
 		// report above stands, drops included, and a rerun finishes it. A
 		// dry run that finds an earlier run's floor written exits so too.
-		return v.failf(keysNotRenamed, "%v", err)
+		return v.failf(keysNotRenamed, "%v; to recover, fix what this names, leave keystore-floor.json and keystore-floor.json.pre-restore as they are, and run sudo k3sm keys floor merge again: it never plans the written merge again, only finishes the steps after the floor write (docs/user/keys.md)", err)
 	}
 	// Done, but what the floor refuses changed in a way to read: a drop, a
 	// kept entry or an unverified one. A dry run exits as the merge would.
