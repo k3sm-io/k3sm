@@ -76,8 +76,8 @@ const keysUsage = `Usage:
   sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run] [--undo]
         after a restore, before k3sm start: merge every deleted generation
         the floor you moved aside to keystore-floor.json.pre-restore in the
-        data root records (the only file it reads) into the restored floor, so keys revoked since the backup stay
-        refused. A restored entry deleted since the backup is deleted again
+        data root records (the only file it reads) into the restored floor, so system-store keys revoked since the
+        backup stay refused (user-scope deletions are not carried over yet). A restored entry deleted since the backup is deleted again
         (buried live); --keep, repeatable, keeps that entry's restored
         version live instead, for an entry you are restoring on purpose.
         Until it runs, put, rotate and rewrap refuse; once written, the
@@ -1096,6 +1096,9 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	}
 	for _, name := range r.Dropped {
 		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
+	}
+	if r.UserScoped {
+		fmt.Fprintln(env.stdout, "user scope: the restored keystore holds user-scope entries, and the floor this merge writes is the system store's: user-scope deletions since the backup are not carried over until the user-scope floor lands, so a user/<uid>/ entry deleted since the backup is back")
 	}
 	if *dryRun && err != nil && !keystore.Committed(err) {
 		return v.failf(keysRefused, "%v", err)

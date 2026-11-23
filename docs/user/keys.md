@@ -407,9 +407,12 @@ moves the restored copy into place with a rename, which cannot cross volumes, so
 `pre-restore.d` in `/var/lib/k3sm` as the steps above do. `rm` also refuses until the
 restored `keystore-floor.json` is in place.
 
-The merge keeps every key revoked since the backup refused: a key created after the backup, every
-older version of a name deleted more than once, and an entry the backup holds that you deleted
-since. That last kind is restored and then deleted again by the merge, because a deletion since
+The merge keeps every system-store key revoked since the backup refused: a key created after the
+backup, every older version of a name deleted more than once, and an entry the backup holds that
+you deleted since. User-scope entries (`user/<uid>/...`) have no floor the merge reads yet, so a
+user-scope deletion since the backup is not carried over: such an entry comes back with the
+restore, and when the restored keystore holds user-scope entries the merge prints a `user scope`
+line saying so. That last kind is restored and then deleted again by the merge, because a deletion since
 the backup may have revoked the key. To bring back an entry you deleted by mistake, which is the
 reason to restore, name it with `--keep`, once for each entry:
 

@@ -420,6 +420,31 @@ func scopeDirName(n string) bool {
 	return err == nil && strconv.FormatUint(u, 10) == n && u >= minScopeUID && u <= maxScopeUID
 }
 
+// holdsUserScopes reports whether the staged tree holds a user scope's
+// directory under .user: user-scope entries, which the system floor the
+// merge writes does not record. It reads after checkStaged, which judged
+// the tree's shape.
+func (st *mergeStaging) holdsUserScopes() (bool, error) {
+	tree, err := st.tree(stagedTreeName)
+	if err != nil || tree == nil {
+		return false, err
+	}
+	defer func() { _ = tree.Close() }() // read-only
+	d, err := tree.Open(userScopesName)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = d.Close() }() // read-only
+	names, err := d.Readdirnames(1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	return len(names) > 0, nil
+}
+
 // checkStaged walks pre-restore.d/restored read-only and refuses it
 // (ErrCorrupt, naming the path inside the tree) unless every node is one the
 // keystore writes, in the shape it writes it (judgeStaged), and the tree

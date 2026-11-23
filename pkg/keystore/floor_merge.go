@@ -146,6 +146,10 @@ type MergeReport struct {
 	// pointer was more than one sequence above the restored record, so the
 	// merge did not raise to it (also in Unverified).
 	overRaise []string
+	// UserScoped is set when the staged tree holds user-scope entries
+	// (.user): the floor is the system store's, so a user-scope deletion
+	// since the backup is not carried over by the merge.
+	UserScoped bool
 	// renumbered is set when the merge renumbered guard-era burials back
 	// below guardEraSeq, which is a change to write.
 	renumbered bool
@@ -357,13 +361,19 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	}
 	// The staged tree's shape is judged read-only before anything is read
 	// from it or planned, so a dry run refuses what the merge refuses.
+	userScoped := false
 	if st.staged {
 		if err := s.checkStaged(ctx, st); err != nil {
 			return r, finish(err)
 		}
+		if userScoped, err = st.holdsUserScopes(); err != nil {
+			return r, finish(err)
+		}
 	}
 	if rerun {
-		return s.finishRerun(ctx, st, in, live, *pending, gone, opts.DryRun, moveAside)
+		r, err := s.finishRerun(ctx, st, in, live, *pending, gone, opts.DryRun, moveAside)
+		r.UserScoped = userScoped
+		return r, err
 	}
 	// A keep of a name rm deleted after the restore would bring back what
 	// the operator revoked under the guard.
@@ -378,6 +388,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	// the live floor already holds writes nothing to the floor.
 	plan := planMerge(live, from, kept, ptrs, aside)
 	pr := plan.r
+	pr.UserScoped = userScoped
 	if unmatched := unmatchedKeep(kept, pr.Kept); len(unmatched) > 0 {
 		return MergeReport{}, fmt.Errorf("--keep names %s, which the merge would not delete: it keeps an entry only when the floor moved aside records its restored generation as deleted, or holds a newer generation of a name the restored floor does not record. Nothing is written; check the names and run the merge again without them", strings.Join(unmatched, ", "))
 	}

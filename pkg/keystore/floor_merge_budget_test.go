@@ -61,3 +61,21 @@ func TestFloorMergeStagedNodeBudget(t *testing.T) {
 		t.Fatal("the refused merge cleared the guard")
 	}
 }
+
+// TestStagedHoldsUserScopes (U192): the merge reports a staged tree that
+// holds a user scope's directory under .user, whose deletions since the
+// backup the system floor does not carry over, and not one without.
+func TestStagedHoldsUserScopes(t *testing.T) {
+	s, server := newTestStore(t)
+	stageRecipe(t, s, server, 0)
+	st := openTestStaging(t, s)
+	if got, err := st.holdsUserScopes(); err != nil || got {
+		t.Fatalf("holdsUserScopes without .user = %v, %v; want false", got, err)
+	}
+	if err := os.MkdirAll(stagePath(s, stagedTreeName, userScopesName, "501"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.holdsUserScopes(); err != nil || !got {
+		t.Fatalf("holdsUserScopes with .user/501 = %v, %v; want true", got, err)
+	}
+}
