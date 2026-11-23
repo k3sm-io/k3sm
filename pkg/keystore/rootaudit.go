@@ -19,6 +19,9 @@ package keystore
 import (
 	"context"
 	"errors"
+	"fmt"
+
+	"golang.org/x/sys/unix"
 )
 
 // auditViaRoot is a root verb's via (docs/design/keystore.md § "The audit
@@ -37,7 +40,9 @@ const auditViaRoot = "root"
 // that the system scope works as in Phase A and AuditRoot writes nothing
 // and returns nil. A log that is missing while user scopes exist, or one
 // the check refuses (flag clear, not the service user's), is an error: the
-// verb has run, and the caller reports that its line was not written.
+// verb has run, and the caller reports that its line was not written. So is
+// a missing log while the maintenance marker stands: a rotate stopped
+// part-way, and its rerun finishes it.
 func (s *FileStore) AuditRoot(ctx context.Context, op, name, result string) error {
 	if err := s.checkConfig(); err != nil {
 		return err
@@ -58,9 +63,36 @@ func (s *FileStore) AuditRoot(ctx context.Context, op, name, result string) erro
 	defer done()
 	err = s.auditSink.append(auditLine{op: op, via: auditViaRoot, scope: scopeSystem, name: name, result: result})
 	if errors.Is(err, errLogMissing) && !errors.Is(err, errLogMissingScopes) {
+		if marked, merr := s.maintenanceMarked(); merr != nil || marked {
+			return fmt.Errorf("%w: %w", errAuditMissingInMaintenance, err)
+		}
 		return nil
 	}
 	return err
+}
+
+// errAuditMissingInMaintenance is AuditRoot's refusal to skip a missing
+// audit log while the maintenance marker stands: an audit --rotate stopped
+// after it moved the old log to .1, and its rerun writes the new one.
+var errAuditMissingInMaintenance = errors.New("the audit log is missing while keystore-maintenance exists, so a maintenance verb stopped part-way: rerun sudo k3sm keys audit --rotate")
+
+// maintenanceMarked reports whether anything stands at the maintenance
+// marker's name in the judged data root.
+func (s *FileStore) maintenanceMarked() (bool, error) {
+	dfd, err := s.openLogDataRoot()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = unix.Close(dfd) }() // read-only
+	var st unix.Stat_t
+	err = unix.Fstatat(dfd, maintenanceMarkerName, &st, unix.AT_SYMLINK_NOFOLLOW)
+	if errors.Is(err, unix.ENOENT) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", maintenanceMarkerName, err)
+	}
+	return true, nil
 }
 
 // auditWord reports whether w is a non-empty word of lowercase letters and

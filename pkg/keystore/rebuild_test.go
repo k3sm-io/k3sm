@@ -37,14 +37,32 @@ type attrRecorder struct {
 	flagged bool
 }
 
-func (r *attrRecorder) Fchown(_, uid, _ int) error {
+func (r *attrRecorder) Fchown(fd, uid, gid int) error {
 	r.calls = append(r.calls, fmt.Sprintf("fchown %d", uid))
-	return nil
+	return ownAsRoot(fd, uid, gid)
 }
 
-func (r *attrRecorder) Fchmod(_ int, mode uint32) error {
+func (r *attrRecorder) Fchmod(fd int, mode uint32) error {
 	r.calls = append(r.calls, fmt.Sprintf("fchmod %o", mode))
-	return nil
+	return modeAsRoot(fd, mode)
+}
+
+// ownAsRoot applies a recorded fchown when the test runs as root, so a
+// rebuilt log is the service user's as the verb leaves it (R1); a non-root
+// test owns every file already and changes nothing.
+func ownAsRoot(fd, uid, gid int) error {
+	if !asRoot() {
+		return nil
+	}
+	return syscall.Fchown(fd, uid, gid)
+}
+
+// modeAsRoot is ownAsRoot for fchmod.
+func modeAsRoot(fd int, mode uint32) error {
+	if !asRoot() {
+		return nil
+	}
+	return syscall.Fchmod(fd, mode)
 }
 
 func (r *attrRecorder) Fchflags(_, flags int) error {
@@ -66,10 +84,10 @@ func rebuild(t *testing.T, s *FileStore) (RebuildReport, *attrRecorder) {
 }
 
 // assertNoMaintenanceLeft checks that a run left neither the marker nor the
-// staging file.
+// staging directory.
 func assertNoMaintenanceLeft(t *testing.T, s *FileStore) {
 	t.Helper()
-	for _, n := range []string{maintenanceMarkerName, floorStagingName} {
+	for _, n := range []string{maintenanceMarkerName, stagingDirName} {
 		if _, err := os.Lstat(filepath.Join(s.dataRoot, n)); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("%s left behind: %v", n, err)
 		}
@@ -333,6 +351,8 @@ func TestBackupRestoreRoundTripRebuild(t *testing.T) {
 	if err := os.WriteFile(p, floor, logMode); err != nil {
 		t.Fatal(err)
 	}
+	// Restored as the service user's, so the flag is what refuses it.
+	giveToService(t, p)
 	rec := &attrRecorder{}
 	s.logFlags = func(*os.File) (uint32, error) {
 		if rec.flagged {

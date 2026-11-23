@@ -246,7 +246,7 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	if got := rec.calls[keysIno(t, name(0))]; !slices.Equal(got, []string{"fchown", "fchmod 600", flagged, "fchown"}) {
 		t.Errorf("the new log saw %q, want root's 0600, the flag, then the service user", got)
 	}
-	for _, n := range []string{"keystore-maintenance", keystore.AuditLogName + ".new"} {
+	for _, n := range []string{"keystore-maintenance", "keystore-staging"} {
 		if _, err := os.Lstat(filepath.Join(root, n)); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("%s left behind: %v", n, err)
 		}
@@ -278,7 +278,7 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	if !slices.Equal(lines, []string{"audit-rotate  refused"}) {
 		t.Errorf("refused audit --rotate audit lines %q", lines)
 	}
-	for _, n := range []string{"keystore-maintenance", keystore.AuditLogName + ".new"} {
+	for _, n := range []string{"keystore-maintenance", "keystore-staging"} {
 		if _, err := os.Lstat(filepath.Join(root, n)); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("a refused rotate left %s: %v", n, err)
 		}

@@ -38,7 +38,8 @@ var errScopeHasDeliveries = errors.New("the scope's delivery record names delive
 // lockMaintenance) it opens the
 // scope's key under W without the GeneratedUID check and reads its delivery
 // record, refusing while the record names any delivery, then removes
-// .user/<uid>/ by descriptor (removeScopeTree). The scope's K_u goes with
+// .user/<uid>/ by descriptor (removeScopeTree), walking from the keystore
+// root it opened and judged first, never from the path again. The scope's K_u goes with
 // scope.key, so the next floor --rebuild drops every floor key of the
 // scope. A scope whose entries/ and delivery record are both gone is an
 // earlier rm-scope that stopped part-way, and is finished.
@@ -81,10 +82,12 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) error {
 	default:
 		return fmt.Errorf("read the delivery record of %s: %w; nothing was changed", u.scope, derr)
 	}
-	return removeScopeTree(s.dir, strconv.FormatUint(uint64(uid), 10))
+	return removeScopeTree(root, strconv.FormatUint(uint64(uid), 10))
 }
 
-// removeScopeTree removes keystore/.user/<uid>/ by descriptor: each step is
+// removeScopeTree removes keystore/.user/<uid>/ by descriptor, starting
+// from keystore, the already-judged keystore root, so a directory swapped in
+// at the keystore's path since it was judged is never walked: each step is
 // openat relative to its parent with O_NOFOLLOW (and O_DIRECTORY), re-checked
 // with fstat against the parent's fstatat of the name (SameFile), each
 // removal is unlinkat relative to its parent, and each listing is bounded.
@@ -93,13 +96,13 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) error {
 // the tree twice: once to judge it, changing nothing, and once to remove
 // it, judging each step again. The entries come first, then every file but
 // scope.key, then scope.key, then the directory.
-func removeScopeTree(keystoreDir, uid string) error {
-	kfd, err := unix.Open(keystoreDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+func removeScopeTree(keystore *os.Root, uid string) error {
+	kd, err := keystore.Open(".")
 	if err != nil {
 		return fmt.Errorf("open the keystore directory: %w", err)
 	}
-	defer func() { _ = unix.Close(kfd) }() // read-only
-	ufd, _, err := openDirAt(kfd, userScopesName)
+	defer func() { _ = kd.Close() }() // read-only
+	ufd, _, err := openDirAt(int(kd.Fd()), userScopesName)
 	if err != nil {
 		return err
 	}

@@ -44,7 +44,7 @@ import (
 const keysSFAppend = 0x00040000
 
 // keysMaintVerb is one maintenance verb: its arguments, the log it swaps
-// and its staging name.
+// and its staging file, in the root-only staging directory.
 type keysMaintVerb struct {
 	name    string
 	args    []string
@@ -53,12 +53,16 @@ type keysMaintVerb struct {
 }
 
 var keysMaintVerbs = []keysMaintVerb{
-	{"floor-rebuild", []string{"floor", "--rebuild"}, keystore.UserFloorLogName, keystore.UserFloorLogName + ".new"},
-	{"audit-rotate", []string{"audit", "--rotate"}, keystore.AuditLogName, keystore.AuditLogName + ".new"},
+	{"floor-rebuild", []string{"floor", "--rebuild"}, keystore.UserFloorLogName, keysStagingDir + "/" + keystore.UserFloorLogName + ".new"},
+	{"audit-rotate", []string{"audit", "--rotate"}, keystore.AuditLogName, keysStagingDir + "/" + keystore.AuditLogName + ".new"},
 }
 
-// keysMarkerName is the maintenance marker in the data root.
-const keysMarkerName = "keystore-maintenance"
+// keysMarkerName is the maintenance marker in the data root, and
+// keysStagingDir the verbs' root-only staging directory there.
+const (
+	keysMarkerName = keystore.MaintenanceMarkerName
+	keysStagingDir = "keystore-staging"
+)
 
 // keysRootMaint is a root-run maintenance fixture: a harness whose store
 // has an entry, its data root root's 0755 as deployed, both logs the
@@ -194,16 +198,23 @@ func keysState(t *testing.T, p string) keysFileState {
 	return s
 }
 
-// nameOf is the data-root name whose inode is ino, or "".
+// nameOf is the name, in the data root or as keystore-staging/<name> in
+// the staging directory, whose inode is ino, or "".
 func (m *keysRootMaint) nameOf(ino uint64) string {
-	names, err := os.ReadDir(m.root)
-	if err != nil {
-		m.t.Fatal(err)
-	}
-	for _, d := range names {
-		var st unix.Stat_t
-		if unix.Lstat(filepath.Join(m.root, d.Name()), &st) == nil && st.Ino == ino {
-			return d.Name()
+	for _, dir := range []string{"", keysStagingDir} {
+		names, err := os.ReadDir(filepath.Join(m.root, dir))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			m.t.Fatal(err)
+		}
+		for _, d := range names {
+			n := filepath.Join(dir, d.Name())
+			var st unix.Stat_t
+			if unix.Lstat(filepath.Join(m.root, n), &st) == nil && st.Ino == ino {
+				return n
+			}
 		}
 	}
 	return ""
@@ -299,9 +310,11 @@ func (p *keysProbeAttrs) eventsOf(ino uint64) []keysAttrEvent {
 
 // TestMaintenanceRefusesPlantedSymlinkAndSwap is U68, root-run: floor
 // --rebuild and audit --rotate each refuse a symlink planted at the marker,
-// at the staging name or at the old log, a FIFO or a second hard link at
-// the old log, and the old log swapped for another file while the verb
-// holds it; audit --rotate also refuses a symlink at an archive. A refusal
+// at the staging directory or at the old log, a FIFO at the old log, and
+// the old log swapped for another file while the verb holds it; audit
+// --rotate also refuses a symlink at an archive. A second hard link at the
+// old log is no refusal: the verb repairs it (pkg/keystore's
+// TestMaintenanceRepairsHardLinkedLog). A refusal
 // follows no planted name and changes no byte, owner or flag of either log
 // (the audit log gains only the verb's own refused line), and leaves no
 // marker or staging file of its own.
@@ -333,7 +346,7 @@ func TestMaintenanceRefusesPlantedSymlinkAndSwap(t *testing.T) {
 	}
 	plants := []plant{
 		{name: "marker symlink", at: symlinkAt(func(keysMaintVerb) string { return keysMarkerName })},
-		{name: "staging symlink", at: symlinkAt(func(v keysMaintVerb) string { return v.staging })},
+		{name: "staging directory symlink", at: symlinkAt(func(keysMaintVerb) string { return keysStagingDir })},
 		{name: "old log symlink", at: symlinkAt(func(v keysMaintVerb) string { return v.log })},
 		{name: "old log FIFO", at: func(m *keysRootMaint, v keysMaintVerb, _ string) string {
 			m.moveAside(v.log)
@@ -341,15 +354,6 @@ func TestMaintenanceRefusesPlantedSymlinkAndSwap(t *testing.T) {
 				m.t.Fatal(err)
 			}
 			return v.log
-		}},
-		{name: "old log hard link", at: func(m *keysRootMaint, v keysMaintVerb, _ string) string {
-			p := filepath.Join(m.root, v.log)
-			m.withFlagCleared(p, func() {
-				if err := os.Link(p, filepath.Join(m.root, "keystore-planted-link")); err != nil {
-					m.t.Fatal(err)
-				}
-			})
-			return ""
 		}},
 		{name: "old log swapped mid-run", midRun: true},
 		{name: "archive symlink", rotateOnly: true, at: func(m *keysRootMaint, _ keysMaintVerb, decoy string) string {
@@ -412,7 +416,7 @@ func TestMaintenanceRefusesPlantedSymlinkAndSwap(t *testing.T) {
 				if got := keysState(t, decoy); got != decoyBefore {
 					t.Errorf("%s: the decoy a planted name points at changed: %+v, was %+v", pl.name, got, decoyBefore)
 				}
-				for _, n := range []string{keysMarkerName, v.staging} {
+				for _, n := range []string{keysMarkerName, keysStagingDir} {
 					p := filepath.Join(m.root, n)
 					if n == planted {
 						if got := keysState(t, p); got != plantedBefore {
@@ -514,10 +518,14 @@ func TestMaintenanceHandsOverOnlyAfterFlag(t *testing.T) {
 					return nil
 				}
 				// A root-owned file the verb is handling: the service user
-				// opens it neither to read nor to write.
+				// opens it neither to read nor to write. The mode refuses
+				// with EACCES; once the file is flagged a write-open is
+				// refused by the flag first, with EPERM (K0 leg 1).
 				for _, flag := range []int{unix.O_RDONLY, unix.O_WRONLY} {
-					if err := m.serviceOpen(n, flag); !errors.Is(err, unix.EACCES) {
-						t.Errorf("before %s(%#x) the service user's open of %s (flags %#x): %v, want EACCES", e.call, e.arg, n, flag, err)
+					err := m.serviceOpen(n, flag)
+					ok := errors.Is(err, unix.EACCES) || (flag != unix.O_RDONLY && e.flags&keysSFAppend != 0 && errors.Is(err, unix.EPERM))
+					if !ok {
+						t.Errorf("before %s(%#x) the service user's open of %s (flags %#x, file flags %#x): %v, want EACCES, or EPERM for a write-open of a flagged file", e.call, e.arg, n, flag, e.flags, err)
 					}
 				}
 				return nil
@@ -628,10 +636,14 @@ func TestMaintenanceHandsOverOnlyAfterFlag(t *testing.T) {
 // TestMaintenanceOldFileRootOwnedWhileUnflagged is U118, root-run: in
 // floor --rebuild and audit --rotate the step that clears the old log's
 // flag, and each archive's that rotate shifts, also makes it root's 0600 on
-// the verb's descriptor, with no other call between; while it is unflagged
-// the service user's open(O_WRONLY|O_TRUNC) of it gets EACCES and changes
-// no byte, though the service user opens a file of its own there; and
-// every archive ends root's 0600 and flagged.
+// the verb's descriptor, with no other call between. Before each attribute
+// call, on any file, and after the verb returns, the service user's
+// open(O_WRONLY|O_TRUNC) of each changes no byte: EACCES while it is
+// unflagged and root's 0600, EACCES or EPERM while the flag stands (the
+// flag refuses a truncating open with EPERM, K0 leg 1). The point between
+// the clear and the chown is residual 12's and is not probed: the flag
+// refuses root's chown, so the clear comes first. Every archive is root's
+// 0600 before rotate and ends root's 0600 and flagged.
 func TestMaintenanceOldFileRootOwnedWhileUnflagged(t *testing.T) {
 	if !keysAsRoot() {
 		t.Skip("root-run (U118): run as root through hack/acceptance/keystore.sh --root")
@@ -647,45 +659,58 @@ func TestMaintenanceOldFileRootOwnedWhileUnflagged(t *testing.T) {
 			}
 			watched := map[uint64]string{keysState(t, filepath.Join(m.root, v.log)).ino: "the old " + v.log}
 			if v.log == keystore.AuditLogName {
-				// .1 and .3 root's, as rotate leaves them; .2 the service
-				// user's, which the shift must make root's.
+				// Archives are root's 0600 and flagged, as rotate leaves them.
 				for n := 1; n <= 3; n++ {
 					name := fmt.Sprintf("%s.%d", keystore.AuditLogName, n)
-					m.placeLog(name, fmt.Sprintf("archive %d\n", n), n == 2, true)
+					m.placeLog(name, fmt.Sprintf("archive %d\n", n), false, true)
 					watched[keysState(t, filepath.Join(m.root, name)).ino] = name
 				}
 			}
-			probed := map[uint64]bool{}
+			unflaggedProbed := map[uint64]bool{}
+			probeAll := func(at string) {
+				for ino, what := range watched {
+					n := m.nameOf(ino)
+					if n == "" {
+						continue
+					}
+					p := filepath.Join(m.root, n)
+					before := keysState(t, p)
+					if before.flags&keysSFAppend == 0 && before.uid != 0 {
+						continue // residual 12: between the clear and the chown
+					}
+					err := m.serviceOpen(n, unix.O_WRONLY|unix.O_TRUNC)
+					switch {
+					case before.flags&keysSFAppend == 0 && !errors.Is(err, unix.EACCES):
+						t.Errorf("%s: the service user's O_WRONLY|O_TRUNC open of %s while unflagged (uid %d mode %04o): %v, want EACCES", at, what, before.uid, before.mode, err)
+					case before.flags&keysSFAppend != 0 && !errors.Is(err, unix.EACCES) && !errors.Is(err, unix.EPERM):
+						t.Errorf("%s: the service user's O_WRONLY|O_TRUNC open of %s while flagged: %v, want EACCES or EPERM", at, what, err)
+					}
+					if before.flags&keysSFAppend == 0 {
+						unflaggedProbed[ino] = true
+					}
+					if after := keysState(t, p); after.data != before.data {
+						t.Errorf("%s: the service user's open changed %s: %q, was %q", at, what, after.data, before.data)
+					}
+				}
+			}
 			p := &keysProbeAttrs{t: t}
 			p.before = func(e keysAttrEvent) error {
-				what, ok := watched[e.ino]
-				if !ok || e.flags != 0 || e.uid != 0 || e.mode != 0o600 {
-					return nil
-				}
-				// Unflagged and root's 0600: the moment the design guards.
-				n := m.nameOf(e.ino)
-				before := keysState(t, filepath.Join(m.root, n))
-				if err := m.serviceOpen(n, unix.O_WRONLY|unix.O_TRUNC); !errors.Is(err, unix.EACCES) {
-					t.Errorf("the service user's O_WRONLY|O_TRUNC open of %s while unflagged: %v, want EACCES", what, err)
-				}
-				if after := keysState(t, filepath.Join(m.root, n)); after.data != before.data {
-					t.Errorf("the service user's open changed %s: %q, was %q", what, after.data, before.data)
-				}
-				probed[e.ino] = true
+				probeAll(fmt.Sprintf("before %s(%#x)", e.call, e.arg))
 				return nil
 			}
 			m.h.attrs = p
 			m.h.mustRun(keysOK, v.args...)
+			probeAll("after the verb")
 			for ino, what := range watched {
 				evs := p.eventsOf(ino)
 				if len(evs) < 3 {
-					t.Errorf("%s saw %+v, want its flag clear, chown and chmod", what, evs)
+					t.Errorf("%s saw %+v, want its chown, chmod and flag clear", what, evs)
 					continue
 				}
 				if evs[0].call != "fchflags" || evs[0].arg != 0 || evs[1].call != "fchown" || evs[1].arg != 0 || evs[2].call != "fchmod" || evs[2].arg != 0o600 {
 					t.Errorf("%s's first calls are %+v, want the flag clear, then root's ownership and 0600", what, evs[:3])
 				}
-				if !probed[ino] {
+				if !unflaggedProbed[ino] {
 					t.Errorf("%s was never probed while unflagged", what)
 				}
 			}
@@ -693,7 +718,7 @@ func TestMaintenanceOldFileRootOwnedWhileUnflagged(t *testing.T) {
 			for i, e := range p.events {
 				if e.call == "fchflags" && e.arg == 0 && watched[e.ino] != "" {
 					if i+2 >= len(p.events) || p.events[i+1].ino != e.ino || p.events[i+2].ino != e.ino {
-						t.Errorf("another call came between %s's flag clear and its chown and chmod", watched[e.ino])
+						t.Errorf("another call came between %s's chown, chmod and flag clear", watched[e.ino])
 					}
 				}
 			}

@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"golang.org/x/sys/unix"
@@ -35,6 +36,28 @@ const (
 	RunDirName        = "keystore-run"
 	UserScopesDirName = userScopesName
 )
+
+// MaintenanceMarkerName is the maintenance marker in the data root:
+// present only while floor --rebuild or audit --rotate runs, or after one
+// stopped part-way, until a rerun of that verb finishes.
+const MaintenanceMarkerName = maintenanceMarkerName
+
+// LinkedLogRepair reports, when err is a log refused for more than one link
+// (a hard link to it), the root verb that repairs it: floor --rebuild for
+// the floor and audit --rotate for the audit log, each of which replaces
+// the log with a fresh file.
+func LinkedLogRepair(err error) (string, bool) {
+	var le logLinkedError
+	if errors.As(err, &le) {
+		return repairVerb(le.log), true
+	}
+	return "", false
+}
+
+// JudgeDirFlagsACL refuses the directory open at fd, as the keystore judges
+// its data root, when it carries a file flag beside SF_APPEND or a
+// non-empty extended ACL, or when either cannot be read.
+func JudgeDirFlagsACL(fd int) error { return judgeFlagsACL(fd, fdFlags) }
 
 // CheckLogFlags opens each append-only log through the data root and judges
 // it on its descriptor, as every read and append does (judgeLog): a log

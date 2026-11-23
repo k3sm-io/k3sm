@@ -688,6 +688,9 @@ func (s *FileStore) judgeLog(f *os.File, st *unix.Stat_t) error {
 	}
 	if bad != "" {
 		slog.Debug("a keystore append-only log is not trusted", "log", f.Name(), "links", st.Nlink, "uid", st.Uid, "mode", fmt.Sprintf("%04o", st.Mode&0o7777))
+		if st.Nlink != 1 && st.Mode&unix.S_IFMT == unix.S_IFREG {
+			return logLinkedError{log: f.Name()}
+		}
 		return fmt.Errorf("%w: %s", errLogUntrusted, bad)
 	}
 	flags, err := s.logFlags(f)
@@ -698,6 +701,26 @@ func (s *FileStore) judgeLog(f *os.File, st *unix.Stat_t) error {
 		return errLogNotAppendOnly
 	}
 	return judgeFlagsACL(int(f.Fd()), func(int) (uint32, error) { return flags, nil })
+}
+
+// logLinkedError is judgeLog's refusal of a log with more than one link.
+// It matches errLogUntrusted, and its text names the maintenance verb that
+// repairs it by replacing the log with a fresh file (repairVerb).
+type logLinkedError struct{ log string }
+
+func (e logLinkedError) Error() string {
+	return fmt.Sprintf("%v: more than one link: %s replaces it with a fresh file", errLogUntrusted, repairVerb(e.log))
+}
+
+func (e logLinkedError) Is(target error) bool { return target == errLogUntrusted }
+
+// repairVerb is the root verb that replaces the log name with a fresh
+// file: floor --rebuild for the floor, audit --rotate for the audit log.
+func repairVerb(name string) string {
+	if name == userFloorLogName {
+		return "sudo k3sm keys floor --rebuild"
+	}
+	return "sudo k3sm keys audit --rotate"
 }
 
 // judgeFlagsACL refuses, as errLogUntrusted, the descriptor fd when its
