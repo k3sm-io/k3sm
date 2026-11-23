@@ -359,15 +359,16 @@ var errScopeFlagBudget = fmt.Errorf("the scope directory holds more flagged entr
 // rmWalk is one removeScopeTree: the service user's uid, how many entries
 // it has cleared or opened to clear their flags, the scope directory's
 // path, which its errors name entries under, the scope, which its warnings
-// name, whether the scope is listed as removed, the scope directory's
-// device, and the directories it left in place as not the scope's.
+// name, whether the scope is listed as removed, the device of .user, the
+// baseline every directory of the tree must share, and the directories it
+// left in place as not the scope's.
 type rmWalk struct {
 	svc     uint32
 	opens   int
 	base    string
 	scope   string
 	listed  bool
-	dev     int32
+	dev     uint64
 	foreign []error
 }
 
@@ -394,8 +395,11 @@ const (
 // removed, on the held descriptor), so no service-user process can then
 // create, rename into, rename out of or unlink in it. A subdirectory is
 // descended into only when the service user owns it, or root does with mode
-// 0700 (an earlier run's work), on the scope directory's device; any other
-// is left in place and the removal fails naming it (errScopeForeignDir).
+// 0700 (an earlier run's work), on .user's device; any other is left in
+// place and the removal fails naming it (errScopeForeignDir). The scope
+// directory itself is held to the same rule before it is taken: one that
+// fails it is not taken, changed or emptied, and the removal fails naming
+// it.
 // Each directory is emptied a batch of rmDirBatch names at a time, read
 // again from its start after each batch until a read returns none, and
 // removed with unlinkat(AT_REMOVEDIR); every other name, whatever its type
@@ -443,7 +447,15 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, listed bool
 	if err != nil {
 		return err
 	}
-	w.dev = dst.Dev
+	// The service user owns .user/ and can rename any directory in at the
+	// name between the by-path judgement and this open: the held directory
+	// is taken only when it passes the owner rule nested directories pass,
+	// on .user's own device, which is the walk's baseline.
+	w.dev = rmDev(&ust)
+	if !w.owned(&dst) || rmDev(&dst) != w.dev {
+		_ = unix.Close(dfd) // read-only, untouched
+		return fmt.Errorf("%w: the scope directory %s (named for reading, not for pasting): %s; it is not the scope's, so rm-scope took nothing, changed nothing and removed nothing in it; inspect it", errScopeForeignDir, quoteName(w.base), w.foreignWhy(&dst, ".user"))
+	}
 	err = w.take(dfd, &dst, "")
 	if err == nil {
 		err = w.emptyScopeDir(dfd)
@@ -494,20 +506,36 @@ func (w *rmWalk) busy(rel string) error {
 
 // ours reports whether the directory st describes is the scope's to
 // descend into: the service user owns it, or root does with mode 0700 (an
-// earlier rm-scope took it, then stopped), and it is on the scope
-// directory's device. Otherwise it records why in w.foreign.
+// earlier rm-scope took it, then stopped), and it is on .user's device,
+// which the scope directory shares. Otherwise it records why in w.foreign.
 func (w *rmWalk) ours(rel string, st *unix.Stat_t) bool {
-	owner := st.Uid == w.svc || (int(st.Uid) == rmRootUID && st.Mode&0o7777 == 0o700)
-	if owner && st.Dev == w.dev {
+	if w.owned(st) && rmDev(st) == w.dev {
 		return true
 	}
-	why := fmt.Sprintf("uid %d owns it with mode %#o, and it is neither the service user's (uid %d) nor root's at 0700", st.Uid, st.Mode&0o7777, w.svc)
-	if owner {
-		why = "it is on another device than the scope directory"
-	}
-	w.foreign = append(w.foreign, fmt.Errorf("%w: the directory %s (named for reading, not for pasting): %s; it may have been renamed into the tree from a directory it shares with another user, so rm-scope left it and everything in it in place; inspect it, and remove it as root once it is known to hold nothing of another user's, then run rm-scope for this scope again", errScopeForeignDir, quoteName(filepath.Join(w.base, rel)), why))
+	w.foreign = append(w.foreign, fmt.Errorf("%w: the directory %s (named for reading, not for pasting): %s; it may have been renamed into the tree from a directory it shares with another user, so rm-scope left it and everything in it in place; inspect it, and remove it as root once it is known to hold nothing of another user's, then run rm-scope for this scope again", errScopeForeignDir, quoteName(filepath.Join(w.base, rel)), w.foreignWhy(st, "the scope directory")))
 	return false
 }
+
+// owned reports whether the directory st describes passes the scope's
+// owner rule: the service user owns it, or root does with mode 0700 (an
+// earlier rm-scope took it, then stopped).
+func (w *rmWalk) owned(st *unix.Stat_t) bool {
+	return st.Uid == w.svc || (int(st.Uid) == rmRootUID && st.Mode&0o7777 == 0o700)
+}
+
+// foreignWhy says why the directory st describes is not the scope's: its
+// owner and mode, or, when those pass, its device, unlike baseline's.
+func (w *rmWalk) foreignWhy(st *unix.Stat_t, baseline string) string {
+	if w.owned(st) {
+		return "it is on another device than " + baseline
+	}
+	return fmt.Sprintf("uid %d owns it with mode %#o, and it is neither the service user's (uid %d) nor root's at 0700", st.Uid, st.Mode&0o7777, w.svc)
+}
+
+// rmDev is the device st describes, as one type on every OS (st_dev is
+// int32 on Darwin, uint64 on Linux); tests replace it to report another
+// device for a chosen inode.
+var rmDev = func(st *unix.Stat_t) uint64 { return uint64(st.Dev) }
 
 // foreignErr is the error for the directories the walk left as not the
 // scope's.

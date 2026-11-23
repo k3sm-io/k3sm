@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -603,5 +604,45 @@ func TestRemoveScopeLeavesForeignOwnedDirAsRoot(t *testing.T) {
 	var st unix.Stat_t
 	if err := unix.Lstat(foreign, &st); err != nil || st.Uid != other || st.Mode&0o7777 != 0o700 {
 		t.Fatalf("the foreign directory: uid %d mode %#o (%v), want it untouched", st.Uid, st.Mode&0o7777, err)
+	}
+}
+
+// TestRemoveScopeRefusesForeignScopeDirAsRoot is the foreign scope
+// directory, root-run: .user/<uid> is a directory another user owns at
+// 0700, as if renamed in at the name after the by-path judgement. Its tree
+// removal takes nothing: the directory keeps its owner and mode and every
+// name in it, and the error names it for reading only and offers no
+// command.
+func TestRemoveScopeRefusesForeignScopeDirAsRoot(t *testing.T) {
+	if !asRoot() {
+		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
+	}
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	other := otherUID(t)
+	if err := os.Lchown(dir, int(other), int(other)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before := treeNames(t, dir)
+	takes := countTakes(t)
+	root, err := s.openDir(s.dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	err = removeScopeTree(root, s.dir, "1001", s.uid, true)
+	checkScopeDirRefused(t, err, s, fmt.Sprintf("uid %d owns it", other))
+	if *takes != 0 {
+		t.Errorf("rmTakeDir ran %d times, want none", *takes)
+	}
+	var st unix.Stat_t
+	if err := unix.Lstat(dir, &st); err != nil || st.Uid != other || st.Mode&0o7777 != 0o700 {
+		t.Fatalf("the scope directory: uid %d mode %#o (%v), want it untouched", st.Uid, st.Mode&0o7777, err)
+	}
+	if after := treeNames(t, dir); !slices.Equal(before, after) {
+		t.Fatalf("the scope directory holds %v, want %v untouched", after, before)
 	}
 }
