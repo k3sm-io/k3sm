@@ -28,11 +28,13 @@ import (
 	"testing"
 	"testing/synctest"
 
-	"golang.org/x/sys/unix"
-
 	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/runtimed/pkg/keystorepaths"
 )
+
+// sfAppend is SF_APPEND (<sys/stat.h>), the flag every judged log carries;
+// x/sys/unix defines it on darwin only, and this rig reports it on any OS.
+const sfAppend = 0x00040000
 
 // storeRig is a real store over a data root in t.TempDir(), laid out as
 // install leaves it, with the test user standing in for root and for the
@@ -76,7 +78,7 @@ func newStoreRig(t *testing.T) *storeRig {
 		UID:       uint32(uid), GID: uint32(gid),
 		DataRoot: data,
 		FloorUID: uid, FloorGID: gid,
-		LogFlags: func(*os.File) (uint32, error) { return unix.SF_APPEND, nil },
+		LogFlags: func(*os.File) (uint32, error) { return sfAppend, nil },
 	})
 	r.logs = r.fs.ServerLogs()
 	t.Cleanup(func() { _ = r.logs.Close() })

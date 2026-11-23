@@ -101,7 +101,7 @@ func newServerLogsStore(t *testing.T) (*FileStore, string) {
 		UID:       uint32(uid), GID: uint32(gid),
 		DataRoot: data,
 		FloorUID: uid, FloorGID: gid,
-		LogFlags: func(*os.File) (uint32, error) { return unix.SF_APPEND, nil },
+		LogFlags: func(*os.File) (uint32, error) { return sfAppend, nil },
 	})
 	return s, audit
 }
