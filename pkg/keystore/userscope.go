@@ -715,13 +715,30 @@ func (u *UserScope) openScopeForRevoke(root *os.Root, k keys) (*openedScope, err
 
 // openScopeForRm is rm-scope's judge: openScopeForRevoke over the scope
 // directory openScopeDirForRm opens, so neither .user's nor the scope
-// directory's mode refuses it.
-func (u *UserScope) openScopeForRm(root *os.Root, k keys) (*openedScope, error) {
+// directory's mode refuses it. pin is the device and inode of the scope
+// directory it opened, set whenever it opened one, also when its
+// scope.key is then missing or untrusted, so rm-scope can require the
+// directory its walk holds at the name to be the one judged.
+func (u *UserScope) openScopeForRm(root *os.Root, k keys) (*openedScope, rmDirPin, error) {
 	dir, err := u.openScopeDirForRm(root)
 	if err != nil {
-		return nil, err
+		return nil, rmDirPin{}, err
 	}
-	return u.openRevokeIn(dir, k)
+	var pin rmDirPin
+	if fi, serr := dir.Stat("."); serr == nil {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			pin = rmDirPin{dev: uint64(st.Dev), ino: st.Ino, set: true}
+		}
+	}
+	o, err := u.openRevokeIn(dir, k)
+	return o, pin, err
+}
+
+// rmDirPin is the device and inode of the scope directory rm-scope's
+// judge opened (set when it opened one).
+type rmDirPin struct {
+	dev, ino uint64
+	set      bool
 }
 
 // openRevokeIn is openScopeForRevoke over the opened scope directory dir,

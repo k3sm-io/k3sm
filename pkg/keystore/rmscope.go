@@ -159,7 +159,8 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		r.path = rmPathTaken
 		return r.finish(root, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), nil)
 	}
-	o, err := u.openScopeForRm(root, k)
+	o, pin, err := u.openScopeForRm(root, k)
+	r.pin = pin
 	var judged string
 	if errors.Is(err, errScopeKeyUntrusted) {
 		// A second link or a wider mode fails the judge, and any local
@@ -335,6 +336,9 @@ type rmRun struct {
 	listFloor floorIdentity
 	listSize  int64
 	listedNow bool
+	// pin is the scope directory the judge opened: on the no-key and
+	// untrusted paths the directory held at the name must be it.
+	pin rmDirPin
 }
 
 // check is the rerun rule, run on the scope directory held at the name
@@ -355,6 +359,9 @@ type rmRun struct {
 // Once accepted, a scope.key that opens as this scope's is listed, or the
 // record made durable again (list), before anything is taken.
 func (r *rmRun) check(dfd int, st *unix.Stat_t) (string, error) {
+	if why := r.pinRule(st); why != "" {
+		return why, nil
+	}
 	if st.Uid != r.svc {
 		// Root's at 0700 by the owner rule: a taken leftover only while it
 		// carries no extended ACL. One with an ACL (a take stopped between
@@ -390,6 +397,21 @@ func (r *rmRun) check(dfd int, st *unix.Stat_t) (string, error) {
 	// run wrote into it.
 	r.listedBefore = r.removed.has(r.u.uid, hk.id) && !(r.wrote && hk.id == r.judged)
 	return "", r.list(hk.id)
+}
+
+// pinRule is check's first rule on the no-key and untrusted paths, which
+// have no key identity to bind the held directory to: it must be the
+// directory the judge opened (device and inode), or nothing in it is
+// taken. A non-empty why refuses it. The judged path keeps its key rule,
+// and the taken path judged root's directory by its owner.
+func (r *rmRun) pinRule(st *unix.Stat_t) string {
+	if r.path != rmPathNoKey && r.path != rmPathUntrusted {
+		return ""
+	}
+	if !r.pin.set || uint64(st.Dev) != r.pin.dev || st.Ino != r.pin.ino {
+		return "it is not the directory rm-scope judged at the name"
+	}
+	return ""
 }
 
 // serviceUserRule is check's rule for a directory the service user owns:

@@ -2788,7 +2788,7 @@ service user can only add to.
   | root's 0700, no key, or a key that does not open as this uid's | strips any ACL, removes it; record unchanged | exit 4 |
   | root's, met on the judged path | removes it | exit 4 ("the directory rm-scope judged was not at its name") |
   | the service user's, on the judged path | the held key must be the judged one, read again after the take | exit 0 only if the judged key is in the record; record full: exit 4 |
-  | the service user's, on the no-key or untrusted path | removes it | exit 0 only if a listed key was read; else exit 4 |
+  | the service user's, on the no-key or untrusted path | must be the directory the judge opened (device, inode), else refuses; removes it | exit 0 only if a listed key was read; else exit 4 |
   | any row above that gives exit 0, with a line of `user/<uid>` in the floor after the proving key's listing, or a floor that cannot be judged | as that row | exit 4 (the newest-scope rule) |
   | the service user's with a valid unlisted key, or not what its path found | refuses | exit 1 (exit 4 if this run added a key to the record) |
   | absent at the walk's open | removes nothing | exit 4 "found absent" if this run added a key, else exit 1 |
@@ -2843,9 +2843,12 @@ service user can only add to.
   Errors about the root-owned removed-scopes record in the data root come from the shared
   root-file helper and reader and keep their wording, repair advice included.
 
-  *Honest limits.* A key that does not open as this uid's cannot be told from forged bytes:
-  another scope's directory renamed onto this name on the untrusted path is removed and
-  reported as unlisted (exit 4), and the other scope is lost. The final `rmdir` races a rename
+  *Binding the paths without a key.* On the no-key and untrusted paths there is no key identity
+  to bind the held directory to, so the judge pins the device and inode of the scope directory
+  it opened, and the walk takes the directory held at the name only when it is that one; any
+  other is refused, nothing taken (exit 1, or exit 4 when this run already changed the record).
+
+  *Honest limits.* The final `rmdir` races a rename
   at the name, which the probe below reports but cannot prevent. *Open item:* the delivery
   check before the removal reads the delivery record without the rollback floor, so a
   rolled-back authentic record naming no deliveries passes without a note; this is not fixed
