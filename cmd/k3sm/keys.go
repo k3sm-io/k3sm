@@ -29,7 +29,6 @@ import (
 	"io/fs"
 	"os"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -91,6 +90,13 @@ const keysUsage = `Usage:
         --accept-drops writes it anyway, dropping the oldest deletions,
         printing each one, and exits 4. --dry-run prints the report the
         merge would make and writes and renames nothing
+  sudo k3sm keys floor --rebuild
+        rebuild the user-scope floor log after a restore, or when it is
+        damaged or past its bounds: carry the old floor's tombstones and
+        sequences forward (read with no size bound), add each user scope's
+        entries, and flag the new log append-only. It refuses, changing
+        nothing, when any user scope does not open. It exits 4 when it
+        dropped anything, listing the counts by class
   sudo k3sm keys deliver system/<name> --namespace NS [--secret S] [--data-key K]
         declare that the server delivers the entry's current version as an
         Opaque Secret S (default: <name>) in NS, under data key K
@@ -101,6 +107,15 @@ const keysUsage = `Usage:
         withdraw the entry's delivery into NS (only into Secret S, with
         --secret). The Secret stays; delete it with kubectl, and rotate the
         entry to revoke
+  sudo k3sm keys rm-scope user/<uid> --yes
+        remove a user scope and every entry in it; irreversible. It refuses
+        while the scope's delivery record names a delivery. Run floor
+        --rebuild after it to free the scope's floor keys
+  sudo k3sm keys audit --rotate [--discard-oldest]
+        move the audit log aside to keystore-audit.log.1, shifting the
+        older archives up to .4, and flag a new, empty log append-only. It
+        refuses, changing nothing, while keystore-audit.log.4 exists: copy
+        the archives off the Mac first, then pass --discard-oldest
 
 Names are scope-qualified: system/<name>, where <name> is 1 to 253 bytes of
 dot-separated labels of lowercase letters, digits and '-'. This build
@@ -126,8 +141,10 @@ and the next keys verb finishes what was left); or the floor dropped a
 recorded deletion to stay within its limits, so a copy of that deleted
 entry put back is accepted; or floor merge kept an entry with --keep, left one unverified,
 moved a target aside, or carried over user-scope entries without a floor
-check (read its report); 5 floor merge written, input not renamed: rerun to
-clear the guard (it wins over 4, and the report lists any drops).
+check (read its report); or floor --rebuild dropped lines or keys of the
+old floor (it lists the counts by class: unparseable, over-long, forged
+live keys, removed-scope keys); 5 floor merge written, input not renamed:
+rerun to clear the guard (it wins over 4, and the report lists any drops).
 floor merge --dry-run exits as the merge itself would.
 `
 
@@ -140,14 +157,15 @@ const (
 	// rewrap under a key the operator did not supply, so it must run again.
 	keysResumed = 3
 	// keysCommitted is a change that was made, but not cleanly: a write's
-	// keystore.ErrCommitted (put, rotate or adopt made its change, and a
+	// committed error, keystore.Committed (put, rotate or adopt made its change, and a
 	// step after the commit point failed); a change whose floor write
 	// dropped a recorded deletion to stay within the floor's limits: a
 	// committed keystore.ErrTombstoneEvicted from put, rotate, adopt or rm
 	// (its tree left behind, or nothing found after a raise that pruned,
 	// included), or a floor merge that reports a drop; and a floor merge
 	// (or its dry run) that keeps an entry with --keep or leaves one
-	// unverified. list and show warn of their floor raise's eviction on
+	// unverified; and a floor --rebuild that dropped lines or keys of the
+	// old floor. list and show warn of their floor raise's eviction on
 	// stderr and exit 0.
 	keysCommitted = 4
 	// keysNotRenamed is a floor merge that was written but whose input,
@@ -178,10 +196,34 @@ type keysStore interface {
 	InterruptedRewrap(ctx context.Context) (fingerprint [sha256.Size]byte, ok bool, err error)
 	RecordsSealedUnder(ctx context.Context, key []byte) (bool, error)
 	UserScopesExist(ctx context.Context) (bool, error)
+	// AuditRoot appends the verb's one audit line, via root, once the
+	// audit log exists.
+	AuditRoot(ctx context.Context, op, name, result string) error
+	// RebuildFloor and RemoveScope are the root maintenance verbs floor
+	// --rebuild and rm-scope.
+	RebuildFloor(ctx context.Context, attrs keystore.FileAttrWriter) (keystore.RebuildReport, error)
+	RemoveScope(ctx context.Context, uid uint32) (bool, error)
+	// RotateAudit is the root maintenance verb audit --rotate.
+	RotateAudit(ctx context.Context, attrs keystore.FileAttrWriter, discardOldest bool) (keystore.RotateReport, error)
 	Orphan(ctx context.Context, name string) (keystore.OrphanInfo, error)
 	Adopt(ctx context.Context, name string, orphan keystore.Version) (keystore.Version, error)
 	MergeFloor(ctx context.Context, opts keystore.MergeOptions) (keystore.MergeReport, error)
 	MergePending() error
+}
+
+// keysAudit is what a root verb's audit line is made from (U52): the store
+// the verb opened, which a verb refused before it opens none leaves nil,
+// and the entry name it parsed. runKeysWith writes the line once the verb
+// returns.
+type keysAudit struct {
+	store keysStore
+	name  string
+	// roots are the verb's scrubbed roots (keysVerb.roots), which the
+	// warning of a line not written is scrubbed of.
+	roots []string
+	// op, when set, is the line's op in place of the one runKeysWith
+	// derives from the verb: the floor verb's two forms set theirs.
+	op string
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -215,11 +257,16 @@ type keysEnv struct {
 	encryptionOn func(workDir string) bool
 	stdout       io.Writer
 	stderr       io.Writer
+	// audit collects the running verb's audit line; runKeysWith sets it.
+	audit *keysAudit
+	// attrs is the file-attribute writer the maintenance verbs act
+	// through; nil is fileAttrSeam.
+	attrs keystore.FileAttrWriter
 }
 
 func defaultKeysEnv(stdout, stderr io.Writer) keysEnv {
 	return keysEnv{
-		euid:       os.Geteuid,
+		euid:       func() int { return euidSeam() },
 		serviceIDs: lookupServiceIDs,
 		open:       func(cfg keystore.Config) keysStore { return keystore.New(cfg) },
 		stdin:      os.Stdin,
@@ -237,7 +284,7 @@ func defaultKeysEnv(stdout, stderr io.Writer) keysEnv {
 
 // lookupServiceIDs resolves the installed service user's uid and gid.
 func lookupServiceIDs() (uid, gid uint32, err error) {
-	u, err := user.Lookup(install.DefaultServiceUser)
+	u, err := uidResolverSeam(install.DefaultServiceUser)
 	if err != nil {
 		return 0, 0, fmt.Errorf("look up the service user %s (is k3sm installed?): %w", install.DefaultServiceUser, err)
 	}
@@ -411,7 +458,11 @@ func (v *keysVerb) store() (keysStore, error) {
 		return nil, err
 	}
 	cfg.UID, cfg.GID = uid, gid
-	return v.env.open(cfg), nil
+	s := v.env.open(cfg)
+	if v.env.audit != nil {
+		v.env.audit.store, v.env.audit.roots = s, v.roots
+	}
+	return s, nil
 }
 
 // keystoreLayout is the store's Config, without its owner, for the server
@@ -538,6 +589,9 @@ func (v *keysVerb) nameArg(pos []string) (string, int) {
 	if err != nil {
 		return "", v.failf(keysBadUsage, "%v", err)
 	}
+	if v.env.audit != nil {
+		v.env.audit.name = name
+	}
 	return name, keysOK
 }
 
@@ -546,7 +600,49 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 		fmt.Fprint(env.stderr, keysUsage)
 		return keysBadUsage
 	}
-	verb, rest := args[0], args[1:]
+	audit := &keysAudit{}
+	env.audit = audit
+	code := runKeysVerb(ctx, args[0], args[1:], env)
+	if audit.store == nil {
+		return code
+	}
+	op := args[0]
+	switch op {
+	case "ls":
+		op = "list"
+	case "audit":
+		op = "audit-rotate"
+	}
+	if audit.op != "" {
+		op = audit.op
+	}
+	if err := audit.store.AuditRoot(ctx, op, audit.name, keysAuditResult(code)); err != nil {
+		// The verb has run; what it did stands, and its exit code says so.
+		fmt.Fprintf(env.stderr, "k3sm keys %s: warning: its audit line was not written: %v\n", op, scrubPaths(err, audit.roots...))
+	}
+	return code
+}
+
+// keysAuditResult is the audit line's result for a verb's exit code: ok,
+// resumed (rewrap finished an earlier rewrap), committed (keysCommitted and
+// keysNotRenamed: the change was made, and its report says what to read or
+// rerun; a put, rotate or adopt whose store returned a keystore.Committed error
+// exits keysCommitted), or refused.
+func keysAuditResult(code int) string {
+	switch code {
+	case keysOK:
+		return "ok"
+	case keysResumed:
+		return "resumed"
+	case keysCommitted, keysNotRenamed:
+		return "committed"
+	default:
+		return "refused"
+	}
+}
+
+// runKeysVerb dispatches one verb.
+func runKeysVerb(ctx context.Context, verb string, rest []string, env keysEnv) int {
 	switch verb {
 	case "-h", "--help", "help":
 		fmt.Fprint(env.stdout, keysUsage)
@@ -571,6 +667,10 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 		return keysDeliver(ctx, rest, env)
 	case "undeliver":
 		return keysUndeliver(ctx, rest, env)
+	case "rm-scope":
+		return keysRmScope(ctx, rest, env)
+	case "audit":
+		return keysAuditVerb(ctx, rest, env)
 	default:
 		// The argument is not echoed: it may be a value typed in the wrong place.
 		fmt.Fprintln(env.stderr, "k3sm keys: unknown subcommand (not echoed); see k3sm keys --help")
@@ -697,7 +797,7 @@ func keysPut(ctx context.Context, args []string, env keysEnv) int {
 	defer clear(value)
 	ver, err := s.Put(ctx, name, kind, value)
 	code = keysOK
-	if errors.Is(err, keystore.ErrCommitted) {
+	if keystore.Committed(err) {
 		// The change stands: it is reported as made, and the exit says a
 		// later step failed.
 		code = v.failf(keysCommitted, "%v", err)
@@ -754,7 +854,7 @@ func keysRotate(ctx context.Context, args []string, env keysEnv) int {
 	}
 	ver, err := s.Rotate(ctx, name, value)
 	code = keysOK
-	if errors.Is(err, keystore.ErrCommitted) {
+	if keystore.Committed(err) {
 		// The change stands: it is reported as made, and the exit says a
 		// later step failed.
 		code = v.failf(keysCommitted, "%v", err)
@@ -1013,7 +1113,25 @@ func (k *keepFlag) Set(q string) error {
 	return nil
 }
 
-// keysFloor is "k3sm keys floor merge [--keep system/<name>]...
+// keysFloorMergeUsage and keysFloorRebuildUsage are the floor verb's two
+// forms, which its one usage line names together.
+const (
+	keysFloorMergeUsage   = "sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run] [--undo]"
+	keysFloorRebuildUsage = "sudo k3sm keys floor --rebuild"
+)
+
+// keysFloor is the floor verb: "floor merge", the system-scope floor merge
+// after a restore (keysFloorMerge), or "floor --rebuild", the root
+// maintenance verb that rebuilds the user-scope floor log
+// (keysFloorRebuild).
+func keysFloor(ctx context.Context, args []string, env keysEnv) int {
+	if len(args) > 0 && args[0] == "merge" {
+		return keysFloorMerge(ctx, args[1:], env)
+	}
+	return keysFloorRebuild(ctx, args, env)
+}
+
+// keysFloorMerge is "k3sm keys floor merge [--keep system/<name>]...
 // [--accept-drops] [--dry-run] [--undo]": it
 // merges the deleted generations the data root's moved-aside floor,
 // keystore-floor.json.pre-restore, records into the live floor a restore put back (keystore.FileStore.MergeFloor),
@@ -1041,20 +1159,24 @@ func (k *keepFlag) Set(q string) error {
 // already written and refuses what is staged included.
 // keysCommitted also marks a merge that kept an entry (--keep), left one
 // unverified, or moved aside what it found at the keystore directory; --dry-run exits as the merge itself would.
-func keysFloor(ctx context.Context, args []string, env keysEnv) int {
-	if len(args) == 0 || args[0] != "merge" {
-		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run] [--undo]")
-		return keysBadUsage
-	}
+func keysFloorMerge(ctx context.Context, args []string, env keysEnv) int {
 	v := newKeysVerb("floor merge", env)
 	var keep keepFlag
 	v.fs.Var(&keep, "keep", "keep this entry's restored version live (system/<name>; repeatable)")
 	acceptDrops := v.fs.Bool("accept-drops", false, "write a merge that has to drop deletions since the backup to fit the floor, printing each one")
 	dryRun := v.fs.Bool("dry-run", false, "print the report the merge would make; write and rename nothing")
 	undo := v.fs.Bool("undo", false, "the reverse merge of an undo: report the versions the restore retired apart from the entries deleted since")
-	pos, err := v.parse(args[1:])
+	pos, err := v.parse(args)
 	if err != nil {
 		return keysBadUsage
+	}
+	if v.env.audit != nil {
+		// A dry run writes nothing, so its line says so: an auditor reading
+		// floor-merge ok knows the floor was merged.
+		v.env.audit.op = "floor-merge"
+		if *dryRun {
+			v.env.audit.op = "floor-merge-dry-run"
+		}
 	}
 	if len(pos) != 0 {
 		return v.failf(keysBadUsage, "takes no file: it reads only keystore-floor.json.pre-restore in the data root, the floor the restore recipe moves aside")
@@ -1209,7 +1331,7 @@ func keysAdopt(ctx context.Context, args []string, env keysEnv) int {
 	}
 	ver, err := s.Adopt(ctx, name, info.Orphan)
 	code = keysOK
-	if errors.Is(err, keystore.ErrCommitted) {
+	if keystore.Committed(err) {
 		code = v.failf(keysCommitted, "%v", err)
 		err = nil
 	}

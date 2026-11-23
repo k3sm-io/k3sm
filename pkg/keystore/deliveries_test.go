@@ -167,7 +167,7 @@ func TestDeliveryRecordDigestRoundTrip(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(scopeDir(server, "1001"), deliveriesName), older, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := u.Delivery(ctx, d.uid); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "floor --rebuild") {
+	if _, err := u.Delivery(ctx, d.uid); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "matched set") {
 		t.Fatalf("lookup over a copied-back record: %v, want ErrCorrupt with the user-scope floor message", err)
 	}
 	// Another scope's entry, or a requester that is not the caller, is

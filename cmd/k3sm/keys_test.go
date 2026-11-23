@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -102,6 +103,9 @@ type keysHarness struct {
 	// cfg is the Config the verb built from the install layout; storeCfg is
 	// the one the store was opened with, cfg with the test's floor owner.
 	cfg, storeCfg keystore.Config
+	// logFlags, when set, is the store's flag source (keystore.Config.LogFlags):
+	// a non-root test cannot set SF_APPEND.
+	logFlags func(*os.File) (uint32, error)
 	// wrap, when set, replaces the store the verbs get; nil is the real
 	// store. Each test that sets it says why the real store will not do.
 	wrap      func(keysStore) keysStore
@@ -115,8 +119,11 @@ type keysHarness struct {
 	keyOutStep func(string) error
 	// encryptionOff is what the verbs' encryptionOn seam answers, negated.
 	encryptionOff bool
-	stdout        bytes.Buffer
-	stderr        bytes.Buffer
+	// attrs is the maintenance verbs' file-attribute writer; nil leaves
+	// fileAttrSeam, which panics in a unit test.
+	attrs  keystore.FileAttrWriter
+	stdout bytes.Buffer
+	stderr bytes.Buffer
 }
 
 func newKeysHarness(t *testing.T) *keysHarness {
@@ -152,6 +159,7 @@ func (h *keysHarness) run(args ...string) int {
 			// user stands in for root as the floor's owner.
 			h.storeCfg = cfg
 			h.storeCfg.FloorUID, h.storeCfg.FloorGID = keysFloorIDs()
+			h.storeCfg.LogFlags = h.logFlags
 			var s keysStore = keystore.New(h.storeCfg)
 			if h.wrap != nil {
 				s = h.wrap(s)
@@ -168,6 +176,7 @@ func (h *keysHarness) run(args ...string) int {
 		deliveryCheck: keysTestDeliveryCheck,
 		deliveryChown: func(*os.File) error { return nil },
 		encryptionOn:  func(string) bool { return !h.encryptionOff },
+		attrs:         h.attrs,
 		stdout:        &h.stdout,
 		stderr:        &h.stderr,
 	}
@@ -1718,7 +1727,12 @@ func TestKeysStoreConfigFromLayout(t *testing.T) {
 		GID:       gid,
 		DataRoot:  filepath.Dir(h.work),
 	}
-	if h.cfg != want {
+	got := h.cfg
+	if got.LogFlags != nil {
+		t.Fatal("the install layout's config sets a flag source; production reads st_flags")
+	}
+	got.LogFlags = nil
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("store config = %+v, want %+v", h.cfg, want)
 	}
 	if h.cfg.FloorUID != 0 || h.cfg.FloorGID != 0 {
@@ -3330,4 +3344,76 @@ func TestKeysFloorMergeReportCodes(t *testing.T) {
 			}
 		}
 	})
+}
+
+// deleteCapture keeps the error the store's Delete returned.
+type deleteCapture struct {
+	keysStore
+	err *error
+}
+
+func (d deleteCapture) Delete(ctx context.Context, name string) error {
+	*d.err = d.keysStore.Delete(ctx, name)
+	return *d.err
+}
+
+// internalCommitted finds, in err's tree, the store's own committed marker:
+// a leaf keystore.Committed reports, which is neither keystore.ErrCommitted
+// nor keystore.ErrTombstoneEvicted.
+func internalCommitted(err error) error {
+	switch u := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if c := internalCommitted(e); c != nil {
+				return c
+			}
+		}
+		return nil
+	case interface{ Unwrap() error }:
+		return internalCommitted(u.Unwrap())
+	}
+	if err != nil && keystore.Committed(err) && !errors.Is(err, keystore.ErrCommitted) && !errors.Is(err, keystore.ErrTombstoneEvicted) {
+		return err
+	}
+	return nil
+}
+
+// wrappedCommittedStore reports every Put as committed through the store's
+// own committed marker, wrapped, with no ErrCommitted in the chain.
+type wrappedCommittedStore struct {
+	keysStore
+	marker error
+}
+
+func (w wrappedCommittedStore) Put(ctx context.Context, name string, kind keystore.Kind, value []byte) (keystore.Version, error) {
+	v, err := w.keysStore.Put(ctx, name, kind, value)
+	if err != nil {
+		return v, err
+	}
+	return v, fmt.Errorf("put %s: %w: injected failure after the commit point", name, w.marker)
+}
+
+// TestKeysWrappedInternalCommittedExits4: the CLI tests a committed change
+// with keystore.Committed, so a wrapped committed error that is not
+// keystore.ErrCommitted (the store's own marker, taken here from a real rm
+// whose floor write evicted a tombstone) exits 4, not 1.
+func TestKeysWrappedInternalCommittedExits4(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	plantBurials(t, recipeFloor(h), "k", 1000, keysPerNameCap)
+	var rmErr error
+	h.wrap = func(s keysStore) keysStore { return deleteCapture{s, &rmErr} }
+	h.mustRun(keysCommitted, "rm", "system/k", "--yes")
+	marker := internalCommitted(rmErr)
+	if marker == nil {
+		t.Fatalf("no committed marker in the rm's error %v", rmErr)
+	}
+
+	h = newKeysHarness(t)
+	h.wrap = func(s keysStore) keysStore { return wrappedCommittedStore{s, marker} }
+	h.stdin = strings.NewReader("one")
+	h.mustRun(keysCommitted, "put", "system/alpha", "--in", "-")
+	if got := h.value("alpha", 1); string(got) != "one" {
+		t.Fatalf("alpha v1 = %q after the committed put", got)
+	}
 }

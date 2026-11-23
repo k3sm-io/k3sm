@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"v\":1,\"ts\":\"2026-11-22T00:00:00Z\",\"op\":\"put\",\"scope\":\"user/1001\",\"name\":\"token\",\"namespace\":\"\",\"result\":\"ok\"}")

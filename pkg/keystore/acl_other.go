@@ -22,3 +22,8 @@ package keystore
 // extended ACL to read. A k3sm build is darwin with cgo, where acl_darwin.go
 // reads it.
 func hasExtendedACL(int) (bool, error) { return false, nil }
+
+// removeExtendedACL removes nothing: a build without darwin's acl(3)
+// cannot. Where fdHasACL still reads an ACL (darwin without cgo), the
+// judge that follows refuses the file, so the build fails closed.
+func removeExtendedACL(int) error { return nil }

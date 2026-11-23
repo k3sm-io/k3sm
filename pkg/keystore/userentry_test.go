@@ -145,6 +145,7 @@ func TestCheckScopeRefusesUserZero(t *testing.T) {
 		t.Fatal("deriveKeys derived keys for user/0")
 	}
 	s, _ := newTestStore(t)
+	startScopes(t, s)
 	if _, err := s.UserScope(0); err == nil {
 		t.Fatal("UserScope(0) built a user scope for root")
 	}

@@ -1,0 +1,5 @@
+go test fuzz v1
+[]byte("user/1001 floor")
+uint16(12)
+uint16(10)
+byte(' ')

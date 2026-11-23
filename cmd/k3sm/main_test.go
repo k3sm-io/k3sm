@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"testing"
 	_ "unsafe" // for go:linkname: the bootstrap work factors below
@@ -90,6 +91,16 @@ func TestMain(m *testing.M) {
 	pullMirrorer = func(context.Context, name.Reference, name.Reference, string) error {
 		return errors.New("this test installed no cluster-registry mirrorer")
 	}
+	// The keystore paths' seams (keystoreseams.go) and the exec seam: a unit
+	// test that forgets to inject a fake panics instead of reaching the host.
+	euidSeam = func() int { panic("a unit test reached geteuid: inject a fake euid source") }
+	uidResolverSeam = func(string) (*user.User, error) {
+		panic("a unit test reached getpwnam: inject a fake uid resolver")
+	}
+	kubectlExec = func(string, []string, []string) error {
+		panic("a unit test reached exec: inject a fake exec")
+	}
+	fileAttrSeam = panickingFileAttrs{}
 	os.Exit(m.Run())
 }
 

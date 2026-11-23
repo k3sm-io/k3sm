@@ -234,6 +234,7 @@ func TestShortNameResolverHasTheDeadline(t *testing.T) {
 // at 2^31 or above, or the service uid.
 func TestUserScopeRefusesIneligibleUIDs(t *testing.T) {
 	s, _ := newTestStore(t)
+	startScopes(t, s)
 	for _, uid := range []uint32{0, 1, 500, s.uid, 2147483648, 4294967294} {
 		if _, err := s.UserScope(uid); err == nil {
 			t.Errorf("UserScope(%d) built a scope", uid)

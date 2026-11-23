@@ -38,6 +38,12 @@ func TestMain(m *testing.M) {
 	timerSeam = func(time.Duration) (<-chan time.Time, func() bool) {
 		panic("a unit test reached the clock: inject a fake timer")
 	}
+	if os.Geteuid() != 0 {
+		// rm-scope takes each scope directory for root; a non-root run
+		// takes it for itself, and counts its own 0700 directories as an
+		// earlier run's work.
+		rmRootUID, rmRootGID = os.Geteuid(), os.Getegid()
+	}
 	os.Exit(m.Run())
 }
 

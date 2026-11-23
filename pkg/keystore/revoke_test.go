@@ -113,8 +113,9 @@ func TestRevocationIsUnconditional(t *testing.T) {
 	})
 }
 
-// A floor that cannot be read does not stop a withdraw: the tombstone is
-// written and its floor line appended. A floor line that could not be
+// A floor that cannot be read does not let a withdraw re-seal a record it
+// cannot check: the withdraw is refused with errWithdrawUnsealed and seals
+// nothing, and the floor is unchanged. A floor line that could not be
 // appended is appended by the next withdraw of the same UID, at the
 // record's sequence, which the floor's max makes idempotent.
 func TestWithdrawFloorFaults(t *testing.T) {
@@ -124,18 +125,19 @@ func TestWithdrawFloorFaults(t *testing.T) {
 		if err := u.addDelivery(ctx, testDelivery(1)); err != nil {
 			t.Fatal(err)
 		}
+		_, before := recordedDelivery(t, s, server, 1)
 		fl, _ := userLogs(s)
 		fl.failRead = true
-		if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil {
-			t.Fatalf("withdraw while the floor read fails: %v", err)
+		if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, errWithdrawUnsealed) {
+			t.Fatalf("withdraw while the floor read fails: %v, want errWithdrawUnsealed", err)
 		}
 		fl.failRead = false
 		d, seq := recordedDelivery(t, s, server, 1)
-		if !d.withdrawn {
-			t.Fatal("the delivery is still live")
+		if d.withdrawn || seq != before {
+			t.Fatalf("the record was re-sealed with the floor unreadable: sequence %d (was %d), withdrawn %v", seq, before, d.withdrawn)
 		}
-		if got, _ := fl.floor("user/1001", deliveriesFloorName, guid(0xA1)); got != seq {
-			t.Fatalf("floor %d after the withdraw, want %d", got, seq)
+		if got, _ := fl.floor("user/1001", deliveriesFloorName, guid(0xA1)); got != before {
+			t.Fatalf("floor %d after the refused withdraw, want %d", got, before)
 		}
 	})
 	t.Run("floor append fails, then a repeat re-appends", func(t *testing.T) {
@@ -248,7 +250,7 @@ func TestWithdrawBelowReadableFloorRefused(t *testing.T) {
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("withdraw below a readable floor: %v, want ErrCorrupt", err)
 	}
-	for _, want := range []string{"is older than the user-scope floor", "sudo k3sm keys floor --rebuild"} {
+	for _, want := range []string{"is older than the user-scope floor", "restore the matched set", "sudo k3sm doctor"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("refusal %q does not say %q", err, want)
 		}

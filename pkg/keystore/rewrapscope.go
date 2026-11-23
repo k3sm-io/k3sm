@@ -207,10 +207,11 @@ func (s *FileStore) checkScopesPlanned(ctx context.Context, root *os.Root, plan 
 // damaged scope of uid. Removing the scope directory by hand recovers only a
 // user who never delivered: for one who did, the floor records the
 // deliveries record past its first sequence, and the owner's next put
-// refuses to mint over it. That recovery is rm-scope, not built yet; until
-// it is, floor --rebuild after the removal is the way, and its cost is said.
+// refuses to mint over it. rm-scope refuses a scope whose record names a
+// delivery until it revokes first, so the recovery there is removing the
+// directory by hand, then floor --rebuild, whose cost is said.
 func damagedScopeRecovery(uid string) string {
-	return fmt.Sprintf("remove keystore/%s/%s/ by hand, which recovers only a user who never delivered (the owner loses their values and re-puts them). For a user who did, the owner's next put refuses to mint over the floor: the recovery is rm-scope, which is not built yet. Until it is, root removes keystore/%s/%s/ and runs `sudo k3sm keys floor --rebuild`, which rewrites the floor from what is on disk and so lowers every record's floor, every user's, to the sequence on disk now: a copied-back older record already in place is accepted from then on", userScopesName, uid, userScopesName, uid)
+	return fmt.Sprintf("remove keystore/%s/%s/ by hand, which recovers only a user who never delivered (the owner loses their values and re-puts them); sudo k3sm keys rm-scope user/%s --yes does the same for such a user. For a user who did, the owner's next put refuses to mint over the floor, and rm-scope refuses a scope with deliveries: root removes keystore/%s/%s/ by hand, then runs sudo k3sm keys floor --rebuild, which drops the removed scope's floor keys and rewrites the floor from what is on disk, and so lowers every record's floor, every user's, to the sequence on disk now, and then sudo k3sm doctor", userScopesName, uid, uid, userScopesName, uid)
 }
 
 // withScopeDir calls fn with the scope directory .user/<uid>.

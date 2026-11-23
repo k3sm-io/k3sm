@@ -35,6 +35,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/version"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -127,6 +128,23 @@ type doctorEnv struct {
 	daemonInfo   func(label string) status.DaemonInfo
 	reportDir    func(requested string) (string, error)
 	writeReport  func(dir, name string, contents []byte) error
+	// keystoreLogs judges the keystore's two append-only logs on their
+	// descriptors (keystore.FileStore.CheckLogFlags): nil when both are the
+	// service user's, mode 0600 and flagged SF_APPEND. A nil seam leaves the
+	// row unprobed.
+	keystoreLogs func(context.Context) error
+	// keystoreLogSizes reads the two logs' sizes and caps
+	// (keystore.FileStore.LogSizes), for the soft-cap hint. A nil seam
+	// leaves the sizes unread.
+	keystoreLogSizes func(context.Context) (keystore.LogSizes, error)
+	// keystoreFloorDamage reads the user-scope floor's damaged-line count
+	// (keystore.FileStore.FloorDamage), and the damage of a floor past the
+	// reader's bounds as its error. A nil seam leaves the row unprobed.
+	keystoreFloorDamage func(context.Context) (int, error)
+	// keystoreMaintenance reads a standing maintenance marker
+	// (keystore.FileStore.StandingMaintenance): whether one stands and the
+	// command of the run that wrote it. A nil seam leaves the row unprobed.
+	keystoreMaintenance func(context.Context) (verb string, present bool, err error)
 	// interconnect is the interconnect section's seams (doctorinterconnect.go).
 	// Nil leaves the section out of the report.
 	interconnect *interconnectEnv
@@ -150,7 +168,128 @@ func doctorChecks() []doctorCheck {
 		{"datastore", checkDatastore},
 		{"toolchain", checkXcodeToolchain},
 		{"agent-daemon", checkAgentDaemon},
+		{"keystore-logs", checkKeystoreLogs},
+		{"keystore-floor", checkKeystoreFloor},
+		{"keystore-maintenance", checkKeystoreMaintenance},
 	}
+}
+
+// checkKeystoreLogs is the keystore's append-only files row: the flag and
+// owner check the server's start step makes before it starts the user
+// scope. A worker has no keystore. A log install has not made is a WARN
+// naming install; a log the check refuses (its flag clear, not the
+// service user's, at another mode) is a FAIL, since the server keeps the
+// user scope off until it is put right; a log an ordinary account cannot
+// open is a WARN naming sudo. Logs that pass but have grown past the soft
+// cap are a WARN with the hint: export the audit archives first, then
+// rotate; rebuild the floor.
+func checkKeystoreLogs(env doctorEnv) checkResult {
+	const name = "keystore-logs"
+	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+		return checkResult{name: name, status: statusSkip, detail: "a worker keeps no keystore"}
+	}
+	if env.keystoreLogs == nil {
+		return checkResult{name: name, status: statusSkip, detail: "not probed"}
+	}
+	err := env.keystoreLogs(context.Background())
+	switch {
+	case err == nil:
+		if r, past := keystoreSoftCapHint(env); past {
+			return r
+		}
+		return checkResult{name: name, status: statusPass, detail: "both append-only logs are the service user's, mode 0600, flagged SF_APPEND"}
+	case errors.Is(err, fs.ErrNotExist):
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("the keystore user scope is off: %v", err), remedy: "sudo k3sm install"}
+	case errors.Is(err, fs.ErrPermission):
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("could not read the keystore logs: %v", err), remedy: "sudo k3sm doctor   # the data root's keystore files are root's and the service user's"}
+	}
+	if verb, ok := keystore.LinkedLogRepair(err); ok {
+		return checkResult{name: name, status: statusFail, detail: fmt.Sprintf("the keystore user scope stays off: %v", err), remedy: verb + "   # replaces the hard-linked log with a fresh file"}
+	}
+	return checkResult{name: name, status: statusFail, detail: fmt.Sprintf("the keystore user scope stays off: %v", err), remedy: "after a restore: sudo k3sm keys floor --rebuild; sudo k3sm keys audit --rotate   # each flags its log append-only again"}
+}
+
+// checkKeystoreFloor is the keystore-floor row: the user-scope floor's
+// damage (keystore.FileStore.FloorDamage). No damaged line is PASS;
+// damaged lines, which the reader skips and which refuse the grants and
+// reads of every key they could name, are WARN with the count; a floor past
+// the reader's bounds is WARN with that damage. floor --rebuild repairs
+// both: it streams the floor with no size bound and reports what it
+// dropped. A floor that cannot be opened is the keystore-logs row's, so it
+// is SKIP here.
+func checkKeystoreFloor(env doctorEnv) checkResult {
+	const name = "keystore-floor"
+	const remedy = "sudo k3sm keys floor --rebuild   # rewrites the floor from the old one and every scope's entries, and lists what it dropped (exit 4)"
+	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+		return checkResult{name: name, status: statusSkip, detail: "a worker keeps no keystore"}
+	}
+	if env.keystoreFloorDamage == nil {
+		return checkResult{name: name, status: statusSkip, detail: "not probed"}
+	}
+	n, err := env.keystoreFloorDamage(context.Background())
+	switch {
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, fs.ErrPermission):
+		return checkResult{name: name, status: statusSkip, detail: fmt.Sprintf("the floor was not read (see keystore-logs): %v", err)}
+	case err != nil:
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("the user-scope floor is damaged past what the reader reads (%d damaged lines before it): %v", n, err), remedy: remedy}
+	case n > 0:
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("the user-scope floor holds %d damaged lines, which the reader skips; grants and reads of every key they could name are refused", n), remedy: remedy}
+	}
+	return checkResult{name: name, status: statusPass, detail: "the user-scope floor holds no damaged line"}
+}
+
+// checkKeystoreMaintenance is the standing maintenance marker's row: none
+// is PASS; one is WARN, since the server keeps the user scope's listener
+// down while it stands, naming the verb that left it and the one to run:
+// a rerun of that verb finishes it, or prints the committed run's report,
+// and install removes a marker that names no verb this build knows.
+func checkKeystoreMaintenance(env doctorEnv) checkResult {
+	const name = "keystore-maintenance"
+	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+		return checkResult{name: name, status: statusSkip, detail: "a worker keeps no keystore"}
+	}
+	if env.keystoreMaintenance == nil {
+		return checkResult{name: name, status: statusSkip, detail: "not probed"}
+	}
+	verb, present, err := env.keystoreMaintenance(context.Background())
+	switch {
+	case !present:
+		return checkResult{name: name, status: statusPass, detail: "no " + keystore.MaintenanceMarkerName + " marker stands"}
+	case err != nil:
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands and could not be read: %v", keystore.MaintenanceMarkerName, err), remedy: "sudo k3sm doctor   # the marker is root's"}
+	case verb == "":
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, naming no maintenance verb this build knows; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName), remedy: "sudo k3sm install   # removes a stale marker"}
+	}
+	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, left by keys %s, which stopped or did not report; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName, verb), remedy: "sudo k3sm keys " + verb + "   # finishes the run, or prints its committed report"}
+}
+
+// keystoreSoftCapHint is the keystore-logs row's WARN when either log is
+// past its soft cap, and whether one is: the audit log's hint says to
+// export the archives first (copy them off the Mac), then rotate, and the
+// floor's to rebuild it. A size that cannot be read gives no hint: the
+// flag check already passed.
+func keystoreSoftCapHint(env doctorEnv) (checkResult, bool) {
+	const name = "keystore-logs"
+	if env.keystoreLogSizes == nil {
+		return checkResult{}, false
+	}
+	sz, err := env.keystoreLogSizes(context.Background())
+	if err != nil {
+		return checkResult{}, false
+	}
+	var details, remedies []string
+	if sz.Audit > sz.SoftCap {
+		details = append(details, fmt.Sprintf("the audit log is %d bytes, past its soft cap of %d", sz.Audit, sz.SoftCap))
+		remedies = append(remedies, "export the audit archives first: as root (only root can read them), copy keystore-audit.log.1 to .4 from keystore-logs/audit/archives/ in the data root off the Mac, then run sudo k3sm keys audit --rotate (with --discard-oldest once .4 exists)")
+	}
+	if sz.UserFloor > sz.SoftCap {
+		details = append(details, fmt.Sprintf("the user-scope floor log is %d bytes, past its soft cap of %d", sz.UserFloor, sz.SoftCap))
+		remedies = append(remedies, "sudo k3sm keys floor --rebuild")
+	}
+	if len(details) == 0 {
+		return checkResult{}, false
+	}
+	return checkResult{name: name, status: statusWarn, detail: strings.Join(details, "; ") + fmt.Sprintf("; past the hard cap of %d no user-scope change is recorded", sz.HardCap), remedy: strings.Join(remedies, "; ")}, true
 }
 
 // checkArch verifies the binary runs on Apple Silicon (arm64). k3sm is
@@ -794,6 +933,36 @@ func realDoctorEnv(workDir string) doctorEnv {
 		daemonInfo:   probeDaemonInfo,
 		reportDir:    makeReportDir,
 		writeReport:  writeReportFile,
+		keystoreLogs: func(ctx context.Context) error {
+			uid, _, err := lookupServiceIDs()
+			if err != nil {
+				return err
+			}
+			cfg := keystoreLayout(workDir)
+			cfg.UID = uid
+			return keystore.New(cfg).CheckLogFlags(ctx)
+		},
+		keystoreLogSizes: func(ctx context.Context) (keystore.LogSizes, error) {
+			uid, _, err := lookupServiceIDs()
+			if err != nil {
+				return keystore.LogSizes{}, err
+			}
+			cfg := keystoreLayout(workDir)
+			cfg.UID = uid
+			return keystore.New(cfg).LogSizes(ctx)
+		},
+		keystoreFloorDamage: func(ctx context.Context) (int, error) {
+			uid, _, err := lookupServiceIDs()
+			if err != nil {
+				return 0, err
+			}
+			cfg := keystoreLayout(workDir)
+			cfg.UID = uid
+			return keystore.New(cfg).FloorDamage(ctx)
+		},
+		keystoreMaintenance: func(ctx context.Context) (string, bool, error) {
+			return keystore.New(keystoreLayout(workDir)).StandingMaintenance(ctx)
+		},
 		interconnect: realInterconnectEnv(),
 	}
 }

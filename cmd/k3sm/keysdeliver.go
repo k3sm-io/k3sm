@@ -188,6 +188,10 @@ func keysUndeliver(ctx context.Context, args []string, env keysEnv) int {
 	if code := v.requireRoot(); code != keysOK {
 		return code
 	}
+	// The store is opened only for the verb's audit line (runKeysWith); one
+	// that cannot be opened has no log to write it to, and the withdrawal
+	// goes ahead.
+	_, _ = v.store()
 	path, err := v.deliveryPath()
 	if err != nil {
 		return v.failf(keysBadUsage, "%v", err)

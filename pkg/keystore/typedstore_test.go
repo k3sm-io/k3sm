@@ -407,6 +407,7 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 
 	// A user scope holding a planted pair, read through every UserScope
 	// method, the deliveries path included.
+	startScopes(t, s)
 	u, err := s.UserScope(1001)
 	check("UserScope", u, err)
 	if err != nil {
@@ -460,6 +461,15 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 			t.Errorf("the audit sink or the user-scope floor carries the refresh token as %q", enc)
 		}
 	}
+
+	// The root maintenance verbs take a file-attribute writer reflection
+	// cannot build: each is called by hand with a recording one, last, as
+	// they rewrite the logs read above. Whether it succeeds or refuses, its
+	// report and its error must not carry the token.
+	rb, err := s.RebuildFloor(ctx, &attrRecorder{})
+	check("RebuildFloor", rb, err)
+	ra, err := s.RotateAudit(ctx, &attrRecorder{}, false)
+	check("RotateAudit", ra, err)
 
 	// allow lists the methods that return no secret data and are not
 	// called above, each with its reason. It is empty: every method is

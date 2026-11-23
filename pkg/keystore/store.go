@@ -35,6 +35,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -111,6 +112,18 @@ type Config struct {
 	// A negative value, or a nonzero one in a process whose effective uid is
 	// 0, makes every operation fail: root's floor belongs to root.
 	FloorUID, FloorGID int
+	// LogFlags is the append-only logs' flag source, for tests only: nil,
+	// as production leaves it, reads each log's st_flags with fstat. A
+	// non-root test, which cannot set SF_APPEND, supplies one.
+	LogFlags func(*os.File) (uint32, error)
+	// LogSoftCap and LogHardCap are each append-only log's soft and hard
+	// caps in bytes (keystore.logSoftCap, keystore.logHardCap), and
+	// LogRevocationBudget each uid's bytes per log for the revocation class
+	// past the hard cap. Zero is the default: 64 MiB, 256 MiB and 704 KiB
+	// (defaultLogRevocationBytes). A negative value, a soft cap over the
+	// hard cap, or a budget under one worst-case burial plus its audit line
+	// (minLogRevokeBudget), makes every operation fail.
+	LogSoftCap, LogHardCap, LogRevocationBudget int64
 }
 
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
@@ -149,6 +162,9 @@ type FileStore struct {
 	// entryMade is called between a new entry directory's mkdir and its open,
 	// where a test swaps the directory.
 	entryMade func(name string)
+	// entryOpen, when set, is called before rm opens an entry directory; a
+	// non-nil return fails the open, where a test makes it fail.
+	entryOpen func(name string) error
 	// dirMade is called inside mkdirAt, between the mkdir and the Lstat that
 	// takes the new directory's identity, where a test swaps the directory.
 	dirMade func(name string)
@@ -160,9 +176,29 @@ type FileStore struct {
 	// a new directory must be owned by before it is handed over.
 	euid func() int
 	// userFloor and auditSink are the user-scope floor and the audit log
-	// (userlogs.go). New installs ones that refuse every call.
+	// (userlogs.go). New installs the file-backed ones.
 	userFloor userFloorLog
 	auditSink auditSink
+	// logFlags is the chflags flag source: a log's st_flags, read on its
+	// descriptor, which must carry SF_APPEND.
+	logFlags func(*os.File) (uint32, error)
+	// logSoftCap, logHardCap and logRevokeBudget are Config's log caps,
+	// with the defaults filled in.
+	logSoftCap, logHardCap, logRevokeBudget int64
+	// userScopesStarted is set by startUserScopes once the server's
+	// user-scope start step has run; until then UserScope refuses
+	// (errUserScopesNotStarted). A pointer, so a copy of the store shares
+	// it; New allocates it.
+	userScopesStarted *atomic.Bool
+	// quarantined is the set of uids whose scope the start step refused a
+	// live catch-up line for: UserScope refuses each with errFloorDegraded,
+	// and every other scope starts. A pointer, as userScopesStarted is;
+	// New allocates it.
+	quarantined *atomic.Pointer[map[uint32]bool]
+	// lostLines is the entries whose put this process committed without
+	// its floor line, which the next operation on the scope catches up. A
+	// pointer, as userScopesStarted is; New allocates it.
+	lostLines *lostEntryLines
 }
 
 var _ Store = (*FileStore)(nil)
@@ -170,28 +206,47 @@ var _ Store = (*FileStore)(nil)
 // New returns the FileStore cfg describes. It touches nothing on disk, and it
 // does not judge cfg: every operation does that first (see checkConfig).
 func New(cfg Config) *FileStore {
-	return &FileStore{
-		dir:            cfg.Dir,
-		masterDir:      cfg.MasterDir,
-		dataRoot:       cfg.DataRoot,
-		uid:            cfg.UID,
-		gid:            cfg.GID,
-		floorUID:       cfg.FloorUID,
-		floorGID:       cfg.FloorGID,
-		scope:          scopeSystem,
-		rand:           rand.Reader,
-		now:            time.Now,
-		chown:          (*os.File).Chown,
-		lockWait:       lockTimeout,
-		step:           func(string) error { return nil },
-		owned:          func([]byte) {},
-		entryMade:      func(string) {},
-		dirMade:        func(string) {},
-		dataRootLocked: func() {},
-		euid:           os.Geteuid,
-		userFloor:      unbuiltUserFloor{},
-		auditSink:      unbuiltAudit{},
+	s := &FileStore{
+		dir:             cfg.Dir,
+		masterDir:       cfg.MasterDir,
+		dataRoot:        cfg.DataRoot,
+		uid:             cfg.UID,
+		gid:             cfg.GID,
+		floorUID:        cfg.FloorUID,
+		floorGID:        cfg.FloorGID,
+		scope:           scopeSystem,
+		rand:            rand.Reader,
+		now:             time.Now,
+		chown:           (*os.File).Chown,
+		lockWait:        lockTimeout,
+		step:            func(string) error { return nil },
+		owned:           func([]byte) {},
+		entryMade:       func(string) {},
+		dirMade:         func(string) {},
+		dataRootLocked:  func() {},
+		euid:            os.Geteuid,
+		logFlags:        fileFlags,
+		logSoftCap:      orDefault(cfg.LogSoftCap, defaultLogSoftCap),
+		logHardCap:      orDefault(cfg.LogHardCap, defaultLogHardCap),
+		logRevokeBudget: orDefault(cfg.LogRevocationBudget, defaultLogRevocationBytes),
+
+		userScopesStarted: new(atomic.Bool),
+		quarantined:       new(atomic.Pointer[map[uint32]bool]),
+		lostLines:         new(lostEntryLines),
 	}
+	if cfg.LogFlags != nil {
+		s.logFlags = cfg.LogFlags
+	}
+	s.userFloor, s.auditSink = newFileFloorLog(s), newFileAuditLog(s)
+	return s
+}
+
+// orDefault is v, or def when v is zero.
+func orDefault(v, def int64) int64 {
+	if v == 0 {
+		return def
+	}
+	return v
 }
 
 // checkConfig refuses a store every operation must fail closed on: a zero
@@ -218,6 +273,18 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: MasterDir is empty", errInvalidConfig)
 	case s.dataRoot == "":
 		return fmt.Errorf("%w: DataRoot is empty", errInvalidConfig)
+	case s.logSoftCap < 0 || s.logHardCap < 0 || s.logRevokeBudget < 0:
+		return fmt.Errorf("%w: a log cap or budget is negative", errInvalidConfig)
+	case s.logRevokeBudget < minLogRevokeBudget:
+		// A budget under one worst-case burial plus its audit line refuses
+		// an rm's tombstones or its audit line, so it would silently
+		// disable revocation.
+		return fmt.Errorf("%w: LogRevocationBudget %d is under one worst-case burial plus its audit line, %d", errInvalidConfig, s.logRevokeBudget, int64(minLogRevokeBudget))
+	case s.logSoftCap > s.logHardCap:
+		return fmt.Errorf("%w: LogSoftCap %d is over LogHardCap %d", errInvalidConfig, s.logSoftCap, s.logHardCap)
+	case s.logHardCap > maxLogHardCap || s.logRevokeBudget > maxLogRevokeBudget:
+		// Bounded so logReadBound cannot overflow.
+		return fmt.Errorf("%w: LogHardCap %d is over %d, or LogRevocationBudget %d is over %d", errInvalidConfig, s.logHardCap, int64(maxLogHardCap), s.logRevokeBudget, int64(maxLogRevokeBudget))
 	}
 	for _, p := range []struct{ field, path string }{{"Dir", s.dir}, {"MasterDir", s.masterDir}, {"DataRoot", s.dataRoot}} {
 		if !filepath.IsAbs(p.path) {

@@ -21,6 +21,8 @@ package keystore
 /*
 #include <sys/types.h>
 #include <sys/acl.h>
+#include <sys/fcntl.h>
+#include <sys/stat.h>
 #include <errno.h>
 
 // k3sm_has_acl is 1 when the file fd holds has an extended ACL with at
@@ -32,6 +34,21 @@ static int k3sm_has_acl(int fd) {
 	acl_entry_t e;
 	int r = acl_get_entry(a, ACL_FIRST_ENTRY, &e) == 0 ? 1 : 0;
 	acl_free(a);
+	return r;
+}
+
+// k3sm_remove_acl removes the extended ACL of the file fd holds, as
+// chmod -N does: fchmodx_np with a filesec whose ACL is
+// _FILESEC_REMOVE_ACL, leaving owner, group and mode unchanged. It is 0,
+// or -1 with errno set.
+static int k3sm_remove_acl(int fd) {
+	filesec_t f = filesec_init();
+	if (f == NULL) return -1;
+	int r = filesec_set_property(f, FILESEC_ACL, _FILESEC_REMOVE_ACL);
+	if (r == 0) r = fchmodx_np(fd, f);
+	int e = errno;
+	filesec_free(f);
+	errno = e;
 	return r;
 }
 */
@@ -53,4 +70,17 @@ func hasExtendedACL(fd int) (bool, error) {
 		return false, fmt.Errorf("read the ACL: %w", err)
 	}
 	return false, fmt.Errorf("read the ACL: acl_get_fd_np failed")
+}
+
+// removeExtendedACL removes the extended ACL of the file fd holds, on the
+// descriptor (fchmodx_np, _FILESEC_REMOVE_ACL); a file with none is left
+// as it is.
+func removeExtendedACL(fd int) error {
+	if r, err := C.k3sm_remove_acl(C.int(fd)); r != 0 {
+		if err != nil {
+			return fmt.Errorf("remove the ACL: %w", err)
+		}
+		return fmt.Errorf("remove the ACL: fchmodx_np failed")
+	}
+	return nil
 }

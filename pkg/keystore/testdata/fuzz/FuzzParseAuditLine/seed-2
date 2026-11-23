@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"v\":1,\"op\":\"put\",\"via\":\"socket\",\"caller\":{\"uid\":501,\"user\":\"alice\",\"pid\":4242},\"future\":[1,2]}")

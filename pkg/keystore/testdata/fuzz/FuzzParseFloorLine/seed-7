@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("system token 10a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1 1")

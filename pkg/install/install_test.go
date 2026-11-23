@@ -62,6 +62,10 @@ func TestMain(m *testing.M) {
 	dataroot.DefaultRecordPath = filepath.Join(dir, "io.k3sm.datavol.json")
 	dataroot.DefaultServerArgsRecordPath = filepath.Join(dir, "io.k3sm.server-args.json")
 	dataroot.DefaultAgentArgsRecordPath = filepath.Join(dir, "io.k3sm.agent-args.json")
+	// The package's seams (seams.go): a unit test that forgets to inject a
+	// fake panics instead of reaching the host.
+	euidSeam = func() int { panic("a unit test reached geteuid: inject a fake euid source") }
+	fileAttrSeam = panicFileAttrWriter{}
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
@@ -845,6 +849,11 @@ func (f *fakeSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
 
 func (f *fakeSystem) EnsureLogDir(dir string, uid uint32) error {
 	f.calls = append(f.calls, "EnsureLogDir:"+dir)
+	return nil
+}
+
+func (f *fakeSystem) EnsureKeystoreFiles(dataRoot string, uid uint32) error {
+	f.calls = append(f.calls, "EnsureKeystoreFiles:"+dataRoot)
 	return nil
 }
 
@@ -1985,6 +1994,9 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureOwnedDir:/var/lib/k3sm/artifacts:271:20:0711",
 		"EnsureOwnedDir:/var/lib/k3sm/.local-stage:271:20:0700",
 		"EnsureOwnedFile:/var/lib/k3sm/runtimed.lock:271:20:0600",
+		// The keystore's append-only files, on a server, in the data root the
+		// state tree step has just made root's.
+		"EnsureKeystoreFiles:/var/lib/k3sm",
 		"EnsureLogDir:/var/log/k3sm",
 		// The purge markers, once both trees exist: `uninstall --purge` refuses
 		// to delete either tree without the marker naming it.

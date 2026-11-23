@@ -97,7 +97,7 @@ func keystoreDeliveryGate(plan serverPlan) (encryptionOn, allowPlaintext bool) {
 func startKeystoreDelivery(ctx context.Context, plan serverPlan, cs kubernetes.Interface, logger *slog.Logger) (stop func()) {
 	encryptionOn, allowPlaintext := keystoreDeliveryGate(plan)
 	cfg, err := keystoreDeliveryConfig(plan.opts.workDir, encryptionOn, allowPlaintext, cs,
-		keystoreDeliveryIDs{euid: os.Geteuid, egid: os.Getegid, service: lookupServiceIDs}, logger)
+		keystoreDeliveryIDs{euid: func() int { return euidSeam() }, egid: os.Getegid, service: lookupServiceIDs}, logger)
 	if err != nil {
 		logger.Error("keystore delivery disabled", "err", err)
 		return noStop

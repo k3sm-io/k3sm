@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("user/1001 token 10a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1 RM")

@@ -30,6 +30,7 @@ import (
 
 func userScope(t *testing.T, s *FileStore, uid uint32) *UserScope {
 	t.Helper()
+	startScopes(t, s)
 	u, err := s.UserScope(uid)
 	if err != nil {
 		t.Fatalf("UserScope(%d): %v", uid, err)
@@ -70,13 +71,21 @@ func copyTree(t *testing.T, src, dst string) {
 			return err
 		}
 		if d.IsDir() {
-			return os.Mkdir(to, fi.Mode().Perm())
+			if err := os.Mkdir(to, fi.Mode().Perm()); err != nil {
+				return err
+			}
+			giveToService(t, to)
+			return nil
 		}
 		b, err := os.ReadFile(p)
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(to, b, fi.Mode().Perm())
+		if err := os.WriteFile(to, b, fi.Mode().Perm()); err != nil {
+			return err
+		}
+		giveToService(t, to)
+		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -268,6 +277,8 @@ func TestScopeCopyWithoutMasterOpensNothing(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(serverB, "keystore", userScopesName), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// The service user owns .user/, as the store would have made it.
+	giveToService(t, filepath.Join(serverB, "keystore", userScopesName))
 	copyTree(t, scopeDir(serverA, "1001"), scopeDir(serverB, "1001"))
 	ub := userScope(t, b, 1001)
 	if _, v, err := ub.Current(ctx, "user/1001/token"); !errors.Is(err, ErrCorrupt) {

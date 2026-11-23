@@ -17,7 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
 	"strings"
@@ -26,6 +28,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/k3sm/pkg/status"
 )
 
@@ -98,6 +101,76 @@ func TestDoctorChecksTable(t *testing.T) {
 		{"sip/warn-probe-error", checkSIP, func(e *doctorEnv) {
 			e.sipEnabled = func() (bool, error) { return false, errors.New("no csrutil") }
 		}, statusWarn},
+
+		// keystore-logs: both logs flagged and the service user's → PASS;
+		// missing → WARN naming install; refused (flag clear, wrong owner) →
+		// FAIL; unreadable as an ordinary account → WARN; a worker → SKIP.
+		{"keystore-logs/pass", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return nil }
+		}, statusPass},
+		{"keystore-logs/warn-missing", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return fmt.Errorf("no log: %w", fs.ErrNotExist) }
+		}, statusWarn},
+		{"keystore-logs/warn-permission", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return fmt.Errorf("open: %w", fs.ErrPermission) }
+		}, statusWarn},
+		{"keystore-logs/fail-unflagged", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return errors.New("the log is not flagged append-only") }
+		}, statusFail},
+		{"keystore-logs/pass-under-soft-cap", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return nil }
+			e.keystoreLogSizes = func(context.Context) (keystore.LogSizes, error) {
+				return keystore.LogSizes{UserFloor: 10, Audit: 64, SoftCap: 64, HardCap: 256}, nil
+			}
+		}, statusPass},
+		{"keystore-logs/warn-past-soft-cap", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return nil }
+			e.keystoreLogSizes = func(context.Context) (keystore.LogSizes, error) {
+				return keystore.LogSizes{UserFloor: 65, SoftCap: 64, HardCap: 256}, nil
+			}
+		}, statusWarn},
+		{"keystore-logs/skip-worker", checkKeystoreLogs, func(e *doctorEnv) {
+			e.nodeRole = func() (install.Role, bool) { return install.RoleAgent, true }
+		}, statusSkip},
+
+		// keystore-floor: no damage → PASS; damaged lines or a floor past
+		// the reader's bounds → WARN naming floor --rebuild; a floor not
+		// read (missing, permission) → SKIP, the keystore-logs row's; a
+		// worker or no seam → SKIP.
+		{"keystore-floor/pass", checkKeystoreFloor, func(e *doctorEnv) {
+			e.keystoreFloorDamage = func(context.Context) (int, error) { return 0, nil }
+		}, statusPass},
+		{"keystore-floor/warn-damaged", checkKeystoreFloor, func(e *doctorEnv) {
+			e.keystoreFloorDamage = func(context.Context) (int, error) { return 3, nil }
+		}, statusWarn},
+		{"keystore-floor/warn-past-bounds", checkKeystoreFloor, func(e *doctorEnv) {
+			e.keystoreFloorDamage = func(context.Context) (int, error) {
+				return 1, errors.New("the keystore append-only log is larger than the reader's bound")
+			}
+		}, statusWarn},
+		{"keystore-floor/skip-missing", checkKeystoreFloor, func(e *doctorEnv) {
+			e.keystoreFloorDamage = func(context.Context) (int, error) { return 0, fmt.Errorf("no log: %w", fs.ErrNotExist) }
+		}, statusSkip},
+		{"keystore-floor/skip-unprobed", checkKeystoreFloor, func(e *doctorEnv) { e.keystoreFloorDamage = nil }, statusSkip},
+		{"keystore-floor/skip-worker", checkKeystoreFloor, func(e *doctorEnv) {
+			e.nodeRole = func() (install.Role, bool) { return install.RoleAgent, true }
+		}, statusSkip},
+
+		// keystore-maintenance: no marker → PASS; a standing marker → WARN
+		// naming its verb; a worker or no seam → SKIP.
+		{"keystore-maintenance/pass", checkKeystoreMaintenance, func(e *doctorEnv) {
+			e.keystoreMaintenance = func(context.Context) (string, bool, error) { return "", false, nil }
+		}, statusPass},
+		{"keystore-maintenance/warn-standing", checkKeystoreMaintenance, func(e *doctorEnv) {
+			e.keystoreMaintenance = func(context.Context) (string, bool, error) { return "floor --rebuild", true, nil }
+		}, statusWarn},
+		{"keystore-maintenance/warn-unknown", checkKeystoreMaintenance, func(e *doctorEnv) {
+			e.keystoreMaintenance = func(context.Context) (string, bool, error) { return "", true, nil }
+		}, statusWarn},
+		{"keystore-maintenance/skip-unprobed", checkKeystoreMaintenance, func(e *doctorEnv) { e.keystoreMaintenance = nil }, statusSkip},
+		{"keystore-maintenance/skip-worker", checkKeystoreMaintenance, func(e *doctorEnv) {
+			e.nodeRole = func() (install.Role, bool) { return install.RoleAgent, true }
+		}, statusSkip},
 
 		// netd-helper: installed+running → PASS, installed-only → WARN, absent → WARN.
 		{"helper/pass-running", checkHelper, func(e *doctorEnv) {
@@ -378,7 +451,7 @@ func TestDoctorChecksTable(t *testing.T) {
 				t.Errorf("registry entry %q returns checkResult.name %q — must match", dc.name, r.name)
 			}
 		}
-		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon"} {
+		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon", "keystore-logs", "keystore-floor", "keystore-maintenance"} {
 			if !seen[want] {
 				t.Errorf("registry missing check %q", want)
 			}
@@ -399,4 +472,15 @@ func TestDoctorChecksTable(t *testing.T) {
 			t.Fatalf("status tags collide: %v", tags)
 		}
 	})
+}
+
+// A standing maintenance marker's WARN names the verb that left it and the
+// command to run.
+func TestDoctorKeystoreMaintenanceNamesVerb(t *testing.T) {
+	e := healthyDoctorEnv()
+	e.keystoreMaintenance = func(context.Context) (string, bool, error) { return "audit --rotate", true, nil }
+	r := checkKeystoreMaintenance(e)
+	if r.status != statusWarn || !strings.Contains(r.detail, "left by keys audit --rotate") || !strings.HasPrefix(r.remedy, "sudo k3sm keys audit --rotate") {
+		t.Fatalf("the row is %+v, want WARN naming audit --rotate and its rerun", r)
+	}
 }

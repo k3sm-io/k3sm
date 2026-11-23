@@ -24,6 +24,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 
 	keyentry "k3sm.io/apis/keystore/entry"
@@ -43,22 +44,19 @@ import (
 // (O_NOFOLLOW, a regular file, a bounded read).
 //
 // The scope's delivery record (kind 0xFD) is deliveries.go, its quotas and
-// rm quota.go, and Rewrap of scope.key rewrapscope.go. Not here yet: the
-// user-scope floor for entries (the delivery record reaches the floor
-// through the userFloorLog seam, userlogs.go).
+// rm quota.go, and Rewrap of scope.key rewrapscope.go. The user-scope floor
+// (userlogs.go) holds a line per entry and per delivery record: a put
+// appends its entry's line after the pointer, and a read refuses a pointer
+// below its line (userfloor.go).
 //
-// Until the user-scope floor lands, a user entry is read against no floor,
-// with two consequences. A copied-back older pointer of a user entry is not
-// refused. And an entry directory with no current pointer cannot be told
-// apart: the system scope's interrupted-put rule needs the floor to tell a
-// crashed Put (generation, maybe v1) from a committed entry whose current,
-// or current and v1, were unlinked, and without it the two shapes are the
-// same files. So the user scope treats every entry directory without a
-// current pointer as damage: ErrCorrupt, never ErrNotFound, and never
-// removed, a crashed user Put included (openUserEntry, createUserEntry). The
-// user-scope floor brings back the interrupted-put rule. No caller outside
-// this package reaches the user scope before the socket does, after the
-// floor (TestUserScopeIsUnexported).
+// The interrupted-put rule is not brought back yet: the system scope's rule
+// needs the floor to tell a crashed Put (generation, maybe v1) from a
+// committed entry whose current, or current and v1, were unlinked, and the
+// user scope does not consult its floor for that. So it treats every entry
+// directory without a current pointer as damage: ErrCorrupt, never
+// ErrNotFound, and never removed, a crashed user Put included
+// (openUserEntry, createUserEntry). No caller outside this package reaches
+// the user scope before the socket does (TestUserScopeIsUnexported).
 
 const (
 	// scopeKeyName is a scope's wrapped key, scopeEntriesName its entries'
@@ -110,12 +108,23 @@ type UserScope struct {
 	s     *FileStore
 	uid   uint32
 	scope string
+	// allowRemoved lets rm-scope open a scope key the removed-scopes record
+	// already lists: a rerun after an rm-scope that recorded it and stopped.
+	allowRemoved bool
 }
 
 // UserScope returns uid's view of the store. A uid outside 501 to
 // 2147483647, or the service uid, is refused: root has no user scope, and
-// neither has a system account, nobody or the service user.
+// neither has a system account, nobody or the service user. Until the
+// server's start step has run (startUserScopes) it refuses every uid,
+// errUserScopesNotStarted. A uid whose scope the start step quarantined
+// still gets its view: its grant and read verbs refuse (quarantineErr), and
+// its rm and withdraw run, since a revocation is never blocked by the
+// floor's damage.
 func (s *FileStore) UserScope(uid uint32) (*UserScope, error) {
+	if s.userScopesStarted == nil || !s.userScopesStarted.Load() {
+		return nil, errUserScopesNotStarted
+	}
 	scope := userScopeOf(uid)
 	if err := checkScope(scope); err != nil {
 		return nil, err
@@ -124,6 +133,18 @@ func (s *FileStore) UserScope(uid uint32) (*UserScope, error) {
 		return nil, err
 	}
 	return &UserScope{s: s, uid: uid, scope: scope}, nil
+}
+
+// quarantineErr refuses a grant or a read in a scope the start step
+// quarantined (startUserScopes), errFloorDegraded; nil otherwise. It is
+// asked per call, so an acknowledgement that lifts the quarantine
+// (ackFloorDamage) takes effect on a view already handed out. Delete and
+// Withdraw never ask it.
+func (u *UserScope) quarantineErr() error {
+	if u.s.scopeQuarantined(u.uid) {
+		return fmt.Errorf("%w: %w", errScopeQuarantined, errFloorDegraded)
+	}
+	return nil
 }
 
 // notFound is the one ErrNotFound a UserScope answers for op, whatever the
@@ -185,6 +206,10 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 		g.refusedBriefly(ctx, err)
 		return Version{}, err
 	}
+	if err := u.quarantineErr(); err != nil {
+		g.refusedBriefly(ctx, err)
+		return Version{}, err
+	}
 	// The entries' directory is never created here: a root put creates it
 	// with the master.
 	root, done, err := u.s.openLocked(ctx, false, true)
@@ -200,21 +225,42 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 			g.refused(err)
 		}
 	}()
+	if err := u.s.admit(u.uid, false); err != nil {
+		return Version{}, err
+	}
 	grant := g.take
 	k, err := u.masterForWrite()
 	if err != nil {
 		return Version{}, err
 	}
 	uk, entries, err := u.openScope(root, func() (keys, error) { return k, nil })
+	roomJudged := false
 	if errors.Is(err, errNoScopeKey) {
+		// The mint appends the delivery record's floor line first. This one
+		// check covers the name's line too, so none follows the mint's ok
+		// audit line: a refusal after it would be audited after an ok.
+		if err := u.s.floorGrantRoom(u.scope, []string{deliveriesFloorName, name}, entryWriteBytes(name, value)); err != nil {
+			return Version{}, err
+		}
+		roomJudged = true
 		uk, entries, err = u.mint(root, k.wrap, grant)
 	}
 	if err != nil {
 		return Version{}, err
 	}
 	defer func() { _ = entries.Close() }() // writes are fsynced by writeFile
+	if names := u.s.lostLines.names(u.scope); len(names) > 0 {
+		u.catchUpLostIn(entries, uk, names)
+	}
 	if err := u.checkNewName(entries, name); err != nil {
 		return Version{}, err
+	}
+	// Refuse, before the grant's first write, a put whose floor line would
+	// be refused after its commit.
+	if !roomJudged {
+		if err := u.s.floorGrantRoom(u.scope, []string{name}, entryWriteBytes(name, value)); err != nil {
+			return Version{}, err
+		}
 	}
 	base, err := u.deliveriesBytes(root)
 	if err != nil {
@@ -231,7 +277,18 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	defer e.close()
-	return u.s.writeEntry(e, uk, kind, value)
+	v, err := u.s.writeEntry(e, uk, kind, value)
+	if err != nil {
+		return Version{}, err
+	}
+	// The record, the pointer, then the floor line: a crash between the
+	// last two leaves the floor one behind, which a read accepts.
+	if err := u.s.userFloor.append(u.scope, name, e.generation, 1, false); err != nil {
+		// The next operation on the scope catches the line up.
+		u.s.lostLines.note(u.scope, name)
+		return v, fmt.Errorf("%w, and its floor line was not written: %w", errCommitted, err)
+	}
+	return v, nil
 }
 
 // masterForWrite loads the master for a user-scope write, read-only: it
@@ -303,7 +360,7 @@ func (u *UserScope) createUserEntry(entries *os.Root, name string) (*entry, erro
 }
 
 // errUserNoPointer is a user entry directory with no current pointer.
-var errUserNoPointer = fmt.Errorf("%w: the entry has no current pointer; until the user-scope floor lands an interrupted put cannot be told from a committed entry whose pointer was removed, so it is refused and kept, not removed", ErrCorrupt)
+var errUserNoPointer = fmt.Errorf("%w: the entry has no current pointer; an interrupted put cannot be told from a committed entry whose pointer was removed, so it is refused and kept, not removed", ErrCorrupt)
 
 // openUserEntry opens name's directory in a user scope's entries/ and reads
 // its generation. A missing directory is ErrNotFound; a directory with no
@@ -338,13 +395,16 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 	if err != nil {
 		return Version{}, nil, err
 	}
+	if err := u.quarantineErr(); err != nil {
+		return Version{}, nil, fail("current", err)
+	}
 	err = u.read(ctx, func(entries *os.Root, uk keys) error {
 		e, err := openUserEntry(entries, name)
 		if err != nil {
 			return err
 		}
 		defer e.close()
-		cur, _, err := e.checkedPointer(uk, nil)
+		cur, err := u.flooredPointer(e, uk)
 		if err != nil {
 			return err
 		}
@@ -366,6 +426,9 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 // does: an entry that cannot be opened carries Err. A uid with no scope is
 // ErrScopeAbsent.
 func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
+	if err := u.quarantineErr(); err != nil {
+		return nil, fail("list", err)
+	}
 	var out []Entry
 	err := u.read(ctx, func(entries *os.Root, uk keys) error {
 		names, err := readDirNames(entries, maxDirNames)
@@ -383,6 +446,11 @@ func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 			}
 			if err != nil {
 				out = append(out, Entry{Name: name, Err: err})
+				continue
+			}
+			if _, err := u.flooredPointer(e, uk); err != nil {
+				out = append(out, Entry{Name: name, Err: err})
+				e.close()
 				continue
 			}
 			out = append(out, listEntry(e, uk, nil))
@@ -541,7 +609,10 @@ func (u *UserScope) readScopeKey(dir *os.Root, wrap func() (keys, error)) ([]byt
 
 // openScopeKey opens the scope.key record r under k's W and, failing that,
 // under master.next's W when k carries one, and returns K_u, which the
-// caller clears.
+// caller clears. A K_u whose identity the removed-scopes record lists is
+// refused (errScopeRemoved), and so is every K_u while that record does not
+// read: every open of a scope key, for a read, a grant, the start step's
+// catch-up or a rebuild, comes here.
 func (u *UserScope) openScopeKey(r record, k keys) ([]byte, error) {
 	ku, err := r.open(k.wrap, u.scope)
 	if err != nil && errors.Is(err, ErrCorrupt) && k.next != nil && k.next.wrap != nil {
@@ -554,8 +625,21 @@ func (u *UserScope) openScopeKey(r record, k keys) ([]byte, error) {
 		clear(ku)
 		return nil, fmt.Errorf("%w: %s holds %d bytes, want %d", ErrCorrupt, scopeKeyName, len(ku), scopeKeySize)
 	}
+	if !u.allowRemoved {
+		if err := u.s.checkScopeNotRemoved(u.uid, scopeKeyID(u.scope, ku)); err != nil {
+			clear(ku)
+			return nil, fmt.Errorf("%s: %w", u.scope, err)
+		}
+	}
 	return ku, nil
 }
+
+// errScopeKeyUntrusted marks an openScopeForRevoke whose scope directory
+// opened but whose scope.key is present and untrusted (ErrCorrupt: a
+// second link, a mode wider than 0600, content that does not parse or
+// open), all of which the service user can cause. rm-scope treats it as a
+// missing scope.key.
+var errScopeKeyUntrusted = errors.New("the scope's scope.key cannot be trusted")
 
 // openScopeForRevoke opens the scope for a revocation: a withdraw, which
 // only ever adds a tombstone. It reads no live GeneratedUID: the bound
@@ -563,7 +647,8 @@ func (u *UserScope) openScopeKey(r record, k keys) ([]byte, error) {
 // directory service that is slow, down, or answering for a new owner of the
 // uid never keeps a revoked credential delivered. It opens scope.key under
 // the live W or master.next's, so it runs at every step of a Rewrap, and
-// needs no entries/ directory.
+// needs no entries/ directory. A scope.key that is present but ErrCorrupt
+// is also errScopeKeyUntrusted.
 func (u *UserScope) openScopeForRevoke(root *os.Root, k keys) (*openedScope, error) {
 	dir, err := u.openScopeDir(root, false)
 	if err != nil {
@@ -576,17 +661,87 @@ func (u *UserScope) openScopeForRevoke(root *os.Root, k keys) (*openedScope, err
 	}
 	if err != nil {
 		_ = dir.Close() // read-only so far
+		if errors.Is(err, ErrCorrupt) {
+			err = fmt.Errorf("%w: %w", errScopeKeyUntrusted, err)
+		}
 		return nil, err
 	}
+	return u.openedFrom(dir, r, ku)
+}
+
+// openedFrom is the opened scope from dir and the K_u ku its scope.key
+// record r opened to; it clears ku, and closes dir on a failure.
+func (u *UserScope) openedFrom(dir *os.Root, r record, ku []byte) (*openedScope, error) {
 	uk, err := deriveKeys(ku, u.scope)
 	dk := deliveriesKey(ku, u.scope)
+	id := scopeKeyID(u.scope, ku)
 	clear(ku) // only the derived keys are kept
 	if err != nil {
 		clear(dk)
 		_ = dir.Close() // read-only so far
 		return nil, err
 	}
-	return &openedScope{dir: dir, key: dk, gen: r.generation, uk: uk}, nil
+	return &openedScope{dir: dir, key: dk, gen: r.generation, uk: uk, id: id}, nil
+}
+
+// errScopeKeyJudgeOnly is openScopeForRmLoose's refusal of a scope.key the
+// judge refused for something other than its link count or mode.
+var errScopeKeyJudgeOnly = errors.New("scope.key's link count and mode are as the judge wants, so its refusal was for another cause")
+
+// openScopeForRmLoose is rm-scope's second open of a scope.key the judge
+// refused (errScopeKeyUntrusted): a second link or a mode wider than 0600
+// fails the judge, but any local user can cause either, and the content
+// still authenticates under the master, so removing the scope unlisted
+// would let a copy put back open. It reads scope.key by descriptor as
+// readScopeKeyRecord does (O_NOFOLLOW, a regular file, bounded at a scope
+// key record's size, owned by the service user) without the link-count and
+// mode checks, and opens it under W as openScopeForRevoke does. why names
+// what the judge refused (its link count, its mode); a scope.key whose
+// link count and mode pass is errScopeKeyJudgeOnly, and one that does not
+// parse or authenticate is ErrCorrupt: both leave the removal unlisted.
+func (u *UserScope) openScopeForRmLoose(root *os.Root, k keys) (o *openedScope, why string, err error) {
+	dir, err := u.openScopeDir(root, false)
+	if err != nil {
+		return nil, "", err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = dir.Close() // read-only
+		}
+	}()
+	b, fi, err := readFile(dir, scopeKeyName, int64(maxScopeKeyRecordSize))
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeKeyName, err)
+	}
+	st, sok := fi.Sys().(*syscall.Stat_t)
+	if !sok || st.Uid != u.s.uid {
+		return nil, "", fmt.Errorf("%w: %s is not the service user's", ErrCorrupt, scopeKeyName)
+	}
+	var whys []string
+	if st.Nlink != 1 {
+		whys = append(whys, fmt.Sprintf("it had %d links, not 1", st.Nlink))
+	}
+	if perm := fi.Mode().Perm(); perm&^fileMode != 0 {
+		whys = append(whys, fmt.Sprintf("its mode was %04o, wider than %04o", perm, fileMode))
+	}
+	if len(whys) == 0 {
+		return nil, "", errScopeKeyJudgeOnly
+	}
+	r, err := parseScopeKey(b)
+	if err != nil {
+		return nil, "", err
+	}
+	ku, err := u.openScopeKey(r, k)
+	if err != nil {
+		return nil, "", err
+	}
+	ok = true
+	o, err = u.openedFrom(dir, r, ku)
+	if err != nil {
+		return nil, "", err
+	}
+	return o, strings.Join(whys, " and "), nil
 }
 
 // readScopeKeyRecord reads and parses dir's scope.key, unopened. The file
@@ -703,7 +858,7 @@ func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, 
 	// The empty delivery record, sequence 1, before scope.key: a scope whose
 	// scope.key opens has its record.
 	dk := deliveriesKey(ku, u.scope)
-	err = u.writeDeliveries(dir, dk, g, nil, 1)
+	err = u.writeDeliveries(dir, dk, g, nil, 1, false)
 	clear(dk)
 	if err != nil {
 		return keys{}, nil, err

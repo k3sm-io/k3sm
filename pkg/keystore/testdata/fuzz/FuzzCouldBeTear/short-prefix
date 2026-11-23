@@ -1,0 +1,5 @@
+go test fuzz v1
+[]byte("user/1")
+uint16(6)
+uint16(0)
+byte('\x00')
