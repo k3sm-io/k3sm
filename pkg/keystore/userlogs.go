@@ -1397,6 +1397,99 @@ func (l *appendLog) reserveBlocks(f *os.File, n int64) error {
 	return nil
 }
 
+// sealTail appends one newline when the log's last byte is not one: the
+// start step's seal (sealUserLogTails), under the exclusive store lock, so
+// a torn last line becomes a closed damaged line (on the floor, read
+// through taintLine), never one that parses, and bytes a foreign writer later appends start a line of their own,
+// even across a restart, where the reader's frozen fragment is not kept.
+// The newline is held to the reader's bound, the revocation slack and a
+// block reservation, as a revocation's line is, and is charged to no uid
+// (an empty line, or the close of a damaged one, is charged to none).
+// A tail torn only at its newline, whose bytes would parse once closed, is
+// left as it is (wholeLine): the seal never makes a torn line parse.
+func (l *appendLog) sealTail() error {
+	f, st, err := l.open(unix.O_RDWR | unix.O_APPEND)
+	if err != nil {
+		l.forgetUnflagged(err, false)
+		return err
+	}
+	defer func() { _ = f.Close() }() // the newline is fsynced below
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if st.Size == 0 {
+		return nil
+	}
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], st.Size-1); err != nil {
+		return fmt.Errorf("read the last byte of %s: %w", l.name, err)
+	}
+	if last[0] == '\n' {
+		return nil
+	}
+	if frag, ok := l.tailFragment(f, st.Size); !ok {
+		return fmt.Errorf("read the torn tail of %s", l.name)
+	} else if l.wholeLine(frag) {
+		// A line torn only at its newline is whole: closing it would make
+		// it parse, and no foreign byte can complete it into another line.
+		return nil
+	}
+	if st.Size+1 > l.s.logReadBound() {
+		return l.pastCap()
+	}
+	if err := l.preflight(f, 1, true); err != nil {
+		return err
+	}
+	if err := l.reserveBlocks(f, 1); err != nil {
+		return err
+	}
+	write := l.write
+	if write == nil {
+		write = (*os.File).Write
+	}
+	if _, err := write(f, []byte{'\n'}); err != nil {
+		return fmt.Errorf("seal the torn tail of %s: %w", l.name, err)
+	}
+	fsync := l.fsync
+	if fsync == nil {
+		fsync = (*os.File).Sync
+	}
+	if err := fsync(f); err != nil {
+		return fmt.Errorf("sync %s: %w", l.name, err)
+	}
+	return nil
+}
+
+// tailFragment returns the bytes after the last newline of f, which is
+// size bytes long, read from at most maxLogLine+1 bytes before its end: a
+// fragment longer than maxLogLine is returned cut to its last maxLogLine+1
+// bytes, which no reader parses. ok is false when the tail cannot be read.
+func (l *appendLog) tailFragment(f *os.File, size int64) (frag []byte, ok bool) {
+	from := max(0, size-maxLogLine-1)
+	buf := make([]byte, size-from)
+	if _, err := f.ReadAt(buf, from); err != nil {
+		return nil, false
+	}
+	if i := bytes.LastIndexByte(buf, '\n'); i >= 0 {
+		return buf[i+1:], true
+	}
+	return buf, true
+}
+
+// wholeLine reports whether frag, a torn tail without its newline, would
+// parse as a line of this log once closed: a floor line whose checksum
+// matches, or an audit line.
+func (l *appendLog) wholeLine(frag []byte) bool {
+	if len(frag) == 0 || len(frag)+1 > maxLogLine {
+		return false
+	}
+	if l.whole {
+		_, err := parseFloorLine(frag)
+		return err == nil
+	}
+	_, err := parseAuditLine(frag)
+	return err == nil
+}
+
 // logBlock is the block an append's reservation is rounded up to, the
 // APFS allocation block.
 const logBlock = 4 << 10

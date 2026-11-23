@@ -1104,6 +1104,11 @@ var errUserScopesNotStarted = errors.New("the user scope is not started: the ser
 // could not run at all. A keystore with no directory or no user scope has
 // nothing to catch up.
 //
+// Before the catch-up, still under the lock, it seals the torn tail of
+// both user-scope logs, the floor and the audit log (sealUserLogTails), so
+// no foreign append, now or across a later restart, can complete the
+// fragment into a line that parses.
+//
 // quarantined is the uids whose live catch-up line the floor refused
 // (errCatchUpRefused): the scopes the start step quarantines.
 func (s *FileStore) catchUpUser(ctx context.Context) (quarantined map[uint32]bool, scopeErrs, err error) {
@@ -1119,7 +1124,30 @@ func (s *FileStore) catchUpUser(ctx context.Context) (quarantined map[uint32]boo
 		return quarantined, nil, err
 	}
 	defer done()
+	s.sealUserLogTails()
 	return s.catchUpUserLocked(ctx, root)
+}
+
+// sealUserLogTails seals the torn tail of the floor and of the audit log
+// (appendLog.sealTail), at the start step, under the exclusive store lock
+// the caller holds. The newline it writes is the leading newline the next
+// append would write: it closes a torn line, which stays counted damage,
+// and never makes it parse. A seal that fails is logged at Warn, and this
+// process reads that tail frozen, as before (docs/design/keystore.md §
+// "A torn tail").
+func (s *FileStore) sealUserLogTails() {
+	var logs []*appendLog
+	if ff, ok := s.userFloor.(*fileFloorLog); ok {
+		logs = append(logs, ff.log)
+	}
+	if fa, ok := s.auditSink.(*fileAuditLog); ok {
+		logs = append(logs, fa.log)
+	}
+	for _, l := range logs {
+		if err := l.sealTail(); err != nil {
+			slog.Warn("a keystore append-only log's torn tail could not be sealed at the start step; this process still reads it frozen", "log", l.name, "err", err)
+		}
+	}
 }
 
 // catchUpUserLocked is catchUpUser under the exclusive store lock the

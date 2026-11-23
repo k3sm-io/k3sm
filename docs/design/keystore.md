@@ -1757,11 +1757,23 @@ service user can only add to.
   the line that later starts there is skipped as damage, classified by the fragment, unless
   it is exactly the fragment and a newline, the server's own close
   (`TestForeignCompletionOfTornTailStaysTainted`, `TestForeignGrowthOfTornTailKeepsTaint`).
-  Freezing was chosen over writing a lone newline when a tear is seen: a seal is one more
-  write a foreign append can land just before, so it is exact only with a check of where it
-  landed, while the frozen bytes are exact for every read after the first by this server. A
-  tail torn and completed before the server first reads it, or across a restart, reads as
-  the bytes say. The leading newline costs one
+  Within a process, freezing was chosen over writing a lone newline when a tear is seen: a
+  seal is one more write a foreign append can land just before, so it is exact only with a
+  check of where it landed, while the frozen bytes are exact for every read after the first
+  by this server. **At each start the tail is sealed**, because the freeze lives only in the
+  process's memory and does not survive a restart: the start step, under the exclusive store
+  lock and before the delivery catch-up, writes to the floor and to the audit log the one
+  leading newline the next append would write, when the log's last byte is not one, before
+  any foreign byte can follow it. That newline closes the fragment; it never makes it parse,
+  and the closed fragment is still counted as damage (on the floor, classified by
+  `taintLine`), so nothing is hidden and nothing is repaired into a valid line. A tail torn
+  only at its newline, whose bytes would parse once closed, is left as it is, since no
+  foreign byte can complete it into another line. A seal that fails is logged at Warn and
+  that process reads the tail frozen
+  (`TestStartSealsTornFloorTail`, `TestStartSealsTornAuditTail`,
+  `TestStartSealLeavesTailTornAtNewline`, `TestForeignCompletionAcrossRestartStaysTainted`).
+  A tail torn and completed before the server first reads it reads as the bytes say. The
+  leading newline costs one
   byte per append: past the hard cap it is charged to the uid with the append's lines, and
   every bound that sums appends counts it (one append of one line is at most 1,025 bytes,
   `maxAppendLine`, which is what `room`, a grant's pre-check and the store-open spent test
