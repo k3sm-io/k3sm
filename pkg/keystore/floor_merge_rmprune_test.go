@@ -221,3 +221,50 @@ func TestFloorMergeCrashBetweenRenames(t *testing.T) {
 		t.Fatalf("the record an undo reads = %+v, %v; want it to retire ret", rec, err)
 	}
 }
+
+// TestFloorMergeFirstRunRemovesRmDroppedStaged (U192): a first run that
+// wrote its commit marker and stopped before the floor write, then an rm
+// under the guard that prunes the burial of generation G at the per-name
+// cap, leaves a pending record whose base is not the live floor. The next
+// run plans again from the floor rm left, which lacks G's burial: the
+// staged directory of G is removed as the rm-dropped record lists it, as
+// a rerun removes it, never moved into keystore/.
+func TestFloorMergeFirstRunRemovesRmDroppedStaged(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	capSetup(t, s, server)
+	stageTree(t, s)
+	failStepOnce(s, "write "+floorName)
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err == nil || Committed(err) {
+		t.Fatalf("first run with the floor write failing: %v, want a refusal not committed", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dataRoot, retiredPendingName)); err != nil {
+		t.Fatalf("the pending record after the first run: %v, want it written", err)
+	}
+	// k's staged generation is its oldest burial, the one the rm drops at
+	// the cap.
+	g := mgen(10)
+	if err := os.Mkdir(stagePath(s, stagedTreeName, "k"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	giveToService(t, stagePath(s, stagedTreeName, "k"))
+	writeStaged(t, s, "k/"+generationName, []byte(g+"\n"))
+	if err := s.Delete(ctx, "k"); !errors.Is(err, ErrTombstoneEvicted) || !DeleteDone(err) {
+		t.Fatalf("Delete k under the guard: %v, want it done with ErrTombstoneEvicted", err)
+	}
+	if fl := floorOf(t, server); fl["k"].buries(g) {
+		t.Fatalf("k after the rm = %+v, want %s's burial dropped at the cap", fl["k"], g)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dataRoot, rmDroppedName)); err != nil {
+		t.Fatalf("the rm-dropped record after the Delete: %v, want it written", err)
+	}
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
+		t.Fatalf("the run after the rm: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dir, "k")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("k's directory after the merge: %v, want its staged generation %s removed, not moved into keystore/", err, g)
+	}
+	if err := s.MergePending(); err != nil {
+		t.Fatalf("MergePending after the merge: %v, want the guard cleared", err)
+	}
+}

@@ -469,8 +469,12 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		// floor, or the write drops its burial) has its staged directory
 		// removed before the tree moves into place, so none is left for a
 		// later prune of its burial to bring back. A name --keep keeps is
-		// live. A failure here leaves the floor unwritten.
-		names, err := s.refusedStaged(st, plan.merged, plan.dropped)
+		// live. Each burial an rm under the guard dropped (gone) counts as
+		// on a rerun (finishRerun), so a first run that stopped before the
+		// floor write and plans again from the floor rm left cannot move in
+		// a staged generation whose burial rm pruned. A failure here leaves
+		// the floor unwritten.
+		names, err := s.refusedStaged(st, plan.merged, append(slices.Clone(plan.dropped), goneDrops(gone)...))
 		if err != nil {
 			return r, err
 		}
