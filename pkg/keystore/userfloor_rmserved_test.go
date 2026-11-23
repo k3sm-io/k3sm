@@ -42,10 +42,17 @@ func shortAfterFirstTombstone(l *appendLog) {
 }
 
 // twoLiveGenerations gives token a second live floor generation, all
-// zeros, which sorts before the put's, and returns the put's.
+// zeros, and returns both. All zeros sorts before every other generation,
+// so before the put's random one whatever it is: the floor's live
+// generations reach the burial sorted (liveGens), and a test that assumes
+// the other one's tombstone lands first holds on every run. (guid(0)
+// starts 0x10, which a random generation starting 0x0 sorts ahead of.)
 func twoLiveGenerations(t *testing.T, s *FileStore, server string) (served, other [generationSize]byte) {
 	t.Helper()
-	served, other = entryGeneration(t, server, "token"), guid(0)
+	served = entryGeneration(t, server, "token")
+	if served == other {
+		t.Fatal("the put's generation is all zeros")
+	}
 	line, err := floorLine("user/1001", "token", other, 1)
 	if err != nil {
 		t.Fatal(err)
