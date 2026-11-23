@@ -583,11 +583,11 @@ check U27 "framing: an oversize frame, unknown type or missing HELLO closes; an 
 check U28 "64 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after HELLO or between requests is closed (socket listener)" \
 	k3sm/pkg/keystore/socket::TestConnectionCapsPerUID TestRequestTimeout TestIdleTimeoutAfterHelloAndBetweenRequests
 check U29 "a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request (socket listener)" \
-	k3sm/pkg/keystore/socket::TestListenerRecoversPanic TestStaleSocketUnlinkChecksOwner TestBoundedLockWait TestCheckBackoffResetsOnPassingChecks k3sm/cmd/k3sm::TestKeystoreSocketWiring
+	k3sm/pkg/keystore/socket::TestListenerRecoversPanic TestStaleSocketUnlinkChecksOwner TestBoundedLockWait TestAbandonedLockWaitsBounded TestCheckBackoffResetsOnPassingChecks k3sm/cmd/k3sm::TestKeystoreSocketWiring TestKeystoreSocketRecoversSupervisorPanic
 check U30 "with two servers registered, the listener does not start and doctor says why (socket listener)" \
 	k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers TestSecondServerStopsServingListener k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow TestKeystoreServerCountNames
 check U31 "a missing or unflagged file logs the install Warn at start and on each retry; doctor reports user scope off (socket listener)" \
-	k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry TestInstallMissingLogNamesInstall TestPreconditionsCheck k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow TestDoctorKeystoreSocketLstat TestDoctorKeystoreKubeconfigPermission
+	k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry TestInstallMissingLogNamesInstall TestPreconditionsCheck k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow TestDoctorKeystoreSocketLstat TestDoctorKeystoreKubeconfigPermission TestDoctorKeystoreReopenJudgement
 pend U32 "the order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (socket operations)" \
 	k3sm/pkg/keystore/socket::TestAuditBeforeReply TestAuditFailureRefusesOps
 pend U33 "refused lines are rate-limited per uid with a summary of the dropped count (socket operations)" \
@@ -634,7 +634,7 @@ check U52 "every root verb writes one audit line with via root once the log exis
 pend U53 "every reconciler Secret write and delete, and every record withdrawal, writes one audit line with via reconciler, except drift repairs, coalesced to one line per delivery per 10 minutes (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited
 check U54 "a pre-frame refusal writes a refused line with the peer uid, rate-limited per uid, drawing on the reconciler budget with its once-a-minute dropped-count summary (socket listener)" \
-	k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited TestPreFrameRefusalLinesRateLimited
+	k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited TestPreFrameRefusalLinesRateLimited TestPreFrameReservedClassLimits k3sm/pkg/keystore::TestPreFrameFsyncFailureIsWrittenNotDropped
 pend U55 "a transient lookup, SAR or apiserver error leaves the Secret, the record entry and the finalizer, sets Authorized=Unknown with reason Indeterminate, and retries with backoff; a SAR with allowed=false and no evaluation error is a definitive denial whatever denied says, and an evaluation error or a failed call is Indeterminate; no sweep before readyz and the RBAC, KeyDelivery and Secret informers sync; every deleting outcome deletes only on two consecutive sweeps; only the allow-list of definitive outcomes deletes (ErrNotFound in a scope that opened among them), and every other sentinel, ErrScopeAbsent and, until a K7a amendment (U127), ErrScopeOwnerChanged included, is Indeterminate; against the real store, on ErrScopeOwnerChanged the reconciler reads the deliveries record under W without the GeneratedUID check only to find recorded targets for a lifecycle delete, deletes them by the target-matching rule, and never delivers, rotates or opens an entry (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestTransientErrorLeavesSecretSetsUnknown TestSAREvaluationErrorIsIndeterminate TestSARAllowedFalseWithoutErrorIsDenial TestNoSweepBeforeReady TestDenialNeedsTwoSweeps TestEverySentinelBesidesNotFoundIsIndeterminate \
 	TestOwnerChangedRecordReadFindsTargetsAgainstRealStore
@@ -786,7 +786,7 @@ pend U129 "floor --rebuild reads every scope whose scope.key opens under W witho
 pend U130 "a scope listed in keystore-removed-scopes.json for its bound GeneratedUID is definitive for claims, so its stale objects lose their claim; rm-scope deletes that scope's KeyDeliveries, each by its recorded namespace and name with a UID precondition (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestRemovedScopeLosesClaim k3sm/cmd/k3sm::TestRmScopeDeletesScopeKeyDeliveries
 check U131 "the listener refuses to start on a data root mounted with MNT_IGNORE_OWNERSHIP, read with fstatfs on the data-root descriptor (socket listener)" \
-	k3sm/pkg/keystore/socket::TestStartRefusesIgnoreOwnershipMount
+	k3sm/pkg/keystore/socket::TestStartRefusesIgnoreOwnershipMount k3sm/cmd/k3sm::TestKeystoreSocketDataRootPerPass
 pend U132 ".user/<uid>/ is 0700 and scope.key and deliveries are 0600, all the service user's; a scope whose directory or files have another owner or a wider mode is refused (user scopes)" \
 	k3sm/pkg/keystore::TestUserScopeFileModes
 pend U133 "keystore-removed-scopes.json is root-owned 0644, under the keystore- prefix the Pod denies cover; a file that is not root's or is group- or other-writable is refused, and the parse is strict, a refused file counting as no listing (KeyDelivery lifecycle)" \

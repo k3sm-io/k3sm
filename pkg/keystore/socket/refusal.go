@@ -21,6 +21,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"k3sm.io/k3sm/pkg/keystore"
 )
 
 // RefusalAuditor receives the pre-frame refusals that pass the per-uid rate
@@ -48,8 +50,9 @@ const (
 )
 
 // NoUID is the uid a refusal names when the peer's could not be read:
-// (uid_t)-1, which no process runs as.
-const NoUID = ^uint32(0)
+// (uid_t)-1, which no process runs as. It is the store's
+// keystore.PreFrameNoUID, the one copy of the number.
+const NoUID = keystore.PreFrameNoUID
 
 // RefusalLinesPerMinute is how many refusals of one uid reach the auditor in
 // any minute; the rest are counted and summarized once a minute.

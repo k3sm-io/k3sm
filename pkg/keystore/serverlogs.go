@@ -137,9 +137,10 @@ func (c preFrameClass) uidShare() int64 {
 	return 0
 }
 
-// preFrameNoUID is the uid a refusal names when none was read:
-// (uid_t)-1, the socket package's NoUID.
-const preFrameNoUID = ^uint32(0)
+// PreFrameNoUID is the uid a pre-frame refusal names when none was read:
+// (uid_t)-1, which no process runs as. The socket package's NoUID is
+// this constant, so the two cannot drift apart.
+const PreFrameNoUID = ^uint32(0)
 
 // PendingSummariesPerAppend is how many uids' pending dropped counts a
 // refused line that lands carries after it as summary lines, in uid order;
@@ -690,7 +691,7 @@ func refusalClass(uid uint32, reason string) preFrameClass {
 		return preFrameClassServiceUID
 	case reason == preFrameReasonSystemUID || reason == preFrameReasonHighUID:
 		return preFrameClassSystemHigh
-	case uid == preFrameNoUID:
+	case uid == PreFrameNoUID:
 		return preFrameClassNoUID
 	case uid >= minScopeUID && uid <= maxScopeUID:
 		return preFrameClassLogin
@@ -709,7 +710,7 @@ func (l *ServerLogs) uidClass(uid uint32) preFrameClass {
 		return preFrameClassRoot
 	case uid == l.s.uid:
 		return preFrameClassServiceUID
-	case uid == preFrameNoUID:
+	case uid == PreFrameNoUID:
 		return preFrameClassNoUID
 	case uid >= minScopeUID && uid <= maxScopeUID:
 		return preFrameClassLogin
