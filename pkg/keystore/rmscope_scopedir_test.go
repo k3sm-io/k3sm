@@ -117,7 +117,7 @@ func TestRemoveScopeRefusesForeignScopeDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	err = removeScopeTree(root, s.dir, "1001", s.uid+1, true)
+	_, err = removeScopeTree(root, s.dir, "1001", s.uid+1, true)
 	checkScopeDirRefused(t, err, s, "neither the service user's")
 	if *takes != 0 {
 		t.Errorf("rmTakeDir ran %d times, want none", *takes)
@@ -150,7 +150,7 @@ func TestRemoveScopeRefusesOtherDeviceScopeDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	err = removeScopeTree(root, s.dir, "1001", s.uid, true)
+	_, err = removeScopeTree(root, s.dir, "1001", s.uid, true)
 	why := "on another device than .user"
 	if asRoot() {
 		why = ""
@@ -191,7 +191,7 @@ func TestRemoveScopeLeavesOtherDeviceDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	err = removeScopeTree(root, s.dir, "1001", s.uid, true)
+	_, err = removeScopeTree(root, s.dir, "1001", s.uid, true)
 	if !errors.Is(err, errScopeForeignDir) {
 		t.Fatalf("removeScopeTree over another device's directory: %v, want errScopeForeignDir", err)
 	}
