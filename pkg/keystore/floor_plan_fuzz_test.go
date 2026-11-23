@@ -107,17 +107,23 @@ func FuzzPlanMerge(f *testing.F) {
 		}
 		keep := map[string]bool{}
 		ptrs := map[string]uint64{}
+		// The moved-aside tree's pointers, from the bytes' high bits: a
+		// byte with its top bit set also gives its name one.
+		aside := map[string]uint64{}
 		for i, name := range planNames {
 			if keepMask&(1<<i) != 0 {
 				keep[name] = true
 			}
 			if i < len(ptrB) {
 				ptrs[name] = uint64(ptrB[i] % 8)
+				if ptrB[i]&0x80 != 0 {
+					aside[name] = uint64(ptrB[i]>>3) % 16
+				}
 			}
 		}
 		before := maps.Clone(live)
 		guarded := live.guardEra()
-		p := planMerge(live, from, keep, ptrs, nil)
+		p := planMerge(live, from, keep, ptrs, aside)
 		if !floorsEqual(live, before) {
 			t.Fatal("planMerge changed the live floor it was given")
 		}
@@ -150,6 +156,13 @@ func FuzzPlanMerge(f *testing.F) {
 				t.Fatalf("the merge cleared %s and dropped its burial of %s", name, before[name].Generation)
 			}
 		}
+		// No fence passes one above the moved-aside record, its mark and
+		// its tree's pointer.
+		for name, a := range from {
+			if e := p.merged[name]; a.live() && e.live() && e.Generation == a.Generation && e.HighWater > max(before[name].HighWater, fenceMark(a, aside[name])) {
+				t.Fatalf("the merge fenced %s at %d, above one past the moved-aside record %+v and pointer %d", name, e.HighWater, a, aside[name])
+			}
+		}
 		for name, was := range before {
 			now := p.merged[name]
 			if was.live() && now.live() && now.Generation == was.Generation && now.Seq > was.Seq+1 {
@@ -165,10 +178,10 @@ func FuzzPlanMerge(f *testing.F) {
 			for _, name := range p.r.Kept {
 				matched[name] = true
 			}
-			if m := planMerge(before, from, matched, ptrs, nil); !floorsEqual(m.merged, p.merged) || !slices.Equal(m.r.Kept, p.r.Kept) {
+			if m := planMerge(before, from, matched, ptrs, aside); !floorsEqual(m.merged, p.merged) || !slices.Equal(m.r.Kept, p.r.Kept) {
 				t.Fatalf("the merge keeping only %v = %+v, want the merge keeping %v, %+v", p.r.Kept, m.r, keep, p.r)
 			}
-			again := planMerge(p.merged, from, matched, ptrs, nil)
+			again := planMerge(p.merged, from, matched, ptrs, aside)
 			// A rerun keeps each kept name again and writes nothing
 			// (docs/design/keystore.md): the same Kept, no floor change.
 			if again.r.floorChanges() || !slices.Equal(again.r.Kept, p.r.Kept) || len(again.dropped) != 0 || !floorsEqual(again.merged, p.merged) {
