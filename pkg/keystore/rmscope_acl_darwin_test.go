@@ -148,12 +148,15 @@ func TestRemoveScopeRootLeftoverUnlistedKeyIsNotExitZero(t *testing.T) {
 	}
 }
 
-// A take stopped before any of its later steps (through the seam: the
-// fchown, the second fchmod, the ACL removal, the final fstat), over a
-// scope directory carrying a real extended ACL whose mode the service user
-// widened after the judge, leaves a directory a rerun finishes. Stopped
-// before the fchown, it is the service user's at 0700 (the first fchmod
-// ran) with its ACL: the rerun judges it and finishes, listed (exit 0).
+// A take stopped before any of its steps (through the seam: the first
+// fchmod, the fchown, the second fchmod, the ACL removal, the final fstat),
+// over a scope directory carrying a real extended ACL whose mode the
+// service user widened after the judge, leaves a directory a rerun
+// finishes, and run 1's text offers the rerun line. Stopped at the first
+// fchmod, it is the service user's at the widened mode with its ACL: the
+// judge reads through the mode, so the rerun judges it and finishes,
+// listed (exit 0). Stopped before the fchown, it is the service user's at
+// 0700 (the first fchmod ran) with its ACL: the same.
 // Stopped after the fchown and before the ACL removal, it is root's (the
 // service-uid seam: the test's own uid stands for root) with the ACL: the
 // rerun removes the ACL and finishes, committed, unproven. Stopped after
@@ -163,7 +166,7 @@ func TestRemoveScopeTakeStopAtEachStepRerunFinishes(t *testing.T) {
 	if asRoot() {
 		t.Skip("the seam's other service uid makes the store's own directories foreign as root")
 	}
-	for step := 1; step < len(rmTakeSteps); step++ {
+	for step := 0; step < len(rmTakeSteps); step++ {
 		t.Run(strconv.Itoa(step), func(t *testing.T) {
 			s, server, _ := fileLogScope(t)
 			dir := scopeDir(server, "1001")
@@ -180,16 +183,20 @@ func TestRemoveScopeTakeStopAtEachStepRerunFinishes(t *testing.T) {
 				}
 				return nil
 			})
-			if _, err := s.RemoveScope(t.Context(), 1001); !errors.Is(err, unix.EIO) || !Committed(err) {
+			_, err := s.RemoveScope(t.Context(), 1001)
+			if !errors.Is(err, unix.EIO) || !Committed(err) {
 				t.Fatalf("run 1, the take stopped at step %d: %v, want committed EIO", step, err)
+			}
+			if !strings.Contains(err.Error(), rmRerunLine) {
+				t.Errorf("run 1, the take stopped at step %d: %q offers no rerun, and a rerun finishes", step, err)
 			}
 			rmTakeStep, rmBeforeTree = nil, nil
 			var st unix.Stat_t
 			if err := unix.Lstat(dir, &st); err != nil {
 				t.Fatal(err)
 			}
-			if st.Mode&0o7777 != 0o700 {
-				t.Fatalf("after run 1 the scope directory is at %#o, want 0700 (the first fchmod ran)", st.Mode&0o7777)
+			if want := map[bool]uint32{true: 0o750, false: 0o700}[step == 0]; uint32(st.Mode&0o7777) != want {
+				t.Fatalf("after run 1 the scope directory is at %#o, want %#o", st.Mode&0o7777, want)
 			}
 			acl := pathHasACL(t, dir)
 			if wantACL := step <= 3; acl != wantACL {

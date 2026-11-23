@@ -57,7 +57,7 @@ func TestRemoveScopeUnreadableDeliveryRecord(t *testing.T) {
 			if !recorded || !Committed(err) {
 				t.Fatalf("rm-scope: recorded %v, %v; want listed and committed", recorded, err)
 			}
-			for _, want := range []string{"removed user/1002", "delivery record could not be read", "deliveries from this scope were not checked", "stays until it is withdrawn or removed by hand"} {
+			for _, want := range []string{"removed user/1002", "delivery record could not be read", "deliveries from this scope were not checked", "stays until it is withdrawn"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("the error %q does not say %q", err, want)
 				}
