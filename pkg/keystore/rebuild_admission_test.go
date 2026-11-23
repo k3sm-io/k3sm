@@ -385,3 +385,47 @@ func TestOldFloorReaderAdmitsAtMostReadBound(t *testing.T) {
 		}
 	}
 }
+
+// Rule 3's absent-scope tombstones are admitted before rule 2's present
+// scopes' other live lines: a flood of forged live lines for present uids,
+// each up to its share and together past the key bound, never evicts an
+// absent scope's real tombstones, even when they come last in the file;
+// the flood is held to what the bound leaves and the rest counted past
+// the share.
+func TestOldFloorReaderPresentLiveFloodKeepsAbsentTombstones(t *testing.T) {
+	var b bytes.Buffer
+	add := func(line []byte, err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Write(line)
+	}
+	const bound, share = 20, 4
+	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{}, names: map[nameKey]bool{}, removed: map[string]int64{}}
+	for u := range uint32(10) {
+		sc := userScopeOf(7101 + u)
+		in.present[sc] = true
+		for i := range share {
+			add(floorLine(sc, fmt.Sprintf("forged%d", i), [generationSize]byte{}, 3))
+		}
+	}
+	for i := range 5 {
+		add(tombLine(userScopeOf(7200), fmt.Sprintf("t%d", i), [generationSize]byte{}))
+	}
+	o, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, bound, bound, share, maxLogLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombs := 0
+	for k := range o.buried {
+		if k.scope == userScopeOf(7200) {
+			tombs++
+		}
+	}
+	if tombs != 5 {
+		t.Fatalf("the absent scope kept %d of its 5 tombstones under a forged live flood", tombs)
+	}
+	if len(o.maxSeq) != bound-5 || o.pastShare != 10*share-(bound-5) {
+		t.Fatalf("admitted %d forged live keys and counted %d past the share; want %d and %d", len(o.maxSeq), o.pastShare, bound-5, 10*share-(bound-5))
+	}
+}

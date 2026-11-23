@@ -298,14 +298,19 @@ func (s *FileStore) readOldFloor(lfd int, in rebuildInput, removed *removedScope
 //     with no entry): oldest first, up to the uid's key share and while the
 //     total stays under keyBound; the rest is dropped and counted in
 //     pastShare;
-//  3. a scope absent from disk and not recorded as removed: its tombstones
-//     first, uids in first-appearance order, while the total stays under
+//  3. a scope absent from disk and not recorded as removed: its tombstones,
+//     uids in first-appearance order, while the total stays under
 //     keyBound; then, only when every such tombstone is in, its live lines,
 //     per uid up to the share, in the same order; the rest is dropped and
 //     counted in absent;
 //  4. a scope rm-scope recorded: a line starting before its recorded floor
 //     offset is dropped and its key counted in removed; a later line is a
 //     re-minted scope's, and falls in rule 1, 2 or 3.
+//
+// They are admitted in this order: rule 1 (with rule 4's drops); rule 3's
+// tombstones; rule 2; rule 3's live lines. A tombstone is what refuses a
+// copy-back, so rule 2's live lines, which the service user can forge for
+// a present uid, never crowd an absent scope's real tombstones out.
 //
 // A line over lineBound is skipped to its newline and counted, and a line
 // that does not parse and a torn last line are dropped and counted. The
@@ -382,25 +387,8 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, read
 	if torn {
 		o.dropped++
 	}
-	// Pass 2: rule 2.
-	err = floorRecsIn(f, off, lineBound, func(r floorRec, start int64) {
-		_, onDisk := in.disk[r.key]
-		switch {
-		case gone(r.key, start) || !in.present[r.key.scope] || onDisk || r.tomb:
-		case admitted(r.key):
-			take(r)
-		case uidKeys[r.key.scope] >= share || total >= keyBound:
-			o.pastShare++
-		default:
-			uidKeys[r.key.scope]++
-			total++
-			take(r)
-		}
-	})
-	if err != nil {
-		return nil, err
-	}
-	// Pass 3: rule 3. fill admits the absent scopes' lines want selects:
+	// Passes 2, 3 and 5: rule 3. fill admits the absent scopes' lines want
+	// selects:
 	// holders are the absent scopes holding keys fill admitted, in
 	// first-appearance order; once the bound is met, an earlier scope's new
 	// key evicts one of the last holder's, so the result is the first
@@ -459,17 +447,39 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, read
 		}
 		return count, short, err
 	}
+	// Pass 3: rule 3's tombstones.
 	tombs, short, err := fill(func(r floorRec) bool { return r.tomb }, func(string) int { return keyBound })
 	if err != nil {
 		return nil, err
 	}
+	// Pass 4: rule 2, after rule 3's tombstones, so forged live lines for
+	// a present uid never crowd an absent scope's real tombstones out: a
+	// tombstone is what refuses a copy-back.
+	err = floorRecsIn(f, off, lineBound, func(r floorRec, start int64) {
+		_, onDisk := in.disk[r.key]
+		switch {
+		case gone(r.key, start) || !in.present[r.key.scope] || onDisk || r.tomb:
+		case admitted(r.key):
+			take(r)
+		case uidKeys[r.key.scope] >= share || total >= keyBound:
+			o.pastShare++
+		default:
+			uidKeys[r.key.scope]++
+			total++
+			take(r)
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Pass 5: rule 3's live lines, once every absent tombstone is in.
 	if !short {
 		_, _, err = fill(func(r floorRec) bool { return !r.tomb }, func(sc string) int { return max(share-tombs[sc], 0) })
 		if err != nil {
 			return nil, err
 		}
 	}
-	// Pass 4: count the rule 3 lines left out.
+	// Pass 6: count the rule 3 lines left out.
 	err = floorRecsIn(f, off, lineBound, func(r floorRec, start int64) {
 		if !in.present[r.key.scope] && !gone(r.key, start) && !admitted(r.key) {
 			o.absent++
