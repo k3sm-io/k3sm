@@ -901,7 +901,12 @@ cluster, so a sweep deletes the Secret of a target whose entry is gone, declared
 revocation is done). The recorded UID decides, as for an update: the Secret must carry it, and the
 delete carries it as `DeleteOptions{Preconditions: {UID: <recorded UID>}}`, so a Secret replaced
 after the Get is not the one deleted. A Secret missing the label or an annotation is still
-deleted and the missing mark logged at Warn; one of another UID is left alone and logged.
+deleted and the missing mark logged at Warn; one of another UID is left alone and logged, and
+so is one that is not `Opaque`, withdrawn or declared. A delete is done only when its effect is
+seen: after a Delete that succeeds, a Get by name must answer NotFound or another UID. A Secret
+still there with the recorded UID (a tenant finalizer holds it terminating) is a stuck
+revocation, not a done one: its record is kept, it Warns, and every sweep checks it again
+until it is gone, when the record is dropped.
 
 *Which entry.* The state record stores the entry a Secret delivers (`entry`, an optional
 field: a record written before it has none), set on create and brought up to date when a
@@ -909,7 +914,10 @@ declared target's owned Secret is seen (root re-pointing a target updates it). A
 target is checked against the record's entry, never the label: the label is on an object any
 namespace writer can edit, and relabelled to a live entry it would keep a deleted entry's value
 readable, or relabelled to another deleted entry get the Secret deleted early. A record without
-the field falls back to the label, with a Warn. A label that disagrees with the record is logged
+the field falls back to the label, with a Warn; that fallback is confined to the upgrade window,
+since a declared target's record gets its entry on the first sweep that sees its Secret and
+every record written since names one, so only a target withdrawn before this build's first
+sweep is decided by its label. A label that disagrees with the record is logged
 at Warn and keeps the record, whatever the entry's state, so the target is never silently
 dropped. The field is additive for this build, which reads an older file; an older build reads
 the state file strictly and refuses one carrying it, so a rollback past this change delivers
@@ -941,26 +949,42 @@ Because a delete cannot be undone, these stand between an absent entry and a del
   only the entries it has room for), or unreadable (`Absent` fails, and the Secret is kept).
   The residual: an interrupted `Delete` that removed the directory but not the floor entry
   holds that name's revocation until the name is put again and removed, or the Secret is
-  deleted by hand; it fails closed, and the Warn names the entry.
-- *Keystore identity.* `keystore.FileStore.Identity` names the entries' directory by device and
-  inode; a Put, Rotate or Delete inside it leaves that alone, and a restore that moves
-  `keystore/` aside, or a keystore deleted and created again, changes it. Each sweep reads it.
-  The first sweep after start, and a sweep that sees it changed (logged at Error, naming both),
-  delete nothing; revocation resumes on the next sweep that sees it unchanged. `Absent` returns
-  the identity it read under the lock, and a delete needs it to be the sweep's, so a swap in the
-  middle of a sweep deletes nothing. The identity is held in memory, not in the state file:
-  every start holds one sweep, which is stricter than comparing with a recorded value.
-- *Breaker.* When the revocations one sweep would make are above 3 **and** above a quarter of
-  the recorded Secrets (`max(3, recorded/4)`), none is made; an Error carries the count, and
-  repeats at most hourly while it holds, until the absent set is back within the limit (entries
-  put back, or the Secrets deleted by hand with kubectl). The base counts live deliveries only:
-  a revoked target's record is dropped with its Secret (a record a failed write left is dropped
-  on a later sweep), so old records do not widen the limit. A stuck revocation does not count
-  toward the breaker: a Secret already terminating, or one whose Delete failed on an earlier
-  sweep and is retrying, so a few that never finish cannot hold every later `rm` back. A Warn
-  marks each when it first gets stuck and each time its state changes, and a summary Warn naming
-  namespace/name and how long repeats at most hourly while any is stuck. The limit is a seam of
-  the reconciler; there is no override verb.
+  deleted by hand; it fails closed, and the Warn names the entry. A second `rm` does not clear
+  it (there is no directory left for it to remove, so it answers not found and leaves the
+  floor entry): the remedy is `put` then `rm`.
+- *Keystore identity and the restore hold.* `keystore.FileStore.Identity` names the entries'
+  directory by device and inode; a Put, Rotate or Delete inside it leaves that alone, and a
+  restore that moves `keystore/` aside, or a keystore deleted and created again, changes it.
+  Each sweep reads it. The first sweep after start, and a sweep that sees it changed (logged at
+  Error, naming both), start the restore hold: no revocation is made until **both** that sweep
+  has passed **and** `revokeHold` (10 minutes) has elapsed. The hold's start is logged at Warn
+  naming the time it ends, so the operator has 10 minutes after `start` (or after the swap) to
+  put back an entry the restored keystore lacks. `Absent` returns the identity it read under the
+  lock, and a delete needs it to be the sweep's, so a swap in the middle of a sweep deletes
+  nothing. The identity is held in memory, not in the state file: every start holds, which is
+  stricter than comparing with a recorded value. The duration is a seam of the reconciler;
+  there is no override verb.
+- *Breaker.* It counts distinct entries, not Secrets: one `rm` of an entry delivered into many
+  namespaces is a single fresh revocation. When the entries one sweep would revoke are above 3
+  **and** above a quarter of the live delivered entries (`max(3, entries/4)`), none of their
+  Secrets is deleted; an Error carries the count, and repeats at most hourly while it holds,
+  until the absent set is back within the limit (entries put back, or the Secrets deleted by
+  hand with kubectl). The base counts live deliveries only: a revoked target's record is dropped
+  with its Secret (a record a failed write left is dropped on a later sweep), so old records do
+  not widen the limit; a record an older build wrote, with no entry, counts as an entry of its
+  own. A stuck revocation does not count toward the breaker: a Secret already terminating, one
+  whose Delete failed on an earlier sweep and is retrying, or one still there after a Delete
+  that succeeded, so a few that never finish cannot hold every later `rm` back. A Warn marks
+  each when it first gets stuck and each time its state changes. The limit is a seam of the
+  reconciler; there is no override verb.
+- *Held states repeat.* A revocation held for a reason that names it (the floor, by entry; an
+  absence `Absent` cannot confirm, an entry found again, a keystore swapped during the sweep, a
+  refused target's Secret that cannot be read, a withdrawn target whose entry cannot be
+  confirmed, each by namespace/name) Warns once when it is first held and again only if its
+  reason changes, never every sweep. The held and the stuck repeat together in one summary at
+  most hourly while any lasts, each with its count and every name, why, and for how long. A
+  refused target's unreadable Secret Warns only when a record exists for it, naming its entry,
+  namespace and Secret: the revocation pending on it.
 - *Re-check before the delete.* Gathering and deleting are a sweep apart, so `revokeOne` asks
   `Absent` again, and compares the identity it read with the sweep's, immediately before each
   Delete; an entry put back in between keeps its Secret.

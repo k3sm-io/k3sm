@@ -223,16 +223,25 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
     that record still lists but whose files are missing was not removed with `rm`: it is a
     restored or rolled-back `keystore/`, and its Secret is kept, with a warning naming the
     entry in the server log (see [Restoring an older keystore/](#restoring-an-older-keystore)).
-  - The first sweep after the server starts, and the first sweep after `keystore/` is
-    replaced, delete nothing and log it.
-  - The breaker: when the number of delivered Secrets whose entries are gone at once is above
-    3 **and** above a quarter of the live deliveries, none is deleted and the server logs an
-    error with the count, again every hour while it holds. It keeps holding until enough
-    entries are back, or until you delete those Secrets yourself with kubectl. A Secret
-    already being deleted, or whose delete keeps failing, does not count; the server warns
-    when one gets stuck, and every hour while any is, naming each and for how long.
+    A second `rm` does not clear that record if an earlier `rm` was interrupted after removing
+    the files; `put` the entry again, then `rm` it.
+  - The restore hold: after the server starts, and after `keystore/` is replaced, nothing is
+    deleted until the first sweep has passed **and** 10 minutes have. The server warns when
+    the hold starts, naming the time it ends. There is no flag to shorten it.
+  - The breaker counts entries, not Secrets: an `rm` of one entry delivered into many
+    namespaces is one. When the number of delivered entries gone at once is above 3 **and**
+    above a quarter of the live delivered entries, none of their Secrets is deleted and the
+    server logs an error with the count, again every hour while it holds. It keeps holding
+    until enough entries are back, or until you delete those Secrets yourself with kubectl.
+  - A delete counts as done only once the Secret is gone. A Secret already being deleted (a
+    finalizer holds it), still there after its delete, or whose delete keeps failing is
+    stuck: it is retried every sweep and does not count toward the breaker.
   - The entry is checked again just before each delete, so one put back meanwhile keeps its
     Secret.
+  - Every Secret kept back for a reason that names it (root's record still lists the entry,
+    the entry's absence cannot be confirmed, the Secret cannot be read) and every stuck
+    delete gets one warning when it starts, and a summary every hour while any lasts,
+    naming each, why, and for how long.
 
 The declaration is `/var/lib/k3sm/keystore-delivery.json`, owned by root, mode 0644, and only
 `k3sm keys deliver` and `undeliver` write it. It decides which namespace the server writes a
@@ -348,7 +357,9 @@ because a restore lost its entry:
   delete the Secret with kubectl.
 - After the steps above, which remove root's record and write it again from the restored
   entries, the record no longer lists the entries the restored copy lacks, so it cannot tell
-  them from an `rm`. The server holds back for one sweep after `keystore/` is replaced, and for
-  every sweep while the breaker holds (above 3 and above a quarter of the deliveries gone at
-  once). After that, an entry the restored copy does not hold has its Secret deleted, as after
-  an `rm`, so restore every entry you still deliver.
+  them from an `rm`. The server holds back for 10 minutes after `start` (and after
+  `keystore/` is replaced while it runs), and for every sweep while the breaker holds (above
+  3 and above a quarter of the delivered entries gone at once). You have those 10 minutes
+  after `start` to put back any entry that is still delivered. After that, an entry the
+  restored copy does not hold has its Secret deleted, as after an `rm`, so restore every entry
+  you still deliver.
