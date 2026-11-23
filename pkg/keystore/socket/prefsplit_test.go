@@ -19,6 +19,7 @@ package socket
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"testing"
 	"testing/synctest"
 
@@ -146,6 +147,124 @@ func TestPreFrameBudgetLoginUIDCannotStarveIneligible(t *testing.T) {
 		}
 		if err := r.logs.Refused(ctx, 0, ReasonRoot); err != nil {
 			t.Fatalf("a root refusal was not written: %v", err)
+		}
+	})
+}
+
+// landUntilSpent appends uid's refusals for reason until one is refused,
+// and returns the bytes that landed.
+func landUntilSpent(t *testing.T, r *storeRig, uid uint32, reason string) int64 {
+	t.Helper()
+	before := size(t, r.auditPath())
+	for i := 0; ; i++ {
+		if i > keystore.PreFrameBudget {
+			t.Fatalf("uid %d's %s lines never ran out of room", uid, reason)
+		}
+		if r.logs.Refused(t.Context(), uid, reason) != nil {
+			break
+		}
+	}
+	return size(t, r.auditPath()) - before
+}
+
+// TestPreFrameReservedClassLimits checks the reserved part's split by
+// class: root, the service uid and no uid read each stop at their own
+// budget; system and high uids stop at their per-uid share and at their
+// class's budget together; no reserved class spent keeps another's line,
+// or a login line, from landing; and a dropped-count summary is charged to
+// the class of the refusals it summarises.
+func TestPreFrameReservedClassLimits(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newStoreRig(t)
+		ctx := t.Context()
+		if err := r.logs.Reopen(ctx); err != nil {
+			t.Fatal(err)
+		}
+		landsAll := func(when string, except ...string) {
+			t.Helper()
+			for _, c := range []struct {
+				uid    uint32
+				reason string
+			}{{0, ReasonRoot}, {serviceUID, ReasonServiceUID}, {NoUID, ReasonCredUnreadable}, {7, ReasonSystemUID}, {1001, ReasonSandboxed}} {
+				if slices.Contains(except, c.reason) && c.uid != 1001 {
+					continue
+				}
+				if err := r.logs.Refused(ctx, c.uid, c.reason); err != nil {
+					t.Fatalf("%s: a %s refusal of uid %d was not written: %v", when, c.reason, c.uid, err)
+				}
+			}
+		}
+		// System uids first: they must not starve root or the service uid.
+		var system int64
+		perUID := int64(0)
+		for u := uint32(1); u < 400; u++ {
+			got := landUntilSpent(t, r, u, ReasonSystemUID)
+			if got > keystore.PreFrameSystemHighUIDShare {
+				t.Fatalf("system uid %d landed %d bytes, over its %d-byte share", u, got, keystore.PreFrameSystemHighUIDShare)
+			}
+			if u == 1 {
+				perUID = got
+			}
+			system += got
+			if got == 0 {
+				break
+			}
+		}
+		if perUID == 0 || system > keystore.PreFrameSystemHighBudget || system <= keystore.PreFrameSystemHighBudget-perUID {
+			t.Fatalf("system uids landed %d bytes (%d for one uid), want close to and at most %d", system, perUID, keystore.PreFrameSystemHighBudget)
+		}
+		if err := r.logs.Refused(ctx, 1<<31, ReasonHighUID); err == nil {
+			t.Fatal("a high-uid line landed past the system-high class's budget")
+		}
+		landsAll("system-high spent", ReasonSystemUID)
+
+		for _, c := range []struct {
+			uid    uint32
+			reason string
+			budget int64
+		}{
+			{0, ReasonRoot, keystore.PreFrameRootBudget},
+			{serviceUID, ReasonServiceUID, keystore.PreFrameServiceUIDBudget},
+			{NoUID, ReasonCredUnreadable, keystore.PreFrameNoUIDBudget},
+		} {
+			got := landUntilSpent(t, r, c.uid, c.reason)
+			one := int64(len(preFrameLineFor(c.uid, c.reason)) + 2)
+			if got > c.budget || got+one <= c.budget-one {
+				t.Fatalf("%s lines landed %d bytes, want close to and at most %d", c.reason, got, c.budget)
+			}
+		}
+
+		// Every reserved class is spent; a login uid still lands.
+		if err := r.logs.Refused(ctx, 1002, ReasonSandboxed); err != nil {
+			t.Fatalf("a login line was not written with the reserved part spent: %v", err)
+		}
+		// A root summary has no room in root's spent class, so its count
+		// stays pending; a login summary lands in the login class.
+		if err := r.logs.Dropped(ctx, 0, 5); err == nil {
+			t.Fatal("a root summary landed past root's class budget")
+		}
+		if got := r.logs.PendingDropped(0); got != 5+1 {
+			t.Fatalf("root's pending dropped count = %d, want 6 (5 summarised, 1 refused line)", got)
+		}
+		_ = r.logs.Dropped(ctx, 1003, 2) // root's pending summary fails; uid 1003's lands
+		if got := r.logs.PendingDropped(1003); got != 0 {
+			t.Fatalf("uid 1003's summary did not land: pending %d", got)
+		}
+
+		// The recount from the log gives the same answers.
+		if err := r.logs.Reopen(ctx); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range []struct {
+			uid    uint32
+			reason string
+		}{{0, ReasonRoot}, {serviceUID, ReasonServiceUID}, {NoUID, ReasonCredUnreadable}, {300, ReasonSystemUID}} {
+			if err := r.logs.Refused(ctx, c.uid, c.reason); err == nil {
+				t.Fatalf("after reopen: a %s line landed in its spent class", c.reason)
+			}
+		}
+		if err := r.logs.Refused(ctx, 1004, ReasonSandboxed); err != nil {
+			t.Fatalf("after reopen: a login line was not written: %v", err)
 		}
 	})
 }

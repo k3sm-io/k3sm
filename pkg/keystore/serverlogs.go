@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -41,15 +42,25 @@ import (
 const PreFrameBudget = 256 << 10
 
 // The pre-frame part's split (docs/design/keystore.md § "Per-uid fairness",
-// the reconciler budget). A refusal of a peer whose uid is in the login
-// range (501 to 2147483647) and whose reason is not a uid-range reason (it
-// was refused as sandboxed, as sandbox-unknown, as token-mismatch, or as
-// cred-unreadable with its uid read), and a summary line of such a uid, is a
-// login line: it is charged to its uid's sub-share and to the login part.
-// Every other pre-frame line (root, the service uid, a system or high uid,
-// no uid read) is charged to the reserved part, which no login line draws
-// on. Each part is recounted from the log, the class read off the line's
-// uid and result, never from memory.
+// the reconciler budget). Every pre-frame line is charged to exactly one
+// class, and no class draws on another's bytes:
+//
+//   - login: a refusal of a peer whose uid is in the login range (501 to
+//     2147483647) and whose reason is not a uid-range reason (sandboxed,
+//     sandbox-unknown, token-mismatch, cred-unreadable with its uid read);
+//     each uid has its own sub-share within the class.
+//   - root: a refusal whose reason is root.
+//   - service-uid: a refusal whose reason is service-uid.
+//   - no-uid: a refusal under uid 4294967295, no uid read.
+//   - system-high: a refusal whose reason is system-uid or high-uid, and
+//     any other refusal outside the login range; each uid has its own
+//     sub-share within the class.
+//
+// A refusal line's class is read off its uid and result; a dropped-count
+// summary line names its class in its own "class" field (preFrameClass),
+// which the recount reads, so a summary is charged to the class of the
+// refusals it summarises whatever uid it names. Each class is recounted
+// from the log, never from memory.
 const (
 	// PreFrameLoginUIDShare is the most one login uid's pre-frame lines may
 	// take of an audit log, for the life of that log.
@@ -58,9 +69,77 @@ const (
 	// take of an audit log together.
 	PreFrameLoginBudget = 128 << 10
 	// PreFrameReserved is the part kept for the pre-frame lines of
-	// ineligible peers.
+	// ineligible peers, split by class below.
 	PreFrameReserved = PreFrameBudget - PreFrameLoginBudget
+	// PreFrameRootBudget is the most root's refusal lines and their
+	// summaries may take.
+	PreFrameRootBudget = 32 << 10
+	// PreFrameServiceUIDBudget is the most the service uid's refusal lines
+	// and their summaries may take.
+	PreFrameServiceUIDBudget = 32 << 10
+	// PreFrameNoUIDBudget is the most the refusals with no uid read
+	// (cred-unreadable under uid 4294967295) and their summaries may take.
+	PreFrameNoUIDBudget = 16 << 10
+	// PreFrameSystemHighBudget is the most all system-uid and high-uid
+	// lines may take together.
+	PreFrameSystemHighBudget = 48 << 10
+	// PreFrameSystemHighUIDShare is the most one system or high uid's
+	// lines may take within PreFrameSystemHighBudget.
+	PreFrameSystemHighUIDShare = 8 << 10
 )
+
+// The reserved classes add up to the reserved part, exactly: a constant
+// changed alone fails to compile (a negative array length).
+var _ [0]struct{} = [PreFrameRootBudget + PreFrameServiceUIDBudget + PreFrameNoUIDBudget + PreFrameSystemHighBudget - PreFrameReserved]struct{}{}
+
+// preFrameClass is a pre-frame line's class: a closed set, named on the
+// wire in a summary line's "class" field.
+type preFrameClass string
+
+// The pre-frame classes.
+const (
+	preFrameClassLogin      preFrameClass = "login"
+	preFrameClassRoot       preFrameClass = "root"
+	preFrameClassServiceUID preFrameClass = "service-uid"
+	preFrameClassNoUID      preFrameClass = "no-uid"
+	preFrameClassSystemHigh preFrameClass = "system-high"
+)
+
+// preFrameClasses is every class, in the order the budgets list them.
+var preFrameClasses = []preFrameClass{preFrameClassLogin, preFrameClassRoot, preFrameClassServiceUID, preFrameClassNoUID, preFrameClassSystemHigh}
+
+// budget is the most c's lines may take of an audit log together.
+func (c preFrameClass) budget() int64 {
+	switch c {
+	case preFrameClassLogin:
+		return PreFrameLoginBudget
+	case preFrameClassRoot:
+		return PreFrameRootBudget
+	case preFrameClassServiceUID:
+		return PreFrameServiceUIDBudget
+	case preFrameClassNoUID:
+		return PreFrameNoUIDBudget
+	case preFrameClassSystemHigh:
+		return PreFrameSystemHighBudget
+	}
+	return 0
+}
+
+// uidShare is the most one uid's lines may take within c, or 0 when c has
+// no per-uid limit.
+func (c preFrameClass) uidShare() int64 {
+	switch c {
+	case preFrameClassLogin:
+		return PreFrameLoginUIDShare
+	case preFrameClassSystemHigh:
+		return PreFrameSystemHighUIDShare
+	}
+	return 0
+}
+
+// preFrameNoUID is the uid a refusal names when none was read:
+// (uid_t)-1, the socket package's NoUID.
+const preFrameNoUID = ^uint32(0)
 
 // PendingSummariesPerAppend is how many uids' pending dropped counts a
 // refused line that lands carries after it as summary lines, in uid order;
@@ -116,13 +195,20 @@ type ServerLogs struct {
 	audit heldLog
 	floor heldLog
 	// used is the pre-frame bytes counted in the held audit file up to
-	// audit.off; usedLogin the login lines' part of it, and usedByUID each
-	// login uid's.
-	used      int64
-	usedLogin int64
-	usedByUID map[uint32]int64
-	// pending is each uid's dropped count not yet in a summary line.
-	pending map[uint32]uint64
+	// audit.off; usedByClass each class's part of it, and usedByUID each
+	// uid's within a class that has per-uid limits.
+	used        int64
+	usedByClass map[preFrameClass]int64
+	usedByUID   map[preFrameKey]int64
+	// pending is each uid's dropped count, by class, not yet in a summary
+	// line.
+	pending map[preFrameKey]uint64
+}
+
+// preFrameKey is one uid within one class.
+type preFrameKey struct {
+	class preFrameClass
+	uid   uint32
 }
 
 // heldLog is one held append descriptor and its file's identity. For the
@@ -138,11 +224,12 @@ type heldLog struct {
 // the first Reopen or append opens both logs and counts the budget.
 func (s *FileStore) ServerLogs() *ServerLogs {
 	return &ServerLogs{
-		s:         s,
-		audit:     heldLog{log: &appendLog{s: s, name: auditLogName}},
-		floor:     heldLog{log: &appendLog{s: s, name: userFloorLogName}},
-		pending:   map[uint32]uint64{},
-		usedByUID: map[uint32]int64{},
+		s:           s,
+		audit:       heldLog{log: &appendLog{s: s, name: auditLogName}},
+		floor:       heldLog{log: &appendLog{s: s, name: userFloorLogName}},
+		pending:     map[preFrameKey]uint64{},
+		usedByClass: map[preFrameClass]int64{},
+		usedByUID:   map[preFrameKey]int64{},
 	}
 }
 
@@ -170,7 +257,7 @@ func (l *ServerLogs) Refused(ctx context.Context, uid uint32, reason string) err
 		reason = auditPlaceholder
 	}
 	err := l.locked(ctx, func() error {
-		if err := l.appendLocked(preFrameRecord(uid, reason, 0, l.s.now())); err != nil {
+		if err := l.appendLocked(preFrameRecord(uid, reason, "", 0, l.s.now())); err != nil {
 			return err
 		}
 		l.writePendingLocked(PendingSummariesPerAppend)
@@ -178,7 +265,7 @@ func (l *ServerLogs) Refused(ctx context.Context, uid uint32, reason string) err
 	})
 	if err != nil {
 		l.mu.Lock()
-		l.pending[uid]++
+		l.pending[preFrameKey{refusalClass(uid, reason), uid}]++
 		l.mu.Unlock()
 	}
 	return err
@@ -188,25 +275,30 @@ func (l *ServerLogs) Refused(ctx context.Context, uid uint32, reason string) err
 // dropped counts, in uid order, forgetting each count written; a count not
 // written stays pending. It returns the first error.
 func (l *ServerLogs) writePendingLocked(max int) error {
-	uids := make([]uint32, 0, len(l.pending))
-	for u, c := range l.pending {
+	keys := make([]preFrameKey, 0, len(l.pending))
+	for k, c := range l.pending {
 		if c > 0 {
-			uids = append(uids, u)
+			keys = append(keys, k)
 		}
 	}
-	slices.Sort(uids)
+	slices.SortFunc(keys, func(a, b preFrameKey) int {
+		if c := cmp.Compare(a.uid, b.uid); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.class, b.class)
+	})
 	var first error
-	for i, u := range uids {
+	for i, k := range keys {
 		if i == max {
 			break
 		}
-		if err := l.appendLocked(preFrameRecord(u, auditResultDropped, l.pending[u], l.s.now())); err != nil {
+		if err := l.appendLocked(preFrameRecord(k.uid, auditResultDropped, k.class, l.pending[k], l.s.now())); err != nil {
 			if first == nil {
 				first = err
 			}
 			continue
 		}
-		delete(l.pending, u)
+		delete(l.pending, k)
 	}
 	return first
 }
@@ -221,7 +313,7 @@ func (l *ServerLogs) writePendingLocked(max int) error {
 func (l *ServerLogs) Dropped(ctx context.Context, uid uint32, n uint64) error {
 	l.mu.Lock()
 	if n > 0 {
-		l.pending[uid] += n
+		l.pending[preFrameKey{l.uidClass(uid), uid}] += n
 	}
 	l.mu.Unlock()
 	return l.locked(ctx, func() error {
@@ -233,11 +325,18 @@ func (l *ServerLogs) Dropped(ctx context.Context, uid uint32, n uint64) error {
 // one value serves the socket's reopen after maintenance.
 func (l *ServerLogs) MaintenanceMarked() (bool, error) { return l.s.maintenanceMarked() }
 
-// PendingDropped is uid's dropped count not yet written in a summary line.
+// PendingDropped is uid's dropped count not yet written in a summary
+// line, every class's together.
 func (l *ServerLogs) PendingDropped(uid uint32) uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.pending[uid]
+	var n uint64
+	for k, c := range l.pending {
+		if k.uid == uid {
+			n += c
+		}
+	}
+	return n
 }
 
 // PreFrameUsed is the pre-frame bytes counted in the held audit file when
@@ -296,7 +395,8 @@ func (l *ServerLogs) closeLocked() {
 
 // resetCountLocked forgets the pre-frame count.
 func (l *ServerLogs) resetCountLocked() {
-	l.used, l.usedLogin = 0, 0
+	l.used = 0
+	clear(l.usedByClass)
 	clear(l.usedByUID)
 }
 
@@ -413,8 +513,8 @@ func (l *ServerLogs) countLocked(size int64) (err error) {
 		if err != nil {
 			return h.log.unreadable(off, err)
 		}
-		if rec, cost, ok := preFrameCharge(line); ok {
-			l.chargeLocked(rec, cost)
+		if k, cost, ok := preFrameCharge(line); ok {
+			l.chargeLocked(k, cost)
 		}
 		off += int64(len(line))
 	}
@@ -485,52 +585,97 @@ func (l *ServerLogs) appendLocked(rec preFrameRec) error {
 // preFrameCharge is the pre-frame part's one charging rule, which the
 // running count after each append and the recount of the file both use:
 // line, a whole audit line with its newline, is charged only if it reads
-// strictly as a pre-frame line (preFrameLineOf), to the part its record
-// names (preFrameLoginLine), and costs its length, newline included, plus
+// strictly as a pre-frame line (preFrameLineOf), to the class its record
+// names (preFrameLineClass), and costs its length, newline included, plus
 // the leading newline its append writes.
-func preFrameCharge(line []byte) (preFrameRec, int64, bool) {
+func preFrameCharge(line []byte) (preFrameKey, int64, bool) {
 	if len(line) < 2 || line[len(line)-1] != '\n' {
-		return preFrameRec{}, 0, false
+		return preFrameKey{}, 0, false
 	}
 	rec, ok := preFrameLineOf(line[:len(line)-1])
 	if !ok {
-		return preFrameRec{}, 0, false
+		return preFrameKey{}, 0, false
 	}
-	return rec, int64(len(line)) + 1, true
+	return preFrameKey{preFrameLineClass(rec), rec.Caller.UID}, int64(len(line)) + 1, true
 }
 
-// chargeLocked adds n bytes of rec's to the count of its part.
-func (l *ServerLogs) chargeLocked(rec preFrameRec, n int64) {
+// chargeLocked adds n bytes to k's class, and to k's uid within it when
+// the class has per-uid limits.
+func (l *ServerLogs) chargeLocked(k preFrameKey, n int64) {
 	l.used += n
-	if preFrameLoginLine(rec) {
-		l.usedLogin += n
-		l.usedByUID[rec.Caller.UID] += n
+	l.usedByClass[k.class] += n
+	if k.class.uidShare() > 0 {
+		l.usedByUID[k] += n
 	}
 }
 
-// roomLocked reports whether n more bytes of rec's fit its part: a login
-// line its uid's sub-share and the login part, any other line the reserved
-// part, and every line the whole pre-frame part.
-func (l *ServerLogs) roomLocked(rec preFrameRec, n int64) bool {
-	if l.used+n > PreFrameBudget {
+// roomLocked reports whether n more bytes fit k: its uid's share within
+// its class when the class has one, its class's budget, and the whole
+// pre-frame part.
+func (l *ServerLogs) roomLocked(k preFrameKey, n int64) bool {
+	if l.used+n > PreFrameBudget || l.usedByClass[k.class]+n > k.class.budget() {
 		return false
 	}
-	if preFrameLoginLine(rec) {
-		return l.usedByUID[rec.Caller.UID]+n <= PreFrameLoginUIDShare && l.usedLogin+n <= PreFrameLoginBudget
+	if share := k.class.uidShare(); share > 0 && l.usedByUID[k]+n > share {
+		return false
 	}
-	return l.used-l.usedLogin+n <= PreFrameReserved
+	return true
 }
 
-// The pre-frame reasons that say the peer's uid is not a login uid: these
-// lines are charged to the reserved part whatever uid they name.
-var preFrameUIDRangeReasons = []string{"root", "service-uid", "system-uid", "high-uid"}
+// The pre-frame reasons that name the uid's own class whatever uid the
+// line carries.
+const (
+	preFrameReasonRoot       = "root"
+	preFrameReasonServiceUID = "service-uid"
+	preFrameReasonSystemUID  = "system-uid"
+	preFrameReasonHighUID    = "high-uid"
+)
 
-// preFrameLoginLine reports whether rec is a login line: its uid in the
-// login range and its result not a uid-range reason. A summary line is
-// classed by its uid; the service uid is a system uid, below the range.
-func preFrameLoginLine(rec preFrameRec) bool {
-	uid := rec.Caller.UID
-	return uid >= minScopeUID && uid <= maxScopeUID && !slices.Contains(preFrameUIDRangeReasons, rec.Result)
+// refusalClass is the class of a refusal of uid for reason: a uid-range
+// reason names its class, uid 4294967295 is no-uid, any other uid in the
+// login range is login, and the rest system-high.
+func refusalClass(uid uint32, reason string) preFrameClass {
+	switch {
+	case reason == preFrameReasonRoot:
+		return preFrameClassRoot
+	case reason == preFrameReasonServiceUID:
+		return preFrameClassServiceUID
+	case reason == preFrameReasonSystemUID || reason == preFrameReasonHighUID:
+		return preFrameClassSystemHigh
+	case uid == preFrameNoUID:
+		return preFrameClassNoUID
+	case uid >= minScopeUID && uid <= maxScopeUID:
+		return preFrameClassLogin
+	}
+	return preFrameClassSystemHigh
+}
+
+// uidClass is the class of the refusals the socket listener counted as
+// dropped for uid, read as the listener reads a peer's uid: 0 is root, the
+// store's service uid is service-uid, 4294967295 is no-uid, a login uid is
+// login, and any other system-high. It is used only when the count is
+// written; the summary line then carries the class.
+func (l *ServerLogs) uidClass(uid uint32) preFrameClass {
+	switch {
+	case uid == 0:
+		return preFrameClassRoot
+	case uid == l.s.uid:
+		return preFrameClassServiceUID
+	case uid == preFrameNoUID:
+		return preFrameClassNoUID
+	case uid >= minScopeUID && uid <= maxScopeUID:
+		return preFrameClassLogin
+	}
+	return preFrameClassSystemHigh
+}
+
+// preFrameLineClass is the class rec is charged to: a summary line's own
+// class field, a refusal's refusalClass.
+func preFrameLineClass(rec preFrameRec) preFrameClass {
+	if rec.Result == auditResultDropped {
+		return rec.Class
+	}
+	return refusalClass(rec.Caller.UID, rec.Result)
 }
 
 // preFrameRec is a pre-frame refused line, or its summary: the audit
@@ -550,6 +695,7 @@ type preFrameRec struct {
 	Charge    string         `json:"charge"`
 	Source    string         `json:"source"`
 	Dropped   uint64         `json:"dropped,omitempty"`
+	Class     preFrameClass  `json:"class,omitempty"`
 }
 
 // preFrameCaller is the refused peer: its uid only.
@@ -558,9 +704,12 @@ type preFrameCaller struct {
 }
 
 // preFrameKeys are preFrameRec's JSON keys, exact.
-var preFrameKeys = append(slices.Clone(auditKeys), "caller", "charge", "source", "dropped")
+var preFrameKeys = append(slices.Clone(auditKeys), "caller", "charge", "source", "dropped", "class")
 
-func preFrameRecord(uid uint32, result string, dropped uint64, now time.Time) preFrameRec {
+// preFrameRecord is a pre-frame line: a refusal when result is a reason
+// (class ""), a summary of dropped refusals of class when result is
+// "dropped".
+func preFrameRecord(uid uint32, result string, class preFrameClass, dropped uint64, now time.Time) preFrameRec {
 	return preFrameRec{
 		V:       auditFormat,
 		TS:      now.UTC().Format(time.RFC3339Nano),
@@ -571,19 +720,28 @@ func preFrameRecord(uid uint32, result string, dropped uint64, now time.Time) pr
 		Charge:  auditChargeReconcil,
 		Source:  auditSourcePreFrame,
 		Dropped: dropped,
+		Class:   class,
 	}
 }
 
 // preFrameLineOf decodes line, without its newline, and reports whether it
 // reads strictly as a pre-frame line: format 1, op refused, via socket, no
-// scope, charged to the reconciler's pre-frame part. Only such lines are
-// counted against PreFrameBudget.
+// scope, charged to the reconciler's pre-frame part, and a class field
+// exactly on a summary line, naming a class of the closed set. Only such
+// lines are counted against PreFrameBudget.
 func preFrameLineOf(line []byte) (preFrameRec, bool) {
 	if err := auditKeysStrictOf(line, preFrameKeys); err != nil {
 		return preFrameRec{}, false
 	}
 	var r preFrameRec
 	if err := json.Unmarshal(line, &r); err != nil {
+		return preFrameRec{}, false
+	}
+	if r.Result == auditResultDropped {
+		if !slices.Contains(preFrameClasses, r.Class) {
+			return preFrameRec{}, false
+		}
+	} else if r.Class != "" {
 		return preFrameRec{}, false
 	}
 	return r, r.V == auditFormat && r.Op == auditOpRefused && r.Via == auditViaSocket && r.Scope == "" &&

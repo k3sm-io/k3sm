@@ -26,21 +26,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// preFrameCounts is one view of the pre-frame part: the total, the login
-// part, the reserved part and each login uid's sub-share.
+// preFrameCounts is one view of the pre-frame part: the total, each
+// class's part, and each uid's sub-share within the classes that have one.
 type preFrameCounts struct {
-	used, login, reserved int64
-	byUID                 map[uint32]int64
+	used    int64
+	byClass map[preFrameClass]int64
+	byUID   map[preFrameKey]int64
 }
 
 func (l *ServerLogs) countsOf() preFrameCounts {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return preFrameCounts{l.used, l.usedLogin, l.used - l.usedLogin, maps.Clone(l.usedByUID)}
+	c := preFrameCounts{l.used, map[preFrameClass]int64{}, map[preFrameKey]int64{}}
+	// A zero entry and an absent one are the same count.
+	for k, v := range l.usedByClass {
+		if v != 0 {
+			c.byClass[k] = v
+		}
+	}
+	for k, v := range l.usedByUID {
+		if v != 0 {
+			c.byUID[k] = v
+		}
+	}
+	return c
 }
 
 func (c preFrameCounts) equal(o preFrameCounts) bool {
-	return c.used == o.used && c.login == o.login && c.reserved == o.reserved && maps.Equal(c.byUID, o.byUID)
+	return c.used == o.used && maps.Equal(c.byClass, o.byClass) && maps.Equal(c.byUID, o.byUID)
 }
 
 // newServerLogsStore is a real store over a data root in t.TempDir(), laid
@@ -151,17 +164,18 @@ func TestPreFrameRunningCountIsTheRecount(t *testing.T) {
 
 	// Pending counts carried after the next line that lands.
 	l.mu.Lock()
-	l.pending[1001] += 2
-	l.pending[0]++
-	l.pending[service] += 5
-	l.pending[noUID]++
+	l.pending[preFrameKey{preFrameClassLogin, 1001}] += 2
+	l.pending[preFrameKey{preFrameClassRoot, 0}]++
+	l.pending[preFrameKey{preFrameClassServiceUID, service}] += 5
+	l.pending[preFrameKey{preFrameClassNoUID, noUID}]++
+	l.pending[preFrameKey{preFrameClassSystemHigh, 42}]++
 	l.mu.Unlock()
 	must("pending flushed with a next line", l.Refused(ctx, 1002, "sandbox-unknown"))
 
 	// Lines of other kinds, and a pre-frame line of another writer.
 	external(`{"v":1,"op":"put","scope":"user/1001","name":"a"}` + "\n")
 	external("not json\n\n")
-	other, err := json.Marshal(preFrameRecord(1003, "sandboxed", 0, s.now()))
+	other, err := json.Marshal(preFrameRecord(1003, "sandboxed", "", 0, s.now()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,8 +193,49 @@ func TestPreFrameRunningCountIsTheRecount(t *testing.T) {
 		check("filling a sub-share")
 	}
 	check("sub-share spent")
-	if got := l.countsOf().byUID[1005]; got > PreFrameLoginUIDShare {
+	if got := l.countsOf().byUID[preFrameKey{preFrameClassLogin, 1005}]; got > PreFrameLoginUIDShare {
 		t.Fatalf("uid 1005 charged %d bytes, over its %d-byte sub-share", got, PreFrameLoginUIDShare)
 	}
 	must("root after a spent sub-share", l.Refused(ctx, 0, "root"))
+
+	// A summary names its own class, and the recount charges it there
+	// whatever uid it carries: a service-uid summary under a login uid is
+	// the service-uid class's, not uid 1006's.
+	cross, err := json.Marshal(preFrameRecord(1006, auditResultDropped, preFrameClassServiceUID, 4, s.now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := l.countsOf()
+	external("\n" + string(cross) + "\n")
+	must("a summary naming its class", l.Refused(ctx, 0, "root"))
+	after := l.countsOf()
+	if after.byUID[preFrameKey{preFrameClassLogin, 1006}] != 0 {
+		t.Fatal("a service-uid summary under a login uid was charged to that uid")
+	}
+	if got, want := after.byClass[preFrameClassServiceUID]-before.byClass[preFrameClassServiceUID], int64(len(cross))+2; got != want {
+		t.Fatalf("service-uid class grew %d bytes, want the summary's %d", got, want)
+	}
+
+	// Each reserved class filled to its own limit through the append
+	// path, the running count equal to the recount at every step.
+	for _, c := range []struct {
+		uid    uint32
+		reason string
+		class  preFrameClass
+	}{
+		{0, "root", preFrameClassRoot},
+		{service, "service-uid", preFrameClassServiceUID},
+		{noUID, "cred-unreadable", preFrameClassNoUID},
+		{42, "system-uid", preFrameClassSystemHigh},
+	} {
+		for l.Refused(ctx, c.uid, c.reason) == nil {
+			check("filling " + string(c.class))
+		}
+		check(string(c.class) + " spent")
+	}
+	for _, c := range preFrameClasses {
+		if got := l.countsOf().byClass[c]; got == 0 || got > c.budget() {
+			t.Fatalf("class %s charged %d bytes, want some and at most %d", c, got, c.budget())
+		}
+	}
 }

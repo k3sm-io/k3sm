@@ -3288,13 +3288,33 @@ service user can only add to.
     `token-mismatch` refusals, `cred-unreadable` when a uid was read, and the summaries of such
     a uid. Login lines draw on at most 8 KiB per uid (`keystore.PreFrameLoginUIDShare`) and at
     most 128 KiB for all login uids together (`keystore.PreFrameLoginBudget`), for the life of
-    the log; every other pre-frame line (root, the service uid, a system or high uid, uid
-    4294967295 when none was read) draws on the remaining 128 KiB
-    (`keystore.PreFrameReserved`), which no login line can consume. A line past its part is
-    dropped and counted as any other. The class is read off each line's uid and `result` when
-    the server recounts, never from memory. *Residual:* the reserved part is still one pool, so
-    a process running as root, or as the service user (which can append forged pre-frame lines
-    too), can spend it and silence the other ineligible peers' lines until the log is rotated.
+    the log. Every other pre-frame line draws on the remaining 128 KiB
+    (`keystore.PreFrameReserved`), which no login line can consume, and that part is split by
+    class too, so one ineligible source cannot silence the others:
+
+    | class | lines | budget | per uid |
+    |---|---|---|---|
+    | `service-uid` | result `service-uid` | 32 KiB (`keystore.PreFrameServiceUIDBudget`) | (one uid) |
+    | `root` | result `root` | 32 KiB (`keystore.PreFrameRootBudget`) | (one uid) |
+    | `no-uid` | uid 4294967295, no uid read (`cred-unreadable`) | 16 KiB (`keystore.PreFrameNoUIDBudget`) | (one uid) |
+    | `system-high` | result `system-uid` or `high-uid` | 48 KiB together (`keystore.PreFrameSystemHighBudget`) | 8 KiB (`keystore.PreFrameSystemHighUIDShare`) |
+
+    The four add up to the reserved 128 KiB (a compile-time check), and no class draws on
+    another's bytes. A refusal line's class is read off its uid and `result`; a dropped-count
+    summary line carries its class in its own `class` field, a closed set (`login`, `root`,
+    `service-uid`, `no-uid`, `system-high`) that the recount reads, so a summary is charged to
+    the class of the refusals it summarises and a service uid inside the login range could not
+    move bytes across classes. A summary with no `class`, or a refusal with one, is not a
+    pre-frame line. A line past its class is dropped and counted as any other. Every class is
+    recounted from the log at start, on every append and after maintenance, by the one charging
+    rule the running count uses, never from memory. *Residual:* a class can still be spent by
+    its own sources: any process running as root spends `root` (and the service user can append
+    forged pre-frame lines of any class); any unsandboxed process of the service uid that merely
+    connects, a native Pod past its Seatbelt deny included, spends `service-uid`; whatever can
+    make its credentials unreadable spends `no-uid`; and system and high uids together, such as
+    a person logged in under a uid below 501 (the macOS Guest account, uid 201) together with
+    five other such uids, spend `system-high`, each one at most its 8 KiB. What each source
+    silences is its own class, until root rotates the log.
   - *Past the share, reads are refused too.* A uid past its share has its own mutations and
     its own reads refused with `ErrLogFull` (code `log-full`) before any line is written, so
     no read is a way around the share. Its `refused` lines and their summaries are not written
