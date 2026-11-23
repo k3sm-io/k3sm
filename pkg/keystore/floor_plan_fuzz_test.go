@@ -86,7 +86,9 @@ func fuzzFloor(b []byte, guard bool) floor {
 // FuzzPlanMerge (U192) drives mergeFloor's decision logic, planMerge, on
 // in-memory floors under a small per-name cap and a tombstone budget from
 // the input, and checks its oracles: a merge allowed without AcceptDrops
-// drops no burial at all, so never one it adds or a guard-era one; a merge
+// drops no burial at all, so never one it adds or a guard-era one; no
+// burial of an allowed merge is above guardEraSeq unless it is guard-era,
+// with guard-era burials in the live floor or none; a merge
 // allowed leaves no name it cleared with neither a live record nor a
 // burial; no raise passes the restored record's sequence plus one; merging
 // the result again changes nothing; and a reverse merge (the undo) of the
@@ -130,6 +132,15 @@ func FuzzPlanMerge(f *testing.F) {
 		}
 		if refused != nil {
 			return
+		}
+		// The guard band holds only guard-era burials, whether the live
+		// floor holds any or none.
+		for name, e := range p.merged {
+			for _, b := range e.burials() {
+				if b.Deleted > guardEraSeq && !guarded[floorBurial{name, b.Generation}] {
+					t.Fatalf("the merge numbered %s's burial %+v above guardEraSeq, and it is not guard-era", name, b)
+				}
+			}
 		}
 		for _, name := range p.r.BuriedLive {
 			if e := p.merged[name]; !e.live() && len(e.burials()) == 0 {
