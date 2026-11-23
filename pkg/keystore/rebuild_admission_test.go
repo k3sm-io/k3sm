@@ -194,8 +194,8 @@ func TestOldFloorReaderAbsentFirstAppearanceOrder(t *testing.T) {
 	for k := range o.buried {
 		count[k.scope]++
 	}
-	if count["user/7001"] != 6 || count["user/7002"] != 4 || count["user/7003"] != 0 || o.absent != 18-10 {
-		t.Fatalf("admitted %v, %d absent, want 6, 4, 0 and 8", count, o.absent)
+	if count["user/7001"] != 4 || count["user/7002"] != 4 || count["user/7003"] != 2 || o.absent != 18-10 {
+		t.Fatalf("admitted %v, %d absent, want 4, 4, 2 (each uid up to the share, in first-appearance order) and 8", count, o.absent)
 	}
 }
 
@@ -422,10 +422,88 @@ func TestOldFloorReaderPresentLiveFloodKeepsAbsentTombstones(t *testing.T) {
 			tombs++
 		}
 	}
-	if tombs != 5 {
-		t.Fatalf("the absent scope kept %d of its 5 tombstones under a forged live flood", tombs)
+	if tombs != share {
+		t.Fatalf("the absent scope kept %d of its 5 tombstones under a forged live flood, want its share, %d", tombs, share)
 	}
-	if len(o.maxSeq) != bound-5 || o.pastShare != 10*share-(bound-5) {
-		t.Fatalf("admitted %d forged live keys and counted %d past the share; want %d and %d", len(o.maxSeq), o.pastShare, bound-5, 10*share-(bound-5))
+	if len(o.maxSeq) != bound-share || o.pastShare != 10*share-(bound-share) {
+		t.Fatalf("admitted %d forged live keys and counted %d past the share; want %d and %d", len(o.maxSeq), o.pastShare, bound-share, 10*share-(bound-share))
+	}
+}
+
+// splitFloor is an old floor holding, first, live lines of present uids
+// 7301 on with no entry (liveUIDs uids, live each) and then tombstones of
+// absent uids 7401 on (tombUIDs uids, tombs each), with the rebuild input
+// that marks the present ones present.
+func splitFloor(t *testing.T, liveUIDs, live, tombUIDs, tombs int) ([]byte, rebuildInput) {
+	t.Helper()
+	var b bytes.Buffer
+	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{}, names: map[nameKey]bool{}, removed: map[string]int64{}}
+	for u := range liveUIDs {
+		sc := userScopeOf(7301 + uint32(u))
+		in.present[sc] = true
+		for i := range live {
+			line, err := floorLine(sc, fmt.Sprintf("l%d", i), [generationSize]byte{}, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b.Write(line)
+		}
+	}
+	for u := range tombUIDs {
+		for i := range tombs {
+			line, err := tombLine(userScopeOf(7401+uint32(u)), fmt.Sprintf("t%d", i), [generationSize]byte{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			b.Write(line)
+		}
+	}
+	return b.Bytes(), in
+}
+
+// A flood of forged tombstones for absent, unlisted uids cannot crowd out
+// a present scope's live lines with no entry directory (its rollback
+// protection for an entry whose directory was removed outside rm): the
+// room rule 1 leaves is split evenly, the live lines need less than their
+// half and are all kept, and the tombstones take the rest.
+func TestOldFloorReaderAbsentTombFloodKeepsPresentLive(t *testing.T) {
+	const bound, share = 20, 4
+	b, in := splitFloor(t, 3, 3, 50, share)
+	o, err := readOldFloorFrom(bytes.NewReader(b), int64(len(b)), in, bound, bound, share, maxLogLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.maxSeq) != 9 || o.pastShare != 0 {
+		t.Fatalf("kept %d of the present scopes' 9 live lines (%d past the share) under a forged tombstone flood", len(o.maxSeq), o.pastShare)
+	}
+	if len(o.buried) != bound-9 || o.absent != 50*share-(bound-9) {
+		t.Fatalf("admitted %d forged tombstones and counted %d absent; want %d and %d", len(o.buried), o.absent, bound-9, 50*share-(bound-9))
+	}
+}
+
+// The mirror case: a flood of forged live lines for present uids cannot
+// crowd out absent scopes' tombstones that fit their half; the live lines
+// take the rest, and each class past its room is counted as dropped.
+func TestOldFloorReaderPresentLiveFloodKeepsAbsentTombsHalf(t *testing.T) {
+	const bound, share = 20, 4
+	b, in := splitFloor(t, 50, share, 3, 3)
+	o, err := readOldFloorFrom(bytes.NewReader(b), int64(len(b)), in, bound, bound, share, maxLogLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.buried) != 9 || o.absent != 0 {
+		t.Fatalf("kept %d of the absent scopes' 9 tombstones (%d absent) under a forged live flood", len(o.buried), o.absent)
+	}
+	if len(o.maxSeq) != bound-9 || o.pastShare != 50*share-(bound-9) {
+		t.Fatalf("admitted %d forged live keys and counted %d past the share; want %d and %d", len(o.maxSeq), o.pastShare, bound-9, 50*share-(bound-9))
+	}
+	// Both classes past their halves: each gets half.
+	b, in = splitFloor(t, 50, share, 50, share)
+	o, err = readOldFloorFrom(bytes.NewReader(b), int64(len(b)), in, bound, bound, share, maxLogLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.buried) != bound/2 || len(o.maxSeq) != bound/2 {
+		t.Fatalf("two floods admitted %d tombstones and %d live keys, want %d each", len(o.buried), len(o.maxSeq), bound/2)
 	}
 }

@@ -295,22 +295,28 @@ func (s *FileStore) readOldFloor(lfd int, in rebuildInput, removed *removedScope
 //     tombstone, whatever the uid's share: the writer takes a revocation's
 //     tombstone past the share, and dropping one would reopen a copy-back;
 //  2. a scope present on disk, every other live line (another generation
-//     with no entry): oldest first, up to the uid's key share and while the
-//     total stays under keyBound; the rest is dropped and counted in
-//     pastShare;
-//  3. a scope absent from disk and not recorded as removed: its tombstones,
-//     uids in first-appearance order, while the total stays under
-//     keyBound; then, only when every such tombstone is in, its live lines,
-//     per uid up to the share, in the same order; the rest is dropped and
-//     counted in absent;
+//     with no entry): oldest first, up to the uid's key share, within its
+//     class's room (below); the rest is dropped and counted in pastShare;
+//  3. a scope absent from disk and not recorded as removed: its
+//     tombstones, per uid up to the share, uids in first-appearance order,
+//     within its class's room; then, only when every such tombstone is
+//     in, its live lines, per uid up to the share less its tombstones, in
+//     the same order, in whatever room is left under keyBound; the rest is
+//     dropped and counted in absent;
 //  4. a scope rm-scope recorded: a line starting before its recorded floor
 //     offset is dropped and its key counted in removed; a later line is a
 //     re-minted scope's, and falls in rule 1, 2 or 3.
 //
-// They are admitted in this order: rule 1 (with rule 4's drops); rule 3's
-// tombstones; rule 2; rule 3's live lines. A tombstone is what refuses a
-// copy-back, so rule 2's live lines, which the service user can forge for
-// a present uid, never crowd an absent scope's real tombstones out.
+// Rule 1 (with rule 4's drops) is admitted first. The room it leaves under
+// keyBound is then split evenly between the two classes no line of which
+// is authenticated: (a) rule 3's tombstones and (b) rule 2's live lines. A
+// class that needs less than its half gives the rest to the other
+// (splitRoom). An absent scope's tombstone refuses its copy-back, and a
+// present scope's live line with no entry directory is its rollback
+// protection for an entry whose directory was removed outside rm; the
+// service user can forge either, so a forger of one class spends at most
+// its half, and the real lines in the other half are safe. Rule 3's live
+// lines come last.
 //
 // A line over lineBound is skipped to its newline and counted, and a line
 // that does not parse and a torn last line are dropped and counted. The
@@ -394,7 +400,7 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, read
 	// key evicts one of the last holder's, so the result is the first
 	// scopes' keys, in order, whatever the interleaving. A scope holds at
 	// most limit(scope) keys. It reports whether it left any key out.
-	fill := func(want func(floorRec) bool, limit func(string) int) (map[string]int, bool, error) {
+	fill := func(want func(floorRec) bool, limit func(string) int, bound int) (map[string]int, bool, error) {
 		type holder struct {
 			scope string
 			keys  []floorKey
@@ -415,7 +421,7 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, read
 			case h != nil && len(h.keys) >= limit(r.key.scope):
 				short = true
 				return
-			case total < keyBound:
+			case total < bound:
 			case h == nil || holders[len(holders)-1] == h:
 				short = true
 				return
@@ -447,21 +453,55 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, read
 		}
 		return count, short, err
 	}
-	// Pass 3: rule 3's tombstones.
-	tombs, short, err := fill(func(r floorRec) bool { return r.tomb }, func(string) int { return keyBound })
+	// Passes 3 and 4 share the room rule 1 left under keyBound: demand
+	// counts what each class would take of it, bounded by the room.
+	room := max(keyBound-total, 0)
+	absentTomb := func(r floorRec, start int64) bool {
+		return r.tomb && !in.present[r.key.scope] && !gone(r.key, start)
+	}
+	presentLive := func(r floorRec, start int64) bool {
+		_, onDisk := in.disk[r.key]
+		return !r.tomb && in.present[r.key.scope] && !onDisk && !gone(r.key, start)
+	}
+	demand := func(want func(floorRec, int64) bool, base map[string]int) (int, error) {
+		seen := map[floorKey]bool{}
+		per := map[string]int{}
+		n := 0
+		err := floorRecsIn(f, off, lineBound, func(r floorRec, start int64) {
+			if n >= room || seen[r.key] || !want(r, start) || admitted(r.key) || base[r.key.scope]+per[r.key.scope] >= share {
+				return
+			}
+			seen[r.key] = true
+			per[r.key.scope]++
+			n++
+		})
+		return n, err
+	}
+	needTombs, err := demand(absentTomb, nil)
 	if err != nil {
 		return nil, err
 	}
-	// Pass 4: rule 2, after rule 3's tombstones, so forged live lines for
-	// a present uid never crowd an absent scope's real tombstones out: a
-	// tombstone is what refuses a copy-back.
+	needLive, err := demand(presentLive, uidKeys)
+	if err != nil {
+		return nil, err
+	}
+	roomTombs, roomLive := splitRoom(room, needTombs, needLive)
+	// Pass 3: rule 3's tombstones, within their room.
+	tombs, short, err := fill(func(r floorRec) bool { return r.tomb }, func(string) int { return share }, total+roomTombs)
+	if err != nil {
+		return nil, err
+	}
+	// Pass 4: rule 2, within its room, so forged live lines for a present
+	// uid never crowd out an absent scope's tombstones past their half, nor
+	// forged absent tombstones a present scope's live lines past theirs.
+	liveBound := total + roomLive
 	err = floorRecsIn(f, off, lineBound, func(r floorRec, start int64) {
 		_, onDisk := in.disk[r.key]
 		switch {
 		case gone(r.key, start) || !in.present[r.key.scope] || onDisk || r.tomb:
 		case admitted(r.key):
 			take(r)
-		case uidKeys[r.key.scope] >= share || total >= keyBound:
+		case uidKeys[r.key.scope] >= share || total >= liveBound:
 			o.pastShare++
 		default:
 			uidKeys[r.key.scope]++
@@ -474,7 +514,7 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, read
 	}
 	// Pass 5: rule 3's live lines, once every absent tombstone is in.
 	if !short {
-		_, _, err = fill(func(r floorRec) bool { return !r.tomb }, func(sc string) int { return max(share-tombs[sc], 0) })
+		_, _, err = fill(func(r floorRec) bool { return !r.tomb }, func(sc string) int { return max(share-tombs[sc], 0) }, keyBound)
 		if err != nil {
 			return nil, err
 		}
@@ -489,6 +529,16 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, read
 		return nil, err
 	}
 	return o, nil
+}
+
+// splitRoom splits room between rebuild's two unauthenticated classes,
+// rule 3's tombstones (needing needTombs of it) and rule 2's live lines
+// (needLive): each gets up to half, the tombstones the odd one, and a class
+// that needs less than its half gives the rest to the other.
+func splitRoom(room, needTombs, needLive int) (tombs, live int) {
+	tombs = min(needTombs, max(room-room/2, room-needLive))
+	live = min(needLive, room-tombs)
+	return tombs, live
 }
 
 // floorRecsIn streams the first off bytes of f and calls fn with each line
