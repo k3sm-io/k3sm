@@ -151,7 +151,7 @@ func (s *FileStore) openStaging(l *floorLock) (st *mergeStaging, err error) {
 	var ts unix.Stat_t
 	switch err := unix.Fstatat(int(st.parent.Fd()), st.target, &ts, unix.AT_SYMLINK_NOFOLLOW); {
 	case err == nil:
-		st.targetExists, st.targetType = true, statTypeName(ts.Mode)
+		st.targetExists, st.targetType = true, statTypeName(uint32(ts.Mode))
 	case !errors.Is(err, syscall.ENOENT):
 		return st, fmt.Errorf("look for %s: %w", s.dir, err)
 	}
@@ -253,8 +253,9 @@ func errStagedTargetExists(dir string) error {
 	return fmt.Errorf("%w: %s came to exist, a symlink counted, after the merge moved what was there aside: the merge moves the staged tree there itself, never through or over what is there, so the restored keystore/ is left staged. Run the same merge again, which moves it aside into pre-restore.d too", errFloorUntrusted, dir)
 }
 
-// statTypeName names the file type in mode, an lstat st_mode.
-func statTypeName(mode uint16) string {
+// statTypeName names the file type in mode, an lstat st_mode, widened to uint32
+// (darwin's Stat_t.Mode is uint16, linux's uint32).
+func statTypeName(mode uint32) string {
 	switch mode & unix.S_IFMT {
 	case unix.S_IFDIR:
 		return "directory"
