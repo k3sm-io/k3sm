@@ -2858,8 +2858,27 @@ service user can only add to.
   it opened, and the walk takes the directory held at the name only when it is that one; any
   other is refused, nothing taken (exit 1, or exit 4 when this run already changed the record).
 
-  *Honest limits.* The final `rmdir` races a rename
-  at the name, which the probe below reports but cannot prevent.
+  *Honest limits.* Each is accepted; none is a revocation failure:
+
+  - A symlink or a file held at the scope's name refuses the run (exit 1). The serving path
+    refuses it too, so nothing serves the scope meanwhile; its key is not listed until the
+    directory is back at its name and rm-scope runs again.
+  - A tree nested deeper than 32 directories below the scope directory stops the walk after the
+    scope directory is taken and its key listed. The scope is revoked (root owns its directory,
+    so no open serves it, and its key is refused everywhere); only the cleanup is blocked.
+  - A full disk refuses the record write. That costs availability only: nothing was removed,
+    and the scope is not reported removed.
+  - A replaced `keystore/.lock` refuses every verb, rm-scope included, until it is repaired;
+    no verb runs, so none serves a removed scope either.
+  - `mkdirAt` creates a directory root's at 0700 and strips any inherited ACL right after its
+    open and check; in the window between the two, a writer holding an inherited
+    `add_subdirectory` entry can move that root-owned directory out. A directory moved out of
+    that window and put at a scope's name cannot produce exit 0: a root-owned held directory
+    proves the removal only with no ACL and a key listed before the run (the unlisted-key
+    rule), and a key so listed still passes the newest-scope rule, which refuses exit 0 when
+    the floor shows a scope of the uid minted after that listing.
+  - The final `rmdir` races a rename at the name, which the probe below reports but cannot
+    prevent; a race it cannot judge is exit 4, never exit 0.
 
   *The delivery check.* The judged path reads the delivery record through the floored reader a
   withdraw uses: a record below the floor (a rolled-back authentic copy) is a rollback, which
