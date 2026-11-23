@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -305,4 +306,10 @@ func TestRmScopeRecordFsyncFailureIsCommitted(t *testing.T) {
 	if _, err := os.Lstat(scopeDir(server, "1001")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the scope directory is still there: %v", err)
 	}
+}
+
+// listed reports whether any scope key of uid is listed. Only the tests ask by
+// uid alone: rm-scope proves a removal by the key it read.
+func (r *removedScopes) listed(uid uint32) bool {
+	return slices.ContainsFunc(r.Scopes, func(sc removedScope) bool { return sc.UID == uid })
 }

@@ -161,11 +161,6 @@ func (r *removedScopes) entry(uid uint32) (removedScope, bool) {
 	return removedScope{}, false
 }
 
-// listed reports whether any scope key of uid is listed.
-func (r *removedScopes) listed(uid uint32) bool {
-	return slices.ContainsFunc(r.Scopes, func(sc removedScope) bool { return sc.UID == uid })
-}
-
 // count is how many scope keys of uid are listed.
 func (r *removedScopes) count(uid uint32) int {
 	for _, sc := range r.Scopes {
