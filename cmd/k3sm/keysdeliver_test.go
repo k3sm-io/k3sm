@@ -291,7 +291,7 @@ func TestKeysRmWarnsDeclared(t *testing.T) {
 	h.mustRun(keysOK, "rm", "system/api-token", "--yes")
 	errOut := h.stderr.String()
 	for _, want := range []string{
-		"system/api-token is still declared for delivery to payments/api-token; the server deletes that Secret on its next sweep, whether or not you run `k3sm keys undeliver`",
+		"system/api-token is still declared for delivery to payments/api-token; the server deletes that Secret on its next sweep, unless the delivery breaker or a restore hold stops it; the server log says so; running `k3sm keys undeliver` does not change that",
 		"still declared for delivery to ops/tok",
 	} {
 		if !strings.Contains(errOut, want) {
