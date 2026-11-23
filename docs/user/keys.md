@@ -61,28 +61,69 @@ name.
 | `sudo k3sm keys rewrap --key-out FILE` | Re-seals every entry under a new master key (see [Changing the master key](#changing-the-master-key)). |
 | `sudo k3sm keys deliver system/NAME --namespace NS` | Declares that the server delivers the entry's current version into the cluster as a Secret (see [Delivering an entry as a Secret](#delivering-an-entry-as-a-secret)). |
 | `sudo k3sm keys undeliver system/NAME --namespace NS [--secret S]` | Withdraws that declaration. The Secret stays. |
-| `sudo k3sm keys floor --rebuild` | Rebuilds the user-scope floor log, `/var/lib/k3sm/keystore-logs/keystore-user-floor.log`, after a restore. It keeps every revocation and sequence of the old log that still reads, however large the log has grown, and adds each user scope's entries. If it dropped anything it lists the counts by class (lines that did not read, over-long lines, live lines with no entry on disk past the floor's key limit, lines of scopes root removed) and exits 4: the new floor is in place, read the list. It exits 0 only when nothing was dropped. If any user scope does not open, it refuses and changes nothing. |
-| `sudo k3sm keys rm-scope user/UID --yes` | Removes a user scope and every entry in it. This cannot be undone. It refuses while the scope still delivers anything, so withdraw those deliveries first. It records the removed scope in `/var/lib/k3sm/keystore-removed-scopes.json`, so a copy of the old scope directory put back never opens: delete such a directory. A scope the user creates afresh opens normally. If that record is full, the scope is still removed and the verb says so; its floor lines are then kept. Run `floor --rebuild` afterwards to free the scope's lines in the floor log. |
-| `sudo k3sm keys audit --rotate [--discard-oldest]` | Moves the audit log, `/var/lib/k3sm/keystore-logs/keystore-audit.log`, aside to `keystore-audit.log.1` in the same directory and starts a new, empty one. The older archives move up one number, and four are kept, `.1` the newest to `.4` the oldest, each readable only by root. While `.4` exists it refuses and changes nothing: copy the archives off the Mac first, then run it again with `--discard-oldest`, which deletes `.4` to make room. After a restore, run it to make the restored audit log append-only again. If it stopped part-way, run it again: it finishes the rotation. |
+| `sudo k3sm keys floor --rebuild` | Rebuilds the user-scope floor log, `/var/lib/k3sm/keystore-logs/floor/keystore-user-floor.log`, after a restore. It keeps every revocation and sequence of the old log that still reads, however large the log has grown, and adds each user scope's entries. If it dropped anything it lists the counts by class (lines that did not read, over-long lines, live lines with no entry on disk past the floor's key limit, lines of scopes root removed) and exits 4: the new floor is in place, read the list. It exits 0 only when nothing was dropped, and 1 when it refused, changing nothing. If any user scope does not open, it refuses, names the scope and changes nothing (see [When a user scope blocks the rebuild](#when-a-user-scope-blocks-the-rebuild)). If it stopped part-way, run it again: if the first run had already put the new floor in place, the second prints the first run's report and exits the same way, 0 or 4. |
+| `sudo k3sm keys rm-scope user/UID --yes` | Removes a user scope and every entry in it. This cannot be undone. It refuses while the scope still delivers anything, so withdraw those deliveries first. It records the removed scope in `/var/lib/k3sm/keystore-removed-scopes.json`, so a copy of the old scope directory put back never opens: delete such a directory. A scope the user creates afresh opens normally. If that record is full, the scope is still removed and the verb says so; its floor lines are then kept. Run `floor --rebuild` afterwards to free the scope's lines in the floor log. It exits 0 when the scope is removed and 1 when it refused or stopped; if it stopped part-way, run it again to finish. |
+| `sudo k3sm keys audit --rotate [--discard-oldest]` | Moves the audit log, `/var/lib/k3sm/keystore-logs/audit/keystore-audit.log`, aside to `keystore-audit.log.1` in the same directory and starts a new, empty one. It exits 0 when done and 1 when it refused, changing nothing. The older archives move up one number, and four are kept, `.1` the newest to `.4` the oldest, each readable only by root. While `.4` exists it refuses and changes nothing: copy the archives off the Mac first, then run it again with `--discard-oldest`, which deletes `.4` to make room. After a restore, run it to make the restored audit log append-only again. If it stopped part-way, run it again before any other maintenance verb: it does not rotate twice. |
 
-`floor --rebuild`, `audit --rotate` and `rm-scope` wait up to 30 seconds for the keystore lock. If they
-stop with "a process running as the service user held the store lock", the server or one of its
-processes is holding it: stop the server with `sudo k3sm stop`, or stop that process, then run
-the verb again. Nothing was changed.
+These three maintenance verbs run while the server runs: you do not need to stop it first.
+`floor --rebuild`, `audit --rotate` and `rm-scope` wait up to 30 seconds for the keystore lock. If
+they stop with "a process running as the service user held the store lock", the server or one of
+its processes is holding it and has not let go: stop the server with `sudo k3sm stop`, or stop
+that process, then run the verb again. Nothing was changed.
 
-Both logs live in `/var/lib/k3sm/keystore-logs/`. While `floor --rebuild` or `audit --rotate`
-replaces a log, that directory is closed to everyone but root (mode 0700), its new file is
-prepared in `/var/lib/k3sm/keystore-staging/`, and the file `/var/lib/k3sm/keystore-maintenance`
-exists. All three are back to normal when the verb finishes. If the verb stopped part-way (a
-crash, a power cut, an error it printed), the server refuses to start and names the reason: the
-logs directory is closed, or `keystore-maintenance` exists. `sudo k3sm install` refuses too. To
-recover, run the verb that stopped again, `sudo k3sm keys floor --rebuild` or
-`sudo k3sm keys audit --rotate`. It finishes what the first run started, opens the logs
-directory and removes `keystore-maintenance`, and it never rotates the audit log twice. Then
-start the server, or run install again.
+Each log lives in its own directory: the floor log in `/var/lib/k3sm/keystore-logs/floor/` and
+the audit log, with its archives, in `/var/lib/k3sm/keystore-logs/audit/`. While
+`floor --rebuild` or `audit --rotate` runs, it builds the complete new log directory in
+`/var/lib/k3sm/keystore-staging/`, which only root can open, and the file
+`/var/lib/k3sm/keystore-maintenance` exists. It then exchanges the new directory with the old
+one in a single step, so the log in `keystore-logs/` is always either the whole old log or the
+whole new one. Both extra names are gone when the verb finishes.
 
-If `doctor` says a log has more than one link, someone made a hard link to it: run the verb it names (`floor --rebuild` for the floor log, `audit --rotate`
-for the audit log), which replaces the log with a fresh file.
+If the verb stopped part-way (a crash, a power cut, an error it printed), the log in place is
+still a complete log. Run the same verb again: `sudo k3sm keys floor --rebuild` or
+`sudo k3sm keys audit --rotate`. It throws away whatever the first run left in
+`keystore-staging/`. If the first run had already put its new log in place, the second run prints
+the first run's report and exits as the first would have; otherwise it runs from the start.
+Running the other verb in between does no harm to either log, but the first verb's next run then
+starts from the beginning, so a second `audit --rotate` rotates again.
+
+Lines that the server appends to a log while `floor --rebuild` or `audit --rotate` is reading it
+wait for the verb and land in the new log. A line written to the old log by a process that does
+not wait for the keystore lock, after the verb has read the log, is dropped with the old log.
+
+### When the server refuses a log
+
+The server refuses to start, and `doctor` names the problem, when a log is not what install
+makes: missing, not append-only (after a restore, for example), owned by someone else, carrying
+an extra flag or access list, or linked under a second name. What to run:
+
+- a log that is missing: `sudo k3sm install`, which creates the log and its directory and
+  leaves a good log alone;
+- a log at a location this release keeps no log at: clear its flag and remove it
+  (`sudo chflags nosappnd` on it, then `sudo rm`), then run `sudo k3sm install`;
+- a floor log that is not append-only after a restore, or that has a second link:
+  `sudo k3sm keys floor --rebuild`;
+- an audit log that is not append-only after a restore, or that has a second link:
+  `sudo k3sm keys audit --rotate`.
+
+When the message names a verb, run that verb. Each of them replaces the log with a fresh file.
+
+### When a user scope blocks the rebuild
+
+`floor --rebuild` refuses, changing nothing, when a user scope does not open, or when a scope has
+filled the floor log with so many entries and deletions that the rebuild cannot keep them all.
+It names the scope, `user/UID`. Remove that scope, then rebuild:
+
+```sh
+sudo k3sm keys rm-scope user/UID --yes
+sudo k3sm keys floor --rebuild
+```
+
+`rm-scope` deletes the scope and every entry in it, and the user loses those values. It refuses
+while the scope still delivers anything; withdraw those deliveries first. A file in the scope
+that its user locked with a user flag (`chflags uchg`) is unlocked and removed, unless that file
+also has a name outside the scope, in which case `rm-scope` stops and says so: unlock it with
+`chflags nouchg` at that other name, then run `rm-scope` again.
 
 `--work-dir DIR` points every verb at a server work dir other than the default
 `/var/lib/k3sm/server`. The data root is its parent.
