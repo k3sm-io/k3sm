@@ -838,36 +838,48 @@ func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (err error) 
 	var (
 		ns      string
 		revoked bool
+		sealed  []delivery
 	)
 	defer func() { // before done: the line is appended under the lock
 		// A revocation is a withdraw that wrote its tombstone or a catch-up
 		// line, whether or not its floor line then failed (errCommitted); a
 		// no-op repeat that wrote neither is not, as for rm.
-		l := auditLine{op: "withdraw", namespace: ns, delivery: id, revoke: revoked && (err == nil || errors.Is(err, errCommitted))}
-		err = u.keepAuditFailure("withdraw", err, u.appendAudit(l, err))
+		revoke := revoked && (err == nil || errors.Is(err, errCommitted))
+		l := auditLine{op: "withdraw", namespace: ns, delivery: id, revoke: revoke}
+		aerr := u.appendAudit(l, err)
+		// A mass seal under a delivery-record taint withdrew others too:
+		// each gets its own line, in the revocation class.
+		for _, d := range sealed {
+			if aerr != nil || !revoke {
+				break
+			}
+			aerr = u.appendAudit(auditLine{op: "withdraw", namespace: d.namespace, delivery: d.uid, revoke: true}, err)
+		}
+		err = u.keepAuditFailure("withdraw", err, aerr)
 	}()
-	ns, revoked, err = u.withdrawBody(root, uid)
+	ns, revoked, sealed, err = u.withdrawBody(root, uid)
 	return err
 }
 
 // withdrawBody is withdrawLocked's work under the lock. It returns the
-// recorded namespace of the delivery it found, for the audit line, and
-// whether it went on to revoke: seal the tombstone or append a catch-up
-// line.
-func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error) {
+// recorded namespace of the delivery it found, for the audit line, whether
+// it went on to revoke: seal the tombstone or append a catch-up line, and
+// the other deliveries a seal under a delivery-record taint withdrew, each
+// of which is audited too.
+func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, []delivery, error) {
 	k, err := u.s.loadMaster()
 	if err != nil {
-		return "", false, err
+		return "", false, nil, err
 	}
 	o, err := u.openScopeForRevoke(root, k)
 	if err != nil {
-		return "", false, err
+		return "", false, nil, err
 	}
 	defer o.close()
 	u.catchUpLostEntries(o)
 	rd, err := u.readDeliveriesFloor(o, true)
 	if err != nil {
-		return "", false, err
+		return "", false, nil, err
 	}
 	ds, seq := rd.ds, rd.seq
 	for i := range ds {
@@ -875,6 +887,7 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 			continue
 		}
 		ns := ds[i].namespace
+		var sealed []delivery
 		if !ds[i].withdrawn && rd.unverified != nil && !errors.Is(rd.unverified, errFloorDegraded) {
 			// The record was not checked against the floor, so it may be an
 			// older copy put back; sealing it at a fresh sequence would make
@@ -882,7 +895,7 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 			// holds damage naming the record (errFloorDegraded) did check it
 			// against every line it has (readDeliveriesFloor): the withdraw
 			// only removes, so it seals and writes its floor line.
-			return ns, false, fmt.Errorf("%w: %w", errWithdrawUnsealed, rd.unverified)
+			return ns, false, nil, fmt.Errorf("%w: %w", errWithdrawUnsealed, rd.unverified)
 		}
 		// Only a withdraw that revokes is in the revocation class, and a
 		// repeat that catches the floor up to the record, which finishes the
@@ -890,16 +903,16 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 		// nothing and is refused past the hard cap like any other operation.
 		catchUp := ds[i].withdrawn && rd.unverified == nil && rd.floor < seq
 		if err := u.s.admit(u.uid, !ds[i].withdrawn || catchUp); err != nil {
-			return ns, false, err
+			return ns, false, nil, err
 		}
 		if ds[i].withdrawn {
 			if !catchUp {
 				// The floor already holds the record's sequence, or cannot
 				// be read to take it: nothing changed, and nothing is
 				// appended.
-				return ns, false, nil
+				return ns, false, nil, nil
 			}
-			return ns, true, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq, true)
+			return ns, true, nil, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq, true)
 		}
 		if errors.Is(rd.unverified, errFloorDegraded) {
 			// The floor's damage could name the record, so a line above
@@ -910,14 +923,17 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 			// live), above both the record's and the floor's sequence.
 			seq = max(seq, rd.floor)
 			for j := range ds {
+				if j != i && !ds[j].withdrawn {
+					sealed = append(sealed, ds[j])
+				}
 				ds[j].withdrawn = true
 			}
 		}
 		if seq == math.MaxUint64 {
-			return ns, false, errDeliveriesLastSeq
+			return ns, false, nil, errDeliveriesLastSeq
 		}
 		ds[i].withdrawn = true
-		return ns, true, u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1, true)
+		return ns, true, sealed, u.writeDeliveries(o.dir, o.key, o.gen, ds, seq+1, true)
 	}
 	// The catch-up line is a revocation's: admitted as one before it is
 	// appended. Without one the unknown UID is admitted as any other
@@ -925,16 +941,16 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, error
 	revoked := false
 	if rd.unverified == nil && rd.seq > rd.floor {
 		if err := u.s.admit(u.uid, true); err != nil {
-			return "", false, err
+			return "", false, nil, err
 		}
 		revoked = u.catchUpDeliveries(o.gen, rd)
 	}
 	if !revoked {
 		if err := u.s.admit(u.uid, false); err != nil {
-			return "", false, err
+			return "", false, nil, err
 		}
 	}
-	return "", revoked, ErrNotFound
+	return "", revoked, nil, ErrNotFound
 }
 
 // catchUpDeliveries appends, for an operation that holds the exclusive store

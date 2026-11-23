@@ -17,6 +17,7 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -60,6 +61,47 @@ func TestWithdrawUnderTaintNeverRevivesLostWithdraw(t *testing.T) {
 		}
 		if seq <= olderSeq {
 			t.Fatalf("the resealed record's sequence %d is not above the copy's %d", seq, olderSeq)
+		}
+	}
+}
+
+// The mass seal under a delivery-record taint is audited: the audit log
+// names every delivery it withdrew, the requested one and the others, each
+// a revocation's line.
+func TestWithdrawUnderTaintAuditsEverySealed(t *testing.T) {
+	ctx := context.Background()
+	s, _, u := fileLogScope(t)
+	for _, n := range []int{1, 2, 3} {
+		if err := u.addDelivery(ctx, testDelivery(n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fl := s.userFloor.(*fileFloorLog).log
+	tornFloorWrite(fl)
+	if err := u.withdrawDelivery(ctx, testDelivery(3).uid); err != nil && !errors.Is(err, errCommitted) {
+		t.Fatalf("withdraw whose floor line tears: %v", err)
+	}
+	fl.write = nil
+	forgetDeliveriesSeen(s)
+	s2 := reopenStore(t, s)
+	if err := s2.startUserScopes(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	before := len(readLog(t, s2, auditLogName))
+	if err := userScope(t, s2, 1001).Withdraw(ctx, testDelivery(1).uid); err != nil {
+		t.Fatalf("withdraw under a delivery-record taint: %v", err)
+	}
+	named := map[string]bool{}
+	for _, l := range bytes.Split(readLog(t, s2, auditLogName)[before:], []byte{'\n'}) {
+		r, err := parseAuditLine(l)
+		if err != nil || r.Op != "withdraw" || r.Result != auditResultOK {
+			continue
+		}
+		named[r.Delivery] = true
+	}
+	for _, n := range []int{1, 2} {
+		if !named[testDelivery(n).uid] {
+			t.Fatalf("the audit log after the mass seal names %v, not delivery %d", named, n)
 		}
 	}
 }
