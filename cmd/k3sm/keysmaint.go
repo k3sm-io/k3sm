@@ -54,19 +54,24 @@ func keysFloorRebuild(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	fmt.Fprintf(env.stdout, "rebuilt the user-scope floor: %d scopes, %d keys\n", rep.Scopes, rep.Keys)
-	if rep.Dropped > 0 {
-		fmt.Fprintf(env.stdout, "dropped %d lines of the old floor that did not parse\n", rep.Dropped)
+	if !rep.Lost() {
+		return keysOK
 	}
-	if rep.OverLong > 0 {
-		fmt.Fprintf(env.stdout, "dropped %d lines of the old floor over the per-line bound\n", rep.OverLong)
+	for _, d := range []struct {
+		n    int
+		what string
+	}{
+		{rep.Dropped, "lines of the old floor that did not parse (a torn last line included)"},
+		{rep.OverLong, "lines of the old floor over the per-line bound"},
+		{rep.ForgedLive, "live lines with no key on disk, past the floor's key bound (forged live keys)"},
+		{rep.RemovedKeys, "keys of user scopes root removed"},
+	} {
+		if d.n > 0 {
+			fmt.Fprintf(env.stdout, "dropped %d %s\n", d.n, d.what)
+		}
 	}
-	if rep.ForgedLive > 0 {
-		fmt.Fprintf(env.stdout, "dropped %d live lines with no key on disk, past the floor's key bound\n", rep.ForgedLive)
-	}
-	if rep.RemovedKeys > 0 {
-		fmt.Fprintf(env.stdout, "dropped %d keys of removed user scopes\n", rep.RemovedKeys)
-	}
-	return keysOK
+	fmt.Fprintln(env.stdout, "the rebuild dropped what is listed above; the new floor is in place (exit 4)")
+	return keysCommitted
 }
 
 // keysAuditVerb is `k3sm keys audit --rotate [--discard-oldest]`, the root

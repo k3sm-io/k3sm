@@ -60,8 +60,8 @@ name.
 | `sudo k3sm keys rewrap --key-out FILE` | Re-seals every entry under a new master key (see [Changing the master key](#changing-the-master-key)). |
 | `sudo k3sm keys deliver system/NAME --namespace NS` | Declares that the server delivers the entry's current version into the cluster as a Secret (see [Delivering an entry as a Secret](#delivering-an-entry-as-a-secret)). |
 | `sudo k3sm keys undeliver system/NAME --namespace NS [--secret S]` | Withdraws that declaration. The Secret stays. |
-| `sudo k3sm keys floor --rebuild` | Rebuilds the user-scope floor log, `/var/lib/k3sm/keystore-logs/keystore-user-floor.log`, after a restore. It keeps every line of the old log that still reads and adds each user scope's entries. It prints how many old lines it dropped because they did not read. If any user scope does not open, it refuses and changes nothing. |
-| `sudo k3sm keys rm-scope user/UID --yes` | Removes a user scope and every entry in it. This cannot be undone. It refuses while the scope still delivers anything, so withdraw those deliveries first. Run `floor --rebuild` afterwards to free the scope's lines in the floor log. |
+| `sudo k3sm keys floor --rebuild` | Rebuilds the user-scope floor log, `/var/lib/k3sm/keystore-logs/keystore-user-floor.log`, after a restore. It keeps every revocation and sequence of the old log that still reads, however large the log has grown, and adds each user scope's entries. If it dropped anything it lists the counts by class (lines that did not read, over-long lines, live lines with no entry on disk past the floor's key limit, lines of scopes root removed) and exits 4: the new floor is in place, read the list. It exits 0 only when nothing was dropped. If any user scope does not open, it refuses and changes nothing. |
+| `sudo k3sm keys rm-scope user/UID --yes` | Removes a user scope and every entry in it. This cannot be undone. It refuses while the scope still delivers anything, so withdraw those deliveries first. It records the removed scope in `/var/lib/k3sm/keystore-removed-scopes.json`, so a copy of the old scope directory put back never opens: delete such a directory. A scope the user creates afresh opens normally. If that record is full, the scope is still removed and the verb says so; its floor lines are then kept. Run `floor --rebuild` afterwards to free the scope's lines in the floor log. |
 | `sudo k3sm keys audit --rotate [--discard-oldest]` | Moves the audit log, `/var/lib/k3sm/keystore-logs/keystore-audit.log`, aside to `keystore-audit.log.1` in the same directory and starts a new, empty one. The older archives move up one number, and four are kept, `.1` the newest to `.4` the oldest, each readable only by root. While `.4` exists it refuses and changes nothing: copy the archives off the Mac first, then run it again with `--discard-oldest`, which deletes `.4` to make room. After a restore, run it to make the restored audit log append-only again. If it stopped part-way, run it again: it finishes the rotation. |
 
 `floor --rebuild`, `audit --rotate` and `rm-scope` wait up to 30 seconds for the keystore lock. If they
@@ -92,7 +92,8 @@ interrupted rewrap instead of yours (run it again with a new key), 4 `put`, `rot
 limits, so a copy of that deleted entry put back is accepted. An `rm` that exits 4 and prints
 `deleted` deleted the entry, even when it says its files were left behind; one that prints no
 `deleted` found nothing to delete. `list` and `show` print such a drop as a warning and exit 0.
-Delete entries you no longer use to make room. 5 `floor merge` wrote the merge, but did not
+Delete entries you no longer use to make room. `floor --rebuild` also exits 4 when it dropped
+lines or keys of the old floor; it lists the counts. 5 `floor merge` wrote the merge, but did not
 rename `keystore-floor.json.pre-restore`: run it again to finish the restore. Exit 5 wins over 4,
 and the report still lists every dropped deletion.
 

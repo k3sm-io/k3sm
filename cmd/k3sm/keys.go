@@ -86,10 +86,12 @@ const keysUsage = `Usage:
         printing each one, and exits 4. --dry-run prints the report the
         merge would make and writes and renames nothing
   sudo k3sm keys floor --rebuild
-        rebuild the user-scope floor log after a restore: carry every line
-        of the old floor that parses forward, add each user scope's
+        rebuild the user-scope floor log after a restore, or when it is
+        damaged or past its bounds: carry the old floor's tombstones and
+        sequences forward (read with no size bound), add each user scope's
         entries, and flag the new log append-only. It refuses, changing
-        nothing, when any user scope does not open
+        nothing, when any user scope does not open. It exits 4 when it
+        dropped anything, listing the counts by class
   sudo k3sm keys deliver system/<name> --namespace NS [--secret S] [--data-key K]
         declare that the server delivers the entry's current version as an
         Opaque Secret S (default: <name>) in NS, under data key K
@@ -132,7 +134,9 @@ earlier interrupted rewrap instead (run it again with a new key); 4 the verb
 deletion to stay within its limits, so a copy of that deleted entry put back
 is accepted, or floor merge kept an entry with --keep, left one
 unverified, moved a target aside, or carried over user-scope entries
-without a floor check (read its report); 5 floor merge written, input not
+without a floor check (read its report), or floor --rebuild dropped lines
+or keys of the old floor (it lists the counts by class: unparseable,
+over-long, forged live keys, removed-scope keys); 5 floor merge written, input not
 renamed: rerun to clear the guard (it wins over 4, and the report lists any
 drops).
 floor merge --dry-run exits as the merge itself would.
@@ -152,7 +156,8 @@ const (
 	// tree left behind, or nothing found after a raise that pruned,
 	// included), or a floor merge that reports a drop; and a floor merge
 	// (or its dry run) that keeps an entry with --keep or leaves one
-	// unverified. list and show warn of their floor raise's eviction on
+	// unverified; and a floor --rebuild that dropped lines or keys of the
+	// old floor. list and show warn of their floor raise's eviction on
 	// stderr and exit 0.
 	keysCommitted = 4
 	// keysNotRenamed is a floor merge that was written but whose input,

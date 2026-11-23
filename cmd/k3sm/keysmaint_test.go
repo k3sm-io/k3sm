@@ -104,6 +104,30 @@ func TestKeysMaintenanceVerbs(t *testing.T) {
 	if !slices.Contains(rec.calls, "fchflags") {
 		t.Errorf("floor --rebuild did not act through the writer it was given: %q", rec.calls)
 	}
+	// A rebuild that dropped anything is done, exits 4 and lists the
+	// counts by class; its audit line's result is committed.
+	f, err := os.OpenFile(floor, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteString("not a floor line\n" + strings.Repeat("z", 4096) + "\n")
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines = nil
+	h.stdout.Reset()
+	h.mustRun(keysCommitted, "floor", "--rebuild")
+	for _, want := range []string{"dropped 1 lines of the old floor that did not parse", "dropped 1 lines of the old floor over the per-line bound", "(exit 4)"} {
+		if !strings.Contains(h.stdout.String(), want) {
+			t.Errorf("floor --rebuild after drops printed %q, want %q", h.stdout.String(), want)
+		}
+	}
+	if !slices.Equal(lines, []string{"floor-rebuild  committed"}) {
+		t.Errorf("floor --rebuild after drops audit lines %q", lines)
+	}
 	lines = nil
 	h.mustRun(keysRefused, "rm-scope", "user/1001", "--yes")
 	if !slices.Equal(lines, []string{"rm-scope  refused"}) {
