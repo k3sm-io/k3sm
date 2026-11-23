@@ -17,7 +17,10 @@ limitations under the License.
 package provider
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
@@ -248,7 +251,7 @@ func lineIndex(profile, want string) int {
 func TestSocketDenyStampIsAUnion(t *testing.T) {
 	const preExisting = "/var/run/some-future-helper.sock"
 
-	base := baseSocketDenies("", "")
+	base := baseSocketDenies("", "", nil)
 	r := &runtimedRuntime{deniedSocks: unionSocketDenies(base)}
 	sp := &runtimev1.SandboxProfile{DeniedUnixSocketPaths: []string{preExisting}}
 	r.stampSocketDenies(sp)
@@ -304,7 +307,7 @@ func TestBaseSocketDeniesKeystoreSocket(t *testing.T) {
 			if got := keystorepaths.SocketPath(wantRoot); got != tc.want {
 				t.Fatalf("keystorepaths.SocketPath(%q) = %q, want %q", wantRoot, got, tc.want)
 			}
-			if base := baseSocketDenies(tc.root, tc.dataRoot); !slices.Contains(base, tc.want) {
+			if base := baseSocketDenies(tc.root, tc.dataRoot, nil); !slices.Contains(base, tc.want) {
 				t.Fatalf("baseSocketDenies(%q, %q) = %v, missing %q", tc.root, tc.dataRoot, base, tc.want)
 			}
 
@@ -319,5 +322,63 @@ func TestBaseSocketDeniesKeystoreSocket(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestBaseSocketDeniesResolvesDataRoot proves a data root reached through a
+// symlink has its keystore socket denied by the resolved path as well as
+// the literal one, that a resolution adding only the /private firmlink adds
+// nothing (the profile renderer writes that spelling), and that a data root
+// that cannot be resolved keeps the literal deny and is logged. It swaps
+// evalDataRoot, so it is not parallel.
+func TestBaseSocketDeniesResolvesDataRoot(t *testing.T) {
+	saved := evalDataRoot
+	t.Cleanup(func() { evalDataRoot = saved })
+	links := map[string]string{
+		"/opt/k3sm-lab/data": "/Volumes/Lab/k3sm-data",
+		"/var/lib/k3sm":      "/private/var/lib/k3sm",
+	}
+	evalDataRoot = func(p string) (string, error) {
+		if r, ok := links[p]; ok {
+			return r, nil
+		}
+		return "", errors.New("fake: no such file or directory")
+	}
+	keys := func(base []string) []string {
+		var out []string
+		for _, p := range base {
+			if strings.HasSuffix(p, "/"+keystorepaths.SocketName) {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+
+	got := keys(baseSocketDenies("/opt/k3sm-lab/pods", "/opt/k3sm-lab/data", nil))
+	want := []string{"/opt/k3sm-lab/data/keystore-sock/keys.sock", "/Volumes/Lab/k3sm-data/keystore-sock/keys.sock"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("symlinked data root: keystore denies %v, want %v", got, want)
+	}
+
+	if got := keys(baseSocketDenies("", "", nil)); !slices.Equal(got, []string{"/var/lib/k3sm/keystore-sock/keys.sock"}) {
+		t.Fatalf("default data root: keystore denies %v, want the literal only", got)
+	}
+
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	if got := keys(baseSocketDenies("/opt/other", "/opt/other", log)); !slices.Equal(got, []string{"/opt/other/keystore-sock/keys.sock"}) {
+		t.Fatalf("unresolvable data root: keystore denies %v, want the literal only", got)
+	}
+	if n := strings.Count(logs.String(), "could not be resolved"); n != 1 {
+		t.Fatalf("%d lines for an unresolvable data root, want 1: %q", n, logs.String())
+	}
+
+	// The rendered profile denies the resolved spelling too.
+	profile := renderPodProfileWith(t, RuntimedConfig{Root: "/opt/k3sm-lab/pods", DataRoot: "/opt/k3sm-lab/data"})
+	denied, _ := socketDenyLiterals(t, profile)
+	for _, w := range want {
+		if !slices.Contains(denied, w) {
+			t.Fatalf("the rendered AF_UNIX deny stanza %v does not deny %q", denied, w)
+		}
 	}
 }
