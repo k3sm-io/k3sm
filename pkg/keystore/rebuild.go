@@ -91,7 +91,7 @@ func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (Reb
 	if err := s.checkConfig(); err != nil {
 		return rep, err
 	}
-	m, err := s.beginMaintenance(ctx)
+	m, err := s.beginMaintenance(ctx, errRebuildRefused)
 	if err != nil {
 		return rep, err
 	}
@@ -115,7 +115,7 @@ func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (Reb
 		m.refused()
 		return rep, fmt.Errorf("%w: the new floor would hold %d keys, past its key bound of %d", errRebuildRefused, keys, bound)
 	}
-	if err := s.swapLog(m, old.f, floorStagingName, userFloorLogName, lines, attrs); err != nil {
+	if err := s.swapLog(m, old.f, floorStagingName, userFloorLogName, lines, attrs, swapHooks{}); err != nil {
 		return rep, err
 	}
 	return rep, nil
@@ -138,6 +138,9 @@ type maintenance struct {
 	fl     *floorLock
 	dfd    int
 	marker bool
+	// refusal is the verb's refused-and-changed-nothing error, which a
+	// refusal before the old file's flag clear wraps.
+	refusal error
 	// keep leaves the marker in place: a step past the old file's flag
 	// clear failed, so the listener must stay down until a rerun.
 	keep bool
@@ -145,8 +148,9 @@ type maintenance struct {
 
 // beginMaintenance takes the exclusive store lock (at most
 // maintenanceLockWait), then keystore-lock, opens and judges the data root
-// and writes the marker.
-func (s *FileStore) beginMaintenance(ctx context.Context) (*maintenance, error) {
+// and writes the marker. refusal is the verb's refused-and-changed-nothing
+// error.
+func (s *FileStore) beginMaintenance(ctx context.Context, refusal error) (*maintenance, error) {
 	root, err := s.openDir(s.dir, false)
 	if err != nil {
 		return nil, err
@@ -159,7 +163,7 @@ func (s *FileStore) beginMaintenance(ctx context.Context) (*maintenance, error) 
 		_ = root.Close() // nothing written
 		return nil, err
 	}
-	m := &maintenance{s: s, root: root, done: func() { unlock(); _ = root.Close() }, dfd: -1}
+	m := &maintenance{s: s, root: root, done: func() { unlock(); _ = root.Close() }, dfd: -1, refusal: refusal}
 	if m.fl, _, err = s.lockFloor(ctx); err != nil {
 		m.end()
 		return nil, err
@@ -238,19 +242,9 @@ type oldFloor struct {
 // past the reader's key bound are dropped and counted. Its owner and flag
 // are not judged: after a restore it is root's and unflagged.
 func (s *FileStore) readOldFloor(dfd int) (*oldFloor, error) {
-	fd, err := unix.Openat(dfd, userFloorLogName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	f, err := openOldLog(dfd, userFloorLogName)
 	if err != nil {
 		return nil, err
-	}
-	f := os.NewFile(uintptr(fd), userFloorLogName)
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		_ = f.Close() // read-only
-		return nil, err
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
-		_ = f.Close() // read-only
-		return nil, fmt.Errorf("%w: not a regular file with one link", errLogUntrusted)
 	}
 	bound := s.logReadBound()
 	b, err := io.ReadAll(io.LimitReader(f, bound+1))
@@ -297,6 +291,29 @@ func (s *FileStore) readOldFloor(dfd int) (*oldFloor, error) {
 		}
 	}
 	return o, nil
+}
+
+// openOldLog opens name, a log or an archive in the data root, read-only
+// through dfd with O_NOFOLLOW, and refuses anything but a regular file
+// with one link: a planted symlink, FIFO or hard link refuses the verb.
+// Its owner and flag are not judged: after a restore it is root's and
+// unflagged.
+func openOldLog(dfd int, name string) (*os.File, error) {
+	fd, err := unix.Openat(dfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), name)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		_ = f.Close() // read-only
+		return nil, err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+		_ = f.Close() // read-only
+		return nil, fmt.Errorf("%w: %s is not a regular file with one link", errLogUntrusted, name)
+	}
+	return f, nil
 }
 
 // rebuildScopes opens every scope under .user/ without the GeneratedUID
@@ -478,29 +495,40 @@ func mergeFloor(old *oldFloor, disk map[floorKey]uint64, present map[string]bool
 	return lines, len(lines), removed
 }
 
+// swapHooks are the steps a verb adds to swapLog's: afterClear runs once
+// the old file is unflagged and root's 0600, before the new file is
+// renamed over canonical (audit --rotate shifts the archives there and
+// moves the old log to .1), and afterFlag once the new file is flagged,
+// before it is handed to the service user (rotate flags .1 there). Either
+// may be nil; a failure in either keeps the marker.
+type swapHooks struct {
+	afterClear, afterFlag func() error
+}
+
 // swapLog writes lines to the staging file and swaps it in for canonical,
 // whose descriptor old the caller holds: write and fsync the new file
 // (root's 0600), clear old's flag and make it root's 0600 in one step,
-// rename the new file over canonical, set sappnd on the new file's held
-// descriptor and only then hand it to the service user. A flagged file is
-// never renamed and nothing is renamed over one. A failure past old's
-// flag clear keeps the marker, so the listener stays down until a rerun.
-func (s *FileStore) swapLog(m *maintenance, old *os.File, staging, canonical string, lines [][]byte, attrs FileAttrWriter) error {
+// run hooks.afterClear, rename the new file over canonical, set sappnd on
+// the new file's held descriptor, run hooks.afterFlag and only then hand
+// the new file to the service user. A flagged file is never renamed and
+// nothing is renamed over one. A failure past old's flag clear keeps the
+// marker, so the listener stays down until a rerun.
+func (s *FileStore) swapLog(m *maintenance, old *os.File, staging, canonical string, lines [][]byte, attrs FileAttrWriter, hooks swapHooks) error {
 	if err := removeStale(m.dfd, staging, attrs); err != nil {
 		m.refused()
-		return fmt.Errorf("%w: %w", errRebuildRefused, err)
+		return fmt.Errorf("%w: %w", m.refusal, err)
 	}
 	fd, err := unix.Openat(m.dfd, staging, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, logMode)
 	if err != nil {
 		m.refused()
-		return fmt.Errorf("%w: create %s: %w", errRebuildRefused, staging, err)
+		return fmt.Errorf("%w: create %s: %w", m.refusal, staging, err)
 	}
 	nf := os.NewFile(uintptr(fd), staging)
 	defer func() { _ = nf.Close() }() // fsynced below
 	unstage := func(err error) error {
-		_ = unix.Unlinkat(m.dfd, staging, 0) // the old floor is untouched
+		_ = unix.Unlinkat(m.dfd, staging, 0) // the old log is untouched
 		m.refused()
-		return fmt.Errorf("%w: %w", errRebuildRefused, err)
+		return fmt.Errorf("%w: %w", m.refusal, err)
 	}
 	if err := attrs.Fchown(fd, s.floorUID, s.floorGID); err != nil {
 		return unstage(fmt.Errorf("own %s: %w", staging, err))
@@ -523,25 +551,28 @@ func (s *FileStore) swapLog(m *maintenance, old *os.File, staging, canonical str
 		return unstage(fmt.Errorf("stat %s: %w", canonical, err))
 	}
 	if named.Dev != held.Dev || named.Ino != held.Ino {
-		return unstage(fmt.Errorf("%w: %s was replaced while the rebuild read it", errLogUntrusted, canonical))
+		return unstage(fmt.Errorf("%w: %s was replaced while the verb held it", errLogUntrusted, canonical))
 	}
 	// From here a failure leaves the marker: the listener stays down.
 	m.keep = true
-	ofd := int(old.Fd())
-	if err := attrs.Fchflags(ofd, 0); err != nil {
-		return fmt.Errorf("clear the flag of the old %s: %w; rerun the verb", canonical, err)
+	if err := s.unflagToRoot(int(old.Fd()), "the old "+canonical, attrs); err != nil {
+		return err
 	}
-	if err := attrs.Fchown(ofd, s.floorUID, s.floorGID); err != nil {
-		return fmt.Errorf("own the old %s: %w; rerun the verb", canonical, err)
-	}
-	if err := attrs.Fchmod(ofd, logMode); err != nil {
-		return fmt.Errorf("chmod the old %s: %w; rerun the verb", canonical, err)
+	if hooks.afterClear != nil {
+		if err := hooks.afterClear(); err != nil {
+			return err
+		}
 	}
 	if err := unix.Renameat(m.dfd, staging, m.dfd, canonical); err != nil {
 		return fmt.Errorf("rename %s over %s: %w; rerun the verb", staging, canonical, err)
 	}
 	if err := attrs.Fchflags(fd, sfAppend); err != nil {
 		return fmt.Errorf("flag the new %s append-only: %w; rerun the verb", canonical, err)
+	}
+	if hooks.afterFlag != nil {
+		if err := hooks.afterFlag(); err != nil {
+			return err
+		}
 	}
 	if err := attrs.Fchown(fd, int(s.uid), int(s.gid)); err != nil {
 		return fmt.Errorf("hand the new %s to the service user: %w; rerun the verb", canonical, err)
@@ -550,6 +581,23 @@ func (s *FileStore) swapLog(m *maintenance, old *os.File, staging, canonical str
 		return fmt.Errorf("fsync the data root: %w; rerun the verb", err)
 	}
 	m.keep = false
+	return nil
+}
+
+// unflagToRoot clears the flag of the file fd holds and, in the same
+// step, makes it root's 0600 on that descriptor (Open requirement 1), so
+// the service user can never open it while it is unflagged. what names it
+// in the error, which asks for a rerun: the marker stays.
+func (s *FileStore) unflagToRoot(fd int, what string, attrs FileAttrWriter) error {
+	if err := attrs.Fchflags(fd, 0); err != nil {
+		return fmt.Errorf("clear the flag of %s: %w; rerun the verb", what, err)
+	}
+	if err := attrs.Fchown(fd, s.floorUID, s.floorGID); err != nil {
+		return fmt.Errorf("own %s: %w; rerun the verb", what, err)
+	}
+	if err := attrs.Fchmod(fd, logMode); err != nil {
+		return fmt.Errorf("chmod %s: %w; rerun the verb", what, err)
+	}
 	return nil
 }
 
