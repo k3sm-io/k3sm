@@ -78,8 +78,9 @@ func TestRebuildStreamsFloorPastReadBound(t *testing.T) {
 	}
 }
 
-// A flood of forged live keys for a scope that exists is dropped first and
-// counted, and every real line is kept.
+// A flood of forged live keys for a scope that exists is trimmed to the
+// uid's share, oldest first, and counted, and every real line (older) is
+// kept.
 func TestRebuildDropsForgedLiveFlood(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)
@@ -104,8 +105,8 @@ func TestRebuildDropsForgedLiveFlood(t *testing.T) {
 	const bound = 10
 	s.floorLog().maxKeys = bound
 	rep, _ := rebuild(t, s)
-	if rep.Keys != bound || rep.ForgedLive != forged-(bound-3) {
-		t.Errorf("the rebuild kept %d keys and dropped %d forged live lines, want %d and %d", rep.Keys, rep.ForgedLive, bound, forged-(bound-3))
+	if rep.Keys != bound || rep.PastShare != forged-(bound-3) {
+		t.Errorf("the rebuild kept %d keys and dropped %d lines past the share, want %d and %d", rep.Keys, rep.PastShare, bound, forged-(bound-3))
 	}
 	var haveToken, haveGone bool
 	for _, r := range floorRecs(t, s) {
@@ -144,7 +145,7 @@ func TestOldFloorReaderMemoryBounded(t *testing.T) {
 		var before, after runtime.MemStats
 		runtime.GC()
 		runtime.ReadMemStats(&before)
-		o, err := readOldFloorFrom(bytes.NewReader(b), int64(len(b)), in, keyBound, maxLogLine)
+		o, err := readOldFloorFrom(bytes.NewReader(b), int64(len(b)), in, keyBound, keyBound, maxLogLine)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -167,16 +168,16 @@ func TestOldFloorReaderMemoryBounded(t *testing.T) {
 	}
 	_, smallLive, small := measure(floodOf(1000, true))
 	_, bigLive, big := measure(floodOf(16*1000, true))
-	if len(small.maxSeq) != keyBound || len(big.maxSeq) != keyBound || big.forged != 16*1000-keyBound {
-		t.Fatalf("admitted %d and %d keys, dropped %d forged, want %d, %d and %d", len(small.maxSeq), len(big.maxSeq), big.forged, keyBound, keyBound, 16*1000-keyBound)
+	if len(small.maxSeq) != keyBound || len(big.maxSeq) != keyBound || big.pastShare != 16*1000-keyBound {
+		t.Fatalf("admitted %d and %d keys, dropped %d past the share, want %d, %d and %d", len(small.maxSeq), len(big.maxSeq), big.pastShare, keyBound, keyBound, 16*1000-keyBound)
 	}
 	if bigLive > smallLive+64<<10 {
 		t.Errorf("a floor of 16 times the forged lines kept %d bytes live against %d: the reader keeps memory in proportion to the file", bigLive, smallLive)
 	}
 }
 
-// Real tombstones alone past the key bound refuse, naming the scopes with
-// the most keys: the one refusal left.
+// The keys of scopes on disk, each within its share, past the key bound
+// refuse, naming the scopes with the most keys: the one refusal left.
 func TestOldFloorReaderRefusesTombstonesPastBound(t *testing.T) {
 	var b bytes.Buffer
 	for i := range 5 {
@@ -187,7 +188,7 @@ func TestOldFloorReaderRefusesTombstonesPastBound(t *testing.T) {
 		b.Write(line)
 	}
 	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{"user/1001": true}, names: map[nameKey]bool{}, removed: map[string]int64{}}
-	_, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, 4, maxLogLine)
+	_, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, 4, 8, maxLogLine)
 	if err == nil || !strings.Contains(err.Error(), "user/1001 (5 keys)") {
 		t.Fatalf("readOldFloorFrom: %v, want a refusal naming user/1001 (5 keys)", err)
 	}

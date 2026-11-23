@@ -80,7 +80,7 @@ func TestKeysMaintenanceCommittedAfterSwap(t *testing.T) {
 	h.stderr.Reset()
 	lines = nil
 	h.mustRun(keysOK, "audit", "--rotate")
-	if !strings.Contains(h.stderr.String(), "an earlier floor --rebuild committed and was not reported: dropped=1") {
+	if !strings.Contains(h.stderr.String(), "an earlier floor --rebuild committed and was not reported: ") || !strings.Contains(h.stderr.String(), "dropped=1") {
 		t.Errorf("rotate after a committed rebuild printed %q to stderr, want the earlier report", h.stderr.String())
 	}
 	if strings.Contains(h.stderr.String(), "not written") {

@@ -116,11 +116,11 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		return false, fmt.Errorf("read the delivery record of %s: %w; nothing was changed", u.scope, derr)
 	}
 	if !recorded {
-		size, err := s.floorSize(dfd)
+		ino, size, err := s.floorSize(dfd)
 		if err != nil {
 			return false, fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed", userFloorLogName, err)
 		}
-		if removed.add(uid, id, size) {
+		if removed.add(uid, id, ino, size) {
 			if err := writeRemovedScopes(dfd, removed); err != nil {
 				return false, fmt.Errorf("record the removed scope %s in %s: %w; the record may or may not list it, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", u.scope, removedScopesName, err, u.scope)
 			}
@@ -137,23 +137,23 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 	return recorded, nil
 }
 
-// floorSize is the user-scope floor's byte size, through the judged data
-// root dfd: 0 when there is no floor yet.
-func (s *FileStore) floorSize(dfd int) (int64, error) {
+// floorSize is the user-scope floor's inode and byte size, through the
+// judged data root dfd: 0 and 0 when there is no floor yet.
+func (s *FileStore) floorSize(dfd int) (uint64, int64, error) {
 	lfd, err := s.openLogsDir(dfd)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer func() { _ = unix.Close(lfd) }() // read-only directory descriptor
 	var st unix.Stat_t
 	err = s.statLog(lfd, userFloorLogName, &st)
 	if errors.Is(err, unix.ENOENT) {
-		return 0, nil
+		return 0, 0, nil
 	}
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return st.Size, nil
+	return st.Ino, st.Size, nil
 }
 
 // scopeDirPresent reports whether keystore/.user/<name> names anything.

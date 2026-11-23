@@ -46,8 +46,13 @@ func TestRebuildKeepsReMintedScopeTombstones(t *testing.T) {
 		t.Fatalf("RemoveScope: %v", err)
 	}
 	r := readRecord(t, s)
-	if len(r.Scopes) != 1 || r.Scopes[0].FloorSize != int64(len(readLog(t, s, userFloorLogName))) {
-		t.Fatalf("the record is %+v, want the floor's size %d at the removal", r.Scopes, len(readLog(t, s, userFloorLogName)))
+	floorIno, _ := inoOf(t, filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName))
+	if len(r.Scopes) != 1 || r.Scopes[0].FloorSize != int64(len(readLog(t, s, userFloorLogName))) || r.Scopes[0].FloorIno != floorIno {
+		t.Fatalf("the record is %+v, want the floor's inode %d and size %d at the removal", r.Scopes, floorIno, len(readLog(t, s, userFloorLogName)))
+	}
+	recordBytes, err := os.ReadFile(removedRecordPath(s))
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// Re-mint, keep a copy holding a live a, then delete a.
@@ -76,8 +81,8 @@ func TestRebuildKeepsReMintedScopeTombstones(t *testing.T) {
 	if !tomb {
 		t.Fatal("the rebuild dropped the re-minted scope's tombstone")
 	}
-	if r := readRecord(t, s); r.Scopes[0].FloorSize != 0 || r.keys() != 1 {
-		t.Fatalf("after the rebuild the record is %+v, want the key listed at offset 0", r.Scopes)
+	if after, err := os.ReadFile(removedRecordPath(s)); err != nil || !bytes.Equal(after, recordBytes) {
+		t.Fatalf("the rebuild rewrote the record: %q, %v; want it byte-identical, %q", after, err, recordBytes)
 	}
 
 	copyTree(t, saved, scopeDir(server, "1002"))
@@ -87,16 +92,18 @@ func TestRebuildKeepsReMintedScopeTombstones(t *testing.T) {
 		t.Fatalf("the copy-back of the re-minted scope: %q, %v; want refused as deleted", got, err)
 	}
 
-	// A second rebuild, at offset 0, drops nothing more.
+	// A second rebuild reads a floor of a new inode, so the recorded
+	// offset no longer applies: it drops nothing more.
 	if rep, _ := rebuild(t, s); rep.RemovedKeys != 0 {
 		t.Errorf("a second rebuild dropped %d keys, want 0", rep.RemovedKeys)
 	}
 }
 
-// U196: a rebuild stopped after it set the record's floor offsets to 0 and
-// before its swap leaves the old floor live, and the rerun keeps the
-// removed scope's lines rather than dropping them (fail closed).
-func TestRebuildCrashAfterRecordRewriteFailsClosed(t *testing.T) {
+// A rebuild refused before its swap changes nothing: the record stays
+// byte-identical (rebuild never writes it), and a later rebuild still
+// drops the removed scope's lines, since the floor is still the one the
+// removal was recorded against.
+func TestRebuildRefusedLeavesRecordAndStillDrops(t *testing.T) {
 	ctx := context.Background()
 	s, _, _ := fileLogScope(t)
 	v := userScope(t, s, 1002)
@@ -104,35 +111,48 @@ func TestRebuildCrashAfterRecordRewriteFailsClosed(t *testing.T) {
 	if _, err := s.RemoveScope(ctx, 1002); err != nil {
 		t.Fatalf("RemoveScope: %v", err)
 	}
+	record, err := os.ReadFile(removedRecordPath(s))
+	if err != nil {
+		t.Fatal(err)
+	}
 	before := readLog(t, s, userFloorLogName)
-	for _, at := range []string{swapStepBuild, swapStepReport} {
-		if _, err := s.RebuildFloor(ctx, &stepCrash{at: at}); !errors.Is(err, errRebuildRefused) {
+	for _, at := range []string{swapStepReadOld, swapStepBuild, swapStepReport} {
+		if _, err := s.RebuildFloor(ctx, &stepCrash{at: at}); !errors.Is(err, errRebuildRefused) && at != swapStepReport {
 			t.Fatalf("a rebuild stopped before %s: %v, want a refusal", at, err)
 		}
-		if r := readRecord(t, s); r.Scopes[0].FloorSize != 0 {
-			t.Fatalf("stopped before %s, the record's offset is %d, want 0", at, r.Scopes[0].FloorSize)
+		if after, err := os.ReadFile(removedRecordPath(s)); err != nil || !bytes.Equal(after, record) {
+			t.Fatalf("a rebuild stopped before %s changed the record: %q, %v", at, after, err)
 		}
 		if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
 			t.Fatalf("a rebuild stopped before %s changed the floor", at)
 		}
 	}
 	rep, _ := rebuild(t, s)
-	if rep.RemovedKeys != 0 || !floorHasScope(t, s, "user/1002") {
-		t.Fatalf("the rerun dropped %d keys of the removed scope; want them kept", rep.RemovedKeys)
+	if rep.RemovedKeys != 2 || floorHasScope(t, s, "user/1002") {
+		t.Fatalf("the rebuild after the refusals dropped %d keys of the removed scope; want 2, none left", rep.RemovedKeys)
+	}
+	if rep, _ := rebuild(t, s); rep.RemovedKeys != 0 {
+		t.Fatalf("a second rebuild dropped %d keys more, want 0", rep.RemovedKeys)
 	}
 }
 
 // A record written before the floor offset existed parses with offset 0,
-// which drops nothing; a negative offset does not parse.
+// which drops nothing; one with an offset and no floor_ino drops nothing;
+// one with both drops only for the floor of that inode; a negative offset
+// does not parse.
 func TestRemovedScopesFloorSizeParse(t *testing.T) {
 	key := bytes.Repeat([]byte("a"), 64)
 	r, err := parseRemovedScopes([]byte(`{"version":1,"scopes":[{"uid":7,"keys":["` + string(key) + `"]}]}`))
-	if err != nil || r.Scopes[0].FloorSize != 0 || len(r.dropBefore()) != 0 {
+	if err != nil || r.Scopes[0].FloorSize != 0 || len(r.dropBefore(9)) != 0 {
 		t.Fatalf("a record without floor_size: %+v, %v; want offset 0, dropping nothing", r, err)
 	}
 	r, err = parseRemovedScopes([]byte(`{"version":1,"scopes":[{"uid":7,"keys":["` + string(key) + `"],"floor_size":42}]}`))
-	if err != nil || r.dropBefore()["user/7"] != 42 {
-		t.Fatalf("a record with floor_size 42: %+v, %v", r, err)
+	if err != nil || len(r.dropBefore(9)) != 0 || len(r.dropBefore(0)) != 0 {
+		t.Fatalf("a record with floor_size 42 and no floor_ino: %+v, %v; want it to drop nothing", r, err)
+	}
+	r, err = parseRemovedScopes([]byte(`{"version":1,"scopes":[{"uid":7,"keys":["` + string(key) + `"],"floor_size":42,"floor_ino":9}]}`))
+	if err != nil || r.dropBefore(9)["user/7"] != 42 || len(r.dropBefore(10)) != 0 {
+		t.Fatalf("a record with floor_size 42 at inode 9: %+v, %v", r, err)
 	}
 	if _, err := parseRemovedScopes([]byte(`{"version":1,"scopes":[{"uid":7,"keys":["` + string(key) + `"],"floor_size":-1}]}`)); err == nil {
 		t.Fatal("a negative floor_size parsed")

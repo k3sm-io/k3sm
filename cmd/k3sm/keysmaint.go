@@ -74,7 +74,8 @@ func printRebuildDrops(env keysEnv, rep keystore.RebuildReport) {
 	}{
 		{rep.Dropped, "lines of the old floor that did not parse (a torn last line included)"},
 		{rep.OverLong, "lines of the old floor over the per-line bound"},
-		{rep.ForgedLive, "live lines with no key on disk, past the floor's key bound (forged live keys)"},
+		{rep.PastShare, "lines of user scopes on disk past the uid's share"},
+		{rep.AbsentScopes, "lines of absent scopes (no scope directory, not removed by root), past their share or the floor's key bound"},
 		{rep.RemovedKeys, "keys of user scopes root removed"},
 	} {
 		if d.n > 0 {

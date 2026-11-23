@@ -81,12 +81,12 @@ type SwapStepper interface {
 // left no room for (the forgeable ones, dropped first), and the keys of
 // scopes root removed and recorded, which it did not carry forward.
 type RebuildReport struct {
-	Scopes, Keys, Dropped, OverLong, ForgedLive, RemovedKeys int
+	Scopes, Keys, Dropped, OverLong, PastShare, AbsentScopes, RemovedKeys int
 }
 
 // Lost reports whether the rebuild dropped any line or key.
 func (r RebuildReport) Lost() bool {
-	return r.Dropped+r.OverLong+r.ForgedLive+r.RemovedKeys > 0
+	return r.Dropped+r.OverLong+r.PastShare+r.AbsentScopes+r.RemovedKeys > 0
 }
 
 // errRebuildRefused marks a rebuild that refused before it touched the old
@@ -107,14 +107,16 @@ var errRebuildRefused = errors.New("floor --rebuild refused and changed nothing"
 // which no entry line overrides, and per live key the higher of the carried
 // sequence and the one on disk. A line of a uid rm-scope recorded is
 // dropped when it starts before the floor offset recorded at the removal,
-// and kept at or after it (a re-minted scope's lines). Any scope that does
-// not open refuses the rebuild, naming the scope, before anything changes.
+// and kept at or after it (a re-minted scope's lines), but only when the
+// removal was recorded against the inode of the floor it reads. Any scope
+// that does not open refuses the rebuild, naming the scope, before anything
+// changes.
 //
-// Before the swap's commit it sets every recorded floor offset to 0 in the
-// removed-scopes record, since the offsets name positions in the floor the
-// swap retires: a crash between that rewrite and the swap leaves the old
-// floor live with offsets that drop nothing, so the rerun keeps those
-// lines (fail closed), never drops lines twice.
+// It never writes the removed-scopes record: only rm-scope does. An
+// offset names a position in one floor file, the one whose inode it was
+// recorded with; the floor this rebuild swaps in has a new inode, so a
+// later rebuild applies no stale offset, and a refused or crashed rebuild
+// has changed nothing.
 //
 // The new floor is swapped in as a whole directory (swapLogDir). A rerun
 // after a crash past the swap prints the crashed run's report and does not
@@ -139,24 +141,18 @@ func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (Reb
 	if err != nil {
 		return rep, fmt.Errorf("%w: %w", errRebuildRefused, err)
 	}
-	in, err := s.rebuildScopes(ctx, m.root)
+	in, err := s.rebuildScopes(ctx, m.root, s.floorLog().keyBound())
 	if err != nil {
 		return rep, fmt.Errorf("%w: %w", errRebuildRefused, err)
 	}
-	in.removed = removed.dropBefore()
 	rep.Scopes = len(in.present)
-	old, err := s.readOldFloor(m.lfd, in)
+	old, err := s.readOldFloor(m.lfd, in, removed)
 	if err != nil {
 		return rep, fmt.Errorf("%w: the old floor %s cannot be read: %w", errRebuildRefused, userFloorLogName, err)
 	}
-	rep.Dropped, rep.OverLong, rep.ForgedLive, rep.RemovedKeys = old.dropped, old.overLong, old.forged, old.removed
+	rep.Dropped, rep.OverLong, rep.PastShare, rep.AbsentScopes, rep.RemovedKeys = old.dropped, old.overLong, old.pastShare, old.absent, old.removed
 	lines, keys := mergeFloor(old, in.disk)
 	rep.Keys = keys
-	if removed.clearFloorSizes() {
-		if err := writeRemovedScopes(m.dfd, removed); err != nil {
-			return rep, fmt.Errorf("%w: set the floor offsets in %s to 0: %w; it may now list them at 0, and a rerun then keeps the removed scopes' floor lines", errRebuildRefused, removedScopesName, err)
-		}
-	}
 	content := func(w io.Writer) error {
 		for _, l := range lines {
 			if _, err := w.Write(l); err != nil {
@@ -175,7 +171,7 @@ func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (Reb
 func (r RebuildReport) fields() map[string]int64 {
 	return map[string]int64{
 		"scopes": int64(r.Scopes), "keys": int64(r.Keys), "dropped": int64(r.Dropped),
-		"overlong": int64(r.OverLong), "forged": int64(r.ForgedLive), "removed": int64(r.RemovedKeys),
+		"overlong": int64(r.OverLong), "past-share": int64(r.PastShare), "absent": int64(r.AbsentScopes), "removed": int64(r.RemovedKeys),
 	}
 }
 
@@ -183,7 +179,7 @@ func (r RebuildReport) fields() map[string]int64 {
 func rebuildReportOf(f map[string]int64) RebuildReport {
 	return RebuildReport{
 		Scopes: int(f["scopes"]), Keys: int(f["keys"]), Dropped: int(f["dropped"]),
-		OverLong: int(f["overlong"]), ForgedLive: int(f["forged"]), RemovedKeys: int(f["removed"]),
+		OverLong: int(f["overlong"]), PastShare: int(f["past-share"]), AbsentScopes: int(f["absent"]), RemovedKeys: int(f["removed"]),
 	}
 }
 
@@ -203,9 +199,10 @@ type oldFloor struct {
 	buried map[floorKey]bool
 	// dropped counts the lines that did not parse and a torn last line;
 	// overLong the lines over the per-line bound, skipped to their newline;
-	// forged the live lines with no key on disk that the key bound left no
-	// room for; removed the keys of scopes root removed and recorded.
-	dropped, overLong, forged, removed int
+	// pastShare the lines of scopes on disk past their uid's key share;
+	// absent the lines of scopes absent from disk left out; removed the
+	// keys of scopes root removed and recorded.
+	dropped, overLong, pastShare, absent, removed int
 }
 
 // rebuildInput is what rebuild knows before it reads the old floor: the
@@ -264,44 +261,66 @@ func floorLines(r io.Reader, lineBound int, fn func(line []byte, start int64, er
 // readOldFloor opens the canonical floor in its judged directory under
 // lfd and judges it (openOldLog, step 2), and streams it once, bounded by
 // its size at open, with memory bounded by the key bound and one line
-// (readOldFloorFrom).
-func (s *FileStore) readOldFloor(lfd int, in rebuildInput) (*oldFloor, error) {
+// (readOldFloorFrom). A removal in the record removed applies only when it
+// was recorded against this floor's inode (dropBefore).
+func (s *FileStore) readOldFloor(lfd int, in rebuildInput, removed *removedScopes) (*oldFloor, error) {
 	o, err := s.openOldLog(lfd, userFloorLogName)
 	if err != nil {
 		return nil, err
 	}
 	defer o.close()
-	return readOldFloorFrom(o.f, o.size, in, s.floorLog().keyBound(), maxLogLine)
+	in.removed = removed.dropBefore(o.ino)
+	return readOldFloorFrom(o.f, o.size, in, s.floorLog().keyBound(), s.floorLog().keyShare(), maxLogLine)
 }
 
-// readOldFloorFrom reads the first size bytes of the old floor f in two
-// streamed passes and admits
-// its keys against keyBound, counting the keys on disk first, in this
-// order (docs/design/keystore.md § "Rebuild reads a flooded floor"):
+// readOldFloorFrom reads the first size bytes of the old floor f in
+// streamed passes and admits its keys, in four classes
+// (docs/design/keystore.md § "Rebuild reads a flooded floor"):
 //
-//  1. every tombstone and every live line whose key is on disk, except a
-//     line of a uid rm-scope recorded that starts before the floor offset
-//     recorded at its removal;
-//  2. then, only while under the bound, live lines with no key on disk
-//     whose entry directory stands (another generation of it);
-//  3. then, only while under the bound, live lines with no entry directory
-//     on disk: the ones the service user can forge, dropped first.
+//  1. a scope present on disk, a line whose key is on disk: every one;
+//  2. a scope present on disk, every other line (a tombstone, another
+//     generation): oldest first, up to the uid's key share, which the
+//     writer never lets a uid pass, so a real scope loses nothing; the rest
+//     is dropped and counted in pastShare;
+//  3. a scope absent from disk and not recorded as removed: per uid up to
+//     the same share, uids in first-appearance order, while the total
+//     stays under keyBound; the rest is dropped and counted in absent;
+//  4. a scope rm-scope recorded: a line starting before its recorded floor
+//     offset is dropped and its key counted in removed; a later line is a
+//     re-minted scope's, and falls in class 1, 2 or 3.
 //
-// A live line of steps 2 and 3 the bound leaves no room for is dropped and
-// counted in forged.
-//
-// A line over lineBound is skipped to its newline and counted, a line that
-// does not parse and a torn last line are dropped and counted, and a key
-// whose line starts before its uid's recorded floor offset is dropped and
-// counted. If the tombstones and
-// the keys on disk alone pass the bound, it refuses, naming the scopes with
-// the most keys: the one refusal left. Memory is the admitted keys, at most
-// keyBound, and one line's buffer, whatever the file's size.
-func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, lineBound int) (*oldFloor, error) {
+// A line over lineBound is skipped to its newline and counted, and a line
+// that does not parse and a torn last line are dropped and counted. The
+// one refusal left is classes 1 and 2 together past keyBound (too many
+// real scopes); it names the scopes with the most keys, and rm-scope of
+// one is the repair. Memory is the keys and names on disk, which
+// rebuildScopes held to keyBound before this read, the admitted keys, at
+// most keyBound, the present scopes' counts and one line's buffer,
+// whatever the file's size.
+func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, share, lineBound int) (*oldFloor, error) {
 	o := &oldFloor{maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
 	total := len(in.disk)
+	uidKeys := map[string]int{}
+	for k := range in.disk {
+		uidKeys[k.scope]++
+	}
 	removedSeen := map[floorKey]bool{}
 	gone := func(k floorKey, start int64) bool { return start < in.removed[k.scope] }
+	admitted := func(k floorKey) bool {
+		_, live := o.maxSeq[k]
+		return live || o.buried[k]
+	}
+	// take carries line r into the admitted key k, already counted.
+	take := func(r floorRec) {
+		switch {
+		case r.tomb:
+			o.buried[r.key] = true
+			delete(o.maxSeq, r.key)
+		case !o.buried[r.key]:
+			o.maxSeq[r.key] = max(o.maxSeq[r.key], r.seq)
+		}
+	}
+	// Pass 1: classes 1, 2 and 4.
 	off, torn, err := floorLines(io.NewSectionReader(f, 0, size), lineBound, func(line []byte, start int64, lerr error) error {
 		if lerr != nil {
 			o.overLong++
@@ -312,6 +331,7 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, line
 			o.dropped++
 			return nil
 		}
+		_, onDisk := in.disk[r.key]
 		switch {
 		case gone(r.key, start):
 			if !removedSeen[r.key] {
@@ -320,22 +340,19 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, line
 				}
 				o.removed++
 			}
-		case r.tomb:
-			if o.buried[r.key] {
-				return nil
-			}
-			o.buried[r.key] = true
-			delete(o.maxSeq, r.key)
-			if _, onDisk := in.disk[r.key]; !onDisk {
-				total++
-			}
-			if total > keyBound {
-				return fmt.Errorf("the tombstones and the keys on disk alone pass the new floor's key bound of %d, so dropping any would lower the floor; the scopes with the most keys: %s", keyBound, topScopes(o.buried, in.disk, 3))
-			}
+		case !in.present[r.key.scope]:
+			// class 3, pass 2
+		case onDisk || admitted(r.key):
+			take(r)
+		case uidKeys[r.key.scope] >= share:
+			o.pastShare++
 		default:
-			if _, onDisk := in.disk[r.key]; onDisk && !o.buried[r.key] {
-				o.maxSeq[r.key] = max(o.maxSeq[r.key], r.seq)
+			uidKeys[r.key.scope]++
+			total++
+			if total > keyBound {
+				return fmt.Errorf("the keys of the scopes on disk, each within its share, pass the new floor's key bound of %d, so dropping any would lower a real scope's floor; remove a scope (sudo k3sm keys rm-scope); the scopes with the most keys: %s", keyBound, topScopes(uidKeys, 3))
 			}
+			take(r)
 		}
 		return nil
 	})
@@ -345,51 +362,84 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, line
 	if torn {
 		o.dropped++
 	}
-	// Live lines with no key on disk: those whose entry directory stands
-	// first, then those with none, each only while under the bound.
-	for _, withDir := range []bool{true, false} {
-		_, _, err = floorLines(io.NewSectionReader(f, 0, off), lineBound, func(line []byte, start int64, lerr error) error {
-			if lerr != nil {
-				return nil
-			}
-			r, err := parseFloorLine(line)
-			if err != nil || r.tomb || gone(r.key, start) || o.buried[r.key] || in.names[nameKey{r.key.scope, r.key.name}] != withDir {
-				return nil
-			}
-			if _, onDisk := in.disk[r.key]; onDisk {
-				return nil
-			}
-			if seq, ok := o.maxSeq[r.key]; ok {
-				o.maxSeq[r.key] = max(seq, r.seq)
-				return nil
-			}
-			if total >= keyBound {
-				o.forged++
-				return nil
-			}
-			o.maxSeq[r.key] = r.seq
-			total++
-			return nil
-		})
-		if err != nil {
-			return nil, err
+	// Pass 2: class 3. Holders are the absent scopes holding admitted
+	// keys, in first-appearance order; once the bound is met, an earlier
+	// scope's new key evicts one of the last holder's, so the result is the
+	// first scopes' shares, in order, whatever the interleaving.
+	type holder struct {
+		scope string
+		keys  []floorKey
+	}
+	var holders []*holder
+	held := map[string]*holder{}
+	err = floorLinesAbsent(f, off, lineBound, in, gone, func(r floorRec) {
+		if admitted(r.key) {
+			take(r)
+			return
 		}
+		h := held[r.key.scope]
+		switch {
+		case h != nil && len(h.keys) >= share:
+			return
+		case total < keyBound:
+		case h == nil || holders[len(holders)-1] == h:
+			return
+		default:
+			last := holders[len(holders)-1]
+			ev := last.keys[len(last.keys)-1]
+			last.keys = last.keys[:len(last.keys)-1]
+			delete(o.maxSeq, ev)
+			delete(o.buried, ev)
+			total--
+			if len(last.keys) == 0 {
+				holders = holders[:len(holders)-1]
+				delete(held, last.scope)
+			}
+		}
+		if h == nil {
+			h = &holder{scope: r.key.scope}
+			holders = append(holders, h)
+			held[r.key.scope] = h
+		}
+		h.keys = append(h.keys, r.key)
+		total++
+		take(r)
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Pass 3: count the class 3 lines left out.
+	err = floorLinesAbsent(f, off, lineBound, in, gone, func(r floorRec) {
+		if !admitted(r.key) {
+			o.absent++
+		}
+	})
+	if err != nil {
+		return nil, err
 	}
 	return o, nil
 }
 
-// topScopes names the n scopes holding the most of the buried and on-disk
-// keys, with their counts, for the rebuild's one refusal.
-func topScopes(buried map[floorKey]bool, disk map[floorKey]uint64, n int) string {
-	count := map[string]int{}
-	for k := range buried {
-		count[k.scope]++
-	}
-	for k := range disk {
-		if !buried[k] {
-			count[k.scope]++
+// floorLinesAbsent streams the first off bytes of f and calls fn with each
+// parsed line of a scope absent from disk that is not dropped as removed.
+func floorLinesAbsent(f io.ReaderAt, off int64, lineBound int, in rebuildInput, gone func(floorKey, int64) bool, fn func(floorRec)) error {
+	_, _, err := floorLines(io.NewSectionReader(f, 0, off), lineBound, func(line []byte, start int64, lerr error) error {
+		if lerr != nil {
+			return nil
 		}
-	}
+		r, err := parseFloorLine(line)
+		if err != nil || in.present[r.key.scope] || gone(r.key, start) {
+			return nil
+		}
+		fn(r)
+		return nil
+	})
+	return err
+}
+
+// topScopes names the n scopes holding the most keys in count, with their
+// counts, for the rebuild's one refusal.
+func topScopes(count map[string]int, n int) string {
 	scopes := make([]string, 0, len(count))
 	for sc := range count {
 		scopes = append(scopes, sc)
@@ -407,10 +457,18 @@ func topScopes(buried map[floorKey]bool, disk map[floorKey]uint64, n int) string
 	return strings.Join(parts, ", ")
 }
 
+// errDiskPastBound stops rebuildScope once the keys or entry names it
+// collected pass the key bound.
+var errDiskPastBound = errors.New("the keys on disk pass the floor's key bound")
+
 // rebuildScopes opens every scope under .user/ without the GeneratedUID
 // check and returns the line each key on disk gets, and the set of scopes
-// present. Any scope that does not open refuses, naming it.
-func (s *FileStore) rebuildScopes(ctx context.Context, root *os.Root) (rebuildInput, error) {
+// present. Any scope that does not open refuses, naming it. It stops
+// collecting once the keys or the entry names on disk pass keyBound, and
+// refuses, naming the scopes with the most entries, before the old floor
+// is read: its memory is held to the bound. The scope walk is bounded by
+// eachScopeDir's listing bound.
+func (s *FileStore) rebuildScopes(ctx context.Context, root *os.Root, keyBound int) (rebuildInput, error) {
 	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{}, names: map[nameKey]bool{}}
 	exists, err := rootHasUserScopes(root)
 	if err != nil || !exists {
@@ -424,7 +482,15 @@ func (s *FileStore) rebuildScopes(ctx context.Context, root *os.Root) (rebuildIn
 		id, _ := strconv.ParseUint(name, 10, 32) // eachScopeDir passes only decimal uids
 		u := &UserScope{s: s, uid: uint32(id), scope: userScopeOf(uint32(id))}
 		in.present[u.scope] = true
-		if err := u.rebuildScope(root, k, in); err != nil {
+		err := u.rebuildScope(root, k, in, keyBound)
+		if errors.Is(err, errDiskPastBound) {
+			count := map[string]int{}
+			for nk := range in.names {
+				count[nk.scope]++
+			}
+			return fmt.Errorf("the entries of the scopes on disk pass the new floor's key bound of %d, so the rebuild would lower a real scope's floor; remove a scope (sudo k3sm keys rm-scope); the scopes with the most entries: %s", keyBound, topScopes(count, 3))
+		}
+		if err != nil {
 			return fmt.Errorf("the scope %s does not open, so the rebuild would lower its floor: %w", u.scope, err)
 		}
 		return nil
@@ -438,8 +504,9 @@ func (s *FileStore) rebuildScopes(ctx context.Context, root *os.Root) (rebuildIn
 // rebuildScope adds u's lines to disk: its delivery record's at its
 // authenticated sequence, and one per entry directory holding a generation
 // file, at the pointer's sequence when the pointer authenticates and at 0
-// for the generation file's generation when it does not.
-func (u *UserScope) rebuildScope(root *os.Root, k keys, in rebuildInput) error {
+// for the generation file's generation when it does not. It stops with
+// errDiskPastBound once the keys or names collected pass keyBound.
+func (u *UserScope) rebuildScope(root *os.Root, k keys, in rebuildInput, keyBound int) error {
 	disk := in.disk
 	o, err := u.openScopeForRevoke(root, k)
 	if err != nil {
@@ -462,6 +529,9 @@ func (u *UserScope) rebuildScope(root *os.Root, k keys, in rebuildInput) error {
 		return fmt.Errorf("list %s: %w", scopeEntriesName, err)
 	}
 	for _, name := range names {
+		if len(in.disk) > keyBound || len(in.names) > keyBound {
+			return errDiskPastBound
+		}
 		if checkName(name) != nil {
 			continue // a temporary name, never an entry
 		}
@@ -482,6 +552,9 @@ func (u *UserScope) rebuildScope(root *os.Root, k keys, in rebuildInput) error {
 				disk[kk] = 0
 			}
 		}
+	}
+	if len(in.disk) > keyBound || len(in.names) > keyBound {
+		return errDiskPastBound
 	}
 	return nil
 }

@@ -32,7 +32,7 @@ import (
 
 // The removed-scopes record (docs/design/keystore.md § "A removed scope
 // stays removed"): rm-scope lists, per uid, the identity of each scope key
-// it removed and the floor's byte size at the removal, in
+// it removed and the floor's inode and byte size at the removal, in
 // keystore-removed-scopes.json in the data root, so a scope directory
 // copied back after rm-scope, whose scope.key still opens under the
 // unchanged master, is refused at every open, and floor --rebuild drops the
@@ -87,17 +87,20 @@ type removedScopes struct {
 	Scopes  []removedScope `json:"scopes"`
 }
 
-// removedScope is one uid's removed scope keys. FloorSize is the user-scope
-// floor's byte size when rm-scope last listed a key of the uid: floor
-// --rebuild drops the uid's floor lines that start before it, every one
+// removedScope is one uid's removed scope keys. FloorIno and FloorSize
+// are the user-scope floor log's inode and byte size when rm-scope last
+// listed a key of the uid: floor --rebuild, reading the floor of that
+// inode, drops the uid's floor lines that start before the size, every one
 // written while a removed scope stood, and keeps those at or after it, a
-// re-minted scope's. A rebuild sets it to 0 before its swap commits, since
-// the offset names a position in the floor the swap retires; 0 drops
-// nothing.
+// re-minted scope's. The offset belongs to that one floor file: a rebuild
+// swaps in a floor of a new inode, so the offset never applies again, and
+// the record is never rewritten by a rebuild. A record without FloorIno
+// (0) drops nothing.
 type removedScope struct {
 	UID       uint32   `json:"uid"`
 	Keys      []string `json:"keys"`
 	FloorSize int64    `json:"floor_size"`
+	FloorIno  uint64   `json:"floor_ino,omitempty"`
 }
 
 // has reports whether uid's scope key id is listed.
@@ -115,29 +118,18 @@ func (r *removedScopes) listed(uid uint32) bool {
 	return slices.ContainsFunc(r.Scopes, func(sc removedScope) bool { return sc.UID == uid })
 }
 
-// dropBefore maps each user scope with a nonzero floor offset to it: the
-// rebuild drops that scope's floor lines starting before the offset.
-func (r *removedScopes) dropBefore() map[string]int64 {
+// dropBefore maps each user scope recorded against the floor of inode ino,
+// with a nonzero offset, to its offset: the rebuild reading that floor
+// drops that scope's lines starting before the offset. A removal recorded
+// against another floor, or with no inode, drops nothing.
+func (r *removedScopes) dropBefore(ino uint64) map[string]int64 {
 	out := map[string]int64{}
 	for _, sc := range r.Scopes {
-		if sc.FloorSize > 0 {
+		if ino != 0 && sc.FloorIno == ino && sc.FloorSize > 0 {
 			out[userScopeOf(sc.UID)] = sc.FloorSize
 		}
 	}
 	return out
-}
-
-// clearFloorSizes sets every nonzero floor offset to 0, and reports
-// whether any was set.
-func (r *removedScopes) clearFloorSizes() bool {
-	changed := false
-	for i := range r.Scopes {
-		if r.Scopes[i].FloorSize != 0 {
-			r.Scopes[i].FloorSize = 0
-			changed = true
-		}
-	}
-	return changed
 }
 
 // keys is the count of scope keys listed.
@@ -149,20 +141,21 @@ func (r *removedScopes) keys() int {
 	return n
 }
 
-// add lists uid's scope key id with the floor's byte size floorSize at the
-// removal, and reports false, changing nothing, when the record is full.
-func (r *removedScopes) add(uid uint32, id string, floorSize int64) bool {
+// add lists uid's scope key id with the floor's inode floorIno and byte
+// size floorSize at the removal, and reports false, changing nothing, when
+// the record is full.
+func (r *removedScopes) add(uid uint32, id string, floorIno uint64, floorSize int64) bool {
 	if r.keys() >= maxRemovedScopeKeys {
 		return false
 	}
 	for i := range r.Scopes {
 		if r.Scopes[i].UID == uid {
 			r.Scopes[i].Keys = append(r.Scopes[i].Keys, id)
-			r.Scopes[i].FloorSize = floorSize
+			r.Scopes[i].FloorSize, r.Scopes[i].FloorIno = floorSize, floorIno
 			return true
 		}
 	}
-	r.Scopes = append(r.Scopes, removedScope{UID: uid, Keys: []string{id}, FloorSize: floorSize})
+	r.Scopes = append(r.Scopes, removedScope{UID: uid, Keys: []string{id}, FloorSize: floorSize, FloorIno: floorIno})
 	return true
 }
 

@@ -397,6 +397,7 @@ func (m *maintenance) end() {
 type oldLog struct {
 	f    *os.File
 	size int64
+	ino  uint64
 	dir  int
 }
 
@@ -442,7 +443,7 @@ func (s *FileStore) openOldLog(lfd int, name string) (*oldLog, error) {
 		o.close()
 		return nil, err
 	}
-	o.size = st.Size
+	o.size, o.ino = st.Size, st.Ino
 	return o, nil
 }
 
