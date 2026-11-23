@@ -618,7 +618,7 @@ rootcheck U50 "root-run: the defeat list run as the service user against both fl
 	k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser
 pend U51 "per-uid log fairness: the share is a fixed byte count, at most 1/16 of the hard cap; every line, reads included, is charged to its uid; a uid past its share has its mutations and reads refused with ErrLogFull while another uid's succeed, never as the global append failure; it cannot get another uid's mutations, reads or revocations refused, though it can delay them through the store lock; list and deliveries are rate-limited per uid (socket operations)" \
 	k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID TestLogShareAtMostOneSixteenthOfHardCap TestShareRefusalIsNotGlobalAppendFailure TestReadRateLimitPerUID TestReadsChargedToShare TestShareExhaustionIsolatedPerUID
-pend U52 "every root verb writes one audit line with via root once the log exists, and none before it (append-only files)" \
+check U52 "every root verb writes one audit line with via root once the log exists, and none before it (append-only files)" \
 	k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine
 pend U53 "every reconciler Secret write and delete, and every record withdrawal, writes one audit line with via reconciler, except drift repairs, coalesced to one line per delivery per 10 minutes (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited
@@ -635,7 +635,7 @@ pend U58 "seam guard, repo level: every package on the closed seam-package list 
 	k3sm/pkg/keystore::TestEverySeamPackageHasAGuard
 pend U59 "seam guard: pkg/keystore/reconcile's TestMain stubs its clock seam (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestRealPrimitivesUnreachable
-pend U60 "seam guard: cmd/k3sm's TestMain stubs each of its seams: clock, uid resolver, client-side peer credentials, server code identity, exec, euid source, file-attribute writer (append-only files)" \
+partial U60 "seam guard: cmd/k3sm's TestMain stubs each of its seams: clock, uid resolver, client-side peer credentials, server code identity, exec, euid source, file-attribute writer (append-only files); delivered: euid source, uid resolver, exec" "client-side peer credentials and server code identity (the non-root CLI and exec), file-attribute writer (floor --rebuild and audit --rotate); the clock when a keystore path in cmd/k3sm first reads it" \
 	k3sm/cmd/k3sm::TestRealPrimitivesUnreachable
 check U61 "seam guard: pkg/install's TestMain stubs its euid source and file-attribute writer (append-only files)" \
 	k3sm/pkg/install::TestRealPrimitivesUnreachable
