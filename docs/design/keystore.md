@@ -3197,6 +3197,16 @@ refused before its first frame:
   server counts every such unaudited operation in memory, and `doctor` shows the count (U112).
   An audit line carries only validated fields; a field that failed its grammar is a fixed
   placeholder.
+- **Root verbs append after they run (deviation).** The root `k3sm keys` verbs that change
+  state (`put`, `rotate`, `rm`, `rewrap`, `deliver`, `undeliver`, `floor merge`,
+  `floor --rebuild`, `audit --rotate`, `rm-scope`) write their one audit line, `via` `root`,
+  after the verb has run, with its result (`ok`, `committed`, `resumed` or `refused`), not
+  before their first change as a grant's is. An intent line before the first change cannot be
+  written in the v1 format with its existing fields: `result` is the outcome and has no value
+  for "about to run", and an `ok` written first would claim an outcome not yet known. So the
+  order stays as built, and a root verb whose append fails after it ran keeps what it did and
+  warns on stderr that its line was not written (U52). Moving the line first takes a format
+  change (a new `result` value), which is out of v1.
 - **Fail closed, except for revocations.** While appends fail (a full disk, an I/O error), the
   server refuses user mutations and reads (`list`, `read-for-exec`, `deliveries`) until an
   append succeeds (U32). The revocation class is the exception: a socket `withdraw`, `rm` or
