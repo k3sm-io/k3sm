@@ -17,6 +17,7 @@ limitations under the License.
 package socket
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,8 +26,14 @@ import (
 )
 
 // RequestBound is how long the server waits for a complete HELLO from
-// accept, and how long it gives each reply's write.
+// accept, and how long a request may take, from its first byte to the end of
+// its reply's write; a request past it is cut by closing the connection.
 const RequestBound = 10 * time.Second
+
+// IdleBound is how long a connection may sit between frames: after the
+// HELLO reply, and after each reply, the next request's first byte must
+// arrive within it or the connection is closed.
+const IdleBound = 30 * time.Second
 
 // ErrUnsupportedVersion is returned by Serve after it answers a HELLO whose
 // version range does not meet the server's with unsupported-version.
@@ -58,7 +65,8 @@ type requestHeader struct {
 }
 
 // Serve runs one connection: HELLO within RequestBound of the call, then
-// requests until the client closes. It returns nil when the client closes
+// requests until the client closes, each starting within IdleBound of the
+// previous reply and done within RequestBound of its first byte. It returns nil when the client closes
 // between frames and an error otherwise (a *ProtocolError for a frame or
 // handshake that breaks the protocol, ErrUnsupportedVersion after its
 // reply); the caller closes c in every case. Cancelling ctx expires c's
@@ -94,27 +102,44 @@ func (h *Handler) Serve(ctx context.Context, c Conn) error {
 	}
 	v, ok := selectVersion(hello.Min, hello.Max, MinVersion, MaxVersion)
 	if !ok {
-		if err := h.write(ctx, c, TypeError, errorHeader{Code: CodeUnsupportedVersion}); err != nil {
+		if err := h.write(ctx, c, h.now().Add(RequestBound), TypeError, errorHeader{Code: CodeUnsupportedVersion}); err != nil {
 			return err
 		}
 		return ErrUnsupportedVersion
 	}
-	// The HELLO deadline ends before the reply goes out: a client may close
-	// as soon as it has read the reply, and a closed conn refuses deadlines.
-	if err := c.SetReadDeadline(time.Time{}); err != nil {
+	// The idle wait starts as the reply goes out, never after it: a client
+	// may close as soon as it has read the reply, and a closed conn refuses
+	// deadlines. A reply's write is bounded too, so the idle wait is at most
+	// IdleBound and never longer.
+	if err := c.SetReadDeadline(h.now().Add(IdleBound)); err != nil {
 		return err
 	}
-	if err := h.write(ctx, c, TypeHello, HelloReply{Proto: Proto, Version: v, MaxFrame: MaxFrame}); err != nil {
+	if err := h.write(ctx, c, h.now().Add(RequestBound), TypeHello, HelloReply{Proto: Proto, Version: v, MaxFrame: MaxFrame}); err != nil {
 		return err
 	}
 	for {
+		// Idle: the next request's first byte within IdleBound of the last
+		// reply's start (the read deadline set before it).
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		f, err := ReadFrame(c)
-		if errors.Is(err, io.EOF) {
-			return nil
+		var first [1]byte
+		if _, err := io.ReadFull(c, first[:]); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
 		}
+		// The request: the rest of its frame and its reply within
+		// RequestBound of its first byte.
+		end := h.now().Add(RequestBound)
+		if err := c.SetReadDeadline(end); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		f, err := ReadFrame(io.MultiReader(bytes.NewReader(first[:]), c))
 		if err != nil {
 			return err
 		}
@@ -128,21 +153,24 @@ func (h *Handler) Serve(ctx context.Context, c Conn) error {
 		if req.Op == "" {
 			return protocolErrorf("request names no op")
 		}
+		if err := c.SetReadDeadline(h.now().Add(IdleBound)); err != nil {
+			return err
+		}
 		// No operation exists yet: every op is unknown, and the connection
 		// stays open so a newer client can fall back.
-		if err := h.write(ctx, c, TypeError, errorHeader{Code: CodeUnknownOp}); err != nil {
+		if err := h.write(ctx, c, end, TypeError, errorHeader{Code: CodeUnknownOp}); err != nil {
 			return err
 		}
 	}
 }
 
-// write sends one header-only frame within RequestBound.
-func (h *Handler) write(ctx context.Context, c Conn, t FrameType, header any) error {
+// write sends one header-only frame, finishing by deadline.
+func (h *Handler) write(ctx context.Context, c Conn, deadline time.Time, t FrameType, header any) error {
 	hb, err := json.Marshal(header)
 	if err != nil {
 		return err
 	}
-	if err := c.SetWriteDeadline(h.now().Add(RequestBound)); err != nil {
+	if err := c.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {

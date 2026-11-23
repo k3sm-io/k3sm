@@ -33,7 +33,9 @@ limitations under the License.
 // answers with TypeHello, TypeReply or TypeError. A request header names its
 // operation in "op"; an error header carries its code in "code".
 //
-// This package holds the frames, the HELLO exchange, the error codes and the
-// per-connection loop. It has no listener, no peer admission and no store:
-// with this layer alone every operation is answered unknown-op.
+// This package holds the frames, the HELLO exchange, the error codes, the
+// per-connection loop with its request and idle bounds, and the Listener:
+// peer admission at accept (eligible uid, not sandboxed, read through
+// injected sources), the connection caps and the rate-limited refusal
+// lines. It has no store: every operation is answered unknown-op.
 package socket
