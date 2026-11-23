@@ -41,8 +41,9 @@ const auditViaRoot = "root"
 // and returns nil. A log that is missing while user scopes exist, or one
 // the check refuses (flag clear, not the service user's), is an error: the
 // verb has run, and the caller reports that its line was not written. So is
-// a missing log while the maintenance marker stands: a rotate stopped
-// part-way, and its rerun finishes it.
+// a missing log while the maintenance marker stands: the maintenance verbs
+// swap whole log directories and never leave the log missing, so it was
+// removed, and install creates it again.
 func (s *FileStore) AuditRoot(ctx context.Context, op, name, result string) error {
 	if err := s.checkConfig(); err != nil {
 		return err
@@ -72,9 +73,10 @@ func (s *FileStore) AuditRoot(ctx context.Context, op, name, result string) erro
 }
 
 // errAuditMissingInMaintenance is AuditRoot's refusal to skip a missing
-// audit log while the maintenance marker stands: an audit --rotate stopped
-// after it moved the old log to .1, and its rerun writes the new one.
-var errAuditMissingInMaintenance = errors.New("the audit log is missing while keystore-maintenance exists, so a maintenance verb stopped part-way: rerun sudo k3sm keys audit --rotate")
+// audit log while the maintenance marker stands: a maintenance verb swaps
+// the whole log directory in one rename and never leaves the log missing,
+// so it was removed.
+var errAuditMissingInMaintenance = errors.New("the audit log " + logsDirName + "/" + auditDirName + "/" + auditLogName + " is missing while the maintenance marker keystore-maintenance stands; a maintenance verb swaps the whole log directory and never leaves the log missing, so it was removed: run sudo k3sm install, which creates it, then sudo k3sm doctor")
 
 // maintenanceMarked reports whether anything stands at the maintenance
 // marker's name in the judged data root.

@@ -746,7 +746,7 @@ func (s *FileStore) statLog(lfd int, name string, st *unix.Stat_t) error {
 }
 
 // openLogDirs opens and judges the data root and, through it, the logs
-// directory (gate open), and returns both descriptors.
+// directory, and returns both descriptors.
 func (s *FileStore) openLogDirs() (dfd, lfd int, err error) {
 	dfd, err = s.openLogDataRoot()
 	if err != nil {

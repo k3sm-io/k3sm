@@ -331,9 +331,9 @@ func TestCopiedBackDeliveriesRecordRefused(t *testing.T) {
 }
 
 // U25: a restored tree whose logs lost their flags is refused until floor
-// --rebuild, which hands the new floor to the service user in staging,
-// closes the gate, retires the old floor, and flags the new one on its held
-// descriptor after its rename, then opens.
+// --rebuild, which builds the new floor's directory in staging, hands the
+// new floor to the service user and flags it on its held descriptor, and
+// swaps the directory in, after which the scope opens.
 func TestBackupRestoreRoundTripRebuild(t *testing.T) {
 	ctx := context.Background()
 	s, server, u := fileLogScope(t)

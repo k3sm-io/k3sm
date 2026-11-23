@@ -500,8 +500,9 @@ func TestOldLogUnflaggedServiceOwnedRefused(t *testing.T) {
 
 // TestAuditRootRefusesMissingLogInMaintenance: with no user scopes a
 // missing audit log is Phase A and AuditRoot writes nothing; while the
-// maintenance marker stands it is a rotate stopped part-way, and AuditRoot
-// says so instead of skipping the line.
+// maintenance marker stands it was removed (the swap never leaves it
+// missing), and AuditRoot says so, naming install, instead of skipping the
+// line.
 func TestAuditRootRefusesMissingLogInMaintenance(t *testing.T) {
 	s, _ := newMasteredStore(t)
 	withFileLogs(t, s)
@@ -516,8 +517,8 @@ func TestAuditRootRefusesMissingLogInMaintenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := s.AuditRoot(ctx, "list", "", "ok")
-	if !errors.Is(err, errAuditMissingInMaintenance) || !strings.Contains(err.Error(), "audit --rotate") {
-		t.Fatalf("AuditRoot with no audit log while the marker stands: %v, want the rerun named", err)
+	if !errors.Is(err, errAuditMissingInMaintenance) || !strings.Contains(err.Error(), "sudo k3sm install") || strings.Contains(err.Error(), "audit --rotate") {
+		t.Fatalf("AuditRoot with no audit log while the marker stands: %v, want install named", err)
 	}
 }
 
