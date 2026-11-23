@@ -69,12 +69,14 @@ func (s *syncBuffer) String() string {
 
 // fakeStore is a ValueSource over a map; it counts Current calls. absentErr,
 // when set, is Absent's answer, standing in for a store that cannot confirm
-// an absence (a missing entries' directory).
+// an absence (a missing entries' directory); identity is the entries'
+// directory's identity Identity and Absent answer.
 type fakeStore struct {
 	mu        sync.Mutex
 	entries   map[string]fakeEntry
 	reads     int
 	absentErr error
+	identity  string
 }
 
 type fakeEntry struct {
@@ -97,14 +99,20 @@ func (s *fakeStore) Current(_ context.Context, name string) (keystore.Version, [
 	return keystore.Version{Name: name, Version: e.version, Kind: keystore.KindOpaque, Fingerprint: hex.EncodeToString(sum[:8])}, bytes.Clone(e.value), nil
 }
 
-func (s *fakeStore) Absent(_ context.Context, name string) (bool, error) {
+func (s *fakeStore) Absent(_ context.Context, name string) (bool, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.absentErr != nil {
-		return false, s.absentErr
+		return false, "", s.absentErr
 	}
 	_, ok := s.entries[name]
-	return !ok, nil
+	return !ok, s.identity, nil
+}
+
+func (s *fakeStore) Identity(context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.identity, nil
 }
 
 // rm deletes name, as keys rm does.
@@ -138,7 +146,7 @@ func newHarness(t *testing.T, encryptionOn, allowPlaintext bool, objs ...runtime
 	h := &harness{
 		dir:    t.TempDir(),
 		client: fake.NewClientset(objs...),
-		store:  &fakeStore{entries: map[string]fakeEntry{}},
+		store:  &fakeStore{entries: map[string]fakeEntry{}, identity: "1:1"},
 		logs:   &syncBuffer{},
 	}
 	h.path = filepath.Join(h.dir, FileName)
@@ -275,8 +283,9 @@ func secretObj(ns, name string, labels map[string]string, data map[string][]byte
 }
 
 // TestDeliveryRefusedWhileEncryptionOff: with encryption off and no override,
-// every target is refused before any apiserver call or store read, and the
-// refusal is logged at Warn once per target however many sweeps run (G18).
+// every target is refused: no create, no update and no read of a value; the
+// only calls are the Gets a revocation needs. The refusal is logged at Warn
+// once per target however many sweeps run (G18).
 func TestDeliveryRefusedWhileEncryptionOff(t *testing.T) {
 	h := newHarness(t, false, false)
 	h.store.set("api-token", 1, []byte("tok"))
@@ -286,8 +295,10 @@ func TestDeliveryRefusedWhileEncryptionOff(t *testing.T) {
 	for range 3 {
 		h.r.Sweep(ctx)
 	}
-	if got := h.client.Actions(); len(got) != 0 {
-		t.Fatalf("encryption off: the apiserver saw %v, want no call", h.verbs())
+	for _, v := range h.verbs() {
+		if v != "get/secrets" {
+			t.Fatalf("encryption off: the apiserver saw %v, want Gets only", h.verbs())
+		}
 	}
 	if h.store.reads != 0 {
 		t.Fatalf("encryption off: the store was read %d times, want 0", h.store.reads)
@@ -318,8 +329,8 @@ func TestDeliveryOverrideAllowsPlaintext(t *testing.T) {
 }
 
 // TestDeliveredTargetStaysWhenOverrideRemoved: a target delivered under the
-// override is left as it is by a server restarted without it: no update, no
-// delete, the Secret still there (G18).
+// override, whose entry is live, is left as it is by a server restarted
+// without it: no update, no delete, the Secret still there (G18).
 func TestDeliveredTargetStaysWhenOverrideRemoved(t *testing.T) {
 	h := newHarness(t, false, true)
 	h.store.set("api-token", 1, []byte("tok"))
@@ -331,8 +342,11 @@ func TestDeliveredTargetStaysWhenOverrideRemoved(t *testing.T) {
 	h.store.set("api-token", 2, []byte("tok2"))
 	restarted := h.reconciler(false, false)
 	restarted.Sweep(ctx)
-	if got := h.client.Actions(); len(got) != 0 {
-		t.Fatalf("after the override was removed the apiserver saw %v, want no call", h.verbs())
+	restarted.Sweep(ctx)
+	for _, v := range h.verbs() {
+		if v != "get/secrets" {
+			t.Fatalf("after the override was removed the apiserver saw %v, want Gets only", h.verbs())
+		}
 	}
 	if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "tok" {
 		t.Fatalf("the delivered Secret changed to %q", got)

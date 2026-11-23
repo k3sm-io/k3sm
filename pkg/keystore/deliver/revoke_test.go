@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -28,6 +30,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stesting "k8s.io/client-go/testing"
+
+	"k3sm.io/k3sm/pkg/keystore"
 )
 
 // deleteUIDs is the UID precondition of every recorded delete of the Secret
@@ -119,10 +123,11 @@ func TestRmKeepsSecretWhenAbsenceUnconfirmed(t *testing.T) {
 	h.gone(t, "payments", "api-token")
 }
 
-// TestRmKeepsUnmarkedSecret: a Secret this server created whose label or
-// annotations were stripped is not deleted when its entry goes, and the
-// reason is logged; a marked one beside it is.
-func TestRmKeepsUnmarkedSecret(t *testing.T) {
+// TestRmDeletesUnmarkedSecretWithWarning: the recorded UID decides, not the
+// marks. A Secret this server created whose label or version annotation was
+// stripped is still deleted when its entry goes, and the missing mark is
+// logged at Warn.
+func TestRmDeletesUnmarkedSecretWithWarning(t *testing.T) {
 	h := newHarness(t, true, false)
 	for _, n := range []string{"marked", "no-label", "no-version"} {
 		h.store.set(n, 1, []byte("v-"+n))
@@ -133,6 +138,10 @@ func TestRmKeepsUnmarkedSecret(t *testing.T) {
 		Target{Entry: "system/no-version", Namespace: "payments"})
 	ctx := context.Background()
 	h.r.Sweep(ctx)
+	uids := map[string]string{}
+	for _, n := range []string{"marked", "no-label", "no-version"} {
+		uids[n] = string(h.secret(t, "payments", n).UID)
+	}
 	s := h.secret(t, "payments", "no-label")
 	delete(s.Labels, LabelKey)
 	if _, err := h.client.CoreV1().Secrets("payments").Update(ctx, s, metav1.UpdateOptions{}); err != nil {
@@ -148,18 +157,15 @@ func TestRmKeepsUnmarkedSecret(t *testing.T) {
 	}
 	h.client.ClearActions()
 	h.r.Sweep(ctx)
-	h.gone(t, "payments", "marked")
-	for _, n := range []string{"no-label", "no-version"} {
-		if got := h.deleteUIDs(n); len(got) != 0 {
-			t.Fatalf("the unmarked %s drew deletes %q", n, got)
-		}
-		if got := string(h.secret(t, "payments", n).Data[DefaultDataKey]); got != "v-"+n {
-			t.Fatalf("the unmarked %s now holds %q", n, got)
+	for _, n := range []string{"marked", "no-label", "no-version"} {
+		h.gone(t, "payments", n)
+		if got := h.deleteUIDs(n); len(got) != 1 || got[0] != uids[n] {
+			t.Fatalf("%s deletes %q, want one under the precondition %q", n, got, uids[n])
 		}
 	}
 	logs := h.logs.String()
-	if strings.Count(logs, "lacks the marks a delivery sets") != 2 {
-		t.Fatalf("each unmarked Secret is not logged once\n%s", logs)
+	if n := strings.Count(logs, `level=WARN msg="keystore delivery: the Secret of a deleted entry lacks the marks`); n != 2 {
+		t.Fatalf("got %d Warn lines for the two unmarked Secrets, want 2\n%s", n, logs)
 	}
 }
 
@@ -244,5 +250,280 @@ func TestRmLeavesLiveKeySecret(t *testing.T) {
 	after := h.secret(t, "payments", "live")
 	if after.UID != before.UID || string(after.Data[DefaultDataKey]) != "live-value" {
 		t.Fatalf("the live Secret changed: uid %q (was %q) data %q", after.UID, before.UID, after.Data[DefaultDataKey])
+	}
+}
+
+// TestRmDeletedAfterUndeliver: rm, then undeliver before a sweep, then a
+// sweep: the withdrawn target's Secret is deleted and its record dropped. A
+// live entry undelivered in the same change keeps its Secret.
+func TestRmDeletedAfterUndeliver(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("revoked", 1, []byte("old"))
+	h.store.set("live", 1, []byte("live-value"))
+	h.declare(t,
+		Target{Entry: "system/revoked", Namespace: "payments"},
+		Target{Entry: "system/live", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	uid := string(h.secret(t, "payments", "revoked").UID)
+	h.store.rm("revoked")
+	h.declare(t)
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	h.gone(t, "payments", "revoked")
+	if got := h.deleteUIDs("revoked"); len(got) != 1 || got[0] != uid {
+		t.Fatalf("deletes %q, want one under the precondition %q", got, uid)
+	}
+	if got := h.deleteUIDs("live"); len(got) != 0 {
+		t.Fatalf("an undeliver of a live entry drew deletes %q", got)
+	}
+	if got := string(h.secret(t, "payments", "live").Data[DefaultDataKey]); got != "live-value" {
+		t.Fatalf("the live Secret now holds %q", got)
+	}
+	st := h.state(t)
+	if st.UID("payments", "revoked") != "" || st.UID("payments", "live") != "" {
+		t.Fatalf("the withdrawn records were not dropped: %+v", st)
+	}
+	h.assertOnlyGetCreateUpdateSecrets(t)
+}
+
+// TestRevokeWhileEncryptionOff: with plaintext delivery refused, a Secret
+// delivered under the override is still revoked once its entry is deleted,
+// after the restarted server's first sweep has seen the keystore; nothing is
+// created or updated.
+func TestRevokeWhileEncryptionOff(t *testing.T) {
+	h := newHarness(t, false, true)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	uid := string(h.secret(t, "payments", "api-token").UID)
+	h.store.rm("api-token")
+	h.client.ClearActions()
+	h.store.reads = 0
+	restarted := h.reconciler(false, false)
+	restarted.Sweep(ctx)
+	h.secret(t, "payments", "api-token") // the first sweep since start holds
+	restarted.Sweep(ctx)
+	h.gone(t, "payments", "api-token")
+	if got := h.deleteUIDs("api-token"); len(got) != 1 || got[0] != uid {
+		t.Fatalf("deletes %q, want one under the precondition %q", got, uid)
+	}
+	for _, v := range h.verbs() {
+		if v == "create/secrets" || v == "update/secrets" {
+			t.Fatalf("encryption off drew %s: %v", v, h.verbs())
+		}
+	}
+	if h.store.reads != 0 {
+		t.Fatalf("encryption off: a value was read %d times", h.store.reads)
+	}
+}
+
+// TestRevokedTargetIsQuiet: once its Secret was revoked, a target whose entry
+// is still gone logs nothing on later sweeps.
+func TestRevokedTargetIsQuiet(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	h.store.rm("api-token")
+	h.r.Sweep(ctx)
+	h.gone(t, "payments", "api-token")
+	before := h.logs.String()
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	if after := h.logs.String(); after != before {
+		t.Fatalf("a revoked target logged again:\n%s", strings.TrimPrefix(after, before))
+	}
+	if strings.Contains(h.logs.String(), "cannot read the entry") {
+		t.Fatalf("a revoked target warned that it cannot read the entry\n%s", h.logs.String())
+	}
+}
+
+// TestRevokeBreaker: when more than max(3, 25%) of the recorded Secrets'
+// entries go at once, none is deleted and one Error carries the count; once
+// the absent set is back to the limit, they are.
+func TestRevokeBreaker(t *testing.T) {
+	h := newHarness(t, true, false)
+	names := []string{"a", "b", "c", "d", "e"}
+	var targets []Target
+	for _, n := range names {
+		h.store.set(n, 1, []byte("v-"+n))
+		targets = append(targets, Target{Entry: "system/" + n, Namespace: "payments"})
+	}
+	h.declare(t, targets...)
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	for _, n := range names[:4] {
+		h.store.rm(n)
+	}
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	for _, v := range h.verbs() {
+		if v == "delete/secrets" {
+			t.Fatalf("4 of 5 entries gone drew a delete: %v", h.verbs())
+		}
+	}
+	logs := h.logs.String()
+	if n := strings.Count(logs, "level=ERROR msg=\"keystore delivery: 4 of 5 delivered Secrets' entries are gone at once"); n != 1 {
+		t.Fatalf("got %d breaker Errors over two sweeps, want 1\n%s", n, logs)
+	}
+	h.store.set("a", 1, []byte("v-a"))
+	h.r.Sweep(ctx)
+	for _, n := range names[1:4] {
+		h.gone(t, "payments", n)
+	}
+	h.secret(t, "payments", "a")
+	h.secret(t, "payments", "e")
+}
+
+// TestRevokeHeldAcrossKeystoreRestore: a real store; three entries
+// delivered, then an older keystore/ holding only one of them is swapped in,
+// as the restore steps do. The sweep that first sees it deletes nothing and
+// logs one Error naming the change.
+func TestRevokeHeldAcrossKeystoreRestore(t *testing.T) {
+	h, s, dir := newRealStoreHarness(t)
+	ctx := context.Background()
+	mustStorePut(t, s, "a")
+	older := dir + ".older"
+	copyTree(t, dir, older)
+	mustStorePut(t, s, "b")
+	mustStorePut(t, s, "c")
+	h.declare(t,
+		Target{Entry: "system/a", Namespace: "payments"},
+		Target{Entry: "system/b", Namespace: "payments"},
+		Target{Entry: "system/c", Namespace: "payments"})
+	h.r.Sweep(ctx)
+	for _, n := range []string{"a", "b", "c"} {
+		h.secret(t, "payments", n)
+	}
+	if err := os.Rename(dir, dir+".pre-restore"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(older, dir); err != nil {
+		t.Fatal(err)
+	}
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	if got := h.deleteUIDs("b"); len(got) != 0 {
+		t.Fatalf("the restore's first sweep deleted b: %v", h.verbs())
+	}
+	if got := h.deleteUIDs("c"); len(got) != 0 {
+		t.Fatalf("the restore's first sweep deleted c: %v", h.verbs())
+	}
+	for _, n := range []string{"a", "b", "c"} {
+		h.secret(t, "payments", n)
+	}
+	logs := h.logs.String()
+	if n := strings.Count(logs, "level=ERROR msg=\"keystore delivery: the keystore directory changed"); n != 1 {
+		t.Fatalf("got %d Errors naming the keystore change, want 1\n%s", n, logs)
+	}
+}
+
+// TestRmDeletesWithRealStore: a real store whose keystore/ stays the same;
+// a plain rm of one entry deletes its Secret on the next sweep and leaves the
+// other's.
+func TestRmDeletesWithRealStore(t *testing.T) {
+	h, s, _ := newRealStoreHarness(t)
+	ctx := context.Background()
+	mustStorePut(t, s, "a")
+	mustStorePut(t, s, "b")
+	h.declare(t,
+		Target{Entry: "system/a", Namespace: "payments"},
+		Target{Entry: "system/b", Namespace: "payments"})
+	h.r.Sweep(ctx)
+	h.secret(t, "payments", "a")
+	if err := s.Delete(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	h.r.Sweep(ctx)
+	h.gone(t, "payments", "a")
+	h.secret(t, "payments", "b")
+}
+
+// state reads the harness's state file.
+func (h *harness) state(t *testing.T) State {
+	t.Helper()
+	euid := uint32(os.Geteuid())
+	st, err := ReadState(filepath.Join(h.dir, StateFileName), OpenNoFollow, StateDirCheck(euid), StateFileCheck(euid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// newRealStoreHarness is newHarness over a keystore.FileStore in a temp
+// tree, owned by the running user, who stands in for both the service user
+// and root (the keystore package's own tests do the same non-root). It
+// returns the store and its entries' directory. A root run skips: the store
+// would need a separate service user.
+func newRealStoreHarness(t *testing.T) (*harness, *keystore.FileStore, string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("a real store as root needs a service user; covered by the fake store")
+	}
+	h := newHarness(t, true, false)
+	data := t.TempDir()
+	server := filepath.Join(data, "server")
+	if err := os.Mkdir(server, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(server, "keystore")
+	s := keystore.New(keystore.Config{
+		Dir:       dir,
+		MasterDir: filepath.Join(server, "cred", "keystore-master"),
+		UID:       uint32(os.Getuid()),
+		GID:       uint32(os.Getgid()),
+		DataRoot:  data,
+		FloorUID:  os.Getuid(),
+		FloorGID:  os.Getgid(),
+	})
+	h.r.store = s
+	return h, s, dir
+}
+
+func mustStorePut(t *testing.T, s *keystore.FileStore, name string) {
+	t.Helper()
+	if _, err := s.Put(context.Background(), name, keystore.KindOpaque, []byte("v-"+name)); err != nil {
+		t.Fatalf("Put %s: %v", name, err)
+	}
+}
+
+// copyTree copies the directory src to dst, keeping each file's and
+// directory's permission bits, as a backup taken with ditto would.
+func copyTree(t *testing.T, src, dst string) {
+	t.Helper()
+	err := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		to := filepath.Join(dst, rel)
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if err := os.Mkdir(to, fi.Mode().Perm()); err != nil {
+				return err
+			}
+			return os.Chmod(to, fi.Mode().Perm())
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(to, b, fi.Mode().Perm()); err != nil {
+			return err
+		}
+		return os.Chmod(to, fi.Mode().Perm())
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

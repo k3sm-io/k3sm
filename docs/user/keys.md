@@ -202,17 +202,25 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
   pick another `--secret`. The server never lists Secrets, and deletes one only to re-create an
   immutable Secret it created after a rotation or a change to its data, or after an `rm`.
   After an `rm`, the next sweep deletes the Secret the server delivered for that entry, if it
-  still has the recorded UID, the label and both annotations, and logs the names; a Secret
-  without them is left alone and logged.
+  still has the recorded UID, and logs the names.
 - **A namespace that does not exist yet.** Delivering into it goes to whoever later creates that
   namespace.
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
   declaration (with `--secret S`, only the one into Secret `S`), and prints: the Secret stays; delete it with kubectl, and rotate the entry to
   revoke. A Pod that read the value still has it, which is why revoking it means rotating.
 - **Deleting a delivered entry.** `rm` does not withdraw its deliveries. For each one still
-  declared, it warns: still declared for delivery to `<namespace>/<secret>`; the Secret keeps its
-  value: run `k3sm keys undeliver` and delete the Secret. Until you do, the server logs that it
-  cannot read the entry, and the Secret holds the last value it delivered.
+  declared, it warns: still declared for delivery to `<namespace>/<secret>`; the server deletes
+  that Secret on its next sweep, whether or not you run `k3sm keys undeliver`. The delete is
+  made only on the Secret with the UID the server recorded when it created it, and it runs
+  while plaintext delivery is refused too. It removes the Secret from the Kubernetes API and
+  nothing more: a Pod that already read the value still has it, and the datastore's history
+  and its backups keep it, so revoking a credential still means rotating or disabling it
+  where it is accepted. Two guards hold the delete back, since it cannot be undone. The first
+  sweep after the server starts, and the first sweep after `keystore/` is replaced (a restore
+  moves it aside), deletes nothing and logs it, so a restore holds revocation for one sweep.
+  And when more than 3, or more than a quarter, of the delivered Secrets' entries are gone at
+  once, none is deleted and the server logs an error with the count; it keeps holding until
+  enough entries are back, or until you delete those Secrets yourself with kubectl.
 
 The declaration is `/var/lib/k3sm/keystore-delivery.json`, owned by root, mode 0644, and only
 `k3sm keys deliver` and `undeliver` write it. It decides which namespace the server writes a
@@ -250,7 +258,8 @@ on:
 
 To turn it off, remove the flag from the plist, restart the server daemon, and run
 `sudo k3sm install`. If the record still carries the flag, remove it there too. A Secret delivered
-while the override was on stays as it is: the server does not delete it, and stops updating it.
+while the override was on stays as it is: the server stops updating it, and deletes it only
+after an `rm` of its entry.
 
 ## Backing Up and Restoring
 
@@ -317,3 +326,8 @@ is deliberate:
 
 Only remove the record when you know the restored entries are the ones you want current, since
 the next keys verb accepts them as the newest.
+
+A restore also changes which entries exist. The server holds back deleting delivered Secrets for
+one sweep after `keystore/` is replaced, and for every sweep while more than 3, or a quarter, of
+them are gone at once. After that, an entry the restored copy does not hold has its Secret
+deleted, as after an `rm`, so restore every entry you still deliver.
