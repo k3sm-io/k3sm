@@ -2911,6 +2911,14 @@ service user can only add to.
     proves the removal only with no ACL and a key listed before the run (the unlisted-key
     rule), and a key so listed still passes the newest-scope rule, which refuses exit 0 when
     the floor shows a scope of the uid minted after that listing.
+  - `mkdirAt`'s ACL removal (`fchmodx_np` with `_FILESEC_REMOVE_ACL`) fails closed on any
+    error, on the serving path too, as rm-scope's take and the audit rotation's removal do: no
+    caller in the package treats `ENOTSUP` or `EOPNOTSUPP` as "no ACL". What that call returns
+    for a directory with no ACL on a volume without ACL support is an open question, not
+    established from the code or measured (no such volume was made for it). If it errors there,
+    a root verb that creates a directory under `keystore/` on such a volume refuses: an
+    availability cost, never a directory handed over with an ACL. The data root measured so far
+    is APFS, which supports ACLs.
   - The final `rmdir` races a rename at the name, which the probe below reports but cannot
     prevent; a race it cannot judge is exit 4, never exit 0.
   - A legitimate rerun can exit 4 although the removal it finishes is the uid's newest scope:
