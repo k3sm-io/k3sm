@@ -97,7 +97,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		// An earlier rm-scope removed scope.key, then stopped: no open
 		// serves the directory, and there is no key to list.
 		if err := removeScopeTree(root, s.dir, name, s.uid); err != nil {
-			return false, fmt.Errorf("%w; the directory keystore/%s/%s has no scope.key and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, userScopesName, name, u.scope)
+			return false, fmt.Errorf("%w; the directory %s has no scope.key and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, quoteName("keystore/"+userScopesName+"/"+name), u.scope)
 		}
 		if removed.listed(uid) {
 			return true, nil
@@ -147,7 +147,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		if !recorded {
 			state = "is not listed in " + removedScopesName + ", which is full"
 		}
-		return recorded, fmt.Errorf("%w; the scope %s %s, and its directory keystore/%s/%s is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, u.scope, state, userScopesName, name, u.scope)
+		return recorded, fmt.Errorf("%w; the scope %s %s, and its directory %s is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, u.scope, state, quoteName("keystore/"+userScopesName+"/"+name), u.scope)
 	}
 	if unread != nil {
 		return recorded, fmt.Errorf("%w: %s", errCommitted, scopeRemovedUnread(u.scope, unread))
@@ -332,7 +332,7 @@ func (w *rmWalk) removeName(pfd int, rel, name string, depth int) error {
 	if err := unix.Fstatat(pfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
 		return nil
 	} else if err != nil {
-		return fmt.Errorf("stat %s: %w", name, err)
+		return fmt.Errorf("stat %s: %w", quoteName(name), err)
 	}
 	rel = filepath.Join(rel, name)
 	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
@@ -346,7 +346,7 @@ func (w *rmWalk) removeName(pfd int, rel, name string, depth int) error {
 		return nil
 	}
 	if depth >= maxScopeTreeDepth {
-		return fmt.Errorf("%w: %s is nested more than %d directories below the scope directory", errPlanted, name, maxScopeTreeDepth)
+		return fmt.Errorf("%w: %s is nested more than %d directories below the scope directory", errPlanted, quoteName(name), maxScopeTreeDepth)
 	}
 	fd, dst, err := openDirAt(pfd, name)
 	if errors.Is(err, unix.ENOENT) {
@@ -364,7 +364,7 @@ func (w *rmWalk) removeName(pfd int, rel, name string, depth int) error {
 	}
 	_ = unix.Close(fd) // fsynced above
 	if err != nil {
-		return fmt.Errorf("%s: %w", name, err)
+		return fmt.Errorf("%s: %w", quoteName(name), err)
 	}
 	err = unix.Unlinkat(pfd, name, unix.AT_REMOVEDIR)
 	if err != nil && !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.ENOTEMPTY) {
@@ -379,7 +379,7 @@ func (w *rmWalk) removeName(pfd int, rel, name string, depth int) error {
 // or socket, which rm-scope does not open), the error names the entry and
 // the chflags that clears it.
 func (w *rmWalk) flagKept(rel string, st *unix.Stat_t, err error) error {
-	p := filepath.Join(w.base, rel)
+	p := quoteName(filepath.Join(w.base, rel))
 	if statFlags(st)&userLockingFlags == 0 {
 		return fmt.Errorf("remove %s: %w", p, err)
 	}
@@ -392,7 +392,7 @@ func (w *rmWalk) flagKept(rel string, st *unix.Stat_t, err error) error {
 		}
 		why = "it is a FIFO, device or socket, which rm-scope does not open"
 	}
-	return fmt.Errorf("remove %s: %w: it carries a user flag (uchg or uappnd) that rm-scope does not clear, because %s; clear it with sudo chflags nouchg,nouappnd %s", p, err, why, p)
+	return fmt.Errorf("remove %s: %w: it carries a user flag (uchg or uappnd) that rm-scope does not clear, because %s; %s", p, err, why, chflagsHint(p))
 }
 
 // clearHeld clears the user flags of the directory held at fd, which st
@@ -445,19 +445,19 @@ func (w *rmWalk) clearScopeFlags(pfd int, name, rel string, st *unix.Stat_t) (le
 		return true, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("open %s to clear its user flags: %w; clear them with sudo chflags nouchg,nouappnd %s", name, err, filepath.Join(w.base, rel))
+		return false, fmt.Errorf("open %s to clear its user flags: %w; %s", quoteName(name), err, chflagsHint(quoteName(filepath.Join(w.base, rel))))
 	}
 	defer func() { _ = unix.Close(fd) }() // only its flags change
 	var got unix.Stat_t
 	if err := unix.Fstat(fd, &got); err != nil {
-		return false, fmt.Errorf("stat %s: %w", name, err)
+		return false, fmt.Errorf("stat %s: %w", quoteName(name), err)
 	}
 	if got.Dev != st.Dev || got.Ino != st.Ino || got.Nlink != st.Nlink || got.Uid != w.svc {
 		// Replaced or relinked under the walk: the next pass sees it anew.
 		return true, nil
 	}
 	if err := scopeFchflags(fd, int(statFlags(&got)&^userLockingFlags)); err != nil {
-		return false, fmt.Errorf("clear the user flags of %s: %w; clear them with sudo chflags nouchg,nouappnd %s", name, err, filepath.Join(w.base, rel))
+		return false, fmt.Errorf("clear the user flags of %s: %w; %s", quoteName(name), err, chflagsHint(quoteName(filepath.Join(w.base, rel))))
 	}
 	return false, nil
 }
@@ -475,11 +475,11 @@ func openDirAt(parent int, name string) (int, unix.Stat_t, error) {
 		return -1, named, err
 	}
 	if named.Mode&unix.S_IFMT != unix.S_IFDIR {
-		return -1, named, fmt.Errorf("%w: %s", errPlanted, name)
+		return -1, named, fmt.Errorf("%w: %s", errPlanted, quoteName(name))
 	}
 	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return -1, named, fmt.Errorf("%w: %s: %w", errPlanted, name, err)
+		return -1, named, fmt.Errorf("%w: %s: %w", errPlanted, quoteName(name), err)
 	}
 	if err := unix.Fstat(fd, &opened); err != nil {
 		_ = unix.Close(fd) // read-only
@@ -487,7 +487,7 @@ func openDirAt(parent int, name string) (int, unix.Stat_t, error) {
 	}
 	if opened.Dev != named.Dev || opened.Ino != named.Ino {
 		_ = unix.Close(fd) // read-only
-		return -1, named, fmt.Errorf("%w: %s was replaced while it was opened", errPlanted, name)
+		return -1, named, fmt.Errorf("%w: %s was replaced while it was opened", errPlanted, quoteName(name))
 	}
 	return fd, opened, nil
 }
@@ -531,6 +531,14 @@ func safeText(s string) string {
 		}
 		return r
 	}, strings.ToValidUTF8(s, ""))
+}
+
+// chflagsHint is the hint that clears the user flags of the entry at
+// quoted, a path quoteName rendered: chflags -h acts on a symlink itself,
+// never its target, and the operator checks the path first, since it
+// names a file in the service user's tree.
+func chflagsHint(quoted string) string {
+	return "check that the path is the one meant, then clear it with sudo chflags -h nouchg,nouappnd " + quoted
 }
 
 // quoteName renders a name or path from the service user's tree for an

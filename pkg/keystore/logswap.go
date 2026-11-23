@@ -678,7 +678,7 @@ func removeEntry(pfd int, name string, attrs FileAttrWriter, depth int) error {
 	switch st.Mode & unix.S_IFMT {
 	case unix.S_IFDIR:
 		if depth >= maxStagingDepth {
-			return fmt.Errorf("%w: %s is nested deeper than a maintenance verb builds; remove keystore-staging/ in the data root as root (sudo chflags -R 0 and sudo rm -rf), then rerun the verb, which makes it afresh", errLogUntrusted, name)
+			return fmt.Errorf("%w: %s is nested deeper than a maintenance verb builds; remove keystore-staging/ in the data root as root (sudo chflags -R 0 and sudo rm -rf), then rerun the verb, which makes it afresh", errLogUntrusted, quoteName(name))
 		}
 		fd, err := unix.Openat(pfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 		if err != nil {
@@ -696,7 +696,7 @@ func removeEntry(pfd int, name string, attrs FileAttrWriter, depth int) error {
 	case unix.S_IFREG:
 		if statFlags(&st) != 0 {
 			if st.Nlink != 1 {
-				return fmt.Errorf("%w: %s carries a file flag and has more than one link; remove keystore-staging/ in the data root as root (sudo chflags -R 0 and sudo rm -rf), then rerun the verb, which makes it afresh", errLogUntrusted, name)
+				return fmt.Errorf("%w: %s carries a file flag and has more than one link; remove keystore-staging/ in the data root as root (sudo chflags -R 0 and sudo rm -rf), then rerun the verb, which makes it afresh", errLogUntrusted, quoteName(name))
 			}
 			fd, err := unix.Openat(pfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 			if err != nil {

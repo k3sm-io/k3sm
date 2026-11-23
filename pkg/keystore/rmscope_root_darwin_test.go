@@ -124,7 +124,7 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 				var st unix.Stat_t
 				if !errors.Is(err, unix.EPERM) {
 					t.Errorf("removeScopeTree over a root-owned uchg file: %v, want EPERM", err)
-				} else if want := "sudo chflags nouchg,nouappnd " + planted; !strings.Contains(err.Error(), want) {
+				} else if want := "sudo chflags -h nouchg,nouappnd " + quoteName(planted); !strings.Contains(err.Error(), want) {
 					t.Errorf("the error %q does not name the repair %q", err, want)
 				}
 				if serr := unix.Lstat(planted, &st); serr != nil || st.Flags&unix.UF_IMMUTABLE == 0 {

@@ -2729,8 +2729,12 @@ service user can only add to.
   would only let it stall the removal. A FIFO or device is not opened (an open can unblock a
   writer or start a driver), and macOS refuses to open a socket (`EOPNOTSUPP`), so a flag on
   one of those stays: its `unlinkat` fails with `EPERM`, and rm-scope stops with an error
-  that names the entry and the repair (`sudo chflags nouchg,nouappnd <path>`, then rerun). An
-  entry another user owns, root included, is left alone and stops rm-scope the same way.
+  that names the entry and the repair (check the path, then `sudo chflags -h nouchg,nouappnd
+  "<path>"`, which acts on a symlink itself, then rerun). An entry another user owns, root
+  included, is left alone and stops rm-scope the same way. Every error or hint that prints a
+  name from the service user's tree prints it Go-quoted with its control bytes removed, so a
+  name holding a shell metacharacter, a newline or an escape sequence neither acts on the
+  terminal nor turns a pasted hint into another command.
   Names that keep
   appearing stop it after three passes with a message that a process running as the service
   user is still writing there and to stop it (`sudo k3sm stop`). An rm-scope that stops after

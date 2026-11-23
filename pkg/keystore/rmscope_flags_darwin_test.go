@@ -214,7 +214,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 		if !errors.Is(err, unix.EPERM) {
 			t.Fatalf("removeScopeTree over a uchg FIFO: %v, want EPERM", err)
 		}
-		for _, want := range []string{fifo, "sudo chflags nouchg,nouappnd " + fifo} {
+		for _, want := range []string{quoteName(fifo), "sudo chflags -h nouchg,nouappnd " + quoteName(fifo)} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("the error %q does not name %q", err, want)
 			}
