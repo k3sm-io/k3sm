@@ -61,8 +61,8 @@ import (
 //     TestLogSharePerUIDRefusesOnlyThatUID, TestLogShareAtMostOneSixteenthOfHardCap,
 //     TestShareRefusalIsNotGlobalAppendFailure, TestReadRateLimitPerUID,
 //     TestReadsChargedToShare, TestShareExhaustionIsolatedPerUID;
-//   - U193, the rebuild, in cmd/k3sm: TestRebuildCarriesTombstonesForward;
-//   - U194, the rebuild after rm-scope, in cmd/k3sm:
+//   - U193, the rebuild, in pkg/keystore: TestRebuildCarriesTombstonesForward;
+//   - U194, the rebuild after rm-scope, in pkg/keystore:
 //     TestRebuildDropsRemovedScopeKeys.
 //
 // The socket slice lifts the ban on references, never the prerequisite
@@ -148,8 +148,8 @@ var exportPrereqs = []struct {
 		"TestShareRefusalIsNotGlobalAppendFailure", "TestReadRateLimitPerUID",
 		"TestReadsChargedToShare", "TestShareExhaustionIsolatedPerUID",
 	}},
-	{"U193", "cmd/k3sm", []string{"TestRebuildCarriesTombstonesForward"}},
-	{"U194", "cmd/k3sm", []string{"TestRebuildDropsRemovedScopeKeys"}},
+	{"U193", "pkg/keystore", []string{"TestRebuildCarriesTombstonesForward"}},
+	{"U194", "pkg/keystore", []string{"TestRebuildDropsRemovedScopeKeys"}},
 }
 
 // userScopeReach are the names whose reference, in pkg/keystore, reaches
@@ -166,8 +166,10 @@ var userScopeReach = map[string]bool{
 // left out the same way, by its receiver: it is reachable only through a
 // *UserScope, which the outside ban holds.
 var inPackageReachAllow = map[string]string{
-	"FileStore.UserScope": "the user scope's own constructor, which the outside ban holds",
-	"ResolveEntry":        "the entry resolver itself, which the outside ban holds",
+	"FileStore.UserScope":    "the user scope's own constructor, which the outside ban holds",
+	"ResolveEntry":           "the entry resolver itself, which the outside ban holds",
+	"FileStore.RebuildFloor": "root's floor --rebuild: it reads every scope to write the floor's lines, all root's and charged to no uid, and gives no caller a user scope",
+	"FileStore.RemoveScope":  "root's rm-scope: it removes one scope under the exclusive lock, appends no uid's line, and gives no caller a user scope",
 }
 
 // inPackageExports returns, as "<Recv>.<Name>" or "<Name>", in declaration
