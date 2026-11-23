@@ -297,7 +297,8 @@ protection is off until a root-run verb rebuilds the floor, and the rebuild reco
 whatever pointers are under `keystore/` as current, so the file is removed as root only
 once those pointers are known to be current.
 
-The file is bounded at 4 MiB, on read and on write. A floor write whose result would be
+The file is bounded at 4 MiB, on read and on write, tombstones included (see "A deleted
+entry put back is refused" below for their share and how they are pruned). A floor write whose result would be
 larger is refused before anything is written, so the floor on disk is always one that
 reads. Put and Rotate check for room before they write the entry, so a full floor refuses
 them with no entry or pointer file written. Other entries' floor records may already have
@@ -318,12 +319,14 @@ accepted, because there is no recorded fact to refuse against:
 - *The floor file is absent.* The check is skipped for every entry, and the next root-run
   verb writes the file from the authenticated pointers (this is also the restore procedure).
 - *The floor file exists but has no entry for the name.* This is the state an interrupted Put
-  leaves (`current` written, floor not yet), and the state after a Delete. The pointer is
-  accepted if it authenticates, and the next root-run verb records its sequence and
-  generation. The residual is a stale backup of a deleted entry restored under the same
-  name: it is accepted, which is the deliberate-restore case the procedure under "Backup and
-  snapshots" already covers, and it reopens nothing the generation check (G4) does not
-  already refuse for an entry that was re-created.
+  leaves (`current` written, floor not yet), and the state after a Delete whose tombstone was
+  pruned. A name with only buried generations, none the pointer's, counts as no entry. The
+  pointer is accepted if it authenticates, and the next root-run verb records its sequence
+  and generation. The residual is a stale backup of a deleted entry whose tombstone was
+  pruned, restored under the same name: it is accepted, which is the deliberate-restore case
+  the procedure under "Backup and snapshots" already covers, and it reopens nothing the
+  generation check (G4) does not already refuse for an entry that was re-created. A deleted
+  entry whose tombstone stands is refused (see "A deleted entry put back is refused").
 
 **The refusal message is its own text, not the `ErrCorrupt` default.** `ErrCorrupt`'s stock
 message tells the operator to restore from backup, which for a stale pointer is the opposite
@@ -353,18 +356,174 @@ first Put mints no master.
 - **Put:** write `generation`, `v1`, `current` (sequence 1), then set the floor entry.
 - **Rotate:** write the new version file, flip `current` (sequence + 1), then raise the
   floor to that sequence.
-- **Delete:** remove `current`, then the entry directory, then the floor entry.
+- **Delete:** bury, then take `keystore/.lock` and judge `keystore/`, then remove
+  `current`, then the entry directory. The burial of the floor's live record comes first,
+  under `keystore-lock` alone, because the service user controls everything after it: it
+  owns `keystore/.lock` and can hold or replace it, it owns `keystore/` and can give it a
+  refused mode, and it owns the entry's files and can make their removal fail (a `uchg`
+  flag makes unlink fail even for root). If the `.lock` or `keystore/` step fails after the
+  burial, Delete returns an error saying the entry is already deleted and refused, its tree
+  was not removed, and `rm` should be rerun once the lock is free. Once `.lock` is held,
+  Delete buries the directory's authenticated generation, when there is one (below). When the removal answers `EPERM`, Delete clears the user locking flags (`uchg`,
+  `uappnd` and `uunlnk` only, through the opened descriptor, never following a symlink) on
+  `keystore/` itself and on the entry's files, and removes once more; root may clear those.
+  It clears a file's flags only when the service user owns it and, for anything but a
+  directory, when it has one link: a hard link shares its flags with names that may be outside
+  the keystore. A symlink is never opened, so a flag the service user set on a symlink itself
+  (`chflags -h`) stays, and the symlink is left behind as an accepted residual, as the hard
+  link is: the burial has already landed, so the entry stays deleted and refused. The clear
+  opens at most 4096 files in all and stops with the verb's context; past the budget it fails
+  and the directory is left behind (`TestDeleteFlagClearBudget`). A flag left in place is
+  named in the error, a flag on `keystore/` included. A removal that still fails, or a crash during it, leaves the entry already deleted and
+  refused: Delete returns an error saying so and that the directory is left behind, and
+  `rm` run again removes the directory without changing the floor. A floor raise at the
+  start that cannot complete (more names under `keystore/` than a read takes, which the
+  service user can plant, or a keystore larger than the floor holds) does not stop the
+  burial: Delete buries from the floor alone and logs the failure at Warn.
 
-**A deleted entry put back is accepted in this phase.** A completed Delete removes the
-name's floor entry, so nothing records that the name was deleted. An old copy of the deleted
-entry's directory, put back before any new Put of the name, therefore authenticates, is
-accepted by every reader, and is recorded by the next root verb's raise. The floor refuses
-such a copy (the generation refusal) only once a Put after the Delete has recorded a new
-generation for the name. This is accepted for this phase: putting a directory back under
-`keystore/` already takes a writer the floor does not defend against for an absent name,
-and the result is the entry as it stood before its Delete, not a forged value. Closing it
-needs a tombstone, a floor record that the name's last generation was deleted, which is
-left to a later change.
+**A deleted entry put back is refused: the tombstone.** A completed Delete does not remove
+the name's floor record. In the same floor write it buries a generation: it adds it to the
+name's buried set, a per-name list of generations a Delete removed, each with a delete
+sequence. The floor file gains a `tombstones` object after `entries`, mapping a name to its
+buried set, oldest first:
+
+```json
+{"version": 1, "scope": "system", "entries": {"signer-key": {"generation": "<hex>", "seq": 7}}, "tombstones": {"old-key": [{"generation": "<hex>", "deleted": 3}], "signer-key": [{"generation": "<hex>", "deleted": 1}, {"generation": "<hex>", "deleted": 4}]}}
+```
+
+- *The record.* `deleted` is the delete sequence: one more than the highest `deleted` in the
+  floor, or 1 when there is none. It orders burials for pruning and means nothing else, so
+  when it would pass 2^53 the next Delete first renumbers every burial 1 to n in its order: the
+  sequence never wraps. A name may hold a live entry and a buried set together, as
+  `signer-key` above: a Put of a deleted name records its new generation live and keeps every
+  generation buried before it. A live generation is never also buried.
+- *What Delete buries.* Delete buries the generation the floor records live for the name,
+  root's own record, whatever the deleted directory's `generation` file says. That file is in
+  the service user's tree, so Delete also buries the generation it read only when the master
+  is loaded and the directory's `current` authenticates under that generation, and only when
+  it is not the live one or already buried: with no live record, a Put that crashed after its
+  pointer and before its floor write; with a live record of another generation, a directory
+  of a generation the floor no longer records live. The floor's live generation is buried
+  first, so it has the lower delete sequence. A planted
+  generation file under a name with no live record therefore buries nothing, and can never
+  push a real burial out of the per-name cap or the tombstone budget below. Delete never removes or replaces a
+  buried generation; a floor write never lowers what the floor refuses on data from the
+  service user's tree. A directory planted under a deleted name with a changed `generation`
+  file and removed by `rm` therefore leaves the buried set as it was, and a decoy directory
+  swapped in under a live name before `rm` buries the floor's live generation, not the
+  decoy's. With neither a live record nor an authenticated pointer, Delete records nothing.
+- *No directory to delete.* Delete buries the live record whatever stands under the name: no
+  directory (or no `keystore/` at all), a non-directory it unlinks, or an incomplete Put it
+  removes. It then succeeds and logs at Warn that the entry directory was already gone and
+  the deletion is recorded. Only a name with no live record answers `ErrNotFound`. So an
+  entry directory moved away while root runs `rm` and moved back afterwards is refused, and
+  so is the copy an earlier build's Delete, which removed the directory before its floor
+  write, left when it crashed between the two, once `rm` runs again.
+- *The per-name cap.* A name keeps at most 64 buried generations. A Delete that buries a 65th
+  drops the name's oldest, and that is a prune (below): logged, and the only way, besides the
+  floor's own prune, that a buried generation leaves the floor. The cap is a backstop, not the
+  main eviction: the tombstone budget below prunes oldest first across every name, so churning
+  one name pushes out its own burials only after 64 deletions, and never another name's sooner
+  than age requires. It stays a cap rather than going away so one name's churn cannot fill the
+  tombstone budget alone; a name's burials are a slice in memory, at most 64 long.
+- *The caps only ever rise.* The per-name cap (64) and the tombstone budget (1 MiB) may only
+  ever be raised in a later release, never lowered: the parser refuses a floor over either
+  cap as malformed, so a lower cap would make a floor an earlier release wrote, or a
+  moved-aside floor the restore merge reads, refuse every root verb. A floor at the caps
+  never fails a write: the write prunes.
+- *Refusal.* A reader or verb that opens an entry directory whose generation is in the name's
+  buried set refuses it as `ErrCorrupt`, with the floor's own message: an older copy of a
+  deleted entry was put back. Its advice leads with a safe action. With no live record for
+  the name, that is `rm`: a copy the operator did not put back is removed, and the floor
+  stays as it is. Only then does it say not to restore from backup, and give the same-backup
+  restore recipe in the user docs as the deliberate case, warning that it brings back every
+  key deleted since the backup. When the floor also records a live entry of the name under
+  another generation, the live entry's directory is missing, so the message says that, says
+  to put the live entry's directory back in place of the copy (that copy is accepted), and
+  says not to run `rm`, which would delete the live entry; it never says the floor stays as
+  it is. The refusals of an older sequence or of another generation with nothing buried lead
+  likewise with putting back the copy the floor records, then say not to restore from backup.
+  That holds for `Current`, `Get`, `List`
+  (the entry is listed with `Err`), Rotate, Rewrap (which refuses, as for any entry `List`
+  marks corrupt), and the floor raise at the start of every root verb, which never records a
+  buried generation, while the name is live under a newer generation and after it is deleted
+  too. A put-back directory with no `current`, in the shape a crashed Put leaves, is damage
+  rather than an interrupted Put when its generation is buried: listed with `Err`, and
+  `ErrExists` from Put. Put of a name whose put-back directory has a `current` answers
+  `ErrExists` too, so the operator removes it with `rm` first. `rm` removes a put-back
+  directory as it removes any corrupt entry, and keeps the buried set. A directory of a
+  generation not in the buried set under a name with no live entry is a Put that crashed after
+  its pointer and before its floor write: the raise records it live beside the buried set.
+- *Put keeps the buried set.* A Put of the name mints a fresh generation and records it live
+  at sequence 1; the buried set stays. Dropping it would let an old copy of the first
+  generation back once the second is deleted too. A live record of another generation, which
+  only a Delete interrupted before its floor write leaves (or an entry directory moved away),
+  is buried by the Put first, as that Delete would have, so its copy stays refused once the
+  new generation is deleted too. `rm` of an absent name with no live record answers
+  `ErrNotFound` and writes no floor. Delete of an interrupted Put under a name with no live
+  record also answers `ErrNotFound` and buries nothing, since that generation never
+  committed a pointer.
+- *Bound and pruning.* Tombstones share the floor's 4 MiB cap, split this way: live entries
+  may use all of it, and the `tombstones` object at most 1 MiB of it, and only what live
+  entries leave. Every floor write, after it applies its own change, prunes buried
+  generations oldest first (lowest `deleted`, then by name) until the tombstones fit in 1 MiB
+  and the file fits in 4 MiB; a name left with no live entry and no burial is removed. A live
+  entry is never pruned. Past the cap the floor therefore prunes rather than fails closed, and
+  the room check Put and Rotate make counts only live entries, so a burial never refuses a
+  Put or a Rotate; `errFloorFull` keeps its meaning, that the live entries alone would not
+  fit. The residual of a pruned burial is the behaviour before this change: an old copy of
+  that deleted entry put back under its name is accepted, unless the name's live entry of
+  another generation refuses it. The oldest burials are the longest-revoked keys, and any
+  root-run churn, bulk puts included, can evict them. That is also why no unprivileged caller
+  may ever drive Put or Delete of the system store: pruning is root-only on the assumption that
+  only root makes the writes that churn the floor, and a caller that could drive them could
+  evict any revoked key's burial at will. So every drop is visible: each prune,
+  the per-name cap's included, logs at Warn through `log/slog` with the count and the names.
+  A Delete whose floor writes drop any burial, its own new one, another name's, or the name's
+  oldest at the per-name cap, fails with `ErrTombstoneEvicted`, naming the count (the floor
+  lock collects every burial its writes' prunes drop): the entry is deleted, its burial and its
+  tree removal complete as usual, and the error is reported as committed, so `keys rm` prints
+  the deletion and exits 4. Every return of Delete reports a pruning write it made, so a
+  Delete that finds nothing to delete after a floor raise that pruned is a committed
+  `ErrTombstoneEvicted` joined to `ErrNotFound`: `keys rm` exits 4 without printing a
+  deletion (`DeleteDone`, `TestDeleteNotFoundReportsEviction`). `keys list` and `keys show`
+  print the eviction of the floor raise they make first as a warning on stderr and exit 0,
+  since that write is not the change the operator asked for (`TestKeysReadVerbsWarnEviction`).
+  A Delete whose own new burial the same write prunes also logs
+  that. `keys floor merge` exits 4 too when its report names a dropped burial. A `--keep` name
+  the merge keeps nothing for refuses it, with nothing written, and each kept name is warned
+  about on stderr as well as listed. 1 MiB holds about 3,500 burials of the
+  longest names and about 16,000 of short ones.
+- *Deletion without the master.* Delete still works without the master. Burying the floor's
+  live record needs only that record and the floor lock, never a key. Over a full floor Delete
+  still runs, since the burial it adds is pruned before any live entry is touched. Without the
+  master no pointer can vouch for a directory's generation, so a master-less Delete under a
+  name with no live record buries nothing. That includes an absent floor file, which then stays
+  absent until the next root verb that opens the master rebuilds it, and a Put that crashed
+  after its pointer under a name with no live record (none at all, or only burials): that
+  generation is lost from the floor, and a copy of it put back later is accepted. The remedy
+  is to run `rm` with the master available: the floor raise at its start records the crashed
+  Put's pointer live, and the Delete buries it. Any Delete that buries nothing, of a directory
+  with a `current` under a name the floor records nothing live for, whose generation it does
+  not already bury, logs this residual at Warn, naming the remedy: rerun `rm` with the master.
+  That covers a master-less Delete and, with the master, a pointer that does not authenticate.
+  *Residual (a directory's generation waits for `.lock`).* A Delete of a name with no live
+  floor record buries nothing until it holds `keystore/.lock`: the directory's generation is
+  buried only once the master opens its pointer, and that read is under `.lock`, which the
+  service user can hold past the bounded wait or replace. Such a Delete therefore records
+  nothing while `.lock` is unavailable, unlike the burial of a live record, which lands under
+  `keystore-lock` alone. Recorded, not built.
+- *Format.* The floor stays format version 1: nothing has shipped, so this is a hard cut with
+  no migration. `tombstones` is optional and comes after `entries`; a verb writes it only when
+  the floor holds a tombstone, so `"tombstones":{}` is not the encoding a verb writes and is
+  refused. A floor with no `tombstones` field, the shape every earlier build wrote, parses as a
+  floor with no tombstones. A burial is parsed as strictly as an entry: a name `put` would
+  refuse, a generation that is not 32 lower-case hex digits, a `deleted` of 0 or above 2^53,
+  a field the format does not have, an empty or over-cap buried set, burials not oldest
+  first, a delete sequence used twice in the floor, a generation buried twice, a burial of the
+  name's live generation, or tombstones over 1 MiB is `ErrCorrupt` with the floor's
+  message. A reader that rejects unknown fields, a build from before this change included,
+  refuses a floor with tombstones whole, so it fails closed.
 
 A crash after the pointer flip but before the floor write leaves the floor one behind the
 pointer, which the rule above accepts (pointer at or above floor). So that the lag does not
@@ -374,8 +533,10 @@ opens. Delete must work without the master, and with none it raises nothing: it 
 only its own entry's floor. The read verbs (`k3sm keys list` and `show`) take no lock that
 writes, so they raise the floor by calling `RaiseFloor` at their start; until the CLI that
 does so lands, a floor that lags its pointer is raised by the next write verb or
-`RaiseFloor`, and readers meanwhile accept the lag. A floor entry for a name with no
-directory (a crash during Delete) is harmless and is overwritten by a later Put.
+`RaiseFloor`, and readers meanwhile accept the lag. A live floor record for a name with no
+directory (a Delete that crashed after removing the directory, before its floor write) is
+buried by a retried `rm`, which succeeds, or by the next Put of the name, which buries it
+before it records its own generation.
 
 **The residual against a process that can read the master.** The pointer's authentication
 is keyed by the master, and the master is a 0600 file owned by the service user. A process
@@ -489,7 +650,8 @@ directory, `generation` alone, and `generation` and `v1`, each with or without t
 files, are incomplete Puts, and only those shapes. `v1` without `generation` is damage, since
 Put cannot leave it. An incomplete Put is not an entry: `List` does not return it, `Current`, `Get` and `Delete` answer `ErrNotFound`
 (Delete removes it too, since a Delete that crashed after removing `current` leaves `generation` and a sealed
-`v1`), and the next Put of the name discards it and starts over. A directory with no `current` that holds
+`v1`; under a name the floor records live, Delete buries that record and succeeds, as for an
+absent directory), and the next Put of the name discards it and starts over. A directory with no `current` that holds
 any other file cannot be an incomplete Put, because Put writes nothing else before `current`.
 That is a pointer lost to damage or to an interrupted Delete, with sealed records still on
 disk. `List` returns it with `Err` set, wrapping `ErrCorrupt`, and `rm` removes the directory
@@ -543,11 +705,19 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   and must still be the held file. Its link count is not judged: macOS lets any local user
   hard-link a file it cannot read, so refusing a second link would let anyone block every
   floor verb, and a link elsewhere is the same file, so it changes nothing about the lock.
-  The order is `keystore/.lock` first, then `keystore-lock`, each with the same bounded
-  wait. Under it each verb re-reads
+  The order is `keystore-lock` first, then `keystore/.lock`, each with the same bounded
+  wait, for every verb that takes both (Put, Rotate, Delete, RaiseFloor, Rewrap); readers
+  take only `.lock`, and no verb takes `.lock` before `keystore-lock`, so no two verbs wait
+  on each other's lock. `keystore-lock` comes first because only root can hold it: Delete
+  buries the floor's live record for the name under it before it takes `.lock` or judges
+  `keystore/`, both of which the service user controls. If that later step fails (the lock
+  wait times out, `.lock` is not a regular file, `keystore/` is refused), Delete returns an
+  error saying the entry is already deleted and refused, its tree was not removed, and `rm`
+  should be rerun once the lock is free; it then buries the directory's authenticated
+  generation and removes the tree as usual. Under the lock each verb re-reads
   `keystore-floor.json` and applies only its own change to what it read (Rotate and the
   start of a verb raise a sequence of the same generation, Put sets sequence 1 for a new
-  generation, Delete removes the entry only if it records the deleted generation), holding
+  generation and keeps the name's burials, Delete buries the floor's live generation and prunes burials to fit), holding
   the lock through the rename and the directory fsync. This lock defends against a writer
   under a swapped `.lock` writing the floor; it does not stop racing entry files under a
   swapped `.lock`. Only root can open `keystore-lock`, so only root can hold this lock. The
@@ -555,9 +725,11 @@ serializes Rewrap, Rotate and Put against each other and against the reconciler'
   but no verb takes that lock, so holding it blocks nothing (U119). This closes the denial
   of service for every local process except the service user, and every native Pod runs as
   the service user ("Threat model"). It owns `keystore/.lock`, which every root write verb
-  takes first, so any native Pod can hold that lock and keep revocation and rotation
-  failing: each Delete and Rotate fails with the lock timeout after the bounded wait, again
-  and again, and the failure does not clear until the holder lets go or exits. That residual
+  takes after `keystore-lock`, so any native Pod can hold that lock and keep rotation failing,
+  and keep revocation from removing the entry's tree: each Rotate fails with the lock timeout
+  after the bounded wait, again and again, and the failure does not clear until the holder
+  lets go or exits. A Delete under a held `.lock` still records the deletion first, so the
+  revoked entry is refused while its tree waits for the rerun. That residual
   is accepted, since every native Pod is the service user, one trust domain with the master.
   Holding the lock costs no integrity, because holding a lock writes nothing; that covers a
   held `.lock`, not a replaced one, whose limits are the swapped-`.lock` caveat above (the
@@ -783,7 +955,14 @@ undeliver system/<name> --namespace NS [--secret NAME]
 
 Exit codes: 0 success, 1 refused (the sentinel's message), 2 bad usage, the three-value shape
 `secrets-encrypt` uses, plus 3 for `rewrap` alone: it completed an earlier interrupted rewrap
-with a key other than the one supplied (`ErrRewrapResumed`), so it must run again. Every verb
+with a key other than the one supplied (`ErrRewrapResumed`), so it must run again. 4 is `put`,
+`rotate`, `rm`, `list`, `show` (their floor raise) or `floor merge` done, but its floor write
+dropped a recorded deletion to stay within the floor's limits (a committed
+`ErrTombstoneEvicted`: `Committed` and `ErrTombstoneEvicted` both match; or a merge that reports
+a drop), so a copy of that deleted entry put back is accepted. Put, Rotate and RaiseFloor
+report their writes' prunes that way, as Delete does, and a Delete whose burial evicted one and
+whose tree removal then failed (the entry already deleted, its directory left behind) is
+committed too, so `rm` exits 4, not 1. Every verb
 in this list requires root (the non-root path is under "User scope"). The human output is not
 stable; `list -o json` and the exit codes are the stable surface. Value input is `--in FILE` or
 stdin only, never an argument: argv is visible to every local user via `ps` and lands in shell
@@ -1017,6 +1196,323 @@ the stale-pointer check. That is the check working. The procedure is: restore `k
 and the matching master, stop the server, `rm /var/lib/k3sm/keystore-floor.json` as root,
 then run any root verb (`sudo k3sm keys list`), which rebuilds the floor from the restored
 pointers.
+
+**Restoring an entry deleted by mistake is the same act.** Its burial refuses the restored
+directory, which is the tombstone working ("A deleted entry put back is refused"). The restore of
+the same backup therefore moves the live `keystore-floor.json` aside, as root, to
+`keystore-floor.json.pre-restore` (never overwrites it, so the restore can be undone) and puts
+back the floor saved with the backup, which records the entry live; restoring `keystore/` alone
+leaves the entry refused. That restore is of the whole keystore: it reverts every rotation and
+brings back every entry deleted since the backup, with their burials gone, until the merge
+below carries them over.
+
+*Restoring with the saved floor: the merge.* Before `k3sm start`, the recipe runs
+`sudo k3sm keys floor merge` (`FileStore.MergeFloor`). It takes no path: its only input is the
+data root's `keystore-floor.json.pre-restore`, read under `keystore-lock` through the data root
+the lock judged, as the floor is read (a regular file, never followed, owned by root and not
+group- or other-writable, at most 4 MiB), and parsed with the same strict parser. So the floor
+saved with the backup, or any other copy, can never be its input, and nothing needs to tell the
+two apart by age (`TestMergeFloorReadsOnlyTheGuardFile`, `TestKeysFloorMergeTakesNoFile`). The
+floor is the system store's, so what the merge keeps refused is the system store's deletions:
+until the user-scope floor lands, a user-scope deletion since the backup is not carried over, and
+when the staged tree holds `.user` entries the report says so (`MergeReport.UserScoped`) and
+the verb exits 4 (`TestKeysFloorMergeReportCodes`). The
+name must still be the file it read when it writes and when it renames it: a guard file
+replaced by another inode during the merge refuses it, writing nothing. It refuses, writing
+nothing, when the live floor is absent ("restore the saved keystore-floor.json first": merging
+into nothing would leave the moved-aside burials with no live records) when the guard file
+is the live floor itself, by inode or byte for byte (equal floors are byte-identical files,
+since the parser accepts one encoding per floor), and when the merge would retire every live
+record the moved-aside floor holds: the live floor neither holds live nor buries any of their
+generations, `--keep` names none, and the moved-aside floor buries no generation the live floor
+holds live, which is a live floor not saved with this backup
+(`TestMergeFloorRefusesRetiringEverything`). A Delete under the guard with the live floor
+absent refuses too ("install the saved keystore-floor.json first"), writing nothing: a floor it
+created would hold its burial alone, and the merge would take it for the restored floor
+(`TestPendingMergeDeleteNeedsLiveFloor`). Then, under `keystore-lock` alone, it adds every
+burial it records that the restored floor lacks, oldest first, each at the next delete
+sequence, so the merged burials keep their order. It writes only the root-owned floor and
+nothing under `keystore/`, so it never takes `keystore/.lock`, which the service user can hold
+or replace to stop it; readers need none against it, since the floor is replaced by an atomic
+rename. So a key created after the backup and
+revoked before the restore stays refused, and so does every generation buried under a name
+after the backup, which re-running `rm` could never record. A generation the moved-aside
+floor buries and the restored floor holds live is buried too, its live record cleared: the
+backup holds an entry deleted after it, perhaps to revoke it, so the merge fails closed rather
+than leave it live. The operator names each entry restored on purpose, the one deleted by
+mistake, with `--keep system/<name>` (repeatable; `MergeFloor`'s keep set), which keeps that
+name's restored generation live. The choice is made before the merge: a burial is never
+removed, so a second merge with `--keep` cannot bring back an entry the first buried. The
+residual is the operator's: a name kept by mistake is a revoked key live again. The
+moved-aside floor's live records are not dropped silently either: for each name whose
+moved-aside live generation the restored floor neither holds live nor buries (it holds another
+generation live, or none), the merge buries that generation after the merged burials and
+counts it as retired. `--keep` spares it only when the restored floor holds no live record of
+the name: `--keep` keeps the restored generation, never a second one, so a name kept live as
+G1 still has its moved-aside G2 retired, and a copy of G2 stays refused after a later `rm`.
+A name kept that the restored floor does not record is recorded live from the moved-aside
+floor: its generation at its sequence, with the high-water mark below (one above the higher of
+its sequence and mark), so an older copy of that generation is refused, and so is a copy from
+the history above the moved-aside record; a rerun keeps it again and writes nothing
+(`TestFloorMergeKeepRecordsAsideLive`). Root retired it by choosing the backup:
+a name live as G1 at the backup, deleted and put again as G2, has G1 buried (the deletion) and
+G2 retired, so neither directory put back is accepted. When the restored floor holds the
+moved-aside live generation itself at a lower sequence (the entry rotated since the backup),
+the moved-aside history would otherwise outrank the restored one: a pre-restore copy at seq 9
+passes a floor at seq 5, and the next Rotate, sealing seq 6, would leave it passing. So the
+merge gives that live record a high-water mark, one above the higher of the moved-aside
+sequence and the moved-aside record's own mark. Either floor can lag its pointer by one, from a
+crash between the pointer flip and the floor write. The `+1` covers a moved-aside floor at seq 9
+whose pointer reached 10: that copy is refused too. For the restored side, the merge, which runs
+as root, authenticates each fenced entry's restored pointer under the master first, and when
+that sequence is exactly one above the restored record (and above its own mark), the lag a crash
+leaves, it raises the record to it, so a restored pointer one past its saved floor is never
+inside the fence. The raise is bounded to that one sequence: a pointer further above the record
+is not raised to, and the fence, computed after the raise, covers it, since an authenticated
+pointer the saved floor never saw that far ahead is a copy of the abandoned history, not the
+restored one (`TestFloorMergeBoundsRestoredRaise`, and `FuzzMergeFloor` with fuzzed pointers:
+no raise exceeds one sequence). Such a pointer, and one that does not authenticate (no master,
+a missing or replaced directory, another generation), leaves the record as the restored floor
+holds it, logged at Warn and reported as `unverified system/<name>` (`MergeReport.Unverified`). At the sequence limit the mark saturates there
+(`TestFloorMergeFenceLaggingFloors`, and `FuzzMergeFloor`'s fence oracle: the result's
+`max(seq, highwater)` is at least the moved-aside record's plus one). The mark is written as an optional `"highwater":N` after `"seq"` in the
+entry and left out when 0, so the parser's canonical round trip and every earlier floor are
+unchanged; the parser refuses a mark at or below `seq`. Readers refuse a pointer of that
+generation above `seq` and at or below the mark, the raise never raises into it, and Rotate
+seals its next sequence at one above `max(seq, highwater)`; the raise to it clears the mark,
+and a Put of a new generation or a burial drops it. The verb counts these as `fenced N`.
+Until the merge runs, the restore is unfinished, and the store enforces that: while
+`keystore-floor.json.pre-restore` is in the data root, Put, Rotate and Rewrap refuse
+under `keystore-lock`, before they write anything, with a message naming `keys floor merge`
+(`errMergePending`); Delete runs and writes only its burials (below); and RaiseFloor, which the
+read verbs call first, raises nothing and logs that at Warn, so no pointer put back before the
+merge is recorded. `list` and `show` run with a warning on stderr and, until the merge, find no
+entry, since the restored tree is staged (below). A successful merge renames its input to
+`keystore-floor.json.merged-<unix>` beside it, through the data root descriptor the lock
+judged (never over an existing file, and only if the name is still the file it read), which
+clears the guard. A rename that fails after the write is reported as committed: the verb prints
+the full report and exits 5 ("merge written, input not renamed: rerun to clear the guard"), which
+wins over 4 (a burial dropped); the report still lists every drop. A rerun is safe: the input is read again under `keystore-lock`, and
+the merge first runs on a copy of the live floor. When every burial and fence the input records
+is already there, it writes nothing, only renames the input, and reports `already merged`. A guard file that is
+the data root's live floor by inode is refused outright
+(`TestMergeFloorCommittedRerun`, `TestKeysFloorMergeCommittedRerun`). `k3sm start` is not hooked: its start path has no cheap synchronous
+check of the keystore, and it writes no floor. The delivery reconciler, the server's one reader
+that publishes a value, is: each sweep first asks `FileStore.MergePending` (a Lstat of
+`keystore-floor.json.pre-restore`, any answer but not found counting as pending; a store
+configured with an empty data root has no floor, so no restore can be pending and it is nil, no
+hold), and while it is set the sweep delivers nothing, reads no entry and makes no apiserver call, logs at Error and
+tries again on the next sweep (`TestDeliveryRefusedWhileMergePending`). `list` and `show` still
+read, and print a warning on stderr; until the merge they find no entry, since the restored tree
+is staged. Before
+anything moves, the recipe checks that nothing runs as the service user (`! pgrep -u _k3sm`),
+that the backup's directory and its parent are owned by root with no group or other write (a
+`find -maxdepth 0 -user root ! -perm +022` that must match both), so the service user cannot swap
+the source between the checks and the copy, and, just before `ditto`, `test ! -L` on its source,
+which `ditto` would follow (`TestKeysRollbackRoundTrip`, the recipe-steps subtest). The save
+recipe makes those directories so (`install -d -o root -g wheel -m 0755`). The
+recipe moves the live `keystore/` into `pre-restore.d/` in the data root, a directory it creates
+root:wheel 0700 with `mkdir` (which fails on an existing name) under a parent only root can
+write, so the service user cannot reach the moved-aside entries to copy one back, nor rename the
+directory, as it could under `server/`. It changes no file inside: a rename changes no inode's
+owner. Root's `ditto` copies the backup into `pre-restore.d/restored` (after `test ! -e`), and
+`server/keystore` is left absent. The merge opens `pre-restore.d` through the data root the lock
+judged, never followed, and refuses it unless root owns it and it grants nothing to group or
+others, by its mode or by an extended ACL (`hasExtendedACL` on the descriptor;
+`TestOpenStagingRefusesACL`): `ditto` keeps the backup's owner inside, so the directory's
+permissions are what keep the service user out of the staged tree. It reads the restored pointers only from
+`pre-restore.d/restored`, bytes only root copied (the raise is still by at most one sequence), and
+authenticates the moved-aside tree's pointers, `pre-restore.d/keystore`, under the master, so the
+fence is one past the highest of the moved-aside floor's sequence, its mark and that pointer: a
+moved-aside floor that lagged its pointer by two or more is fenced above the pointer
+(`TestFloorMergeFencesAboveAsidePointer`). A moved-aside pointer above 2^62 is reported unverified and not fenced above
+(`TestFloorMergeBoundsAsidePointer`): no entry rotates that far, and fencing above it would leave the
+mark at the sequence limit, where no Rotate can seal above it. With the moved-aside tree present, each name whose
+pointer there does not authenticate (no entry, another generation, a refused record), or every
+name when the master does not load, is reported unverified (`AsideUnverified`, logged at Warn):
+its fence is one past the moved-aside floor's record and mark only, and the CLI prints an
+`unverified ... the moved-aside pointer` line and exits 4, dry run included
+(`TestFloorMergeAsideUnverified`). An absent moved-aside tree holds no pointer, and is no failure. Anything at `server/keystore` while a tree is staged,
+a symlink counted, was planted: the recipe leaves it absent. The merge renames it, after its
+refusals and before the floor write, into `pre-restore.d/planted-<unix>` (the first free second
+from now) through the two directory descriptors with `renameatx_np` `RENAME_EXCL`
+(`moveTargetAside`): never followed, never read, and out of the service user's reach in the
+root-only directory. It logs that at Warn, reports it (`MovedAside`, `MovedAsideType`; the CLI's
+`moved aside` line and a stderr warning) and goes on; a dry run reports the name it would use and
+moves nothing (`TestFloorMergeRefusesExistingTarget`). A rerun after a committed merge
+(exit 5) finds the live floor already holding every burial and fence the input records, judged
+without the trees' pointers (`planMerge` with none), so a refusal after that, of the staged
+tree's shape, of opening `pre-restore.d`, of its pointers, or of the move aside, is committed and
+worded so (`committedShape`), never "nothing is written", and the CLI exits 5, dry run included
+(`TestFloorMergeRerunCommittedWording`, `TestKeysFloorMergeCommittedRerunRefused`). The tree's own `RENAME_EXCL` move still
+guards the race: something planted after the move aside fails it, committed, and a rerun moves
+that aside too,
+and with nothing staged a merge that would change the floor refuses (`TestFloorMergeNeedsStagedTree`).
+Before anything is read from it or planned, dry run included, the merge walks the staged tree
+read-only (`checkStaged`) and refuses it as `ErrCorrupt`, naming the path inside the tree, unless
+every node is one the store writes, in the shape it writes it. The names come from the code: at
+the top, `.lock` (a regular file, empty), `.user` and directories named by `checkName`; in an
+entry's directory, `generation`, `current`, `v<N>` up to `maxVersion`, the `.new` sibling Rewrap
+seals `current` and `v<N>` into, and the `.<name>.<16 hex>.tmp` file `writeFile` makes for each;
+in `.user`, directories named by an eligible uid in canonical decimal; in a scope, `entries`
+(directories named by `checkName`, each an entry's directory), `scope.key`, `scope.key.new`,
+`deliveries` and their temporary files. Each file is a regular file with one link, at most its
+kind's record maximum (`generationFileSize`, `maxRecordSize`, `maxScopeKeyRecordSize`,
+`maxDeliveriesRecordSize`, 0 for `.lock`); each directory is a directory; no node has a setuid,
+setgid or sticky bit, a file flag, or an extended ACL (`acl_get_fd_np`), and each is owned by the
+service user or by uid 99, the unknown owner a volume that ignores ownership reports. A
+root-owned node is refused: a `ditto` keeps the service user's owner, so a root file there is a
+copied link to one of root's. The walk is at most five levels deep, `maxDirNames` names a
+directory and 2^22 nodes in all, checks its context as it goes, and runs read-only once before
+the handover, which judges each node again on its descriptor (`TestFloorMergeStagedNodeBudget`,
+`TestChownStagedRefusesShape`, `TestChownStagedRefusesACL`,
+`TestChownStagedRefusesForeignOwner`, `TestChownStagedNameBound`,
+`TestFloorMergeShapeDryRunParity`). Before the floor write the merge then hands the staged tree to
+the service user in Go, through descriptors: each node is opened `O_NOFOLLOW|O_NONBLOCK`, judged
+again on the descriptor (`fstat`), set to the mode Put writes (`fchmod`, 0700 or 0600), handed
+over (`fchown`), and `fstat`ed again; a file that gained a link has its owner and mode put back
+and refuses the tree, so no by-name change reaches another inode (`TestChownStagedRecheckSeam`,
+`TestChownStagedSetsModes`). Each node handed over is fsynced on that descriptor (`syncStaged`;
+`F_FULLFSYNC` on darwin), a file at once and a directory once its children are, all before the
+tree's rename, so a crash after the rename leaves no truncated key file and no directory missing
+a name (`TestFloorMergeSyncsStagedTree`).
+After the floor write it renames `pre-restore.d/restored` to `server/keystore` through the two
+directory descriptors with `renameatx_np(RENAME_EXCL)` (from `golang.org/x/sys/unix`), which
+refuses an existing name, a symlink included, in the same step; a failed fsync after it is
+logged at Warn and the rename stands. Only then is the guard file renamed. A failed move after
+the floor write exits 5, and a rerun, which writes nothing more, completes the move and the
+rename (`TestFloorMergeMovesStagedTree`). The undo stages the trees the other way round inside
+`pre-restore.d` (the moved-aside tree as `restored`, the restored one as `keystore`) and swaps the floors:
+the moved-aside floor goes back in place and the restored floor becomes
+`keystore-floor.json.pre-restore`, then runs the merge in that reverse direction, so a deletion
+made after the restore survives the undo. Every first run writes, root-owned at the floor's mode
+and in one canonical encoding, its commit marker `keystore-floor.json.pre-restore.retired` before
+the floor write: the sha256 of its input (the guard file's bytes), of the live floor it read and of
+the floor bytes it writes, and the names it retired, buried live, kept and dropped; it renames the
+record with its input to `keystore-floor.json.merged-<unix>.retired` (the first second from now
+with both names free). A run that finds a pending record of its input whose floor is the live one
+is a rerun: it never plans the floor again (a prune an `--accept-drops` run made would be undone
+and another made), only finishes the staged tree's handover and move and the rename, and reports
+from the record (`TestFloorMergeRerunAfterAcceptDrops`, `TestFloorMergeRerunKeepsRetiredSets`).
+A record whose base is the live floor is a first run that stopped before the floor write, which
+runs again and unions the record; any other floor fails closed, committed
+(`TestFloorMergeRerunFloorChanged`). No pending record means nothing is written, so a refusal
+before the write says so (`TestFloorMergePointerOnlyRefusalNotCommitted`). While the record is
+pending, rm is never refused, since revocation always succeeds: the record also holds the floor
+read and the floor written (`read`, `written`), and a rerun whose live floor is the floor written
+plus only burials added since (a new burial or one numbered higher; no burial removed, no live
+record lowered, of another generation or newly live, and a live record gone only with its
+generation buried) finishes from the record, keeps those burials and removes their staged
+directories, while one whose live floor is the floor read plus only rm's burials above
+`guardEraSeq` is a first run that stopped before the floor write and runs again. The floors are
+parsed and compared structurally, the sha256 only the fast path for an exact match. A live record
+kept counts only at the recorded sequence with a mark at or above the recorded one, or above both
+(`TestBuriedSinceFence`, `FuzzRerunPredicates`). An rm under the pending record can drop a burial
+either floor holds, at the per-name cap or in the prune (certain after `--accept-drops`): before its
+floor write it appends each burial dropped to a root-owned
+`keystore-floor.json.pre-restore.rm-dropped`, bound to the pending record by its input and base
+sha256 and capped at 4096 burials (one of another record is ignored, one untrusted or not in its
+one encoding refuses the rerun), and the rerun accepts those burials gone; the Delete still reports
+`ErrTombstoneEvicted` (`TestFloorMergeRerunAfterRmPrune`). The record never refuses the rm: when
+it would list more than 4096 burials, does not read, or cannot be written, the Delete replaces it
+with a root-owned mark bound to the pending record (`"unusable": true`, no burials) and buries
+regardless, still before the floor write and under `keystore-lock` alone. A rerun or first run
+that finds the mark accepts no drops and stops, committed, for the operator to inspect the floor
+against the record; one whose mark could not be written refuses too, since the floor then lacks a
+burial the record does not list, or the record does not read
+(`TestDeleteUnderGuardNeverRefusedBySidecar`, `TestParseRmDroppedMark`). Either run passes the
+listed burials to the staged-directory removal, so a first run that plans again from the floor rm
+left removes the staged directory of a generation whose burial rm pruned
+(`TestFloorMergeFirstRunRemovesRmDroppedStaged`). A live floor that is the floor read with
+a change rm does not make is refused as not written (`TestPendingSinceReadFloorNotCommitted`). A
+run with no pending record whose renamed `merged-<unix>.retired` has this input and the live
+floor stopped between the two renames: it only renames the input, writing no second record, and
+removes the rm-dropped record as the rename it finishes does (`TestFloorMergeCrashBetweenRenames`,
+`TestFloorMergeCrashBetweenRenamesClearsRmDropped`). Anything else
+fails closed, committed (`TestFloorMergeRerunAfterDelete`, `TestFloorMergeDeleteBeforeFloorWrite`,
+`TestFloorMergeRerunNonMonotone`). The merge
+refuses up front when `pre-restore.d` and the keystore's parent directory are on different
+devices (`TestFloorMergeRefusesTwoDevices`), and before the floor write removes the staged
+directory of every entry whose staged generation the merged floor buries or whose burial the
+write drops (`TestFloorMergeRemovesAsideBuriedStaged`, `TestFloorMergeRemovesDroppedStaged`); a
+directory fsync that fails after the tree's rename is committed (exit 5,
+`TestFloorMergeMoveSyncCommitted`). The reverse merge, run with `--undo`, reads only the
+`.merged-<unix>.retired` record whose input sha256 is the live floor's (in an undo the live floor
+is the first merge's input), never choosing by the `<unix>` in its name, so a clock stepped back
+cannot pick another merge's record, and refuses with no record or none matching
+(`TestFloorMergeUndoRecord`); its report splits the buried-live names into those the first merge retired ("retired by the
+restore": `--keep` brings it back) and those deleted since the restore ("stays deleted"), and it
+refuses `--keep` on one of the latter (`TestKeysRollbackRoundTrip`, `TestParseRetired`). No recipe changes owner,
+mode or flags recursively (`chown -R`, `chmod -R`, `chflags -R`) over a tree the service user
+wrote: root would follow a hard link planted in it to an unrelated inode
+(`TestKeysRollbackRoundTrip`). The merge keeps every live record of
+the restored floor not buried above. The write is pruned as every floor write is, the per-name cap
+included, and each burial dropped is logged at Warn and reported. As Put and Rotate ask for room
+before they write, the merge first decides on in-memory floors (`planMerge`: the merge and the
+prune on a copy), computing every burial the write would drop. Without `--accept-drops` any drop
+refuses it with the floor-full error, writing nothing and leaving its input in place, so the
+guard stays, a burial the restored floor already held included
+(`TestMergeFloorRefusesDroppingItsOwnBurials`, `TestMergeFloorRefusesDroppingRestoredBurials`).
+`--accept-drops` never drops a buried-live burial, one whose name the merge cleared to no live
+record: the restored copy would be accepted again with nothing refusing it. That merge is refused
+with or without the flag, naming the entries to `keys rm` first; the rm's own burial, a guard-era
+one, then stands in for it (`TestMergeFloorNeverDropsBuriedLive`). `FuzzPlanMerge` drives
+`planMerge` and checks that a merge allowed without `AcceptDrops` drops nothing, that no cleared
+name ends with neither a record nor a burial, that no raise exceeds the record's sequence plus one,
+that merging twice equals merging once (the same floor, nothing more written, each kept name kept
+again; `TestPlanMergeKeepTwiceWritesNothing`), and that a reverse merge after it keeps every guard-era
+deletion and one made since the restore, each the rm's own write did not evict at the per-name cap
+or in its prune, which that Delete reports (`TestFuzzRmReportsCapEviction`). A guard-era burial is one `rm` wrote while the guard was
+set. A Delete under the guard numbers each burial above
+`guardEraSeq`, half the delete-sequence limit, which no floor reaches by counting deletions, so
+the merge tells those burials from the restored floor's from the live floor alone, with no
+record beside it and nothing more for the Delete to write. The merge moves the guard-era
+burials to just above `guardEraSeq`, the others from 1, inserts each burial it adds between the
+two, oldest first, and renumbers every burial from 1 at the end, order kept, which the parser's
+distinct-and-increasing rule accepts. So the burials it carries over, older in real time than
+any written during the guard, are pruned first, and a guard-era burial is never pruned before
+them (`TestGuardEraBurialSurvivesPressuredMerge`, and `FuzzMergeFloor`: none ends above
+`guardEraSeq`, and every added burial ends below every guard-era one). A floor with a burial
+above `guardEraSeq` and no guard (the guard file removed by hand) is renumbered back to ordinary
+numbering, order kept, by the next Delete with no guard pending (`TestDeleteRenormalisesStaleBand`)
+and by any merge. At the sequence limit a Delete under the guard renumbers through
+`renumberGuard` and numbers its burial above `guardEraSeq`, so the band survives
+(`FuzzDeleteUnderGuardAtLimit`, seeded at 2^52 and 2^53-1). An `rm` under the guard buries the
+restored entry while its files are staged in `pre-restore.d/restored`, out of its reach, and
+leaves its cluster Secret in place until the merge. The merge removes the staged directory of
+each entry a guard-era burial buries that the merged floor does not hold live, and of each entry
+it buries live itself (a name `--keep` keeps is not buried live), so a later prune of the burial
+brings no copy back (`TestFloorMergeRemovesBuriedLiveStaged`), through the
+descriptor-opened tree's `os.Root.RemoveAll` (a symlink is removed itself, never followed), before
+the floor write and the tree's move, so no second `rm` is needed
+(`TestFloorMergeRemovesGuardBuriedStaged`). The refusal names what binds. When only the
+floor's size does, it names `keys rm`, which frees a live record. When the tombstone budget or
+the per-name cap binds, `rm` cannot help, since each deletion records one more, so it names the
+budget, or the cap and its names, and `--accept-drops` (`MergeOptions.AcceptDrops`), which writes
+the merge anyway: the write prunes oldest first, as every floor write does, reports and prints
+each burial dropped, exits 4 and renames the input, so the guard has an exit. `--dry-run`
+(`MergeOptions.DryRun`) stops after the merge on a copy and prints that report, drops included,
+writing and renaming nothing, and exits with the code the merge itself would
+(`TestKeysFloorMergeDryRun`)
+(`TestGuardEraTombstoneBudget`, `TestGuardEraBurialPerNameCap`, `TestPendingMergeDeleteMakesRoom`,
+`TestKeysFloorMergeAcceptDrops`). A
+fence is a mark on a live record, which no prune removes. The verb prints `merged N`,
+`already present N`, `buried live N`, `kept N`, `retired N`, `dropped N` and `fenced N`, one per line, then `buried live
+system/<name>: ...` for each name whose live generation it buried (whose directory `rm` removes;
+the line also names `--keep`, since in an undo it may be a version the first merge retired, which
+the floors cannot tell apart), `kept system/<name>: revoked, kept live ...` for each name kept
+whose restored generation the moved-aside floor buries (warned of on stderr too) and `kept
+system/<name>: recorded the moved-aside version ...` for one the restored floor does not record
+(`MergeReport.Recorded`), `retired system/<name>: ...` for each name whose moved-aside live
+generation it retired, `unverified system/<name>: ...` and `dropped system/<name>: ...` for each
+burial dropped. Its exit codes: 0 once the merge is written with nothing below; 1 refused; 4
+written, but it dropped a burial, kept an entry, left one unverified, moved a target aside, or
+carried over the staged tree's user-scope entries without a floor check
+(`MergeReport.UserScoped`, a line saying so); 5 written, but the staged
+tree was not moved or the input not renamed, which wins over 4 (`TestKeysFloorMergeReportCodes`). The saved floor must come from a
+root-owned, root-only location: the floor decides what is live, and a planted floor marks
+revoked entries live. Removing the floor, the older-keystore procedure above, discards every
+burial.
 
 Amended by the user scope's append-only files: the matched set also includes `keystore/.user/`,
 `keystore-user-floor.log` and `keystore-audit.log`. The append-only flag does not survive
@@ -3140,7 +3636,7 @@ text points here.
    `keystore-lock` in the data root, root-owned 0600, created by the first root verb through
    the data-root descriptor rules ("Root never acts by path where the service user can write"),
    which only root can open. Every root verb that writes the system floor or a keystore file in
-   the data root takes it, after the store `.lock` and with the same bounded wait: `put`,
+   the data root takes it, before the store `.lock` (§ "Concurrency") and with the same bounded wait: `put`,
    `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise at the start of `list` and
    `show`, `rm-scope`, `floor --rebuild` and `audit --rotate`. The server never takes it. This
    changes Phase A code already merged and Phase A's "Concurrency" text, so it is also filed as
@@ -4069,13 +4565,14 @@ last pull request lands and no row is pending.
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
 | G14 | One lock serializes Rewrap, Rotate, Put and reads, with a bounded wait | unit: a held lock gives a timeout error within the bound, not a hang |
 | G15 | Files a root-run verb writes under `server/` are owned by the service user at the layout's modes | unit with a fake owner seam |
-| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put unless the floor records its generation: not listed, `ErrNotFound` from `Current`, `Get` and `Delete` (Delete removes it too, and leaves the floor alone), discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included), or in one of those shapes with its generation recorded in the floor, is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm` with its floor entry when that records the directory's generation, and `ErrExists` from Put with every file left in place | unit: each incomplete-Put shape with no floor entry, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, no floor file, a floor of another generation; damage: `v1` without `generation`, `v2` without `v1`, a `v1`-and-`v2` directory with `current` removed, and the one-version entry that lost `current` (`generation` and `v1`, or `current` renamed to a temporary name) with its generation in the floor; a retried `rm` after an interrupted one; a CLI exit-code test for `list` and `rm` |
+| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put unless the floor records its generation: not listed, `ErrNotFound` from `Current`, `Get` and `Delete` (Delete removes it too, and leaves the floor alone; with a live record for the name it buries that record and succeeds), discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included), or in one of those shapes with its generation recorded in the floor, is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm`, its floor entry replaced by a tombstone, and `ErrExists` from Put with every file left in place | unit: each incomplete-Put shape with no floor entry, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, no floor file, a floor of another generation; damage: `v1` without `generation`, `v2` without `v1`, a `v1`-and-`v2` directory with `current` removed, and the one-version entry that lost `current` (`generation` and `v1`, or `current` renamed to a temporary name) with its generation in the floor; a retried `rm` after an interrupted one; a CLI exit-code test for `list` and `rm` |
 | G17 | `show` prints a value only with `--reveal`, and then writes exactly the stored bytes with no trailing newline; no verb takes a value as an argument | CLI test over the usage strings; a `--reveal` test comparing stdout to the stored bytes for an opaque value and for 32- and 64-byte Ed25519 values |
 | G18 | Delivery is refused while encryption is off unless the override flag was set at server start; a delivered target stays when the override is removed | unit over the reconciler with a fake client |
 | G19 | The delivery declaration is root-owned and not shared-writable, and is refused otherwise | unit, the same cases as the manifest directory |
 | G20 | The reconciler only Gets, creates and updates its labelled `Opaque` Secrets, and leaves an unlabelled or foreign Secret alone | unit over a fake client that records every call |
 | G21 | The rollback recipe in this document runs as written and is a byte-exact round trip | a script test that pipes `show --reveal` into `rotate --in -`, then compares the new current version's value byte for byte (`cmp`) with version N's, for an opaque entry and an Ed25519 entry |
 | G22 | `hack/ci.sh` passes | the gate runs it |
+| G23 | A deleted entry's directory put back before a new Put of the name is refused by every reader and verb, never recorded in the floor, and removed by `rm`, which keeps the tombstone | unit: Delete, put the old directory back, expect `ErrCorrupt` from `Current`, `Get`, `List`, Rotate and Rewrap, `ErrExists` from Put, the floor unchanged by `RaiseFloor`; the same for a put-back directory with no `current`; a directory planted with a changed generation file and removed by `rm`, a delete, re-create, delete cycle, a decoy swapped in before `rm`, the entry's directory or `keystore/` hidden during `rm` and moved back, a symlink or an incomplete Put in its place, a Delete crashed before its floor write and run again, a crashed Delete followed by a Put and a Delete, a Delete faulted after its burial and before its removal (an error naming the directory left behind; a retried `rm` removes it with no floor change), a `uchg` flag on an entry file, the entry directory or `keystore/` (removed), a flagged file hard-linked into the entry from outside it (its flag kept, the entry left behind), `keystore/.lock` held past the bounded wait or replaced by a directory (the burial lands first; a retry once the lock is free removes the tree), and more planted names under `keystore/` than a read takes, each leaving the original copy refused |
 
 Phase A is complete when the gate passes with no row pending. A row can be reworded or dropped only by a change
 to this document, reviewed like any other.
@@ -4084,7 +4581,8 @@ to this document, reviewed like any other.
 
 The user scope adds the U rows below (unit tier unless the row says otherwise) and the rig legs
 under "Rig legs". U138 to U191 and the legs E28 to E36 are the typed credentials' ("Typed credentials", "Gate
-mechanics"); their ids continue after U137 and E27, and `--listed` refuses a duplicated id. The gate runs each row's named tests in the repo the row names (`k3sm/…`,
+mechanics"); their ids continue after U137 and E27, and `--listed` refuses a duplicated id. U192 is the system floor's tombstone ("Pointer sequence and floor"), checked in `--check`
+and in no unit mode. The gate runs each row's named tests in the repo the row names (`k3sm/…`,
 `runtimed/…`, `apis/…`, package paths relative to the module), and fails a row whose named
 test is absent or skipped. Each change runs the rows it delivers in its own gate mode, and the
 rig rows as an explicit, recorded step. Every row below is pending until the change named in
@@ -4293,6 +4791,7 @@ carried by the unit rows.
 | U189 | `refresh-now` is owner-only, rate-limited, `refresh-not-owned` for `local`, sends nothing for a parked pair | `k3sm/pkg/keystore/socket::TestRefreshNowOwnerOnly` | pending: the refresher |
 | U190 | the refresher `doctor` rows; every state change logs at Warn or Error under `io.k3sm.keystore`, names and causes only | `k3sm/cmd/k3sm::TestDoctorRefresherRows`, `k3sm/pkg/keystore/refresh::TestStateChangesLogAtWarn` | pending: the refresher |
 | U191 | `examples/keydelivery-github.yaml` validates against the `apis` CRD schema; `limitations.md` lists the typed-credential residuals | `k3sm/examples::TestKeyDeliveryExamplesValidateAgainstCRD`, `TestLimitationsListTypedResiduals` | pending: the typed-credential docs |
+| U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 64 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no tombstones field parses, and a burial is parsed as strictly as an entry; keys floor merge carries every burial of the moved-aside floor into a restored one, burying a generation it holds live and each moved-aside live generation it does not hold live (--keep spares only the restored generation; an unmatched --keep refuses), fencing a restored generation, and recording a kept one the restored floor does not record, with a high-water mark one past the higher of the moved-aside sequence and mark (+1) that readers and the raise honour and Rotate seals above, under keystore-lock alone, reading only the data root's keystore-floor.json.pre-restore (no path; a guard file replaced during the merge refuses it), reading the restored pointers only from the root-only pre-restore.d/restored the recipe stages (pre-restore.d refused with an extended ACL; anything at the keystore directory, a symlink counted, is moved aside into pre-restore.d/planted-<unix> through directory descriptors with RENAME_EXCL and reported, a dry run moving nothing; with nothing staged a merge that would change the floor refuses), fencing above the moved-aside tree's authenticated pointer too (pre-restore.d/keystore), refusing a staged tree holding anything the store does not write (a name outside the entry-file allowlist, a non-regular file, a second link, a setuid, setgid or sticky bit, a flag, an ACL, a file over its cap, an owner but the service user or the unknown owner), dry run included, handing it to the service user through descriptors (openat O_NOFOLLOW, fstat, fchmod, fchown, fstat again; a link gained refuses it) and fsyncing every file and directory of it before the rename and moving it into place with renameatx_np RENAME_EXCL after the floor write (a failed move exits 5 and a rerun completes it; a rerun that finds the floor written words a refusal of the staged tree or of the move aside as committed and exits 5, dry run included), raising a restored record to its authenticated pointer by at most one sequence (a higher pointer is unverified and fenced), refusing an absent live floor, the live floor itself and a merge that would retire every moved-aside live record, renaming its input to keystore-floor.json.merged-<unix> (a rerun after a failed rename writes nothing and renames it; that failure exits 5), pruned and reported, refusing a write that would drop any burial, the restored floor's own included (rm's under the guard numbered above guardEraSeq, kept newer than the merged ones, the band kept at the sequence limit and renumbered back by a Delete with no guard), naming keys rm only when the floor size binds and --accept-drops (which writes it, prints each drop and exits 4) when the tombstone budget or the per-name cap does, never dropping a buried-live burial even with --accept-drops (that refusal names keys rm), removing the staged directory of each entry whose staged generation the merged floor buries or whose burial the write drops, recording before the floor write, as its commit marker, the input's and the written floor's sha256 and what it retired, buried live, kept and dropped in a root-owned keystore-floor.json.pre-restore.retired renamed with the input to keystore-floor.json.merged-<unix>.retired (a rerun finding that record and that floor, or that floor with only burials added since, never plans the floor again and reports from the record, keeping those burials and removing their staged directories, any other floor fails closed, and rm runs while the record is pending, first recording each burial its write drops in a root-owned keystore-floor.json.pre-restore.rm-dropped bound to the record, which a rerun accepts gone, and never refused for it: a record full, unreadable or unwritable is marked unusable and the rerun stops committed; a rerun after the record's rename and before the input's renames only the input), refusing --keep of an entry rm deleted after the restore, that --undo reads only when its input is the live floor to report a version the restore retired apart from one deleted since (refusing --keep on the latter, and refusing with no matching record), refusing pre-restore.d on another device than the keystore's directory, exiting 4 too when it keeps an entry, leaves one unverified (with pre-restore.d/keystore absent, each moved-aside live entry), moves a planted target aside or carries over user-scope entries without a floor check, and 5 when a directory fsync after the tree's rename fails (a restored pointer, or a moved-aside one that does not authenticate or has no master to load), --dry-run writing nothing and exiting as the merge would; while keystore-floor.json.pre-restore is in the data root Put, Rotate and Rewrap refuse, Delete refuses with no live floor, RaiseFloor raises nothing and the delivery reconciler delivers nothing (guarded delivery); a committed change whose floor write evicted a burial exits 4, and list and show warn of it and exit 0 | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `TestDeleteIgnoresPlantedGeneration`, `TestPerNameCapIsBackstop`, `TestDeleteWithoutMasterWarnsUnrecorded`, `TestDeleteReportsEvictedTombstone`, `TestDeleteWarnsUnrecordedWithMaster`, `TestFloorMergeSemantics`, `TestFloorMergeCapsAndPrune`, `TestFloorMergeRefusesUntrusted`, `TestFloorMergeBuriesRevokedLive`, `TestMergeFloorKeep`, `TestFloorMergeRetiresAsideLive`, `TestFloorMergeRefusesUntrustedPlace`, `TestDeleteReportsAnyEvictedTombstone`, `TestFloorHighWaterEncoding`, `TestFloorHighWaterCheckRaise`, `TestFloorMergeFencesAbandonedHistory`, `TestMergeFloorIgnoresEntryLock`, `TestMergeFloorRefusesWrongInput`, `TestPendingMergeGuard`, `TestEvictionReportedCommitted`, `TestMergeFloorRefusesUnmatchedKeep`, `TestMergeFloorRefusesDroppingItsOwnBurials`, `TestFloorMergeKeepRecordsAsideLive`, `TestDeleteNotFoundReportsEviction`, `FuzzParseFloor`, `FuzzMergeFloor`, `TestMergeFloorReadsOnlyTheGuardFile`, `TestFloorMergeBoundsRestoredRaise`, `TestGuardEraBurialSurvivesPressuredMerge`, `TestGuardEraTombstoneBudget`, `TestGuardEraBurialPerNameCap`, `TestPendingMergeDeleteNeedsLiveFloor`, `TestMergeFloorRefusesRetiringEverything`, `TestFloorMergeRefusesExistingTarget`, `TestFloorMergeFencesAboveAsidePointer`, `TestFloorMergeMovesStagedTree`, `TestFloorMergeNeedsStagedTree`, `TestMergeFloorNeverDropsBuriedLive`, `TestMergeFloorRefusesDroppingRestoredBurials`, `FuzzPlanMerge`, `TestPlanMergeKeepTwiceWritesNothing`, `TestFuzzRmReportsCapEviction`, `TestPlanMergeUnmatchedKeepRefusedFirst`, `FuzzDeleteUnderGuardAtLimit`, `TestDeleteRenormalisesStaleBand`, `TestFloorMergeRemovesGuardBuriedStaged`, `TestChownStagedRefusesShape`, `TestChownStagedRefusesACL`, `TestChownStagedRefusesForeignOwner`, `TestChownStagedRecheckSeam`, `TestChownStagedNameBound`, `TestChownStagedSetsModes`, `TestFloorMergeShapeDryRunParity`, `FuzzStagedChild`, `TestFloorMergeRemovesBuriedLiveStaged`, `TestParseRetired`, `TestFloorMergeRerunCommittedWording`, `TestFloorMergeAsideUnverified`, `TestFloorMergeSyncsStagedTree`, `TestOpenStagingRefusesACL`, `TestFloorMergeRerunAfterAcceptDrops`, `TestFloorMergeKeptOnlyWritesRecord`, `TestFloorMergePointerOnlyRefusalNotCommitted`, `TestFloorMergeRerunKeepsRetiredSets`, `TestFloorMergeRerunFloorChanged`, `TestFloorMergeUndoRecord`, `TestFloorMergeAbsentAsideTree`, `TestFloorMergeRerunAfterMoveNotUnverified`, `TestFloorMergeRemovedStagedNamed`, `TestFloorMergeMoveSyncCommitted`, `TestFloorMergeRemovesAsideBuriedStaged`, `TestFloorMergeRemovesDroppedStaged`, `TestFloorMergeRefusesTwoDevices`, `TestFloorMergeRerunAfterDelete`, `TestFloorMergeDeleteBeforeFloorWrite`, `TestFloorMergeRerunNonMonotone`, `TestFloorMergeRerunAfterRmPrune`, `TestPendingSinceReadFloorNotCommitted`, `TestFloorMergeCrashBetweenRenames`, `TestFloorMergeCrashBetweenRenamesClearsRmDropped`, `TestFloorMergeFirstRunRemovesRmDroppedStaged`, `TestDeleteUnderGuardNeverRefusedBySidecar`, `TestParseRmDroppedMark`, `TestMergeFloorRefusesKeepAfterRm`, `TestClassifyUndoDeletedSince`, `FuzzRerunPredicates`, `TestBuriedSinceFence`, `TestFloorMergeBoundsAsidePointer`, `TestFloorMergeStagedNodeBudget`, `TestStagedHoldsUserScopes`, `k3sm/cmd/k3sm::TestKeysEvictionExitsCommitted`, `TestKeysPendingMergeGuard`, `TestKeysReadVerbsWarnEviction`, `TestKeysFloorMergeTakesNoFile`, `TestKeysFloorMergeAcceptDrops`, `TestKeysFloorMergeDryRun`, `TestKeysFloorMergeReportCodes`, `TestKeysFloorMergeMovesPlantedAside`, `TestKeysFloorMergeCommittedRerunRefused` | checked: the floor's tombstone |
 
 ### Rig legs
 

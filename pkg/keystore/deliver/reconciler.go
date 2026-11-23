@@ -71,8 +71,12 @@ const targetTimeout = 10 * time.Second
 const changeDebounce = 500 * time.Millisecond
 
 // ValueSource is the slice of keystore.Store the reconciler reads.
+// MergePending is non-nil while a keystore restore is unfinished (its floor
+// merge has not run): the restored floor then lacks the deletions since the
+// backup, so a sweep delivers nothing until it is nil.
 type ValueSource interface {
 	Current(ctx context.Context, name string) (keystore.Version, []byte, error)
+	MergePending() error
 }
 
 // Config is what New needs.
@@ -275,6 +279,14 @@ func forwardEvents(events <-chan fsnotify.Event, errs <-chan error, name string,
 func (r *Reconciler) Sweep(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if err := r.store.MergePending(); err != nil {
+		// A restored keystore whose floor merge has not run may hold a key
+		// deleted since the backup to revoke it: nothing is published until
+		// the merge has run. The next sweep tries again.
+		r.logger.Error("keystore delivery: a keystore restore is unfinished; nothing delivered until sudo k3sm keys floor merge has run, retried on the next sweep", "reason", err.Error())
+		return
+	}
 
 	d, fi, exists, err := Read(r.path, r.open, r.check)
 	if err != nil {

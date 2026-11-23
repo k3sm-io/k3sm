@@ -1,0 +1,5 @@
+go test fuzz v1
+[]byte("{\"version\":1,\"scope\":\"system\",\"entries\":{\"o\":{\"generation\":\"00000000000000000000000000000009\",\"seq\":1}},\"tombstones\":{\"k\":[{\"generation\":\"00000000000000000000000000000001\",\"deleted\":3},{\"generation\":\"00000000000000000000000000000002\",\"deleted\":4503599627370497}]}}")
+[]byte("{\"version\":1,\"scope\":\"system\",\"entries\":{\"o\":{\"generation\":\"00000000000000000000000000000009\",\"seq\":1}},\"tombstones\":{\"d\":[{\"generation\":\"00000000000000000000000000000005\",\"deleted\":1}],\"k\":[{\"generation\":\"00000000000000000000000000000003\",\"deleted\":2}]}}")
+string("")
+string("")

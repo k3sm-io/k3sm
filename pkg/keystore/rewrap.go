@@ -122,6 +122,15 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, p *rewrapProgr
 	if err := s.checkFloorWritable(); err != nil {
 		return err
 	}
+	// keystore-lock first, then .lock: the one order of § Concurrency.
+	fdir, fl, err := s.lockFloor(ctx)
+	if err != nil {
+		return err
+	}
+	defer fdir.unlock()
+	if err := fdir.mergePending(); err != nil {
+		return err
+	}
 	root, err := s.openDir(s.dir, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("the keystore holds nothing to rewrap: %w", err)
@@ -135,11 +144,6 @@ func (s *FileStore) rewrap(ctx context.Context, newMaster []byte, p *rewrapProgr
 		return err
 	}
 	defer unlock()
-	fdir, fl, err := s.lockFloor(ctx)
-	if err != nil {
-		return err
-	}
-	defer fdir.unlock()
 	mroot, err := s.openMasterDir(false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return ErrMasterMissing

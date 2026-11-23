@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"version\":1,\"scope\":\"system\",\"entries\":{\"a\":{\"generation\":\"0123456789abcdef0123456789abcdef\",\"seq\":4}},\"tombstones\":{\"b\":[{\"generation\":\"0123456789abcdef0123456789abcdef\",\"deleted\":2}],\"c\":[{\"generation\":\"0123456789abcdef0123456789abcdef\",\"deleted\":1}]}}\n")

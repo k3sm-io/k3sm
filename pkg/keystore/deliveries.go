@@ -587,6 +587,11 @@ func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSiz
 // written.
 var errCommitted = errors.New("the change was made")
 
+// Committed reports whether err followed a change that was committed and
+// stands, such as a Delete whose entry was deleted though its floor write
+// evicted tombstones (ErrTombstoneEvicted).
+func Committed(err error) bool { return errors.Is(err, errCommitted) }
+
 // deliveriesKey derives the delivery-record key from K_u.
 func deliveriesKey(ku []byte, scope string) []byte {
 	return hmacSHA256(ku, scopedLabel(deliveriesKeyLabel, scope))

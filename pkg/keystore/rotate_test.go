@@ -207,55 +207,26 @@ func TestFloorRefusesCopiedBackPointer(t *testing.T) {
 		if err := os.Rename(old, filepath.Join(server, "keystore", "k")); err != nil {
 			t.Fatal(err)
 		}
+		// The deleted generation stays buried after the new Put, so that is
+		// the refusal.
 		var stale *staleError
 		_, _, err := s.Current(ctx, "k")
-		if !errors.As(err, &stale) || !stale.generation {
-			t.Fatalf("Current over an old generation: %v, want the floor's generation refusal", err)
+		if !errors.As(err, &stale) || !stale.deleted {
+			t.Fatalf("Current over an old generation: %v, want the floor's deleted refusal", err)
 		}
-		// The refusal names the case it covers: a put-back after a newer Put,
-		// never a deleted entry put back in general, which is accepted
-		// (TestDeletedEntryPutBack).
+		// With its burial gone (pruned), the live record of the new
+		// generation still refuses it: the generation refusal, which names
+		// its case, a put-back after a newer Put.
+		live := floorOf(t, server)["k"]
+		putFloorFile(t, server, floor{"k": {Generation: live.Generation, Seq: live.Seq}})
+		_, _, err = s.Current(ctx, "k")
+		if !errors.As(err, &stale) || !stale.generation {
+			t.Fatalf("Current over a pruned generation: %v, want the floor's generation refusal", err)
+		}
 		if msg := err.Error(); !strings.Contains(msg, "after a newer put of the name") {
 			t.Errorf("generation refusal %q does not say the put-back followed a newer put", msg)
 		}
 	})
-}
-
-// TestDeletedEntryPutBack pins the residual docs/design/keystore.md §
-// "Pointer sequence and floor" accepts for this phase: a completed Delete
-// removes the name's floor entry, so an old copy of the deleted entry put
-// back before any new Put of the name has nothing to be refused against. It
-// opens, and the next root verb records its generation and sequence.
-func TestDeletedEntryPutBack(t *testing.T) {
-	ctx := context.Background()
-	s, server := newTestStore(t)
-	mustPut(t, s, "k", KindOpaque, []byte("one"))
-	mustRotate(t, s, "k", "two")
-	old := filepath.Join(server, "old-entry")
-	if err := os.Mkdir(old, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range []string{generationName, "v1", "v2", currentName} {
-		copyFile(t, entryPath(server, "k", f), filepath.Join(old, f))
-	}
-	recorded := floorOf(t, server)["k"]
-	if err := s.Delete(ctx, "k"); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := floorOf(t, server)["k"]; ok {
-		t.Fatal("the Delete left the name's floor entry")
-	}
-	if err := os.Rename(old, filepath.Join(server, "keystore", "k")); err != nil {
-		t.Fatal(err)
-	}
-	mustCurrent(t, s, "k", "two")
-	if err := s.RaiseFloor(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := floorOf(t, server)["k"]; got != recorded {
-		t.Fatalf("floor after RaiseFloor = %+v, want the put-back entry's %+v", got, recorded)
-	}
-	mustCurrent(t, s, "k", "two")
 }
 
 // TestFloorTrust is G6: the floor, and the data root holding it, are judged
@@ -381,8 +352,8 @@ func TestFloorRaised(t *testing.T) {
 		if err := s.Delete(ctx, "k"); err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := floorOf(t, server)["k"]; ok {
-			t.Fatal("floor still records a deleted entry")
+		if f := floorOf(t, server)["k"]; len(f.burials()) == 0 || f.live() {
+			t.Fatalf("floor after Delete = %+v, want the deleted entry's tombstone", f)
 		}
 	})
 	t.Run("a Rotate crash after the flip", func(t *testing.T) {
@@ -469,8 +440,8 @@ func TestFloorRaised(t *testing.T) {
 		if err := s.Delete(ctx, "a"); err != nil {
 			t.Fatalf("Delete without the master: %v", err)
 		}
-		if fl := floorOf(t, server); len(fl) != 1 || fl["b"].Seq != 1 {
-			t.Fatalf("floor = %+v, want only b", fl)
+		if fl := floorOf(t, server); len(fl) != 2 || fl["b"].Seq != 1 || fl["a"].Buried[0].Deleted != 1 {
+			t.Fatalf("floor = %+v, want b live and a's tombstone", fl)
 		}
 	})
 	t.Run("nothing to raise", func(t *testing.T) {
@@ -676,8 +647,9 @@ func TestFloorScope(t *testing.T) {
 
 // TestFloorMalformedAdvice: a floor that does not parse is refused with
 // advice that says what removing it costs, never a bare "delete the file":
-// with no floor the stale-pointer check is off, and the rebuild trusts
-// whatever pointers are there.
+// with no floor the stale-pointer check is off, the rebuild trusts whatever
+// pointers are there, and every deleted entry, revoked keys included, is
+// accepted again if put back.
 func TestFloorMalformedAdvice(t *testing.T) {
 	s, server := newTestStore(t)
 	mustPut(t, s, "k", KindOpaque, []byte("v"))
@@ -687,7 +659,7 @@ func TestFloorMalformedAdvice(t *testing.T) {
 		t.Fatalf("Current over a malformed floor: %v, want errFloorMalformed", err)
 	}
 	msg := err.Error()
-	for _, want := range []string{"turns replay protection off", "known to be current", "rebuild"} {
+	for _, want := range []string{"turns replay protection off", "known to be current", "rebuild", "discards every deletion the floor recorded", "a key revoked by deleting it included, is accepted again"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("malformed-floor advice %q does not say %q", msg, want)
 		}
