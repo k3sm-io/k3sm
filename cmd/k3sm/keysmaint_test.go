@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -288,5 +289,18 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	want("rotate --discard-oldest", "live3\n", "live2\n", "live\n", "a1\n")
 	if !strings.Contains(h.stdout.String(), "discarded the oldest") || !strings.Contains(h.stdout.String(), "4 archives kept") {
 		t.Errorf("audit --rotate --discard-oldest printed %q", h.stdout.String())
+	}
+
+	// doctor's hint past the soft cap says to export the archives first,
+	// then rotate.
+	env := healthyDoctorEnv()
+	env.keystoreLogs = func(context.Context) error { return nil }
+	env.keystoreLogSizes = func(context.Context) (keystore.LogSizes, error) {
+		return keystore.LogSizes{Audit: 65, SoftCap: 64, HardCap: 256}, nil
+	}
+	r := checkKeystoreLogs(env)
+	if r.status != statusWarn || !strings.Contains(r.remedy, "export the audit archives first") || !strings.Contains(r.remedy, "sudo k3sm keys audit --rotate") ||
+		strings.Index(r.remedy, "export") > strings.Index(r.remedy, "audit --rotate") {
+		t.Errorf("doctor past the audit log's soft cap: %v %q / %q, want a WARN saying to export first, then rotate", r.status, r.detail, r.remedy)
 	}
 }

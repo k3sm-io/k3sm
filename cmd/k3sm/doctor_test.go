@@ -28,6 +28,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/k3sm/pkg/status"
 )
 
@@ -116,6 +117,18 @@ func TestDoctorChecksTable(t *testing.T) {
 		{"keystore-logs/fail-unflagged", checkKeystoreLogs, func(e *doctorEnv) {
 			e.keystoreLogs = func(context.Context) error { return errors.New("the log is not flagged append-only") }
 		}, statusFail},
+		{"keystore-logs/pass-under-soft-cap", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return nil }
+			e.keystoreLogSizes = func(context.Context) (keystore.LogSizes, error) {
+				return keystore.LogSizes{UserFloor: 10, Audit: 64, SoftCap: 64, HardCap: 256}, nil
+			}
+		}, statusPass},
+		{"keystore-logs/warn-past-soft-cap", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return nil }
+			e.keystoreLogSizes = func(context.Context) (keystore.LogSizes, error) {
+				return keystore.LogSizes{UserFloor: 65, SoftCap: 64, HardCap: 256}, nil
+			}
+		}, statusWarn},
 		{"keystore-logs/skip-worker", checkKeystoreLogs, func(e *doctorEnv) {
 			e.nodeRole = func() (install.Role, bool) { return install.RoleAgent, true }
 		}, statusSkip},

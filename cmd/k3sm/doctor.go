@@ -133,6 +133,10 @@ type doctorEnv struct {
 	// service user's, mode 0600 and flagged SF_APPEND. A nil seam leaves the
 	// row unprobed.
 	keystoreLogs func(context.Context) error
+	// keystoreLogSizes reads the two logs' sizes and caps
+	// (keystore.FileStore.LogSizes), for the soft-cap hint. A nil seam
+	// leaves the sizes unread.
+	keystoreLogSizes func(context.Context) (keystore.LogSizes, error)
 	// interconnect is the interconnect section's seams (doctorinterconnect.go).
 	// Nil leaves the section out of the report.
 	interconnect *interconnectEnv
@@ -166,7 +170,9 @@ func doctorChecks() []doctorCheck {
 // naming install; a log the check refuses (its flag clear, not the
 // service user's, at another mode) is a FAIL, since the server keeps the
 // user scope off until it is put right; a log an ordinary account cannot
-// open is a WARN naming sudo.
+// open is a WARN naming sudo. Logs that pass but have grown past the soft
+// cap are a WARN with the hint: export the audit archives first, then
+// rotate; rebuild the floor.
 func checkKeystoreLogs(env doctorEnv) checkResult {
 	const name = "keystore-logs"
 	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
@@ -178,13 +184,45 @@ func checkKeystoreLogs(env doctorEnv) checkResult {
 	err := env.keystoreLogs(context.Background())
 	switch {
 	case err == nil:
+		if r, past := keystoreSoftCapHint(env); past {
+			return r
+		}
 		return checkResult{name: name, status: statusPass, detail: "both append-only logs are the service user's, mode 0600, flagged SF_APPEND"}
 	case errors.Is(err, fs.ErrNotExist):
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("the keystore user scope is off: %v", err), remedy: "sudo k3sm install"}
 	case errors.Is(err, fs.ErrPermission):
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("could not read the keystore logs: %v", err), remedy: "sudo k3sm doctor   # the data root's keystore files are root's and the service user's"}
 	}
-	return checkResult{name: name, status: statusFail, detail: fmt.Sprintf("the keystore user scope stays off: %v", err)}
+	return checkResult{name: name, status: statusFail, detail: fmt.Sprintf("the keystore user scope stays off: %v", err), remedy: "after a restore: sudo k3sm keys floor --rebuild; sudo k3sm keys audit --rotate   # each flags its log append-only again"}
+}
+
+// keystoreSoftCapHint is the keystore-logs row's WARN when either log is
+// past its soft cap, and whether one is: the audit log's hint says to
+// export the archives first (copy them off the Mac), then rotate, and the
+// floor's to rebuild it. A size that cannot be read gives no hint: the
+// flag check already passed.
+func keystoreSoftCapHint(env doctorEnv) (checkResult, bool) {
+	const name = "keystore-logs"
+	if env.keystoreLogSizes == nil {
+		return checkResult{}, false
+	}
+	sz, err := env.keystoreLogSizes(context.Background())
+	if err != nil {
+		return checkResult{}, false
+	}
+	var details, remedies []string
+	if sz.Audit > sz.SoftCap {
+		details = append(details, fmt.Sprintf("the audit log is %d bytes, past its soft cap of %d", sz.Audit, sz.SoftCap))
+		remedies = append(remedies, "export the audit archives first: copy keystore-audit.log.1 to .4 from the data root off the Mac, then run sudo k3sm keys audit --rotate (with --discard-oldest once .4 exists)")
+	}
+	if sz.UserFloor > sz.SoftCap {
+		details = append(details, fmt.Sprintf("the user-scope floor log is %d bytes, past its soft cap of %d", sz.UserFloor, sz.SoftCap))
+		remedies = append(remedies, "sudo k3sm keys floor --rebuild")
+	}
+	if len(details) == 0 {
+		return checkResult{}, false
+	}
+	return checkResult{name: name, status: statusWarn, detail: strings.Join(details, "; ") + fmt.Sprintf("; past the hard cap of %d no user-scope change is recorded", sz.HardCap), remedy: strings.Join(remedies, "; ")}, true
 }
 
 // checkArch verifies the binary runs on Apple Silicon (arm64). k3sm is
@@ -836,6 +874,15 @@ func realDoctorEnv(workDir string) doctorEnv {
 			cfg := keystoreLayout(workDir)
 			cfg.UID = uid
 			return keystore.New(cfg).CheckLogFlags(ctx)
+		},
+		keystoreLogSizes: func(ctx context.Context) (keystore.LogSizes, error) {
+			uid, _, err := lookupServiceIDs()
+			if err != nil {
+				return keystore.LogSizes{}, err
+			}
+			cfg := keystoreLayout(workDir)
+			cfg.UID = uid
+			return keystore.New(cfg).LogSizes(ctx)
 		},
 		interconnect: realInterconnectEnv(),
 	}
