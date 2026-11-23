@@ -97,7 +97,7 @@ func TestWithdrawUnderTaintAuditsEverySealed(t *testing.T) {
 		if err != nil || r.Op != "withdraw" || r.Result != auditResultOK {
 			continue
 		}
-		named[r.Delivery] = true
+		named[r.DeliveryUID] = true
 	}
 	for _, n := range []int{1, 2} {
 		if !named[testDelivery(n).uid] {

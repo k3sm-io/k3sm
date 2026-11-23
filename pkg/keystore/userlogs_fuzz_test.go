@@ -95,7 +95,7 @@ func FuzzParseAuditLine(f *testing.F) {
 		if r.V != auditFormat || len(b)+1 > maxLogLine {
 			t.Fatalf("accepted %q as %+v", b, r)
 		}
-		line, err := marshalAuditLine(auditLine{op: r.Op, scope: r.Scope, name: r.Name, namespace: r.Namespace, delivery: r.Delivery, result: r.Result}, time.Unix(1_800_000_000, 0))
+		line, err := marshalAuditLine(auditLine{op: r.Op, scope: r.Scope, name: r.Name, namespace: r.Namespace, delivery: r.DeliveryUID, result: r.Result}, time.Unix(1_800_000_000, 0))
 		if err != nil {
 			// A record re-encoded with its JSON escapes can pass 1 KiB.
 			return

@@ -34,17 +34,20 @@ const auditFormat = 1
 // and none for a value's length, so no line can carry either. Via names the
 // path the operation came by ("root" for a root verb); a line without it,
 // as every line written before it existed is, still reads. The caller and
-// fingerprint fields are the socket's to add.
+// fingerprint fields are the socket's to add. The delivery field is
+// DeliveryUID in Go, not Delivery: the export gate (unexported_test.go)
+// reads a bare Delivery identifier as the delivery type, and would count
+// every exported caller of the audit writer as reaching the user scope.
 type auditRecord struct {
-	V         int    `json:"v"`
-	TS        string `json:"ts"`
-	Op        string `json:"op"`
-	Via       string `json:"via,omitempty"`
-	Scope     string `json:"scope"`
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
-	Delivery  string `json:"delivery,omitempty"`
-	Result    string `json:"result"`
+	V           int    `json:"v"`
+	TS          string `json:"ts"`
+	Op          string `json:"op"`
+	Via         string `json:"via,omitempty"`
+	Scope       string `json:"scope"`
+	Name        string `json:"name"`
+	Namespace   string `json:"namespace"`
+	DeliveryUID string `json:"delivery,omitempty"`
+	Result      string `json:"result"`
 }
 
 // fileAuditLog is the file-backed audit log.
@@ -77,15 +80,15 @@ func (a *fileAuditLog) append(l auditLine) error {
 // included, refusing one longer than maxLogLine.
 func marshalAuditLine(l auditLine, now time.Time) ([]byte, error) {
 	b, err := json.Marshal(auditRecord{
-		V:         auditFormat,
-		TS:        now.UTC().Format(time.RFC3339Nano),
-		Op:        l.op,
-		Via:       l.via,
-		Scope:     l.scope,
-		Name:      l.name,
-		Namespace: l.namespace,
-		Delivery:  l.delivery,
-		Result:    l.result,
+		V:           auditFormat,
+		TS:          now.UTC().Format(time.RFC3339Nano),
+		Op:          l.op,
+		Via:         l.via,
+		Scope:       l.scope,
+		Name:        l.name,
+		Namespace:   l.namespace,
+		DeliveryUID: l.delivery,
+		Result:      l.result,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode an audit line: %w", err)

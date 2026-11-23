@@ -108,7 +108,7 @@ func TestWithdrawMassSealAuditsEveryDeliveryAtBudgetEdge(t *testing.T) {
 			named := map[string]bool{}
 			for _, l := range bytes.Split(auditAfter[len(auditBefore):], []byte{'\n'}) {
 				if r, perr := parseAuditLine(l); perr == nil && r.Op == "withdraw" && r.Result == auditResultOK {
-					named[r.Delivery] = true
+					named[r.DeliveryUID] = true
 				}
 			}
 			if err != nil && !errors.Is(err, errCommitted) {
