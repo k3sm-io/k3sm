@@ -87,6 +87,7 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 		return rep, err
 	}
 	defer m.end()
+	m.hook, _ = attrs.(SwapStepper)
 	present, err := s.judgeArchives(m.lfd)
 	if err != nil {
 		m.refused()
@@ -104,12 +105,20 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 		}
 		return rep, err
 	}
+	if err := m.step(swapStepReadOld); err != nil {
+		m.refused()
+		return rep, fmt.Errorf("%w: %w", errRotateRefused, err)
+	}
 	old, err := openOldLog(m.lfd, auditLogName)
 	if err != nil {
 		m.refused()
 		return rep, fmt.Errorf("%w: the audit log %s cannot be opened: %w", errRotateRefused, auditLogName, err)
 	}
 	defer func() { _ = old.Close() }() // read-only
+	if err := m.step(swapStepStageArchive); err != nil {
+		m.refused()
+		return rep, fmt.Errorf("%w: %w", errRotateRefused, err)
+	}
 	af, off, err := s.stageArchive(m, old, attrs)
 	if err != nil {
 		m.refused()
@@ -133,7 +142,12 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 		retire: retire,
 	}
 	if err := s.swapLog(m, sw, attrs); err != nil {
-		_ = unix.Unlinkat(m.sfd, auditArchiveStagingName, 0) // only when the swap refused before the gate: the old log stands
+		if !m.keep {
+			// The swap refused before the gate closed: the old log stands.
+			// Past it the staged archive holds the old log's only copy,
+			// which the rerun places.
+			_ = unix.Unlinkat(m.sfd, auditArchiveStagingName, 0) // a stale archive is removed by the rerun too
+		}
 		return rep, err
 	}
 	rep.Archives, err = s.countArchives(m.lfd)
@@ -193,6 +207,9 @@ func (s *FileStore) retireArchives(m *maintenance, discardOldest bool, rep *Rota
 	if err != nil {
 		return fmt.Errorf("%w; rerun the verb", err)
 	}
+	if err := m.step(swapStepShiftArchives); err != nil {
+		return err
+	}
 	if present[auditArchives] {
 		if !discardOldest {
 			return fmt.Errorf("%s exists: rerun sudo k3sm keys audit --rotate with --discard-oldest once the archives are exported", auditArchiveName(auditArchives))
@@ -209,6 +226,9 @@ func (s *FileStore) retireArchives(m *maintenance, discardOldest bool, rep *Rota
 		if err := renameExcl(m.lfd, auditArchiveName(n), m.lfd, auditArchiveName(n+1)); err != nil {
 			return fmt.Errorf("rename %s to %s: %w; rerun the verb", auditArchiveName(n), auditArchiveName(n+1), err)
 		}
+	}
+	if err := m.step(swapStepPlaceArchive); err != nil {
+		return err
 	}
 	if err := renameExcl(m.sfd, auditArchiveStagingName, m.lfd, auditArchiveName(1)); err != nil {
 		return fmt.Errorf("rename %s to %s: %w; rerun the verb", auditArchiveStagingName, auditArchiveName(1), err)

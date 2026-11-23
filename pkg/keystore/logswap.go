@@ -72,6 +72,10 @@ type logSwap struct {
 // gate's close on a failure keeps the marker, so the listener stays down
 // until a rerun, which resumeSwap finishes.
 func (s *FileStore) swapLog(m *maintenance, sw logSwap, attrs FileAttrWriter) error {
+	if err := m.step(swapStepStage); err != nil {
+		m.refused()
+		return fmt.Errorf("%w: %w", m.refusal, err)
+	}
 	nf, err := s.stageNewLog(m, sw.staging, sw.content, attrs)
 	if err != nil {
 		m.refused()
@@ -84,6 +88,9 @@ func (s *FileStore) swapLog(m *maintenance, sw logSwap, attrs FileAttrWriter) er
 		return err
 	}
 	if sw.old != nil {
+		if err := m.step(swapStepReadTail); err != nil {
+			return err
+		}
 		if err := readTail(sw, nf); err != nil {
 			return err
 		}
@@ -143,7 +150,8 @@ func (m *maintenance) closeGate(attrs FileAttrWriter) error {
 }
 
 // openGate is step 9: the directories are fsynced and keystore-logs/ goes
-// back to 0755. The swap is done: the marker may go.
+// back to 0755. The swap is done: the marker may go (a step seam that fails
+// at swapStepEnd keeps it, as a crash before its removal would).
 func (m *maintenance) openGate(attrs FileAttrWriter) error {
 	for _, d := range []struct {
 		fd   int
@@ -155,6 +163,9 @@ func (m *maintenance) openGate(attrs FileAttrWriter) error {
 	}
 	if err := attrs.Fchmod(m.lfd, logsDirMode); err != nil {
 		return fmt.Errorf("open %s (mode 0755): %w; rerun the verb", logsDirName, err)
+	}
+	if err := m.step(swapStepEnd); err != nil {
+		return err
 	}
 	m.keep = false
 	return nil
@@ -204,6 +215,9 @@ func (m *maintenance) retireOld(old *os.File, canonical string, attrs FileAttrWr
 	if err := attrs.Fchflags(int(old.Fd()), 0); err != nil {
 		return fmt.Errorf("clear the flag of the old %s: %w; rerun the verb", canonical, err)
 	}
+	if err := m.step(swapStepUnlinkOld); err != nil {
+		return err
+	}
 	if err := unix.Unlinkat(m.lfd, canonical, 0); err != nil {
 		return fmt.Errorf("unlink the old %s: %w; rerun the verb", canonical, err)
 	}
@@ -214,6 +228,9 @@ func (m *maintenance) retireOld(old *os.File, canonical string, attrs FileAttrWr
 // only while nothing stands there, flagged and judged (flagNewLog), and the
 // gate opened.
 func (s *FileStore) placeNewLog(m *maintenance, nf *os.File, staging, canonical string, attrs FileAttrWriter) error {
+	if err := m.step(swapStepRename); err != nil {
+		return err
+	}
 	if err := renameExcl(m.sfd, staging, m.lfd, canonical); err != nil {
 		return fmt.Errorf("rename %s to %s: %w; rerun the verb", staging, canonical, err)
 	}
@@ -244,7 +261,12 @@ func (s *FileStore) flagNewLog(nf *os.File, canonical string, attrs FileAttrWrit
 //     shift, which skips what is done) runs, then steps 7 to 9;
 //   - the gate closed, the canonical log present and nothing staged: the
 //     new log was renamed in; it is flagged when its flag is clear, judged,
-//     and the gate opened.
+//     and the gate opened;
+//   - with the marker from that run, the gate open, nothing staged and the
+//     canonical log judged and born no earlier than the marker: the swap
+//     finished and the crash came before the marker went (swapFinished).
+//     Nothing is redone (a rotate would archive the new, empty log): the
+//     marker goes and the caller writes the audit line.
 //
 // Any other state is a swap to run from step 2: the canonical log is the
 // old one (unflagged, when the crash came between the flag clear and the
@@ -299,8 +321,38 @@ func (s *FileStore) resumeSwap(m *maintenance, canonical, staging string, retire
 			return true, fmt.Errorf("the new %s: %w; rerun the verb", canonical, err)
 		}
 		return true, m.openGate(attrs)
+	case cerr == nil && !gateClosed && !staged && m.crashed:
+		return s.swapFinished(m, canonical, &cst), nil
 	}
 	return false, nil
+}
+
+// swapFinished reports whether the canonical log, which cst describes, is
+// the new log of the crashed run whose marker still stands: it passes the
+// steady-state judge and was born no earlier than the marker, which that
+// run wrote before it created the log. A log from before the run (a crash
+// before step 3) was born earlier, and the verb runs again. Without birth
+// times on either it reports false, and the verb runs again.
+func (s *FileStore) swapFinished(m *maintenance, canonical string, cst *unix.Stat_t) bool {
+	var mst unix.Stat_t
+	if unix.Fstatat(m.dfd, maintenanceMarkerName, &mst, unix.AT_SYMLINK_NOFOLLOW) != nil {
+		return false
+	}
+	lb, mb := logBirth(cst), logBirth(&mst)
+	if (lb == unix.Timespec{}) || (mb == unix.Timespec{}) || lb.Nano() < mb.Nano() {
+		return false
+	}
+	fd, err := unix.Openat(m.lfd, canonical, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false
+	}
+	f := os.NewFile(uintptr(fd), canonical)
+	defer func() { _ = f.Close() }() // read-only
+	var st unix.Stat_t
+	if s.judgeLog(f, &st) != nil || st.Ino != cst.Ino || st.Dev != cst.Dev {
+		return false
+	}
+	return true
 }
 
 // openStaged opens the staged new log name in the staging directory sfd

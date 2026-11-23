@@ -68,6 +68,32 @@ type FileAttrWriter interface {
 	Fchflags(fd, flags int) error
 }
 
+// SwapStepper is the optional step seam of a FileAttrWriter: when the
+// writer also implements it, the maintenance verbs call BeforeSwapStep
+// with the step's name before each step of the swap that makes no
+// attribute call of its own (the swapStep names below), so a root-run test
+// can probe, or stop the verb at, every step. An error fails the step as a
+// crash there would leave it.
+type SwapStepper interface {
+	BeforeSwapStep(step string) error
+}
+
+// The steps a SwapStepper is called before, in the order the swap runs
+// them (docs/design/keystore.md § "The swap"). The attribute calls between
+// them (the new log's fchown and fchmod, the gate's close and open, the old
+// log's flag clear, the new log's flag) reach the writer itself.
+const (
+	swapStepReadOld       = "read-old"
+	swapStepStageArchive  = "stage-archive"
+	swapStepStage         = "stage"
+	swapStepReadTail      = "read-tail"
+	swapStepUnlinkOld     = "unlink-old"
+	swapStepShiftArchives = "shift-archives"
+	swapStepPlaceArchive  = "place-archive"
+	swapStepRename        = "rename"
+	swapStepEnd           = "end"
+)
+
 // RebuildReport is what floor --rebuild did: the scopes it read, the keys
 // the new floor holds, the old floor's lines it dropped because they did
 // not parse, and the keys of removed scopes it did not carry forward.
@@ -107,9 +133,14 @@ func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (Reb
 		return rep, err
 	}
 	defer m.end()
+	m.hook, _ = attrs.(SwapStepper)
 	done, err := s.resumeSwap(m, userFloorLogName, floorStagingName, nil, attrs)
 	if done || err != nil {
 		return rep, err
+	}
+	if err := m.step(swapStepReadOld); err != nil {
+		m.refused()
+		return rep, fmt.Errorf("%w: %w", errRebuildRefused, err)
 	}
 	old, err := s.readOldFloor(m.lfd)
 	if err != nil {
@@ -199,6 +230,19 @@ type maintenance struct {
 	// keep leaves the marker in place: a step past the old file's flag
 	// clear failed, so the listener must stay down until a rerun.
 	keep bool
+	// hook is the attribute writer's step seam, or nil.
+	hook SwapStepper
+}
+
+// step calls the step seam, when there is one, before the step name.
+func (m *maintenance) step(name string) error {
+	if m.hook == nil {
+		return nil
+	}
+	if err := m.hook.BeforeSwapStep(name); err != nil {
+		return fmt.Errorf("before the step %s: %w; rerun the verb", name, err)
+	}
+	return nil
 }
 
 // errStoreLockHeld is the maintenance verbs' refusal when the store lock
