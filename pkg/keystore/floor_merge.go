@@ -794,9 +794,18 @@ func (e *mergeFullError) Error() string { return e.msg }
 // Is matches errFloorFull.
 func (e *mergeFullError) Is(target error) bool { return target == errFloorFull }
 
-// changes reports whether the merge r reports changed the floor.
+// changes reports whether the merge r reports has anything to commit: a
+// change to the floor (floorChanges) or a name kept, so a kept-only first
+// run writes its retired record.
 func (r MergeReport) changes() bool {
-	return r.Merged > 0 || len(r.Retired) > 0 || len(r.Fenced) > 0 || len(r.Kept) > 0 || r.raised > 0 || r.recorded > 0 || r.renumbered
+	return r.floorChanges() || len(r.Kept) > 0
+}
+
+// floorChanges reports whether the merge r reports changed the floor. A
+// keep repeated by a second merge of the same input changes nothing in it:
+// a rerun keeps the name again and writes nothing.
+func (r MergeReport) floorChanges() bool {
+	return r.Merged > 0 || len(r.Retired) > 0 || len(r.Fenced) > 0 || r.raised > 0 || r.recorded > 0 || r.renumbered
 }
 
 // errMergeLiveFloor refuses a merge whose input is the data root's live

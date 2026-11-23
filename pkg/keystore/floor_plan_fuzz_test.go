@@ -91,7 +91,7 @@ func fuzzFloor(b []byte, guard bool) floor {
 // with guard-era burials in the live floor or none; a merge
 // allowed leaves no name it cleared with neither a live record nor a
 // burial; no raise passes the restored record's sequence plus one; merging
-// the result again changes nothing; and a reverse merge (the undo) of the
+// the result again changes nothing in the floor and keeps the same names; and a reverse merge (the undo) of the
 // result into the moved-aside floor, after an rm since the restore, keeps
 // every guard-era deletion and that one.
 func FuzzPlanMerge(f *testing.F) {
@@ -158,7 +158,9 @@ func FuzzPlanMerge(f *testing.F) {
 		}
 		if len(p.dropped) == 0 {
 			again := planMerge(p.merged, from, keep, ptrs, nil)
-			if again.r.changes() || len(again.dropped) != 0 || !floorsEqual(again.merged, p.merged) {
+			// A rerun keeps each kept name again and writes nothing
+			// (docs/design/keystore.md): the same Kept, no floor change.
+			if again.r.floorChanges() || !slices.Equal(again.r.Kept, p.r.Kept) || len(again.dropped) != 0 || !floorsEqual(again.merged, p.merged) {
 				t.Fatalf("merging twice = %+v, dropped %v; want the result of merging once", again.r, again.dropped)
 			}
 		}
