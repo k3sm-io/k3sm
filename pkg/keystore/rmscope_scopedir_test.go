@@ -300,3 +300,73 @@ func TestRemoveScopeDirMovedBeforeRmdir(t *testing.T) {
 		})
 	}
 }
+
+// The final rmdir's probe tells a removed directory (ENOENT) from one still
+// linked (it takes the probe). A probe that fails for any other cause
+// (through the seam: ENOSPC, EDQUOT, EROFS, EIO) is reported as a removal
+// rm-scope could not confirm: committed, never moved, never success, with
+// no rerun offered. A probe that was created in the emptied directory and
+// whose removal fails is said in the error, not ignored.
+func TestRemoveScopeRmdirProbeFailures(t *testing.T) {
+	for _, errno := range []unix.Errno{unix.ENOSPC, unix.EDQUOT, unix.EROFS, unix.EIO} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			s, server, _ := fileLogScope(t)
+			setSeam(t, &rmProbeMkdir, func(int, string, uint32) error { return errno })
+			res, err := s.RemoveScope(t.Context(), 1001)
+			if !Committed(err) || !errors.Is(err, errScopeRmdirUnconfirmed) || errors.Is(err, errScopeDirMoved) {
+				t.Fatalf("rm-scope with the probe failing %v: %v, want committed and unconfirmed, not moved", errno, err)
+			}
+			msg := err.Error()
+			for _, want := range []string{"could not confirm the removal", errno.Error(), quoteName(scopeDir(server, "1001")) + " (named for reading, not for pasting)"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the error %q does not say %q", msg, want)
+				}
+			}
+			for _, bad := range []string{"rerun", "moved away"} {
+				if strings.Contains(msg, bad) {
+					t.Errorf("the error %q says %q", msg, bad)
+				}
+			}
+			if !res.Recorded {
+				t.Error("the listed key was proven in the held directory, but the result is not recorded")
+			}
+		})
+	}
+	t.Run("probe left behind", func(t *testing.T) {
+		s, server, _ := fileLogScope(t)
+		dir := scopeDir(server, "1001")
+		away := filepath.Join(filepath.Dir(dir), "away")
+		done := false
+		setSeam(t, &rmBeforeScopeRmdir, func(step rmdirStep) {
+			if done || step != rmdirBeforeUnlink {
+				return
+			}
+			done = true
+			if err := os.Rename(dir, away); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		})
+		setSeam(t, &rmProbeRmdir, func(int) error { return unix.EIO })
+		root, err := s.openDir(s.dir, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = root.Close() }()
+		_, err = removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true})
+		if !errors.Is(err, errScopeDirMoved) {
+			t.Fatalf("removeScopeTree with an empty directory swapped in: %v, want errScopeDirMoved", err)
+		}
+		msg := err.Error()
+		for _, want := range []string{"another directory was removed at the name", "could not remove its check directory", unix.EIO.Error()} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("the error %q does not say %q", msg, want)
+			}
+		}
+		if _, err := os.Lstat(filepath.Join(away, rmGoneProbe)); err != nil {
+			t.Fatalf("the probe the seam kept: %v, want it in the emptied directory", err)
+		}
+	})
+}

@@ -454,11 +454,12 @@ func rmStopped(err error, changed bool, state, scope, cleared string) error {
 // (errScopeForeignDir), a tree nested too deep (errScopeTreeDeep), an
 // emptied scope directory no longer at its name (errScopeDirMoved), a
 // planted name (errPlanted), another user's flag on .user
-// (errSharedDirFlag), or a flag on an entry that rm-scope leaves
+// (errSharedDirFlag), a flag on an entry that rm-scope leaves
 // (errFlagLeft: a system flag, or a user flag on a multiply-linked entry it
-// does not clear).
+// does not clear), or a final rmdir it could not confirm
+// (errScopeRmdirUnconfirmed: a rerun finds the name empty either way).
 func rmRerunCannotHelp(err error) bool {
-	for _, e := range []error{errScopeForeignDir, errScopeTreeDeep, errScopeDirMoved, errPlanted, errSharedDirFlag, errFlagLeft} {
+	for _, e := range []error{errScopeForeignDir, errScopeTreeDeep, errScopeDirMoved, errPlanted, errSharedDirFlag, errFlagLeft, errScopeRmdirUnconfirmed} {
 		if errors.Is(err, e) {
 			return true
 		}
@@ -825,7 +826,7 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, opts rmTree
 	case err == nil:
 		w.changed = true
 		return tree, unix.Fsync(ufd)
-	case errors.Is(err, errScopeDirMoved):
+	case errors.Is(err, errScopeDirMoved), errors.Is(err, errScopeRmdirUnconfirmed):
 		return tree, err
 	}
 	return tree, fmt.Errorf("remove the scope directory: %w", err)
@@ -937,6 +938,19 @@ var rmBeforeScopeRmdir func(rmdirStep)
 // name (ENOENT), one still linked takes it.
 const rmGoneProbe = ".rm-scope-removed-check"
 
+// rmProbeMkdir and rmProbeRmdir are rmdirHeld's creation of rmGoneProbe in
+// the held directory and its removal again; tests replace them to fail.
+var (
+	rmProbeMkdir = unix.Mkdirat
+	rmProbeRmdir = func(fd int) error { return unix.Unlinkat(fd, rmGoneProbe, unix.AT_REMOVEDIR) }
+)
+
+// errScopeRmdirUnconfirmed is a directory rm-scope removed at the scope's
+// name whose probe (rmGoneProbe) failed for another cause than the one
+// that tells (ENOSPC, EDQUOT, EROFS, EIO): whether it was the emptied
+// directory cannot be told, and a rerun finds the name empty either way.
+var errScopeRmdirUnconfirmed = errors.New("rm-scope removed a directory at the scope's name and could not confirm the removal")
+
 // rmdirHeld removes the name uid from .user, held at ufd, only while it is
 // still the emptied directory held at fd, which held describes: .user is
 // the service user's, so the name can be renamed away or another
@@ -949,9 +963,13 @@ const rmGoneProbe = ".rm-scope-removed-check"
 // before (2), so the link count cannot say; mkdirat of rmGoneProbe in it
 // fails with ENOENT once it is removed, on macOS and Linux alike. When it
 // is still linked, the probe is removed again and the error says another
-// directory was removed at the name and the emptied one remains. Every
-// failure here is errScopeDirMoved: the emptied directory is not at the
-// name, and a rerun would meet whatever is.
+// directory was removed at the name and the emptied one remains, and also
+// that the probe stays when its removal failed. Every failure up to here
+// is errScopeDirMoved: the emptied directory is not at the name, and a
+// rerun would meet whatever is. A probe that fails for any other cause
+// (ENOSPC, EDQUOT, EROFS, EIO, ...) cannot tell, and is reported as a
+// removal rm-scope could not confirm (errScopeRmdirUnconfirmed), never as
+// moved and never as success.
 func (w *rmWalk) rmdirHeld(ufd int, uid string, fd int, held *unix.Stat_t) error {
 	if rmBeforeScopeRmdir != nil {
 		rmBeforeScopeRmdir(rmdirBeforeStat)
@@ -982,17 +1000,23 @@ func (w *rmWalk) rmdirHeld(ufd int, uid string, fd int, held *unix.Stat_t) error
 		return err
 	}
 	w.changed = true
-	err = unix.Mkdirat(fd, rmGoneProbe, 0o700)
+	err = rmProbeMkdir(fd, rmGoneProbe, 0o700)
+	other := fmt.Errorf("%w: another directory was removed at the name %s (named for reading, not for pasting), and the emptied one remains, no longer at that name", errScopeDirMoved, quoteName(w.base))
 	switch {
 	case errors.Is(err, unix.ENOENT):
 		return nil
 	case err == nil:
-		_ = unix.Unlinkat(fd, rmGoneProbe, unix.AT_REMOVEDIR) // the held directory is root's; the probe goes again
-		fallthrough
+		// The held directory is root's; the probe goes again.
+		if cerr := rmProbeRmdir(fd); cerr != nil {
+			return fmt.Errorf("%w; rm-scope could not remove its check directory %s from the emptied one again (%v), so it stays there", other, rmGoneProbe, safeText(cerr.Error()))
+		}
+		return other
 	case errors.Is(err, unix.EEXIST):
-		return fmt.Errorf("%w: another directory was removed at the name %s (named for reading, not for pasting), and the emptied one remains, no longer at that name", errScopeDirMoved, quoteName(w.base))
+		return other
 	}
-	return fmt.Errorf("%w: a directory was removed at the name %s (named for reading, not for pasting), and rm-scope could not tell whether it was the emptied one: %w", errScopeDirMoved, quoteName(w.base), err)
+	// The errno is said, not wrapped: an EPERM here is not the unlinkat's,
+	// which removeScopeTree answers by clearing a flag on .user.
+	return fmt.Errorf("%w: a directory was removed at the name %s (named for reading, not for pasting), and rm-scope could not confirm the removal was the emptied directory's, since its check in the emptied directory failed (%v)", errScopeRmdirUnconfirmed, quoteName(w.base), safeText(err.Error()))
 }
 
 // moved is errScopeDirMoved naming the scope directory's name.
