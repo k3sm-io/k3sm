@@ -193,6 +193,9 @@ func checkKeystoreLogs(env doctorEnv) checkResult {
 	case errors.Is(err, fs.ErrPermission):
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("could not read the keystore logs: %v", err), remedy: "sudo k3sm doctor   # the data root's keystore files are root's and the service user's"}
 	}
+	if verb, ok := keystore.LinkedLogRepair(err); ok {
+		return checkResult{name: name, status: statusFail, detail: fmt.Sprintf("the keystore user scope stays off: %v", err), remedy: verb + "   # replaces the hard-linked log with a fresh file"}
+	}
 	return checkResult{name: name, status: statusFail, detail: fmt.Sprintf("the keystore user scope stays off: %v", err), remedy: "after a restore: sudo k3sm keys floor --rebuild; sudo k3sm keys audit --rotate   # each flags its log append-only again"}
 }
 
