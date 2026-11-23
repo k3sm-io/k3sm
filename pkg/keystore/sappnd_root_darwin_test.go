@@ -548,3 +548,27 @@ func TestSappndDirectorySwap(t *testing.T) {
 		t.Errorf("the canonical log is flags %#x nlink %d (%v), want SF_APPEND alone and one link", st.Flags, st.Nlink, err)
 	}
 }
+
+// plantSocket binds a unix socket at p: it is bound in a short directory
+// under /private/tmp (a socket path is at most 104 bytes) and renamed to
+// p, on the same volume.
+func plantSocket(t *testing.T, p string) {
+	t.Helper()
+	d, err := os.MkdirTemp("/private/tmp", "k3s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	tmp := filepath.Join(d, "s")
+	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: tmp}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		t.Fatal(err)
+	}
+}

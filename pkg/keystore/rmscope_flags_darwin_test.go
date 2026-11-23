@@ -196,7 +196,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 			}
 		}
 	})
-	t.Run("a flagged FIFO and socket", func(t *testing.T) {
+	t.Run("a flagged FIFO", func(t *testing.T) {
 		s, server, _ := fileLogScope(t)
 		dir := scopeDir(server, "1001")
 		t.Cleanup(func() { unflagScopeTree(dir) })
@@ -204,12 +204,9 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 		if err := unix.Mkfifo(fifo, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		sock := filepath.Join(dir, scopeEntriesName, "planted-socket")
-		plantSocket(t, sock)
 		giveScopeTree(t, dir)
 		inos := map[uint64]string{
 			setScopeFlagsByPath(t, fifo, unix.UF_IMMUTABLE|unix.UF_NODUMP): "the FIFO",
-			setScopeFlagsByPath(t, sock, unix.UF_IMMUTABLE|unix.UF_APPEND): "the socket",
 		}
 		calls := recordScopeFlags(t)
 		named := recordSetFlagsAt(t)
@@ -219,7 +216,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 		}
 		defer func() { _ = root.Close() }()
 		if err := removeScopeTree(root, s.dir, "1001", s.uid); err != nil {
-			t.Fatalf("removeScopeTree over a uchg FIFO and socket: %v", err)
+			t.Fatalf("removeScopeTree over a uchg FIFO: %v", err)
 		}
 		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("the scope directory is still there: %v", err)
@@ -244,27 +241,46 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 	})
 }
 
-// plantSocket binds a unix socket at p: it is bound in a short directory
-// under /private/tmp (a socket path is at most 104 bytes) and renamed to
-// p, on the same volume.
-func plantSocket(t *testing.T, p string) {
-	t.Helper()
-	d, err := os.MkdirTemp("/private/tmp", "k3s")
+// A socket takes clearUnopened's path as a FIFO does: rm-scope never
+// opens it (macOS refuses with EOPNOTSUPP) and writes 0 by name. No real
+// socket is needed to drive it: the entry's fstatat result is all the walk
+// reads of its type, so a flagged FIFO's stat with its type set to
+// S_IFSOCK drives clearScopeFlags down the socket branch. No descriptor
+// flag write is made, the write by name is exactly 0, and the entry's
+// flags are clear afterwards.
+func TestClearScopeFlagsSocketTypeUnopened(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "sock")
+	if err := unix.Mkfifo(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Chflags(p, 0) })
+	setScopeFlagsByPath(t, p, unix.UF_IMMUTABLE|unix.UF_APPEND)
+	dfd, err := unix.Open(d, unix.O_RDONLY|unix.O_DIRECTORY, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(d) })
-	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
+	defer func() { _ = unix.Close(dfd) }()
+	var st unix.Stat_t
+	if err := unix.Fstatat(dfd, "sock", &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = unix.Close(fd) }()
-	tmp := filepath.Join(d, "s")
-	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: tmp}); err != nil {
-		t.Fatal(err)
+	st.Mode = st.Mode&^unix.S_IFMT | unix.S_IFSOCK
+	calls := recordScopeFlags(t)
+	named := recordSetFlagsAt(t)
+	w := &rmWalk{svc: st.Uid, base: d, scope: "user/1001"}
+	leave, err := w.clearScopeFlags(dfd, "sock", "sock", &st)
+	if err != nil || leave {
+		t.Fatalf("clearScopeFlags of a socket-typed entry: leave %v, %v", leave, err)
 	}
-	if err := os.Rename(tmp, p); err != nil {
-		t.Fatal(err)
+	if len(*calls) != 0 {
+		t.Errorf("rm-scope opened the socket-typed entry to clear its flag: %+v", *calls)
+	}
+	if len(*named) != 1 || (*named)[0].flags != 0 || (*named)[0].ino != st.Ino {
+		t.Errorf("the writes by name were %+v, want one write of 0 to inode %d", *named, st.Ino)
+	}
+	if err := unix.Lstat(p, &st); err != nil || st.Flags != 0 {
+		t.Errorf("the entry has flags %#x (%v), want none", st.Flags, err)
 	}
 }
 
