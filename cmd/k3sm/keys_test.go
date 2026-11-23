@@ -2757,7 +2757,8 @@ func TestKeysFloorMergeCommittedRerun(t *testing.T) {
 // TestKeysFloorMergeMovesPlantedAside (U192): a symlink planted at the
 // keystore directory while the restored tree is staged is reported on
 // stdout and stderr; --dry-run names where it would go and moves nothing,
-// and the merge moves it into pre-restore.d and exits 0.
+// and the merge moves it into pre-restore.d and exits 4, dry run too, so the
+// report is read.
 func TestKeysFloorMergeMovesPlantedAside(t *testing.T) {
 	h := newKeysHarness(t)
 	h.put("system/k", []byte("v"))
@@ -2770,14 +2771,14 @@ func TestKeysFloorMergeMovesPlantedAside(t *testing.T) {
 	if err := os.Symlink(elsewhere, h.keystoreDir()); err != nil {
 		t.Fatal(err)
 	}
-	h.mustRun(0, "floor", "merge", "--dry-run")
+	h.mustRun(keysCommitted, "floor", "merge", "--dry-run")
 	if out, errOut := h.stdout.String(), h.stderr.String(); !strings.Contains(out, "would move aside symlink "+h.keystoreDir()+" to ") || !strings.Contains(errOut, "warning: ") {
 		t.Fatalf("dry run printed %q, %q; want the move aside reported", out, errOut)
 	}
 	if fi, err := os.Lstat(h.keystoreDir()); err != nil || fi.Mode().Type() != fs.ModeSymlink {
 		t.Fatalf("keystore dir after the dry run: %v, %v; want the symlink left", fi, err)
 	}
-	h.mustRun(0, "floor", "merge")
+	h.mustRun(keysCommitted, "floor", "merge")
 	if out, errOut := h.stdout.String(), h.stderr.String(); !strings.Contains(out, "moved aside symlink "+h.keystoreDir()+" to "+recipePreRestore(h)+"/planted-") || !strings.Contains(errOut, "warning: ") {
 		t.Fatalf("merge printed %q, %q; want the move aside reported", out, errOut)
 	}

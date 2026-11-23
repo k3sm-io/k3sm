@@ -1013,8 +1013,8 @@ func (k *keepFlag) Set(q string) error {
 // its input could not be renamed or the restored tree not moved
 // (keystore.Committed), which wins, a rerun or dry run that finds the floor
 // already written and refuses what is staged included.
-// keysCommitted also marks a merge that kept an entry (--keep) or left one
-// unverified; --dry-run exits as the merge itself would.
+// keysCommitted also marks a merge that kept an entry (--keep), left one
+// unverified, or moved aside what it found at the keystore directory; --dry-run exits as the merge itself would.
 func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if len(args) == 0 || args[0] != "merge" {
 		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run] [--undo]")
@@ -1117,6 +1117,9 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	}
 	if n := len(unionStrings(r.Unverified, r.AsideUnverified)); n > 0 {
 		why = append(why, fmt.Sprintf("left %d entr(y/ies) unverified", n))
+	}
+	if r.MovedAside != "" {
+		why = append(why, fmt.Sprintf("moved aside the %s it found at the keystore directory", r.MovedAsideType))
 	}
 	if len(why) > 0 {
 		lead := "the merge is written, but it"
