@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"syscall"
@@ -40,8 +41,10 @@ import (
 // directory succeeds, and of a flagged file fails; root's setattrlistat
 // of ATTR_CMN_FLAGS with FSOPT_NOFOLLOW, by directory descriptor and name,
 // clears UF_IMMUTABLE on the service user's FIFO and socket, and at a
-// symlink changes the link, not its target. Only root can set the flag,
-// so it skips unless root.
+// symlink changes the link, not its target; root's fclonefileat of the
+// service user's flagged file carrying an extended attribute and an ACL
+// carries the attribute and not the ACL, and cloneArchive leaves neither.
+// Only root can set the flag, so it skips unless root.
 func TestSappndMeasuredFacts(t *testing.T) {
 	if !asRoot() {
 		t.Skip("root-run (U195): run as root through hack/acceptance/keystore.sh --root")
@@ -182,6 +185,65 @@ func TestSappndMeasuredFacts(t *testing.T) {
 		}
 		if err := unix.Fstat(int(f.Fd()), &st); err != nil || st.Uid != svcUID || st.Flags != sfAppend || st.Size != 2 {
 			t.Errorf("the clone's source is uid %d flags %#x size %d (%v); want it unchanged", st.Uid, st.Flags, st.Size, err)
+		}
+	}
+
+	// What the clone carries from the source (cloneFileAt's flags, measured
+	// 2026-11-23, U195): from the service user's SF_APPEND file with an
+	// extended attribute and an extended ACL, the clone carries the
+	// extended attribute and not the ACL (no CLONE_ACL: it takes only what
+	// its directory would pass on, and the root-only staging directory has
+	// none). cloneArchive then leaves the archive with neither, root's 0600,
+	// unflagged and passing the logs' judge.
+	xp, xf := file(false)
+	if err := unix.Setxattr(xp, "com.k3sm.probe", []byte("owner-set"), 0); err != nil {
+		t.Fatalf("setxattr on the source: %v", err)
+	}
+	if out, err := exec.Command("/bin/chmod", "+a", "everyone allow read", xp).CombinedOutput(); err != nil {
+		t.Fatalf("chmod +a on the source: %v: %s", err, out)
+	}
+	if err := unix.Fchown(int(xf.Fd()), int(svcUID), int(svcGID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Fchflags(int(xf.Fd()), sfAppend); err != nil {
+		t.Fatal(err)
+	}
+	if acl, err := fdHasACL(int(xf.Fd())); err != nil || !acl {
+		t.Fatalf("the source's ACL reads %v (%v), want one", acl, err)
+	}
+	if err := cloneFileAt(int(xf.Fd()), sfd, "x"); err != nil {
+		t.Errorf("root clone of the service user's flagged file with an xattr and an ACL: %v", err)
+	} else {
+		xfd, err := unix.Openat(sfd, "x", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names, lerr := listXattrs(xfd)
+		acl, aerr := fdHasACL(xfd)
+		_ = unix.Close(xfd)
+		t.Logf("the clone of a flagged source with an xattr and an ACL: xattrs %q (%v), ACL %v (%v)", names, lerr, acl, aerr)
+		if lerr != nil || len(names) != 1 || names[0] != "com.k3sm.probe" {
+			t.Errorf("the clone carries xattrs %q (%v), want the source's com.k3sm.probe", names, lerr)
+		}
+		if aerr != nil || acl {
+			t.Errorf("the clone has an ACL %v (%v), want none: the source's is not carried without CLONE_ACL", acl, aerr)
+		}
+	}
+	if err := cloneArchive(&oldLog{f: xf, size: 2}, sfd, "a"); err != nil {
+		t.Errorf("cloneArchive of the flagged source with an xattr and an ACL: %v", err)
+	} else {
+		afd, err := unix.Openat(sfd, "a", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names, lerr := listXattrs(afd)
+		acl, aerr := fdHasACL(afd)
+		jerr := judgeFlagsACL(afd, fdFlags)
+		var ast unix.Stat_t
+		serr := unix.Fstat(afd, &ast)
+		_ = unix.Close(afd)
+		if lerr != nil || len(names) != 0 || aerr != nil || acl || jerr != nil || serr != nil || ast.Uid != 0 || ast.Mode&0o7777 != logMode || ast.Flags != 0 || ast.Size != 2 {
+			t.Errorf("the archive carries xattrs %q (%v), ACL %v (%v), judge %v, uid %d mode %04o flags %#x size %d (%v); want none, none, passing, root's 0600, unflagged, 2 bytes", names, lerr, acl, aerr, jerr, ast.Uid, ast.Mode&0o7777, ast.Flags, ast.Size, serr)
 		}
 	}
 

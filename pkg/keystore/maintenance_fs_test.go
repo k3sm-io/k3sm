@@ -498,7 +498,8 @@ func TestSwapRerunFromEachStep(t *testing.T) {
 // TestOldLogUnflaggedServiceOwnedRefused: an old log whose SF_APPEND flag
 // is clear is taken as input only when root owns it; owned by the service
 // user it could have been rewritten, and the verb refuses. A flagged old
-// log is taken, and so is one with more than one link.
+// log is taken, and so is one with more than one link; one with an
+// extended ACL is refused, as the steady-state judge refuses it.
 func TestOldLogUnflaggedServiceOwnedRefused(t *testing.T) {
 	s := &FileStore{uid: 501, floorUID: 0}
 	for _, tt := range []struct {
@@ -506,19 +507,25 @@ func TestOldLogUnflaggedServiceOwnedRefused(t *testing.T) {
 		owner uint32
 		flags uint32
 		nlink uint16
+		acl   bool
 		want  error
 	}{
-		{"flagged, the service user's", 501, sfAppend, 1, nil},
-		{"flagged, two links", 501, sfAppend, 2, nil},
-		{"unflagged, root's (a restore)", 0, 0, 1, nil},
-		{"unflagged, the service user's", 501, 0, 1, errOldLogUnflagged},
-		{"unflagged, another user's", 777, 0, 1, errOldLogUnflagged},
+		{"flagged, the service user's", 501, sfAppend, 1, false, nil},
+		{"flagged, two links", 501, sfAppend, 2, false, nil},
+		{"unflagged, root's (a restore)", 0, 0, 1, false, nil},
+		{"unflagged, the service user's", 501, 0, 1, false, errOldLogUnflagged},
+		{"unflagged, another user's", 777, 0, 1, false, errOldLogUnflagged},
+		{"flagged, the service user's, with an ACL", 501, sfAppend, 1, true, errLogUntrusted},
+		{"unflagged, root's, with an ACL", 0, 0, 1, true, errLogUntrusted},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			st := unix.Stat_t{Mode: unix.S_IFREG | logMode, Uid: tt.owner, Nlink: tt.nlink}
-			err := s.judgeOldLog(userFloorLogName, &st, tt.flags)
+			err := s.judgeOldLog(userFloorLogName, &st, tt.flags, tt.acl)
 			if tt.want == nil && err != nil || tt.want != nil && !errors.Is(err, tt.want) {
 				t.Fatalf("got %v, want %v", err, tt.want)
+			}
+			if tt.acl && !strings.Contains(err.Error(), "extended ACL") {
+				t.Fatalf("the ACL refusal %q does not name the ACL", err)
 			}
 		})
 	}

@@ -414,9 +414,9 @@ var errOldLogUnflagged = fmt.Errorf("%w: its SF_APPEND flag is clear and the ser
 
 // openOldLog is step 2's open: the log name, in its judged directory
 // under lfd, opened read-only with O_NOFOLLOW and judged on its
-// descriptor. It must be a regular file; flagged SF_APPEND (its owner is
-// then the service user, or root), or, unflagged, root's (a restore). A log
-// with more than one link is taken as input, with a Warn naming it: the
+// descriptor. It must be a regular file with no extended ACL; flagged
+// SF_APPEND (its owner is then the service user, or root), or, unflagged,
+// root's (a restore). A log with more than one link is taken as input, with a Warn naming it: the
 // verb swaps in a fresh inode, so the other link keeps only the old file.
 func (s *FileStore) openOldLog(lfd int, name string) (*oldLog, error) {
 	dir, err := s.openLogDir(lfd, name)
@@ -439,7 +439,12 @@ func (s *FileStore) openOldLog(lfd int, name string) (*oldLog, error) {
 		o.close()
 		return nil, fmt.Errorf("%w: read the flags of %s: %w; rerun the verb", errLogUntrusted, name, err)
 	}
-	if err := s.judgeOldLog(name, &st, fl); err != nil {
+	acl, err := fdHasACL(fd)
+	if err != nil {
+		o.close()
+		return nil, fmt.Errorf("%w: read the ACL of %s: %w; rerun the verb", errLogUntrusted, name, err)
+	}
+	if err := s.judgeOldLog(name, &st, fl, acl); err != nil {
 		o.close()
 		return nil, err
 	}
@@ -447,12 +452,17 @@ func (s *FileStore) openOldLog(lfd int, name string) (*oldLog, error) {
 	return o, nil
 }
 
-// judgeOldLog refuses the old log name, which st and its flags fl
-// describe, unless it is a regular file, flagged SF_APPEND or, unflagged,
-// root's (errOldLogUnflagged). More than one link is a Warn.
-func (s *FileStore) judgeOldLog(name string, st *unix.Stat_t, fl uint32) error {
+// judgeOldLog refuses the old log name, which st, its flags fl and acl
+// (whether it carries an extended ACL) describe, unless it is a regular
+// file with no extended ACL, as the steady-state judge requires
+// (judgeFlagsACL), flagged SF_APPEND or, unflagged, root's
+// (errOldLogUnflagged). More than one link is a Warn.
+func (s *FileStore) judgeOldLog(name string, st *unix.Stat_t, fl uint32, acl bool) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return fmt.Errorf("%w: %s is not a regular file: as root, move it aside and restore the log from a backup, then rerun the verb", errLogUntrusted, name)
+	}
+	if acl {
+		return fmt.Errorf("%w: %s carries an extended ACL, which can grant what its mode does not show: as root, remove it (sudo chmod -N on the log), then rerun the verb", errLogUntrusted, name)
 	}
 	if fl&sfAppend == 0 && int64(st.Uid) != int64(s.floorUID) {
 		return fmt.Errorf("%s: %w", name, errOldLogUnflagged)

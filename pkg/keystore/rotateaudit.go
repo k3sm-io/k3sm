@@ -17,6 +17,7 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -232,7 +233,7 @@ func (s *FileStore) judgeArchives(dir int) ([auditArchives + 1]bool, error) {
 		if err != nil {
 			return present, fmt.Errorf("stat %s: %w", name, err)
 		}
-		if err := s.judgeArchive(name, &st); err != nil {
+		if err := s.judgeArchive(dir, name, &st); err != nil {
 			return present, err
 		}
 		present[n] = true
@@ -240,12 +241,29 @@ func (s *FileStore) judgeArchives(dir int) ([auditArchives + 1]bool, error) {
 	return present, nil
 }
 
-// judgeArchive refuses the archive name, which st describes, unless it is
-// an unflagged regular file of the data root's owner at mode 0600, and logs a Warn
+// judgeArchive refuses the archive name in the archives directory dir,
+// which st describes, unless it is an unflagged regular file of the data
+// root's owner at mode 0600 with no extended ACL, read on a descriptor
+// opened O_NOFOLLOW and checked as the inode st describes; it logs a Warn
 // when it has more than one link.
-func (s *FileStore) judgeArchive(name string, st *unix.Stat_t) error {
+func (s *FileStore) judgeArchive(dir int, name string, st *unix.Stat_t) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFREG || int64(st.Uid) != int64(s.floorUID) || st.Mode&0o7777 != logMode || statFlags(st) != 0 {
 		return fmt.Errorf("%w: %s is not an unflagged regular file, root's 0600; as root, move it out of %s/%s/ or set it so, then rerun", errLogUntrusted, name, auditDirName, archivesDirName)
+	}
+	fd, err := unix.Openat(dir, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", name, err)
+	}
+	defer func() { _ = unix.Close(fd) }() // read-only
+	var ost unix.Stat_t
+	if err := unix.Fstat(fd, &ost); err != nil {
+		return fmt.Errorf("stat %s: %w", name, err)
+	}
+	if ost.Dev != st.Dev || ost.Ino != st.Ino {
+		return fmt.Errorf("%w: %s was replaced while it was judged; rerun", errLogUntrusted, name)
+	}
+	if err := judgeFlagsACL(fd, func(int) (uint32, error) { return statFlags(&ost), nil }); err != nil {
+		return fmt.Errorf("%s/%s/%s: %w; as root, remove the ACL (sudo chmod -N), then rerun", auditDirName, archivesDirName, name, err)
 	}
 	if st.Nlink > 1 {
 		slog.Warn("a keystore audit archive has more than one link; it is root's 0600, so the other link gives no other user anything", "archive", name, "links", st.Nlink)
@@ -259,13 +277,17 @@ var errCloneRefused = errors.New("the audit log could not be cloned")
 
 // cloneArchive makes name in the root-only archives directory nad a clone
 // of the old log (cloneFileAt), then makes it the archive: the clone holds
-// the whole file and its flag, so on its own descriptor its flag is
-// cleared, it is made the caller's (root's) at mode 0600, and, reopened
-// for writing and checked as the same inode, it is truncated to the size
-// the old log had at open (the snapshot rule), fsynced and verified. It is
-// a fresh inode in a directory only root reaches, so no other process can
-// act on it meanwhile. A clone the volume refuses is errCloneRefused with
-// nothing created.
+// the whole file, its flag and its extended attributes (measured as root,
+// U195), so on its own descriptor its flag is cleared, every extended
+// attribute is removed (stripXattrs), any extended ACL is removed
+// (removeACL), it is made the caller's (root's) at mode 0600, and,
+// reopened for writing and checked as the same inode, it is truncated to
+// the size the old log had at open (the snapshot rule), fsynced and
+// verified: the caller's, 0600, unflagged, one link, the size at open, no
+// extended attribute, and passing the logs' flags-and-ACL judge
+// (judgeFlagsACL). It is a fresh inode in a directory only root reaches,
+// so no other process can act on it meanwhile. A clone the volume refuses
+// is errCloneRefused with nothing created.
 func cloneArchive(old *oldLog, nad int, name string) error {
 	if err := cloneFileAt(int(old.f.Fd()), nad, name); err != nil {
 		return fmt.Errorf("%w: %w", errCloneRefused, err)
@@ -286,6 +308,12 @@ func cloneArchive(old *oldLog, nad int, name string) error {
 		if err := unix.Fchflags(rfd, 0); err != nil {
 			return fmt.Errorf("clear the flags of the cloned %s: %w", name, err)
 		}
+	}
+	if err := stripXattrs(rfd); err != nil {
+		return fmt.Errorf("the cloned %s: %w", name, err)
+	}
+	if err := removeACL(rfd); err != nil {
+		return fmt.Errorf("the cloned %s: %w", name, err)
 	}
 	euid := os.Geteuid()
 	if err := unix.Fchown(rfd, euid, -1); err != nil {
@@ -320,6 +348,74 @@ func cloneArchive(old *oldLog, nad int, name string) error {
 	}
 	if int(w.Uid) != euid || w.Mode&0o7777 != logMode || statFlags(&w) != 0 || w.Nlink != 1 || w.Size != old.size {
 		return fmt.Errorf("the cloned %s is not the caller's, mode %04o, unflagged, one link and %d bytes after it was set so", name, logMode, old.size)
+	}
+	if err := judgeFlagsACL(wfd, fdFlags); err != nil {
+		return fmt.Errorf("the cloned %s after its ACL was removed: %w", name, err)
+	}
+	if left, err := listXattrs(wfd); err != nil || len(left) != 0 {
+		return fmt.Errorf("the cloned %s still carries %d extended attributes after they were removed (%v)", name, len(left), err)
+	}
+	return nil
+}
+
+// fremovexattr and removeACL remove one extended attribute, and the
+// extended ACL, of the file a descriptor holds. They are variables so a
+// test can make a removal fail.
+var (
+	fremovexattr = unix.Fremovexattr
+	removeACL    = removeExtendedACL
+)
+
+// maxXattrList bounds the extended-attribute name list stripXattrs reads.
+const maxXattrList = 1 << 20
+
+// listXattrs is the names of the extended attributes of the file fd
+// holds (flistxattr), the list bounded by maxXattrList.
+func listXattrs(fd int) ([]string, error) {
+	for range 4 {
+		n, err := unix.Flistxattr(fd, nil)
+		if err != nil {
+			return nil, fmt.Errorf("list the extended attributes: %w", err)
+		}
+		if n == 0 {
+			return nil, nil
+		}
+		if n > maxXattrList {
+			return nil, fmt.Errorf("list the extended attributes: %d bytes of names, past %d", n, maxXattrList)
+		}
+		buf := make([]byte, n)
+		n, err = unix.Flistxattr(fd, buf)
+		if errors.Is(err, unix.ERANGE) {
+			continue // the list grew between the calls
+		}
+		if err != nil {
+			return nil, fmt.Errorf("list the extended attributes: %w", err)
+		}
+		var names []string
+		for _, b := range bytes.Split(buf[:n], []byte{0}) {
+			if len(b) != 0 {
+				names = append(names, string(b))
+			}
+		}
+		return names, nil
+	}
+	return nil, fmt.Errorf("list the extended attributes: the list kept changing")
+}
+
+// stripXattrs removes every extended attribute of the file fd holds,
+// skipping none, and refuses when one cannot be removed or any remains.
+func stripXattrs(fd int) error {
+	names, err := listXattrs(fd)
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		if err := fremovexattr(fd, n); err != nil {
+			return fmt.Errorf("remove the extended attribute %q: %w", n, err)
+		}
+	}
+	if left, err := listXattrs(fd); err != nil || len(left) != 0 {
+		return fmt.Errorf("%d extended attributes remain after removal (%v)", len(left), err)
 	}
 	return nil
 }
