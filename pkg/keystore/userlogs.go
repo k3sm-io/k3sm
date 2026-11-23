@@ -252,6 +252,20 @@ func (s *FileStore) logReadBound() int64 {
 	return s.logHardCap + maxRevokeUIDs*s.logRevokeBudget + logBoundMargin
 }
 
+// readBound is the size past which l's log is damage: logReadBound, and
+// for the audit log PreFrameBudget more. The pre-frame refusal lines are
+// excluded from the hard-cap test, and each budget raises the reader's
+// bound in the same change rather than spending logBoundMargin.
+func (l *appendLog) readBound() int64 { return l.s.readBoundOf(l.name) }
+
+// readBoundOf is readBound for the log named name.
+func (s *FileStore) readBoundOf(name string) int64 {
+	if name == auditLogName {
+		return s.logReadBound() + PreFrameBudget
+	}
+	return s.logReadBound()
+}
+
 // logMissingScopesError is errLogMissingScopes: it matches errLogMissing,
 // and its text names the matched-set restore, never install.
 type logMissingScopesError struct{}
@@ -950,7 +964,7 @@ func (l *appendLog) sync(f *os.File, st unix.Stat_t) (*logState, error) {
 // syncRead is sync's reading.
 func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 	s := &l.state
-	bound := l.s.logReadBound()
+	bound := l.readBound()
 	var src io.ReaderAt = f
 	if l.readAt != nil {
 		src = l.readAt(f)
@@ -1229,7 +1243,7 @@ func (l *appendLog) revokeRoomFor(uid uint32, n int64) error {
 	if err != nil || state.bad != nil {
 		return nil
 	}
-	if st.Size+n > l.s.logReadBound() {
+	if st.Size+n > l.readBound() {
 		return l.pastCap()
 	}
 	return l.revokeRoom(state, st.Size, uid, min(n, st.Size+n-l.s.logHardCap))
@@ -1296,7 +1310,7 @@ func (l *appendLog) pastCap() error {
 // start past the hard cap past its revocation budget. room and appendLine
 // both judge through it.
 func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64) error {
-	if size+n > l.s.logReadBound() {
+	if size+n > l.readBound() {
 		return l.pastCap()
 	}
 	if state.pastCap[uid]+n > l.s.logRevokeBudget {
@@ -1376,7 +1390,7 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 		}
 		out = append(out, line...)
 	}
-	if bound := l.s.logReadBound(); st.Size+int64(len(out)) > bound {
+	if bound := l.readBound(); st.Size+int64(len(out)) > bound {
 		// Never make the damage the reader refuses.
 		return l.pastCap()
 	}
@@ -1631,7 +1645,7 @@ func (l *appendLog) sealTail() error {
 		// it parse, and no foreign byte can complete it into another line.
 		return nil
 	}
-	if st.Size+1 > l.s.logReadBound() {
+	if st.Size+1 > l.readBound() {
 		return l.pastCap()
 	}
 	if err := l.preflight(f, 1, true); err != nil {
@@ -2240,7 +2254,6 @@ func (s *FileStore) CheckLogBounds(ctx context.Context) (damage, spent int, err 
 	if err := s.checkConfig(); err != nil {
 		return 0, 0, err
 	}
-	bound := s.logReadBound()
 	spentUIDs := map[uint32]bool{}
 	for _, l := range []any{s.userFloor, s.auditSink} {
 		var log *appendLog
@@ -2257,6 +2270,7 @@ func (s *FileStore) CheckLogBounds(ctx context.Context) (damage, spent int, err 
 			log.forgetUnflagged(err, false)
 			return 0, 0, err
 		}
+		bound := log.readBound()
 		n, err := func() (int, error) {
 			defer func() { _ = f.Close() }() // read-only
 			if st.Size > bound {

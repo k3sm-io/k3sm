@@ -564,7 +564,7 @@ func (l *ServerLogs) countLocked(size int64) (err error) {
 	if size == h.off {
 		return nil
 	}
-	if size > l.s.logReadBound() {
+	if size > h.log.readBound() {
 		return fmt.Errorf("%w: %s", errLogTooLarge, auditLogName)
 	}
 	r := bufio.NewReaderSize(io.NewSectionReader(h.f, h.off, size-h.off), 64<<10)
@@ -630,7 +630,7 @@ func (l *ServerLogs) appendLocked(rec preFrameRec) error {
 	if err := unix.Fstat(int(h.f.Fd()), &st); err != nil {
 		return fmt.Errorf("stat the held %s: %w", auditLogName, err)
 	}
-	if st.Size+int64(len(out)) > l.s.logReadBound() {
+	if st.Size+int64(len(out)) > h.log.readBound() {
 		return h.log.pastCap()
 	}
 	if err := h.log.preflight(h.f, len(out), false); err != nil {

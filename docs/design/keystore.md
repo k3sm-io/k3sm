@@ -3516,7 +3516,10 @@ service user can only add to.
   (704 KiB + 256 KiB) plus the 1 MiB reconciler budget plus the 1 MiB margin: the most the
   server itself can write past the hard cap, 1024 uids at both their budgets and the
   reconciler at its own, with the margin above it, so no log the server wrote reads as
-  damage. Each budget's change raises the bound in the same change. A floor holding more distinct
+  damage. Each budget's change raises the bound in the same change. The first to land is the
+  reconciler budget's 256 KiB pre-frame part (`keystore.PreFrameBudget`): the audit log's bound
+  is `logReadBound` plus `PreFrameBudget`, and the floor's, to which no pre-frame line is
+  written, stays `logReadBound` (`readBoundOf`). A floor holding more distinct
   `(scope, name, generation)` keys than its key bound is damage too, the key bound being that size bound over the shortest line
   that adds a key (55 bytes, its checksum included), held to a ceiling of 2^18 (262,144) keys whatever the caps are
   configured to (larger caps do not raise it), plus the revocation headroom of 1/16 of that ("Per-uid fairness"): 278,528

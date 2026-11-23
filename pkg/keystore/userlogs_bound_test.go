@@ -41,6 +41,9 @@ func TestLogReaderSizeBound(t *testing.T) {
 	if want := size + maxRevokeUIDs*minLogRevokeBudget + logBoundMargin; bound != want {
 		t.Fatalf("the bound is %d, want %d", bound, want)
 	}
+	if got := s.readBoundOf(userFloorLogName); got != bound {
+		t.Fatalf("the floor's bound is %d, want %d: no pre-frame line is written to it", got, bound)
+	}
 	gen := entryGeneration(t, server, "token")
 	line, err := floorLine("user/1001", "token", gen, 1)
 	if err != nil {
@@ -154,5 +157,38 @@ func TestAuditOverlongLineSkipped(t *testing.T) {
 	}
 	if state.pastCap[1001] != int64(len(line)) || len(state.pastCap) != 1 || state.off != st.Size {
 		t.Fatalf("past the cap %v is charged and reading stopped at %d of %d, want only uid 1001's %d bytes and the end", state.pastCap, state.off, st.Size, len(line))
+	}
+}
+
+// TestLogReadBoundAuditCarriesPreFrameBudget: the audit log's reader bound
+// is the floor's raised by PreFrameBudget, so the pre-frame refusal lines,
+// excluded from the hard-cap test, do not spend logBoundMargin; the server's
+// append surface and the read-only bounds check apply it.
+func TestLogReadBoundAuditCarriesPreFrameBudget(t *testing.T) {
+	s, auditPath := newServerLogsStore(t)
+	if got, want := s.readBoundOf(auditLogName), s.logReadBound()+PreFrameBudget; got != want {
+		t.Fatalf("the audit log's bound is %d, want %d", got, want)
+	}
+	if got := s.readBoundOf(userFloorLogName); got != s.logReadBound() {
+		t.Fatalf("the floor's bound is %d, want %d", got, s.logReadBound())
+	}
+	// An audit log past the floor's bound but within its own is read; one
+	// past its own is refused.
+	s.logHardCap, s.logSoftCap, s.logRevokeBudget = 1<<10, 1<<10, minLogRevokeBudget
+	line := []byte(`{"v":1}` + "\n")
+	fill := func(n int64) {
+		t.Helper()
+		b := bytes.Repeat(line, int(n)/len(line))
+		if err := os.WriteFile(auditPath, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fill(s.logReadBound() + PreFrameBudget/2)
+	if _, _, err := s.CheckServerLogs(t.Context()); err != nil {
+		t.Fatalf("an audit log within its bound: %v", err)
+	}
+	fill(s.readBoundOf(auditLogName) + int64(2*len(line)))
+	if _, _, err := s.CheckServerLogs(t.Context()); !errors.Is(err, errLogTooLarge) {
+		t.Fatalf("an audit log past its bound: %v, want errLogTooLarge", err)
 	}
 }
