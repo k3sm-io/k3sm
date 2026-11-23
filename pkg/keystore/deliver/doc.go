@@ -62,9 +62,11 @@ limitations under the License.
 //     confirms the entry is definitively gone (Current's ErrNotFound alone is
 //     not enough: a missing entries' directory answers it too), deletes it
 //     under a precondition on the recorded UID and logs the names, never a
-//     value; a missing label or annotation is logged at Warn. The keystore
-//     identity guard and the breaker (revoke.go) hold the delete after a
-//     restore, after a start, and when many entries go at once;
+//     value; a missing label or annotation is logged at Warn. A withdrawn
+//     target's entry is the one its state record names, not its label. The
+//     keystore floor, the identity guard and the breaker (revoke.go) hold
+//     the delete after a restore, after a start, and when many entries go
+//     at once;
 //   - anything else (no recorded UID, or a UID other than the recorded one,
 //     whatever its label): leaves it alone and logs why. The
 //     label is forgeable by anyone who can write Secrets in the namespace;

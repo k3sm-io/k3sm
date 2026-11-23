@@ -170,6 +170,9 @@ type Reconciler struct {
 	heldState     string
 	// floorHeld are the entry names whose floor-held revocation was logged.
 	floorHeld map[string]bool
+	// recordState is the last logged state of a withdrawn record's entry
+	// (see withdrawn), by namespace/name.
+	recordState map[string]string
 	// stuck are the revocations that have not finished, by namespace/name,
 	// and stuckSummary when their summary was last logged (see markStuck).
 	stuck        map[string]*stuckRevocation
@@ -214,6 +217,7 @@ func New(cfg Config) *Reconciler {
 		},
 		targetState: map[string]string{},
 		floorHeld:   map[string]bool{},
+		recordState: map[string]string{},
 		stuck:       map[string]*stuckRevocation{},
 		now:         time.Now,
 		revokeLimit: defaultRevokeLimit,
@@ -379,9 +383,14 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 			delete(r.targetState, k)
 		}
 	}
-	if sw.state.Retain(func(ns, name string) bool { return declared[stateKey(ns, name)] || sw.keep[stateKey(ns, name)] }) {
+	for k := range r.recordState {
+		if _, ok := sw.state.owned[k]; !ok {
+			delete(r.recordState, k)
+		}
+	}
+	if sw.state.Retain(func(ns, name string) bool { return declared[stateKey(ns, name)] || sw.keep[stateKey(ns, name)] }) || sw.dirty {
 		if err := WriteState(r.statePath, sw.state, r.stateDirCheck, r.chown); err != nil {
-			r.logger.Warn("keystore delivery: cannot drop withdrawn targets from the state file; will retry", "file", r.statePath, "err", err)
+			r.logger.Warn("keystore delivery: cannot write the state file (dropping withdrawn targets, or recording entries); will retry", "file", r.statePath, "err", err)
 		}
 	}
 }
@@ -411,6 +420,8 @@ func (r *Reconciler) missingDeclaration() {
 type sweep struct {
 	state    State
 	recorded bool
+	// dirty is a record changed this sweep that no write since has saved.
+	dirty bool
 
 	// recordedSecrets is the number of records at the sweep's start, the
 	// base of the revocation breaker.
@@ -476,6 +487,12 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 			r.note(t, "skipped:foreign:"+reason, slog.LevelWarn,
 				"Secret left alone, not created by this server; delete it or pick another --secret", "reason", reason)
 			return
+		}
+		// Ours, declared for t: the record names t's entry, so a record an
+		// older build wrote, or one root re-pointed at another entry, is
+		// brought up to date (written at the end of the sweep).
+		if sw.state.setEntry(t.Namespace, t.Secret(), t.Entry) {
+			sw.dirty = true
 		}
 		if cur.Type != corev1.SecretTypeOpaque {
 			r.note(t, "skipped:type:"+string(cur.Type), slog.LevelWarn, "Secret left alone: it is labelled for this entry but is not Opaque", "type", string(cur.Type))
@@ -651,7 +668,7 @@ func (r *Reconciler) create(ctx context.Context, sw *sweep, t Target, ver keysto
 		r.note(t, "error:uid", slog.LevelError, "the created Secret has no UID, so it cannot be recorded and is left alone; delete it")
 		return false
 	}
-	sw.state.Set(t.Namespace, t.Secret(), string(created.UID))
+	sw.state.SetDelivered(t.Namespace, t.Secret(), string(created.UID), t.Entry)
 	if err := WriteState(r.statePath, sw.state, r.stateDirCheck, r.chown); err != nil {
 		r.note(t, "error:record:"+err.Error(), slog.LevelError, "created the Secret but cannot record it, so later sweeps leave it alone; delete it to have it created again", "file", r.statePath, "err", err)
 		return false

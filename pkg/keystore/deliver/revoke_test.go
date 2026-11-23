@@ -288,6 +288,66 @@ func TestRmDeletedAfterUndeliver(t *testing.T) {
 	h.assertOnlyGetCreateUpdateSecrets(t)
 }
 
+// TestRelabelBeforeWithdrawnSweepStillRevokes: the record names the entry
+// a Secret delivers. rm, then undeliver, then a namespace writer relabels
+// the Secret to a live entry before the sweep: the sweep still deletes it,
+// by the record's entry, not the label's, and Warns that they disagree.
+func TestRelabelBeforeWithdrawnSweepStillRevokes(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("revoked", 1, []byte("old"))
+	h.store.set("live", 1, []byte("live-value"))
+	h.declare(t, Target{Entry: "system/revoked", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	st := h.state(t)
+	if got := st.Entry("payments", "revoked"); got != "system/revoked" {
+		t.Fatalf("the record names entry %q, want system/revoked", got)
+	}
+	uid := string(h.secret(t, "payments", "revoked").UID)
+	h.store.rm("revoked")
+	h.declare(t)
+	s := h.secret(t, "payments", "revoked")
+	s.Labels[LabelKey] = "live"
+	if _, err := h.client.CoreV1().Secrets("payments").Update(ctx, s, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	h.gone(t, "payments", "revoked")
+	if got := h.deleteUIDs("revoked"); len(got) != 1 || got[0] != uid {
+		t.Fatalf("deletes %q, want one under the precondition %q", got, uid)
+	}
+	logs := h.logs.String()
+	if !strings.Contains(logs, `level=WARN msg="keystore delivery: a withdrawn target's Secret has a k3sm.io/keystore-delivery label that is not the entry recorded`) ||
+		!strings.Contains(logs, "label=live") {
+		t.Fatalf("the relabel is not logged at Warn\n%s", logs)
+	}
+	st = h.state(t)
+	if st.UID("payments", "revoked") != "" {
+		t.Fatal("the revoked withdrawn record was not dropped")
+	}
+}
+
+// TestWithdrawnOldRecordFallsBackToLabel: a record an older build wrote,
+// with no entry, falls back to the label, with a Warn.
+func TestWithdrawnOldRecordFallsBackToLabel(t *testing.T) {
+	h := newHarness(t, true, false)
+	ctx := context.Background()
+	old := secretObj("payments", "tok", map[string]string{LabelKey: "tok"}, map[string][]byte{DefaultDataKey: []byte("v")})
+	old.UID = "uid-old"
+	if _, err := h.client.CoreV1().Secrets("payments").Create(ctx, old, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h.own(t, old)
+	h.declare(t)
+	h.r.Sweep(ctx) // first sweep since start holds
+	h.r.Sweep(ctx)
+	h.gone(t, "payments", "tok")
+	if !strings.Contains(h.logs.String(), "names no entry (an older build wrote it)") {
+		t.Fatalf("the label fallback is not logged\n%s", h.logs.String())
+	}
+}
+
 // TestRevokeWhileEncryptionOff: with plaintext delivery refused, a Secret
 // delivered under the override is still revoked once its entry is deleted,
 // after the restarted server's first sweep has seen the keystore; nothing is

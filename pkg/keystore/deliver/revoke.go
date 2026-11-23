@@ -186,7 +186,7 @@ func (r *Reconciler) collect(ctx context.Context, sw *sweep, t Target, cur *core
 
 // withdrawn handles the record of namespace/name, a Secret this server
 // created for a target no longer declared: when the Secret still carries the
-// recorded UID and the entry its label names is gone, it is gathered for
+// recorded UID and the entry the record names is gone, it is gathered for
 // revocation and its record kept until that is done; when the entry is live,
 // or the Secret is gone or another, the record is dropped and the Secret
 // left alone. A transient failure keeps the record for the next sweep.
@@ -206,20 +206,36 @@ func (r *Reconciler) withdrawn(ctx context.Context, sw *sweep, namespace, name s
 	case string(cur.UID) != sw.state.UID(namespace, name):
 		return // recreated by someone else: not ours
 	}
-	// The record holds no entry name; the label on our own object names it.
-	// A namespace writer who changes it can only get our own Secret deleted,
-	// which a delete of it would do as well.
-	entry := cur.Labels[LabelKey]
+	// The entry is the record's, written when the Secret was delivered. The
+	// label is on an object any namespace writer can edit: relabelled to a
+	// live entry it would keep a deleted entry's value readable, and to
+	// another deleted entry it would get the Secret deleted early. So the
+	// label decides nothing here; a record an older build wrote, with no
+	// entry, falls back to it, with a Warn.
+	label := cur.Labels[LabelKey]
+	entry := sw.state.Entry(namespace, name)
 	if entry == "" {
-		r.logger.Warn("keystore delivery: a withdrawn target's Secret has no "+LabelKey+" label, so its entry is unknown and it is left alone",
+		if label == "" {
+			r.recordNote(k, "no-entry:no-label", "keystore delivery: a withdrawn target's record names no entry and its Secret has no "+LabelKey+" label, so its entry is unknown and it is left alone",
+				"namespace", namespace, "secret", name)
+			return
+		}
+		entry = EntryPrefix + label
+		r.recordNote(k, "no-entry:label:"+label, "keystore delivery: a withdrawn target's record names no entry (an older build wrote it), so the "+LabelKey+" label on its Secret names it",
+			"entry", entry, "namespace", namespace, "secret", name)
+	}
+	t := Target{Entry: entry, Namespace: namespace, SecretName: name}
+	if t.Check() != nil {
+		r.recordNote(k, "bad-entry:"+entry, "keystore delivery: a withdrawn target's entry is not a deliverable entry name, so its Secret is left alone",
 			"namespace", namespace, "secret", name)
 		return
 	}
-	t := Target{Entry: EntryPrefix + entry, Namespace: namespace, SecretName: name}
-	if t.Check() != nil {
-		r.logger.Warn("keystore delivery: a withdrawn target's Secret has a "+LabelKey+" label that names no entry, so it is left alone",
-			"namespace", namespace, "secret", name)
-		return
+	if label != t.Name() {
+		// Kept whatever the entry's state, so a relabel never silently
+		// drops the target: the record is checked again every sweep.
+		sw.keep[k] = true
+		r.recordNote(k, "relabelled:"+label, "keystore delivery: a withdrawn target's Secret has a "+LabelKey+" label that is not the entry recorded when it was delivered; the record decides, and is kept",
+			"entry", t.Entry, "label", label, "namespace", namespace, "secret", name)
 	}
 	absent, id, err := r.store.Absent(ctx, t.Name())
 	switch {
@@ -242,6 +258,15 @@ func (r *Reconciler) withdrawn(ctx context.Context, sw *sweep, namespace, name s
 		entry: t.Entry, namespace: namespace, secret: name, uid: string(cur.UID),
 		terminating: cur.DeletionTimestamp != nil, withdrawn: true,
 	})
+}
+
+// recordNote logs msg at Warn for the withdrawn record k once per state.
+func (r *Reconciler) recordNote(k, state, msg string, attrs ...any) {
+	if r.recordState[k] == state {
+		return
+	}
+	r.recordState[k] = state
+	r.logger.Warn(msg, attrs...)
 }
 
 // revokeAll deletes the gathered Secrets, unless this sweep holds them (the
