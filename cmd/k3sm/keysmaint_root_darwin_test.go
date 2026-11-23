@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -526,10 +527,18 @@ func (r *keysSwapRun) checkCanonical(at string) {
 	}
 	got := string(b)
 	// After the verb, the audit log holds the verb's own audit line too,
-	// in whichever log is live.
+	// in whichever log is live: one append, its leading newline and the
+	// line, written whole (appendLines). It is cut off, both, and judged:
+	// audit-rotate via root, the result the exit code gives.
 	if strings.HasPrefix(at, "after the verb") && r.v.log == keystore.AuditLogName {
-		if i := strings.LastIndex(strings.TrimSuffix(got, "\n"), "\n"); strings.HasSuffix(got, "\n") {
-			got = got[:i+1]
+		rest, rec, err := keysCutAuditLine(got)
+		switch {
+		case err != nil:
+			r.failf("%s: the canonical %s holds %q; want it to end with the verb's own audit line, a leading newline and the line, written whole: %v", at, r.v.rel(), got, err)
+		case rec.V != 1 || rec.Op != "audit-rotate" || rec.Via != "root" || rec.Scope != "system" || rec.Result != keysAuditResult(r.code):
+			r.failf("%s: the canonical %s ends with the audit line %+v; want audit-rotate via root, scope system, result %q", at, r.v.rel(), rec, keysAuditResult(r.code))
+		default:
+			got = rest
 		}
 	}
 	if strings.Contains(got, keysAttack) {
@@ -548,6 +557,34 @@ func (r *keysSwapRun) checkCanonical(at string) {
 	default:
 		r.failf("%s: the canonical %s is inode %d, neither the old log (%d) nor the staged new log (%d, seen %v)", at, r.v.rel(), st.Ino, r.oldIno, r.newIno, r.haveNew)
 	}
+}
+
+// keysAuditTail is the part of an audit line keysCutAuditLine judges.
+type keysAuditTail struct {
+	V      int    `json:"v"`
+	Op     string `json:"op"`
+	Via    string `json:"via"`
+	Scope  string `json:"scope"`
+	Result string `json:"result"`
+}
+
+// keysCutAuditLine splits the audit log's bytes data into what precedes
+// its last append and that append's line: data must end with a newline,
+// a line, and a newline, and the line must decode.
+func keysCutAuditLine(data string) (string, keysAuditTail, error) {
+	var rec keysAuditTail
+	body, ok := strings.CutSuffix(data, "\n")
+	if !ok {
+		return data, rec, errors.New("the log does not end with a newline")
+	}
+	i := strings.LastIndex(body, "\n")
+	if i < 0 {
+		return data, rec, errors.New("no leading newline before the last line")
+	}
+	if err := json.Unmarshal([]byte(body[i+1:]), &rec); err != nil {
+		return data, rec, fmt.Errorf("the last line does not decode: %w", err)
+	}
+	return data[:i], rec, nil
 }
 
 // byPath is the service user's attempts on the canonical log by path:
@@ -742,29 +779,79 @@ func (m *keysRootMaint) checkLive(v keysMaintVerb, what string, code int, stderr
 	}
 }
 
-// checkArchives checks rotate's .1: root's 0600, unflagged, one link, a
-// fresh inode, starting with old (the audit log's bytes before the run)
-// and, when sole, no .2.
-func (m *keysRootMaint) checkArchives(oldIno uint64, old string, sole bool, what, stderr string) {
+// checkCrashed checks what a run of v that crashed before step leaves
+// (docs/design/keystore.md § "Crash and rerun"): the canonical log judged
+// and, from step 4 on (a crash before swap, clean or end), the marker
+// standing, root's 0644 regular file naming v and its swap; staging may
+// hold leftovers, which the next run cleans. Before step 4 the failure
+// removed the marker and cleaned staging.
+func (m *keysRootMaint) checkCrashed(v keysMaintVerb, step string, code int, stderr string) {
+	m.t.Helper()
+	what := "after the crash before " + step
+	if !keysPastReport(step) {
+		m.checkLive(v, what, code, stderr)
+		return
+	}
+	fail := func(format string, args ...any) {
+		m.t.Errorf("%s: %s; verb exit %d, stderr %q", what, fmt.Sprintf(format, args...), code, stderr)
+	}
+	var st unix.Stat_t
+	if err := unix.Lstat(m.logPath(v.log), &st); err != nil {
+		fail("stat the canonical %s: %v", v.rel(), err)
+	} else if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || st.Uid != m.svcUID || st.Mode&0o7777 != 0o600 || st.Flags != keysSFAppend {
+		fail("the canonical %s is uid %d mode %04o flags %#x nlink %d; want the service user's 0600, SF_APPEND alone, one link", v.rel(), st.Uid, st.Mode&0o7777, st.Flags, st.Nlink)
+	}
+	p := filepath.Join(m.root, keysMarkerName)
+	if err := unix.Lstat(p, &st); err != nil {
+		fail("the marker %s is not left for the rerun: %v", keysMarkerName, err)
+		return
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || st.Uid != 0 || st.Mode&0o7777 != 0o644 {
+		fail("the marker is uid %d mode %04o type %#o nlink %d; want root's 0644 regular file with one link", st.Uid, st.Mode&0o7777, st.Mode&unix.S_IFMT, st.Nlink)
+	}
+	b, _ := os.ReadFile(p)
+	if !strings.Contains(string(b), "verb="+v.name+"\n") || !strings.Contains(string(b), "swapped=1\n") {
+		fail("the marker holds %q; want verb=%s and swapped=1 (its report written at step 4)", b, v.name)
+	}
+}
+
+// keysPastReport reports whether a crash before step comes after step 4,
+// the report written into the marker.
+func keysPastReport(step string) bool {
+	return slices.Index(keystore.SwapSteps, step) > slices.Index(keystore.SwapSteps, "report")
+}
+
+// keysPastCommit reports whether a crash before step comes after step 5,
+// the swap.
+func keysPastCommit(step string) bool {
+	return slices.Index(keystore.SwapSteps, step) > slices.Index(keystore.SwapSteps, "swap")
+}
+
+// checkArchives checks rotate's archive .n: root's 0600, unflagged, one
+// link, an inode other than the old log's, starting with old (the audit
+// log's bytes before the run) and, when sole, no .n+1.
+func (m *keysRootMaint) checkArchives(n int, oldIno uint64, old string, sole bool, what, stderr string) {
 	m.t.Helper()
 	fail := func(format string, args ...any) {
 		m.t.Errorf("%s: %s; verb stderr %q", what, fmt.Sprintf(format, args...), stderr)
 	}
-	p := filepath.Join(filepath.Dir(m.logPath(keystore.AuditLogName)), keystore.AuditLogName+".1")
+	name := fmt.Sprintf(".%d", n)
+	p := filepath.Join(filepath.Dir(m.logPath(keystore.AuditLogName)), keystore.AuditLogName+name)
 	var st unix.Stat_t
 	if err := unix.Lstat(p, &st); err != nil {
-		fail("stat .1: %v", err)
+		fail("stat %s: %v", name, err)
 		return
 	}
 	if st.Uid != 0 || st.Mode&0o7777 != 0o600 || st.Flags != 0 || st.Nlink != 1 || st.Ino == oldIno {
-		fail(".1 is uid %d mode %04o flags %#x nlink %d inode %d (the old log's %d); want a fresh root 0600 unflagged copy with one link", st.Uid, st.Mode&0o7777, st.Flags, st.Nlink, st.Ino, oldIno)
+		fail("%s is uid %d mode %04o flags %#x nlink %d inode %d (the old log's %d); want a fresh root 0600 unflagged copy with one link", name, st.Uid, st.Mode&0o7777, st.Flags, st.Nlink, st.Ino, oldIno)
 	}
 	b, _ := os.ReadFile(p)
 	if !strings.HasPrefix(string(b), old) || strings.Contains(string(b), keysAttack) {
-		fail(".1 holds %q; want it to start with the old log's %q, and no held-descriptor write", b, old)
+		fail("%s holds %q; want it to start with the old log's %q, and no held-descriptor write", name, b, old)
 	}
-	if _, err := os.Lstat(filepath.Join(filepath.Dir(p), keystore.AuditLogName+".2")); sole && !errors.Is(err, os.ErrNotExist) {
-		fail("a second archive .2 exists: %v", err)
+	next := fmt.Sprintf(".%d", n+1)
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(p), keystore.AuditLogName+next)); sole && !errors.Is(err, os.ErrNotExist) {
+		fail("a further archive %s exists: %v", next, err)
 	}
 }
 
@@ -801,7 +888,7 @@ func TestMaintenanceSwapRefusesServiceUser(t *testing.T) {
 			}
 			r.checkDone(v.name)
 			if v.log == keystore.AuditLogName {
-				m.checkArchives(r.oldIno, r.oldData, true, v.name, r.stderr)
+				m.checkArchives(1, r.oldIno, r.oldData, true, v.name, r.stderr)
 			}
 		})
 	}
@@ -840,12 +927,14 @@ func TestMaintenanceSwapRefusesServiceUser(t *testing.T) {
 // TestMaintenanceCrashAtEverySwapStepReruns is U90's crash half,
 // root-run: floor --rebuild and audit --rotate stopped at each step in
 // keystore.SwapSteps in turn, probed throughout as in
-// TestMaintenanceSwapRefusesServiceUser, leave a valid live log. Rerun,
-// the same verb finishes: the rebuild, whose old floor holds a line that
-// does not parse, exits 4 and prints the uncrashed run's counts, whether
-// the crash came before or past the commit; rotate keeps one new archive.
-// Run instead, the other verb harms nothing of the first verb's log and
-// finishes, and the first verb's rerun then finishes too.
+// TestMaintenanceSwapRefusesServiceUser, leave a valid live log, and,
+// from step 4 on, the marker for the rerun (checkCrashed). Rerun, the
+// same verb finishes, leaving no marker and no staging: the rebuild, whose
+// old floor holds a line that does not parse, exits 4 and prints the
+// uncrashed run's counts, whether the crash came before or past the
+// commit; rotate keeps one new archive. Run instead, the other verb harms
+// nothing of the first verb's log, replaces its marker and finishes, and
+// the first verb's rerun then runs from step 1 and finishes too.
 func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
 	for _, v := range keysMaintVerbs {
 		var ref string
@@ -866,7 +955,7 @@ func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
 				if r.code == keysOK {
 					t.Fatalf("the run crashed before %s reported success; stderr %q", step, r.stderr)
 				}
-				m.checkLive(v, "after the crash before "+step, r.code, r.stderr)
+				m.checkCrashed(v, step, r.code, r.stderr)
 				rerun := m.runProbed(v, "", false)
 				rerun.report(t, "the rerun after a crash before "+step)
 				if rerun.code != v.code || (ref != "" && rerun.stdout != ref) {
@@ -874,7 +963,7 @@ func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
 				}
 				m.checkLive(v, "the rerun after a crash before "+step, rerun.code, rerun.stderr)
 				if v.log == keystore.AuditLogName {
-					m.checkArchives(r.oldIno, r.oldData, true, "the rerun after a crash before "+step, r.stderr+rerun.stderr)
+					m.checkArchives(1, r.oldIno, r.oldData, true, "the rerun after a crash before "+step, r.stderr+rerun.stderr)
 				}
 			})
 			t.Run(v.name+"/crash before "+step+"/other verb", func(t *testing.T) {
@@ -905,7 +994,16 @@ func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
 				}
 				m.checkLive(v, v.name+"'s rerun after "+o.name, rerun.code, rerun.stderr)
 				if v.log == keystore.AuditLogName {
-					m.checkArchives(r.oldIno, r.oldData, false, v.name+"'s rerun after "+o.name, r.stderr+rerun.stderr)
+					// The other verb replaced the first's marker, so the
+					// rerun runs from step 1 (docs/design/keystore.md §
+					// "Crash and rerun"): past the commit the first run's
+					// rotation stands as .1, and the rerun's own shifts it
+					// to .2.
+					n := 1
+					if keysPastCommit(step) {
+						n = 2
+					}
+					m.checkArchives(n, r.oldIno, r.oldData, false, v.name+"'s rerun after "+o.name, r.stderr+rerun.stderr)
 				}
 			})
 		}
@@ -982,7 +1080,7 @@ func TestMaintenanceOldLogRetiredNeverReowned(t *testing.T) {
 			if v.log != keystore.AuditLogName {
 				return
 			}
-			m.checkArchives(oldSt.ino, oldSt.data, false, v.name, stderr)
+			m.checkArchives(1, oldSt.ino, oldSt.data, false, v.name, stderr)
 			for n, a := range archives {
 				got := keysState(t, filepath.Join(filepath.Dir(m.logPath(v.log)), fmt.Sprintf("%s.%d", v.log, n+2)))
 				if got.ino != a.ino || got.data != a.data || got.uid != 0 || got.flags != 0 || got.mode != 0o600 || got.nlink != 1 {
