@@ -352,8 +352,15 @@ func TestBackupRestoreRoundTripRebuild(t *testing.T) {
 	if err := os.WriteFile(p, floor, logMode); err != nil {
 		t.Fatal(err)
 	}
-	// Restored as the service user's, so the flag is what refuses it.
-	giveToService(t, p)
+	// A real restore leaves the floor unflagged and its writer's: root's.
+	// Non-root, the test user is both the floor's owner and the service
+	// user, so the clear flag is what the reader refuses; as root the floor
+	// is root's, and the reader refuses its owner first. Either way the
+	// rebuild takes it as a restore: unflagged and the floor owner's.
+	wantRead := errLogNotAppendOnly
+	if asRoot() {
+		wantRead = errLogUntrusted
+	}
 	rec := &attrRecorder{}
 	s.logFlags = func(*os.File) (uint32, error) {
 		if rec.flagged {
@@ -361,8 +368,8 @@ func TestBackupRestoreRoundTripRebuild(t *testing.T) {
 		}
 		return 0, nil
 	}
-	if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, errLogNotAppendOnly) {
-		t.Fatalf("read before the rebuild: %v, want the unflagged floor refused", err)
+	if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, wantRead) {
+		t.Fatalf("read before the rebuild: %v, want the restored floor refused (%v)", err, wantRead)
 	}
 	if _, err := s.RebuildFloor(ctx, rec); err != nil {
 		t.Fatal(err)
@@ -370,8 +377,9 @@ func TestBackupRestoreRoundTripRebuild(t *testing.T) {
 	assertNoMaintenanceLeft(t, s)
 	svc := fmt.Sprintf("fchown %d", s.uid)
 	// The new log is handed over, set to 0600 and flagged before it is
-	// reachable; the restored log is unflagged and, in this non-root test,
-	// the floor owner's, so it is taken as a restore; no other call is made.
+	// reachable; the restored log is unflagged and the floor owner's (root,
+	// or the test user standing in for root), so it is taken as a restore;
+	// no other call is made.
 	want := []string{svc, "fchmod 600", fmt.Sprintf("fchflags %#x", sfAppend)}
 	if strings.Join(rec.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("attribute calls %q, want %q", rec.calls, want)
