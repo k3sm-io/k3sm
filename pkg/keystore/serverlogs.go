@@ -241,7 +241,8 @@ func (l *ServerLogs) PendingDropped(uid uint32) uint64 {
 }
 
 // PreFrameUsed is the pre-frame bytes counted in the held audit file when
-// it was last read: at the last Reopen or append.
+// it was last read: at the last Reopen or append, the append's own lines
+// included.
 func (l *ServerLogs) PreFrameUsed() int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -367,9 +368,17 @@ func (l *ServerLogs) canonical(h *heldLog) (bool, error) {
 // size and adds each pre-frame line's charge. A file shorter than where the
 // count stopped is counted again from its start. A last line with no
 // newline is left for the next read; a line that does not read as a
-// pre-frame line is charged nothing here.
-func (l *ServerLogs) countLocked(size int64) error {
+// pre-frame line is charged nothing here. On an error the count is
+// forgotten, so the next read counts the file again from its start rather
+// than charging twice what this one read.
+func (l *ServerLogs) countLocked(size int64) (err error) {
 	h := &l.audit
+	defer func() {
+		if err != nil {
+			h.off = 0
+			l.resetCountLocked()
+		}
+	}()
 	if size < h.off {
 		h.off = 0
 		l.resetCountLocked()
@@ -404,10 +413,8 @@ func (l *ServerLogs) countLocked(size int64) error {
 		if err != nil {
 			return h.log.unreadable(off, err)
 		}
-		if len(line) > 1 {
-			if rec, ok := preFrameLineOf(line[:len(line)-1]); ok {
-				l.chargeLocked(rec, int64(len(line))+1)
-			}
+		if rec, cost, ok := preFrameCharge(line); ok {
+			l.chargeLocked(rec, cost)
 		}
 		off += int64(len(line))
 	}
@@ -433,7 +440,11 @@ func (l *ServerLogs) appendLocked(rec preFrameRec) error {
 	}
 	out := make([]byte, 0, len(line)+2)
 	out = append(append(append(out, '\n'), line...), '\n')
-	if !l.roomLocked(rec, int64(len(out))) {
+	charged, cost, ok := preFrameCharge(out[1:])
+	if !ok {
+		return fmt.Errorf("encode an audit line: the %s line does not read as a pre-frame line", rec.Op)
+	}
+	if !l.roomLocked(charged, cost) {
 		return errPreFrameBudgetSpent
 	}
 	h := &l.audit
@@ -460,7 +471,32 @@ func (l *ServerLogs) appendLocked(rec preFrameRec) error {
 	if err != nil {
 		return fmt.Errorf("append to %s: %w", auditLogName, err)
 	}
+	// The running count reads on through what this append wrote, with the
+	// recount's one rule, so it charges the line now and charges it as a
+	// reopen's recount of the file would: the leading newline written, a
+	// torn tail it closed, the line.
+	// The line landed, so a count that fails here does not fail the call
+	// nor count the line as dropped: the count is forgotten and the next
+	// append recounts the file from its start before it tests the budget.
+	_ = l.countLocked(st.Size + int64(len(out)))
 	return nil
+}
+
+// preFrameCharge is the pre-frame part's one charging rule, which the
+// running count after each append and the recount of the file both use:
+// line, a whole audit line with its newline, is charged only if it reads
+// strictly as a pre-frame line (preFrameLineOf), to the part its record
+// names (preFrameLoginLine), and costs its length, newline included, plus
+// the leading newline its append writes.
+func preFrameCharge(line []byte) (preFrameRec, int64, bool) {
+	if len(line) < 2 || line[len(line)-1] != '\n' {
+		return preFrameRec{}, 0, false
+	}
+	rec, ok := preFrameLineOf(line[:len(line)-1])
+	if !ok {
+		return preFrameRec{}, 0, false
+	}
+	return rec, int64(len(line)) + 1, true
 }
 
 // chargeLocked adds n bytes of rec's to the count of its part.

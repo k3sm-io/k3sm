@@ -398,10 +398,10 @@ func checkRefusalsLogged(t *testing.T, cases []admissionCase, logged bool) {
 // checkLogged checks that the rig's audit log holds exactly the refusals
 // and summaries given, as pre-frame lines, and that the budget has
 // charged every one of them: a refusal past the last counts what it
-// holds, then lands too.
+// holds, then lands and is charged too.
 func checkLogged(t *testing.T, store *storeRig, refusals []refusal, drops []drop) {
 	t.Helper()
-	lines, charged := readAudit(t, store.auditPath())
+	lines, _ := readAudit(t, store.auditPath())
 	rs, ds := refusedOf(t, lines)
 	if !slices.Equal(rs, refusals) || !slices.Equal(ds, drops) {
 		t.Fatalf("audit log refusals %v, summaries %v; want %v and %v", rs, ds, refusals, drops)
@@ -409,7 +409,8 @@ func checkLogged(t *testing.T, store *storeRig, refusals []refusal, drops []drop
 	if err := store.logs.Refused(t.Context(), 0, ReasonRoot); err != nil {
 		t.Fatal(err)
 	}
-	if got := store.logs.PreFrameUsed(); got != charged {
+	if _, charged := readAudit(t, store.auditPath()); store.logs.PreFrameUsed() != charged {
+		got := store.logs.PreFrameUsed()
 		t.Fatalf("pre-frame budget used %d, want the log's %d", got, charged)
 	}
 }

@@ -273,13 +273,14 @@ func TestAppendReopensOnInodeMismatch(t *testing.T) {
 	if n := size(t, oldAudit); n != retiredSize {
 		t.Fatalf("the retired audit log grew from %d to %d bytes", retiredSize, n)
 	}
-	lines, _ := readAudit(t, r.auditPath())
+	lines, charged := readAudit(t, r.auditPath())
 	if rs, _ := refusedOf(t, lines); !slices.Equal(rs, []refusal{{0, ReasonRoot}, {77, ReasonSystemUID}}) {
 		t.Fatalf("new audit log refusals = %v", rs)
 	}
-	// Recounted from the new file before the append: the seeded line only,
-	// nothing of the retired file's.
-	if got, want := r.logs.PreFrameUsed(), int64(len(seeded)); got != want {
+	// Recounted from the new file before the append, then charged the
+	// append: the seeded line and the refusal, nothing of the retired
+	// file's.
+	if got, want := r.logs.PreFrameUsed(), charged; got != want || got != size(t, r.auditPath()) {
 		t.Fatalf("budget used after the reopen = %d, want the new file's %d", got, want)
 	}
 
@@ -297,17 +298,19 @@ func TestAppendReopensOnInodeMismatch(t *testing.T) {
 	if n := size(t, oldAudit); n != retiredSize {
 		t.Fatalf("the retired audit log grew from %d to %d bytes", retiredSize, n)
 	}
-	lines, charged := readAudit(t, r.auditPath())
+	lines, _ = readAudit(t, r.auditPath())
 	rs, ds := refusedOf(t, lines)
 	if !slices.Equal(rs, []refusal{{0, ReasonRoot}, {77, ReasonSystemUID}}) || !slices.Equal(ds, []drop{{77, 4}}) {
 		t.Fatalf("new audit log = %v, summaries %v", rs, ds)
 	}
-	// Each append first counts what the file holds: the next one charges
-	// every line of the new file, and only those.
+	// Each append first counts what the file holds, then charges what it
+	// wrote: the next one leaves every line of the new file charged, and
+	// only those.
 	if err := r.logs.Refused(t.Context(), 600, ReasonServiceUID); err != nil {
 		t.Fatal(err)
 	}
-	if got := r.logs.PreFrameUsed(); got != charged {
+	if _, charged = readAudit(t, r.auditPath()); r.logs.PreFrameUsed() != charged {
+		got := r.logs.PreFrameUsed()
 		t.Fatalf("budget used %d, want the new file's %d", got, charged)
 	}
 }
