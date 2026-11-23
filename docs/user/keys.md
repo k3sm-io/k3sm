@@ -125,9 +125,14 @@ while the scope's delivery record names a delivery; withdraw those deliveries fi
 whose delivery record is damaged or missing is still removed, and `rm-scope` exits 4: it could
 not check that scope's deliveries, so any Secret it delivered stays until it is withdrawn or
 removed by hand. A file in the scope
-that its user locked with a user flag (`chflags uchg`) is unlocked and removed, unless that file
-also has a name outside the scope, in which case `rm-scope` stops and says so: unlock it with
-`chflags nouchg` at that other name, then run `rm-scope` again.
+that its user locked with a user flag (`chflags uchg`, `uappnd` or `uunlnk`) is unlocked and
+removed when the service user owns it, even when the file also has a name outside the scope.
+`rm-scope` stops, and says so, only at a flagged entry it does not unlock: a FIFO, socket or
+device, which it never opens, or an entry another user owns. The message names the entry and the
+command that clears the flag, `sudo chflags -h nouchg,nouappnd` followed by the entry's path:
+check that the path is the one meant, run it, then run `rm-scope` again. If the scope holds more
+flagged files than `rm-scope` unlocks in one run, it stops and names
+`sudo chflags -R nouchg,nouappnd` on the scope directory instead.
 
 `--work-dir DIR` points every verb at a server work dir other than the default
 `/var/lib/k3sm/server`. The data root is its parent.
