@@ -34,7 +34,8 @@ import (
 var errScopeHasDeliveries = errors.New("the scope's delivery record names deliveries, and rm-scope does not yet delete their Secrets: withdraw each delivery first; nothing was changed")
 
 // RemoveScope removes uid's user scope (rm-scope), as root: under the
-// exclusive store lock (at most 30 s) and the floor lock it opens the
+// floor lock and then the exclusive store lock (at most 30 s;
+// lockMaintenance) it opens the
 // scope's key under W without the GeneratedUID check and reads its delivery
 // record, refusing while the record names any delivery, then removes
 // .user/<uid>/ by descriptor (removeScopeTree). The scope's K_u goes with
@@ -53,19 +54,12 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) error {
 		return err
 	}
 	defer func() { _ = root.Close() }() // removals are fsynced in their directories
-	saved := s.lockWait
-	s.lockWait = maintenanceLockWait
-	unlock, err := s.lock(ctx, root, true)
-	s.lockWait = saved
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	fl, _, err := s.lockFloor(ctx)
+	fl, unlock, err := s.lockMaintenance(ctx, root)
 	if err != nil {
 		return err
 	}
 	defer fl.unlock()
+	defer unlock()
 	k, err := s.loadMasterLocked()
 	if err != nil {
 		return err

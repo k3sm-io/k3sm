@@ -2466,10 +2466,11 @@ service user can only add to.
   `sudo k3sm keys audit --rotate` run as root only. Each writes the marker
   `keystore-maintenance` and then waits for the listener to stop, which it does when it sees
   the marker (it closes its connections and stops accepting; launchd keeps the socket bound).
-That wait is the store `.lock`
+It first takes the floor lock `keystore-lock`, which only root can open (Open requirement
+2), and only then waits for the store `.lock`, the order every verb that takes both keeps
+("Concurrency"). That wait is the store `.lock`
   taken exclusively, bounded at 30 s: the verb gets the lock once no server operation holds
-  it, and past 30 s it removes its marker and refuses, changing nothing. It then takes the
-  floor lock `keystore-lock`, which only root can open (Open requirement 2). Holding both, it
+  it, and past 30 s it removes its marker and refuses, changing nothing. Holding both, it
   **writes and fsyncs the new file before it touches the old one**. Rebuild writes
   `keystore-user-floor.log.new` from the scopes' entries, walking `.user/` by descriptor ("Root
   walks service-user trees by descriptor"); rotate writes an empty
@@ -3997,8 +3998,8 @@ nothing that the object's deletion did not already (U75). This differs on purpos
 revocation that leaves a long-lived token in place is not a revocation.
 
 **`rm-scope` revokes first.** Removing a scope must not leave its delivered Secrets in place
-with no record left to find them by. `sudo k3sm keys rm-scope user/<uid> --yes` holds the store
-lock exclusively, and the floor lock `keystore-lock` (Open requirement 2), for its whole run,
+with no record left to find them by. `sudo k3sm keys rm-scope user/<uid> --yes` holds the floor
+lock `keystore-lock` (Open requirement 2) and, taken after it, the store lock exclusively, for its whole run,
 so no reconciler write from that scope lands in between, and runs in this order:
 
 0. **List the uid's bindings.** It lists every RoleBinding and ClusterRoleBinding with a
@@ -5325,7 +5326,7 @@ last pull request lands and no row is pending.
 | G4 | Delete then Put of the same name does not reopen the old `v1` | unit: replay the old file onto the new entry, expect `ErrCorrupt` |
 | G5 | A previously valid `current` copied back over the current one is refused, with a message that names the floor and does not tell the operator to restore from backup; a floor file with no entry for the name, or no floor file, accepts an authenticating pointer | unit: Rotate, restore the earlier `current`, expect `ErrCorrupt` whose text names the floor and omits "restore it from backup"; one case each for the missing entry and the missing file |
 | G6 | The floor is root-owned and checked on the opened descriptor; a floor that is group- or other-writable, a symlink, or not root-owned is refused. The floor file names the `system` scope and is parsed strictly, and a verb that cannot write it changes nothing | unit with a fake FS for each case; a missing, other or unknown-field scope; a fuzz target over the parser with committed seeds; a read-only data root on a first Put |
-| G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock` |
+| G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound. A verb that takes both locks, a maintenance verb (`floor --rebuild`, `audit --rotate`, `rm-scope`) included, takes `keystore-lock` before `keystore/.lock` | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock`; a maintenance verb waiting for a held `.lock` already holds `keystore-lock` |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
 | G9 | A Rotate retry discards an orphaned next version and seals the value it was given | unit: orphan with value A, retry with value B, expect B |
 | G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts an operator-made key: `rewrap --key-in` refuses a key that is neither the recorded `master.next.sha256` nor one some record already opens under |

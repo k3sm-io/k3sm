@@ -459,8 +459,8 @@ check G5 "a copied-back current is refused against the floor, with its own messa
 	TestFloorRefusesCopiedBackPointer TestFloorCheck
 check G6 "the floor and the data root are root-owned and not shared, judged on the descriptor; the floor is the system scope's, parsed strictly; a caller that cannot write it changes nothing; no non-test file sets the floor's owner" \
 	TestFloorTrust TestFloorScope FuzzParseFloor TestFloorNotWritableChangesNothing TestFloorOwnerUnsetOutsideTests
-check G7 "the floor is raised by Put, Rotate, RaiseFloor and Delete when the master opens, and by list and show before they read; one behind is accepted; each write re-reads it under the data-root lock, with a bounded wait" \
-	TestFloorRaised TestFloorWriteRereads TestFloorLockBoundedWait k3sm/cmd/k3sm::TestKeysReadVerbsRaiseFloor
+check G7 "the floor is raised by Put, Rotate, RaiseFloor and Delete when the master opens, and by list and show before they read; one behind is accepted; each write re-reads it under the data-root lock, with a bounded wait; a verb that takes both locks, a maintenance verb included, takes keystore-lock before keystore/.lock" \
+	TestFloorRaised TestFloorWriteRereads TestFloorLockBoundedWait TestMaintenanceTakesFloorLockFirst k3sm/cmd/k3sm::TestKeysReadVerbsRaiseFloor
 check G8 "Rotate flips the pointer last; a crash before the flip leaves the old version current" \
 	TestRotateCrashAtEveryStep TestRotate
 check G9 "a Rotate retry discards the orphan and seals the value it was given" TestRotateRetryDiscardsOrphan TestParseVersionName

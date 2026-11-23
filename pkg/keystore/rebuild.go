@@ -129,7 +129,7 @@ func (s *FileStore) floorLog() *appendLog {
 	return newFileFloorLog(s).log
 }
 
-// maintenance is a maintenance verb's hold: the store lock, the floor lock,
+// maintenance is a maintenance verb's hold: the floor lock, the store lock,
 // the keystore root and the judged data-root descriptor.
 type maintenance struct {
 	s      *FileStore
@@ -146,28 +146,41 @@ type maintenance struct {
 	keep bool
 }
 
-// beginMaintenance takes the exclusive store lock (at most
-// maintenanceLockWait), then keystore-lock, opens and judges the data root
-// and writes the marker. refusal is the verb's refused-and-changed-nothing
-// error.
-func (s *FileStore) beginMaintenance(ctx context.Context, refusal error) (*maintenance, error) {
-	root, err := s.openDir(s.dir, false)
+// lockMaintenance takes a maintenance verb's two locks in the order every
+// verb that takes both keeps (docs/design/keystore.md § "Concurrency"):
+// keystore-lock first, then the exclusive store lock, waiting at most
+// maintenanceLockWait for it. A failure releases what it took.
+func (s *FileStore) lockMaintenance(ctx context.Context, root *os.Root) (*floorLock, func(), error) {
+	fl, _, err := s.lockFloor(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	saved := s.lockWait
 	s.lockWait = maintenanceLockWait
 	unlock, err := s.lock(ctx, root, true)
 	s.lockWait = saved
 	if err != nil {
+		fl.unlock()
+		return nil, nil, err
+	}
+	return fl, unlock, nil
+}
+
+// beginMaintenance takes keystore-lock, then the exclusive store lock (at
+// most maintenanceLockWait; lockMaintenance), opens and judges the data
+// root and writes the marker. refusal is the verb's
+// refused-and-changed-nothing error.
+func (s *FileStore) beginMaintenance(ctx context.Context, refusal error) (*maintenance, error) {
+	root, err := s.openDir(s.dir, false)
+	if err != nil {
+		return nil, err
+	}
+	fl, unlock, err := s.lockMaintenance(ctx, root)
+	if err != nil {
 		_ = root.Close() // nothing written
 		return nil, err
 	}
-	m := &maintenance{s: s, root: root, done: func() { unlock(); _ = root.Close() }, dfd: -1, refusal: refusal}
-	if m.fl, _, err = s.lockFloor(ctx); err != nil {
-		m.end()
-		return nil, err
-	}
+	m := &maintenance{s: s, root: root, fl: fl, done: func() { unlock(); _ = root.Close() }, dfd: -1, refusal: refusal}
 	if m.dfd, err = s.openLogDataRoot(); err != nil {
 		m.end()
 		return nil, err
