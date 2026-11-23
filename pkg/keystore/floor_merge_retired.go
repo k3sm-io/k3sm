@@ -331,10 +331,24 @@ func (s *FileStore) readRetired(l *floorLock, liveSum string) (retiredRecord, er
 // undo, into those the restore's merge retired (rec), which --keep brings
 // back, and those deleted since the restore, which stay deleted, and
 // refuses a keep of one of the latter: kept names r would otherwise have
-// buried live.
-func classifyUndo(r *MergeReport, rec retiredRecord) error {
+// buried live. A name counts as deleted since whenever from, the floor the
+// undo reads as its input, buries a generation of it that the floor rec
+// records writing does not: an rm after the restore, whatever rec retired.
+func classifyUndo(r *MergeReport, rec retiredRecord, from floor) error {
+	written, err := recordFloor(rec.Written, rec.Floor)
+	if err != nil {
+		return fmt.Errorf("%w: the retired record's floor written: %w", ErrCorrupt, err)
+	}
+	since := func(n string) bool {
+		for _, b := range from[n].burials() {
+			if !written[n].buries(b.Generation) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, n := range r.BuriedLive {
-		if slices.Contains(rec.Retired, n) {
+		if slices.Contains(rec.Retired, n) && !since(n) {
 			r.RetiredByRestore = append(r.RetiredByRestore, n)
 		} else {
 			r.DeletedSinceRestore = append(r.DeletedSinceRestore, n)
@@ -342,12 +356,12 @@ func classifyUndo(r *MergeReport, rec retiredRecord) error {
 	}
 	var refused []string
 	for _, n := range r.Kept {
-		if !slices.Contains(r.Recorded, n) && !slices.Contains(rec.Retired, n) {
+		if since(n) || (!slices.Contains(r.Recorded, n) && !slices.Contains(rec.Retired, n)) {
 			refused = append(refused, n)
 		}
 	}
 	if len(refused) > 0 {
-		return fmt.Errorf("--keep names %s, deleted since the restore: the restore's merge did not retire it, so the undo keeps it deleted. Nothing is written; run the merge again without it", strings.Join(refused, ", "))
+		return fmt.Errorf("--keep names %s, deleted since the restore: the restore's merge did not retire it, or keys rm deleted it after the restore, so the undo keeps it deleted. Nothing is written; run the merge again without it", strings.Join(refused, ", "))
 	}
 	return nil
 }

@@ -351,6 +351,11 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if rerun {
 		return s.finishRerun(st, in, live, *pending, gone, opts.DryRun, moveAside)
 	}
+	// A keep of a name rm deleted after the restore would bring back what
+	// the operator revoked under the guard.
+	if after := keptAfterRm(live, kept); len(after) > 0 {
+		return MergeReport{}, fmt.Errorf("--keep names %s, deleted with keys rm after the restore: the live floor records that deletion, made while this merge was pending, and a keep would bring the entry back. Nothing is written; run the merge again without it", strings.Join(after, ", "))
+	}
 	ptrs, unverified, aside, asideUnverified, err := s.stagedPointers(ctx, st, live, from)
 	if err != nil {
 		return r, err
@@ -363,7 +368,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 		return MergeReport{}, fmt.Errorf("--keep names %s, which the merge would not delete: it keeps an entry only when the floor moved aside records its restored generation as deleted, or holds a newer generation of a name the restored floor does not record. Nothing is written; check the names and run the merge again without them", strings.Join(unmatched, ", "))
 	}
 	if opts.Undo {
-		if err := classifyUndo(&pr, undo); err != nil {
+		if err := classifyUndo(&pr, undo, from); err != nil {
 			return MergeReport{}, err
 		}
 	}
@@ -666,6 +671,21 @@ func goneDrops(gone map[floorBurial]bool) []pruned {
 		return strings.Compare(a.name+"\x00"+a.generation, b.name+"\x00"+b.generation)
 	})
 	return out
+}
+
+// keptAfterRm is each name in keep, sorted, whose burial in live is a
+// guard-era one (numbered above guardEraSeq): an rm run after the restore,
+// while the merge was pending, deleted it.
+func keptAfterRm(live floor, keep map[string]bool) []string {
+	set := map[string]bool{}
+	for name := range keep {
+		for _, b := range live[name].burials() {
+			if b.Deleted > guardEraSeq {
+				set[name] = true
+			}
+		}
+	}
+	return sortedNames(set)
 }
 
 // floorBurial is one burial by name and generation.
