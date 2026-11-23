@@ -31,12 +31,15 @@ const auditFormat = 1
 
 // auditRecord is one audit line as it is written and read
 // (docs/design/keystore.md § "The audit log"). It has no field for a value
-// and none for a value's length, so no line can carry either. The caller,
-// via and fingerprint fields are the socket's and root verbs' to add.
+// and none for a value's length, so no line can carry either. Via names the
+// path the operation came by ("root" for a root verb); a line without it,
+// as every line written before it existed is, still reads. The caller and
+// fingerprint fields are the socket's to add.
 type auditRecord struct {
 	V         int    `json:"v"`
 	TS        string `json:"ts"`
 	Op        string `json:"op"`
+	Via       string `json:"via,omitempty"`
 	Scope     string `json:"scope"`
 	Name      string `json:"name"`
 	Namespace string `json:"namespace"`
@@ -77,6 +80,7 @@ func marshalAuditLine(l auditLine, now time.Time) ([]byte, error) {
 		V:         auditFormat,
 		TS:        now.UTC().Format(time.RFC3339Nano),
 		Op:        l.op,
+		Via:       l.via,
 		Scope:     l.scope,
 		Name:      l.name,
 		Namespace: l.namespace,
@@ -117,7 +121,7 @@ func parseAuditLine(line []byte) (auditRecord, error) {
 }
 
 // auditKeys are auditRecord's JSON keys, exact.
-var auditKeys = []string{"v", "ts", "op", "scope", "name", "namespace", "delivery", "result"}
+var auditKeys = []string{"v", "ts", "op", "via", "scope", "name", "namespace", "delivery", "result"}
 
 // auditKeysStrict refuses line unless it is one JSON object whose keys are
 // each given once and, where one matches a known key under encoding/json's

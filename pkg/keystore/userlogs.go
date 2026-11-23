@@ -334,6 +334,9 @@ type userFloorLog interface {
 // value and never a value's length.
 type auditLine struct {
 	op, scope, name, namespace, result string
+	// via is the path the operation came by, "root" for a root verb;
+	// empty writes no via field.
+	via string
 	// delivery is the KeyDelivery UID a withdraw names, or
 	// auditPlaceholder for one outside the grammar; empty for other ops.
 	delivery string
