@@ -379,16 +379,22 @@ func TestListenerRefusesUnlessServiceUID(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			r := newSupRig(t, func(c *startChecks) { c.euid = euid })
 			r.wantState(t, PhaseOff, OffNotInstalledServer, MinBackoff)
-			if n := r.log.count("level=WARN", "user scope needs the installed server"); n != 1 {
-				t.Errorf("euid %d: %d Warn lines saying user scope needs the installed server, want 1", euid, n)
+			says := func() int { return r.log.count("user scope needs the installed server") }
+			if n, info := says(), r.log.count("level=INFO", "user scope needs the installed server"); n != 1 || info != 1 {
+				t.Errorf("euid %d: %d lines saying user scope needs the installed server (%d at Info), want 1 at Info", euid, n, info)
 			}
 			advance(MinBackoff)
 			r.wantState(t, PhaseOff, OffNotInstalledServer, 2*MinBackoff)
+			advance(2 * MinBackoff)
+			r.wantState(t, PhaseOff, OffNotInstalledServer, 4*MinBackoff)
+			if n := says(); n != 1 {
+				t.Errorf("euid %d: %d lines after two retries, want the one at start", euid, n)
+			}
 			if got := r.ck.get(); got.listens != 0 || got.counted != 0 {
 				t.Errorf("euid %d: the listener source ran %d times and the server count %d; want neither", euid, got.listens, got.counted)
 			}
 			r.ck.set(func(c *startChecks) { c.euid = serviceUID })
-			advance(2 * MinBackoff)
+			advance(4 * MinBackoff)
 			r.wantState(t, PhaseServing, "", 0)
 			r.dial(t, 501).admitted(t)
 		})

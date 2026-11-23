@@ -280,6 +280,54 @@ func TestKeystoreSocketWiring(t *testing.T) {
 		})
 	})
 
+	t.Run("a failed build is retried with backoff", func(t *testing.T) {
+		f := newWiringFixture(t)
+		f.deps.euid = func() int { return 501 } // a rootless server, so the built supervisor stays off
+		var lookups atomic.Int32
+		f.deps.serviceIDs = func() (uint32, uint32, error) {
+			if lookups.Add(1) <= 2 {
+				return 0, 0, errors.New("fake: no _k3sm user yet")
+			}
+			return 777, 20, nil
+		}
+		logs := &bytes.Buffer{}
+		log := slog.New(slog.NewTextHandler(logs, nil))
+		f.deps.log = log
+		synctest.Test(t, func(t *testing.T) {
+			var built atomic.Pointer[keystoreSocket]
+			build := func() (*keystoreSocket, error) {
+				ks, err := newKeystoreSocket(f.deps)
+				if ks != nil {
+					built.Store(ks)
+				}
+				return ks, err
+			}
+			stop := superviseKeystoreSocket(context.Background(), build, wallClock{}, log)
+			defer stop()
+			synctest.Wait()
+			if n := lookups.Load(); n != 1 || built.Load() != nil {
+				t.Fatalf("at start: %d lookups, built %v; want 1 and nothing", n, built.Load())
+			}
+			<-time.NewTimer(socket.MinBackoff).C
+			synctest.Wait()
+			if n := lookups.Load(); n != 2 || built.Load() != nil {
+				t.Fatalf("after %v: %d lookups; want 2", socket.MinBackoff, n)
+			}
+			<-time.NewTimer(2 * socket.MinBackoff).C
+			synctest.Wait()
+			ks := built.Load()
+			if ks == nil {
+				t.Fatal("the third build did not run the supervisor")
+			}
+			if st := ks.sup.State(); st.Phase != socket.PhaseOff || st.Reason != socket.OffNotInstalledServer {
+				t.Fatalf("state = %+v, want the built supervisor running its checks", st)
+			}
+			if got := strings.Count(logs.String(), "the socket listener was not built"); got != 2 {
+				t.Fatalf("%d build-failure lines, want 2", got)
+			}
+		})
+	})
+
 	t.Run("an agent node starts nothing", func(t *testing.T) {
 		deps := keystoreSocketDeps{nodeRole: func() (install.Role, bool) { return install.RoleAgent, true }}
 		// Every other dependency is nil, so reaching one panics.

@@ -213,22 +213,51 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 	}, closeAll, nil
 }
 
-// runKeystoreSocket runs ks's supervisor in its own goroutine, which closes
-// what ks holds only once Run has returned, and returns the stop that
-// cancels it and waits for Run at most keystoreSocketStopTimeout: past that
-// it logs and returns, so the server's shutdown is never held by the
-// listener, and the descriptors stay open until Run returns or the process
-// exits. A nil ks (a worker) runs nothing and stops at once.
+// runKeystoreSocket runs the built ks (superviseKeystoreSocket). A nil ks
+// (a worker) runs nothing and stops at once.
 func runKeystoreSocket(ctx context.Context, ks *keystoreSocket) (stop func()) {
 	if ks == nil {
 		return noStop
 	}
+	return superviseKeystoreSocket(ctx, func() (*keystoreSocket, error) { return ks, nil }, wallClock{}, ks.log)
+}
+
+// superviseKeystoreSocket builds the listener's supervisor with build and
+// runs it, in one goroutine, and returns the stop. A build that fails (the
+// service-user lookup, say) is logged and retried on the supervisor's
+// backoff, from socket.MinBackoff doubling to socket.MaxBackoff on clock,
+// so the user scope is not left off for the life of the process; a build
+// that returns nil (an installed agent) runs nothing. What the supervisor
+// holds is closed by that goroutine once Run has returned. The stop
+// cancels it and waits at most keystoreSocketStopTimeout: past that it
+// logs and returns, so the server's shutdown is never held by the
+// listener, and the descriptors stay open until Run returns or the process
+// exits.
+func superviseKeystoreSocket(ctx context.Context, build func() (*keystoreSocket, error), clock socket.Clock, log *slog.Logger) (stop func()) {
 	rctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ks.sup.Run(rctx)
-		ks.close()
+		backoff := socket.MinBackoff
+		for {
+			ks, err := build()
+			if err == nil {
+				if ks != nil {
+					ks.sup.Run(rctx)
+					ks.close()
+				}
+				return
+			}
+			log.Error("keystore user scope is off: the socket listener was not built", "err", err, "retry", backoff)
+			tick, stopTick := clock.After(backoff)
+			select {
+			case <-rctx.Done():
+				stopTick()
+				return
+			case <-tick:
+			}
+			backoff = min(2*backoff, socket.MaxBackoff)
+		}
 	}()
 	return func() {
 		cancel()
@@ -237,7 +266,7 @@ func runKeystoreSocket(ctx context.Context, ks *keystoreSocket) (stop func()) {
 		select {
 		case <-done:
 		case <-t.C:
-			ks.log.Warn("keystore socket: the listener did not stop in time; shutdown goes on without it", "waited", keystoreSocketStopTimeout)
+			log.Warn("keystore socket: the listener did not stop in time; shutdown goes on without it", "waited", keystoreSocketStopTimeout)
 		}
 	}
 }
@@ -256,12 +285,13 @@ func (wallClock) After(d time.Duration) (<-chan time.Time, func() bool) {
 // user socket: it builds the supervisor over the real primitives and runs
 // it, returning the stop runServer defers beside keystore-delivery's, so
 // LIFO drains it before the control plane stops. listen is how the
-// listening socket is obtained, which this wiring leaves to its caller. It
-// logs a build failure itself and returns noStop; it is never nil.
+// listening socket is obtained, which this wiring leaves to its caller. A
+// build failure is logged and retried with backoff
+// (superviseKeystoreSocket); the stop is never nil.
 //
 //lint:ignore U1000 the server start calls it once the listening socket's source is chosen
 func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Interface, listen socket.ListenerSource, logger *slog.Logger) (stop func()) {
-	ks, err := newKeystoreSocket(keystoreSocketDeps{
+	deps := keystoreSocketDeps{
 		workDir:          workDir,
 		layout:           keystoreLayout,
 		client:           cs,
@@ -276,12 +306,8 @@ func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Inte
 		sandboxCheck:     socket.SandboxSelfCheck,
 		clock:            wallClock{},
 		log:              logger,
-	})
-	if err != nil {
-		logger.Error("keystore user scope is off: the socket listener was not built", "err", err)
-		return noStop
 	}
-	return runKeystoreSocket(ctx, ks)
+	return superviseKeystoreSocket(ctx, func() (*keystoreSocket, error) { return newKeystoreSocket(deps) }, deps.clock, logger)
 }
 
 // doctorUserScope is what doctor's user-scope row reads: the start checks

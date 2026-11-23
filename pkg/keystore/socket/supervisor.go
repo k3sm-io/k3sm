@@ -449,13 +449,19 @@ func (r OffReason) Remedy() string {
 }
 
 // off records a failed start check and logs it: the install Warn on every
-// retry, the marker once when it first stands, every other reason each time.
+// retry, the marker once when it first stands, a server that is not the
+// installed one (a rootless server, a permanent state) once at Info until
+// it changes, every other reason each time at Warn.
 func (s *Supervisor) off(reason OffReason, detail string, last OffReason, wait time.Duration) {
 	s.set(State{Phase: PhaseOff, Reason: reason, Detail: detail, Until: s.cfg.Clock.Now().Add(wait)})
 	switch reason {
 	case OffMaintenance:
 		if last != OffMaintenance {
 			s.cfg.Log.Info(offMsg+": the listener is down while the maintenance marker stands", "reason", string(reason))
+		}
+	case OffNotInstalledServer:
+		if last != OffNotInstalledServer {
+			s.cfg.Log.Info(offMsg, "reason", string(reason), "err", detail)
 		}
 	case OffInstall:
 		s.cfg.Log.Warn(offMsg+"; "+reason.Remedy(), "reason", string(reason), "err", detail, "retry", wait)
