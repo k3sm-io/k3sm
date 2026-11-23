@@ -3669,7 +3669,13 @@ answers, before the pid and the token are read, so an ineligible peer that close
 connecting is still refused and audited under its own uid; an eligible uid whose pid or token
 read then fails is refused as `cred-unreadable` under that uid. The audit token must name the
 same process: its euid (`audit_token_to_euid`) must equal the `LOCAL_PEERCRED` uid and its pid
-(`audit_token_to_pid`) the `LOCAL_PEERPID` pid, or the peer is refused as `token-mismatch`. Refused before any
+(`audit_token_to_pid`) the `LOCAL_PEERPID` pid, or the peer is refused as `token-mismatch`.
+`sandbox_check_by_audit_token` is private and is not linked: it is resolved with
+`dlsym(RTLD_DEFAULT)` at first use, so a macOS that drops it still launches the binary and every
+peer is refused as `sandbox-unknown`. At start the server asks the check about its own audit
+token (`task_info(TASK_AUDIT_TOKEN)`) and requires 0; any other answer or an error keeps the
+user scope off (`sandbox-check-unusable`). That control cannot show that a sandboxed peer still
+reads as 1; the rig leg shows that, on each supported macOS. Refused before any
 frame is read: uid 0 (root uses the direct-file verbs, as in Phase A), the service uid (every
 native Pod shares it), every uid below 501 (system accounts) (U26, E6), and every uid at
 2^31 (2147483648) or above, `nobody` (4294967294) among them, which is no login user and

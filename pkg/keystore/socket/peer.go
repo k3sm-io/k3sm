@@ -63,6 +63,7 @@ type PeerSandboxSource interface {
 var (
 	peerCredSeam    = readPeerCred
 	peerSandboxSeam = sandboxedByToken
+	sandboxSelfSeam = selfSandboxCheck
 )
 
 // KernelPeerCreds is the production PeerCredSource: LOCAL_PEERCRED,
@@ -79,3 +80,17 @@ type KernelPeerSandbox struct{}
 
 // Sandboxed implements PeerSandboxSource.
 func (KernelPeerSandbox) Sandboxed(token AuditToken) (bool, error) { return peerSandboxSeam(token) }
+
+// SandboxSelfCheck is the start-time control on the peer-sandbox check: it
+// asks the check about the server's own audit token, obtained with
+// task_info(mach_task_self(), TASK_AUDIT_TOKEN), and returns nil only when
+// the answer is 0, not sandboxed, which is what the server running under
+// launchd must read as. Any other answer, a symbol that does not resolve,
+// or an error, is returned, and the supervisor wiring keeps the listener
+// off (OffSandboxCheckUnusable).
+//
+// What it does NOT prove: that a sandboxed peer still reads as 1. A check
+// that answered 0 for every process would pass it and admit Pods; only a
+// sandboxed peer on each supported macOS shows the other half, which is the
+// rig leg's job. Off darwin it always fails.
+func SandboxSelfCheck() error { return sandboxSelfSeam() }

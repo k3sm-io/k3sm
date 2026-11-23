@@ -37,6 +37,9 @@ func TestMain(m *testing.M) {
 	peerSandboxSeam = func(AuditToken) (bool, error) {
 		panic("a unit test reached sandbox_check_by_audit_token: pass a fake peer-sandbox source")
 	}
+	sandboxSelfSeam = func() error {
+		panic("a unit test reached sandbox_check_by_audit_token on the own audit token: pass a fake sandbox check")
+	}
 	geteuidSeam = func() int {
 		panic("a unit test reached geteuid: pass a fake euid source")
 	}
@@ -72,6 +75,8 @@ func TestRealPrimitivesUnreachable(t *testing.T) {
 		{"KernelPeerSandbox", "sandbox_check_by_audit_token", func() { _, _ = KernelPeerSandbox{}.Sandboxed(AuditToken{}) }},
 		{"peerCredSeam", "LOCAL_PEERCRED", func() { _, _ = peerCredSeam(server) }},
 		{"peerSandboxSeam", "sandbox_check_by_audit_token", func() { _, _ = peerSandboxSeam(AuditToken{}) }},
+		{"SandboxSelfCheck", "sandbox_check_by_audit_token", func() { _ = SandboxSelfCheck() }},
+		{"sandboxSelfSeam", "sandbox_check_by_audit_token", func() { _ = sandboxSelfSeam() }},
 		{"ProcessEUID", "geteuid", func() { _ = ProcessEUID() }},
 		{"geteuidSeam", "geteuid", func() { _ = geteuidSeam() }},
 		{"DataRootIgnoresOwnership", "fstatfs", func() { _, _ = DataRootIgnoresOwnership(dir) }},

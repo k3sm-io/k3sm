@@ -30,11 +30,16 @@ package socket
 //
 // sandbox_check_by_audit_token is PRIVATE SPI: no public SDK header declares
 // it. It is exported by /usr/lib/system/libsystem_sandbox.dylib (listed in
-// the SDK's libsystem_sandbox.tbd) and declared below by hand in the form
-// Apple's own SPI headers use. With operation NULL and filter type 0
-// (SANDBOX_FILTER_NONE) it asks only whether the process is sandboxed: 1 yes,
-// 0 no, -1 error with errno set. It is reached only through
-// PeerSandboxSource, so a change in the symbol is confined to this file.
+// the SDK's libsystem_sandbox.tbd), part of libSystem, which every process
+// has loaded. It is NOT linked: it is resolved with dlsym(RTLD_DEFAULT) at
+// first use and called through a pointer typed in the form Apple's own SPI
+// headers use, so a macOS that drops it does not stop the binary from
+// launching; the sandbox check then fails for every peer (sandbox-unknown)
+// and the listener refuses everyone. With operation NULL and filter type 0
+// (SANDBOX_FILTER_NONE) it asks only whether the process is sandboxed: 1
+// yes, 0 no, -1 error with errno set. It is reached only through
+// PeerSandboxSource and SandboxSelfCheck, so a change in the symbol is
+// confined to this file.
 
 /*
 #include <errno.h>
@@ -42,10 +47,32 @@ package socket
 #include <sys/un.h>
 #include <sys/ucred.h>
 #include <bsm/libbsm.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <mach/mach.h>
 
 #cgo LDFLAGS: -lbsm
 
-extern int sandbox_check_by_audit_token(audit_token_t token, const char *operation, int type, ...);
+typedef int (*k3sm_sandbox_check_fn)(audit_token_t token, const char *operation, int type, ...);
+
+static k3sm_sandbox_check_fn k3sm_sandbox_check;
+static pthread_once_t k3sm_sandbox_once = PTHREAD_ONCE_INIT;
+
+static void k3sm_sandbox_resolve(void) {
+	k3sm_sandbox_check = (k3sm_sandbox_check_fn)dlsym(RTLD_DEFAULT, "sandbox_check_by_audit_token");
+}
+
+// k3sm_sandbox_available reports whether the symbol resolved, resolving it
+// on the first call.
+static int k3sm_sandbox_available(void) {
+	pthread_once(&k3sm_sandbox_once, k3sm_sandbox_resolve);
+	return k3sm_sandbox_check != NULL;
+}
+
+static int k3sm_self_token(audit_token_t *tok) {
+	mach_msg_type_number_t n = TASK_AUDIT_TOKEN_COUNT;
+	return task_info(mach_task_self(), TASK_AUDIT_TOKEN, (task_info_t)tok, &n);
+}
 
 static int k3sm_peer_token(int fd, audit_token_t *tok) {
 	socklen_t len = sizeof(*tok);
@@ -59,8 +86,12 @@ static int k3sm_peer_token(int fd, audit_token_t *tok) {
 }
 
 static int k3sm_token_sandboxed(audit_token_t *tok, int *err) {
+	if (!k3sm_sandbox_available()) {
+		*err = ENOSYS;
+		return -2;
+	}
 	errno = 0;
-	int rc = sandbox_check_by_audit_token(*tok, NULL, 0);
+	int rc = k3sm_sandbox_check(*tok, NULL, 0);
 	*err = errno;
 	return rc;
 }
@@ -132,20 +163,49 @@ func readPeerCred(c net.Conn) (PeerCred, error) {
 // errSandboxAnswer is a sandbox check that answered neither yes nor no.
 var errSandboxAnswer = errors.New("keystore socket: sandbox_check_by_audit_token answered neither 0 nor 1")
 
+// errSandboxSymbol is a process in which sandbox_check_by_audit_token does
+// not resolve.
+var errSandboxSymbol = errors.New("keystore socket: sandbox_check_by_audit_token does not resolve on this macOS")
+
 // sandboxedByToken asks whether the process token names is sandboxed. An
-// answer other than 0 or 1 is an error.
+// answer other than 0 or 1 is an error, and so is a symbol that does not
+// resolve.
 func sandboxedByToken(token AuditToken) (bool, error) {
 	var tok C.audit_token_t
 	for i := range token {
 		tok.val[i] = C.uint(token[i])
 	}
+	return sandboxedByCToken(&tok)
+}
+
+func sandboxedByCToken(tok *C.audit_token_t) (bool, error) {
 	var e C.int
-	switch rc := C.k3sm_token_sandboxed(&tok, &e); rc {
+	switch rc := C.k3sm_token_sandboxed(tok, &e); rc {
 	case 0:
 		return false, nil
 	case 1:
 		return true, nil
+	case -2:
+		return false, errSandboxSymbol
 	default:
 		return false, fmt.Errorf("%w: %d (%v)", errSandboxAnswer, int(rc), syscall.Errno(e))
 	}
+}
+
+// selfSandboxCheck asks the sandbox check about this process's own audit
+// token (task_info TASK_AUDIT_TOKEN) and requires the answer 0, not
+// sandboxed: the server runs unsandboxed under launchd.
+func selfSandboxCheck() error {
+	var tok C.audit_token_t
+	if kr := C.k3sm_self_token(&tok); kr != C.KERN_SUCCESS {
+		return fmt.Errorf("keystore socket: task_info(TASK_AUDIT_TOKEN): kern_return %d", int(kr))
+	}
+	sandboxed, err := sandboxedByCToken(&tok)
+	if err != nil {
+		return err
+	}
+	if sandboxed {
+		return errors.New("keystore socket: the sandbox check says the server itself is sandboxed")
+	}
+	return nil
 }

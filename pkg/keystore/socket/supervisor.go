@@ -50,16 +50,17 @@ type OffReason string
 
 // The reasons the listener is off.
 const (
-	OffNotInstalledServer  OffReason = "user scope needs the installed server"
-	OffMaintenance         OffReason = "a maintenance verb is running"
-	OffMaintenanceUnknown  OffReason = "the maintenance marker cannot be read"
-	OffIgnoresOwnership    OffReason = "the data root is mounted ignoring ownership"
-	OffMountUnknown        OffReason = "the data root's mount flags cannot be read"
-	OffInstall             OffReason = "the socket directory or an append-only log is missing, wrong or unflagged"
-	OffServers             OffReason = "more than one server registered"
-	OffServersUnknown      OffReason = "the server count is unknown"
-	OffListenerUnavailable OffReason = "the listening socket is unavailable"
-	OffListenerFailed      OffReason = "the listener failed"
+	OffNotInstalledServer   OffReason = "user scope needs the installed server"
+	OffMaintenance          OffReason = "a maintenance verb is running"
+	OffMaintenanceUnknown   OffReason = "the maintenance marker cannot be read"
+	OffIgnoresOwnership     OffReason = "the data root is mounted ignoring ownership"
+	OffMountUnknown         OffReason = "the data root's mount flags cannot be read"
+	OffInstall              OffReason = "the socket directory or an append-only log is missing, wrong or unflagged"
+	OffServers              OffReason = "more than one server registered"
+	OffServersUnknown       OffReason = "the server count is unknown"
+	OffListenerUnavailable  OffReason = "the listening socket is unavailable"
+	OffListenerFailed       OffReason = "the listener failed"
+	OffSandboxCheckUnusable OffReason = "the peer sandbox check is unusable (sandbox-check-unusable)"
 )
 
 // The supervisor's log text: every off line starts with offMsg, and the
@@ -126,6 +127,8 @@ type SupervisorConfig struct {
 	ServerCount func(ctx context.Context) (int, error)
 	// MaintenanceMarked reports whether the maintenance marker stands.
 	MaintenanceMarked func() (bool, error)
+	// SandboxCheck is Preconditions.SandboxCheck; nil skips it.
+	SandboxCheck func() error
 	// Creds, Sandbox, Audit and Handler are given to each run's Listener.
 	Creds   PeerCredSource
 	Sandbox PeerSandboxSource
@@ -279,6 +282,7 @@ func (s *Supervisor) check(ctx context.Context) (OffReason, string) {
 		IgnoresOwnership:  s.cfg.IgnoresOwnership,
 		CheckInstall:      s.cfg.CheckInstall,
 		ServerCount:       s.cfg.ServerCount,
+		SandboxCheck:      s.cfg.SandboxCheck,
 	}.Check(ctx)
 }
 
@@ -300,6 +304,10 @@ type Preconditions struct {
 	CheckInstall func(ctx context.Context) error
 	// ServerCount returns how many servers the cluster has registered.
 	ServerCount func(ctx context.Context) (int, error)
+	// SandboxCheck is the start-time control on the peer-sandbox check;
+	// production passes SandboxSelfCheck. An error keeps the listener off
+	// with OffSandboxCheckUnusable. It is run last; nil skips it.
+	SandboxCheck func() error
 }
 
 // Check runs the start checks in the design's order (the effective uid, the
@@ -338,6 +346,11 @@ func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
 		return OffServers, fmt.Sprintf("%d servers registered", n)
 	case n < 1:
 		return OffServersUnknown, fmt.Sprintf("%d servers registered", n)
+	}
+	if p.SandboxCheck != nil {
+		if _, err := guard(func() (struct{}, error) { return struct{}{}, p.SandboxCheck() }); err != nil {
+			return OffSandboxCheckUnusable, err.Error()
+		}
 	}
 	return "", ""
 }

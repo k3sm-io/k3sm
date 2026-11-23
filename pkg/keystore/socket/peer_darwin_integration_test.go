@@ -63,8 +63,15 @@ func TestKernelPeerSourcesOnASocketpair(t *testing.T) {
 	}
 	// The answer depends on whether the test itself runs sandboxed; it
 	// must be an answer.
-	if _, err := sandboxedByToken(pc.Token); err != nil {
+	sandboxed, err := sandboxedByToken(pc.Token)
+	if err != nil {
 		t.Fatalf("sandboxedByToken = %v", err)
+	}
+	// The start-time self-control asks about the same process through
+	// task_info's token and must agree: usable (nil) exactly when the
+	// process reads as not sandboxed.
+	if err := selfSandboxCheck(); (err == nil) == sandboxed {
+		t.Fatalf("selfSandboxCheck = %v, but the peer read as sandboxed=%v", err, sandboxed)
 	}
 	if _, err := readPeerCred(&countingConn{}); err == nil {
 		t.Fatal("readPeerCred took a conn with no descriptor")

@@ -20,11 +20,12 @@ import "testing"
 
 // TestSandboxCheckByAuditTokenSymbolCanary is the symbol canary for
 // sandbox_check_by_audit_token, the private SPI behind KernelPeerSandbox
-// (peer_darwin.go), which no public SDK header declares. The package links
-// it, so a macOS without it fails the build; this names it at run time, so a
-// renamed or dropped export is a red test naming the symbol rather than a
-// peer-sandbox source that refuses every connection. The negative case
-// proves the lookup can say no.
+// (peer_darwin.go), which no public SDK header declares. The package
+// resolves it with dlsym at first use, so a macOS without it still launches
+// the binary and the listener refuses every peer as sandbox-unknown; this
+// names it at run time, so a renamed or dropped export is a red test naming
+// the symbol rather than a listener that silently admits no one. The
+// negative case proves the lookup can say no.
 func TestSandboxCheckByAuditTokenSymbolCanary(t *testing.T) {
 	if !symbolResolves("sandbox_check_by_audit_token") {
 		t.Fatal("sandbox_check_by_audit_token does not resolve: the listener's peer-sandbox check needs it")

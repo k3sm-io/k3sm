@@ -30,3 +30,5 @@ var errNoPeerSource = errors.New("keystore socket: peer credentials and sandbox 
 func readPeerCred(net.Conn) (PeerCred, error) { return PeerCred{}, errNoPeerSource }
 
 func sandboxedByToken(AuditToken) (bool, error) { return false, errNoPeerSource }
+
+func selfSandboxCheck() error { return errNoPeerSource }
