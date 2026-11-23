@@ -626,3 +626,70 @@ func TestRemoveScopeFlagBudget(t *testing.T) {
 		t.Fatalf("the scope directory is still there: %v", err)
 	}
 }
+
+// The service user can set a user flag again on its own scope.key after
+// rm-scope cleared it, before the unlink (through the seam on the flag
+// write: the clear lands, then uchg is set again on the same descriptor).
+// The unlink fails with EPERM and the run stops committed (it took the
+// directory and cleared flags), saying the flag was set again while it ran
+// and to rerun once nothing sets the flag, with the rerun line. The rerun,
+// with nothing setting the flag, finds root's taken leftover (the seam's
+// other service uid makes the test's own 0700 directories root's) holding
+// the key the first run listed: it makes the record durable again, clears
+// the flag, removes the directory and reports it removed and listed.
+func TestRemoveScopeFlagResetThenRerunFinishes(t *testing.T) {
+	if asRoot() {
+		t.Skip("the seam's other service uid makes the store's own directories foreign as root")
+	}
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	t.Cleanup(func() { unflagScopeTree(dir) })
+	key := filepath.Join(dir, scopeKeyName)
+	keyIno := setScopeFlags(t, key, unix.UF_IMMUTABLE, false)
+	saved := scopeFchflags
+	resets := 0
+	setSeam(t, &scopeFchflags, func(fd, flags int) error {
+		if err := saved(fd, flags); err != nil {
+			return err
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			return err
+		}
+		if st.Ino == keyIno {
+			resets++
+			return unix.Fchflags(fd, flags|unix.UF_IMMUTABLE)
+		}
+		return nil
+	})
+	_, err := s.RemoveScope(t.Context(), 1001)
+	if !Committed(err) || !errors.Is(err, unix.EPERM) || resets != 1 {
+		t.Fatalf("run 1 with the flag set again: %v (resets %d), want committed with EPERM", err, resets)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		quoteName(key) + " (named for reading, not for pasting)",
+		"rm-scope cleared the flag, and it was set again while rm-scope ran",
+		"Rerun once nothing sets the flag",
+		"rerun sudo k3sm keys rm-scope user/1001 --yes",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("run 1's error %q does not say %q", msg, want)
+		}
+	}
+	if _, err := os.Lstat(key); err != nil {
+		t.Fatalf("scope.key after run 1: %v, want it left for the rerun", err)
+	}
+	scopeFchflags = saved
+	asTakenRerun(t, s, dir)
+	res, err := s.RemoveScope(t.Context(), 1001)
+	if err != nil || !res.Recorded {
+		t.Fatalf("the rerun: %v, recorded %v; want removed and listed", err, res.Recorded)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there: %v", err)
+	}
+	if !readRecord(t, s).listed(1001) {
+		t.Error("the record does not list the scope")
+	}
+}
