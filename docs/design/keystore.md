@@ -3587,7 +3587,7 @@ refused before its first frame:
   A pre-frame line is `{"v":1,"ts":…,"op":"refused","via":"socket","caller":{"uid":<peer
   uid>},"scope":"","name":"","namespace":"","result":"<reason>","charge":"reconciler","source":"pre-frame"}`,
   the reason one of the listener's closed set (`root`, `service-uid`, `system-uid`, `high-uid`,
-  `sandboxed`, `cred-unreadable`, `sandbox-unknown`); its summary has `result` `dropped` and a
+  `sandboxed`, `cred-unreadable`, `sandbox-unknown`, `token-mismatch`); its summary has `result` `dropped` and a
   `dropped` count, one line per uid, carrying every line of that uid's not written since its
   last summary (rate-limited, past the budget, or the lock not had within 2 seconds). Each is
   charged to the pre-frame part its length, its newline and its append's leading newline, and
@@ -3664,7 +3664,12 @@ process is not sandboxed: before the first frame the listener also asks `sandbox
 the peer's audit token, through its peer-sandbox source, and refuses a sandboxed peer, so a Pod
 process is refused by a check that does not rest on its uid (Open requirement 15, U137). A peer
 whose credentials or sandbox state cannot be read is refused as well, its `refused` line naming
-uid 4294967295 when no uid was read. Refused before any
+uid 4294967295 when no uid was read. The uid range is judged as soon as `LOCAL_PEERCRED`
+answers, before the pid and the token are read, so an ineligible peer that closes right after
+connecting is still refused and audited under its own uid; an eligible uid whose pid or token
+read then fails is refused as `cred-unreadable` under that uid. The audit token must name the
+same process: its euid (`audit_token_to_euid`) must equal the `LOCAL_PEERCRED` uid and its pid
+(`audit_token_to_pid`) the `LOCAL_PEERPID` pid, or the peer is refused as `token-mismatch`. Refused before any
 frame is read: uid 0 (root uses the direct-file verbs, as in Phase A), the service uid (every
 native Pod shares it), every uid below 501 (system accounts) (U26, E6), and every uid at
 2^31 (2147483648) or above, `nobody` (4294967294) among them, which is no login user and

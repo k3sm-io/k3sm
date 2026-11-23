@@ -56,6 +56,11 @@ func TestKernelPeerSourcesOnASocketpair(t *testing.T) {
 	if pc.Token[1] != pc.UID || int32(pc.Token[5]) != pc.PID {
 		t.Fatalf("token %v does not name uid %d pid %d", pc.Token, pc.UID, pc.PID)
 	}
+	// libbsm reads the same euid and pid off the token: the listener's
+	// cross-check passes on a live self-peer.
+	if !pc.UIDRead || pc.TokenEUID != pc.UID || pc.TokenPID != pc.PID {
+		t.Fatalf("token euid %d pid %d (uid read %v), want %d and %d", pc.TokenEUID, pc.TokenPID, pc.UIDRead, pc.UID, pc.PID)
+	}
 	// The answer depends on whether the test itself runs sandboxed; it
 	// must be an answer.
 	if _, err := sandboxedByToken(pc.Token); err != nil {

@@ -43,6 +43,8 @@ package socket
 #include <sys/ucred.h>
 #include <bsm/libbsm.h>
 
+#cgo LDFLAGS: -lbsm
+
 extern int sandbox_check_by_audit_token(audit_token_t token, const char *operation, int type, ...);
 
 static int k3sm_peer_token(int fd, audit_token_t *tok) {
@@ -76,7 +78,10 @@ import (
 
 // readPeerCred reads the peer of c, an accepted unix connection, off its
 // descriptor: euid from LOCAL_PEERCRED, pid from LOCAL_PEERPID, audit token
-// from LOCAL_PEERTOKEN. Every read must succeed.
+// from LOCAL_PEERTOKEN, and the euid and pid the token carries through
+// libbsm. The uid is read first; a read that fails after it returns its
+// error with the uid read (UIDRead), so the listener refuses an ineligible
+// uid under that uid and an eligible one as cred-unreadable under it.
 func readPeerCred(c net.Conn) (PeerCred, error) {
 	sc, ok := c.(syscall.Conn)
 	if !ok {
@@ -98,25 +103,28 @@ func readPeerCred(c net.Conn) (PeerCred, error) {
 			opErr = fmt.Errorf("LOCAL_PEERCRED: xucred version %d", x.Version)
 			return
 		}
+		pc.UID, pc.UIDRead = x.Uid, true
 		pid, err := unix.GetsockoptInt(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERPID)
 		if err != nil {
 			opErr = fmt.Errorf("LOCAL_PEERPID: %w", err)
 			return
 		}
+		pc.PID = int32(pid)
 		var tok C.audit_token_t
 		if rc := C.k3sm_peer_token(C.int(fd), &tok); rc != 0 {
 			opErr = fmt.Errorf("LOCAL_PEERTOKEN: %w", syscall.Errno(rc))
 			return
 		}
-		pc = PeerCred{UID: x.Uid, PID: int32(pid)}
 		for i := range pc.Token {
 			pc.Token[i] = uint32(tok.val[i])
 		}
+		pc.TokenEUID = uint32(C.audit_token_to_euid(tok))
+		pc.TokenPID = int32(C.audit_token_to_pid(tok))
 	}); err != nil {
 		return PeerCred{}, fmt.Errorf("keystore socket: peer credentials: %w", err)
 	}
 	if opErr != nil {
-		return PeerCred{}, fmt.Errorf("keystore socket: peer credentials: %w", opErr)
+		return pc, fmt.Errorf("keystore socket: peer credentials: %w", opErr)
 	}
 	return pc, nil
 }

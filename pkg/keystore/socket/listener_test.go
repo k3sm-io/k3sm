@@ -77,6 +77,7 @@ func (c *countingConn) Read(b []byte) (int, error) {
 type fakeCreds struct {
 	mu    sync.Mutex
 	peers map[net.Conn]PeerCred
+	fail  map[net.Conn]bool // answer the peer's PeerCred with an error
 }
 
 func (f *fakeCreds) PeerCred(c net.Conn) (PeerCred, error) {
@@ -86,7 +87,16 @@ func (f *fakeCreds) PeerCred(c net.Conn) (PeerCred, error) {
 	if !ok {
 		return PeerCred{}, errors.New("fake: no peer credentials")
 	}
+	if f.fail[c] {
+		return pc, errors.New("fake: a read after the uid failed")
+	}
 	return pc, nil
+}
+
+// credOf is the PeerCred the kernel reports for a peer running as uid with
+// pid: its token names both.
+func credOf(uid uint32, pid int32) PeerCred {
+	return PeerCred{UID: uid, UIDRead: true, PID: pid, Token: AuditToken{1: uid, 5: uint32(pid)}, TokenEUID: uid, TokenPID: pid}
 }
 
 // fakeSandbox answers from a table of sandboxed tokens and records the
@@ -191,7 +201,7 @@ func startRigWith(t *testing.T, service uint32, also RefusalAuditor) *rig {
 	t.Helper()
 	r := &rig{
 		ln:      newFakeListener(),
-		creds:   &fakeCreds{peers: make(map[net.Conn]PeerCred)},
+		creds:   &fakeCreds{peers: make(map[net.Conn]PeerCred), fail: make(map[net.Conn]bool)},
 		sandbox: &fakeSandbox{sandboxed: make(map[AuditToken]bool), fail: make(map[AuditToken]bool)},
 		audit:   &fakeAuditor{},
 		done:    make(chan error, 1),
@@ -223,19 +233,29 @@ func (r *rig) stop() error {
 // dialAs connects as uid; sandboxed marks the peer's token, and unreadable
 // leaves its credentials out of the table.
 func (r *rig) dialAs(uid uint32, sandboxed, sandboxFails, unreadable bool) peer {
+	r.pid++
+	pc := credOf(uid, r.pid)
+	if unreadable {
+		pc = PeerCred{}
+	}
+	r.sandbox.mu.Lock()
+	r.sandbox.sandboxed[pc.Token] = sandboxed
+	r.sandbox.fail[pc.Token] = sandboxFails
+	r.sandbox.mu.Unlock()
+	return r.dialCred(pc, false)
+}
+
+// dialCred connects a peer the credential source reports as pc, with an
+// error when credErr is set; a zero pc is left out of the table.
+func (r *rig) dialCred(pc PeerCred, credErr bool) peer {
 	client, server := net.Pipe()
 	sc := &countingConn{Conn: server}
-	r.pid++
-	tok := AuditToken{1: uid, 5: uint32(r.pid)}
 	r.creds.mu.Lock()
-	if !unreadable {
-		r.creds.peers[sc] = PeerCred{UID: uid, PID: r.pid, Token: tok}
+	if pc != (PeerCred{}) {
+		r.creds.peers[sc] = pc
 	}
+	r.creds.fail[sc] = credErr
 	r.creds.mu.Unlock()
-	r.sandbox.mu.Lock()
-	r.sandbox.sandboxed[tok] = sandboxed
-	r.sandbox.fail[tok] = sandboxFails
-	r.sandbox.mu.Unlock()
 	r.ln.conns <- sc
 	synctest.Wait()
 	return peer{client: client, server: sc}
@@ -411,6 +431,59 @@ func TestPeerEligibility(t *testing.T) {
 			}
 		})
 	})
+}
+
+// TestPeerAttribution checks whose uid a refusal names when a read after
+// LOCAL_PEERCRED fails, and that the audit token must name the uid and pid
+// read beside it.
+func TestPeerAttribution(t *testing.T) {
+	cases := []struct {
+		name    string
+		pc      PeerCred
+		credErr bool
+		uid     uint32
+		reason  string // "" admitted
+	}{
+		{"root, later read failed", credOf(0, 7), true, 0, ReasonRoot},
+		{"service uid, later read failed", credOf(serviceUID, 7), true, serviceUID, ReasonServiceUID},
+		{"system uid, later read failed", PeerCred{UID: 88, UIDRead: true}, true, 88, ReasonSystemUID},
+		{"high uid, later read failed", PeerCred{UID: 1 << 31, UIDRead: true}, true, 1 << 31, ReasonHighUID},
+		{"login uid, later read failed", PeerCred{UID: 501, UIDRead: true}, true, 501, ReasonCredUnreadable},
+		{"no uid read", PeerCred{PID: 7}, true, NoUID, ReasonCredUnreadable},
+		{"success without a uid read", PeerCred{UID: 501, PID: 7, TokenEUID: 501, TokenPID: 7}, false, NoUID, ReasonCredUnreadable},
+		{"token names another euid", func() PeerCred { pc := credOf(501, 7); pc.TokenEUID = 502; return pc }(), false, 501, ReasonTokenMismatch},
+		{"token names root", func() PeerCred { pc := credOf(501, 7); pc.TokenEUID = 0; return pc }(), false, 501, ReasonTokenMismatch},
+		{"token names another pid", func() PeerCred { pc := credOf(501, 7); pc.TokenPID = 8; return pc }(), false, 501, ReasonTokenMismatch},
+		{"token names both", credOf(501, 7), false, 0, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := startRig(t)
+				p := r.dialCred(tc.pc, tc.credErr)
+				var want []refusal
+				if tc.reason == "" {
+					p.admitted(t)
+				} else {
+					p.refused(t)
+					want = []refusal{{tc.uid, tc.reason}}
+				}
+				p.close()
+				if err := r.stop(); err != nil {
+					t.Fatalf("Serve = %v", err)
+				}
+				if got, _ := r.audit.lines(); !slices.Equal(got, want) {
+					t.Fatalf("refused lines = %v, want %v", got, want)
+				}
+				r.sandbox.mu.Lock()
+				asked := len(r.sandbox.asked)
+				r.sandbox.mu.Unlock()
+				if tc.reason != "" && asked != 0 {
+					t.Fatalf("the sandbox source was asked about a refused peer")
+				}
+			})
+		})
+	}
 }
 
 func TestPeerUIDRangeRefusesNobodyAndHighUIDs(t *testing.T) {

@@ -201,14 +201,25 @@ func (l *Listener) recovered(what string) {
 }
 
 // check reads c's peer and returns the reason it is refused, or "" for an
-// eligible peer, with the uid a refusal names.
+// eligible peer, with the uid a refusal names. The uid range is judged as
+// soon as a uid is read, before anything read after it, so an ineligible
+// peer is refused under its own uid even when a later read fails; an
+// eligible uid whose later reads fail is refused as cred-unreadable under
+// that uid, and NoUID is named only when no uid was read. The token must
+// then name the uid and pid read beside it.
 func (l *Listener) check(c net.Conn) (uint32, string) {
 	pc, err := l.creds.PeerCred(c)
-	if err != nil {
-		return NoUID, ReasonCredUnreadable
+	if !pc.UIDRead {
+		return NoUID, ReasonCredUnreadable // a source that read no uid fails closed, error or not
 	}
 	if reason := uidRefusal(pc.UID, l.serviceUID); reason != "" {
 		return pc.UID, reason
+	}
+	if err != nil {
+		return pc.UID, ReasonCredUnreadable
+	}
+	if pc.TokenEUID != pc.UID || pc.TokenPID != pc.PID {
+		return pc.UID, ReasonTokenMismatch
 	}
 	sandboxed, err := l.sandbox.Sandboxed(pc.Token)
 	if err != nil {

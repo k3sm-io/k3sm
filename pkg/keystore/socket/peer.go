@@ -25,15 +25,26 @@ type AuditToken [8]uint32
 // PeerCred is what the kernel says about an accepted connection's peer, read
 // at accept. UID is the peer's effective uid at connect time and is the
 // authority; PID is advisory, for an audit line; Token names the process for
-// the sandbox check.
+// the sandbox check. TokenEUID and TokenPID are the euid and pid the token
+// itself carries (audit_token_to_euid, audit_token_to_pid): the listener
+// refuses a token that does not name the uid and pid read beside it.
+//
+// UIDRead is set once UID has been read, and a PeerCred without it is
+// refused as unread whatever the error. A source that fails after reading
+// the uid returns its error with UID and UIDRead set, so the refusal names
+// the uid that was read.
 type PeerCred struct {
-	UID   uint32
-	PID   int32
-	Token AuditToken
+	UID       uint32
+	UIDRead   bool
+	PID       int32
+	Token     AuditToken
+	TokenEUID uint32
+	TokenPID  int32
 }
 
 // PeerCredSource reads an accepted connection's peer credentials. An error
-// refuses the connection.
+// refuses the connection; with it, a PeerCred whose UIDRead is set names
+// the uid read before the failure.
 type PeerCredSource interface {
 	PeerCred(c net.Conn) (PeerCred, error)
 }

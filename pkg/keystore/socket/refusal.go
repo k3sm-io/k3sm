@@ -44,6 +44,7 @@ const (
 	ReasonSandboxed      = "sandboxed"       // a sandboxed process, whatever its uid
 	ReasonCredUnreadable = "cred-unreadable" // the peer credentials could not be read
 	ReasonSandboxUnknown = "sandbox-unknown" // the sandbox check failed
+	ReasonTokenMismatch  = "token-mismatch"  // the audit token names another euid or pid than LOCAL_PEERCRED and LOCAL_PEERPID
 )
 
 // NoUID is the uid a refusal names when the peer's could not be read:

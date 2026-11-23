@@ -275,9 +275,8 @@ func (r *supRig) dial(t *testing.T, uid uint32) peer {
 	t.Helper()
 	client, server := net.Pipe()
 	sc := &countingConn{Conn: server}
-	tok := AuditToken{1: uid}
 	r.creds.mu.Lock()
-	r.creds.peers[sc] = PeerCred{UID: uid, Token: tok}
+	r.creds.peers[sc] = credOf(uid, 0)
 	r.creds.mu.Unlock()
 	r.ln.conns <- sc
 	synctest.Wait()
