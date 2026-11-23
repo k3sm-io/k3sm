@@ -264,6 +264,13 @@ var (
 	// place and before its pointer flip keeps that file and returns an
 	// error matching it, never ErrCommitted.
 	ErrOrphanVersion = errors.New("a sealed version of the keystore entry lies above its current pointer, left by a crashed rotation or a copied-back pointer")
+	// ErrTombstoneEvicted reports a verb that made its change (a Delete, a
+	// Put, a Rotate, an Adopt, a RaiseFloor) but whose floor writes dropped burials,
+	// its own or other names', to stay within the floor's tombstone budget
+	// or a name's cap of buried generations: a copy of each of those deleted
+	// entries put back is accepted again. It comes with errCommitted
+	// (Committed) when the change stands.
+	ErrTombstoneEvicted = errors.New("the change is made, but the same floor write evicted tombstones to stay within the floor's tombstone budget or a name's cap of deleted generations, so a copy of each of those deleted entries put back would be accepted again; delete entries that are no longer used to make room")
 	// ErrVersionNotFound reports that the entry exists but holds no such
 	// version.
 	ErrVersionNotFound = errors.New("keystore entry version not found")

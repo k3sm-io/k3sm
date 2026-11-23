@@ -72,6 +72,14 @@ type fakeStore struct {
 	mu      sync.Mutex
 	entries map[string]fakeEntry
 	reads   int
+	// pending is what MergePending returns: set, a restore is unfinished.
+	pending error
+}
+
+func (s *fakeStore) MergePending() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pending
 }
 
 type fakeEntry struct {
@@ -278,6 +286,35 @@ func TestDeliveryRefusedWhileEncryptionOff(t *testing.T) {
 	}
 	if !strings.Contains(logs, "--"+AllowPlaintextFlag) {
 		t.Errorf("the refusal does not name the override flag\n%s", logs)
+	}
+}
+
+// TestDeliveryRefusedWhileMergePending (U192): while a restore is unfinished
+// (the store's MergePending is set), a sweep delivers nothing: no apiserver
+// call and no store read, logged at Error. Once the merge has run, the next
+// sweep delivers.
+func TestDeliveryRefusedWhileMergePending(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.store.pending = errors.New("a restore is unfinished")
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	if got := h.client.Actions(); len(got) != 0 {
+		t.Fatalf("merge pending: the apiserver saw %v, want no call", h.verbs())
+	}
+	if h.store.reads != 0 {
+		t.Fatalf("merge pending: the store was read %d times, want 0", h.store.reads)
+	}
+	if logs := h.logs.String(); !strings.Contains(logs, "level=ERROR") || !strings.Contains(logs, "keys floor merge") {
+		t.Fatalf("merge pending: logs %s; want an Error naming keys floor merge", logs)
+	}
+	h.store.mu.Lock()
+	h.store.pending = nil
+	h.store.mu.Unlock()
+	h.r.Sweep(ctx)
+	if s := h.secret(t, "payments", "api-token"); string(s.Data[DefaultDataKey]) != "tok" {
+		t.Fatalf("after the merge: data = %q, want tok", s.Data[DefaultDataKey])
 	}
 }
 

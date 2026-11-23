@@ -440,6 +440,11 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	err = u.Delete(ctx, "user/1001/pair")
 	check("UserScope.Delete", err)
 
+	// MergeFloor takes an options struct reflection cannot build: a dry
+	// run, which writes nothing, is called by hand.
+	mr, err := s.MergeFloor(ctx, MergeOptions{DryRun: true})
+	check("MergeFloor", mr, err)
+
 	err = s.Delete(ctx, "pair")
 	check("Delete", err)
 

@@ -961,12 +961,15 @@ func TestRewrapRemovesStaleNew(t *testing.T) {
 
 // TestRewrapOverFullFloor: Rewrap records nothing new in the floor, so a
 // floor with no room to raise the entries it holds does not stop it, and the
-// floor is left as it was.
+// floor is left as it was. It lowers the floor's limits
+// (setSmallFloorLimits): the floor is one byte short of room for the
+// smallest entry either way.
 func TestRewrapOverFullFloor(t *testing.T) {
+	setSmallFloorLimits(t)
 	s, server := newTestStore(t)
 	vals := seedRewrap(t, s)
 	// Neither entry is recorded, and the floor has no room to record one.
-	fillFloor(t, server, nil, maxFloorSize-minFloorEntrySize+1)
+	fillFloor(t, server, nil, floorSizeLimit-minFloorEntrySize+1)
 	before, err := os.ReadFile(floorPath(server))
 	if err != nil {
 		t.Fatal(err)

@@ -582,6 +582,18 @@ func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSiz
 	return nil
 }
 
+// errCommitted marks an error after a change was committed: the change
+// stands, and what follows it (a floor line, an audit line) was not
+// written. Unlike ErrCommitted it is joined to other sentinels: a committed
+// ErrTombstoneEvicted, or a floor merge's refusal to go on.
+var errCommitted = errors.New("the change was made")
+
+// Committed reports whether err followed a change that was committed and
+// stands: an error matching ErrCommitted, or one marked errCommitted, such
+// as a Delete whose entry was deleted though its floor write evicted
+// tombstones (ErrTombstoneEvicted).
+func Committed(err error) bool { return errors.Is(err, errCommitted) || errors.Is(err, ErrCommitted) }
+
 // deliveriesKey derives the delivery-record key from K_u.
 func deliveriesKey(ku []byte, scope string) []byte {
 	return hmacSHA256(ku, scopedLabel(deliveriesKeyLabel, scope))

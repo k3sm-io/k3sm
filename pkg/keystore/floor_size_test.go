@@ -30,6 +30,13 @@ import (
 // The tests for the floor's size bound: every floor write refuses a result
 // larger than maxFloorSize, so the floor on disk always reads back.
 
+// size is the length of fl's encoding by marshalFloor, computed without
+// encoding it: an entry's name is a checkName name and its generation hex, so
+// neither is escaped.
+func (fl floor) size() int {
+	return fl.liveSize() + fl.deadSize()
+}
+
 // nameOfLen returns a checkName name of n characters made of c.
 func nameOfLen(n int, c string) string {
 	var b strings.Builder
@@ -180,7 +187,7 @@ func TestFloorFull(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = l.update(func(fl floor) bool { return fl.set("over", [generationSize]byte{1}) })
+		_, err = l.update(func(fl floor) bool { changed, _, _ := fl.set("over", [generationSize]byte{1}); return changed })
 		l.unlock()
 		if !errors.Is(err, errFloorFull) {
 			t.Fatalf("update over the bound: %v, want errFloorFull", err)
@@ -190,8 +197,10 @@ func TestFloorFull(t *testing.T) {
 	t.Run("Delete makes room", func(t *testing.T) {
 		t.Parallel()
 		s, server, _ := setup(t)
-		if err := s.Delete(ctx, "k"); err != nil {
-			t.Fatalf("Delete in a full floor: %v", err)
+		// Over a full floor the burial is pruned in its own write: the
+		// entry is deleted, and Delete says its tombstone was evicted.
+		if err := s.Delete(ctx, "k"); !errors.Is(err, ErrTombstoneEvicted) {
+			t.Fatalf("Delete in a full floor: %v, want ErrTombstoneEvicted", err)
 		}
 		if _, ok := floorOf(t, server)["k"]; ok {
 			t.Fatal("Delete left k's floor entry")

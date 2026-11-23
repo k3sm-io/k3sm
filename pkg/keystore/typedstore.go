@@ -80,7 +80,9 @@ func (s *FileStore) putCredential(ctx context.Context, name string, kind Kind, e
 // seed drawn from the store's random seam, with comment (empty for none). It
 // returns the version and the public key's authorized_keys line; the private
 // half leaves the store only by projection. A failure after the commit point
-// returns both with an error matching ErrCommitted: the key exists.
+// returns both with an error matching ErrCommitted, and a Put whose floor
+// write drops a tombstone returns both with a committed ErrTombstoneEvicted
+// (Committed): the key exists.
 func (s *FileStore) GenerateSSH(ctx context.Context, name, comment string) (Version, string, error) {
 	seed, err := typed.GenerateSSH(s.rand)
 	if err != nil {
@@ -96,7 +98,7 @@ func (s *FileStore) GenerateSSH(ctx context.Context, name, comment string) (Vers
 		Seed:      seed,
 		Comment:   comment,
 	}})
-	if errors.Is(err, ErrCommitted) {
+	if Committed(err) {
 		return v, line, err
 	}
 	if err != nil {

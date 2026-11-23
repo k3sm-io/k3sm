@@ -262,7 +262,8 @@ func (s *FileStore) Orphan(ctx context.Context, name string) (OrphanInfo, error)
 // the record digest, so an orphan replaced after it was inspected is never
 // adopted in its place. It is attended and root-only, as Rotate is: the
 // floor is root's. A failure after the pointer flip returns the adopted
-// version with an error matching ErrCommitted.
+// version with an error matching ErrCommitted; one whose floor write drops a
+// tombstone returns it with a committed ErrTombstoneEvicted (Committed).
 //
 // Adopting is right for both causes an orphan has: after a crashed rotation
 // it completes the flip the crash interrupted, and behind a copied-back
@@ -274,7 +275,8 @@ func (s *FileStore) Adopt(ctx context.Context, name string, orphan Version) (Ver
 	version := orphan.Version
 	v, err := s.adopt(ctx, name, orphan)
 	if err != nil {
-		// v is the committed version when err is ErrCommitted.
+		// v is the committed version when err is Committed, and zero
+		// otherwise.
 		return v, fmt.Errorf("adopt %s version %d: %w", name, version, err)
 	}
 	return v, nil
@@ -304,6 +306,9 @@ func (s *FileStore) adopt(ctx context.Context, name string, want Version) (Versi
 		return Version{}, err
 	}
 	defer fdir.unlock()
+	if err := fdir.mergePending(); err != nil {
+		return Version{}, err
+	}
 	e, err := openEntry(root, name, fl)
 	if err != nil {
 		return Version{}, err
@@ -354,10 +359,14 @@ func (s *FileStore) adopt(ctx context.Context, name string, want Version) (Versi
 	if orphan.Kind != old.Kind {
 		return Version{}, fmt.Errorf("%w: version %d is %s, but %s is %s", ErrKindMismatch, version, orphan.Kind, name, old.Kind)
 	}
-	if cur >= versionLimit(old.Kind) || seq == math.MaxUint64 {
+	// The next sequence is above the floor's high-water mark, when a floor
+	// merge set one, as Rotate's is.
+	base := max(seq, fl[name].HighWater)
+	if cur >= versionLimit(old.Kind) || base == math.MaxUint64 {
 		return Version{}, fmt.Errorf("%w: the pointer is at the last version or sequence", ErrCorrupt)
 	}
-	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(e.generation[:]), Seq: seq + 1}); err != nil {
+	nextSeq := base + 1
+	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(e.generation[:]), Seq: nextSeq}); err != nil {
 		return Version{}, err
 	}
 	newLow := low
@@ -365,7 +374,7 @@ func (s *FileStore) adopt(ctx context.Context, name string, want Version) (Versi
 		newLow = cur
 	}
 	ptr := record{kind: kindPointer, name: name, generation: e.generation, created: s.now().Unix()}
-	if err := ptr.seal(k.seal, k.scope, rangePlaintext(version, seq+1, newLow), s.rand); err != nil {
+	if err := ptr.seal(k.seal, k.scope, rangePlaintext(version, nextSeq, newLow), s.rand); err != nil {
 		return Version{}, err
 	}
 	flipped, err := s.commitPointer(e, ptr.marshal())
@@ -375,20 +384,23 @@ func (s *FileStore) adopt(ctx context.Context, name string, want Version) (Versi
 	if err != nil {
 		return orphan, committedf(err, "version %d is current, but syncing its directory failed", version)
 	}
-	if _, err := fdir.update(func(fl floor) bool { return fl.raise(name, e.generation, seq+1) }); err != nil {
+	if _, err := fdir.update(func(fl floor) bool { return fl.raise(name, e.generation, nextSeq) }); err != nil {
 		return orphan, committedf(err, "version %d is current, but recording its floor failed (the next keys verb records it)", version)
 	}
+	// A tombstone the floor write dropped is reported with the version
+	// (evicted), committed, as Rotate reports it.
+	ev := evicted(fdir, nil, nil)
 	if newLow > low {
 		if err := s.step("prune " + name); err != nil {
-			return orphan, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)", version, newLow)
+			return orphan, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)%s", version, newLow, alsoEvicted(ev))
 		}
 		if err := discardOrphans(ctx, e, k, newLow, version); err != nil {
-			return orphan, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)", version, newLow)
+			return orphan, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)%s", version, newLow, alsoEvicted(ev))
 		}
 	}
 	// Metadata only: the name, the version numbers and the record digest,
 	// which reveals nothing about the value.
 	s.logger().Info("keystore: adopted an orphaned version",
 		"entry", name, "oldVersion", old.Version, "version", orphan.Version, "recordDigest", orphan.RecordDigest())
-	return orphan, nil
+	return orphan, ev
 }

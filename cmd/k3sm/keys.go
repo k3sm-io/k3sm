@@ -78,6 +78,19 @@ const keysUsage = `Usage:
         --key-in FILE only finishes an interrupted rewrap, with the key its
         --key-out saved: the recorded master.next.sha256, or a key some
         record already opens under; any other key is refused
+  sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run] [--undo]
+        after a restore, before k3sm start: merge every deleted generation
+        the floor you moved aside to keystore-floor.json.pre-restore in the
+        data root records (the only file it reads) into the restored floor, so system-store keys revoked since the
+        backup stay refused (user-scope deletions are not carried over yet). A restored entry deleted since the backup is deleted again
+        (buried live); --keep, repeatable, keeps that entry's restored
+        version live instead, for an entry you are restoring on purpose.
+        Until it runs, put, rotate, adopt and rewrap refuse; once written, the
+        file is renamed to keystore-floor.json.merged-<unix>. A merge that
+        would drop a deletion since the backup to fit the floor refuses;
+        --accept-drops writes it anyway, dropping the oldest deletions,
+        printing each one, and exits 4. --dry-run prints the report the
+        merge would make and writes and renames nothing
   sudo k3sm keys deliver system/<name> --namespace NS [--secret S] [--data-key K]
         declare that the server delivers the entry's current version as an
         Opaque Secret S (default: <name>) in NS, under data key K
@@ -107,8 +120,15 @@ Flags:
 
 Exit codes: 0 done; 1 refused or failed; 2 usage; 3 rewrap completed an
 earlier interrupted rewrap instead (run it again with a new key);
-4 the change was made (put, rotate or adopt) but a step after it failed: the
-new version is current, and the next keys verb finishes what was left.
+4 the change was made (put, rotate, rm, adopt or floor merge is done), but:
+a step after it failed (put, rotate or adopt: the new version is current,
+and the next keys verb finishes what was left); or the floor dropped a
+recorded deletion to stay within its limits, so a copy of that deleted
+entry put back is accepted; or floor merge kept an entry with --keep, left one unverified,
+moved a target aside, or carried over user-scope entries without a floor
+check (read its report); 5 floor merge written, input not renamed: rerun to
+clear the guard (it wins over 4, and the report lists any drops).
+floor merge --dry-run exits as the merge itself would.
 `
 
 // Exit codes of `k3sm keys`.
@@ -119,9 +139,22 @@ const (
 	// keysResumed is rewrap's ErrRewrapResumed: it finished an earlier
 	// rewrap under a key the operator did not supply, so it must run again.
 	keysResumed = 3
-	// keysCommitted is a write's ErrCommitted: put, rotate or adopt made its
-	// change, and a step after the commit point failed.
+	// keysCommitted is a change that was made, but not cleanly: a write's
+	// keystore.ErrCommitted (put, rotate or adopt made its change, and a
+	// step after the commit point failed); a change whose floor write
+	// dropped a recorded deletion to stay within the floor's limits: a
+	// committed keystore.ErrTombstoneEvicted from put, rotate, adopt or rm
+	// (its tree left behind, or nothing found after a raise that pruned,
+	// included), or a floor merge that reports a drop; and a floor merge
+	// (or its dry run) that keeps an entry with --keep or leaves one
+	// unverified. list and show warn of their floor raise's eviction on
+	// stderr and exit 0.
 	keysCommitted = 4
+	// keysNotRenamed is a floor merge that was written but whose input,
+	// keystore-floor.json.pre-restore, was not renamed: the guard stays,
+	// and a rerun clears it. It wins over keysCommitted; the report still
+	// lists every burial dropped.
+	keysNotRenamed = 5
 )
 
 // The keystore's two directories in the server work dir. pkg/keystore's
@@ -147,6 +180,8 @@ type keysStore interface {
 	UserScopesExist(ctx context.Context) (bool, error)
 	Orphan(ctx context.Context, name string) (keystore.OrphanInfo, error)
 	Adopt(ctx context.Context, name string, orphan keystore.Version) (keystore.Version, error)
+	MergeFloor(ctx context.Context, opts keystore.MergeOptions) (keystore.MergeReport, error)
+	MergePending() error
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -316,6 +351,42 @@ func (v *keysVerb) flagError(err error) {
 func (v *keysVerb) failf(code int, format string, a ...any) int {
 	fmt.Fprintf(v.env.stderr, "k3sm keys %s: %s\n", v.name, scrubPaths(fmt.Errorf(format, a...), v.roots...))
 	return code
+}
+
+// evictedCode prints err and returns its exit code: keysCommitted for a
+// change made whose floor write evicted tombstones (keystore.Committed and
+// keystore.ErrTombstoneEvicted), which the verb then reports as done, and
+// keysRefused for anything else.
+func (v *keysVerb) evictedCode(err error) int {
+	if keystore.Committed(err) && errors.Is(err, keystore.ErrTombstoneEvicted) {
+		return v.failf(keysCommitted, "%v", err)
+	}
+	return v.failf(keysRefused, "%v", err)
+}
+
+// raiseForRead runs the floor raise list and show make first. Its write is
+// not the change the operator asked for, so an eviction it made
+// (keystore.ErrTombstoneEvicted) is a warning on stderr and keysOK; any
+// other failure refuses the verb.
+func (v *keysVerb) raiseForRead(ctx context.Context, s keysStore) int {
+	err := s.RaiseFloor(ctx)
+	switch {
+	case err == nil:
+		return keysOK
+	case errors.Is(err, keystore.ErrTombstoneEvicted):
+		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: %s\n", v.name, scrubPaths(err, v.roots...))
+		return keysOK
+	}
+	return v.failf(keysRefused, "%v", err)
+}
+
+// warnMergePending prints a warning on stderr while a restore is unfinished
+// (s.MergePending): the read verbs still read the restored entries, which
+// the merge may yet delete again.
+func (v *keysVerb) warnMergePending(s keysStore) {
+	if err := s.MergePending(); err != nil {
+		fmt.Fprintf(v.env.stderr, "k3sm keys %s: warning: a restore is unfinished: these are the restored entries before sudo k3sm keys floor merge has run, which may delete some of them again (%s)\n", v.name, scrubPaths(err, v.roots...))
+	}
 }
 
 // requireRoot refuses unless the verb runs as root: the master and entries
@@ -494,6 +565,8 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 		return keysAdopt(ctx, rest, env)
 	case "rewrap":
 		return keysRewrap(ctx, rest, env)
+	case "floor":
+		return keysFloor(ctx, rest, env)
 	case "deliver":
 		return keysDeliver(ctx, rest, env)
 	case "undeliver":
@@ -623,15 +696,20 @@ func keysPut(ctx context.Context, args []string, env keysEnv) int {
 	}
 	defer clear(value)
 	ver, err := s.Put(ctx, name, kind, value)
+	code = keysOK
 	if errors.Is(err, keystore.ErrCommitted) {
-		fmt.Fprintf(env.stdout, "created %s at version %d (%s, fingerprint %s)\n", qualify(name), ver.Version, ver.Kind, ver.Fingerprint)
-		return v.failf(keysCommitted, "%v", err)
+		// The change stands: it is reported as made, and the exit says a
+		// later step failed.
+		code = v.failf(keysCommitted, "%v", err)
+		err = nil
 	}
 	if err != nil {
-		return v.failf(keysRefused, "%v", err)
+		if code = v.evictedCode(err); code == keysRefused {
+			return code
+		}
 	}
 	fmt.Fprintf(env.stdout, "created %s at version %d (%s, fingerprint %s)\n", qualify(name), ver.Version, ver.Kind, ver.Fingerprint)
-	return keysOK
+	return code
 }
 
 func keysRotate(ctx context.Context, args []string, env keysEnv) int {
@@ -675,19 +753,24 @@ func keysRotate(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	ver, err := s.Rotate(ctx, name, value)
+	code = keysOK
 	if errors.Is(err, keystore.ErrCommitted) {
-		fmt.Fprintf(env.stdout, "rotated %s to version %d (fingerprint %s)\n", qualify(name), ver.Version, ver.Fingerprint)
-		return v.failf(keysCommitted, "%v", err)
+		// The change stands: it is reported as made, and the exit says a
+		// later step failed.
+		code = v.failf(keysCommitted, "%v", err)
+		err = nil
 	}
 	if err != nil {
-		return v.failf(keysRefused, "%v", err)
+		if code = v.evictedCode(err); code == keysRefused {
+			return code
+		}
 	}
 	if fromSet {
 		fmt.Fprintf(env.stdout, "rotated %s to version %d, a copy of version %d (fingerprint %s)\n", qualify(name), ver.Version, *from, ver.Fingerprint)
-		return keysOK
+		return code
 	}
 	fmt.Fprintf(env.stdout, "rotated %s to version %d (fingerprint %s)\n", qualify(name), ver.Version, ver.Fingerprint)
-	return keysOK
+	return code
 }
 
 // keysListEntry is one entry of `keys list -o json`.
@@ -744,15 +827,17 @@ func keysList(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	if err := s.RaiseFloor(ctx); err != nil {
-		return v.failf(keysRefused, "%v", err)
+	v.warnMergePending(s)
+	raised := v.raiseForRead(ctx, s)
+	if raised != keysOK {
+		return raised
 	}
 	entries, err := s.List(ctx)
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
 	rows := make([]keysListEntry, 0, len(entries))
-	code := keysOK
+	code := raised
 	for _, e := range entries {
 		r := keysEntryStatus(e, v.roots...)
 		if r.Status != "ok" {
@@ -808,8 +893,10 @@ func keysShow(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	if err := s.RaiseFloor(ctx); err != nil {
-		return v.failf(keysRefused, "%v", err)
+	v.warnMergePending(s)
+	raised := v.raiseForRead(ctx, s)
+	if raised != keysOK {
+		return raised
 	}
 	if !*reveal {
 		ver, err := showMetadata(ctx, s, name, *version)
@@ -821,7 +908,7 @@ func keysShow(ctx context.Context, args []string, env keysEnv) int {
 		fmt.Fprintf(env.stdout, "version:     %d\n", ver.Version)
 		fmt.Fprintf(env.stdout, "created:     %s\n", ver.Created.UTC().Format(time.RFC3339))
 		fmt.Fprintf(env.stdout, "fingerprint: %s\n", ver.Fingerprint)
-		return keysOK
+		return raised
 	}
 	var value []byte
 	if *version != 0 {
@@ -836,7 +923,7 @@ func keysShow(ctx context.Context, args []string, env keysEnv) int {
 	if _, err := env.stdout.Write(value); err != nil {
 		return v.failf(keysRefused, "write: %v", err)
 	}
-	return keysOK
+	return raised
 }
 
 // showMetadata is one version's metadata, taken from List so the verb never
@@ -889,11 +976,191 @@ func keysRm(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
+	// rm runs while a restore is unfinished, so it can make room for a
+	// merge refused because the floor is full; it warns as list and show do.
+	v.warnMergePending(s)
+	code = keysOK
 	if err := s.Delete(ctx, name); err != nil {
-		return v.failf(keysRefused, "%v", err)
+		// A Delete whose floor write evicted tombstones exits
+		// keysCommitted; it is reported as done when it deleted the entry,
+		// its tree left behind included (keystore.DeleteDone), and not when
+		// only a floor raise before it wrote (ErrNotFound, say).
+		if code = v.evictedCode(err); code == keysRefused {
+			return code
+		}
+		if !keystore.DeleteDone(err) {
+			return code
+		}
 	}
 	fmt.Fprintf(env.stdout, "deleted %s\n", qualify(name))
 	v.warnDeclared(name)
+	return code
+}
+
+// keepFlag is floor merge's repeatable --keep system/<name>: the names whose
+// restored generation the merge keeps live. A value parseKeyName refuses is
+// refused without being echoed.
+type keepFlag []string
+
+func (k *keepFlag) String() string { return strings.Join(*k, ",") }
+
+func (k *keepFlag) Set(q string) error {
+	name, err := parseKeyName(q)
+	if err != nil {
+		return err
+	}
+	*k = append(*k, name)
+	return nil
+}
+
+// keysFloor is "k3sm keys floor merge [--keep system/<name>]...
+// [--accept-drops] [--dry-run] [--undo]": it
+// merges the deleted generations the data root's moved-aside floor,
+// keystore-floor.json.pre-restore, records into the live floor a restore put back (keystore.FileStore.MergeFloor),
+// keeping live the restored generation of each entry --keep names, and
+// prints a summary:
+//
+//	merged N
+//	already present N
+//	buried live N
+//	kept N
+//	retired N
+//	dropped N
+//	fenced N
+//
+// then one line per entry buried live ("buried live system/<name>: ..."),
+// kept ("kept system/<name>: ..."), retired ("retired system/<name>: ...")
+// and per burial dropped ("dropped
+// system/<name>: ..."), preceded by "already merged" when the live floor
+// already held everything the input records (a rerun: nothing is written,
+// the input is only renamed). It exits 0 when the merge is written,
+// keysCommitted, the report printed, when it is written but dropped a
+// burial, and keysNotRenamed, the report printed, when it is written but
+// its input could not be renamed or the restored tree not moved
+// (keystore.Committed), which wins, a rerun or dry run that finds the floor
+// already written and refuses what is staged included.
+// keysCommitted also marks a merge that kept an entry (--keep), left one
+// unverified, or moved aside what it found at the keystore directory; --dry-run exits as the merge itself would.
+func keysFloor(ctx context.Context, args []string, env keysEnv) int {
+	if len(args) == 0 || args[0] != "merge" {
+		fmt.Fprintln(env.stderr, "k3sm keys floor: want: sudo k3sm keys floor merge [--keep system/<name>]... [--accept-drops] [--dry-run] [--undo]")
+		return keysBadUsage
+	}
+	v := newKeysVerb("floor merge", env)
+	var keep keepFlag
+	v.fs.Var(&keep, "keep", "keep this entry's restored version live (system/<name>; repeatable)")
+	acceptDrops := v.fs.Bool("accept-drops", false, "write a merge that has to drop deletions since the backup to fit the floor, printing each one")
+	dryRun := v.fs.Bool("dry-run", false, "print the report the merge would make; write and rename nothing")
+	undo := v.fs.Bool("undo", false, "the reverse merge of an undo: report the versions the restore retired apart from the entries deleted since")
+	pos, err := v.parse(args[1:])
+	if err != nil {
+		return keysBadUsage
+	}
+	if len(pos) != 0 {
+		return v.failf(keysBadUsage, "takes no file: it reads only keystore-floor.json.pre-restore in the data root, the floor the restore recipe moves aside")
+	}
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	r, err := s.MergeFloor(ctx, keystore.MergeOptions{Keep: keep, AcceptDrops: *acceptDrops, DryRun: *dryRun, Undo: *undo})
+	// A dry run refused for the drops it would make prints that report
+	// first.
+	if err != nil && !keystore.Committed(err) && (!*dryRun || len(r.Dropped) == 0) {
+		return v.failf(keysRefused, "%v", err)
+	}
+	if *dryRun {
+		fmt.Fprintln(env.stdout, "dry run: nothing written")
+	}
+	if r.AlreadyMerged {
+		fmt.Fprintln(env.stdout, "already merged")
+	}
+	if r.MovedAside != "" {
+		// Something was planted where the recipe leaves nothing: a report
+		// line, and on stderr too.
+		dir, to := filepath.Join(v.roots[0], keystoreSubdir), filepath.Join(v.roots[2], "pre-restore.d", r.MovedAside)
+		verb, verbIt := "moved aside", "moved it aside"
+		if *dryRun {
+			verb, verbIt = "would move aside", "would move it aside"
+		}
+		fmt.Fprintf(env.stdout, "%s %s %s to %s: the restore recipe leaves it absent while the restored keystore/ is staged, so the merge moves it into the root-only pre-restore.d, out of the service user's reach, unread\n", verb, r.MovedAsideType, dir, to)
+		fmt.Fprintf(env.stderr, "k3sm keys floor merge: warning: %s was not absent while the restored keystore/ was staged: the merge %s, a %s, to %s; inspect it there\n", dir, verbIt, r.MovedAsideType, to)
+	}
+	fmt.Fprintf(env.stdout, "merged %d\nalready present %d\nburied live %d\nkept %d\nretired %d\ndropped %d\nfenced %d\n", r.Merged, r.AlreadyPresent, len(r.BuriedLive), len(r.Kept), len(r.Retired), len(r.Dropped), len(r.Fenced))
+	for _, name := range r.BuriedLive {
+		switch {
+		case slices.Contains(r.RetiredByRestore, name):
+			fmt.Fprintf(env.stdout, "buried live %s: retired by the restore: pass --keep %s to bring it back; without it the merge buries it and removes its files\n", qualify(name), qualify(name))
+		case slices.Contains(r.DeletedSinceRestore, name):
+			fmt.Fprintf(env.stdout, "buried live %s: deleted since the restore: stays deleted, and the merge removes its files\n", qualify(name))
+		default:
+			fmt.Fprintf(env.stdout, "buried live %s: the floor moved aside records this version as deleted, so the merge buries it and removes its restored files\n", qualify(name))
+		}
+	}
+	revoked := 0
+	for _, name := range r.Kept {
+		if slices.Contains(r.Recorded, name) {
+			fmt.Fprintf(env.stdout, "kept %s: recorded the moved-aside version as current, as --keep asked: the restored floor holds no record of this entry\n", qualify(name))
+			continue
+		}
+		revoked++
+		fmt.Fprintf(env.stdout, "kept %s: revoked, kept live: the floor moved aside records it as deleted since the backup, and --keep keeps the restored version live; if that deletion revoked the key, the revoked key is live again\n", qualify(name))
+		// A downgrade of what the floor refuses, so on stderr too.
+		fmt.Fprintf(env.stderr, "k3sm keys floor merge: warning: %s is kept live as --keep asked, though the floor moved aside records it as deleted since the backup; if that deletion revoked the key, the revoked key is live again\n", qualify(name))
+	}
+	for _, name := range r.Retired {
+		fmt.Fprintf(env.stdout, "retired %s: its version current before the restore is not the restored one, so a copy of it put back is refused\n", qualify(name))
+	}
+	for _, name := range r.Unverified {
+		fmt.Fprintf(env.stdout, "unverified %s: the restored pointer did not authenticate under the master, or is more than one version past the restored floor's record, so the merge leaves that record as the restored floor holds it: a copy below the recorded version is refused; one at it is accepted; one past it is accepted unless the merge fenced the entry, when one past it and at or below the fence is refused until a rotate numbers past the fence\n", qualify(name))
+	}
+	for _, name := range r.AsideUnverified {
+		fmt.Fprintf(env.stdout, "unverified %s: the moved-aside pointer, in pre-restore.d/keystore, did not authenticate under the master, so the merge fences the entry one past the version the floor moved aside records, not past that pointer: a copy from before the restore numbered above that version may be accepted\n", qualify(name))
+	}
+	for _, name := range r.Dropped {
+		fmt.Fprintf(env.stdout, "dropped %s: a deleted generation dropped to keep the floor within its caps; a copy of it put back is accepted\n", qualify(name))
+	}
+	if r.UserScoped {
+		fmt.Fprintln(env.stdout, "user scope: the restored keystore holds user-scope entries, and the floor this merge writes is the system store's: user-scope deletions since the backup are not carried over until the user-scope floor lands, so a user/<uid>/ entry deleted since the backup is back")
+	}
+	if *dryRun && err != nil && !keystore.Committed(err) {
+		return v.failf(keysRefused, "%v", err)
+	}
+	if err != nil {
+		// Written, but the input was not renamed or the tree not moved: the
+		// report above stands, drops included, and a rerun finishes it. A
+		// dry run that finds an earlier run's floor written exits so too.
+		return v.failf(keysNotRenamed, "%v; to recover, fix what this names, leave keystore-floor.json and keystore-floor.json.pre-restore as they are, and run sudo k3sm keys floor merge again: it never plans the written merge again, only finishes the steps after the floor write (docs/user/keys.md)", err)
+	}
+	// Done, but what the floor refuses changed in a way to read: a drop, a
+	// kept entry, an unverified one, a target moved aside, or user-scope
+	// entries carried over unchecked. A dry run exits as the merge would.
+	var why []string
+	if n := len(r.Dropped); n > 0 {
+		why = append(why, fmt.Sprintf("dropped %d deleted generation(s) to keep the floor within its caps", n))
+	}
+	if n := len(r.Kept); n > 0 {
+		why = append(why, fmt.Sprintf("kept %d entr(y/ies) with --keep (%d revoked since the backup)", n, revoked))
+	}
+	if n := len(unionStrings(r.Unverified, r.AsideUnverified)); n > 0 {
+		why = append(why, fmt.Sprintf("left %d entr(y/ies) unverified", n))
+	}
+	if r.MovedAside != "" {
+		why = append(why, fmt.Sprintf("moved aside the %s it found at the keystore directory", r.MovedAsideType))
+	}
+	if r.UserScoped {
+		why = append(why, "carried over the restored user-scope entries without a floor check, so a user/<uid>/ entry deleted since the backup is back")
+	}
+	if len(why) > 0 {
+		lead := "the merge is written, but it"
+		if *dryRun {
+			lead = "dry run: the merge would be written, but it"
+		}
+		return v.failf(keysCommitted, "%s %s; read the report above", lead, strings.Join(why, "; "))
+	}
 	return keysOK
 }
 
@@ -941,15 +1208,18 @@ func keysAdopt(ctx context.Context, args []string, env keysEnv) int {
 		}
 	}
 	ver, err := s.Adopt(ctx, name, info.Orphan)
+	code = keysOK
 	if errors.Is(err, keystore.ErrCommitted) {
-		fmt.Fprintf(env.stdout, "adopted %s version %d: it is current\n", qualify(name), ver.Version)
-		return v.failf(keysCommitted, "%v", err)
+		code = v.failf(keysCommitted, "%v", err)
+		err = nil
 	}
 	if err != nil {
-		return v.failf(keysRefused, "%v", err)
+		if code = v.evictedCode(err); code == keysRefused {
+			return code
+		}
 	}
 	fmt.Fprintf(env.stdout, "adopted %s version %d: it is current\n", qualify(name), ver.Version)
-	return keysOK
+	return code
 }
 
 // printAdoptSide prints the metadata `keys adopt` shows under one side's
@@ -990,6 +1260,17 @@ func confirmed(r io.Reader) bool {
 	}
 	answer := strings.ToLower(strings.TrimSpace(string(line)))
 	return answer == "y" || answer == "yes"
+}
+
+// unionStrings is the strings in a or b, without repeats.
+func unionStrings(a, b []string) []string {
+	out := slices.Clone(a)
+	for _, x := range b {
+		if !slices.Contains(out, x) {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // keyOutFile is a key file writeKeyOut wrote, held through the directory
