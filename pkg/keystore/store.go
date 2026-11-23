@@ -371,6 +371,57 @@ func (s *FileStore) Current(ctx context.Context, name string) (Version, []byte, 
 	return v, val, err
 }
 
+// Absent reports whether name is definitively not an entry, for a caller
+// that must act on a deletion (the delivery reconciler deletes the Secret it
+// delivered for a deleted entry). Current answers ErrNotFound both for a
+// name with no entry and for an entries' directory that is not there; only
+// the first is an answer about name, since a data root restored without its
+// keystore, or not yet mounted, is not every entry deleted. So Absent is true
+// only when the entries' directory opens and is trusted under the shared
+// lock, the recorded floor reads, and name has no directory there or holds
+// only what an interrupted Put leaves (not an entry, as for Current). A
+// missing entries' directory, an entry Current reports as corrupt (a lost
+// pointer included) and any other failure is false with the error. It reads
+// no record and does not load the master key, so it names no value.
+func (s *FileStore) Absent(ctx context.Context, name string) (bool, error) {
+	absent, err := s.absent(ctx, name)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", name, err)
+	}
+	return absent, nil
+}
+
+func (s *FileStore) absent(ctx context.Context, name string) (bool, error) {
+	if err := s.checkConfig(); err != nil {
+		return false, err
+	}
+	if err := checkName(name); err != nil {
+		return false, err
+	}
+	// Unlike read, a missing entries' directory stays fs.ErrNotExist: it is
+	// not an answer about name.
+	root, done, err := s.openLocked(ctx, false, false)
+	if err != nil {
+		return false, err
+	}
+	defer done()
+	fdir, fl, err := s.openFloor()
+	if err != nil {
+		return false, err
+	}
+	_ = fdir.Close() // read-only; nothing to flush
+	e, err := openEntry(root, name, fl)
+	switch {
+	case err == nil:
+		e.close()
+		return false, nil
+	case errors.Is(err, ErrNotFound):
+		return true, nil
+	default:
+		return false, err
+	}
+}
+
 // Get returns version of name with its value. A version above the one the
 // current pointer names is ErrVersionNotFound: it is not yet committed.
 func (s *FileStore) Get(ctx context.Context, name string, version uint64) (Version, []byte, error) {
