@@ -550,9 +550,13 @@ type logState struct {
 	// unrecovered marks a whole line with a bad checksum that no unique
 	// single-bit correction recovers, and unrecoveredAt the start of the
 	// latest (userfloor_taint.go): every generation of every key is
-	// refused while it counts.
-	unrecovered   bool
-	unrecoveredAt int64
+	// refused while it counts. unrecoveredN counts those lines and
+	// unrecoveredOffs holds the start of the first maxUnrecoveredOffsets
+	// of them, in file order, for root's review (floorAckView).
+	unrecovered     bool
+	unrecoveredAt   int64
+	unrecoveredN    int
+	unrecoveredOffs []int64
 	// frozen holds the torn last line's bytes as first read, by its
 	// offset: its classification is fixed there. The line that later
 	// starts at that offset is damage unless it is exactly those bytes and

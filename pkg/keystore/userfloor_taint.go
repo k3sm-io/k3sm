@@ -83,6 +83,9 @@ const (
 	// are each a line's field, so 64 entries hold at most 64 lines' bytes:
 	// the count is the only cap.
 	maxTaintKeys = 64
+	// maxUnrecoveredOffsets caps the unrecovered lines' offsets the state
+	// keeps for root's review; their count is never capped.
+	maxUnrecoveredOffsets = 64
 )
 
 // taintKind is what a damaged floor line could have been.
@@ -250,6 +253,13 @@ func (s *logState) taintLine(off int64, line []byte) {
 		return
 	}
 	s.unattributable(off)
+	if s.unrecovered && off == s.unrecoveredAt {
+		return
+	}
+	s.unrecoveredN++
+	if len(s.unrecoveredOffs) < maxUnrecoveredOffsets {
+		s.unrecoveredOffs = append(s.unrecoveredOffs, off)
+	}
 	if !s.unrecovered || off > s.unrecoveredAt {
 		s.unrecovered, s.unrecoveredAt = true, off
 	}

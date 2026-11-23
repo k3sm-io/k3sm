@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 
 	"golang.org/x/sys/unix"
@@ -161,53 +162,84 @@ func (s *FileStore) readFloorAck() (floorAck, bool) {
 var errAckNotRoot = errors.New("acknowledging the user-scope floor's damage is root maintenance")
 
 // errAckStale refuses ackFloorDamage when the floor is not the one root
-// reviewed: its size or its count of unattributable damaged lines changed.
+// reviewed: its size, its count of unattributable damaged lines or its
+// count of unrecovered lines changed.
 var errAckStale = errors.New("the user-scope floor changed since its damage was reviewed; review it again before acknowledging")
 
+// floorReview is what root reviews before it acknowledges the floor's
+// damage (floorAckView), and what ackFloorDamage compares again under the
+// lock. size is the floor's size; unattributable counts its unattributable
+// damaged lines, the torn last line and the unrecovered lines included;
+// unrecovered counts the unrecovered lines alone (logState.unrecovered),
+// each a line that could have been any key's tombstone, and unrecoveredAt
+// holds the byte offsets where the first maxUnrecoveredOffsets of them
+// start, in file order. Acknowledging a floor with unrecovered lines
+// accepts that a tombstone one of them held may stay lost: past the
+// watermark every known generation is served again, and a copy back of a
+// generation whose tombstone was there is no longer refused by it.
+type floorReview struct {
+	size           int64
+	unattributable int
+	unrecovered    int
+	unrecoveredAt  []int64
+}
+
 // floorAckView is what root reviews before it acknowledges the floor's
-// damage: the floor's size and its count of unattributable damaged lines,
-// the torn last line included, which ackFloorDamage compares again under
-// the lock.
+// damage: the floor's size, its damage counts and the unrecovered lines'
+// offsets (floorReview), which ackFloorDamage compares again under the
+// lock.
 //
 //lint:ignore U1000 root maintenance calls it once its verb lands; until then the tests hold it.
-func (s *FileStore) floorAckView(ctx context.Context) (size int64, unattributable int, err error) {
+func (s *FileStore) floorAckView(ctx context.Context) (floorReview, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, 0, err
+		return floorReview{}, err
 	}
 	ff, ok := s.userFloor.(*fileFloorLog)
 	if !ok {
-		return 0, 0, errors.New("the store has no file-backed user-scope floor to acknowledge")
+		return floorReview{}, errors.New("the store has no file-backed user-scope floor to acknowledge")
 	}
 	f, st, err := ff.log.open(unix.O_RDONLY)
 	if err != nil {
 		ff.log.forgetUnflagged(err, false)
-		return 0, 0, err
+		return floorReview{}, err
 	}
 	defer func() { _ = f.Close() }() // read-only
 	ff.log.mu.Lock()
 	defer ff.log.mu.Unlock()
 	state, err := ff.log.sync(f, st)
 	if err != nil {
-		return 0, 0, err
+		return floorReview{}, err
 	}
-	return st.Size, state.unattributableLines(), nil
+	return reviewOf(st.Size, state), nil
+}
+
+// reviewOf is the floor's review at size from its state. The caller holds
+// the floor's mutex.
+func reviewOf(size int64, state *logState) floorReview {
+	return floorReview{
+		size:           size,
+		unattributable: state.unattributableLines(),
+		unrecovered:    state.unrecoveredN,
+		unrecoveredAt:  slices.Clone(state.unrecoveredOffs),
+	}
 }
 
 // ackFloorDamage records, as root, the acknowledgement of the floor's damage
 // as it stands, compare-and-set: under the exclusive store lock and the
-// floor's mutex it refuses (errAckStale) unless the floor's size is
-// wantSize and its count of unattributable damaged lines is wantDamage, the
-// figures root reviewed (floorAckView), then writes the floor file's inode
-// and birth time and that size as the watermark through the data-root
-// descriptor it judged. Still under the store lock it then runs the start
-// step's catch-up again, when the user scope is started, so a scope
-// quarantined only by acknowledged damage is served; a scope a taint still
-// refuses stays quarantined, and no catch-up line is written for a
-// generation whose key a damaged line could name. It is root maintenance
-// with no verb yet.
+// floor's mutex it refuses (errAckStale) unless the floor's size, its count
+// of unattributable damaged lines and its count of unrecovered lines are
+// want's, the figures root reviewed (floorAckView), then writes the floor
+// file's inode and birth time and that size as the watermark through the
+// data-root descriptor it judged. Acknowledging unrecovered lines accepts
+// that a tombstone one of them held may stay lost (floorReview). Still
+// under the store lock it then runs the start step's catch-up again, when
+// the user scope is started, so a scope quarantined only by acknowledged
+// damage is served; a scope a taint still refuses stays quarantined, and
+// no catch-up line is written for a generation whose key a damaged line
+// could name. It is root maintenance with no verb yet.
 //
 //lint:ignore U1000 root maintenance calls it once its verb lands; until then the tests hold it.
-func (s *FileStore) ackFloorDamage(ctx context.Context, wantSize int64, wantDamage int) error {
+func (s *FileStore) ackFloorDamage(ctx context.Context, want floorReview) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -226,7 +258,7 @@ func (s *FileStore) ackFloorDamage(ctx context.Context, wantSize int64, wantDama
 		return err
 	}
 	defer done()
-	if err := s.writeFloorAck(ff, wantSize, wantDamage); err != nil {
+	if err := s.writeFloorAck(ff, want); err != nil {
 		return err
 	}
 	if s.userScopesStarted == nil || !s.userScopesStarted.Load() {
@@ -242,7 +274,7 @@ func (s *FileStore) ackFloorDamage(ctx context.Context, wantSize int64, wantDama
 
 // writeFloorAck is ackFloorDamage's compare and write, under the floor's
 // mutex. The caller holds the exclusive store lock.
-func (s *FileStore) writeFloorAck(ff *fileFloorLog, wantSize int64, wantDamage int) error {
+func (s *FileStore) writeFloorAck(ff *fileFloorLog, want floorReview) error {
 	f, st, err := ff.log.open(unix.O_RDONLY)
 	if err != nil {
 		ff.log.forgetUnflagged(err, false)
@@ -255,7 +287,7 @@ func (s *FileStore) writeFloorAck(ff *fileFloorLog, wantSize int64, wantDamage i
 	if err != nil {
 		return err
 	}
-	if st.Size != wantSize || state.unattributableLines() != wantDamage {
+	if got := reviewOf(st.Size, state); got.size != want.size || got.unattributable != want.unattributable || got.unrecovered != want.unrecovered {
 		return errAckStale
 	}
 	dfd, err := s.openLogDataRoot()
