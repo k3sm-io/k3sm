@@ -1009,6 +1009,43 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 	return l.revokeRoom(state, st.Size, uid, maxAppendLine)
 }
 
+// revokeRoomFor refuses, as ErrLogFull, n more bytes of uid's revocation
+// lines, appended now, several appends at once: when they would take the
+// log past logReadBound, or their bytes that could start at or past the
+// hard cap (at most all of n, and at most what lands past the cap) past
+// uid's revocation budget. A log that cannot be opened or read is no
+// answer here, as for room.
+func (l *appendLog) revokeRoomFor(uid uint32, n int64) error {
+	f, st, err := l.open(unix.O_RDONLY)
+	if err != nil {
+		l.forgetUnflagged(err, false)
+		return nil
+	}
+	defer func() { _ = f.Close() }() // read-only
+	if st.Size+n <= l.s.logHardCap {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	state, err := l.sync(f, st)
+	if err != nil || state.bad != nil {
+		return nil
+	}
+	if st.Size+n > l.s.logReadBound() {
+		return l.pastCap()
+	}
+	return l.revokeRoom(state, st.Size, uid, min(n, st.Size+n-l.s.logHardCap))
+}
+
+// auditRevokeRoom refuses, as ErrLogFull, n more bytes of uid's revocation
+// audit lines on the file-backed audit log (revokeRoomFor).
+func (s *FileStore) auditRevokeRoom(uid uint32, n int64) error {
+	if a, ok := s.auditSink.(*fileAuditLog); ok {
+		return a.log.revokeRoomFor(uid, n)
+	}
+	return nil
+}
+
 // grantKeys is the most keys one grant adds to the floor: a put that mints
 // its scope adds the delivery record's key and the entry's.
 const grantKeys = 2

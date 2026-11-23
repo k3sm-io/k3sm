@@ -847,18 +847,30 @@ func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (err error) 
 		revoke := revoked && (err == nil || errors.Is(err, errCommitted))
 		l := auditLine{op: "withdraw", namespace: ns, delivery: id, revoke: revoke}
 		aerr := u.appendAudit(l, err)
-		// A mass seal under a delivery-record taint withdrew others too:
-		// each gets its own line, in the revocation class.
-		for _, d := range sealed {
-			if aerr != nil || !revoke {
-				break
-			}
-			aerr = u.appendAudit(auditLine{op: "withdraw", namespace: d.namespace, delivery: d.uid, revoke: true}, err)
+		if revoke && len(sealed) > 0 {
+			aerr = errors.Join(aerr, u.auditSealed(sealed, err))
 		}
 		err = u.keepAuditFailure("withdraw", err, aerr)
 	}()
 	ns, revoked, sealed, err = u.withdrawBody(root, uid)
 	return err
+}
+
+// auditSealed appends the audit line of each delivery a mass seal under a
+// delivery-record taint withdrew besides the one named, in the revocation
+// class: it attempts every line, keeps going past a failure, and reports
+// how many it wrote alongside every failure (errCommitted).
+func (u *UserScope) auditSealed(sealed []delivery, err error) error {
+	var errs []error
+	for _, d := range sealed {
+		if aerr := u.appendAudit(auditLine{op: "withdraw", namespace: d.namespace, delivery: d.uid, revoke: true}, err); aerr != nil {
+			errs = append(errs, aerr)
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("the audit lines of the deliveries the withdraw sealed: %d of %d written: %w", len(sealed)-len(errs), len(sealed), errors.Join(errs...))
 }
 
 // withdrawBody is withdrawLocked's work under the lock. It returns the
@@ -935,6 +947,12 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, []del
 					sealed = append(sealed, ds[j])
 				}
 				ds[j].withdrawn = true
+			}
+			// Every delivery it seals is audited, each on its own line
+			// after the withdraw's own: the audit log must hold all of
+			// them, whole appends, before anything is sealed.
+			if err := u.s.auditRevokeRoom(u.uid, int64(1+len(sealed))*maxAppendLine); err != nil {
+				return ns, false, nil, err
 			}
 		}
 		if seq == math.MaxUint64 {
