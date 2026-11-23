@@ -121,7 +121,9 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 	if err := s.eligibleUID(uid); err != nil {
 		return RemoveScopeResult{}, err
 	}
-	root, err := s.openDir(s.dir, false)
+	// keystore/ is opened whatever its mode, its owner still the service
+	// user's (openDirForRm): the serving path's mode check stays.
+	root, err := s.openDirForRm(s.dir)
 	if err != nil {
 		return RemoveScopeResult{}, err
 	}

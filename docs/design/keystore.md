@@ -2829,10 +2829,10 @@ service user can only add to.
   uid (a floor without a whole identity, as on a file system with no birth time, keeps the
   listed scope's own lines and so always trips it).
 
-  *Directory mode.* rm-scope's judge, and only it, reads through the mode of `.user` and of
-  the scope directory, which the service user can set (a judge that refused it would let the
-  principal being revoked veto its revocation): either is opened by descriptor whatever its
-  mode, its owner still the service user's, and the take forces the scope directory to 0700;
+  *Directory mode.* rm-scope, and only it, reads through the mode of `keystore/`, of `.user`
+  and of the scope directory, which the service user can set (a judge that refused it would
+  let the principal being revoked veto its revocation): each is opened by descriptor whatever
+  its mode, its owner still the service user's, and the take forces the scope directory to 0700;
   the serving path still refuses any mode wider than 0700. So a take stopped at any step, the
   first `fchmod` included, leaves a directory a rerun finishes.
 

@@ -99,6 +99,37 @@ func (s *FileStore) openDir(path string, create bool) (*os.Root, error) {
 	return root, nil
 }
 
+// openDirForRm is openDir for rm-scope only, never for a serving path,
+// and never creating: the keystore directory at path must be the service
+// user's, but its mode is not judged. The service user can set it, and a
+// mode check would let the principal being revoked veto its revocation,
+// as with .user and the scope directory (openScopeDirForRm).
+func (s *FileStore) openDirForRm(path string) (*os.Root, error) {
+	named, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !named.IsDir() {
+		return nil, fmt.Errorf("%s is not a directory (mode %s)", path, named.Mode())
+	}
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := root.Stat(".")
+	if err == nil && !os.SameFile(named, opened) {
+		err = errors.New("changed while it was opened")
+	}
+	if err == nil {
+		err = s.checkOwned(opened, fs.ModePerm)
+	}
+	if err != nil {
+		_ = root.Close() // the open is abandoned; its close has nothing to report
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return root, nil
+}
+
 // openSubdir is openDir for the directory name inside parent, created with
 // mkdirAt, so the open never leaves parent.
 func (s *FileStore) openSubdir(parent *os.Root, name string, create bool) (*os.Root, error) {

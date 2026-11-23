@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// The service user can keep its scope directory, or .user, at a mode other
+// The service user can keep its scope directory, .user or keystore/ at a mode other
 // than 0700; that does not let the principal being revoked veto its
 // revocation: rm-scope's judge opens either directory whatever its mode
 // (the owner rule is unchanged), so the scope is judged, listed and
@@ -37,6 +37,7 @@ func TestRmScopeDirectoryModeCannotVeto(t *testing.T) {
 		{"scope directory 0750", func(server string) string { return scopeDir(server, "1001") }, 0o750},
 		{"scope directory 0777", func(server string) string { return scopeDir(server, "1001") }, 0o777},
 		{".user 0755", func(server string) string { return filepath.Dir(scopeDir(server, "1001")) }, 0o755},
+		{"keystore 0750", func(server string) string { return filepath.Join(server, "keystore") }, 0o750},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, server, _ := fileLogScope(t)
@@ -44,13 +45,20 @@ func TestRmScopeDirectoryModeCannotVeto(t *testing.T) {
 				t.Fatal(err)
 			}
 			root, err := s.openDir(s.dir, false)
-			if err != nil {
-				t.Fatal(err)
+			if tc.dir(server) == s.dir {
+				if err == nil {
+					_ = root.Close()
+					t.Errorf("the serving path's opener of keystore/ at mode %#o accepted it", tc.mode)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := rmScopeOf(s, 1001).openScopeDir(root, false); !errors.Is(err, ErrCorrupt) {
+					t.Errorf("the serving path's opener at mode %#o: %v, want ErrCorrupt", tc.mode, err)
+				}
+				_ = root.Close()
 			}
-			if _, err := rmScopeOf(s, 1001).openScopeDir(root, false); !errors.Is(err, ErrCorrupt) {
-				t.Errorf("the serving path's opener at mode %#o: %v, want ErrCorrupt", tc.mode, err)
-			}
-			_ = root.Close()
 			res, err := s.RemoveScope(t.Context(), 1001)
 			if err != nil || !res.Recorded {
 				t.Fatalf("rm-scope with %s: %v, recorded %v; want removed and listed", tc.name, err, res.Recorded)
