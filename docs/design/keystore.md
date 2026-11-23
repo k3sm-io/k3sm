@@ -2849,10 +2849,14 @@ service user can only add to.
   other is refused, nothing taken (exit 1, or exit 4 when this run already changed the record).
 
   *Honest limits.* The final `rmdir` races a rename
-  at the name, which the probe below reports but cannot prevent. *Open item:* the delivery
-  check before the removal reads the delivery record without the rollback floor, so a
-  rolled-back authentic record naming no deliveries passes without a note; this is not fixed
-  yet.
+  at the name, which the probe below reports but cannot prevent.
+
+  *The delivery check.* The judged path reads the delivery record through the floored reader a
+  withdraw uses: a record below the floor (a rolled-back authentic copy) is a rollback, which
+  rm-scope treats as a damaged record (it removes the scope, exit 4, saying the scope's
+  deliveries were not checked), and a floor that cannot be read leaves a record naming no
+  delivery unverified: exit 4, saying the deliveries are not confirmed, never exit 0. The
+  no-key, untrusted and taken paths never read the delivery record, and their results say so.
 
   The scope directory's descriptor stays open through
 

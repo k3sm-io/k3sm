@@ -53,8 +53,8 @@ type RemoveScopeResult struct {
 // RemoveScope removes uid's user scope (rm-scope), as root: under the
 // floor lock and then the exclusive store lock (at most 30 s;
 // lockMaintenance) it opens the scope's key under W without the
-// GeneratedUID check and reads its delivery record, refusing while the
-// record names any delivery. A damaged record (deliveriesDamaged: the
+// GeneratedUID check and reads its delivery record against the floor
+// (rmReadDeliveries), refusing while the record names any delivery. A damaged record (deliveriesDamaged: the
 // service user can damage its own) does not stop it, since listing needs
 // only scope.key: the scope is removed and the result is errCommitted,
 // saying its deliveries were not checked. Any other failure to read it
@@ -190,15 +190,20 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 	}
 	id := o.id
 	recorded := removed.has(uid, id)
-	_, ds, derr := rmReadDeliveries(u, o)
+	dr, derr := rmReadDeliveries(u, o)
+	ds := dr.ds
 	_, eerr := o.dir.Lstat(scopeEntriesName)
 	o.close()
-	var unread error
+	var unread, unverified error
 	switch {
 	case recorded:
 		// An earlier rm-scope listed the key, then stopped part-way.
 	case derr == nil && len(ds) > 0:
 		return RemoveScopeResult{}, fmt.Errorf("%s: %w", u.scope, errScopeHasDeliveries)
+	case derr == nil && dr.unverified != nil:
+		// The floor could not be read, so a rolled-back record naming no
+		// delivery cannot be told apart: never exit 0 on it.
+		unverified = dr.unverified
 	case derr == nil:
 	case errors.Is(derr, ErrScopeAbsent) && errors.Is(eerr, os.ErrNotExist):
 		// An earlier rm-scope, unlisted (a full record), removed entries/
@@ -227,6 +232,9 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 	}
 	if unread != nil {
 		notes = append(notes, scopeRemovedUnread(u.scope, unread))
+	}
+	if unverified != nil {
+		notes = append(notes, scopeRemovedUnverified(u.scope, unverified))
 	}
 	state := "is listed as removed in " + removedScopesName + ", so no open serves it"
 	if !r.removed.has(uid, id) {
@@ -268,7 +276,11 @@ func (e *rmTextErr) Unwrap() error { return e.err }
 // to restore the file from backup replaced by what it found, since
 // rm-scope suggests no action by hand over that tree.
 func rmErrText(err error) string {
-	return safeText(strings.ReplaceAll(err.Error(), ErrCorrupt.Error(), "it failed authentication or does not parse, or is not as the layout puts it"))
+	s := strings.ReplaceAll(err.Error(), ErrCorrupt.Error(), "it failed authentication or does not parse, or is not as the layout puts it")
+	// A rollback's shared restore advice is a by-hand action over the
+	// tree, with commands: rm-scope says only what it found.
+	s = strings.ReplaceAll(s, " For a deliberate restore, "+restoreRemedy, "")
+	return safeText(s)
 }
 
 // rmReadRemovedScopes is RemoveScope's read of the removed-scopes record;
@@ -746,11 +758,18 @@ func scopeRemovedJudged(scope, why string, recorded bool) string {
 	return "removed " + scope + " and " + state + ", but its scope.key's link count or mode was wrong (" + safeText(why) + "): another name or a reader of the key file may have kept a copy of it"
 }
 
-// rmReadDeliveries is rm-scope's read of the delivery record; tests
-// replace it to inject a failure.
-var rmReadDeliveries = (*UserScope).readDeliveriesUnfloored
+// rmReadDeliveries is rm-scope's read of the delivery record: the floored
+// reader a withdraw uses (readDeliveriesFloor with revoke set), so a
+// record below the floor, a rolled-back authentic copy, is refused like
+// any rollback (ErrCorrupt, which deliveriesDamaged counts as damage),
+// and a floor that cannot be read is reported as unverified, never as a
+// checked record. rm-scope holds the floor lock and the store lock; the
+// read takes neither. Tests replace it to inject a failure.
+var rmReadDeliveries = func(u *UserScope, o *openedScope) (deliveriesRead, error) {
+	return u.readDeliveriesFloor(o, true)
+}
 
-// deliveriesDamaged reports whether err, from readDeliveriesUnfloored, is
+// deliveriesDamaged reports whether err, from rmReadDeliveries, is
 // a damaged record rather than a failure to read it: ErrCorrupt (a record
 // that does not parse, authenticate or bind, or the judge's refusal of its
 // type, owner, mode, flags or links, errBadFile), a planted name
@@ -758,6 +777,13 @@ var rmReadDeliveries = (*UserScope).readDeliveriesUnfloored
 // of which the service user can cause and a rerun would meet again.
 func deliveriesDamaged(err error) bool {
 	return errors.Is(err, ErrCorrupt) || errors.Is(err, errBadFile) || errors.Is(err, errPlanted) || errors.Is(err, ErrScopeAbsent)
+}
+
+// scopeRemovedUnverified is rm-scope's committed report for a scope
+// removed whose delivery record named no delivery but could not be
+// checked against the floor (err, the floor's).
+func scopeRemovedUnverified(scope string, err error) string {
+	return "removed " + scope + ", but the user-scope floor could not be read (" + rmErrText(err) + "), so its delivery record, which names no delivery, was not checked against the floor: an older copy put back cannot be told apart, so the scope's deliveries are not confirmed"
 }
 
 // scopeRemovedUnread is rm-scope's committed report for a scope removed
@@ -792,6 +818,16 @@ func (s *FileStore) floorSize(dfd int) (floorIdentity, int64, error) {
 // keys the record lists for the uid: whether the removed directory's key
 // was among them cannot be told, so a copy put back may open.
 func scopeRemovedUnconfirmed(scope string, held heldKey, untrusted error, n int) string {
+	return scopeRemovedUnconfirmedKey(scope, held, untrusted, n) + "; " + deliveriesNotChecked
+}
+
+// deliveriesNotChecked is the clause every rm-scope result without a
+// judged key carries: those paths never read the delivery record.
+const deliveriesNotChecked = "its delivery record was not read, so the scope's deliveries were not checked: any Secret it delivered stays until it is withdrawn"
+
+// scopeRemovedUnconfirmedKey is scopeRemovedUnconfirmed's report of the
+// key alone.
+func scopeRemovedUnconfirmedKey(scope string, held heldKey, untrusted error, n int) string {
 	why := "its scope.key was absent (an interrupted earlier rm-scope, or tampering)"
 	if held.present {
 		why = "its scope.key could not be trusted"

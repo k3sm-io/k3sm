@@ -168,7 +168,7 @@ func TestRemoveScopeTransientDeliveryReadRefuses(t *testing.T) {
 			s, server, _ := fileLogScope(t)
 			userPut(t, userScope(t, s, 1002), "user/1002/x", "x")
 			saved := rmReadDeliveries
-			rmReadDeliveries = func(*UserScope, *openedScope) (uint64, []delivery, error) { return 0, nil, tc.err }
+			rmReadDeliveries = func(*UserScope, *openedScope) (deliveriesRead, error) { return deliveriesRead{}, tc.err }
 			t.Cleanup(func() { rmReadDeliveries = saved })
 			res, err := s.RemoveScope(ctx, 1002)
 			recorded := res.Recorded
