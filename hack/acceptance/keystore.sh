@@ -616,7 +616,7 @@ pend U44 "losing authority deletes exactly the owned Secret; the crash order is 
 	k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret TestFinalizerCrashOrder TestOrphanSweep TestForgedOwnerAnnotationOnOtherSecretIsLeftAlone
 pend U45 "cross-user refusal with a fake peer-credential seam: a peer with uid B asks for list, read-for-exec, rotate, rm, deliver, withdraw and deliveries of uid A's entries and objects, and for any system/... name; every call is ErrNotFound with text identical to an absent entry of B's own, and the refused audit lines carry uid B (socket operations)" \
 	k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred TestNonRootCannotNameSystemEntries
-pend U46 "baseSocketDenies derives keys.sock from runtimed's keystorepaths.SocketPath(dataRoot), <dataRoot>/keystore-sock/keys.sock (socket listener)" \
+check U46 "baseSocketDenies derives keys.sock from runtimed's keystorepaths.SocketPath(dataRoot), <dataRoot>/keystore-sock/keys.sock (socket listener)" \
 	k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket runtimed/pkg/keystorepaths::TestNames
 pend U47 "seam guard: the real primitives the keystore's tests replace are unreachable from a test build (user scopes)" \
 	k3sm/pkg/keystore::TestRealPrimitivesUnreachable
