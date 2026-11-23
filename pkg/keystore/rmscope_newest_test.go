@@ -65,6 +65,7 @@ func wantNewestRefused(t *testing.T, res RemoveScopeResult, err error, live stri
 	if strings.Contains(msg, "sudo") {
 		t.Errorf("the error %q offers a command", msg)
 	}
+	checkRmScopeCommands(t, msg)
 	if after := treeNames(t, live); !slices.Equal(before, after) {
 		t.Fatalf("the live scope holds %v, want %v untouched", after, before)
 	}

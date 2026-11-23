@@ -44,6 +44,7 @@ func TestRmScopeRolledBackDeliveriesIsNotExitZero(t *testing.T) {
 	if !strings.Contains(msg, "deliveries from this scope were not checked") || !strings.Contains(msg, "older") {
 		t.Errorf("the error %q does not say the record is older and deliveries were not checked", msg)
 	}
+	checkRmScopeCommands(t, msg)
 	if strings.Contains(msg, "sudo") || strings.Contains(msg, "restore the matched set") {
 		t.Errorf("the error %q carries the shared restore advice", msg)
 	}

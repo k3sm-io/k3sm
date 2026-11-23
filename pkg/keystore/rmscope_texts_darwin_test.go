@@ -38,6 +38,7 @@ const rmRerunLine = "rerun sudo k3sm keys rm-scope user/1001 --yes"
 // where a rerun cannot help.
 func checkRmScopeText(t *testing.T, msg string, rerun bool) {
 	t.Helper()
+	checkRmScopeCommands(t, msg)
 	for _, bad := range []string{"rm -", "remove it as root", "clear the flag", "Root may", "its owner may", "by hand", "administrator", "chflags", "delete", "k3sm doctor", "restore it"} {
 		if strings.Contains(msg, bad) {
 			t.Errorf("the error %q offers %q, an action by hand", msg, bad)
@@ -405,6 +406,7 @@ func TestRmScopeRecordErrorsNameNoServiceUserPath(t *testing.T) {
 			if !errors.Is(err, errRemovedScopesBad) || Committed(err) || !strings.Contains(err.Error(), "nothing was changed") {
 				t.Fatalf("rm-scope over a bad record: %v, want a refusal of errRemovedScopesBad saying nothing was changed", err)
 			}
+			checkRmScopeCommands(t, err.Error())
 			for _, bad := range []string{s.dir, userScopesName, "user/1001", "user/1002"} {
 				if strings.Contains(err.Error(), bad) {
 					t.Errorf("the error %q names %q, from the service user's tree", err, bad)

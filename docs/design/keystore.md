@@ -2841,12 +2841,17 @@ service user can only add to.
   the serving path still refuses any mode wider than 0700. So a take stopped at any step, the
   first `fchmod` included, leaves a directory a rerun finishes.
 
-  *The command rule.* rm-scope prints no command other than its own rerun line, `sudo k3sm
-  keys rm-scope user/<uid> --yes`, built from the integer uid, and only where a rerun can
-  finish the removal; it suggests no by-hand action over the service user's tree (no `rm`, no
-  flag to clear, no file to restore), and never prints a name from that tree in a command.
-  Errors about the root-owned removed-scopes record in the data root come from the shared
-  root-file helper and reader and keep their wording, repair advice included.
+  *The command rule.* rm-scope's output holds exactly these commands and no other: its own
+  rerun line, `sudo k3sm keys rm-scope user/<uid> --yes`, built from the integer uid, only where
+  a rerun can finish the removal; the follow-up `sudo k3sm keys floor --rebuild` the verb prints
+  on success; and whatever the shared store-lock and root-file helpers print (`sudo k3sm stop`
+  when a service-user process held the store lock, and the flag repair `sudo chflags 0` on a
+  root-owned file in the data root, such as the removed-scopes record, whose path is root's).
+  It suggests no by-hand action over the service user's tree (no `rm`, no flag to clear, no
+  file to restore, no restore advice from a rolled-back record), and never prints a name from
+  that tree in a command. Errors about the root-owned removed-scopes record come from the
+  shared root-file helper and reader and keep their wording, repair advice included. The text
+  tests hold every rm-scope result to that set (`checkRmScopeCommands`).
 
   *Binding the paths without a key.* On the no-key and untrusted paths there is no key identity
   to bind the held directory to, so the judge pins the device and inode of the scope directory
