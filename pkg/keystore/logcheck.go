@@ -89,17 +89,25 @@ func JudgeDirFlagsACL(fd int) error { return judgeFlagsACL(fd, fdFlags) }
 // root's: the doctor prints it.
 func (s *FileStore) CheckLogFlags(ctx context.Context) error {
 	for _, name := range []string{userFloorLogName, auditLogName} {
-		if err := ctx.Err(); err != nil {
+		if err := s.checkLogFlag(ctx, name); err != nil {
 			return err
 		}
-		l := &appendLog{s: s, name: name}
-		f, _, err := l.open(unix.O_RDONLY)
-		if err != nil {
-			return err
-		}
-		if err := f.Close(); err != nil {
-			return fmt.Errorf("close %s: %w", name, err)
-		}
+	}
+	return nil
+}
+
+// checkLogFlag is CheckLogFlags for the one log name.
+func (s *FileStore) checkLogFlag(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l := &appendLog{s: s, name: name}
+	f, _, err := l.open(unix.O_RDONLY)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", name, err)
 	}
 	return nil
 }

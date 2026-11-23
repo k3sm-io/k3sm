@@ -130,7 +130,10 @@ var auditKeys = []string{"v", "ts", "op", "via", "scope", "name", "namespace", "
 // each given once and, where one matches a known key under encoding/json's
 // case folding, spelled exactly as that key. With it json.Unmarshal reads
 // each known field from the one key a strict decoder would.
-func auditKeysStrict(line []byte) error {
+func auditKeysStrict(line []byte) error { return auditKeysStrictOf(line, auditKeys) }
+
+// auditKeysStrictOf is auditKeysStrict over the known keys known.
+func auditKeysStrictOf(line []byte, known []string) error {
 	dec := json.NewDecoder(bytes.NewReader(line))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return errors.New("an audit line is not a JSON object")
@@ -151,7 +154,7 @@ func auditKeysStrict(line []byte) error {
 			}
 		}
 		seen = append(seen, key)
-		for _, k := range auditKeys {
+		for _, k := range known {
 			if strings.EqualFold(k, key) && k != key {
 				return errors.New("an audit line spells a known key in another case")
 			}
