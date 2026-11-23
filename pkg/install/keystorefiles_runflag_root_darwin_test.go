@@ -36,8 +36,16 @@ func TestKeystoreRunDirUserFlagAsRoot(t *testing.T) {
 		t.Fatalf("the first install: %v", err)
 	}
 	run := filepath.Join(r.root, keystore.RunDirName)
-	if err := r.asService(func() error { return unix.Chflags(run, unix.UF_IMMUTABLE) }); err != nil {
-		t.Fatalf("the service user's chflags uchg of keystore-run/: %v", err)
+	// The service user cannot search the test's temp parents, so it sets
+	// the flag through a descriptor root opened: fchflags is judged on
+	// ownership, which is the service user's.
+	fd, err := unix.Open(run, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := r.asService(func() error { return unix.Fchflags(fd, unix.UF_IMMUTABLE) }); err != nil {
+		t.Fatalf("the service user's fchflags uchg of keystore-run/: %v", err)
 	}
 	if err := unix.Chmod(run, 0o755); err == nil {
 		t.Fatal("root's chmod of a uchg directory succeeded; the case this test pins does not arise")
