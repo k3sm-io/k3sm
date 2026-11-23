@@ -291,6 +291,9 @@ func (m *maintenance) readMarker() (*marker, error) {
 		return nil, fmt.Errorf("stat %s: %w", maintenanceMarkerName, err)
 	}
 	if err := judgeRootFile(fd, &st, maintenanceMarkerName, int64(m.s.floorUID)); err != nil {
+		if fix := rootFileFlagRepair(err, m.s.dataRoot, maintenanceMarkerName); fix != "" {
+			return nil, fmt.Errorf("%w: %s: %w; the first repair is %s, which clears the flag on this root-owned file, then run the verb again; only if that does not work, sudo k3sm install, which removes a marker it cannot read", errLogUntrusted, maintenanceMarkerName, err, fix)
+		}
 		return nil, fmt.Errorf("%w: %s: %w; root repairs it with sudo k3sm install, which removes a marker it cannot read", errLogUntrusted, maintenanceMarkerName, err)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxMarkerSize))

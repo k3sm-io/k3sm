@@ -266,6 +266,9 @@ func (s *FileStore) readRemovedScopes(dfd int) (*removedScopes, error) {
 		return nil, fmt.Errorf("%w: stat: %w", errRemovedScopesBad, err)
 	}
 	if err := judgeRootFile(fd, &st, removedScopesName, int64(s.floorUID)); err != nil {
+		if fix := rootFileFlagRepair(err, s.dataRoot, removedScopesName); fix != "" {
+			return nil, fmt.Errorf("%s: %w; the first repair is %s, which clears the flag on this root-owned file, then run the verb again; only if that does not work: %w", removedScopesName, err, fix, errRemovedScopesBad)
+		}
 		return nil, fmt.Errorf("%w: %w", errRemovedScopesBad, err)
 	}
 	if st.Size > maxRemovedScopesSize {

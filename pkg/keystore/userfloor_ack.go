@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"slices"
 	"strconv"
@@ -141,7 +142,10 @@ func (s *FileStore) readFloorAck() (floorAck, bool) {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return floorAck{}, false
 	}
-	if judgeRootFile(fd, &st, floorAckName, int64(s.floorUID)) != nil {
+	if err := judgeRootFile(fd, &st, floorAckName, int64(s.floorUID)); err != nil {
+		if fix := rootFileFlagRepair(err, s.dataRoot, floorAckName); fix != "" {
+			slog.Warn("the floor acknowledgement carries a file flag, so it is ignored and acknowledging again cannot replace it; the first repair clears the flag on this root-owned file, then acknowledge again", "file", floorAckName, "repair", fix)
+		}
 		return floorAck{}, false
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxFloorAckSize+1))

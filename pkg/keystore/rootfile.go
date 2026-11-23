@@ -18,7 +18,10 @@ package keystore
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/sys/unix"
@@ -52,8 +55,11 @@ func judgeRootFile(fd int, st *unix.Stat_t, name string, owner int64) error {
 		return errRootFileShape
 	}
 	fl, err := fdFlags(fd)
-	if err != nil || fl != 0 {
+	if err != nil {
 		return errRootFileShape
+	}
+	if fl != 0 {
+		return &rootFileFlagged{flags: fl}
 	}
 	if acl, err := fdHasACL(fd); err != nil || acl {
 		return errRootFileShape
@@ -64,4 +70,32 @@ func judgeRootFile(fd int, st *unix.Stat_t, name string, owner int64) error {
 		}
 	}
 	return nil
+}
+
+// rootFileFlagged is judgeRootFile's refusal of a root-written file whose
+// type, owner and mode pass but which carries a file flag. It is
+// errRootFileShape (errors.Is), and it carries the flags so the refusal
+// can name the repair (rootFileFlagRepair).
+type rootFileFlagged struct{ flags uint32 }
+
+func (e *rootFileFlagged) Error() string {
+	return fmt.Sprintf("it carries a file flag (flags %#x), which the keystore never sets on it", e.flags)
+}
+
+func (e *rootFileFlagged) Unwrap() error { return errRootFileShape }
+
+// rootFileFlagRepair is the first repair for err, judgeRootFile's refusal
+// of the file name in the data root dataRoot, when the refusal was for a
+// flag alone: clearing it as root. The path is root's own, built from the
+// configured data root and the file's fixed name, never from a name the
+// service user chose, and judgeRootFile found the file a regular file of
+// root's; it is single-quoted so a shell expands nothing in it. It is ""
+// for any other refusal.
+func rootFileFlagRepair(err error, dataRoot, name string) string {
+	var f *rootFileFlagged
+	if !errors.As(err, &f) || dataRoot == "" {
+		return ""
+	}
+	p := filepath.Join(dataRoot, name)
+	return "sudo chflags 0 '" + strings.ReplaceAll(p, "'", `'\''`) + "'"
 }
