@@ -2693,7 +2693,14 @@ service user can only add to.
   to the floor. rm-scope removes the tree by descriptor and cannot be blocked by a name the
   service user plants in it: a regular file, FIFO, symlink, device or socket is removed with
   `unlinkat`, which never follows; a directory is opened `O_DIRECTORY|O_NOFOLLOW`, re-checked
-  `SameFile`, emptied and removed with `AT_REMOVEDIR`; `scope.key` goes last. Names that keep
+  `SameFile`, emptied and removed with `AT_REMOVEDIR`; `scope.key` goes last. A user flag
+  (`uchg`, `uappnd`, `uunlnk`) the service user set on its own file or directory, which makes
+  root's `unlinkat` fail with `EPERM`, is cleared first with `fchflags` on a descriptor opened
+  `O_NOFOLLOW` (`O_SYMLINK` for a symlink) and re-checked as the name, never by path, at most
+  4096 opens in all; only a file the service user owns is cleared, and a non-directory with
+  more than one link only when it is a regular file whose every link was met in the scope
+  tree in the same pass (its other names go in the next pass); a flagged file linked outside
+  the tree stops rm-scope, which says so. Names that keep
   appearing stop it after three passes with a message that a process running as the service
   user is still writing there and to stop it (`sudo k3sm stop`). An rm-scope that stops after
   the record is written says so (the scope listed as removed, its directory partly or wholly

@@ -40,6 +40,10 @@ const maxFlagOpens = 4096
 // flagOpenLimit is maxFlagOpens; tests lower it.
 var flagOpenLimit = maxFlagOpens
 
+// scopeFchflags is rm-scope's flag write, on a held descriptor; tests
+// replace it to record the calls.
+var scopeFchflags = unix.Fchflags
+
 const (
 	// ufNoUnlink is UF_NOUNLINK (uunlnk): 0x10 in the BSD header, commented
 	// out in Darwin's, so x/sys has no name for it.
@@ -48,6 +52,9 @@ const (
 	// changed, appended to only, or removed: uchg, uappnd and uunlnk. No
 	// other flag is ever cleared, and system flags (SF_*) never are.
 	userLockingFlags = unix.UF_IMMUTABLE | unix.UF_APPEND | ufNoUnlink
+	// oSymlink is O_SYMLINK: open a symlink itself, never its target, so
+	// rm-scope clears a flag on a planted link through a descriptor.
+	oSymlink = unix.O_SYMLINK
 )
 
 // clearUserFlags clears the user locking flags (userLockingFlags) on

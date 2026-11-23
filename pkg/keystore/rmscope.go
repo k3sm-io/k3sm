@@ -90,7 +90,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 	if errors.Is(err, errNoScopeKey) && scopeDirPresent(root, name) {
 		// An earlier rm-scope removed scope.key, then stopped: no open
 		// serves the directory, and there is no key to list.
-		if err := removeScopeTree(root, name); err != nil {
+		if err := removeScopeTree(root, name, s.uid); err != nil {
 			return false, fmt.Errorf("%w; the directory keystore/%s/%s has no scope.key and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, userScopesName, name, u.scope)
 		}
 		return removed.listed(uid), nil
@@ -127,7 +127,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 			recorded = true
 		}
 	}
-	if err := removeScopeTree(root, name); err != nil {
+	if err := removeScopeTree(root, name, s.uid); err != nil {
 		state := "is listed as removed in " + removedScopesName + ", so no open serves it"
 		if !recorded {
 			state = "is not listed in " + removedScopesName + ", which is full"
@@ -175,6 +175,28 @@ const (
 // maxRemovePasses removal passes.
 var errScopeTreeBusy = fmt.Errorf("new names kept appearing in the scope directory over %d removal passes: a process running as the service user is still writing there; stop the server (sudo k3sm stop) and any such process", maxRemovePasses)
 
+// errScopeFlagLinked is a file in the scope tree carrying a user flag
+// whose other links are not all in the tree: its flag is shared with a
+// name outside the scope, so rm-scope does not clear it.
+var errScopeFlagLinked = errors.New("a file in the scope directory carries a user flag (uchg, uappnd or uunlnk) and has a link outside the scope directory, so rm-scope does not clear the flag; clear it on the other link (chflags nouchg), then rerun")
+
+// errScopeFlagBudget is a scope tree whose user flags would take more
+// opens than rm-scope makes.
+var errScopeFlagBudget = fmt.Errorf("the scope directory holds more flagged files than rm-scope opens to clear their user flags (%d)", maxFlagOpens)
+
+// rmWalk is one removeScopeTree: the service user's uid, whose own files'
+// user flags it clears, how many files it has opened to do so, and, per
+// pass, how many names of each flagged file with more than one link it has
+// met in the tree.
+type rmWalk struct {
+	svc   uint32
+	opens int
+	seen  map[[2]uint64]int
+	// linked is set when a flagged file's links were not all met in a
+	// pass: it may have one outside the tree.
+	linked bool
+}
+
 // removeScopeTree removes keystore/.user/<uid>/ by descriptor, starting
 // from keystore, the already-judged keystore root, so a directory swapped
 // in at the keystore's path since it was judged is never walked. Each
@@ -186,26 +208,43 @@ var errScopeTreeBusy = fmt.Errorf("new names kept appearing in the scope directo
 // last, once nothing else is left beside it. A name that vanishes under
 // the walk is skipped. When names keep appearing, it makes at most
 // maxRemovePasses passes and then fails (errScopeTreeBusy).
-func removeScopeTree(keystore *os.Root, uid string) error {
+//
+// The service user (svc) can set a user flag (uchg, uappnd, uunlnk) on its
+// own files, which makes root's unlinkat fail with EPERM. So before a name
+// is removed, a user flag on it is cleared (clearScopeFlags): on a
+// descriptor opened O_NOFOLLOW (O_SYMLINK for a symlink), never by path,
+// re-checked as the name, and only when the service user owns it. A
+// non-directory with more than one link is cleared only when it is a
+// regular file and all its links were met in the tree in the same pass;
+// its earlier names are then removed in the next pass.
+func removeScopeTree(keystore *os.Root, uid string, svc uint32) error {
 	kd, err := keystore.Open(".")
 	if err != nil {
 		return fmt.Errorf("open the keystore directory: %w", err)
 	}
 	defer func() { _ = kd.Close() }() // read-only
-	ufd, _, err := openDirAt(int(kd.Fd()), userScopesName)
+	ufd, ust, err := openDirAt(int(kd.Fd()), userScopesName)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = unix.Close(ufd) }() // fsynced below
+	w := &rmWalk{svc: svc}
+	if err := w.clearHeld(ufd, &ust); err != nil {
+		return err
+	}
 	for range maxRemovePasses {
-		dfd, _, err := openDirAt(ufd, uid)
+		w.seen, w.linked = map[[2]uint64]int{}, false
+		dfd, dst, err := openDirAt(ufd, uid)
 		if errors.Is(err, unix.ENOENT) {
 			return unix.Fsync(ufd)
 		}
 		if err != nil {
 			return err
 		}
-		err = emptyScopeDir(dfd)
+		err = w.clearHeld(dfd, &dst)
+		if err == nil {
+			err = w.emptyScopeDir(dfd)
+		}
 		_ = unix.Close(dfd) // fsynced in emptyScopeDir
 		if err != nil {
 			return err
@@ -218,13 +257,16 @@ func removeScopeTree(keystore *os.Root, uid string) error {
 			return fmt.Errorf("remove the scope directory: %w", err)
 		}
 	}
+	if w.linked {
+		return errScopeFlagLinked
+	}
 	return errScopeTreeBusy
 }
 
 // emptyScopeDir removes every name in the scope directory dfd, scope.key
 // last and only when nothing else is left beside it.
-func emptyScopeDir(dfd int) error {
-	if err := emptyDir(dfd, 0, scopeKeyName); err != nil {
+func (w *rmWalk) emptyScopeDir(dfd int) error {
+	if err := w.emptyDir(dfd, 0, scopeKeyName); err != nil {
 		return err
 	}
 	names, err := listDir(dfd)
@@ -232,7 +274,7 @@ func emptyScopeDir(dfd int) error {
 		return err
 	}
 	if len(names) == 1 && names[0] == scopeKeyName {
-		if err := removeName(dfd, scopeKeyName, 0); err != nil {
+		if err := w.removeName(dfd, scopeKeyName, 0); err != nil {
 			return err
 		}
 	}
@@ -242,7 +284,7 @@ func emptyScopeDir(dfd int) error {
 // emptyDir removes every name in the directory dfd but keep, at depth
 // below the scope directory. A subdirectory that is not empty by the time
 // it is removed (a name appeared in it) is left for the next pass.
-func emptyDir(dfd, depth int, keep string) error {
+func (w *rmWalk) emptyDir(dfd, depth int, keep string) error {
 	names, err := listDir(dfd)
 	if err != nil {
 		return err
@@ -251,7 +293,7 @@ func emptyDir(dfd, depth int, keep string) error {
 		if n == keep {
 			continue
 		}
-		if err := removeName(dfd, n, depth); err != nil {
+		if err := w.removeName(dfd, n, depth); err != nil {
 			return err
 		}
 	}
@@ -259,9 +301,12 @@ func emptyDir(dfd, depth int, keep string) error {
 }
 
 // removeName removes name in the directory pfd: a directory is opened by
-// descriptor (openDirAt), emptied and removed with AT_REMOVEDIR; any other
-// name is removed with unlinkat. A name already gone is not an error.
-func removeName(pfd int, name string, depth int) error {
+// descriptor (openDirAt), its user flags cleared, emptied and removed with
+// AT_REMOVEDIR; any other name has its user flags cleared
+// (clearScopeFlags) and is removed with unlinkat, unless it is a flagged
+// file whose links are not all met yet, which is left for the next pass.
+// A name already gone is not an error.
+func (w *rmWalk) removeName(pfd int, name string, depth int) error {
 	var st unix.Stat_t
 	if err := unix.Fstatat(pfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
 		return nil
@@ -269,6 +314,10 @@ func removeName(pfd int, name string, depth int) error {
 		return fmt.Errorf("stat %s: %w", name, err)
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		leave, err := w.clearScopeFlags(pfd, name, &st)
+		if err != nil || leave {
+			return err
+		}
 		if err := unix.Unlinkat(pfd, name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			return fmt.Errorf("remove %s: %w", name, err)
 		}
@@ -277,14 +326,17 @@ func removeName(pfd int, name string, depth int) error {
 	if depth >= maxScopeTreeDepth {
 		return fmt.Errorf("%w: %s is nested more than %d directories below the scope directory", errPlanted, name, maxScopeTreeDepth)
 	}
-	fd, _, err := openDirAt(pfd, name)
+	fd, dst, err := openDirAt(pfd, name)
 	if errors.Is(err, unix.ENOENT) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	err = emptyDir(fd, depth+1, "")
+	err = w.clearHeld(fd, &dst)
+	if err == nil {
+		err = w.emptyDir(fd, depth+1, "")
+	}
 	if err == nil {
 		err = unix.Fsync(fd)
 	}
@@ -297,6 +349,83 @@ func removeName(pfd int, name string, depth int) error {
 		return fmt.Errorf("remove %s: %w", name, err)
 	}
 	return nil
+}
+
+// clearHeld clears the user flags of the directory held at fd, which st
+// describes, when it carries one and the service user owns it.
+func (w *rmWalk) clearHeld(fd int, st *unix.Stat_t) error {
+	fl := statFlags(st)
+	if fl&userLockingFlags == 0 || st.Uid != w.svc {
+		return nil
+	}
+	if err := scopeFchflags(fd, int(fl&^userLockingFlags)); err != nil {
+		return fmt.Errorf("clear the user flags of a scope directory: %w", err)
+	}
+	return nil
+}
+
+// clearScopeFlags clears the user flags of the non-directory name in pfd,
+// which st describes (fstatat, not followed), before its removal. Nothing
+// is done unless it carries one and the service user owns it (a file of
+// another owner is left for unlinkat to refuse). A file with more than one
+// link is cleared only when it is a regular file and every link has been
+// met in the tree in this pass; until then leave is true and the name is
+// left for the next pass. The file is opened O_NOFOLLOW (a symlink
+// O_SYMLINK, which opens the link itself), never by path, re-checked as
+// the name (device, inode, link count), and changed with fchflags on the
+// descriptor. At most flagOpenLimit files are opened in all.
+func (w *rmWalk) clearScopeFlags(pfd int, name string, st *unix.Stat_t) (leave bool, err error) {
+	fl := statFlags(st)
+	if fl&userLockingFlags == 0 || st.Uid != w.svc {
+		return false, nil
+	}
+	typ := st.Mode & unix.S_IFMT
+	if st.Nlink > 1 {
+		if typ != unix.S_IFREG {
+			w.linked = true
+			return true, nil
+		}
+		id := [2]uint64{uint64(st.Dev), st.Ino}
+		w.seen[id]++
+		if w.seen[id] < int(st.Nlink) {
+			w.linked = true
+			return true, nil
+		}
+	}
+	var flags int
+	switch typ {
+	case unix.S_IFREG, unix.S_IFIFO:
+		flags = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC
+	case unix.S_IFLNK:
+		flags = unix.O_RDONLY | oSymlink | unix.O_NONBLOCK | unix.O_CLOEXEC
+	default:
+		// A device or socket is not opened; unlinkat reports the flag.
+		return false, nil
+	}
+	if w.opens >= flagOpenLimit {
+		return false, errScopeFlagBudget
+	}
+	w.opens++
+	fd, err := unix.Openat(pfd, name, flags, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("open %s to clear its user flags: %w", name, err)
+	}
+	defer func() { _ = unix.Close(fd) }() // only its flags change
+	var got unix.Stat_t
+	if err := unix.Fstat(fd, &got); err != nil {
+		return false, fmt.Errorf("stat %s: %w", name, err)
+	}
+	if got.Dev != st.Dev || got.Ino != st.Ino || got.Nlink != st.Nlink || got.Uid != w.svc {
+		// Replaced or relinked under the walk: the next pass sees it anew.
+		return true, nil
+	}
+	if err := scopeFchflags(fd, int(statFlags(&got)&^userLockingFlags)); err != nil {
+		return false, fmt.Errorf("clear the user flags of %s: %w", name, err)
+	}
+	return false, nil
 }
 
 // errPlanted is a name in a service-user tree that the layout does not put
