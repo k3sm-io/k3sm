@@ -1738,7 +1738,7 @@ burial.
 Amended by the user scope's append-only files: the matched set also includes `keystore/.user/`,
 `keystore-user-floor.log` and `keystore-audit.log`. The append-only flag does not survive
 `cp`, rsync or Time Machine, so every restore ends with `sudo k3sm keys floor --rebuild`, and
-`sudo k3sm keys audit --rotate` re-flags the audit log ("User scope", "The user-scope floor").
+`sudo k3sm keys audit --rotate` swaps in a fresh flagged audit log ("User scope", "The user-scope floor").
 
 ## User scope
 
@@ -1869,17 +1869,17 @@ Phase A's paths are unchanged. Added:
 /var/lib/k3sm/                          data root, root:wheel 0755
   keystore-floor.json                   Phase A: root 0644, system floor; now Pod-denied
   keystore-delivery.json                Phase A: root 0644, root-declared deliveries; now Pod-denied
-  keystore-logs/                        NEW: root 0755, the gate; 0700 while a maintenance verb or install swaps a log
-    keystore-user-floor.log             NEW: the user-scope floor, append-only
-    keystore-audit.log                  NEW: the audit log, append-only
-    keystore-audit.log.1 … .4           NEW: the previous audit logs after `audit --rotate`, `.1` the newest; fresh root 0600 unflagged copies
+  keystore-logs/                        NEW: root 0755, the logs' directory
+    floor/                              NEW: root 0755, the floor log's own directory
+      keystore-user-floor.log           NEW: the user-scope floor, append-only
+    audit/                              NEW: root 0755, the audit log's own directory
+      keystore-audit.log                NEW: the audit log, append-only
+      keystore-audit.log.1 … .4         NEW: the previous audit logs after `audit --rotate`, `.1` the newest; root 0600 unflagged
   keystore-lock                         NEW: root 0600, the floor lock only root can open (Open requirement 2)
   keystore-removed-scopes.json          NEW: root 0644, written by `rm-scope`, parsed strictly; Pod-denied (Open requirement 13)
-  keystore-maintenance                  NEW: root 0644, present only while a maintenance verb runs
-  keystore-staging/                     NEW: root 0700, present only while a maintenance verb runs
-    keystore-user-floor.log.new         NEW: staging file of `floor --rebuild`, present only during it
-    keystore-audit.log.new              NEW: staging file of `audit --rotate`, present only during it
-    keystore-audit.log.1.new            NEW: `audit --rotate`'s staging archive, present only during it
+  keystore-maintenance                  NEW: root 0644, the marker, present only while a maintenance verb runs
+  keystore-staging/                     NEW: root 0700, present only while a maintenance verb or install runs
+    floor.new/, audit.new/              NEW: a replacement log directory being built, then the retired one after the swap
   keystore-sock/                        NEW: root:wheel 0755, made by install, the socket's directory, Pod-denied
     keys.sock                           NEW: srw-rw-rw-, root's, created by launchd from the server plist; access is decided by peer credentials
   server/                               already Pod-denied
@@ -2055,13 +2055,13 @@ old copy or damaged since its commit refuses the swap, so the old master is not 
 it. Rewrap pins each scope's `K_u` (by a fingerprint, never the key), generation and created
 time when it plans the scope, and its commit and that last check refuse (`ErrCorrupt`) a
 `scope.key` that no longer holds them, even one that opens under the new `W`. The recovery is root's: restore the scope from a backup, then run `rewrap` again. Removing
-that scope's directory `.user/<uid>/` by hand recovers only a user who never delivered (its
+that scope with `rm-scope` and nothing more recovers only a user who never delivered (its
 owner loses its values and re-puts them): for one who did, the user-scope floor records the
 `deliveries` record past its first sequence, and the owner's next put refuses to mint a fresh
 scope over it. For that user `rm-scope` refuses while the record names a delivery, until the
 KeyDelivery reconciler (lifecycle) builds its revocation ("`rm-scope` revokes first"). The
-recovery is removing `.user/<uid>/` by hand, then `floor --rebuild`, which drops every key of
-a scope whose directory is gone ("Rebuild drops a removed scope's keys", U194), the
+recovery is `sudo k3sm keys rm-scope user/<uid> --yes`, then `floor --rebuild`, which drops
+every key of the removed scope ("Rebuild drops a removed scope's keys", U194), the
 `deliveries` line among them, so the owner's next put mints a fresh scope; the scope's
 delivered Secrets stay until root deletes them. Rewrap's refusal is correct either way and
 stays.
@@ -2581,30 +2581,20 @@ service user can only add to.
   and refuses to start the listener if either flag is clear or either file is not the
   service user's (U21).
 - **Root maintenance verbs.** `sudo k3sm keys floor --rebuild` (the restore procedure) and
-  `sudo k3sm keys audit --rotate` run as root only. Each writes the marker
-  `keystore-maintenance` before it waits for either lock, and then waits for the listener to stop, which it does when it sees
-  the marker (it closes its connections and stops accepting; launchd keeps the socket bound).
-It first takes the floor lock `keystore-lock`, which only root can open (Open requirement
-2), and only then waits for the store `.lock`, the order every verb that takes both keeps
-("Concurrency"). The marker is no lock, so writing it first leaves that order as it is; holding
-both locks, the verb writes the marker again if a verb that ran in the meantime removed it. A
-marker that stood before the verb wrote one and still stands once it holds both locks is a
-crashed run's. That wait is the store `.lock`
-  taken exclusively, bounded at 30 s: the verb gets the lock once no server operation holds
-  it, and past 30 s it removes the marker if it wrote it (a marker another run left stays) and
-  refuses, changing nothing. The verb already holds `keystore-lock`, which every root verb
-  takes first, so the holder is a process running as the service user, and the refusal says
-  so and names the remedy: stop the server (`sudo k3sm stop`) or that process. Holding both, it
-  **writes and fsyncs the new file before it touches the old one**. Rebuild writes
-  `keystore-user-floor.log.new` from the scopes' entries, walking `.user/` by descriptor ("Root
-  walks service-user trees by descriptor"); rotate writes an empty
-  `keystore-audit.log.new`, each inside `keystore-staging/`, a directory in the data root,
-  root's 0700, created with `mkdirat` and judged on its descriptor (a directory, root's, 0700,
-  no flag beside `SF_APPEND`, no extended ACL). macOS lets any user hard-link a file it cannot
-  read, and only root can reach a name in that directory, so no one can link the new file while
-  it is written; the directory is on the data root's volume, so the file is renamed out of it.
-  The new file is created root-owned, mode 0600, and stays so while it is written ("The
-  swap", step 3).
+  `sudo k3sm keys audit --rotate` run as root only, and need no server stop. Each first takes
+  the floor lock `keystore-lock`, which only root can open (Open requirement 2), and then the
+  store `.lock` exclusively, the order every verb that takes both keeps ("Concurrency"). The
+  wait for `.lock` is bounded at 30 s: the verb gets it once no server operation holds it, and
+  past 30 s it refuses, changing nothing. The verb already holds `keystore-lock`, which every
+  root verb takes first, so the holder is a process running as the service user, and the
+  refusal says so and names the remedy: stop the server (`sudo k3sm stop`) or that process.
+  Only then, holding both locks, does the verb write the marker `keystore-maintenance`, so no
+  marker stands while a verb waits. The listener stops while the marker stands (it closes its
+  connections and stops accepting; launchd keeps the socket bound). The verb **builds the
+  whole replacement before it touches the live set**: rebuild writes the new floor from the
+  old floor and the scopes' entries, walking `.user/` by descriptor ("Root walks service-user
+  trees by descriptor"); rotate writes an empty new log and its archives; each inside its own
+  replacement directory in `keystore-staging/` ("The swap").
 - **Rebuild keeps damage visible.** Rebuild writes one line for every entry directory that
   holds a `generation` file, not only for the entries that open. An entry whose `current`
   authenticates gets its pointer's sequence. An entry with no authenticated pointer (no
@@ -2730,14 +2720,17 @@ crashed run's. That wait is the store `.lock`
   - *An unopenable scope refuses the rebuild.* If any scope's `scope.key` does not open under
     `W`, or any of its files fails to open or authenticate for any other reason (`ErrBusy`
     included), rebuild refuses to finish and names the scope. It refuses before it touches the
-    old file, so it changes nothing: it unlinks its staging file, leaves the old log as it was
-    and removes the marker.
+    old file, so it changes nothing: it cleans `keystore-staging/`, leaves the old log as it
+    was and removes the marker.
   - *The `deliveries` record gets its line.* For each scope rebuild writes the line for the key
     `(user/<uid>, .deliveries, generation, seq)` with the record's authenticated sequence ("Key
     hierarchy"), so a copied-back older record is refused after a rebuild as before it (U88).
-- **SF_APPEND, as measured.** A probe run as root on the worker lab Mac on 2026-11-23 (macOS
-  27.2.1, APFS, the service user `_k3sm`) measured what the flag refuses. The swap below rests
-  on this table, and U195 (`TestSappndMeasuredFacts`, root-run) pins it:
+- **SF_APPEND, as measured.** Two probes run as root on 2026-11-23 (macOS 27.2.1, APFS, the
+  service user `_k3sm`) measured what the flag refuses. The swap below rests on both tables,
+  and U195 pins them, root-run: `TestSappndMeasuredFacts` the first, `TestSappndDirectorySwap`
+  the second.
+
+  The first probe, on files:
 
   | Operation | Result |
   |---|---|
@@ -2754,92 +2747,107 @@ crashed run's. That wait is the store `.lock`
   | the service user's `link(2)` of a root-owned 0600 unflagged file into its own directory | succeeds (`nlink` 2) |
   | the service user's `link(2)` of a flagged file | fails (`nlink` 1) |
 
-  So a log is handed to its owner first and flagged second; the old log's owner is never
-  changed (that would need its flag cleared first, and it is retired instead); once the flag
-  is set, a descriptor opened without `O_APPEND` before it can neither rewrite nor truncate;
-  and a hard link needs an unflagged file and a searchable path to it. The rig spike of
-  2026-11-21 also measured that root's rename over a flagged target fails with `EPERM`, and
-  that the service user cannot rename a flagged file away (`EPERM`); root can clear the flag
-  at `kern.securelevel` 0 (`status.txt`, leg 1, and `leg1.txt`).
-- **The layout.** Both logs live in `keystore-logs/`, a directory in the data root, root's
-  0755: the gate. The maintenance verbs and install close it to 0700 while they swap a log, so
-  no other user can look a name up in it, by path or through a directory descriptor it opened
-  earlier (a lookup checks the directory's mode at the time of the lookup). Staged files live
-  in `keystore-staging/`, root's 0700 always, present only while a verb runs, on the data
-  root's volume so a staged file is renamed out of it. Rotate's archives `keystore-audit.log.1`
-  to `.4` live in `keystore-logs/` beside the log. The server refuses to start while the gate is
-  closed, naming the verbs to rerun, and refuses a log at the top of the data root, naming
-  `sudo k3sm install`.
-- **The swap.** `floor --rebuild` and `audit --rotate` swap a log in the same numbered steps;
-  each step's function is named in `pkg/keystore/logswap.go`:
-  1. write the marker, then take `keystore-lock` and the exclusive store `.lock` (above);
-  2. open the old log `O_NOFOLLOW` through `keystore-logs/` and read it under its flag, on the
-     verb's own descriptor (rebuild parses it; rotate copies it into a fresh staging archive,
-     `keystore-audit.log.1.new`, created root's 0600 in `keystore-staging/`);
-  3. create the new log `O_CREAT|O_EXCL|O_NOFOLLOW` in `keystore-staging/`, root's 0600, write
-     it, fsync it, then `fchown` it to the service user and `fchmod` it 0600, both on the held
-     descriptor;
-  4. close the gate: `fchmod` of `keystore-logs/` to 0700;
-  5. re-read the old log's tail, from where step 2 stopped, through the descriptor step 2 holds:
-     rebuild merges the lines that parse into the new log, rotate appends the bytes to the
-     staging archive; both are fsynced;
-  6. retire the old log: check the canonical name still holds the inode step 2 opened, clear
-     its flag with `fchflags` on that descriptor, and `unlinkat` its name. It is never chowned
-     and its inode never reused. Rotate then discards `.4` (with `--discard-oldest`), shifts
-     `.3` to `.4` down to `.1` to `.2` with plain renames, and renames the staging archive to
-     `.1`;
-  7. rename the new log to its canonical name with `renameatx_np(RENAME_EXCL)`, so nothing is
-     renamed over;
-  8. set `sappnd` on the held descriptor, then judge it: the service user's, 0600, `SF_APPEND`
-     alone, one link, no ACL;
-  9. fsync the directories, open the gate (`keystore-logs/` to 0755), and remove the marker; the
-     CLI then writes the audit line.
+  So a file is handed to its owner first and flagged second; an owner change of a flagged file
+  needs its flag cleared first; once the flag is set, a descriptor opened without `O_APPEND`
+  before it can neither rewrite nor truncate; and a hard link needs an unflagged file and a
+  searchable path to it.
 
-  No flagged file is renamed, chowned or renamed over, and nothing takes a name the service
-  user can reach before step 7. The new log is root-owned 0600 while written, and the service
-  user owns it only inside `keystore-staging/`, which it cannot reach, so it never holds a
-  descriptor from before the flag; from step 4 to step 9 neither the old log nor the new log
-  is reachable by any name the service user can look up (U90). The old log is unflagged only
-  between step 6's clear and its unlink, behind the closed gate (U118). An archive is a fresh
-  root-owned unflagged copy, 0600, and an alias of it gives the service user nothing, so a
-  link to one is a Warn.
-- **Crash and rerun.** A failure before step 4 removes the staging files and the marker and
-  changes nothing. From step 4 on a failure keeps the marker, so the listener stays down, and
-  the verb names itself to rerun. The rerun, holding both locks, reads the state the crash left
-  (`resumeSwap`):
-  - no canonical log, with the crashed run's marker: the old log was unlinked, so the staged new
-    log is whole; the rerun closes the gate, finishes rotate's archive shift (skipping each shift
-    already made), and runs steps 7 to 9;
-  - the gate closed, the canonical log present and nothing staged: the new log was renamed in;
-    the rerun flags it if its flag is clear, judges it and runs step 9;
-  - the crashed run's marker, the gate open, nothing staged, and the canonical log judged and
-    born no earlier than the marker: the swap finished and only the marker's removal was
-    lost; the rerun redoes nothing (a rotate would otherwise archive the new, empty log), removes
-    the marker, and the CLI writes the audit line;
-  - anything else is a swap to run from step 2: the canonical log is the old one (unflagged,
-    if the crash came between step 6's clear and its unlink, and still behind the closed gate),
-    and a staged file is stale and removed (opened `O_NOFOLLOW`, refused unless a regular file
-    with one link, root's or the service user's).
+  The second probe, on a directory swap: a live directory (root 0755) holding the service
+  user's 0600 flagged log, and a root-only 0700 staging directory holding a replacement
+  directory with its own flagged log. A service-uid process opened the old log
+  `O_WRONLY|O_APPEND` and a descriptor on the live directory before the swap.
 
-  Every crash point ends, after a rerun, with a judged, flagged log and an open gate (U90's
-  crash half, run as root, stops the verb at every step). A rotate that fails past step 4 keeps
-  its staging archive, which then holds the old log's only copy, for the rerun to place.
-  *Residual (a descriptor held on the old log).* Bytes appended through a descriptor the
-  service user held on the old log, after step 5's tail re-read and before step 6's unlink, land
-  in the retired inode and are dropped. The listener is down during maintenance, so only a
-  hostile process can write then; what it could append is its own lines, which it could also
-  have dropped.
-- **Install uses the same order.** Install creates each log root's 0600 in
-  `keystore-staging/` with nothing written, `fchmod`s and `fchown`s it to the service user
-  there, closes the gate, renames it in with `RENAME_EXCL`, flags it on the held descriptor,
-  judges it, and opens the gate. A log the service user owns at 0600 with no flag, found while
-  the gate is closed, is the log of an install that stopped after its rename, and is flagged
-  and judged; anything else is refused and left as found (U21; root-run, U90).
+  | Operation | Result |
+  |---|---|
+  | root `rename` of a directory holding a flagged file | works |
+  | root `renameatx_np(RENAME_SWAP)` of two directories, each holding a flagged file | works; the canonical path reads the new log at once |
+  | root clears the flag on the retired log, now inside staging | works |
+  | the service user, held descriptor on the retired log: `F_SETFL` clearing `O_APPEND` | works |
+  | the same descriptor: `pwrite` at offset 0, `ftruncate` | works (the retired log was emptied) |
+  | the service user, held directory descriptor: `openat` the retired log for write | works |
+  | the service user, by path: open the new canonical log `O_WRONLY` without `O_APPEND` | `EPERM` |
+  | the service user, by path: open the new canonical log `O_TRUNC` | `EPERM` |
+  | the service user, by path: `O_APPEND` write to the new canonical log | works |
+  | the service user: list the staging directory | `EACCES` |
+
+  After every attempt the canonical log held its content and the one legitimate append, flags
+  `0x40000`, `nlink` 1. So an old log whose flag was cleared is writable through any descriptor
+  the service user held from before, whatever its directory's mode, and is never read again;
+  and swapping whole directories leaves no reachable unflagged window: the replacement is
+  flagged before it is reachable, and the old log is unflagged only once it is unreachable by
+  path and no longer an input. While a log is flagged, every write through a held descriptor
+  but an append is refused, `F_SETFL` clearing `O_APPEND` included (U50).
+- **The layout.** Each log lives alone in its own directory in `keystore-logs/`:
+  `keystore-logs/floor/keystore-user-floor.log`, and `keystore-logs/audit/keystore-audit.log`
+  with rotate's archives `keystore-audit.log.1` to `.4` beside it. `keystore-logs/` and each
+  log's directory are root's 0755 with no flag and no ACL, judged on their descriptors. Each
+  log is the service user's, 0600, flagged `SF_APPEND` alone, one link. `keystore-staging/` is
+  root's 0700, judged on its descriptor, present only while a verb or install runs, on the data
+  root's volume so a directory built in it is swapped out of it; only root can reach a name in
+  it. The server refuses a log at the top of the data root or directly in `keystore-logs/`,
+  naming `sudo k3sm install`.
+- **The swap.** `floor --rebuild` and `audit --rotate` replace a log's whole directory in the
+  same numbered steps; each step's function is named in `pkg/keystore/logswap.go`, and the
+  step seam (`SwapSteps`) names the points a test stops at:
+  1. **Locks, then the marker** (`beginMaintenance`). Take `keystore-lock`, then the exclusive
+     store `.lock` (above). Open and judge `keystore-staging/` and clean it (`cleanStaging`:
+     whatever a crashed run left is removed, never read), then open and judge `keystore-logs/`.
+     Write the marker (`writeMarker`): the verb and a random run id, written in staging,
+     fsynced and renamed into the data root, which is fsynced.
+  2. **One bounded read of the old log** (`openOldLog`, `judgeOldLog`). Open the old log
+     `O_NOFOLLOW` in its judged directory and judge it on its descriptor: a regular file,
+     flagged `SF_APPEND`, or unflagged and root's (a restore); an unflagged log the service
+     user owns is refused, since any descriptor it held could have rewritten it. A second link
+     is a Warn. Read it once, bounded by its size at open: rebuild streams it; rotate copies it.
+  3. **The replacement, built and flagged in staging** (`buildLogDir`). Create
+     `keystore-staging/<dir>.new`, open it `O_DIRECTORY|O_NOFOLLOW` and judge it; create the
+     new log in it `O_CREAT|O_EXCL|O_NOFOLLOW`, write it, fsync it, `fchown` it to the service
+     user, `fchmod` it 0600, set `SF_APPEND`, each on the held descriptor, and judge it. Rotate
+     adds a fresh root 0600 `.1` holding the old log's bytes read in step 2, and hard-links the
+     live `.1` to `.3` in as `.2` to `.4` (the old `.4` is not linked, so the swap drops it). Set
+     the directory to root's 0755 and fsync it.
+  4. **The report** (`writeMarker`). Rewrite the marker with the new log's device and inode and
+     the verb's report.
+  5. **The commit** (`swapLogDir`, `renameSwap`). Exchange `keystore-staging/<dir>.new` and
+     `keystore-logs/<dir>` with one `renameatx_np(RENAME_SWAP)`, then fsync both parents. The
+     canonical path reads the new log at once; the old directory is now in staging.
+  6. **The retired set, cleaned unread** (`cleanStaging`). Each entry of the retired directory
+     is removed by descriptor: a regular file carrying a flag, with one link, has it cleared on
+     a descriptor opened `O_NOFOLLOW` and re-checked as the entry named; a file with a flag and
+     another link refuses; everything else is unlinked with `unlinkat`, which never follows.
+     Nothing in staging is read.
+  7. **The marker removed** (`end`). The CLI then prints the report and writes the audit line.
+
+  No flagged file is renamed, chowned or renamed over, and no file is flagged after it is
+  reachable. Every attribute call goes on a held descriptor. The canonical directory is always
+  one complete, flagged, judged set: the old one before step 5, the new one after it (U90).
+  The old log takes one attribute call, its flag clear, in step 6, once the swap has made it
+  unreachable by path; it is never chowned or chmodded and never read again (U118). An archive
+  is root's 0600 and unflagged, and an alias of it gives the service user nothing, so a link
+  to one is a Warn.
+- **Crash and rerun.** The live set is always one complete set, so a crash at any step leaves
+  a valid log, and the rerun never finishes a half-done swap: it cleans staging, which it
+  never trusts, and reads the marker. A failure before step 4 cleans staging, removes the
+  marker and changes nothing. From step 4 on a failure keeps the marker, and the verb names
+  itself to rerun. A marker of the same verb whose recorded inode is the live log is a run
+  whose swap committed: the rerun prints that marker's saved report (a rebuild that dropped
+  lines exits 4 with the same counts) and does not run again. Any other marker, the other
+  verb's or one whose swap never committed, is replaced: the live set is valid, and the rerun
+  runs from step 1. A marker that is not a regular file with one link, of the data root's
+  owner, refuses the verb. A planted symlink, FIFO or directory at the marker, at
+  `keystore-staging/` or at a log's directory refuses the verb before anything changes; one
+  inside `keystore-staging/` is removed unread (U68).
+- **Install builds a missing log the same way.** Install builds each missing log's directory
+  in `keystore-staging/` as step 3 does, the log empty, and places it in `keystore-logs/` with
+  `renameatx_np(RENAME_EXCL)`, so nothing is renamed over. A log that passes the judge is left
+  alone; anything else, an unflagged log among them, is refused and left as found. Install
+  refuses, changing nothing, while a maintenance verb holds `keystore-lock`, and removes a
+  stale marker once the live set is ensured (U21; root-run, U90).
 - **The hand-over order was not measured before 2026-11-23.** The order this design first
   named, flag the new file and then `fchown` it to the service user, rested on an unmeasured
   assumption (K0 measured the service user's operations on a flagged file, not root's). The
-  first root run of the verbs on 2026-11-23 failed at that hand-over, and the probe above
-  measured why; the owner-first, gated order replaces it.
+  first root run of the verbs on 2026-11-23 failed at that hand-over, and the first probe
+  measured why; the second probe measured the directory swap that replaced the design.
 - **Root never acts by path where the service user can write.** `server/` and `.user/` are
   the service user's (and so is `keystore-sock/` in the deny-plus-pin fallback), so a name
   root created there could be a symlink or a swapped file the service user planted. The
@@ -2847,49 +2855,45 @@ crashed run's. That wait is the store `.lock`
   (root:wheel 0755), where only root creates names, under `keystore-`-prefixed names that the
   Pod prefix deny covers ("Pod denies"). Every step goes through one descriptor on the data
   root, opened `O_DIRECTORY|O_NOFOLLOW` and judged by `fstat` (root-owned, not group- or
-  other-writable), and descriptors on `keystore-logs/` and `keystore-staging/` opened and
-  judged the same way:
-  - each create is `openat` with `O_CREAT|O_EXCL|O_NOFOLLOW`, so an existing name, a symlink
-    included, is refused rather than followed or reused;
-  - every attribute call (`fchown`, `fchmod`, `fchflags`) goes on a held descriptor, never a
-    path;
-  - the old log is opened `O_NOFOLLOW` and must be a regular file; each archive must be a
-    regular file, root's 0600, unflagged; a marker a crash left is kept only when it is a
-    regular file with one link owned by root.
+  other-writable), and descriptors on `keystore-logs/`, each log's directory and
+  `keystore-staging/` opened and judged the same way; each create is `O_CREAT|O_EXCL|O_NOFOLLOW`.
 
-  *A hard link does not strand the logs.* A flagged file cannot be linked, and no unflagged
-  log is reachable by the service user, but a link may stand on a restored log. The verbs take
-  an old log with more than one link as input, with a Warn naming it, and never refuse on it:
-  they always replace the canonical inode with a fresh one, and the other link keeps only the
-  old file. The steady-state check (`judgeLog`) still refuses a canonical log with more than
-  one link, and its error, and `doctor`, name the verb that repairs it: `floor --rebuild` for
-  the floor, `audit --rotate` for the audit log. Install refuses, changing nothing, while the
-  marker exists, naming the verb to rerun, so it never flags or hands over a log a stopped
-  verb left; it judges the data root's flags and ACL as the keystore does.
-
-  A planted symlink or FIFO at the marker, `keystore-staging/`, the old log or an archive
-  refuses the verb before anything changes, and an old log swapped while the verb holds it is
-  refused at step 6, behind the closed gate, with the marker kept; no byte of either log
-  changes (U68, run as root). The verb removes the marker last (U22). Rebuild is the user-scope
-  twin of Phase A's "remove `keystore-floor.json`, then run any root verb".
+  *A hard link does not strand the logs.* A flagged file cannot be linked, but a link may
+  stand on a restored log. The verbs take an old log with more than one link as input, with a
+  Warn naming it: they always swap in a fresh inode, and the other link keeps only the old
+  file. The steady-state check (`judgeLog`) still refuses a canonical log with more than one
+  link, and its error, and `doctor`, name the verb that repairs it: `floor --rebuild` for the
+  floor, `audit --rotate` for the audit log. Rebuild is the user-scope twin of Phase A's
+  "remove `keystore-floor.json`, then run any root verb".
+- **The residuals of the swap.**
+  - *Lines appended after the read.* The read in step 2 is bounded by the old log's size at
+    open. A line appended to the old log after that is dropped with the retired log. Every
+    legitimate writer holds the store lock, which the verb holds, so only a hostile process
+    appends then, and what it could append is its own lines.
+  - *The service user can block `floor --rebuild`.* It can flood the floor with tombstones past
+    the key bound, or make one of its scopes unopenable; rebuild then refuses, naming the scope
+    ("Rebuild never lowers"). The repair is `sudo k3sm keys rm-scope user/<uid> --yes` for that
+    scope, then `floor --rebuild`.
+  - *Root's audit line comes after the verb.* The CLI writes the verb's audit line once the
+    verb has returned, so a crash between the commit and that line leaves the change without
+    its line; the rerun writes one.
+  - *A bounded descent.* `rm-scope` descends at most 32 directories below the scope directory
+    and refuses a deeper tree ("A removed scope stays removed").
 - **`audit --rotate` keeps four archives.** The previous logs are `keystore-audit.log.1` (the
-  newest) to `keystore-audit.log.4`, in `keystore-logs/`. Rotate refuses, changing nothing, when
-  `.4` exists, unless `--discard-oldest` is given, so evidence is never discarded without root
-  saying so; the `doctor` hint past the soft cap says to export the archives first (copy them
-  off the Mac), then rotate. The archives are root's evidence: each is a fresh root-owned,
-  unflagged copy of the log, 0600 with one link, written in `keystore-staging/` (step 2 and step
-  5 of the swap) and renamed to `.1`; the old log's inode is retired, never re-owned, and the
-  service user never appends to an archive. Rotate requires every archive to be a regular file,
-  root's, 0600, unflagged, and refuses anything else before it changes anything; an archive with
-  a second link is a Warn, not a refusal, since an alias of a root 0600 file gives the service
-  user nothing. Older archives shift up by plain renames under the closed gate; with
-  `--discard-oldest`, `.4` is first unlinked. A crash during the shift is finished by the rerun,
-  which skips each shift already made. Without the crashed run's marker a missing audit log
-  refuses the rotate, and while the marker stands a root verb's audit line refuses rather than
-  skipping a missing audit log. Rotation resets every uid's audit share and budgets to 0
-  (below). That is deliberate: only root rotates, and what a uid wrote before is kept in the
-  archives, so the evidence a reset share can push out of the live log is bounded by the four
-  archives (U91).
+  newest) to `keystore-audit.log.4`, in `keystore-logs/audit/`. Rotate refuses, changing
+  nothing, when `.4` exists, unless `--discard-oldest` is given, so evidence is never discarded
+  without root saying so; the `doctor` hint past the soft cap says to export the archives first
+  (copy them off the Mac), then rotate. The archives are root's evidence: `.1` is a fresh
+  root-owned, unflagged copy of the old log's bytes read in step 2, 0600 with one link, and the
+  older archives are carried into the replacement directory by hard link; the service user never
+  appends to an archive. Rotate requires every archive to be a regular file, root's, 0600,
+  unflagged, and refuses anything else before it changes anything; an archive with a second
+  link is a Warn, not a refusal, since an alias of a root 0600 file gives the service user
+  nothing. A rerun after a crash past the swap prints the crashed run's report and does not
+  rotate twice. While the marker stands a root verb's audit line refuses rather than skipping a
+  missing audit log. Rotation resets every uid's audit share and budgets to 0 (below). That is
+  deliberate: only root rotates, and what a uid wrote before is kept in the archives, so the
+  evidence a reset share can push out of the live log is bounded by the four archives (U91).
 - **The server reopens after maintenance.** The server's append descriptors still name the
   old files after a maintenance verb renames them, and its per-uid counts describe the old
   contents. So when the marker is gone, before the listener restarts and before any server
@@ -3242,7 +3246,8 @@ crashed run's. That wait is the store `.lock`
   while user scopes exist, unless root gives it an explicit flag that says it lowers the
   floor (`TestLogMissingWithScopesNamesRestore`; the install side lands with install).
 - **Backup and restore.** The flag does not survive `cp`, rsync or Time Machine, so a restore
-  always ends with `floor --rebuild`, and `audit --rotate` re-flags the audit log. Until then
+  always ends with `floor --rebuild`, and `audit --rotate` swaps in a fresh flagged audit log.
+  Until then
   the listener refuses to start (U25, E17).
 - **What it does not stop.** A process running as the service user can append a huge `seq`
   and make an entry unreadable, a denial of service the same-user model already permits, since
@@ -3373,9 +3378,10 @@ refused before its first frame:
   Pre-frame refusals are rate-limited the same way, per peer uid, with their own dropped-count
   summary (U54).
 - **What it claims.** The log is append-only against truncation and deletion by the service
-  user, except that bytes it appends through a descriptor held on the old log late in a maintenance
-  verb are dropped (residual 12); it cannot reach the old log while it is unflagged, which is
-  only behind the closed gate, and the archives are root 0600 ("The swap"). A service-user process outside Seatbelt can append forged lines, because it shares the
+  user, except that bytes it appends to the old log after a maintenance verb's one read of it
+  are dropped (residual 12); the old log is unflagged only once the swap has made it
+  unreachable by path and it is no longer an input, and the archives are root 0600 ("The
+  swap"). A service-user process outside Seatbelt can append forged lines, because it shares the
   trust domain with the master; a hash chain would not stop that writer, so there is none.
 - `audit --rotate` moves the log aside under the maintenance procedure above.
 
@@ -3605,8 +3611,8 @@ layer.**
    `keystore-delivery.json`, `keystore-user-floor.log`, `keystore-audit.log`,
    the archives `keystore-audit.log.1` to `.4`, the floor lock `keystore-lock`, the removal
    record `keystore-removed-scopes.json` (Open requirement 13), the maintenance marker
-   `keystore-maintenance` and the staging files
-   `keystore-user-floor.log.new` and `keystore-audit.log.new`), and the whole `keystore-sock/`
+   `keystore-maintenance` and the staging directory `keystore-staging/`), the logs'
+   directory `keystore-logs/`, and the whole `keystore-sock/`
    tree, which the prefix also covers. A prefix means a keystore file a later change adds is
    denied without a runtimed change. runtimed renders them under the work dir always and under
    `Posture.DataRoot` when it is set and differs (`keystoreRoots`), not under
@@ -4609,12 +4615,12 @@ the uid throughout.
     accepted: the service user must read the floor, and neither file holds a value. Pods are
     covered by the data-root denies ("Pod denies"). What a login user cannot do with a system
     entry is read or deliver it (E12).
-12. During `audit --rotate` and `floor --rebuild`, bytes appended through a descriptor the
-    service user held on the old log, after the swap's tail re-read (step 5) and before the old
-    log's unlink (step 6), land in the retired inode and are dropped. The listener is down
-    during maintenance, so only a hostile process can write then. Nothing else of the old log
-    or the new one is reachable: both are behind the closed gate from step 4 to step 9, the old
-    log is never re-owned, and the new log is flagged before the gate opens ("The swap").
+12. During `audit --rotate` and `floor --rebuild`, lines appended to the old log after the
+    verb's one read of it (step 2, bounded by its size at open) are dropped with the retired
+    log. Every legitimate writer holds the store lock the verb holds, so only a hostile process
+    can write then. What a descriptor the service user held from before does to the retired log
+    once its flag is cleared (step 6) never reaches the new log, which was flagged before it was
+    reachable, and the retired log is never read again ("The swap").
 13. The GeneratedUID's stability across a macOS upgrade, a Migration Assistant transfer or a
     directory rebind is not measured; K0 measured it only across processes and a restart. A
     change there reads as `ErrScopeOwnerChanged`, which in this release is `Indeterminate` and
@@ -4695,10 +4701,13 @@ text points here.
    between its flag clear and its next flag set while still owned by the service user, so a
    service-user process can open it by path with `O_TRUNC` and truncate it. *Fix (as built,
    2026-11-23):* the flag refuses root's `fchown`, so the old log is not re-owned: it is
-   retired. Its flag is cleared behind the closed gate (`keystore-logs/` at 0700) and its name
-   unlinked in the next step; the archives are fresh root-owned unflagged copies ("The swap").
-   *Test:* U118, root-run: the old log's one attribute call is its flag clear, and while it is
-   unflagged the service user's write-open, truncating open and link of it fail with `EACCES`.
+   retired. The whole log directory is swapped out with `RENAME_SWAP` into the root-only
+   `keystore-staging/`, and only then is the old log's flag cleared and the retired set removed
+   unread; `.1` is a fresh root-owned unflagged copy, and the older archives are carried by hard
+   link, never unflagged ("The swap"). *Test:* U118, root-run: the old log's one attribute call
+   is its flag clear, after the swap; U90, root-run: at every step the canonical log by path is a
+   complete judged log, and nothing the service user's held descriptors do to the retired log
+   reaches the new one.
 2. **Any local user can hold the floor lock (K8, and merged Phase A code).** Phase A's floor
    writers take `flock(2)` on the data-root directory itself (`pkg/keystore/floor.go:368` to
    `:375`); the data root is root:wheel 0755, so any local user can open it, take the lock and
@@ -4811,8 +4820,9 @@ the K0 spike's evidence of 2026-11-21 (`status.txt`, `leg1.txt` to `leg4-*.txt`,
 **K0 note, 2026-11-23.** K0 measured the service user's operations on a flagged file, not
 root's. The order the maintenance verbs first used, flag the new log and then hand it to the
 service user, was not measured before 2026-11-23; that day's probe (§ "SF_APPEND, as
-measured") found root's `fchown` of a flagged file refused, and the swap now hands a log to its
-owner first and flags it second, behind the gate.
+measured") found root's `fchown` of a flagged file refused, and that day's second probe
+measured the directory swap: the swap now hands the new log to its owner first and flags it
+second, inside the root-only `keystore-staging/`, before it is reachable.
 
 | leg | the fact | result | where it applies |
 |---|---|---|---|
@@ -5787,11 +5797,11 @@ carried by the unit rows.
 | U18 | CRD: `entry`, `secretName`, `items`, `requestedBy` required with no default and immutable by CEL transition rules (`items` as a map); `requestedBy` matches its pattern and, for a user entry, equals `k3sm:local:` plus the entry's uid; `conditions` is `listType=map` keyed by `type`; status subresource on; reasons listed; a `system/…` entry is refused | `apis/config/crd::TestKeyDeliveryCRDMatchesTheGoTypes`, `TestKeyDeliveryImmutableFields`, `TestKeyDeliveryRequiredFields`, `TestKeyDeliveryRequestedByMatchesEntryUID`, `TestKeyDeliveryConditionsListMap`, `TestKeyDeliveryRefusesSystemEntry` | pending: the `KeyDelivery` API |
 | U19 | the CRD pattern, its `maxLength` of 269, the uid range rule and the 253-byte name-length rule pass the shared entry-grammar vectors, `user/1/` and `system/` each with a 254-byte name refused | `apis/config/crd::TestEntryGrammarVectors` | pending: the `KeyDelivery` API |
 | U20 | a user entry tree copied back after `rm` is refused as deleted against the floor log's tombstone (real, not synthetic), a later `put` of the name is served, and an `rm` whose removal fails still leaves the entry refused; an `rm` buries every generation it can name (the floor's live ones, the `generation` file's, the pointer header's and each `v<N>` record header's), so a swapped `generation` file, or a `generation` file and pointer both rewritten, does not let the original tree back, and it reports the mismatch after the commit; a planted tree naming more than 4 generations beyond the floor's live ones has only the floor's and the pointer header's buried, is removed and is reported altered; whatever stands at the name it buries the floor's live generations first: a file or a symlink there is buried, removed and reported after the commit, a directory that cannot be opened is buried first and kept, refused when the floor does not take the tombstone, a burial is one write of every tombstone, the served generation first (the authenticated one, or the pointer header's without K_u), under one block reservation, and one whose reservation is refused or whose write lands short inside its first tombstone refuses the `rm` with nothing removed (the short bytes are a torn tail the reader skips), while one whose write lands short after a whole tombstone is committed and audited as a revocation, while a floor that takes tombstones one by one reports a burial that fails after its first tombstone landed after the commit, audited as a revocation, a name no source names a generation for is refused before anything is removed, and an `rm` of an absent tree with live generations buries them and succeeds, so a retry after a failed burial closes the window; an absent floor refuses an `rm`, which removes nothing, a withdraw over a floor that is absent, unflagged or unreadable seals nothing and is refused naming the Secret's deletion, so a restored record is never re-sealed, a floor line that does not parse, or a torn tail, is skipped and counted as damage (root reads the count), so an `rm` and a withdraw of two uids after garbage each succeed while a grant is refused before its first write naming `CheckLogBounds` and the root acknowledgement (a skipped line can be a tombstone, so damage writes no live line for a key it could name: a torn line whose scope and name parse taints that key, or that generation, for every generation, the delivery record included, a line torn inside its name or its scope taints every key whose name or scope starts with the partial text, and other names keep working, while unattributable damage keeps the floor-wide rule; no catch-up or `put` writes one for a generation whose tombstone was lost, `current` of it is refused, and every floor line carries a CRC-32C checksum, so a truncated or flipped line never parses, a truncated one taints its key or counts as unattributable, and a damaged line that could be a tear, a prefix of a line in the grammar, taints by that prefix, and any other is corrected to the keys it taints, a flipped-away newline's two lines included, or, with no unique single-bit correction, refuses every known generation until the acknowledgement, the start step quarantines only a scope whose live catch-up line the damage refused, its grants and reads refused while its rm and withdraw still run, and a full volume quarantines nothing; a taint past the taint set's cap refuses every key's grants and reads, which no acknowledgement lifts; the acknowledgement is a compare-and-set against the floor root reviewed, its unrecovered count included, and the review gives each unrecovered line's offset; a withdraw under a delivery-record taint seals every delivery withdrawn and audits each one it withdrew, admitting every audit line on the audit log before it seals and attempting each one past a failure), every append writes a newline first, so a foreign fragment landing just before the server's write is one damaged line and every server line parses, and a torn tail is frozen where first read, so a foreign append that completes it stays damage that keeps its key tainted, an empty line is benign, a burial's free-space preflight also holds its audit line's after the burial's block-rounded reservation, an `rm` whose burial fsync fails is committed, durability uncertain, and audited as a revocation when its tombstones are visible, found from the file's real end, and refused with nothing removed when none is, and the tombstones read before the garbage still refuse their copies; an `rm` over a torn floor tail buries and removes; a floor past the reader's bound refuses a withdraw with `ErrCorrupt` naming the matched-set restore, which brings back every entry deleted since the backup, and a read I/O error is not damage; a grant over a floor that is absent, unflagged, unreadable or past its bound is refused before its first write, with no `ok` line. A `current` below a floor line is refused with the user-scope floor message, which names the matched-set restore, not removing `keystore-floor.json`; until user rotate exists that half is proved against a synthetic later floor line, and becomes a real "older `current` than a later write" check with rotate | `k3sm/pkg/keystore::TestUserFloorRefusesCopyBackAfterRm`, `TestUserPutAfterRmServed`, `TestUserRmBuriesBeforeRemoval`, `TestUserRmAbsentFloorRemovesNothing`, `TestUserRmSwappedGenerationStillBuries`, `TestUserRmNonDirectoryBuries`, `TestUserRmRetryAfterTreeGoneBuries`, `TestUserRmBuriesVersionHeaderGeneration`, `TestUserRmOpenFailureBuriesFirst`, `TestUserRmOpenFailureRefusedWithoutTombstone`, `TestUserRmMissingEntriesBuriesFirst`, `TestUserRmRemovalFailureIsCommitted`, `TestUserRmChargesEveryTombstone`, `TestRmBurialReservedBeforeFirstTombstone`, `TestRmBurialIsOneWrite`, `TestRmBurialWriteFailureRefuses`, `TestRmBurialShortWriteAfterWholeLineCommits`, `TestRmBurialServedPointerFirstWithoutKu`, `TestRmBurialPartialNamesLandedWithoutServed`, `TestServerPathsLeaveOneLiveGeneration`, `TestRmBurialSyncFailureRefuses`, `TestRmBurialSyncFailureVisibleCommits`, `TestRmBurialForeignAppendBeforeShortWriteCommits`, `TestForeignFragmentBeforeWriteIsOwnLine`, `TestRmPartialBurialIsCommitted`, `TestUserRmUnreadableScopeKeyBuriesNothing`, `TestUserRmNoGenerationRefusesFirst`, `TestUserRmCapsTreeGenerations`, `TestUserFloorRefusesCopiedBackCurrent`, `TestWithdrawAbsentFloorProceeds`, `TestWithdrawUnverifiedFloorSealsNothing`, `TestRmOverTornFloorTailBuries`, `TestFloorGarbageTailIsSkippedDamage`, `TestFloorDamageDegradesLiveLines`, `TestTornBurialTaintsOnlyItsKey`, `TestTornBurialEveryCutRefusesKnownGeneration`, `TestSkippedScopePrefixTaintsItsScopes`, `TestTornWithdrawLineTaintsDeliveryRecord`, `TestUnattributableDamageKeepsFloorWideRefusal`, `TestTornPutLineQuarantinesOnlyItsScope`, `TestQuarantinedScopeRevokes`, `TestFullVolumeAtStartDoesNotQuarantine`, `TestWithdrawRunsUnderDeliveryRecordTaint`, `TestFloorLineCarriesChecksum`, `TestEveryTruncationAndFlipNeverParses`, `TestClosedTearRefusesKnownGeneration`, `TestDeliveryTearClosedKeepsTaint`, `TestFlippedGenerationDigitTaintsName`, `TestCorruptTombstoneOfKnownGenerationRefused`, `TestFloorDamageAckLiftsOnlyUnattributable`, `TestFloorTaintOverflowRefusesEveryKey`, `TestFloorDamageAckRefusesChangedFloor`, `TestFloorDamageAckRefusesStaleUnrecovered`, `TestFloorAckViewGivesUnrecoveredOffsets`, `TestFloorDamageAckCatchUpSkipsAttributable`, `TestRuntimeCatchUpRestoresLostEntryLine`, `TestWithdrawUnderTaintNeverRevivesLostWithdraw`, `TestFloorTornMiddleLineIsSkipped`, `TestWithdrawMalformedFloorRefused`, `TestFloorReadErrorIsNotDamage`, `TestGrantRefusesUntrustedFloorFirst`, `TestEveryTombstoneFlipRefusesKnownGeneration`, `TestFlippedTombstoneScopeRefusesCopyBack`, `TestUnrecoveredFlipRefusesKnownGenerations`, `TestForeignCompletionOfTornTailStaysTainted`, `TestForeignGrowthOfTornTailKeepsTaint`, `TestWithdrawUnderTaintAuditsEverySealed`, `TestWithdrawMassSealAuditsEveryDeliveryAtBudgetEdge`, `TestAuditSealedKeepsGoingPastFailure`, `TestRmBurialNeverLosesItsAuditLine`, `TestRmBurialFreeSpaceCoversItsAuditLine`, `TestDeliveryCatchUpPathsCheckLiveRefused`, `FuzzParseFloorLine`, `TestEveryBurialBufferFlipRefusesEveryBuried`, `TestEveryTwoBitTombstoneFlipTaintsTrueKeyOrUnrecovered`, `TestCouldBeTearMatchesOracle`, `TestReadBurialEverySingleFlip`, `FuzzCouldBeTear`, `FuzzBurialFlips`; rig leg E9 | checked: the append-only files (the store side) |
-| U21 | install creates both logs owner first behind the gate: each is created root's 0600 in the root-only `keystore-staging/` with nothing written, handed to the service user and set 0600 there, `keystore-logs/` is closed to 0700, the log renamed in, flagged on the held descriptor and judged, and `keystore-logs/` opened to 0755 again, so the logs end service-user-owned 0600 and flagged; it judges the data root's flags and ACL as the keystore does, and refuses, changing nothing, while keystore-maintenance exists, naming the verb to rerun; the listener refuses to start when a flag is clear, a log is not the service user's or the gate is closed (seams: chflags flag source, file-attribute writer, euid source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `TestKeystoreFilesRefuseDuringMaintenance`, `TestKeystoreFilesJudgeDataRootFlags`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
+| U21 | install creates each missing log with its own directory, as the maintenance verbs build one: the directory is built in the root-only keystore-staging/, the log created root's 0600 with O_EXCL\|O_NOFOLLOW and nothing written, handed to the service user, set 0600 and flagged SF_APPEND on its descriptor and judged, all before the directory is placed in keystore-logs/ with RENAME_EXCL, so the log is flagged before it is reachable; a log that passes the judge is left alone, and an unflagged one is refused and left as found; it judges the data root's flags and ACL as the keystore does, refuses, changing nothing, while a maintenance verb runs, and removes a stale keystore-maintenance marker once the live set is ensured; the listener refuses to start when a flag is clear or a log is not the service user's (seams: chflags flag source, file-attribute writer, euid source) | `k3sm/pkg/install::TestKeystoreAppendOnlyFilesAtInstall`, `TestKeystoreFilesRefuseDuringMaintenance`, `TestKeystoreFilesJudgeDataRootFlags`, `k3sm/pkg/keystore::TestFlagCheckRefusesUnflagged`; rig leg E1 | pending: the append-only files |
 | U22 | `floor --rebuild` and `audit --rotate` write the marker `keystore-maintenance` and stage `keystore-user-floor.log.new` and `keystore-audit.log.new` in the root-owned data root, stop the listener, hold the lock, write the new file before touching the old, clear the old file's flag before any rename, and flag the new file on its held descriptor after the rename; a crash at each step leaves the marker, so the listener stays down until a rerun leaves a flagged file; every audit and floor append, the reconciler's and the pre-frame lines included, takes the store lock that maintenance holds exclusively, so a reconciler append during an `audit --rotate` waits and lands in the new log; after maintenance, under the exclusive lock, the server reopens its audit and floor append descriptors and recounts the per-uid shares before releasing it, and the counts reset (seams: file-attribute writer, euid source) | `k3sm/cmd/k3sm::TestKeysFloorRebuildCrashOrder`, `TestKeysAuditRotateCrashOrder`, `k3sm/pkg/keystore/reconcile::TestReconcilerAppendWaitsForAuditRotate`, `k3sm/pkg/keystore/socket::TestMaintenanceReopensLogsAndResetsShares`; rig leg E17 | pending: the append-only files, the socket listener and the KeyDelivery reconciler (lifecycle), run in the lifecycle's mode, the last to land |
 | U23 | every audited operation writes one `v:1` line; no line carries a value or its length; readers ignore unknown fields; an append after a torn tail writes a newline first, so the torn bytes are a dropped line of their own and the new line parses; a change committed whole is audited ok and one committed in part committed; a partial commit whose audit line fails keeps both failures and logs the scope and verb at Warn | `k3sm/pkg/keystore::TestAuditLineNeverCarriesValue`, `TestAuditReaderIgnoresUnknownFields`, `TestAuditTornTailAppendParses`, `FuzzParseAuditLine`, `TestAuditLineChargedStrictly`, `TestAuditResultCommitted`, `TestCommittedChangeKeepsAuditFailure` | checked: the append-only files (the store side) |
 | U24 | the logs' sizes and soft cap are exposed for `doctor` (`LogSizes`); past the hard cap every mutating user op is `ErrLogFull`, except the revocation class, which draws on its uid's revocation budget; a line over 1 KiB is refused, and one found past the hard cap in the audit log is skipped and charged to no uid, while in the floor it is damage; the reader is bounded in size and floor keys, and the writer never appends past either bound: a floor line adding a key past the key bound is ErrLogFull, a grant without room for its keys is refused before its first write naming doctor, and a revocation of a key the floor holds still goes through, so put/rm churn never makes the floor damage; the reader reads through a line straddling the cap, and never blocks on a FIFO; a log or data root carrying a file flag beside `SF_APPEND` or a non-empty extended ACL is refused as untrusted; an append preflights free space and refuses, retryably, below 1 MiB plus the line, except a revocation's line, which keeps only a minimal check of the line plus 9 KiB; a put whose floor line would be refused after its commit (at the key bound, at a cap straddle where a minting put's second line would start past the hard cap, or below the free-space margin) is refused before its first write, and so is a deliver's; a grant line adding a key is refused once its uid has added its lifetime share of keys, buried or live (uidKeyShare, 4,112), while its rm still succeeds and another uid's grant succeeds, and a revocation line adding a key lands in a revocation headroom past the key bound, which the reader's bound includes; a configuration whose bounds sit below what an existing log holds is refused at store open; an append reserves its line's blocks on the log's descriptor before it writes, and a refused reservation is refused for space with the log byte-identical; a configuration under which a uid's lines past the hard cap already exceed its revocation budget is refused at store open naming the remedy, a budget under two lines is refused, and the default budget holds one scope's full revocation | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations`, `TestAuditLineBoundedAtOneKiB`, `TestLogReaderSizeBound`, `TestFloorKeyBound`, `TestFloorKeyBoundChurnRefusesGrants`, `TestFloorWriterRefusesKeyPastBound`, `TestFloorKeyBoundDerivedFromCaps`, `TestAuditStraddlingLineCharged`, `TestLogOpenFIFORefused`, `TestLogAppendPreflightsFreeSpace`, `TestRevocationLinesSkipFreeMargin`, `TestRevocationLineAtKeyBound`, `TestLogRefusesExtraFlags`, `TestLogDataRootRefusesExtraFlags`, `TestLogRefusesExtendedACL`, `TestAuditOverlongLineSkipped`, `TestPutRefusedFirstBelowFloorMargin`, `TestPutRefusedFirstAtKeyBound`, `TestPutRefusedFirstAtCapStraddle`, `TestDeliverRefusedFirstBelowFloorMargin`, `TestPutFloorLineSurvivesVolumeFiller`, `TestPutPreflightReservesValueRoom`, `TestFloorLineBudgetFollowsClass`, `TestLogFullTextNamesNoNumbers`, `TestLogErrorsNameNoFigures`, `TestFloorSeqZeroLineIsPresent`, `TestFloorKeyShareRefusesOneUID`, `TestFloorKeyShareChargesBuriedKeys`, `TestFloorKeyShareLifetimeArithmetic`, `TestFloorDeliverRoomExistingKeyPastBound`, `TestFloorTombstoneLandsInHeadroom`, `TestFloorReaderAcceptsHeadroom`, `TestCheckLogBoundsRefusesShrunkCaps`, `TestCheckLogBoundsRefusesKeysPastBound`, `TestCheckConfigBoundsCapsAbove`, `TestLogMissingWithScopesNamesRestore`, `TestLogAppendReservesBlocks`, `TestReserveLogBlocksRounds`, `TestCheckLogBoundsRefusesSpentRevocationBudget`, `TestCheckLogBoundsRefusesAtSpent`, `TestSpentRevocationBudgetIsPerUID`, `TestCheckConfigRevocationBudgetFloor`, `TestDefaultRevocationBudgetHoldsFullRevocation` | checked: the append-only files (the store side) |
-| U25 | backup and restore round trip: a restored tree with cleared flags is refused until `floor --rebuild`, then opens; the rebuild writes a line for every entry directory holding a `generation` file, an authenticated pointer's sequence or, with none, sequence 0, so a damaged entry stays `ErrCorrupt` and never becomes `ErrNotFound`; the maintenance verbs write the marker before they wait for the locks, stage in a root-only 0700 directory, and take a log with a second link as input, which the steady-state check refuses naming the verb, leaving a fresh canonical log with one link; past the 30 s wait they name the service-user holder and k3sm stop | `k3sm/pkg/keystore::TestBackupRestoreRoundTripRebuild`, `TestRebuildKeepsDamagedEntryCorrupt`, `TestSwapCallOrder`, `TestSwapRerunFromEachCrashPoint`, `TestSwapRerunFromEachStep`, `TestSwapKeepsTailAppendedBeforeGate`, `TestLogsGateClosedRefusesServer`, `TestLogAtOldLocationRefused`, `TestMaintenanceRepairsHardLinkedLog`, `TestMaintenanceStagingDirIsRootOnly`, `TestMaintenanceMarkerBeforeLocks`; rig leg E17 | done: the append-only files (floor --rebuild) |
+| U25 | backup and restore round trip: a restored tree with cleared flags is refused until floor --rebuild, which takes the restored root-owned unflagged floor as input, then opens; the rebuild writes a line for every entry directory holding a generation file, an authenticated pointer's sequence or, with none, sequence 0, so a damaged entry stays ErrCorrupt and never becomes ErrNotFound; the maintenance verbs take the locks, keystore-lock then the store lock, before they write the marker, build the replacement directory in a root-only 0700 keystore-staging/, swap it in with RENAME_SWAP, and leave the live set one complete set at every step; they take a log with a second link as input, which the steady-state check refuses naming the verb, leaving a fresh canonical log with one link, and refuse an unflagged old log the service user owns; past the 30 s wait they name the service-user holder and k3sm stop | `TestBackupRestoreRoundTripRebuild`, `TestRebuildKeepsDamagedEntryCorrupt`, `TestSwapCallOrder`, `TestSwapRerunFromEachStep`, `TestMaintenanceRepairsHardLinkedLog`, `TestMaintenanceStagingDirIsRootOnly`, `TestMaintenanceLocksBeforeMarker`, `TestOldLogUnflaggedServiceOwnedRefused`; rig leg E17 | done: the append-only files (floor --rebuild) |
 | U26 | peers uid 0, the service uid and uid < 501 are refused before any frame is read (seam: peer-credential source) | `k3sm/pkg/keystore/socket::TestPeerEligibility` | pending: the socket listener |
 | U27 | framing: an oversize frame, unknown type, a sub-length past the frame length or missing `HELLO` closes; `HELLO` past the 10-second bound closes; an unknown header field is ignored; `HELLO` picks the highest common version and the reply carries it and the server's frame cap; no common version sends `unsupported-version` then closes; an unknown `op` answers `unknown-op` and keeps the connection; the frame cap covers the largest value, header and framing | `k3sm/pkg/keystore/socket::FuzzFrameReader` (committed seeds), `TestFramingBounds`, `TestSubLengthsWithinFrame`, `TestHelloReadDeadline`, `TestUnknownHeaderFieldsIgnored`, `TestHelloVersionRange`, `TestHelloReplyCarriesVersionAndMaxFrame`, `TestHelloNoOverlapSendsUnsupportedVersion`, `TestUnknownOpKeepsConnection`, `TestFrameCapCoversMaxValue` | pending: the socket listener |
 | U28 | 64 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after `HELLO` or between requests is closed | `k3sm/pkg/keystore/socket::TestConnectionCapsPerUID`, `TestRequestTimeout`, `TestIdleTimeoutAfterHelloAndBetweenRequests` (`testing/synctest`) | pending: the socket listener |
@@ -5834,7 +5844,7 @@ carried by the unit rows.
 | U65 | the reconciler reads `ErrScopeAbsent` as `Indeterminate` and deletes nothing; every outcome on the allow-list, not only a SAR denial, deletes only on two consecutive sweeps for the same generation; the single-server check is re-run from a fresh List before every sweep, and a second server or a failed List runs no sweep | `k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate`, `TestEveryDeletingOutcomeNeedsTwoSweeps`, `TestSingleServerRecheckedBeforeEverySweep` | pending: the KeyDelivery reconciler (lifecycle) |
 | U66 | the GeneratedUID lookup recognises the synthesized compatibility form (prefix `FFFFEEEE-DDDD-CCCC-BBBB-AAAA`) and answers `ErrScopeOwnerUnknown`, never a changed owner, and no mint binds it; `ErrScopeOwnerChanged` only when a real, non-synthesized GeneratedUID differs from the bound one (seam: GeneratedUID lookup) | `k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown` | pending: the user-scope store |
 | U67 | the revocation class (`withdraw`, `rm`, `rotate`, the withdrawal's floor line, the reconciler's `deliver-delete`, its `deliver-write` of a withdrawal and its rotation write) is charged to the share while it has room and past it bypasses the share and the hard cap, drawing on its uid's own budgets per log, counted per uid from the log: a 256 KiB reconciler allowance for the reconciler's lines and a separate 704 KiB socket margin for the uid's own `withdraw`, `rm` and `rotate` and their floor lines; neither budget can draw on the other; only the budget a line draws on running out refuses it, so one uid's revocations are never refused because of another uid: uid A uses up its budgets and uid B's revocation still succeeds; a uid with 64 live deliveries past its share still revokes from its socket margin, and spending that margin leaves the reconciler allowance whole; a no-op `rm`, `withdraw` or `rotate` is charged like any line and refused past the share; a uid whose budget is spent to under one line is counted and logged per uid and never refuses the store start, so after a restart uid B's `rm` and `withdraw` succeed while uid A's next revocation is refused, and only a log over a uid's budget (lowered caps) is refused at store open; a log passes the hard cap by at most 320 KiB per user scope, plus the 1 MiB reconciler budget | `k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve`, `TestNoOpRevocationChargedToShare`, `TestReserveKeepsReconcilerPart`, `TestRevocationAllowanceIsPerUID`, `TestSocketMarginSeparateFromReconcilerAllowance` | pending: the socket operations |
-| U68 | root-run: the maintenance verbs refuse a symlink or a FIFO planted at the marker, keystore-staging/, the old log in keystore-logs/ or an archive, before anything changes; creates are `O_EXCL\|O_NOFOLLOW` through one data-root descriptor, in the root-only keystore-staging/, and no flagged file is renamed, chowned or renamed over; an old log swapped while the verb holds it is refused under the closed gate, the marker kept so the listener stays down, and the rerun finishes; no log byte changes on a refusal (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedSymlinkAndSwap` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
+| U68 | root-run: floor --rebuild and audit --rotate meet a symlink, a FIFO and a swapped directory at the marker, at keystore-staging/ and at their log's directory in keystore-logs/, and refuse before anything changes; a symlink, FIFO or directory inside keystore-staging/ is removed unread and the verb finishes; the verb never follows a planted name, the decoy it points at does not change, and no log byte changes on a refusal (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedNames` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
 | U69 | the client pins the server: it reads the peer's audit token (`LOCAL_PEERTOKEN`) and refuses, writing nothing, unless the peer's cdhash equals the cdhash of the installed `/Library/k3sm/k3sm`; a service-user peer that is another binary, a reused pid, a code lookup error, an old server after an upgrade (which prints the restart message) and a listener inherited or passed to another process are each refused (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientPinsServerByInstalledCDHash`, `TestClientRefusesServiceUIDPeerOfOtherCode`, `TestClientRefusesReusedPeerPID`, `TestClientCDHashMismatchNamesRestart`, `TestClientPinWithInheritedOrPassedListener` | pending: the non-root CLI and `exec` |
 | U70 | (helper variant only) the floor helper admits only a peer that runs as the service uid and whose audit token resolves to the installed binary's cdhash, and the server admits only a helper that runs as root and is that binary; it refuses every request but `append` and `read` | `k3sm/pkg/keystore/floorhelper::TestFloorHelperPeerPinned`, `TestFloorHelperRefusesOtherRequests` | pending: the K0 amendment (helper variant only) |
 | U71 | (helper variant only) every Pod profile variant denies the helper's socket path, for connect, bind and every file operation | `runtimed/pkg/sandbox::TestFloorHelperSocketPodDenied` | pending: the K0 amendment (helper variant only) |
@@ -5856,8 +5866,8 @@ carried by the unit rows.
 | U87 | the admission policy also matches UPDATE and DELETE of `keydeliveries` and admits one only when the requester equals `oldObject.spec.requestedBy`, is the k3sm server's identity, or is in `system:masters` (and, for DELETE only, the namespace controller's ServiceAccount); a finalizer edit is an UPDATE, so another author can neither delete the object nor strip its finalizer; the reconciler's and `withdraw`'s own writes pass; on a DELETE `object` is null and only `oldObject` is read; `failurePolicy` is `Fail` | `k3sm/pkg/policy::TestVAPRefusesDeleteByOtherAuthor`, `TestVAPRefusesFinalizerStripByOtherAuthor`; rig leg E23 | pending: KeyDelivery authoring |
 | U88 | `floor --rebuild` never lowers: it reads every scope whose `scope.key` opens under `W` without the GeneratedUID check, so an owner change or a departed account is rebuilt from its pointers (U129); if any scope's `scope.key` does not open under `W` or any other error stops it (`ErrBusy` included), it refuses to finish, names the scope and changes nothing; the `deliveries` record's AAD is scope, kind 0xFD, name `deliveries`, generation and sequence, its floor key is `(user/<uid>, .deliveries, generation, seq)`, and the rebuild writes that key's line; a copied-back older `deliveries` record is refused against the floor, before and after a rebuild | `k3sm/pkg/keystore::TestRebuildRefusesOnUnopenableScope`, `k3sm/pkg/keystore::TestCopiedBackDeliveriesRecordRefused` | done: the append-only files (floor --rebuild) |
 | U89 | reads take the store lock shared and mutations exclusive, through a writer-preferring in-process lock; a server exclusive hold does at most 50 ms of work per operation, larger work chunked, no hold across an API call (the bound measured in K7a); a reconciler revocation that gets `ErrBusy` retries up to 3 times with jitter in the same sweep before it is `Indeterminate`; under a sustained read load from other uids a revocation completes | `k3sm/pkg/keystore/reconcile::TestRevocationCompletesUnderOtherUIDReadLoad` | pending: the KeyDelivery reconciler (lifecycle) |
-| U90 | root-run: the gated swap, owner before flag: the new log is root-owned 0600 while written in keystore-staging/, fsynced, handed to the service user and set 0600 there; the gate (keystore-logs/ at 0700) closes; the old log's tail is re-read, its flag cleared and its name unlinked; the new log is renamed in with RENAME_EXCL, flagged on the held descriptor and judged; the gate opens and the marker goes. No other user can reach keystore-staging/, so the service user never holds a descriptor from before the flag. Before every step, the service user's open(O_WRONLY), open(O_WRONLY\|O_TRUNC) and link() of the old log, the canonical name and the staging names, through the data root and through a keystore-logs/ descriptor opened before the gate closed, each fail (EACCES behind the gate or keystore-staging/, EPERM on a flagged file), no log byte changes, a line it appends through O_APPEND before the gate closes survives, and the final log passes the judge with nlink 1; install's log creation is probed the same way; a crash at each step and a rerun end with a judged, flagged log and the gate open, and a crash after the gate opened is only finished, never rotated twice; the maintenance wait is the exclusive .lock, bounded at 30 s (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceGatedSwapRefusesServiceUser`, `TestMaintenanceCrashAtEverySwapStepReruns`, `k3sm/pkg/install::TestKeystoreLogCreationRefusesServiceUserAtEveryStep` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
-| U91 | `audit --rotate` keeps four archives, `.1` to `.4`, and refuses, changing nothing, when `.4` exists unless `--discard-oldest`; each shifted archive is re-flagged on its own descriptor; every archive is root's 0600, and a second link on one is a Warn; a marker or a stale staging file with a second link refuses; a rerun after a crash between the old log's move to .1 and the new log's rename in finishes the rotate, and while the marker stands a missing audit log is never skipped; the `doctor` hint says to export first; rotation resets the shares, bounded by the archive count | `k3sm/cmd/k3sm::TestAuditRotateKeepsFourArchives`, `k3sm/pkg/keystore::TestMaintenanceJudgesMarkerAndStale`, `TestRotateFinishesAfterCrashBeforeNewLog`, `TestAuditRootRefusesMissingLogInMaintenance` | checked: the append-only files |
+| U90 | root-run: the directory swap. A process running as the service user holds, from before floor --rebuild, audit --rotate or install's log creation, an O_APPEND descriptor on the old log, a descriptor on the log's live directory and one on keystore-logs/. Before every step and after, by path on the canonical log its open(O_WRONLY), open(O_WRONLY\|O_TRUNC) and link() into its own directory each fail EPERM, and through the held descriptors F_SETFL clearing O_APPEND, pwrite and ftruncate fail EPERM while the file is flagged and openat for write fails EPERM, or ENOENT once the name is gone; at every hook the canonical log by path is a complete judged log, the whole old content or the whole new content, flags exactly SF_APPEND, the service user's, 0600, one link; at the end the new log holds what the verb wrote and the service user's O_APPEND lines, nothing the held descriptors did reaches the new log, and staging and the retired directory are empty. A crash at every step and a rerun of the same verb end valid, a rebuild that dropped lines exiting 4 with the same counts; the other verb run first harms nothing, and the first verb's rerun still finishes; the maintenance wait is the exclusive .lock, bounded at 30 s (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceSwapRefusesServiceUser`, `TestMaintenanceCrashAtEverySwapStepReruns`, `k3sm/pkg/install::TestKeystoreLogCreationRefusesServiceUserAtEveryStep`, `k3sm/pkg/keystore::TestStoreReadsSwappedLogDirAsRoot` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
+| U91 | audit --rotate keeps four archives, .1 to .4, and refuses, changing nothing, when .4 exists unless --discard-oldest; the replacement directory holds an empty flagged log, a fresh root 0600 .1 holding the old log's bytes read once, and the older archives carried by hard link as .2 to .4; every archive is root's 0600, unflagged, and a second link on one is a Warn; a marker or a stale staging file with a second link refuses; a rerun after a crash past the swap prints the crashed run's report and does not rotate twice, and while the marker stands a missing audit log is never skipped; the doctor hint says to export first; rotation resets the shares, bounded by the archive count | `k3sm/cmd/k3sm::TestAuditRotateKeepsFourArchives`, `k3sm/pkg/keystore::TestMaintenanceJudgesMarkerAndStale`, `TestSwapRerunFromEachStep`, `TestAuditRootRefusesMissingLogInMaintenance` | checked: the append-only files |
 | U92 | a `rotate` whose delivery will stall (owner past share, the delivery's rotation write used) is stored and answered `stored; delivery pending: past your log share`; the CLI prints the warning line and exits 0 | `k3sm/cmd/k3sm::TestRotateReportsDeliveryStall` | pending: the non-root CLI and `exec` |
 | U93 | the sweep period is 30 s by default; two consecutive deleting observations count only when at least 60 s apart on the clock seam, however many sweeps run between them | `k3sm/pkg/keystore/reconcile::TestDeletingObservationsSpacedOnClock` | pending: the KeyDelivery reconciler (lifecycle) |
 | U94 | `withdraw` opens the caller's scope and so runs the GeneratedUID check: a reused uid with a changed GeneratedUID gets `scope-owner-changed` and deletes nothing (seams: GeneratedUID lookup, peer-credential source) | `k3sm/pkg/keystore/socket::TestWithdrawChecksGeneratedUID` | pending: KeyDelivery authoring |
@@ -5883,7 +5893,7 @@ carried by the unit rows.
 | U114 | `rm-scope` writes `keystore-removed-scopes.json` in the data root, root-owned, through the data-root descriptor rules, listing the removed scope's uid and bound GeneratedUID before it removes the scope; only a scope listed there counts as removed for the finalizer, and a plain `ErrScopeAbsent` stays non-definitive and keeps the finalizer (seam: euid source) | `k3sm/cmd/k3sm::TestRmScopeRecordsRemovedScope`, `k3sm/pkg/keystore/reconcile::TestOnlyRecordedRemovalCountsAsWithdrawn` | pending: the KeyDelivery reconciler (lifecycle) |
 | U115 | `rm-scope` names each blocking binding, a RoleBinding with its namespace; `--remove-bindings` deletes each listed binding through the admin client before anything else changes, and a failed delete stops the verb, changing nothing further | `k3sm/cmd/k3sm::TestRmScopeNamesBindingsAndRemovesThem` | pending: the KeyDelivery reconciler (lifecycle) |
 | U116 | the Pod uid refusal applies to native Pods only: a vm Pod with `runAsUser: 1000` is allowed, since a guest uid has no host meaning, while a native Pod with the same drop target is refused; the guest's groups skip the host group rules the same way | `runtimed/pkg/runtime::TestVMPodGuestUIDNotRefused` (the refusal sits on the native spawn path, `checkPodUID` in `pkg/runtime/security.go`; the same test, in `pkg/runtime/vmcontainers_test.go`, also pins that a vm Pod's `runAsGroup` of 1000 reaches the guest's GID and SupplementalGIDs unrefused) | checked: runtimed's sandbox change |
-| U118 | root-run: the old log is retired, never re-owned: in audit --rotate and floor --rebuild its one attribute call is its flag clear on the verb's descriptor, under the closed gate, and its name is unlinked in the next step; it is never chowned or chmodded and its inode is never reused; while it is unflagged the service user reaches it by no route (EACCES) and no byte changes; rotate's archives are fresh root-owned unflagged copies, 0600 with one link, and the older archives shift up by rename, unchanged (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceOldLogRetiredNeverReowned` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
+| U118 | root-run: the old log is retired, never re-owned: in audit --rotate and floor --rebuild the new log gets, in staging, its fchown to the service user, its fchmod 0600 and then its flag, between the build and report steps; the old log's one attribute call is its flag clear, made after the swap has made it unreachable by path, in the retired directory in keystore-staging/, which is then removed unread; it is never chowned or chmodded, ends unlinked with its owner, mode and bytes unchanged; rotate's archives are fresh root-owned unflagged copies, 0600 with one link, and the older archives carried by link are the same inodes and bytes (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceOldLogRetiredNeverReowned` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
 | U119 | the floor lock is `keystore-lock`, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root (`put`, `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise of `list` and `show`, `rm-scope`, `floor --rebuild`, `audit --rotate`); run as root (a root-run row, `--root`), a non-root process other than the service user holding the old data-root flock blocks none of them | `k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb` (integration, root-run) | checked as a root-run row (`--root`) for the verbs that exist: `put`, `rotate`, `rm`, `rewrap` and the floor raise; `rm-scope`, `floor --rebuild` and `audit --rotate` take it as they land (the append-only files) |
 | U120 | the activated listening descriptor reaches no child (integration): the server spawns each child type, an `exec.Command` child, the runtimed helper and a Pod through the exec shim, lists each one's open descriptors, and the listening socket is among none of them | `k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild` (integration) | pending: the socket listener |
 | U121 | under activation, a client whose connected peer reads as uid 0 or as launchd's code refuses and writes nothing; U36 is never relaxed to accept uid 0, and if K7a finds the client-side peer names launchd the self-bind form ships (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer` | pending: the socket listener |
@@ -5960,7 +5970,7 @@ carried by the unit rows.
 | U192 | the floor's tombstones: a completed Delete buries the floor's live generation for the name (with no live record, the directory's only when its pointer authenticates under it with the master, so a planted generation buries nothing) with a delete sequence, without the master too; a later Put keeps the buried set; at most 64 buried generations a name; tombstones use at most 1 MiB of the 4 MiB floor and are pruned oldest first, never a live entry, each prune logged at Warn; a floor with no tombstones field parses, and a burial is parsed as strictly as an entry; keys floor merge carries every burial of the moved-aside floor into a restored one, burying a generation it holds live and each moved-aside live generation it does not hold live (--keep spares only the restored generation; an unmatched --keep refuses), fencing a restored generation, and recording a kept one the restored floor does not record, with a high-water mark one past the higher of the moved-aside sequence and mark (+1) that readers and the raise honour and Rotate seals above, under keystore-lock alone, reading only the data root's keystore-floor.json.pre-restore (no path; a guard file replaced during the merge refuses it), reading the restored pointers only from the root-only pre-restore.d/restored the recipe stages (pre-restore.d refused with an extended ACL; anything at the keystore directory, a symlink counted, is moved aside into pre-restore.d/planted-<unix> through directory descriptors with RENAME_EXCL and reported, a dry run moving nothing; with nothing staged a merge that would change the floor refuses), fencing above the moved-aside tree's authenticated pointer too (pre-restore.d/keystore), refusing a staged tree holding anything the store does not write (a name outside the entry-file allowlist, a non-regular file, a second link, a setuid, setgid or sticky bit, a flag, an ACL, a file over its cap, an owner but the service user or the unknown owner), dry run included, handing it to the service user through descriptors (openat O_NOFOLLOW, fstat, fchmod, fchown, fstat again; a link gained refuses it) and fsyncing every file and directory of it before the rename and moving it into place with renameatx_np RENAME_EXCL after the floor write (a failed move exits 5 and a rerun completes it; a rerun that finds the floor written words a refusal of the staged tree or of the move aside as committed and exits 5, dry run included), raising a restored record to its authenticated pointer by at most one sequence (a higher pointer is unverified and fenced), refusing an absent live floor, the live floor itself and a merge that would retire every moved-aside live record, renaming its input to keystore-floor.json.merged-<unix> (a rerun after a failed rename writes nothing and renames it; that failure exits 5), pruned and reported, refusing a write that would drop any burial, the restored floor's own included (rm's under the guard numbered above guardEraSeq, kept newer than the merged ones, the band kept at the sequence limit and renumbered back by a Delete with no guard), naming keys rm only when the floor size binds and --accept-drops (which writes it, prints each drop and exits 4) when the tombstone budget or the per-name cap does, never dropping a buried-live burial even with --accept-drops (that refusal names keys rm), removing the staged directory of each entry whose staged generation the merged floor buries or whose burial the write drops, recording before the floor write, as its commit marker, the input's and the written floor's sha256 and what it retired, buried live, kept and dropped in a root-owned keystore-floor.json.pre-restore.retired renamed with the input to keystore-floor.json.merged-<unix>.retired (a rerun finding that record and that floor, or that floor with only burials added since, never plans the floor again and reports from the record, keeping those burials and removing their staged directories, any other floor fails closed, and rm runs while the record is pending, first recording each burial its write drops in a root-owned keystore-floor.json.pre-restore.rm-dropped bound to the record, which a rerun accepts gone, and never refused for it: a record full, unreadable or unwritable is marked unusable and the rerun stops committed; a rerun after the record's rename and before the input's renames only the input), refusing --keep of an entry rm deleted after the restore, that --undo reads only when its input is the live floor to report a version the restore retired apart from one deleted since (refusing --keep on the latter, and refusing with no matching record), refusing pre-restore.d on another device than the keystore's directory, exiting 4 too when it keeps an entry, leaves one unverified (with pre-restore.d/keystore absent, each moved-aside live entry), moves a planted target aside or carries over user-scope entries without a floor check, and 5 when a directory fsync after the tree's rename fails (a restored pointer, or a moved-aside one that does not authenticate or has no master to load), --dry-run writing nothing and exiting as the merge would; while keystore-floor.json.pre-restore is in the data root Put, Rotate and Rewrap refuse, Delete refuses with no live floor, RaiseFloor raises nothing and the delivery reconciler delivers nothing (guarded delivery); a committed change whose floor write evicted a burial exits 4, and list and show warn of it and exit 0 | `k3sm/pkg/keystore::TestTombstoneKeptByPut`, `TestDeleteWithoutMasterTombstones`, `TestTombstonePrune`, `TestTombstoneNeverRefusesPut`, `TestPruneLogsAtWarn`, `TestParseFloorTombstones`, `TestFloorOpsProperty`, `TestDeleteSequenceNeverWraps`, `TestDeleteIgnoresPlantedGeneration`, `TestPerNameCapIsBackstop`, `TestDeleteWithoutMasterWarnsUnrecorded`, `TestDeleteReportsEvictedTombstone`, `TestDeleteWarnsUnrecordedWithMaster`, `TestFloorMergeSemantics`, `TestFloorMergeCapsAndPrune`, `TestFloorMergeRefusesUntrusted`, `TestFloorMergeBuriesRevokedLive`, `TestMergeFloorKeep`, `TestFloorMergeRetiresAsideLive`, `TestFloorMergeRefusesUntrustedPlace`, `TestDeleteReportsAnyEvictedTombstone`, `TestFloorHighWaterEncoding`, `TestFloorHighWaterCheckRaise`, `TestFloorMergeFencesAbandonedHistory`, `TestMergeFloorIgnoresEntryLock`, `TestMergeFloorRefusesWrongInput`, `TestPendingMergeGuard`, `TestEvictionReportedCommitted`, `TestMergeFloorRefusesUnmatchedKeep`, `TestMergeFloorRefusesDroppingItsOwnBurials`, `TestFloorMergeKeepRecordsAsideLive`, `TestDeleteNotFoundReportsEviction`, `FuzzParseFloor`, `FuzzMergeFloor`, `TestMergeFloorReadsOnlyTheGuardFile`, `TestFloorMergeBoundsRestoredRaise`, `TestGuardEraBurialSurvivesPressuredMerge`, `TestGuardEraTombstoneBudget`, `TestGuardEraBurialPerNameCap`, `TestPendingMergeDeleteNeedsLiveFloor`, `TestMergeFloorRefusesRetiringEverything`, `TestFloorMergeRefusesExistingTarget`, `TestFloorMergeFencesAboveAsidePointer`, `TestFloorMergeMovesStagedTree`, `TestFloorMergeNeedsStagedTree`, `TestMergeFloorNeverDropsBuriedLive`, `TestMergeFloorRefusesDroppingRestoredBurials`, `FuzzPlanMerge`, `TestPlanMergeKeepTwiceWritesNothing`, `TestFuzzRmReportsCapEviction`, `TestPlanMergeUnmatchedKeepRefusedFirst`, `FuzzDeleteUnderGuardAtLimit`, `TestDeleteRenormalisesStaleBand`, `TestFloorMergeRemovesGuardBuriedStaged`, `TestChownStagedRefusesShape`, `TestChownStagedRefusesACL`, `TestChownStagedRefusesForeignOwner`, `TestChownStagedRecheckSeam`, `TestChownStagedNameBound`, `TestChownStagedSetsModes`, `TestFloorMergeShapeDryRunParity`, `FuzzStagedChild`, `TestFloorMergeRemovesBuriedLiveStaged`, `TestParseRetired`, `TestFloorMergeRerunCommittedWording`, `TestFloorMergeAsideUnverified`, `TestFloorMergeSyncsStagedTree`, `TestOpenStagingRefusesACL`, `TestFloorMergeRerunAfterAcceptDrops`, `TestFloorMergeKeptOnlyWritesRecord`, `TestFloorMergePointerOnlyRefusalNotCommitted`, `TestFloorMergeRerunKeepsRetiredSets`, `TestFloorMergeRerunFloorChanged`, `TestFloorMergeUndoRecord`, `TestFloorMergeAbsentAsideTree`, `TestFloorMergeRerunAfterMoveNotUnverified`, `TestFloorMergeRemovedStagedNamed`, `TestFloorMergeMoveSyncCommitted`, `TestFloorMergeRemovesAsideBuriedStaged`, `TestFloorMergeRemovesDroppedStaged`, `TestFloorMergeRefusesTwoDevices`, `TestFloorMergeRerunAfterDelete`, `TestFloorMergeDeleteBeforeFloorWrite`, `TestFloorMergeRerunNonMonotone`, `TestFloorMergeRerunAfterRmPrune`, `TestPendingSinceReadFloorNotCommitted`, `TestFloorMergeCrashBetweenRenames`, `TestFloorMergeCrashBetweenRenamesClearsRmDropped`, `TestFloorMergeFirstRunRemovesRmDroppedStaged`, `TestDeleteUnderGuardNeverRefusedBySidecar`, `TestParseRmDroppedMark`, `TestMergeFloorRefusesKeepAfterRm`, `TestClassifyUndoDeletedSince`, `FuzzRerunPredicates`, `TestBuriedSinceFence`, `TestFloorMergeBoundsAsidePointer`, `TestFloorMergeStagedNodeBudget`, `TestStagedHoldsUserScopes`, `k3sm/cmd/k3sm::TestKeysEvictionExitsCommitted`, `TestKeysPendingMergeGuard`, `TestKeysReadVerbsWarnEviction`, `TestKeysFloorMergeTakesNoFile`, `TestKeysFloorMergeAcceptDrops`, `TestKeysFloorMergeDryRun`, `TestKeysFloorMergeReportCodes`, `TestKeysFloorMergeMovesPlantedAside`, `TestKeysFloorMergeCommittedRerunRefused` | checked: the floor's tombstone |
 | U193 | `floor --rebuild` carries the old floor forward: over an old floor holding tombstones, sequence lines and a torn last line (which the reader already skips as counted damage, so the floor served throughout), it keeps every tombstone and every key's highest sequence that parses, writes the higher of that and the sequence on disk, drops the lines that do not parse and names their count (U196 holds the other classes it drops); a tree copied back after an `rm`, a crash and a rebuild is refused as deleted, and a copied-back older record is refused; a floor that cannot be read refuses the rebuild, changing nothing | `k3sm/pkg/keystore::TestRebuildCarriesTombstonesForward` | done: the append-only files (the rebuild verb) |
 | U194 | once root removes a user scope (`rm-scope`), `floor --rebuild` drops every key of that scope, live or buried, by position: the uid's lines before the floor size rm-scope recorded, keeping every line after it, so a re-minted scope whose directory is later deleted by hand keeps its tombstones and a copy-back of it is refused; a re-minted scope gets a fresh K_u, and rm-scope's record refuses the old scope key (U197); the rebuild frees the uid's lifetime key share and its keys in the global key bound | `k3sm/pkg/keystore::TestRebuildDropsRemovedScopeKeys`, `TestRebuildKeepsReMintedScopeTombstones` | done: the append-only files (the rebuild verb, after rm-scope) |
-| U195 | root-run: the SF_APPEND facts measured on 2026-11-23: on a flagged file root's fchown, fchmod, rename, link, unlink and O_TRUNC open are each EPERM; chown then flag works, and root's fchown back is then EPERM; a descriptor opened without O_APPEND before the flag can neither pwrite nor ftruncate once it is set; the service user's link() of a root-owned 0600 unflagged file into its own directory succeeds, and of a flagged file fails (integration, a root-run row: `--root`; § "SF_APPEND, as measured") | `k3sm/pkg/keystore::TestSappndMeasuredFacts` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
+| U195 | root-run: the SF_APPEND facts measured on 2026-11-23: on a flagged file root's fchown, fchmod, rename, link, unlink and O_TRUNC open are each EPERM; chown then flag works, and root's fchown back is then EPERM; a descriptor opened without O_APPEND before the flag can neither pwrite nor ftruncate once it is set; the service user's link() of a root-owned 0600 unflagged file into its own directory succeeds, and of a flagged file fails. The second probe: root's rename and RENAME_SWAP of directories holding flagged files work; once the retired log is unflagged a descriptor held from before can clear O_APPEND, pwrite and ftruncate it, and a held directory descriptor can openat it; the new canonical log refuses non-append and O_TRUNC opens with EPERM and takes an O_APPEND write; staging is EACCES (integration, a root-run row: `--root`; § "SF_APPEND, as measured") | `k3sm/pkg/keystore::TestSappndMeasuredFacts`, `TestSappndDirectorySwap` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
 | U196 | floor --rebuild reads a flooded floor: it streams the old floor with no size bound and memory bounded by the key bound and one line, so a floor past the steady-state reader's size bound, which the service user can reach at will, rebuilds; over-long and unparseable lines are dropped and counted, every real tombstone is kept, live lines with no key on disk are admitted only while under the key bound and dropped first, counted; only tombstones and keys on disk past the bound refuse, naming the scopes with the most keys; it sets the record's floor offsets to 0 before its swap commits, so a crash between the two keeps the removed scopes' lines (fail closed) | `k3sm/pkg/keystore::TestRebuildStreamsFloorPastReadBound`, `TestRebuildDropsForgedLiveFlood`, `TestOldFloorReaderMemoryBounded`, `TestOldFloorReaderRefusesTombstonesPastBound`, `TestRebuildCrashAfterRecordRewriteFailsClosed` | done: the append-only files (the rebuild verb) |
 | U197 | rm-scope lists the removed scope key's identity in keystore-removed-scopes.json in the data root, with the floor's byte size at the removal (root's, by temp, fsync and rename, parsed strictly, bounded), so the old scope directory copied back is refused at every open (read, put, the start step, rebuild) while a re-minted scope opens; a full record still removes the scope and rebuild keeps its floor keys; a record that does not read fails closed; an rm-scope stopped part-way names the state it left and a rerun finishes it | `k3sm/pkg/keystore::TestRemovedScopeCopiedBackRefused`, `TestRemovedScopesFullKeepsFloorKeys`, `TestRemovedScopesMalformedFailsClosed`, `TestRemovedScopesFloorSizeParse`, `TestRemoveScopeRerunFinishesPartialRemoval` | done: the append-only files (rm-scope) |
 | U198 | the log reader charges at most maxRevokeUIDs plus 64 distinct uids past the hard cap; forged lines of more distinct uids are sticky damage, with no growth of its per-uid map | `k3sm/pkg/keystore::TestAuditReaderBoundsChargedUIDs` | done: the append-only files (the reader) |
