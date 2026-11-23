@@ -70,6 +70,7 @@ type Listener struct {
 	serviceUID uint32
 	clock      Clock
 	refusals   *refusalLimiter
+	queue      *auditQueue // between refusals and the auditor; drained by Serve's writer
 	h          *Handler
 	served     atomic.Bool
 	log        *slog.Logger // receives a recovered goroutine panic
@@ -99,13 +100,17 @@ func NewListener(ln net.Listener, creds PeerCredSource, sandbox PeerSandboxSourc
 	case h == nil:
 		return nil, errors.New("keystore socket: nil handler")
 	}
+	q := newAuditQueue(audit, slog.Default())
+	refusals := newRefusalLimiter(q, clock.Now)
+	q.overflow = refusals.count
 	return &Listener{
 		ln:         ln,
 		creds:      creds,
 		sandbox:    sandbox,
 		serviceUID: serviceUID,
 		clock:      clock,
-		refusals:   newRefusalLimiter(audit, clock.Now),
+		refusals:   refusals,
+		queue:      q,
 		h:          h,
 		log:        slog.Default(),
 		perUID:     make(map[uint32]int),
@@ -116,13 +121,28 @@ func NewListener(ln net.Listener, creds PeerCredSource, sandbox PeerSandboxSourc
 // connection and serving each admitted one in its own goroutine. When ctx is
 // done Serve closes the listening socket, which ends the pending Accept;
 // when Accept fails it leaves the socket open. Either way it cuts the open
-// connections, waits for their goroutines, writes the last dropped-count
-// summaries and returns: nil when ctx is done, the Accept error otherwise.
-// A Listener is served once.
+// connections, waits for their goroutines, queues the last dropped-count
+// summaries, lets the audit writer drain the queue for at most
+// AuditDrainWait and returns: nil when ctx is done, the Accept error
+// otherwise. A Listener is served once.
+//
+// The refusal audit runs in one writer goroutine Serve starts and waits
+// for: admission only queues a line, so a slow audit append never holds up
+// accept.
 func (l *Listener) Serve(ctx context.Context) error {
 	if !l.served.CompareAndSwap(false, true) {
 		return errServed
 	}
+	l.queue.log = l.log
+	writerCtx, stopWriter := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopWriter()
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		defer l.recovered("refusal audit")
+		l.queue.run(writerCtx)
+	}()
+	defer l.drainAudit(stopWriter, writerDone)
 	stopClose := context.AfterFunc(ctx, func() {
 		_ = l.ln.Close() // ends Accept; a close error leaves nothing to undo
 	})
@@ -150,6 +170,23 @@ func (l *Listener) Serve(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+// drainAudit closes the audit queue and waits for the writer to drain it,
+// for at most AuditDrainWait; past that it cancels the writer, which gives
+// up its call in flight (a contextAuditor's) and discards the rest, and
+// waits for it to return. Serve defers it, so nothing queues after.
+func (l *Listener) drainAudit(stopWriter context.CancelFunc, writerDone <-chan struct{}) {
+	close(l.queue.items)
+	tick, stop := l.clock.After(AuditDrainWait)
+	defer stop()
+	select {
+	case <-writerDone:
+		return
+	case <-tick:
+	}
+	stopWriter()
+	<-writerDone
 }
 
 // summarizeEvery sends the dropped-count summaries once a minute until ctx

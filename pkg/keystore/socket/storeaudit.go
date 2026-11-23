@@ -56,14 +56,24 @@ func NewStoreAuditor(log RefusalLog, logger *slog.Logger) (*StoreAuditor, error)
 
 // Refused implements RefusalAuditor.
 func (a *StoreAuditor) Refused(uid uint32, reason string) {
-	if err := a.log.Refused(context.Background(), uid, reason); err != nil {
-		a.logger.Warn("keystore socket: a refused line was not written; it is counted as dropped", "uid", uid, "reason", reason, "err", err)
-	}
+	a.refusedContext(context.Background(), uid, reason)
 }
 
 // Dropped implements RefusalAuditor.
 func (a *StoreAuditor) Dropped(uid uint32, n uint64) {
-	if err := a.log.Dropped(context.Background(), uid, n); err != nil {
+	a.droppedContext(context.Background(), uid, n)
+}
+
+// refusedContext is Refused under ctx, which bounds the store-lock wait.
+func (a *StoreAuditor) refusedContext(ctx context.Context, uid uint32, reason string) {
+	if err := a.log.Refused(ctx, uid, reason); err != nil {
+		a.logger.Warn("keystore socket: a refused line was not written; it is counted as dropped", "uid", uid, "reason", reason, "err", err)
+	}
+}
+
+// droppedContext is Dropped under ctx, which bounds the store-lock wait.
+func (a *StoreAuditor) droppedContext(ctx context.Context, uid uint32, n uint64) {
+	if err := a.log.Dropped(ctx, uid, n); err != nil {
 		a.logger.Warn("keystore socket: a dropped-count summary line was not written; the count is kept for the next", "uid", uid, "err", err)
 	}
 }

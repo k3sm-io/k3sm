@@ -206,13 +206,33 @@ func startRigWith(t *testing.T, service uint32, also RefusalAuditor) *rig {
 		audit:   &fakeAuditor{},
 		done:    make(chan error, 1),
 	}
-	h, err := NewHandler(time.Now)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var audit RefusalAuditor = r.audit
 	if also != nil {
 		audit = teeAuditor{r.audit, also}
+	}
+	return r.serve(t, service, audit)
+}
+
+// startRigAudit starts a rig whose listener runs as service and gives
+// every refusal and summary to audit alone; the rig's recorder stays empty.
+func startRigAudit(t *testing.T, service uint32, audit RefusalAuditor) *rig {
+	t.Helper()
+	r := &rig{
+		ln:      newFakeListener(),
+		creds:   &fakeCreds{peers: make(map[net.Conn]PeerCred), fail: make(map[net.Conn]bool)},
+		sandbox: &fakeSandbox{sandboxed: make(map[AuditToken]bool), fail: make(map[AuditToken]bool)},
+		audit:   &fakeAuditor{},
+		done:    make(chan error, 1),
+	}
+	return r.serve(t, service, audit)
+}
+
+// serve starts r's Listener as service over audit.
+func (r *rig) serve(t *testing.T, service uint32, audit RefusalAuditor) *rig {
+	t.Helper()
+	h, err := NewHandler(time.Now)
+	if err != nil {
+		t.Fatal(err)
 	}
 	l, err := NewListener(r.ln, r.creds, r.sandbox, service, bubbleClock{}, audit, h)
 	if err != nil {

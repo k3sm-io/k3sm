@@ -101,6 +101,19 @@ func (l *refusalLimiter) refuse(uid uint32, reason string) {
 	}
 }
 
+// count adds n to uid's dropped count, for its next summary: a line or a
+// summary the audit queue had no room for.
+func (l *refusalLimiter) count(uid uint32, n uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	rc := l.uids[uid]
+	if rc == nil {
+		rc = &refusalCount{}
+		l.uids[uid] = rc
+	}
+	rc.dropped += n
+}
+
 // expire forgets the passed refusals a window or more old.
 func (rc *refusalCount) expire(now time.Time) {
 	i := 0
