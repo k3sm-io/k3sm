@@ -2525,7 +2525,10 @@ crashed run's. That wait is the store `.lock`
 - **Rebuild reads a flooded floor.** The service user can append to the floor without limit,
   so it can push the floor past the steady-state reader's bounds (`logReadBound`, the key
   bound) at will. The steady-state reader keeps those bounds: a floor past them is damage that
-  refuses grants and withdraws. Rebuild is the repair for a floor past them, so it never
+  refuses grants and withdraws. The audit reader's memory is bounded the same way: beside the line
+  buffer it keeps, per uid, the bytes charged past the hard cap, and it charges at most
+  `maxRevokeUIDs` + 64 (1,088) distinct uids; a log charging more is sticky damage, as a log
+  past its size bound is, so forged lines of many uids grow nothing. Rebuild is the repair for a floor past them, so it never
   refuses for size: it streams the old floor with no size bound, one line at a time through a
   buffer of the per-line bound (1 KiB), and its memory is the admitted keys, at most the key
   bound, plus that buffer, whatever the file's size. A line over the per-line bound is skipped

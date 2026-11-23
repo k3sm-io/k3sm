@@ -134,6 +134,12 @@ const (
 	// logBoundMargin; the server never appends past either itself.
 	maxRevokeUIDs  = 1024
 	logBoundMargin = 1 << 20
+	// maxChargedUIDs bounds the reader's per-uid map of bytes charged past
+	// the hard cap (logState.pastCap): maxRevokeUIDs, whose budgets the size
+	// bound holds, plus a fixed margin. A log charging more distinct uids is
+	// sticky damage (errLogTooManyUIDs), so forged lines of many uids cannot
+	// grow the map past it.
+	maxChargedUIDs = maxRevokeUIDs + 64
 	// maxFloorKeysCeiling is the absolute ceiling on the floor's key bound,
 	// whatever the caps are configured to: what bounds the reader's memory.
 	// At the default caps the size alone would allow about 10.2M keys. The
@@ -284,6 +290,10 @@ var (
 	// errFloorTooManyKeys is a floor with more distinct keys than its key
 	// bound: damage.
 	errFloorTooManyKeys = errors.New("the user-scope floor holds more distinct keys than its key bound")
+	// errLogTooManyUIDs is a log whose lines past the hard cap are charged
+	// to more distinct uids than maxChargedUIDs: damage, as a log past its
+	// size bound is, which it matches.
+	errLogTooManyUIDs = fmt.Errorf("%w: its lines past the hard cap are charged to more distinct uids than the reader's bound", errLogTooLarge)
 	// errLogTorn is a last line with no newline: damage.
 	errLogTorn = errors.New("the last line has no newline")
 	// errLogLineTooLong is a line over maxLogLine, which is never written.
@@ -1034,6 +1044,12 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 			uid = 0
 		}
 		if off >= s.hardCap && uid != 0 {
+			if _, ok := s.pastCap[uid]; !ok && len(s.pastCap) >= maxChargedUIDs {
+				// Sticky damage, as a log past its size bound: the map
+				// of charged uids grows no further.
+				s.bad = s.at(off, fmt.Errorf("%w: %s", errLogTooManyUIDs, l.name))
+				return s, nil
+			}
 			s.pastCap[uid] += int64(len(line))
 			if s.leadEnd == off && s.leadAt >= s.hardCap {
 				s.pastCap[uid]++
