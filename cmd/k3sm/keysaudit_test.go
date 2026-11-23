@@ -43,7 +43,9 @@ func (r keysAuditRecorder) AuditRoot(ctx context.Context, op, name, result strin
 }
 
 // U52: every root verb that exists (put, list, show, rotate, rm, rewrap,
-// deliver, undeliver; floor merge in TestFloorMergeWritesAuditLine) asks for exactly one audit line, via root, naming its
+// deliver, undeliver; adopt in TestAdoptWritesAuditLine; floor merge in
+// TestFloorMergeWritesAuditLine; floor --rebuild, rm-scope and audit
+// --rotate in keysmaint_test.go) asks for exactly one audit line, via root, naming its
 // op, its entry and its result, and a refusal is audited as refused. A verb
 // refused before it opens the store (usage, not root) asks for none. With
 // no audit log (before install made it) no line is written, nothing creates
@@ -169,6 +171,78 @@ func TestFloorMergeWritesAuditLine(t *testing.T) {
 	h.mustRun(keysBadUsage, "floor")
 	if len(lines) != 0 {
 		t.Errorf("floor refused for usage asked for audit lines: %q", lines)
+	}
+}
+
+// U52 for adopt, and for a change made whose later step failed
+// (keystore.ErrCommitted, exit 4): adopt asks for one audit line under its
+// own op, refused when there is nothing to adopt; put, rotate and adopt
+// that commit and then fail a step are each audited committed.
+func TestAdoptWritesAuditLine(t *testing.T) {
+	var lines []string
+	h := newKeysHarness(t)
+	h.wrap = func(s keysStore) keysStore { return keysAuditRecorder{keysStore: s, lines: &lines} }
+	h.put("system/alpha", []byte("one"))
+	orphanAudited(t, h, "alpha", keysOK)
+	lines = nil
+	h.mustRun(keysOK, "adopt", "system/alpha", "--yes")
+	if want := []string{"adopt alpha ok"}; !slices.Equal(lines, want) {
+		t.Errorf("adopt: audit lines %q, want %q", lines, want)
+	}
+	lines = nil
+	h.mustRun(keysRefused, "adopt", "system/alpha", "--yes")
+	if want := []string{"adopt alpha refused"}; !slices.Equal(lines, want) {
+		t.Errorf("adopt with nothing to adopt: audit lines %q, want %q", lines, want)
+	}
+
+	// The recorder wraps committedStore, so it sees the exit the verb
+	// returned for the injected ErrCommitted.
+	h = newKeysHarness(t)
+	h.wrap = func(s keysStore) keysStore { return keysAuditRecorder{keysStore: committedStore{s}, lines: &lines} }
+	lines = nil
+	h.stdin = strings.NewReader("one")
+	h.mustRun(keysCommitted, "put", "system/beta", "--in", "-")
+	if want := []string{"put beta committed"}; !slices.Equal(lines, want) {
+		t.Errorf("committed put: audit lines %q, want %q", lines, want)
+	}
+	lines = nil
+	orphanAudited(t, h, "beta", keysCommitted)
+	if want := []string{"rotate beta committed"}; !slices.Equal(lines, want) {
+		t.Errorf("committed rotate: audit lines %q, want %q", lines, want)
+	}
+	lines = nil
+	h.mustRun(keysCommitted, "adopt", "system/beta", "--yes")
+	if want := []string{"adopt beta committed"}; !slices.Equal(lines, want) {
+		t.Errorf("committed adopt: audit lines %q, want %q", lines, want)
+	}
+}
+
+// orphanAudited rotates name, the harness's only entry, to version 2
+// (exiting rotateCode), then copies its version 1 pointer back and lags the
+// floor to it: the files a crashed rotation leaves, with version 2 to adopt.
+func orphanAudited(t *testing.T, h *keysHarness, name string, rotateCode int) {
+	t.Helper()
+	cur := filepath.Join(h.keystoreDir(), name, "current")
+	saved, err := os.ReadFile(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.stdin = strings.NewReader("two")
+	h.mustRun(rotateCode, "rotate", "system/"+name, "--in", "-")
+	if err := os.WriteFile(cur, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	floorPath := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+	b, err := os.ReadFile(floorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lagged := strings.Replace(string(b), `"seq":2`, `"seq":1`, 1)
+	if lagged == string(b) {
+		t.Fatalf("the floor does not record sequence 2: %s", b)
+	}
+	if err := os.WriteFile(floorPath, []byte(lagged), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

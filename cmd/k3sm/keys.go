@@ -626,7 +626,8 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 // keysAuditResult is the audit line's result for a verb's exit code: ok,
 // resumed (rewrap finished an earlier rewrap), committed (keysCommitted and
 // keysNotRenamed: the change was made, and its report says what to read or
-// rerun), or refused.
+// rerun; a put, rotate or adopt whose store returned keystore.ErrCommitted
+// exits keysCommitted), or refused.
 func keysAuditResult(code int) string {
 	switch code {
 	case keysOK:
