@@ -586,7 +586,7 @@ check U29 "a listener panic is recovered and restarted; the apiserver is untouch
 	k3sm/pkg/keystore/socket::TestListenerRecoversPanic TestStaleSocketUnlinkChecksOwner TestBoundedLockWait
 check U30 "with two servers registered, the listener does not start and doctor says why (socket listener)" \
 	k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers
-pend U31 "a missing or unflagged file logs the install Warn at start and on each retry; doctor reports user scope off (socket listener)" \
+check U31 "a missing or unflagged file logs the install Warn at start and on each retry; doctor reports user scope off (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow
 pend U32 "the order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (socket operations)" \
 	k3sm/pkg/keystore/socket::TestAuditBeforeReply TestAuditFailureRefusesOps

@@ -29,9 +29,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/k3sm/pkg/keystore/socket"
+	"k3sm.io/k3sm/pkg/kubeclient"
 )
 
 // keystoreServerCountTimeout bounds one count of the cluster's servers, so a
@@ -250,4 +252,54 @@ func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Inte
 		return noStop
 	}
 	return runKeystoreSocket(ctx, ks)
+}
+
+// doctorKeystoreUserScope is doctor's view of the user scope's start checks
+// for the server whose work dir is workDir. Doctor runs as its own process,
+// so where the server's supervisor reads its own state doctor reads the
+// installed one: the server's effective uid is the service uid when this
+// Mac is installed as a server (its LaunchDaemon runs as the service user),
+// and doctor's own otherwise, the uid a rootless server started from the
+// same account runs as; the marker is read without reopening anything; the
+// data root's descriptor is opened here and released by the returned func;
+// and the servers are counted through the work dir's admin kubeconfig. A
+// failure to open the data root or to load the kubeconfig is that check's
+// error, so it is reported in its place in the order.
+func doctorKeystoreUserScope(workDir string) (socket.Preconditions, func(), error) {
+	uid, gid, err := lookupServiceIDs()
+	if err != nil {
+		return socket.Preconditions{}, nil, err
+	}
+	storeCfg := keystoreLayout(workDir)
+	storeCfg.UID, storeCfg.GID = uid, gid
+	store := keystore.New(storeCfg)
+	release := func() {}
+	var ignores func() (bool, error)
+	if dir, err := openKeystoreDataRoot(storeCfg.DataRoot); err != nil {
+		ignores = func() (bool, error) { return false, err }
+	} else {
+		ignores = func() (bool, error) { return socket.DataRootIgnoresOwnership(dir) }
+		release = func() { _ = dir.Close() } // read-only descriptor
+	}
+	euid := func() int {
+		if role, installed := installedRole(); installed && role == install.RoleServer {
+			return int(uid)
+		}
+		return euidSeam()
+	}
+	count := func(ctx context.Context) (int, error) {
+		_, cs, err := kubeclient.FromPath(executor.KubeconfigPath(workDir))
+		if err != nil {
+			return 0, fmt.Errorf("load the admin kubeconfig: %w", err)
+		}
+		return countKeystoreServers(ctx, cs)
+	}
+	return socket.Preconditions{
+		EUID:              euid,
+		ServiceUID:        uid,
+		MaintenanceMarked: store.MaintenanceMarked,
+		IgnoresOwnership:  ignores,
+		CheckInstall:      store.CheckSocketInstall,
+		ServerCount:       count,
+	}, release, nil
 }

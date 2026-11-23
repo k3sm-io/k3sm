@@ -36,6 +36,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/keystore"
+	"k3sm.io/k3sm/pkg/keystore/socket"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/version"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -145,6 +146,12 @@ type doctorEnv struct {
 	// (keystore.FileStore.StandingMaintenance): whether one stands and the
 	// command of the run that wrote it. A nil seam leaves the row unprobed.
 	keystoreMaintenance func(context.Context) (verb string, present bool, err error)
+	// keystoreUserScope builds the user scope's start checks as doctor
+	// re-runs them in its own process (doctorKeystoreUserScope): the same
+	// socket.Preconditions the server's supervisor runs, and a func that
+	// releases what they hold. An error is a service user that cannot be
+	// resolved. A nil seam leaves the row unprobed.
+	keystoreUserScope func() (socket.Preconditions, func(), error)
 	// interconnect is the interconnect section's seams (doctorinterconnect.go).
 	// Nil leaves the section out of the report.
 	interconnect *interconnectEnv
@@ -171,6 +178,7 @@ func doctorChecks() []doctorCheck {
 		{"keystore-logs", checkKeystoreLogs},
 		{"keystore-floor", checkKeystoreFloor},
 		{"keystore-maintenance", checkKeystoreMaintenance},
+		{"keystore-user-scope", checkKeystoreUserScope},
 	}
 }
 
@@ -261,6 +269,46 @@ func checkKeystoreMaintenance(env doctorEnv) checkResult {
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, naming no maintenance verb this build knows; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName), remedy: "sudo k3sm install   # removes a stale marker"}
 	}
 	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, left by keys %s, which stopped or did not report; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName, verb), remedy: "sudo k3sm keys " + verb + "   # finishes the run, or prints its committed report"}
+}
+
+// checkKeystoreUserScope is the user scope's row: "keystore user scope: on"
+// when every start check the server's supervisor runs passes, else "off
+// (<reason>)" with the supervisor's reason, naming `sudo k3sm install` where
+// that puts it right. Doctor cannot read the server's supervisor, so it
+// re-runs the same checks through the same evaluator
+// (socket.Preconditions.Check); off is a WARN, since the system scope is
+// unaffected. A worker runs no listener.
+func checkKeystoreUserScope(env doctorEnv) checkResult {
+	const name = "keystore-user-scope"
+	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+		return checkResult{name: name, status: statusSkip, detail: "a worker runs no keystore listener"}
+	}
+	if env.keystoreUserScope == nil {
+		return checkResult{name: name, status: statusSkip, detail: "not probed"}
+	}
+	var reason socket.OffReason
+	var why string
+	pre, release, err := env.keystoreUserScope()
+	if err != nil {
+		reason, why = socket.OffNotInstalledServer, err.Error()
+	} else {
+		reason, why = pre.Check(context.Background())
+		release()
+	}
+	if reason == "" {
+		return checkResult{name: name, status: statusPass, detail: "keystore user scope: on"}
+	}
+	detail := "keystore user scope: off (" + string(reason) + ")"
+	r := checkResult{name: name, status: statusWarn}
+	if remedy := reason.Remedy(); remedy != "" {
+		detail += "; " + remedy
+		r.remedy = strings.Trim(strings.TrimPrefix(remedy, "run "), "`")
+	}
+	if why != "" {
+		detail += " [" + why + "]"
+	}
+	r.detail = detail
+	return r
 }
 
 // keystoreSoftCapHint is the keystore-logs row's WARN when either log is
@@ -962,6 +1010,9 @@ func realDoctorEnv(workDir string) doctorEnv {
 		},
 		keystoreMaintenance: func(ctx context.Context) (string, bool, error) {
 			return keystore.New(keystoreLayout(workDir)).StandingMaintenance(ctx)
+		},
+		keystoreUserScope: func() (socket.Preconditions, func(), error) {
+			return doctorKeystoreUserScope(workDir)
 		},
 		interconnect: realInterconnectEnv(),
 	}
