@@ -107,6 +107,9 @@ type UserScope struct {
 	s     *FileStore
 	uid   uint32
 	scope string
+	// allowRemoved lets rm-scope open a scope key the removed-scopes record
+	// already lists: a rerun after an rm-scope that recorded it and stopped.
+	allowRemoved bool
 }
 
 // UserScope returns uid's view of the store. A uid outside 501 to
@@ -600,7 +603,10 @@ func (u *UserScope) readScopeKey(dir *os.Root, wrap func() (keys, error)) ([]byt
 
 // openScopeKey opens the scope.key record r under k's W and, failing that,
 // under master.next's W when k carries one, and returns K_u, which the
-// caller clears.
+// caller clears. A K_u whose identity the removed-scopes record lists is
+// refused (errScopeRemoved), and so is every K_u while that record does not
+// read: every open of a scope key, for a read, a grant, the start step's
+// catch-up or a rebuild, comes here.
 func (u *UserScope) openScopeKey(r record, k keys) ([]byte, error) {
 	ku, err := r.open(k.wrap, u.scope)
 	if err != nil && errors.Is(err, ErrCorrupt) && k.next != nil && k.next.wrap != nil {
@@ -612,6 +618,12 @@ func (u *UserScope) openScopeKey(r record, k keys) ([]byte, error) {
 	if len(ku) != scopeKeySize {
 		clear(ku)
 		return nil, fmt.Errorf("%w: %s holds %d bytes, want %d", ErrCorrupt, scopeKeyName, len(ku), scopeKeySize)
+	}
+	if !u.allowRemoved {
+		if err := u.s.checkScopeNotRemoved(u.uid, scopeKeyID(u.scope, ku)); err != nil {
+			clear(ku)
+			return nil, fmt.Errorf("%s: %w", u.scope, err)
+		}
 	}
 	return ku, nil
 }
@@ -639,13 +651,14 @@ func (u *UserScope) openScopeForRevoke(root *os.Root, k keys) (*openedScope, err
 	}
 	uk, err := deriveKeys(ku, u.scope)
 	dk := deliveriesKey(ku, u.scope)
+	id := scopeKeyID(u.scope, ku)
 	clear(ku) // only the derived keys are kept
 	if err != nil {
 		clear(dk)
 		_ = dir.Close() // read-only so far
 		return nil, err
 	}
-	return &openedScope{dir: dir, key: dk, gen: r.generation, uk: uk}, nil
+	return &openedScope{dir: dir, key: dk, gen: r.generation, uk: uk, id: id}, nil
 }
 
 // readScopeKeyRecord reads and parses dir's scope.key, unopened. The file

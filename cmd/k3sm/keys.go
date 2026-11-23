@@ -189,7 +189,7 @@ type keysStore interface {
 	// RebuildFloor and RemoveScope are the root maintenance verbs floor
 	// --rebuild and rm-scope.
 	RebuildFloor(ctx context.Context, attrs keystore.FileAttrWriter) (keystore.RebuildReport, error)
-	RemoveScope(ctx context.Context, uid uint32) error
+	RemoveScope(ctx context.Context, uid uint32) (bool, error)
 	// RotateAudit is the root maintenance verb audit --rotate.
 	RotateAudit(ctx context.Context, attrs keystore.FileAttrWriter, discardOldest bool) (keystore.RotateReport, error)
 	MergeFloor(ctx context.Context, opts keystore.MergeOptions) (keystore.MergeReport, error)

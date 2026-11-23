@@ -1788,7 +1788,8 @@ with the scope's record; under `entries/` they are ordinary names (U63). The mod
 `.user/<uid>/`, `scope.key` and `deliveries` are checked by U132.
 `keystore-removed-scopes.json` is root-owned 0644, refused if group- or other-writable or not
 root's, and parsed strictly: an unknown field, a duplicate uid or trailing data refuses it,
-and a refused file counts as no listing (U133).
+and a refused file counts as no listing for the finalizer (U133), while every open of a scope
+key refuses until it reads ("A removed scope stays removed").
 
 The owner and mode of the two logs depend on the floor variant ("The user-scope floor"): with
 the append-only flag they are the service user's, mode 0600, flagged `sappnd`; with the floor
@@ -2501,11 +2502,13 @@ crashed run's. That wait is the store `.lock`
   deletion. A directory with no `generation` file is the shape a crashed put leaves before
   its first step and gets no line (U25).
 - **Rebuild carries the old floor forward.** Before it writes the new file, rebuild reads the
-  old floor line by line, as root, on its own descriptor, with the reader's size bound. It
-  keeps every line that parses: every tombstone, and every key's highest sequence. It drops
-  only the lines that do not parse (a torn tail, a line over 1 KiB, a line outside the
-  grammar, a line past a bound the reader refuses), counts them, and names the count in its
-  output and in its audit line, never their bytes. The new file holds, per key, the higher of
+  old floor line by line, as root, on its own descriptor ("Rebuild reads a flooded floor":
+  streamed, with no size bound). It keeps every tombstone and every key's highest sequence that
+  the key bound admits. It drops the lines that do not parse (a torn tail, a line outside the
+  grammar), the lines over 1 KiB, the live lines the key bound leaves no room for, and the keys
+  of scopes root removed and recorded, and counts each class in its output, never their bytes.
+  The audit line has no field for a count: a rebuild that dropped anything exits 4 and its
+  audit line's result is `committed`, so the counts are in the verb's output. The new file holds, per key, the higher of
   the carried-forward sequence and the one on disk, and every carried tombstone, which the
   entry lines never override, so a buried generation stays buried and a copied-back older
   record stays refused across a rebuild. *Residual (the dropped lines).* What a dropped line
@@ -2519,14 +2522,59 @@ crashed run's. That wait is the store `.lock`
   log is the old floor rebuild carries forward, so the floor lowers to the backup's, and every
   entry deleted since the backup comes back. A floor
   that cannot be opened or read at all refuses the rebuild, which changes nothing (U193).
-- **Rebuild drops a removed scope's keys.** Once root has removed a user scope (with
-  `rm-scope`, which deletes the scope directory and with it `scope.key`), `floor --rebuild`
-  carries none of that scope's keys forward, live or buried: no line of `user/<uid>` whose
-  scope directory is gone reaches the new floor. That is safe because the removed scope's
-  K_u is gone: a re-minted scope for the same uid gets a fresh K_u, so no old tree, record or
-  copied-back entry authenticates under it, and none needs a tombstone to be refused. It is
-  what frees the uid's lifetime key share and those keys in the global key bound ("Per-uid
-  fairness", residual self-lockout) (U194).
+- **Rebuild reads a flooded floor.** The service user can append to the floor without limit,
+  so it can push the floor past the steady-state reader's bounds (`logReadBound`, the key
+  bound) at will. The steady-state reader keeps those bounds: a floor past them is damage that
+  refuses grants and withdraws. Rebuild is the repair for a floor past them, so it never
+  refuses for size: it streams the old floor with no size bound, one line at a time through a
+  buffer of the per-line bound (1 KiB), and its memory is the admitted keys, at most the key
+  bound, plus that buffer, whatever the file's size. A line over the per-line bound is skipped
+  to its newline and counted; a line that does not parse is dropped and counted. It reads the
+  floor in passes and admits keys against the key bound, the keys on disk counted first, in
+  this order: (1) every tombstone of a scope root did not record as removed, and every live
+  line whose key is on disk; (2) then, only while under the bound, live lines with no key on
+  disk whose entry directory stands (another generation of it); (3) then, only while under the
+  bound, live lines with no entry directory on disk. Live lines of (2) and (3) are the ones the
+  service user can forge, so they are dropped first, and counted separately. Tombstones and
+  live lines of a scope that is absent but not recorded as removed are kept in the same
+  classes (fail closed: "A removed scope stays removed"). The one refusal left is the
+  tombstones and the keys on disk alone passing the key bound: dropping any of them would lower
+  the floor, so rebuild refuses, changing nothing, and names the scopes with the most keys.
+- **Rebuild drops a removed scope's keys.** Once root has removed a user scope with
+  `rm-scope`, which lists the scope key's identity in `keystore-removed-scopes.json` and then
+  deletes the scope directory, `floor --rebuild` carries none of that scope's keys forward, live
+  or buried: no line of a `user/<uid>` whose scope directory is gone and that the record lists
+  reaches the new floor. That is safe because the record, not the deleted directory, is what
+  keeps the scope removed: K_u is not gone, since a copy of the old directory put back still
+  holds a `scope.key` wrapped under the unchanged master, but every open of a scope key the
+  record lists is refused ("A removed scope stays removed"), so no old tree, record or
+  copied-back entry is served, and none needs a tombstone to be refused. A re-minted scope for
+  the same uid gets a fresh K_u, which the record does not list. It is what frees the uid's
+  lifetime key share and those keys in the global key bound ("Per-uid fairness", residual
+  self-lockout) (U194). An absent scope the record does not list (a full record, or a
+  directory deleted by hand) keeps its keys: rebuild fails closed for a copy-back.
+- **A removed scope stays removed.** `rm-scope` records the removed scope in
+  `keystore-removed-scopes.json` in the data root before it removes the directory: root's,
+  mode 0644 (the service user's opens read it; it is closed to group and other writes),
+  written to a temporary name, fsynced and renamed through the judged data-root descriptor, the
+  data root fsynced; read with `O_NOFOLLOW` and judged on its descriptor (a regular file with
+  one link, the data root's owner's, not group- or other-writable, at most 256 KiB); parsed
+  strictly (one JSON object `{"version":1,"scopes":[{"uid":…,"keys":[…]}]}`, no unknown field,
+  no trailing data, each uid listed once, each key 64 lowercase hex digits listed once, at most
+  1024 keys in all). A record holds per uid the identity of each scope key removed: a labelled
+  SHA-256 of the scope and K_u, which Rewrap leaves as it is (it re-seals the same K_u) and a
+  re-minted scope never shares; rm-scope already holds the master to open `scope.key`. Every
+  open of a scope key (a read, a grant, the start step's catch-up, rebuild) refuses one the
+  record lists, saying root removed the scope and the directory must be deleted; a record that
+  does not read or parse refuses every open, rm-scope and rebuild (fail closed). When the
+  record is full, rm-scope still removes the scope, says so, and leaves it unlisted, and
+  rebuild keeps that scope's floor keys instead of dropping them, so a copy-back is still held
+  to the floor. *Residual (a full record).* An unlisted removed scope copied back opens: its
+  floor keys hold it to its last floor, and nothing more. *Residual (one uid, two removals).*
+  Rebuild drops by uid: once one removed key of a uid is listed, an absent scope of that uid
+  is dropped even when its own key went unlisted for a full record. The later rows (U114,
+  U130, U133) extend this record with the bound GeneratedUID and the delivered Secrets; this
+  slice holds only the uid and the key identities.
 - **Rebuild never lowers.** Rebuild opens every scope under `.user/` before it writes the new
   file's first line, and a line it cannot write is a floor it would lower:
   - *Rebuild skips the owner check.* Rebuild reads every scope whose `scope.key` opens under
@@ -3036,9 +3084,9 @@ crashed run's. That wait is the store `.lock`
     every further grant that adds a key, though its `rm` still succeeds. Larger caps do not
     help, since the ceiling is fixed. The remedy is root's: once root removes that user scope
     (with `rm-scope`), `floor --rebuild` drops every key of that scope, live or buried.
-    The scope's K_u is gone with it, and a re-minted scope gets a fresh K_u, so no old tree,
-    record or copied-back entry can authenticate under it and no tombstone of the old scope
-    is needed to refuse it. That frees the uid's share and its keys in the global bound (U194,
+    `rm-scope` lists the scope key in `keystore-removed-scopes.json`, so a copied-back old
+    directory, whose K_u still opens under the unchanged master, is refused at every open, and
+    a re-minted scope gets a fresh K_u; no tombstone of the old scope is needed to refuse it. That frees the uid's share and its keys in the global bound (U194,
     pending). Short of that, no server write frees a key; compacting buried keys of a scope
     that still stands is an open question.
   - The hard cap and the per-uid budgets bound the whole log (U51, U62, U67).

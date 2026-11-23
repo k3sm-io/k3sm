@@ -443,6 +443,9 @@ type openedScope struct {
 	uk  keys
 	key []byte
 	gen [generationSize]byte
+	// id is the scope key's identity (scopeKeyID), set by
+	// openScopeForRevoke, for rm-scope's record.
+	id string
 }
 
 // close clears the delivery-record key and closes the scope directory; the

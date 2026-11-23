@@ -218,7 +218,7 @@ func TestRebuildDropsRemovedScopeKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RemoveScope(ctx, 1002); err != nil {
+	if _, err := s.RemoveScope(ctx, 1002); err != nil {
 		t.Fatalf("RemoveScope: %v", err)
 	}
 	if _, err := os.Lstat(scopeDir(server, "1002")); !errors.Is(err, os.ErrNotExist) {
@@ -434,7 +434,7 @@ func TestRootWalksRefusePlantedNames(t *testing.T) {
 		if err := tc.plant(tc.at); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.RemoveScope(ctx, 1001); !errors.Is(err, errPlanted) {
+		if _, err := s.RemoveScope(ctx, 1001); !errors.Is(err, errPlanted) {
 			t.Fatalf("rm-scope over a planted %s: %v, want errPlanted", tc.name, err)
 		}
 		for _, n := range []string{filepath.Join(dir, scopeKeyName), filepath.Join(dir, deliveriesName), filepath.Join(entry, currentName)} {
@@ -463,7 +463,7 @@ func TestRootWalksRefusePlantedNames(t *testing.T) {
 	if err := os.Rename(p+".aside", p); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RemoveScope(ctx, 1001); err != nil {
+	if _, err := s.RemoveScope(ctx, 1001); err != nil {
 		t.Fatalf("rm-scope of a clean tree: %v", err)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {

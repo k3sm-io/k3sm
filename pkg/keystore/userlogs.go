@@ -410,7 +410,10 @@ func (s *FileStore) LogSizes(ctx context.Context) (LogSizes, error) {
 // the reader skips: lines that do not parse, and a last line with no
 // newline. It is root's, for doctor: a damaged line lost only what it
 // would have recorded. The floor is opened and judged as for any read; a
-// store with no file-backed floor has none.
+// store with no file-backed floor has none. A floor past the reader's
+// bounds (its size or key bound) returns that damage as the error, beside
+// the count read before it: floor --rebuild, which streams the floor with
+// no size bound, is its repair.
 func (s *FileStore) FloorDamage(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -431,7 +434,7 @@ func (s *FileStore) FloorDamage(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return state.damaged(), nil
+	return state.damaged(), state.bad
 }
 
 // appendLog is one append-only log and what has been read of it: the

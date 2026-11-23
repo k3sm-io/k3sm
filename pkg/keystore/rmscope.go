@@ -37,52 +37,76 @@ var errScopeHasDeliveries = errors.New("the scope's delivery record names delive
 // floor lock and then the exclusive store lock (at most 30 s;
 // lockMaintenance) it opens the
 // scope's key under W without the GeneratedUID check and reads its delivery
-// record, refusing while the record names any delivery, then removes
-// .user/<uid>/ by descriptor (removeScopeTree), walking from the keystore
-// root it opened and judged first, never from the path again. The scope's K_u goes with
-// scope.key, so the next floor --rebuild drops every floor key of the
-// scope. A scope whose entries/ and delivery record are both gone is an
-// earlier rm-scope that stopped part-way, and is finished.
-func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) error {
+// record, refusing while the record names any delivery, then lists the
+// scope key's identity in the removed-scopes record
+// (keystore-removed-scopes.json, through the judged data-root descriptor),
+// then removes .user/<uid>/ by descriptor (removeScopeTree), walking from
+// the keystore root it opened and judged first, never from the path again.
+// A scope directory copied back after it is refused at every open, since
+// its scope.key's identity is listed, and the next floor --rebuild drops
+// every floor key of the scope. A full record does not stop the removal:
+// recorded reports false, the scope is removed unlisted, and floor
+// --rebuild keeps its floor keys (fail closed for a copy-back). A record
+// that does not read refuses, changing nothing. A scope whose entries/ and
+// delivery record are both gone is an earlier rm-scope that stopped
+// part-way, and is finished.
+func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool, err error) {
 	if err := s.checkConfig(); err != nil {
-		return err
+		return false, err
 	}
 	if err := s.eligibleUID(uid); err != nil {
-		return err
+		return false, err
 	}
 	root, err := s.openDir(s.dir, false)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = root.Close() }() // removals are fsynced in their directories
 	fl, unlock, err := s.lockMaintenance(ctx, root)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer fl.unlock()
 	defer unlock()
 	k, err := s.loadMasterLocked()
 	if err != nil {
-		return err
+		return false, err
 	}
-	u := &UserScope{s: s, uid: uid, scope: userScopeOf(uid)}
+	dfd, err := s.openLogDataRoot()
+	if err != nil {
+		return false, fmt.Errorf("%w; nothing was changed", err)
+	}
+	defer func() { _ = unix.Close(dfd) }() // the record's rename is fsynced in it
+	removed, err := s.readRemovedScopes(dfd)
+	if err != nil {
+		return false, fmt.Errorf("%w; nothing was changed", err)
+	}
+	u := &UserScope{s: s, uid: uid, scope: userScopeOf(uid), allowRemoved: true}
 	o, err := u.openScopeForRevoke(root, k)
 	if err != nil {
-		return fmt.Errorf("open the scope %s: %w; nothing was changed", u.scope, err)
+		return false, fmt.Errorf("open the scope %s: %w; nothing was changed", u.scope, err)
 	}
+	id := o.id
 	_, ds, derr := u.readDeliveriesUnfloored(o)
 	_, eerr := o.dir.Lstat(scopeEntriesName)
 	o.close()
 	switch {
 	case derr == nil && len(ds) > 0:
-		return fmt.Errorf("%s: %w", u.scope, errScopeHasDeliveries)
+		return false, fmt.Errorf("%s: %w", u.scope, errScopeHasDeliveries)
 	case derr == nil:
 	case errors.Is(derr, ErrScopeAbsent) && errors.Is(eerr, os.ErrNotExist):
 		// An earlier rm-scope removed entries/ and the record, then stopped.
 	default:
-		return fmt.Errorf("read the delivery record of %s: %w; nothing was changed", u.scope, derr)
+		return false, fmt.Errorf("read the delivery record of %s: %w; nothing was changed", u.scope, derr)
 	}
-	return removeScopeTree(root, strconv.FormatUint(uint64(uid), 10))
+	recorded = removed.has(uid, id)
+	if !recorded && removed.add(uid, id) {
+		if err := writeRemovedScopes(dfd, removed); err != nil {
+			return false, fmt.Errorf("record the removed scope %s in %s: %w; nothing else was changed", u.scope, removedScopesName, err)
+		}
+		recorded = true
+	}
+	return recorded, removeScopeTree(root, strconv.FormatUint(uint64(uid), 10))
 }
 
 // removeScopeTree removes keystore/.user/<uid>/ by descriptor, starting
