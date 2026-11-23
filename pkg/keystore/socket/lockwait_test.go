@@ -140,3 +140,53 @@ func TestBoundedLockWait(t *testing.T) {
 		})
 	})
 }
+
+// TestAbandonedLockWaitsBounded: with a lock that ignores its context, at
+// most MaxAbandonedLockWaits waits are left behind; the next request is
+// busy at once and starts no wait, and once the lock returns the abandoned
+// waits are released, each taken lock released at once.
+func TestAbandonedLockWaitsBounded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var abandoned atomic.Int32
+		l := &heldLock{free: make(chan struct{}), ignoreCtx: true}
+		var calls atomic.Int32
+		lock := func(ctx context.Context) (func(), error) {
+			calls.Add(1)
+			return l.lock(ctx)
+		}
+		for i := range MaxAbandonedLockWaits {
+			start := time.Now()
+			if err := withStoreLock(t.Context(), lock, func() error { return nil }, &abandoned); !errors.Is(err, ErrBusy) {
+				t.Fatalf("request %d = %v, want busy", i, err)
+			}
+			if got := time.Since(start); got != LockWait {
+				t.Fatalf("request %d busy after %v, want %v", i, got, LockWait)
+			}
+		}
+		if got := abandoned.Load(); got != MaxAbandonedLockWaits {
+			t.Fatalf("%d abandoned waits, want %d", got, MaxAbandonedLockWaits)
+		}
+		start := time.Now()
+		if err := withStoreLock(t.Context(), lock, func() error { return nil }, &abandoned); !errors.Is(err, ErrBusy) {
+			t.Fatalf("request past the bound = %v, want busy", err)
+		}
+		if got := time.Since(start); got != 0 {
+			t.Fatalf("request past the bound waited %v, want busy at once", got)
+		}
+		if got := calls.Load(); got != MaxAbandonedLockWaits {
+			t.Fatalf("lock called %d times, want %d: a request past the bound started a wait", got, MaxAbandonedLockWaits)
+		}
+		close(l.free)
+		synctest.Wait()
+		if got := abandoned.Load(); got != 0 {
+			t.Fatalf("%d abandoned waits after the lock returned, want 0", got)
+		}
+		if got := l.unlocked.Load(); got != MaxAbandonedLockWaits {
+			t.Fatalf("%d late locks released, want %d", got, MaxAbandonedLockWaits)
+		}
+		ran := false
+		if err := withStoreLock(t.Context(), lock, func() error { ran = true; return nil }, &abandoned); err != nil || !ran {
+			t.Fatalf("after the release: %v, ran %v; want the request served", err, ran)
+		}
+	})
+}

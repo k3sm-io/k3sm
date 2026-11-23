@@ -374,36 +374,56 @@ func runKeystoreSocket(ctx context.Context, ks *keystoreSocket) (stop func()) {
 // service-user lookup, say) is logged and retried on the supervisor's
 // backoff, from socket.MinBackoff doubling to socket.MaxBackoff on clock,
 // so the user scope is not left off for the life of the process; a build
-// that returns nil (an installed agent) runs nothing. What the supervisor
-// holds is closed by that goroutine once Run has returned. The stop
-// cancels it and waits at most keystoreSocketStopTimeout: past that it
-// logs and returns, so the server's shutdown is never held by the
-// listener, and the descriptors stay open until Run returns or the process
-// exits.
+// that returns nil (an installed agent) runs nothing. A panic out of Run,
+// or out of build, is recovered in that goroutine and never ends the
+// process: it is logged, socket.MinBackoff passes on clock, and the same
+// supervisor runs again (a panicking build counts as a failed build). What
+// the supervisor holds is closed by that goroutine once Run has returned
+// without panicking. The stop cancels it and waits at most
+// keystoreSocketStopTimeout: past that it logs and returns, so the server's
+// shutdown is never held by the listener, and the descriptors stay open
+// until Run returns or the process exits.
 func superviseKeystoreSocket(ctx context.Context, build func() (*keystoreSocket, error), clock socket.Clock, log *slog.Logger) (stop func()) {
 	rctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		var ks *keystoreSocket
+		defer func() {
+			if ks != nil {
+				ks.close()
+			}
+		}()
 		backoff := socket.MinBackoff
 		for {
-			ks, err := build()
-			if err == nil {
-				if ks != nil {
-					ks.sup.Run(rctx)
-					ks.close()
+			wait := socket.MinBackoff
+			if ks == nil {
+				built, err := recoveredBuild(build)
+				if err == nil {
+					if built == nil {
+						return // an installed agent runs nothing
+					}
+					ks = built
+				} else {
+					log.Error("keystore user scope is off: the socket listener was not built", "err", err, "retry", backoff)
+					wait = backoff
+					backoff = min(2*backoff, socket.MaxBackoff)
 				}
-				return
 			}
-			log.Error("keystore user scope is off: the socket listener was not built", "err", err, "retry", backoff)
-			tick, stopTick := clock.After(backoff)
+			if ks != nil {
+				v, panicked := recoveredRun(rctx, ks)
+				if !panicked {
+					return
+				}
+				log.Error("keystore socket: recovered a panic out of the supervisor; it runs again", "panic", fmt.Sprint(v), "retry", wait)
+			}
+			tick, stopTick := clock.After(wait)
 			select {
 			case <-rctx.Done():
 				stopTick()
 				return
 			case <-tick:
 			}
-			backoff = min(2*backoff, socket.MaxBackoff)
 		}
 	}()
 	return func() {
@@ -416,6 +436,28 @@ func superviseKeystoreSocket(ctx context.Context, build func() (*keystoreSocket,
 			log.Warn("keystore socket: the listener did not stop in time; shutdown goes on without it", "waited", keystoreSocketStopTimeout)
 		}
 	}
+}
+
+// recoveredBuild calls build, turning a panic in it into an error.
+func recoveredBuild(build func() (*keystoreSocket, error)) (ks *keystoreSocket, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			ks, err = nil, fmt.Errorf("keystore socket: the build panicked: %v", v)
+		}
+	}()
+	return build()
+}
+
+// recoveredRun runs ks's supervisor until it returns, reporting a panic out
+// of it, with the value, instead of letting it end the process.
+func recoveredRun(ctx context.Context, ks *keystoreSocket) (v any, panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			v, panicked = r, true
+		}
+	}()
+	ks.sup.Run(ctx)
+	return nil, false
 }
 
 // wallClock is the supervisor's production clock.
@@ -455,6 +497,20 @@ func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Inte
 		log:              logger,
 	}
 	return superviseKeystoreSocket(ctx, func() (*keystoreSocket, error) { return newKeystoreSocket(deps) }, deps.clock, logger)
+}
+
+// doctorOpenLogs is doctor's log step: the server's reopen judgement,
+// read-only (keystore.FileStore.CheckServerLogs), then the same check
+// that both logs lie on the pass's data root. It takes no store lock and
+// writes nothing.
+func doctorOpenLogs(store *keystore.FileStore, pass *dataRootPass) func(context.Context) error {
+	return func(ctx context.Context) error {
+		audit, floor, err := store.CheckServerLogs(ctx)
+		if err != nil {
+			return err
+		}
+		return pass.sameDeviceFiles(audit, floor)
+	}
 }
 
 // doctorUserScope is what doctor's user-scope row reads: the start checks
@@ -528,7 +584,8 @@ func readAdminKubeconfig(path string) (kubernetes.Interface, error) {
 // Mac is installed as a server (its LaunchDaemon runs as the service user),
 // and doctor's own otherwise, the uid a rootless server started from the
 // same account runs as; the marker is read without reopening anything, and
-// the logs are judged read-only (CheckLogFlags) where the server reopens
+// the logs are judged read-only (CheckServerLogs: the reopen's flag,
+// owner, size and recount checks, no lock, no write) where the server reopens
 // them; the data root is opened afresh by the pass, as the server's is, and
 // closed when it ends (release closes it too); the servers are listed through the work dir's admin
 // kubeconfig; and the socket path is only lstat'd. A failure to open the
@@ -565,7 +622,7 @@ func doctorKeystoreUserScope(workDir string) (doctorUserScope, error) {
 			EUID:              euid,
 			ServiceUID:        uid,
 			MaintenanceMarked: store.MaintenanceMarked,
-			OpenLogs:          store.CheckLogFlags,
+			OpenLogs:          doctorOpenLogs(store, pass),
 			SandboxCheck:      socket.SandboxSelfCheck,
 			IgnoresOwnership:  pass.ignoresOwnership,
 			EndPass:           pass.end,

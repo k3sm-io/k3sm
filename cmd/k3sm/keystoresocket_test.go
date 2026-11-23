@@ -405,6 +405,77 @@ func TestKeystoreSocketWiring(t *testing.T) {
 	})
 }
 
+// panicOnceClock is a socket.Clock whose first Now panics; its waits never
+// end on their own.
+type panicOnceClock struct{ calls *atomic.Int32 }
+
+func (c panicOnceClock) Now() time.Time {
+	if c.calls.Add(1) == 1 {
+		panic("fake: the supervisor's clock panicked")
+	}
+	return time.Time{}
+}
+
+func (panicOnceClock) After(time.Duration) (<-chan time.Time, func() bool) {
+	return make(chan time.Time), func() bool { return true }
+}
+
+// TestKeystoreSocketRecoversSupervisorPanic: a panic out of the
+// supervisor's Run (here its clock, which Run does not guard) is recovered
+// in the supervising goroutine, logged, and after socket.MinBackoff on the
+// supervising clock the same supervisor runs again; the descriptors are
+// closed only once Run returns at the stop.
+func TestKeystoreSocketRecoversSupervisorPanic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var nows atomic.Int32
+		sup, err := socket.NewSupervisor(socket.SupervisorConfig{
+			Listen:            func(context.Context) (net.Listener, error) { return nil, errors.New("none") },
+			EUID:              func() int { return 501 }, // off at once: the state's Until reads the clock
+			ServiceUID:        277,
+			IgnoresOwnership:  func() (bool, error) { return false, nil },
+			CheckInstall:      func(context.Context) error { return nil },
+			MaintenanceMarked: func() (bool, error) { return false, nil },
+			OpenLogs:          func(context.Context) error { return nil },
+			SandboxCheck:      func() error { return nil },
+			ServerCount:       func(context.Context) (int, error) { return 1, nil },
+			Creds:             fakePeerCreds{},
+			Sandbox:           fakePeerSandbox{},
+			Audit:             discardAuditor{},
+			Handler:           mustHandler(t),
+			Clock:             panicOnceClock{&nows},
+			Log:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var closed atomic.Bool
+		logs := &bytes.Buffer{}
+		log := slog.New(slog.NewTextHandler(logs, nil))
+		stop := superviseKeystoreSocket(context.Background(), func() (*keystoreSocket, error) {
+			return &keystoreSocket{sup: sup, close: func() { closed.Store(true) }, log: log}, nil
+		}, wallClock{}, log)
+		synctest.Wait()
+		if !strings.Contains(logs.String(), "recovered a panic out of the supervisor") || !strings.Contains(logs.String(), "the supervisor's clock panicked") {
+			t.Fatalf("no line for the recovered panic: %q", logs.String())
+		}
+		if n := nows.Load(); n != 1 {
+			t.Fatalf("%d clock reads before the backoff, want 1 (Run must wait %v before running again)", n, socket.MinBackoff)
+		}
+		<-time.NewTimer(socket.MinBackoff).C // the bubble's clock
+		synctest.Wait()
+		if st := sup.State(); st.Phase != socket.PhaseOff || st.Reason != socket.OffNotInstalledServer {
+			t.Fatalf("after the backoff: state %+v, want the supervisor running again and off", st)
+		}
+		if closed.Load() {
+			t.Fatal("the descriptors were closed after a recovered panic; the same supervisor must run again")
+		}
+		stop()
+		if !closed.Load() {
+			t.Fatal("the descriptors were not closed once Run returned at the stop")
+		}
+	})
+}
+
 // errFakeSandboxCheck is the wiring fixture's sandbox self-check result.
 var errFakeSandboxCheck = errors.New("fake: sandbox self-check")
 
@@ -573,4 +644,99 @@ func TestKeystoreSocketDataRootPerPass(t *testing.T) {
 			t.Fatalf("sameDevice across the /dev mount = %v, want errDataRootMoved", err)
 		}
 	})
+}
+
+// TestDoctorKeystoreReopenJudgement: doctor's log step judges what the
+// server's reopen judges. An audit log past the reader's bound is refused
+// by the supervisor's reopen and by doctor's read-only check with the same
+// off reason and detail, and doctor's check takes no lock and writes
+// nothing.
+func TestDoctorKeystoreReopenJudgement(t *testing.T) {
+	f := newWiringFixture(t)
+	me := uint32(os.Getuid())
+	f.deps.serviceIDs = func() (uint32, uint32, error) { return me, uint32(os.Getgid()), nil }
+	f.deps.ignoresOwnership = func(*os.File) (bool, error) { return false, nil }
+	layout := f.deps.layout
+	f.deps.layout = func(work string) keystore.Config {
+		c := layout(work)
+		c.LogFlags = func(*os.File) (uint32, error) { return unix.SF_APPEND, nil }
+		return c
+	}
+	storeCfg := f.deps.layout(f.deps.workDir)
+	storeCfg.UID, storeCfg.GID = me, uint32(os.Getgid())
+	for _, d := range []struct {
+		p    string
+		mode os.FileMode
+	}{
+		{f.deps.workDir, 0o700},
+		{storeCfg.Dir, 0o700},
+		{filepath.Join(f.dataRoot, "keystore-logs"), 0o755},
+		{filepath.Join(f.dataRoot, "keystore-logs", "floor"), 0o755},
+		{filepath.Join(f.dataRoot, "keystore-logs", "audit"), 0o755},
+	} {
+		if err := os.Mkdir(d.p, d.mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(d.p, d.mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	audit := filepath.Join(f.dataRoot, "keystore-logs", "audit", "keystore-audit.log")
+	for _, p := range []string{audit, filepath.Join(f.dataRoot, "keystore-logs", "floor", "keystore-user-floor.log")} {
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Past any reader bound the store accepts, as a sparse file.
+	if err := os.Truncate(audit, 1<<40); err != nil {
+		t.Skipf("no sparse 1 TiB file on this volume: %v", err)
+	}
+	cfg, closeAll, err := keystoreSocketConfig(f.deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAll()
+	store := keystore.New(storeCfg)
+	pass := &dataRootPass{path: storeCfg.DataRoot, open: openKeystoreDataRoot, ignores: func(*os.File) (bool, error) { return false, nil }}
+	defer pass.end()
+	check := func(openLogs func(context.Context) error, ignores func() (bool, error), end func()) (socket.OffReason, string) {
+		return socket.Preconditions{
+			EUID: func() int { return 277 }, ServiceUID: 277,
+			IgnoresOwnership: ignores, EndPass: end,
+			CheckInstall:      func(context.Context) error { return nil },
+			MaintenanceMarked: func() (bool, error) { return false, nil },
+			OpenLogs:          openLogs,
+			SandboxCheck:      func() error { return nil },
+			ServerCount:       func(context.Context) (int, error) { return 1, nil },
+		}.Check(context.Background())
+	}
+	supReason, supDetail := check(cfg.OpenLogs, cfg.IgnoresOwnership, cfg.EndPass)
+	before, err := os.ReadDir(storeCfg.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	docReason, docDetail := check(doctorOpenLogs(store, pass), pass.ignoresOwnership, pass.end)
+	if supReason != socket.OffLogsUnavailable || !strings.Contains(supDetail, "keystore-audit.log") {
+		t.Fatalf("supervisor: %q %q, want the logs reason naming the audit log", supReason, supDetail)
+	}
+	if docReason != supReason || docDetail != supDetail {
+		t.Fatalf("doctor: %q %q; supervisor: %q %q; want the same", docReason, docDetail, supReason, supDetail)
+	}
+	after, err := os.ReadDir(storeCfg.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("doctor's check changed the store directory: %v, then %v", before, after)
+	}
+	// Under the bound both pass, and doctor holds no descriptor after.
+	if err := os.Truncate(audit, 0); err != nil {
+		t.Fatal(err)
+	}
+	if r, d := check(doctorOpenLogs(store, pass), pass.ignoresOwnership, pass.end); r != socket.OffSandboxCheckUnusable && r != "" {
+		t.Fatalf("doctor on an empty audit log: %q %q, want the log step passed", r, d)
+	}
 }

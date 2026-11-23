@@ -247,6 +247,46 @@ func (l *ServerLogs) Reopen(ctx context.Context) error {
 	})
 }
 
+// CheckServerLogs is Reopen's judgement, read-only, for doctor: it opens
+// both logs O_RDONLY through the data root (the floor's first, as Reopen
+// does), applies the same flag, owner, mode and link checks on each
+// descriptor, and counts the audit log's pre-frame lines with Reopen's
+// recount, so a log past the reader's bound, or one that does not read, is
+// refused here exactly as the server's reopen refuses it. It takes no store
+// lock, holds nothing after it returns and writes nothing. It returns the
+// identity of the two files it judged, for the caller's device check.
+func (s *FileStore) CheckServerLogs(ctx context.Context) (audit, floor LogFileID, err error) {
+	if err := s.checkConfig(); err != nil {
+		return LogFileID{}, LogFileID{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return LogFileID{}, LogFileID{}, err
+	}
+	l := &ServerLogs{
+		s:           s,
+		audit:       heldLog{log: &appendLog{s: s, name: auditLogName}},
+		floor:       heldLog{log: &appendLog{s: s, name: userFloorLogName}},
+		usedByClass: map[preFrameClass]int64{},
+		usedByUID:   map[preFrameKey]int64{},
+	}
+	defer l.closeLocked() // read-only descriptors; l is never shared
+	for _, h := range []*heldLog{&l.floor, &l.audit} {
+		f, st, err := h.log.open(unix.O_RDONLY)
+		if err != nil {
+			return LogFileID{}, LogFileID{}, err
+		}
+		h.f, h.id = f, LogFileID{Dev: uint64(st.Dev), Ino: st.Ino}
+	}
+	var st unix.Stat_t
+	if err := s.judgeLog(l.audit.f, &st); err != nil {
+		return LogFileID{}, LogFileID{}, fmt.Errorf("%s: %w", auditLogName, err)
+	}
+	if err := l.countLocked(st.Size); err != nil {
+		return LogFileID{}, LogFileID{}, err
+	}
+	return l.audit.id, l.floor.id, nil
+}
+
 // Refused appends one refused line, via socket, for a connection from uid
 // refused before its first frame for reason (a word of lowercase letters
 // and '-', otherwise written as the placeholder): no scope, no name, no

@@ -3684,13 +3684,22 @@ directory is root's"). A worker node runs no listener (E18).
   row, stops it with that reason and cuts its connections. A rootless server's reason is logged
   once, at Info, and not again while it stands; every other reason is a Warn on every retry. A
   listener that cannot be built (the service user not found, say) is retried on the same
-  backoff. The server's shutdown waits at most 10 seconds for the listener, then logs and goes
-  on; the listener's descriptors are closed only once it has stopped.
+  backoff. A panic out of the supervisor itself, or out of building it, is recovered in the
+  goroutine that runs it and never ends the process: it is logged, 1 second (the minimum
+  backoff) passes, and the supervisor runs again. The server's shutdown waits at most 10 seconds
+  for the listener, then logs and goes on; the listener's descriptors are closed only once it
+  has stopped. Doctor's log step judges what this reopen judges, read-only: it opens both logs
+  read-only through the data root, applies the same flag, owner, mode and link checks and the
+  same recount of the audit log with its reader bound, and takes no lock and writes nothing, so
+  a log the server's reopen refuses shows the same `logs-unavailable` detail in doctor.
   Between runs the activated descriptor stays open and bound: accept is stopped by expiring
   the descriptor's deadline, not by closing it. A run that served for a minute before failing
   starts the backoff again from 1 second. A panic serving one connection is recovered and ends
   that connection only. A lock taken after the 2-second wait is released at once, and `busy`
-  fails the request, never the connection.
+  fails the request, never the connection. A lock call that ignores its deadline holds a
+  goroutine until it returns; at most 4 such abandoned waits are kept at once
+  (`MaxAbandonedLockWaits`), and past that a request is `busy` at once and starts no wait; each
+  is released when its lock call returns.
 
 **Peer identity.** At accept, `getsockopt(SOL_LOCAL, LOCAL_PEERCRED)` on the connected
 descriptor gives the peer's **effective uid at connect time**, and that is the authority. A
