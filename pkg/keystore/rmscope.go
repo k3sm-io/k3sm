@@ -427,10 +427,11 @@ const (
 // it.
 // Each directory is emptied a batch of rmDirBatch names at a time, read
 // again from its start after each batch until a read returns none, and
-// removed with unlinkat(AT_REMOVEDIR); every other name, whatever its type
-// (a regular file, FIFO, symlink, device or socket), is removed with
-// unlinkat, which never follows. scope.key goes last, once nothing else is
-// left beside it. A name that vanishes under the walk is skipped. A name
+// removed with unlinkat(AT_REMOVEDIR), the scope directory itself only
+// while its name in .user is still the directory emptied (rmdirHeld);
+// every other name, whatever its type (a regular file, FIFO, symlink,
+// device or socket), is removed with unlinkat, which never follows.
+// scope.key goes last, once nothing else is left beside it. A name that vanishes under the walk is skipped. A name
 // left in a directory the walk emptied fails it (errScopeTreeBusy).
 //
 // A user locking flag (uchg, uappnd, uunlnk) makes root's unlinkat fail
@@ -493,7 +494,7 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, listed bool
 	if err != nil {
 		return "", err
 	}
-	err = unix.Unlinkat(ufd, uid, unix.AT_REMOVEDIR)
+	err = w.rmdirHeld(ufd, uid, &dst)
 	if errors.Is(err, unix.EPERM) {
 		// .user is shared by every scope: its user locking flags are
 		// cleared only when its removal of this one needs it, and only
@@ -501,16 +502,59 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, listed bool
 		var unlocked bool
 		cleared, unlocked, err = w.unlockShared(ufd, err)
 		if unlocked {
-			err = unix.Unlinkat(ufd, uid, unix.AT_REMOVEDIR)
+			err = w.rmdirHeld(ufd, uid, &dst)
 		}
 	}
 	switch {
-	case err == nil, errors.Is(err, unix.ENOENT):
+	case err == nil:
 		return cleared, unix.Fsync(ufd)
 	case errors.Is(err, unix.ENOTEMPTY):
 		return cleared, w.busy("")
+	case errors.Is(err, errScopeTreeBusy), errors.Is(err, errScopeDirMoved):
+		return cleared, err
 	}
 	return cleared, fmt.Errorf("remove the scope directory: %w", err)
+}
+
+// errScopeDirMoved is a scope directory rm-scope emptied that was no longer
+// at its name in .user when it came to remove it.
+var errScopeDirMoved = errors.New("the scope directory was moved away from its name after rm-scope emptied it, and is not removed")
+
+// rmBeforeScopeRmdir, when set, runs just before rm-scope checks the
+// scope directory's name for its final removal; tests swap the name.
+var rmBeforeScopeRmdir func()
+
+// rmdirHeld removes the name uid from .user, held at ufd, only while it is
+// still the emptied directory held describes: .user is the service user's,
+// so the name can be renamed away or another directory put at it. The name
+// is stat'ed (not followed) first, and a different device or inode fails as
+// busy, removing nothing; a name missing then, or at the unlinkat, is
+// errScopeDirMoved, never success.
+func (w *rmWalk) rmdirHeld(ufd int, uid string, held *unix.Stat_t) error {
+	if rmBeforeScopeRmdir != nil {
+		rmBeforeScopeRmdir()
+	}
+	var st unix.Stat_t
+	err := unix.Fstatat(ufd, uid, &st, unix.AT_SYMLINK_NOFOLLOW)
+	if errors.Is(err, unix.ENOENT) {
+		return w.moved()
+	}
+	if err != nil {
+		return fmt.Errorf("stat the scope directory: %w", err)
+	}
+	if st.Dev != held.Dev || st.Ino != held.Ino {
+		return fmt.Errorf("%w: the name %s (named for reading, not for pasting) is no longer the directory rm-scope emptied, so nothing at it was removed", errScopeTreeBusy, quoteName(w.base))
+	}
+	err = unix.Unlinkat(ufd, uid, unix.AT_REMOVEDIR)
+	if errors.Is(err, unix.ENOENT) {
+		return w.moved()
+	}
+	return err
+}
+
+// moved is errScopeDirMoved naming the scope directory's name.
+func (w *rmWalk) moved() error {
+	return fmt.Errorf("%w: %s (named for reading, not for pasting)", errScopeDirMoved, quoteName(w.base))
 }
 
 // unlockShared answers the EPERM (perm) of the scope directory's removal

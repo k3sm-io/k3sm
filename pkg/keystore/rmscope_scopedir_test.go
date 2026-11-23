@@ -216,3 +216,66 @@ func TestRemoveScopeLeavesOtherDeviceDir(t *testing.T) {
 		t.Fatalf("entries/ holds %v (%v), want only the other device's directory", names, err)
 	}
 }
+
+// .user is the service user's, so the emptied scope directory's name can be
+// renamed away, or another directory put at it, just before rm-scope
+// removes it (the seam does either once). Neither is reported removed: a
+// name gone is errScopeDirMoved, never success, and the directory moved
+// away is still there; a name now naming another directory fails as busy,
+// and the swapped-in directory survives.
+func TestRemoveScopeDirMovedBeforeRmdir(t *testing.T) {
+	for _, swapIn := range []bool{false, true} {
+		name := "moved away"
+		if swapIn {
+			name = "another directory at the name"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, server, _ := fileLogScope(t)
+			dir := scopeDir(server, "1001")
+			away := filepath.Join(filepath.Dir(dir), "away")
+			var swapped uint64
+			setSeam(t, &rmBeforeScopeRmdir, func() {
+				if swapped != 0 {
+					return
+				}
+				if err := os.Rename(dir, away); err != nil {
+					t.Fatal(err)
+				}
+				swapped = 1
+				if swapIn {
+					if err := os.Mkdir(dir, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					swapped, _ = inoOf(t, dir)
+				}
+			})
+			root, err := s.openDir(s.dir, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			_, err = removeScopeTree(root, s.dir, "1001", s.uid, true)
+			if swapped == 0 {
+				t.Fatal("the seam never ran")
+			}
+			want := errScopeDirMoved
+			if swapIn {
+				want = errScopeTreeBusy
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("removeScopeTree with the name swapped before its rmdir: %v, want %v", err, want)
+			}
+			if !strings.Contains(err.Error(), quoteName(dir)+" (named for reading, not for pasting)") {
+				t.Errorf("the error %q does not name the scope directory for reading", err)
+			}
+			if names, err := os.ReadDir(away); err != nil || len(names) != 0 {
+				t.Fatalf("the emptied directory moved away: %v (%v), want it present and empty", names, err)
+			}
+			if swapIn {
+				if ino, _ := inoOf(t, dir); ino != swapped {
+					t.Fatalf("the directory at the name is inode %d, want the swapped-in %d", ino, swapped)
+				}
+			}
+		})
+	}
+}
