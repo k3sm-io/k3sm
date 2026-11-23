@@ -154,13 +154,24 @@ untouched. It exits 0 only when, beyond a listed key, the user-scope floor log s
 of that user after the key was listed. If the user's server activity continued after the key
 was listed (a newer scope), or the floor log cannot be read, it still removes what it found but
 exits 4, saying it cannot confirm the user's current scope is the one removed, and that the
-current scope may have been moved away from its name. Only a run repeated after the user made
-changes, or after a floor rebuild that kept a line of that user, meets this; a first removal does
-not. It removes only the
+current scope may have been moved away from its name. A first removal can meet this too: when
+the floor log cannot be read, or when a process of the server's user writes a line for that user
+to the floor log while `rm-scope` runs (it can, without the keystore lock). Exit 4 then still
+means the scope at the name is removed and listed; only the confirmation is missing, and running
+it again finds the scope absent, so that confirmation cannot be had later. A run repeated after
+the user made changes, or after a floor rebuild that kept a line of that user, meets it as well;
+on a file system without birth time (any system other than macOS) every repeated run exits 4. It
+also exits 4 when the floor log shows that the user's scope was created more than once since it
+was last listed: another scope of that user may then be kept away from its name, and `rm-scope`
+removed and listed only the one at the name. A floor rebuild between those creations erases
+that evidence, so this check can miss it, and a forged line in the floor log only costs a
+needless exit 4. It removes only the
 scope directory it checked:
 if another directory is at the scope's name by the time it removes it (one renamed there by the
 server's user, for example), it stops, leaves that directory untouched, and says the directory
-is not the scope it checked. If the emptied scope directory was moved from its name before the
+is not the scope it checked. The one exception is an empty directory renamed onto the name at
+the very moment of the last step: that one can be removed, and `rm-scope` says another directory
+was removed at the name. If the emptied scope directory was moved from its name before the
 last step, it says so and does not report the scope removed; if it cannot tell whether the
 directory it removed last was the scope's, it says it could not confirm the removal and exits 4. It does not go into a directory in
 the scope that another user owns (one moved in from a shared directory, for example): it leaves
@@ -178,9 +189,14 @@ already listed the scope again, unchanged, and could not confirm that save reach
 and the message says what is unconfirmed or where it stopped; and 1 when it refused, or stopped
 before changing anything.
 Exit 0 means the directory at the scope's name was removed and its key is listed, so no copy of
-that scope opens again. It does not mean no other scope of that user exists: if the server's
-user moved the scope directory away before `rm-scope` ran and the server then made a new scope
-in its place, `rm-scope` removes and lists only the new one, and the moved one, put back, opens.
+that scope opens again. It does not mean no other scope of that user exists. `rm-scope` can only
+list a key it reads at the scope's name, so a scope the server's user moved away from its name
+before `rm-scope` ran is not removed at all, also when earlier scopes of that user were removed:
+if the name is left empty, `rm-scope` says it found the scope absent (exit 1); if a file or a
+symlink is put there, it refuses (exit 1); if the server made a new scope in its place,
+`rm-scope` removes and lists only the new one (exit 0, or exit 4 when the floor log shows the
+scope was created twice). In each case the moved scope, put back, opens. Closing this needs a
+change to the server, not to `rm-scope`, and is not done yet.
 When the message ends with `rerun sudo k3sm keys rm-scope user/UID --yes`, running that continues
 where it stopped. When it does not, running it again would meet the same state; the message
 names what it found, for you to read.

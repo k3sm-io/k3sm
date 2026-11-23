@@ -2751,7 +2751,11 @@ service user can only add to.
   directories onto the name after rm-scope judged it, so before the scope directory held by
   descriptor is taken, its owner is checked (the service user's, or root's at 0700, on `.user`'s
   device) and its `scope.key` is read inside it by descriptor (`fstatat`, then `O_NOFOLLOW`
-  re-checked as that file, bounded, opened under W).
+  re-checked as that file, bounded, opened under W). So rm-scope removes only the directory it
+  judged, or a root-owned leftover an earlier run took, with one exception: an empty directory
+  renamed onto the name between the final `rmdir`'s `fstatat` and its `unlinkat` can be
+  removed, and is reported ("another directory was removed at the name"), never as the scope's
+  removal.
 
   *The measured premise.* What the service user can put at the name, measured on macOS (APFS,
   non-root): it cannot create a root-owned directory; moving a directory it cannot write to
@@ -2830,11 +2834,14 @@ service user can only add to.
   moved away from its name; it names no path and offers no command. rm-scope holds the floor
   lock and the exclusive store lock while it reads, so no server write runs: a hostile append
   to the floor can only add a line, which turns exit 0 into exit 4, never the reverse. A first
-  removal never trips it (nothing can be written after a listing made under the lock it still
-  holds) unless the floor cannot be judged; a rerun trips it when the uid had any floor
-  activity after the listing, or, on a floor rebuilt since, when the rebuild kept a line of the
-  uid (a floor without a whole identity, as on a file system with no birth time, keeps the
-  listed scope's own lines and so always trips it).
+  removal can trip it too: when the floor cannot be opened, judged or read, or when a line of
+  the uid is appended to the floor during the run (the service user's processes can append to
+  the floor without the store lock). Exit 4 there means the scope at the name is removed and
+  listed; only the confirmation is withheld, and a rerun finds the name absent (exit 1, found
+  absent), so the confirmation cannot be obtained later. A rerun trips it when the uid had any
+  floor activity after the listing, or, on a floor rebuilt since, when the rebuild kept a line
+  of the uid (a floor without a whole identity, as on a file system with no birth time, keeps
+  the listed scope's own lines and so always trips it).
 
   *The created-twice rule.* Inside the same scan, a partial detection of the open limit below.
   Every mint of a scope appends the same floor line for the uid, its empty delivery record at
@@ -2887,9 +2894,6 @@ service user can only add to.
   *Honest limits.* Each below is accepted; none is a revocation failure. One more, after the
   list, is open:
 
-  - A symlink or a file held at the scope's name refuses the run (exit 1). The serving path
-    refuses it too, so nothing serves the scope meanwhile; its key is not listed until the
-    directory is back at its name and rm-scope runs again.
   - A tree nested deeper than 32 directories below the scope directory stops the walk after the
     scope directory is taken. Root owns the directory, so no open serves it, and only the cleanup
     is blocked; but its key is listed only when this run listed one: always on the judged path,
@@ -2916,29 +2920,47 @@ service user can only add to.
   - On a file system without birth time (any build off darwin) the recorded floor identity is
     never whole, so a rerun counts every line of `user/<uid>` in the floor as later, and, while
     the listed scope's own lines remain (until `floor --rebuild`), every rerun exits 4.
-  - The record keeps one floor position per uid, the latest listing's, not one per key. A
-    rerun proving the removal by a key an earlier run listed measures from the uid's latest
-    listing, so a line written between that key's listing and the latest one is not counted;
-    it belongs to a scope minted before the latest listing, which is the open limit below.
+  - A veto of the report, not of the revocation: the service user's processes can append a
+    line of the uid to the floor without the store lock, during any run, the first included,
+    and a floor that cannot be opened, judged or read is never exit 0. Either turns exit 0 into
+    exit 4 while the scope at the name is removed and listed; only the confirmation is
+    withheld, and since a rerun finds the name absent, it cannot be obtained later.
 
-  *Open limit: a scope never judged.* Not accepted; no test pins it as correct. A tree-writer
-  that can rename within `.user` moves the uid's scope directory K_a out of its name before any
-  rm-scope. The scope is then absent at its name, and the server's next grant for the uid mints a
-  new scope K_b there (a `put`, or a grant that records a delivery, mints on `errNoScopeKey`);
-  the mint consults neither the removed-scopes record nor the uid's earlier floor lines as a sign
-  of another scope, and refuses only when the floor records the delivery record past sequence 1
-  under the user's GeneratedUID, or when `entries/` at the name holds names. So the attack needs K_a's delivery
-  record never to have advanced past sequence 1. rm-scope then judges K_b, lists it and exits 0:
-  every line after the listing is K_b's own or none. The writer moves K_a back. Its open
-  compares its key identity only with the removed-scopes record, which lists K_b alone, and its
-  record's generation with the live GeneratedUID, which still matches; its entries' pointers are
-  checked against floor lines keyed by each entry's own random generation, which K_a's lines
-  still satisfy. K_a is served. A floor line carries the scope, the name, a generation (the
-  entry's random one, or the GeneratedUID for the delivery record) and a sequence, and nothing
-  that names a scope key, so "a line of this uid that belongs to no listed key" cannot be told
-  from the floor as it is written. Exit 0 therefore proves that the directory at the name is
-  removed and its key is listed; it does not prove that no never-judged scope of this uid is
-  held elsewhere.
+  *Open limit: a scope kept away from its name.* Not accepted; no test pins it as correct.
+  rm-scope can list only a key it reads at the scope's name, so a scope kept away from its name
+  is not revoked by this verb at all. A tree-writer that can rename within `.user` moves the
+  uid's scope directory K_a out of its name before an rm-scope judges that scope; this applies
+  to a uid never removed and equally after earlier removals of the uid. Then:
+
+  - the name left empty: rm-scope finds the scope absent (exit 1, "found absent");
+  - a file or a symlink held at the name: rm-scope refuses (exit 1); the serving path refuses
+    it too, so nothing serves the scope meanwhile, but K_a is not listed;
+  - a freshly created scope K_b at the name: the server's next grant for the uid mints K_b
+    there (a `put`, or a grant that records a delivery, mints on `errNoScopeKey`); the mint
+    consults neither the removed-scopes record nor the uid's earlier floor lines as a sign of
+    another scope, and refuses only when the floor records the delivery record past sequence 1
+    under the user's GeneratedUID, or when `entries/` at the name holds names, so this needs
+    K_a's delivery record never to have advanced past sequence 1. rm-scope judges K_b, lists it
+    and removes it: exit 0 when no second creation line of the uid is in the floor since its
+    last listing, exit 4 when the created-twice rule finds K_a's own creation line too (it does
+    not when a `floor --rebuild` between the mints dropped it, or, on a key an earlier run
+    listed, when K_a was minted before the uid's latest listing: the record keeps one floor
+    position per uid, the latest listing's, not one per key, so a line written between that
+    key's listing and the latest one is not counted).
+
+  In each case the writer later moves K_a back. Its open compares its key identity only with
+  the removed-scopes record, which does not list it, and its record's generation with the live
+  GeneratedUID, which still matches; its entries' pointers are checked against floor lines
+  keyed by each entry's own random generation, which K_a's lines still satisfy. K_a is served.
+  A floor line carries the scope, the name, a generation (the entry's random one, or the
+  GeneratedUID for the delivery record) and a sequence, and nothing that names a scope key, so
+  "a line of this uid that belongs to no listed key" cannot be told from the floor as it is
+  written. Exit 0 therefore proves that the directory at the name is removed and its key is
+  listed; it does not prove that no other scope of this uid is held elsewhere. Closing it needs
+  revocation by uid (an authenticated per-uid epoch bound into the key record, a serving-path
+  change) or a server-side refusal to create a second scope for a uid whose creation line lies
+  past its last listing (a mint-path change, with an availability cost). Both are follow-up
+  work, not in this change.
 
   *The delivery check.* The judged path reads the delivery record through the floored reader a
   withdraw uses: a record below the floor (a rolled-back authentic copy) is a rollback, which
