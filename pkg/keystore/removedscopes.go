@@ -32,10 +32,11 @@ import (
 
 // The removed-scopes record (docs/design/keystore.md § "A removed scope
 // stays removed"): rm-scope lists, per uid, the identity of each scope key
-// it removed, in keystore-removed-scopes.json in the data root, so a scope
-// directory copied back after rm-scope, whose scope.key still opens under
-// the unchanged master, is refused at every open, and floor --rebuild knows
-// which absent scopes root removed.
+// it removed and the floor's byte size at the removal, in
+// keystore-removed-scopes.json in the data root, so a scope directory
+// copied back after rm-scope, whose scope.key still opens under the
+// unchanged master, is refused at every open, and floor --rebuild drops the
+// uid's floor lines written before the removal, and only those.
 
 const (
 	// removedScopesName is the record, in the data root.
@@ -80,16 +81,23 @@ func scopeKeyID(scope string, ku []byte) string {
 }
 
 // removedScopes is the parsed record: per uid, the identities of its
-// removed scope keys.
+// removed scope keys and the floor offset its lines are dropped before.
 type removedScopes struct {
 	Version int            `json:"version"`
 	Scopes  []removedScope `json:"scopes"`
 }
 
-// removedScope is one uid's removed scope keys.
+// removedScope is one uid's removed scope keys. FloorSize is the user-scope
+// floor's byte size when rm-scope last listed a key of the uid: floor
+// --rebuild drops the uid's floor lines that start before it, every one
+// written while a removed scope stood, and keeps those at or after it, a
+// re-minted scope's. A rebuild sets it to 0 before its swap commits, since
+// the offset names a position in the floor the swap retires; 0 drops
+// nothing.
 type removedScope struct {
-	UID  uint32   `json:"uid"`
-	Keys []string `json:"keys"`
+	UID       uint32   `json:"uid"`
+	Keys      []string `json:"keys"`
+	FloorSize int64    `json:"floor_size"`
 }
 
 // has reports whether uid's scope key id is listed.
@@ -102,13 +110,34 @@ func (r *removedScopes) has(uid uint32, id string) bool {
 	return false
 }
 
-// scopes is the set of user scopes with any removed key listed.
-func (r *removedScopes) scopes() map[string]bool {
-	out := map[string]bool{}
+// listed reports whether any scope key of uid is listed.
+func (r *removedScopes) listed(uid uint32) bool {
+	return slices.ContainsFunc(r.Scopes, func(sc removedScope) bool { return sc.UID == uid })
+}
+
+// dropBefore maps each user scope with a nonzero floor offset to it: the
+// rebuild drops that scope's floor lines starting before the offset.
+func (r *removedScopes) dropBefore() map[string]int64 {
+	out := map[string]int64{}
 	for _, sc := range r.Scopes {
-		out[userScopeOf(sc.UID)] = true
+		if sc.FloorSize > 0 {
+			out[userScopeOf(sc.UID)] = sc.FloorSize
+		}
 	}
 	return out
+}
+
+// clearFloorSizes sets every nonzero floor offset to 0, and reports
+// whether any was set.
+func (r *removedScopes) clearFloorSizes() bool {
+	changed := false
+	for i := range r.Scopes {
+		if r.Scopes[i].FloorSize != 0 {
+			r.Scopes[i].FloorSize = 0
+			changed = true
+		}
+	}
+	return changed
 }
 
 // keys is the count of scope keys listed.
@@ -120,26 +149,28 @@ func (r *removedScopes) keys() int {
 	return n
 }
 
-// add lists uid's scope key id, and reports false, changing nothing, when
-// the record is full.
-func (r *removedScopes) add(uid uint32, id string) bool {
+// add lists uid's scope key id with the floor's byte size floorSize at the
+// removal, and reports false, changing nothing, when the record is full.
+func (r *removedScopes) add(uid uint32, id string, floorSize int64) bool {
 	if r.keys() >= maxRemovedScopeKeys {
 		return false
 	}
 	for i := range r.Scopes {
 		if r.Scopes[i].UID == uid {
 			r.Scopes[i].Keys = append(r.Scopes[i].Keys, id)
+			r.Scopes[i].FloorSize = floorSize
 			return true
 		}
 	}
-	r.Scopes = append(r.Scopes, removedScope{UID: uid, Keys: []string{id}})
+	r.Scopes = append(r.Scopes, removedScope{UID: uid, Keys: []string{id}, FloorSize: floorSize})
 	return true
 }
 
 // parseRemovedScopes parses the record strictly: one JSON object of the
 // version, with no unknown field and no trailing data; each uid nonzero and
 // listed once, each key 64 lowercase hex digits and listed once, at most
-// maxRemovedScopeKeys keys in all.
+// maxRemovedScopeKeys keys in all, each floor offset not negative (a
+// record without one has offset 0, which drops nothing).
 func parseRemovedScopes(b []byte) (*removedScopes, error) {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
@@ -158,6 +189,9 @@ func parseRemovedScopes(b []byte) (*removedScopes, error) {
 	for _, sc := range r.Scopes {
 		if sc.UID == 0 || uids[sc.UID] || len(sc.Keys) == 0 {
 			return nil, fmt.Errorf("uid %d is zero, listed twice or lists no key", sc.UID)
+		}
+		if sc.FloorSize < 0 {
+			return nil, fmt.Errorf("uid %d has a negative floor offset", sc.UID)
 		}
 		uids[sc.UID] = true
 		for _, k := range sc.Keys {

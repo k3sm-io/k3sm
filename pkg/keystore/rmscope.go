@@ -38,13 +38,15 @@ var errScopeHasDeliveries = errors.New("the scope's delivery record names delive
 // lockMaintenance) it opens the
 // scope's key under W without the GeneratedUID check and reads its delivery
 // record, refusing while the record names any delivery, then lists the
-// scope key's identity in the removed-scopes record
+// scope key's identity, with the user-scope floor's byte size at that
+// moment, in the removed-scopes record
 // (keystore-removed-scopes.json, through the judged data-root descriptor),
 // then removes .user/<uid>/ by descriptor (removeScopeTree), walking from
 // the keystore root it opened and judged first, never from the path again.
 // A scope directory copied back after it is refused at every open, since
 // its scope.key's identity is listed, and the next floor --rebuild drops
-// every floor key of the scope. A full record does not stop the removal:
+// the uid's floor lines written before the recorded size, and keeps the
+// ones after it (a re-minted scope's). A full record does not stop the removal:
 // recorded reports false, the scope is removed unlisted, and floor
 // --rebuild keeps its floor keys (fail closed for a copy-back). A record
 // that does not read refuses, changing nothing. A scope whose entries/ and
@@ -100,13 +102,38 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		return false, fmt.Errorf("read the delivery record of %s: %w; nothing was changed", u.scope, derr)
 	}
 	recorded = removed.has(uid, id)
-	if !recorded && removed.add(uid, id) {
-		if err := writeRemovedScopes(dfd, removed); err != nil {
-			return false, fmt.Errorf("record the removed scope %s in %s: %w; nothing else was changed", u.scope, removedScopesName, err)
+	if !recorded {
+		size, err := s.floorSize(dfd)
+		if err != nil {
+			return false, fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed", userFloorLogName, err)
 		}
-		recorded = true
+		if removed.add(uid, id, size) {
+			if err := writeRemovedScopes(dfd, removed); err != nil {
+				return false, fmt.Errorf("record the removed scope %s in %s: %w; nothing else was changed", u.scope, removedScopesName, err)
+			}
+			recorded = true
+		}
 	}
 	return recorded, removeScopeTree(root, strconv.FormatUint(uint64(uid), 10))
+}
+
+// floorSize is the user-scope floor's byte size, through the judged data
+// root dfd: 0 when there is no floor yet.
+func (s *FileStore) floorSize(dfd int) (int64, error) {
+	lfd, err := s.openLogsDir(dfd)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = unix.Close(lfd) }() // read-only directory descriptor
+	var st unix.Stat_t
+	err = s.statLog(lfd, userFloorLogName, &st)
+	if errors.Is(err, unix.ENOENT) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return st.Size, nil
 }
 
 // removeScopeTree removes keystore/.user/<uid>/ by descriptor, starting

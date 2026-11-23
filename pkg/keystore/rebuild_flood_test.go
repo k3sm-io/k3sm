@@ -122,7 +122,7 @@ func TestRebuildDropsForgedLiveFlood(t *testing.T) {
 // times larger leaves no more live heap behind, and a floor of over-long
 // lines alone allocates no more in total.
 func TestOldFloorReaderMemoryBounded(t *testing.T) {
-	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{"user/1001": true}, names: map[nameKey]bool{}, removed: map[string]bool{}}
+	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{"user/1001": true}, names: map[nameKey]bool{}, removed: map[string]int64{}}
 	const keyBound = 4
 	floodOf := func(n int, forged bool) []byte {
 		var b bytes.Buffer
@@ -186,7 +186,7 @@ func TestOldFloorReaderRefusesTombstonesPastBound(t *testing.T) {
 		}
 		b.Write(line)
 	}
-	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{"user/1001": true}, names: map[nameKey]bool{}, removed: map[string]bool{}}
+	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{"user/1001": true}, names: map[nameKey]bool{}, removed: map[string]int64{}}
 	_, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, 4, maxLogLine)
 	if err == nil || !strings.Contains(err.Error(), "user/1001 (5 keys)") {
 		t.Fatalf("readOldFloorFrom: %v, want a refusal naming user/1001 (5 keys)", err)

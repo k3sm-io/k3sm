@@ -105,9 +105,16 @@ var errRebuildRefused = errors.New("floor --rebuild refused and changed nothing"
 // line that parses, opens every scope under .user/ without the
 // GeneratedUID check, and writes one line per key: every carried tombstone,
 // which no entry line overrides, and per live key the higher of the carried
-// sequence and the one on disk. A key of a scope whose directory is gone is
-// dropped. Any scope that does not open refuses the rebuild, naming the
-// scope, before anything changes.
+// sequence and the one on disk. A line of a uid rm-scope recorded is
+// dropped when it starts before the floor offset recorded at the removal,
+// and kept at or after it (a re-minted scope's lines). Any scope that does
+// not open refuses the rebuild, naming the scope, before anything changes.
+//
+// Before the swap's commit it sets every recorded floor offset to 0 in the
+// removed-scopes record, since the offsets name positions in the floor the
+// swap retires: a crash between that rewrite and the swap leaves the old
+// floor live with offsets that drop nothing, so the rerun keeps those
+// lines (fail closed), never drops lines twice.
 //
 // The new floor is swapped in as a whole directory (swapLogDir). A rerun
 // after a crash past the swap prints the crashed run's report and does not
@@ -136,7 +143,7 @@ func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (Reb
 	if err != nil {
 		return rep, fmt.Errorf("%w: %w", errRebuildRefused, err)
 	}
-	in.removed = removed.scopes()
+	in.removed = removed.dropBefore()
 	rep.Scopes = len(in.present)
 	old, err := s.readOldFloor(m.lfd, in)
 	if err != nil {
@@ -145,6 +152,11 @@ func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (Reb
 	rep.Dropped, rep.OverLong, rep.ForgedLive, rep.RemovedKeys = old.dropped, old.overLong, old.forged, old.removed
 	lines, keys := mergeFloor(old, in.disk)
 	rep.Keys = keys
+	if removed.clearFloorSizes() {
+		if err := writeRemovedScopes(m.dfd, removed); err != nil {
+			return rep, fmt.Errorf("%w: set the floor offsets in %s to 0: %w; it may now list them at 0, and a rerun then keeps the removed scopes' floor lines", errRebuildRefused, removedScopesName, err)
+		}
+	}
 	content := func(w io.Writer) error {
 		for _, l := range lines {
 			if _, err := w.Write(l); err != nil {
@@ -198,12 +210,13 @@ type oldFloor struct {
 
 // rebuildInput is what rebuild knows before it reads the old floor: the
 // keys on disk, the scopes present, the (scope, name) of every entry
-// directory present, and the scopes rm-scope recorded as removed.
+// directory present, and per scope rm-scope recorded as removed the floor
+// offset its lines are dropped before.
 type rebuildInput struct {
 	disk    map[floorKey]uint64
 	present map[string]bool
 	names   map[nameKey]bool
-	removed map[string]bool
+	removed map[string]int64
 }
 
 // errFloorLineTooLong is a line over the per-line bound, skipped to its
@@ -212,11 +225,11 @@ var errFloorLineTooLong = errors.New("a floor line is over the per-line bound")
 
 // floorLines streams r line by line through a buffer of lineBound bytes
 // (a line and its newline): fn gets each whole line, without its newline,
-// or errFloorLineTooLong for one over the bound, which is skipped to its
-// newline. It returns the offset just past the last whole line, and
+// and the offset it starts at, or errFloorLineTooLong for one over the
+// bound, which is skipped to its newline. It returns the offset just past the last whole line, and
 // whether a torn last line (no newline) followed it; memory stays at the
 // buffer whatever the size of r.
-func floorLines(r io.Reader, lineBound int, fn func(line []byte, err error) error) (int64, bool, error) {
+func floorLines(r io.Reader, lineBound int, fn func(line []byte, start int64, err error) error) (int64, bool, error) {
 	br := bufio.NewReaderSize(r, lineBound)
 	var off, pos int64
 	long := false
@@ -232,6 +245,7 @@ func floorLines(r io.Reader, lineBound int, fn func(line []byte, err error) erro
 		case err != nil:
 			return off, false, err
 		}
+		start := off
 		off = pos
 		line := b[:len(b)-1]
 		var ferr error
@@ -241,7 +255,7 @@ func floorLines(r io.Reader, lineBound int, fn func(line []byte, err error) erro
 		if len(line) == 0 && ferr == nil {
 			continue // an append's leading newline
 		}
-		if err := fn(line, ferr); err != nil {
+		if err := fn(line, start, ferr); err != nil {
 			return off, false, err
 		}
 	}
@@ -265,8 +279,9 @@ func (s *FileStore) readOldFloor(lfd int, in rebuildInput) (*oldFloor, error) {
 // its keys against keyBound, counting the keys on disk first, in this
 // order (docs/design/keystore.md § "Rebuild reads a flooded floor"):
 //
-//  1. every tombstone, of any scope rm-scope did not record as removed,
-//     and every live line whose key is on disk;
+//  1. every tombstone and every live line whose key is on disk, except a
+//     line of a uid rm-scope recorded that starts before the floor offset
+//     recorded at its removal;
 //  2. then, only while under the bound, live lines with no key on disk
 //     whose entry directory stands (another generation of it);
 //  3. then, only while under the bound, live lines with no entry directory
@@ -276,8 +291,9 @@ func (s *FileStore) readOldFloor(lfd int, in rebuildInput) (*oldFloor, error) {
 // counted in forged.
 //
 // A line over lineBound is skipped to its newline and counted, a line that
-// does not parse and a torn last line are dropped and counted, and a key of
-// a recorded removed scope is dropped and counted. If the tombstones and
+// does not parse and a torn last line are dropped and counted, and a key
+// whose line starts before its uid's recorded floor offset is dropped and
+// counted. If the tombstones and
 // the keys on disk alone pass the bound, it refuses, naming the scopes with
 // the most keys: the one refusal left. Memory is the admitted keys, at most
 // keyBound, and one line's buffer, whatever the file's size.
@@ -285,8 +301,8 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, line
 	o := &oldFloor{maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
 	total := len(in.disk)
 	removedSeen := map[floorKey]bool{}
-	gone := func(k floorKey) bool { return !in.present[k.scope] && in.removed[k.scope] }
-	off, torn, err := floorLines(io.NewSectionReader(f, 0, size), lineBound, func(line []byte, lerr error) error {
+	gone := func(k floorKey, start int64) bool { return start < in.removed[k.scope] }
+	off, torn, err := floorLines(io.NewSectionReader(f, 0, size), lineBound, func(line []byte, start int64, lerr error) error {
 		if lerr != nil {
 			o.overLong++
 			return nil
@@ -297,7 +313,7 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, line
 			return nil
 		}
 		switch {
-		case gone(r.key):
+		case gone(r.key, start):
 			if !removedSeen[r.key] {
 				if len(removedSeen) < keyBound {
 					removedSeen[r.key] = true
@@ -332,12 +348,12 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, line
 	// Live lines with no key on disk: those whose entry directory stands
 	// first, then those with none, each only while under the bound.
 	for _, withDir := range []bool{true, false} {
-		_, _, err = floorLines(io.NewSectionReader(f, 0, off), lineBound, func(line []byte, lerr error) error {
+		_, _, err = floorLines(io.NewSectionReader(f, 0, off), lineBound, func(line []byte, start int64, lerr error) error {
 			if lerr != nil {
 				return nil
 			}
 			r, err := parseFloorLine(line)
-			if err != nil || r.tomb || gone(r.key) || o.buried[r.key] || in.names[nameKey{r.key.scope, r.key.name}] != withDir {
+			if err != nil || r.tomb || gone(r.key, start) || o.buried[r.key] || in.names[nameKey{r.key.scope, r.key.name}] != withDir {
 				return nil
 			}
 			if _, onDisk := in.disk[r.key]; onDisk {
