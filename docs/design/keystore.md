@@ -3723,6 +3723,16 @@ token (`task_info(TASK_AUDIT_TOKEN)`) and requires 0; any other answer or an err
 user scope off (`sandbox-check-unusable`). That control cannot show that a sandboxed peer still
 reads as 1; the rig leg shows that, on each supported macOS.
 
+*Measured on macOS 27.2.1 (26B131), without root, 2026-11-23* (`-tags integration`,
+`TestIntegrationDeadPeerRefused`, `TestIntegrationSandboxedPeerRefused`). A peer that connects,
+writes a HELLO and exits before the accept: on the accepted descriptor `LOCAL_PEERCRED` still
+answers (xucred version 0, the peer's uid 501), while `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` each
+fail with `ENOTCONN`, so no token reaches the sandbox check and the listener refuses the peer as
+`cred-unreadable` under uid 501; its buffered bytes are never read. A child that sandboxes itself
+with `sandbox-exec -p '(version 1)(allow default)'` and stays connected reads as sandboxed (1)
+through the real sandbox source, and the listener refuses it as `sandboxed`. Still owed on the
+rig: a real Pod's connection, and the other supported macOS version.
+
 **What each layer is.** A Pod is kept from the socket by three layers, in this order. The
 Seatbelt deny on `keys.sock` (Pod denies, layer 1) is the first barrier: a Pod's `connect(2)`
 fails before the listener sees it. The uid refusal is the second: every native Pod runs as the
