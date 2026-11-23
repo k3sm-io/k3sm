@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -91,6 +92,140 @@ func openKeystoreDataRoot(path string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
+// dataRootPass is one start-check pass's hold on the data root: the
+// mount-flag check opens it afresh (O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC),
+// fstats and fstatfs's that descriptor, and the later checks of the same
+// pass judge what they opened against it, so a volume mounted over the
+// data root, the socket directory or the logs since an earlier pass is
+// judged as it is now, never through an old descriptor. end closes it.
+type dataRootPass struct {
+	path    string
+	open    func(path string) (*os.File, error)
+	ignores func(dir *os.File) (bool, error)
+
+	mu  sync.Mutex // guards f and dev
+	f   *os.File
+	dev uint64
+}
+
+// errDataRootMoved is an object a start check opened that is not on the
+// pass's data root's device.
+var errDataRootMoved = errors.New("not on the data root's device")
+
+// ignoresOwnership starts the pass: it ends any earlier one, opens the
+// data root afresh, records its device and reads its mount flags.
+func (p *dataRootPass) ignoresOwnership() (bool, error) {
+	p.end()
+	f, err := p.open(p.path)
+	if err != nil {
+		return false, err
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		_ = f.Close() // read-only descriptor
+		return false, fmt.Errorf("stat the data root %s: %w", p.path, err)
+	}
+	p.mu.Lock()
+	p.f, p.dev = f, uint64(st.Dev)
+	p.mu.Unlock()
+	return p.ignores(f)
+}
+
+// root returns the pass's data-root descriptor and its device, or an
+// error when no pass is open.
+func (p *dataRootPass) root() (*os.File, uint64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.f == nil {
+		return nil, 0, errors.New("no data-root descriptor for this start-check pass")
+	}
+	return p.f, p.dev, nil
+}
+
+// sameDevice opens each of paths relative to the pass's data-root
+// descriptor, one component at a time, each O_DIRECTORY|O_NOFOLLOW, and
+// refuses one whose device is not the data root's: a volume mounted over
+// it since the data root was judged.
+func (p *dataRootPass) sameDevice(paths ...[]string) error {
+	root, dev, err := p.root()
+	if err != nil {
+		return err
+	}
+	for _, comps := range paths {
+		fd := int(root.Fd())
+		owned := -1
+		for _, c := range comps {
+			next, err := unix.Openat(fd, c, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+			if owned >= 0 {
+				_ = unix.Close(owned) // read-only directory descriptor
+			}
+			if err != nil {
+				return fmt.Errorf("open %s through the data root: %w", filepath.Join(comps...), err)
+			}
+			fd, owned = next, next
+		}
+		var st unix.Stat_t
+		err := unix.Fstat(fd, &st)
+		if owned >= 0 {
+			_ = unix.Close(owned) // read-only directory descriptor
+		}
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", filepath.Join(comps...), err)
+		}
+		if uint64(st.Dev) != dev {
+			return fmt.Errorf("%s is %w", filepath.Join(comps...), errDataRootMoved)
+		}
+	}
+	return nil
+}
+
+// sameDeviceFiles refuses a held log whose device is not the pass's data
+// root's.
+func (p *dataRootPass) sameDeviceFiles(files ...keystore.LogFileID) error {
+	_, dev, err := p.root()
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		if f.Dev != dev {
+			return fmt.Errorf("a reopened log is %w", errDataRootMoved)
+		}
+	}
+	return nil
+}
+
+// end closes the pass's data-root descriptor, if one is open.
+func (p *dataRootPass) end() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.f != nil {
+		_ = p.f.Close() // read-only descriptor
+		p.f, p.dev = nil, 0
+	}
+}
+
+// socketInstallDirs are the directories the install check judges, as
+// components under the data root, each re-checked on the pass's device.
+var socketInstallDirs = [][]string{
+	{keystorepaths.SockDir},
+	{keystore.LogsDirName},
+	{keystore.LogsDirName, keystore.AuditDirName},
+	{keystore.LogsDirName, keystore.FloorDirName},
+}
+
+// checkInstallOn is the store's install check, then each directory it
+// judged re-opened through the pass's data root and refused when it is on
+// another device: the store's check opens by path, so the device is what
+// ties what it judged to the data root whose flags were read.
+func checkInstallOn(pass *dataRootPass, check func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if err := check(ctx); err != nil {
+			return err
+		}
+		return pass.sameDevice(socketInstallDirs...)
+	}
+}
+
 // keystoreSocketDeps is what the user socket's wiring takes from the server,
 // so a test can fake each part.
 type keystoreSocketDeps struct {
@@ -110,8 +245,8 @@ type keystoreSocketDeps struct {
 	// user.
 	euid       func() int
 	serviceIDs func() (uid, gid uint32, err error)
-	// openDataRoot opens the data root's descriptor, kept for the
-	// supervisor's life; ignoresOwnership reads its mount flags.
+	// openDataRoot opens the data root's descriptor afresh for each
+	// start-check pass; ignoresOwnership reads its mount flags.
 	openDataRoot     func(path string) (*os.File, error)
 	ignoresOwnership func(dir *os.File) (bool, error)
 	// creds and sandbox are the listener's peer sources; sandboxCheck is
@@ -123,8 +258,9 @@ type keystoreSocketDeps struct {
 	log          *slog.Logger
 }
 
-// keystoreSocket is a built supervisor and what it holds open: the data-root
-// descriptor and the server's log descriptors, closed once Run has returned.
+// keystoreSocket is a built supervisor and what it holds open: the server's
+// log descriptors, and a pass's data-root descriptor if Run stopped inside
+// one, closed once Run has returned.
 // log receives the stop's line when Run outlives keystoreSocketStopTimeout.
 type keystoreSocket struct {
 	sup   *socket.Supervisor
@@ -154,10 +290,10 @@ func newKeystoreSocket(deps keystoreSocketDeps) (*keystoreSocket, error) {
 // keystoreSocketConfig is the supervisor's config for this server: the
 // store's server log surface and its refusal auditor, the peer sources, the
 // handler and the start checks (the effective uid, the service uid, the
-// mount flags of a data-root descriptor it opens and keeps open, the store's
-// install check, the maintenance marker read, the log reopen and the server
-// count). The returned func closes the
-// descriptors the config holds.
+// mount flags of a data-root descriptor opened afresh for each pass and
+// closed when it ends, the store's install check and the log reopen, each
+// held to that descriptor's device, the maintenance marker read and the
+// server count). The returned func closes the descriptors the config holds.
 func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, func(), error) {
 	if deps.listen == nil {
 		return socket.SupervisorConfig{}, nil, errors.New("no listener source")
@@ -185,31 +321,42 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 	if err != nil {
 		return socket.SupervisorConfig{}, nil, err
 	}
-	dir, err := deps.openDataRoot(storeCfg.DataRoot)
-	if err != nil {
-		return socket.SupervisorConfig{}, nil, err
+	if deps.openDataRoot == nil || deps.ignoresOwnership == nil {
+		return socket.SupervisorConfig{}, nil, errors.New("no data-root opener or mount-flag check")
 	}
+	pass := &dataRootPass{path: storeCfg.DataRoot, open: deps.openDataRoot, ignores: deps.ignoresOwnership}
 	closeAll := func() {
 		_ = logs.Close() // the listener is stopped: nothing appends any more
-		_ = dir.Close()  // read-only descriptor
+		pass.end()
 	}
 	cs := deps.client
 	return socket.SupervisorConfig{
 		Listen:            deps.listen,
 		EUID:              deps.euid,
 		ServiceUID:        uid,
-		IgnoresOwnership:  func() (bool, error) { return deps.ignoresOwnership(dir) },
-		CheckInstall:      store.CheckSocketInstall,
+		IgnoresOwnership:  pass.ignoresOwnership,
+		EndPass:           pass.end,
+		CheckInstall:      checkInstallOn(pass, store.CheckSocketInstall),
 		ServerCount:       func(ctx context.Context) (int, error) { return countKeystoreServers(ctx, cs) },
 		MaintenanceMarked: logs.MaintenanceMarked,
-		OpenLogs:          logs.Reopen,
-		SandboxCheck:      deps.sandboxCheck,
-		Creds:             deps.creds,
-		Sandbox:           deps.sandbox,
-		Audit:             audit,
-		Handler:           handler,
-		Clock:             deps.clock,
-		Log:               deps.log,
+		OpenLogs: func(ctx context.Context) error {
+			if err := logs.Reopen(ctx); err != nil {
+				return err
+			}
+			audit, floor := logs.Files()
+			if err := pass.sameDeviceFiles(audit, floor); err != nil {
+				_ = logs.Close() // never append through a log off the judged data root
+				return err
+			}
+			return nil
+		},
+		SandboxCheck: deps.sandboxCheck,
+		Creds:        deps.creds,
+		Sandbox:      deps.sandbox,
+		Audit:        audit,
+		Handler:      handler,
+		Clock:        deps.clock,
+		Log:          deps.log,
 	}, closeAll, nil
 }
 
@@ -382,8 +529,8 @@ func readAdminKubeconfig(path string) (kubernetes.Interface, error) {
 // and doctor's own otherwise, the uid a rootless server started from the
 // same account runs as; the marker is read without reopening anything, and
 // the logs are judged read-only (CheckLogFlags) where the server reopens
-// them; the data root's descriptor is opened here and released by the
-// returned release; the servers are listed through the work dir's admin
+// them; the data root is opened afresh by the pass, as the server's is, and
+// closed when it ends (release closes it too); the servers are listed through the work dir's admin
 // kubeconfig; and the socket path is only lstat'd. A failure to open the
 // data root or to load the kubeconfig is that check's error, so it is
 // reported in its place in the order.
@@ -395,14 +542,7 @@ func doctorKeystoreUserScope(workDir string) (doctorUserScope, error) {
 	storeCfg := keystoreLayout(workDir)
 	storeCfg.UID, storeCfg.GID = uid, gid
 	store := keystore.New(storeCfg)
-	release := func() {}
-	var ignores func() (bool, error)
-	if dir, err := openKeystoreDataRoot(storeCfg.DataRoot); err != nil {
-		ignores = func() (bool, error) { return false, err }
-	} else {
-		ignores = func() (bool, error) { return socket.DataRootIgnoresOwnership(dir) }
-		release = func() { _ = dir.Close() } // read-only descriptor
-	}
+	pass := &dataRootPass{path: storeCfg.DataRoot, open: openKeystoreDataRoot, ignores: socket.DataRootIgnoresOwnership}
 	euid := func() int {
 		if role, installed := installedRole(); installed && role == install.RoleServer {
 			return int(uid)
@@ -427,11 +567,12 @@ func doctorKeystoreUserScope(workDir string) (doctorUserScope, error) {
 			MaintenanceMarked: store.MaintenanceMarked,
 			OpenLogs:          store.CheckLogFlags,
 			SandboxCheck:      socket.SandboxSelfCheck,
-			IgnoresOwnership:  ignores,
-			CheckInstall:      store.CheckSocketInstall,
+			IgnoresOwnership:  pass.ignoresOwnership,
+			EndPass:           pass.end,
+			CheckInstall:      checkInstallOn(pass, store.CheckSocketInstall),
 			ServerCount:       count,
 		},
-		release:   release,
+		release:   pass.end,
 		servers:   func() ([]string, error) { return names, countErr },
 		sockPath:  sock,
 		sockState: func() error { return lstatKeystoreSocket(sock, uid) },

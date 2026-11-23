@@ -3650,7 +3650,14 @@ directory is root's"). A worker node runs no listener (E18).
   (`ErrBusy`), not the server.
 - The start check also refuses a data root on a file system mounted with
   `MNT_IGNORE_OWNERSHIP` (read with `fstatfs` on the data-root descriptor, `f_flags`), since
-  every owner check in this design means nothing there (U131).
+  every owner check in this design means nothing there (U131). The data root is opened afresh
+  (`O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`) at every start-check pass, never kept from an earlier
+  one, and closed when the pass ends, so a volume mounted over the path since is judged as it
+  is now. The install check and the log reopen open their objects by path; in the same pass the
+  socket directory, `keystore-logs/` and each log's directory are opened again through that
+  descriptor, one component at a time with `O_NOFOLLOW`, and the reopened logs' descriptors are
+  compared too: any on another device than the freshly opened data root (a volume mounted over
+  one of them) fails the pass closed, as the install reason or `logs-unavailable`.
 - While the maintenance marker `keystore-maintenance` exists in the data root the listener
   stays down: it accepts nothing, and a client that connects meanwhile waits in launchd's
   backlog until its 10-second `HELLO` wait ends and it reports the server unavailable.

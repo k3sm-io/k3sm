@@ -476,3 +476,101 @@ func TestDoctorKeystoreKubeconfigPermission(t *testing.T) {
 		t.Fatalf("readAdminKubeconfig = %v, want a permission error", err)
 	}
 }
+
+// TestKeystoreSocketDataRootPerPass checks that each start-check pass opens
+// the data root afresh and closes it when the pass ends, and that what the
+// install check and the log reopen judged is refused when it is not on the
+// pass's data root's device: /dev is a mount of its own under /, so a pass
+// rooted at / refuses it as a volume mounted over a judged directory would
+// be refused.
+func TestKeystoreSocketDataRootPerPass(t *testing.T) {
+	t.Run("opened afresh, closed at the end of each pass", func(t *testing.T) {
+		f := newWiringFixture(t)
+		var opened []*os.File
+		f.deps.openDataRoot = func(path string) (*os.File, error) {
+			d, err := openKeystoreDataRoot(path)
+			if err == nil {
+				opened = append(opened, d)
+			}
+			return d, err
+		}
+		cfg, closeAll, err := keystoreSocketConfig(f.deps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeAll()
+		if len(opened) != 0 {
+			t.Fatal("the data root was opened at build time")
+		}
+		for i := range 2 {
+			if _, err := cfg.IgnoresOwnership(); err != nil {
+				t.Fatal(err)
+			}
+			if len(opened) != i+1 {
+				t.Fatalf("pass %d: %d data-root opens, want one per pass", i, len(opened))
+			}
+			cfg.EndPass()
+			if opened[i].Fd() != ^uintptr(0) {
+				t.Fatalf("pass %d: the data-root descriptor is still open after the pass", i)
+			}
+		}
+		// The supervisor's Check ends its pass, whatever the outcome.
+		p := socket.Preconditions{
+			EUID: cfg.EUID, ServiceUID: cfg.ServiceUID, IgnoresOwnership: cfg.IgnoresOwnership,
+			EndPass: cfg.EndPass, CheckInstall: cfg.CheckInstall, MaintenanceMarked: cfg.MaintenanceMarked,
+			OpenLogs: cfg.OpenLogs, SandboxCheck: cfg.SandboxCheck, ServerCount: cfg.ServerCount,
+		}
+		if reason, _ := p.Check(context.Background()); reason == "" {
+			t.Fatal("the checks passed on a temp data root with nothing installed")
+		}
+		if last := opened[len(opened)-1]; len(opened) != 3 || last.Fd() != ^uintptr(0) {
+			t.Fatalf("after Check: %d opens, the last still open = %v", len(opened), last.Fd() != ^uintptr(0))
+		}
+	})
+
+	t.Run("an object on another device is refused", func(t *testing.T) {
+		root := t.TempDir()
+		for _, d := range socketInstallDirs {
+			if err := os.MkdirAll(filepath.Join(append([]string{root}, d...)...), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pass := &dataRootPass{path: root, open: openKeystoreDataRoot, ignores: func(*os.File) (bool, error) { return false, nil }}
+		defer pass.end()
+		if err := pass.sameDevice(socketInstallDirs...); err == nil {
+			t.Fatal("sameDevice passed with no pass open")
+		}
+		if _, err := pass.ignoresOwnership(); err != nil {
+			t.Fatal(err)
+		}
+		if err := pass.sameDevice(socketInstallDirs...); err != nil {
+			t.Fatalf("sameDevice on one volume = %v", err)
+		}
+		_, dev, _ := pass.root()
+		if err := pass.sameDeviceFiles(keystore.LogFileID{Dev: dev}, keystore.LogFileID{Dev: dev}); err != nil {
+			t.Fatalf("sameDeviceFiles on one volume = %v", err)
+		}
+		if err := pass.sameDeviceFiles(keystore.LogFileID{Dev: dev}, keystore.LogFileID{Dev: dev + 1}); !errors.Is(err, errDataRootMoved) {
+			t.Fatalf("sameDeviceFiles with a log on another device = %v, want errDataRootMoved", err)
+		}
+		if err := checkInstallOn(pass, func(context.Context) error { return nil })(context.Background()); err != nil {
+			t.Fatalf("checkInstallOn on one volume = %v", err)
+		}
+		// A real mount point: /dev under /.
+		slash := &dataRootPass{path: "/", open: openKeystoreDataRoot, ignores: func(*os.File) (bool, error) { return false, nil }}
+		defer slash.end()
+		if _, err := slash.ignoresOwnership(); err != nil {
+			t.Fatal(err)
+		}
+		var st unix.Stat_t
+		if err := unix.Stat("/dev", &st); err != nil {
+			t.Skipf("no /dev to stand in for a mount point: %v", err)
+		}
+		if _, rdev, _ := slash.root(); uint64(st.Dev) == rdev {
+			t.Skip("/dev is on the root volume here; no mount point to test with")
+		}
+		if err := slash.sameDevice([]string{"dev"}); !errors.Is(err, errDataRootMoved) {
+			t.Fatalf("sameDevice across the /dev mount = %v, want errDataRootMoved", err)
+		}
+	})
+}

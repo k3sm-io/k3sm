@@ -131,9 +131,13 @@ type SupervisorConfig struct {
 	// EUID returns it, and refuses it as a peer.
 	ServiceUID uint32
 	// IgnoresOwnership reports whether the data root's file system is
-	// mounted with MNT_IGNORE_OWNERSHIP; production passes a closure over
-	// DataRootIgnoresOwnership and the data-root descriptor.
+	// mounted with MNT_IGNORE_OWNERSHIP; production opens the data root
+	// afresh for each start-check pass and reads its descriptor's flags.
 	IgnoresOwnership func() (bool, error)
+	// EndPass, when set, ends one start-check pass: it runs once Check
+	// returns, whatever the outcome, and production closes the pass's
+	// data-root descriptor in it.
+	EndPass func()
 	// CheckInstall returns an error when the socket directory or either
 	// append-only log is absent, wrong or unflagged.
 	CheckInstall func(ctx context.Context) error
@@ -335,6 +339,7 @@ func (s *Supervisor) check(ctx context.Context) (OffReason, string) {
 		CheckInstall:      s.cfg.CheckInstall,
 		ServerCount:       s.cfg.ServerCount,
 		SandboxCheck:      s.cfg.SandboxCheck,
+		EndPass:           s.cfg.EndPass,
 	}.Check(ctx)
 }
 
@@ -368,6 +373,10 @@ type Preconditions struct {
 	// with OffSandboxCheckUnusable, and so does a nil one. It runs before
 	// the server count.
 	SandboxCheck func() error
+	// EndPass is optional: when set, Check calls it once it returns, so a
+	// descriptor the pass opened (the data root, opened afresh by
+	// IgnoresOwnership) is closed when the pass ends.
+	EndPass func()
 }
 
 // Check runs the start checks in the design's order (the effective uid, the
@@ -381,6 +390,9 @@ type Preconditions struct {
 // A check that panics is recovered and fails as that check: its reason,
 // with the panic as its detail.
 func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
+	if p.EndPass != nil {
+		defer func() { _, _ = guard(func() (struct{}, error) { p.EndPass(); return struct{}{}, nil }) }()
+	}
 	euid, err := guard(func() (int, error) { return p.EUID(), nil })
 	if err != nil {
 		return OffNotInstalledServer, err.Error()
