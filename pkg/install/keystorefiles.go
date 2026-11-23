@@ -217,7 +217,9 @@ func lockMaintenanceFree(dfd int) (func(), error) {
 }
 
 // ensureKeystoreRunDir creates keystore-run/ under dfd and hands it to the
-// service user at keystoreRunDirMode, on its own descriptor.
+// service user at keystoreRunDirMode, on its own descriptor: a user flag
+// on it (the service user can set one) is cleared first, and the chmod and
+// chown are made only when the mode or owner is not already right.
 func ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID int) error {
 	name := keystore.RunDirName
 	if err := unix.Mkdirat(dfd, name, keystoreRunDirMode); err != nil && !errors.Is(err, unix.EEXIST) {
@@ -232,14 +234,26 @@ func ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID int) error {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return fmt.Errorf("stat %s: %w", name, err)
 	}
-	if int64(st.Uid) != int64(rootUID) && int64(st.Uid) != int64(svcUID) {
-		return fmt.Errorf("%s is owned by uid %d: %w", name, st.Uid, errKeystoreFileUntrusted)
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR || (int64(st.Uid) != int64(rootUID) && int64(st.Uid) != int64(svcUID)) {
+		return fmt.Errorf("%s is not a directory, or is owned by uid %d: %w", name, st.Uid, errKeystoreFileUntrusted)
 	}
-	if err := fileAttrSeam.Fchmod(fd, keystoreRunDirMode); err != nil {
-		return fmt.Errorf("chmod %s: %w", name, err)
+	// The service user owns the directory, so it can set a user flag on it
+	// (uchg, uappnd), which makes root's fchmod and fchown fail: clear the
+	// user-settable flags first, on the judged descriptor.
+	if fl := st.Flags & unix.UF_SETTABLE; fl != 0 {
+		if err := fileAttrSeam.Fchflags(fd, int(st.Flags&^unix.UF_SETTABLE)); err != nil {
+			return fmt.Errorf("clear the user flags %#x of %s: %w", fl, name, err)
+		}
 	}
-	if err := fileAttrSeam.Fchown(fd, svcUID, svcGID); err != nil {
-		return fmt.Errorf("chown %s: %w", name, err)
+	if st.Mode&0o7777 != keystoreRunDirMode {
+		if err := fileAttrSeam.Fchmod(fd, keystoreRunDirMode); err != nil {
+			return fmt.Errorf("chmod %s: %w", name, err)
+		}
+	}
+	if int64(st.Uid) != int64(svcUID) || int64(st.Gid) != int64(svcGID) {
+		if err := fileAttrSeam.Fchown(fd, svcUID, svcGID); err != nil {
+			return fmt.Errorf("chown %s: %w", name, err)
+		}
 	}
 	return nil
 }

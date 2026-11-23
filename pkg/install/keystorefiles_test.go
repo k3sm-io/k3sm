@@ -134,7 +134,7 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 		return []string{"chown:" + n + ":271:20", "chmod:" + n + ":0600", "chflags:" + n + ":0x40000"}
 	}
 	logPath := func(root, n string) string { return filepath.Join(root, logs, keystore.LogDirOf(n), n) }
-	want := append(append([]string{"chmod:" + run + ":0700", "chown:" + run + ":271:20"}, swap(floor)...), swap(audit)...)
+	want := append(append([]string{"chown:" + run + ":271:20"}, swap(floor)...), swap(audit)...)
 	setup := func(t *testing.T) (string, *attrRecorder) {
 		t.Helper()
 		root := t.TempDir()
@@ -179,7 +179,7 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); err != nil {
 			t.Fatal(err)
 		}
-		rerun := []string{"chmod:" + run + ":0700", "chown:" + run + ":271:20"}
+		rerun := []string{"chown:" + run + ":271:20"}
 		if got := rec.calls[before:]; !slices.Equal(got, rerun) {
 			t.Fatalf("rerun calls:\n got %q\nwant %q", got, rerun)
 		}
@@ -199,7 +199,7 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := rec.calls[before:]
-		wantRerun := append(append([]string{"chmod:" + run + ":0700", "chown:" + run + ":271:20"}, swap(floor)...), swap(audit)...)
+		wantRerun := append(append([]string{"chown:" + run + ":271:20"}, swap(floor)...), swap(audit)...)
 		if !slices.Equal(got, wantRerun) {
 			t.Fatalf("rerun calls:\n got %q\nwant %q", got, wantRerun)
 		}
