@@ -275,6 +275,9 @@ type rmRun struct {
 	rootHeld     bool
 	aclStripped  bool
 	listedBefore bool
+	// rereadBad is set when scope.key, read again from the held directory
+	// after its take, was no longer the key check read (reread).
+	rereadBad bool
 }
 
 // check is the rerun rule, run on the scope directory held at the name
@@ -437,7 +440,31 @@ func (r *rmRun) proven() bool {
 	if r.rootHeld && (r.aclStripped || !r.listedBefore) {
 		return false
 	}
-	return true
+	if r.path == rmPathJudged && (r.rootHeld || r.held.id != r.judged || !r.removed.has(r.u.uid, r.judged)) {
+		// The judged path proves the judged key's listing, read in the
+		// service user's directory that held it: a root-owned directory at
+		// the name is never the judged one.
+		return false
+	}
+	return !r.rereadBad
+}
+
+// reread reads scope.key again from the held directory dfd after its take
+// (the directory is root's then, so no service-user process can rename a
+// name into it): a key that is no longer the one check read sets
+// rereadBad, so the removal is not proven.
+func (r *rmRun) reread(dfd int) error {
+	if !r.heldRead || r.held.id == "" {
+		return nil
+	}
+	hk, err := r.u.scopeKeyAt(dfd, r.k)
+	if err != nil {
+		return err
+	}
+	if hk.id != r.held.id {
+		r.rereadBad = true
+	}
+	return nil
 }
 
 // rootUnproven is finish's committed note for a root-owned leftover it
@@ -447,6 +474,9 @@ func (r *rmRun) proven() bool {
 func (r *rmRun) rootUnproven() string {
 	at := quoteName("keystore/" + userScopesName + "/" + r.name)
 	var why []string
+	if r.path == rmPathJudged {
+		why = append(why, "the directory rm-scope judged was not at its name")
+	}
 	if r.aclStripped {
 		why = append(why, "it carried an extended ACL, which can let the service user move a root-owned directory to the name from another parent")
 	}
@@ -464,7 +494,7 @@ func (r *rmRun) rootUnproven() string {
 // remains when the walk stops, notes are the judged path's committed notes.
 func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScopeResult, error) {
 	uid, scope := r.u.uid, r.u.scope
-	tree, err := removeScopeTree(root, r.s.dir, r.name, r.svc, rmTreeOpts{listedNow: r.proven, check: r.check})
+	tree, err := removeScopeTree(root, r.s.dir, r.name, r.svc, rmTreeOpts{listedNow: r.proven, check: r.check, afterTake: r.reread})
 	if r.stopErr != nil {
 		return RemoveScopeResult{Recorded: r.wrote || r.renewed}, r.stopErr
 	}
@@ -489,7 +519,7 @@ func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScope
 			return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: %s", errCommitted, withCleared(strings.Join(notes, "; "), tree.cleared))
 		}
 		return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
-	case r.rootHeld && (r.held.id != "" || r.aclStripped):
+	case r.rootHeld && (r.held.id != "" || r.aclStripped || r.path == rmPathJudged):
 		note := r.rootUnproven()
 		if r.held.id == "" {
 			note += "; " + scopeRemovedUnconfirmed(scope, r.held, r.untrusted, r.removed.count(uid))
@@ -498,7 +528,13 @@ func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScope
 			note = strings.Join(append(notes, note), "; ")
 		}
 		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(note, tree.cleared))
-	case r.full && r.held.id != "":
+	case r.rereadBad:
+		note := "removed the directory at the name of " + scope + ", but its scope.key read again after rm-scope took the directory was not the one it read before, so rm-scope cannot confirm the removal is listed"
+		if len(notes) > 0 {
+			note = strings.Join(append(notes, note), "; ")
+		}
+		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(note, tree.cleared))
+	case r.full && r.held.id != "" && (r.path != rmPathJudged || r.held.id == r.judged):
 		// The key opened as this scope's, and the record is full.
 		if len(notes) > 0 {
 			return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(strings.Join(notes, "; "), tree.cleared))
@@ -898,6 +934,9 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, opts rmTree
 	// this descriptor that it was the directory removed.
 	defer func() { _ = unix.Close(dfd) }() // fsynced in emptyScopeDir
 	err = w.take(dfd, &dst, "")
+	if err == nil && opts.afterTake != nil {
+		err = opts.afterTake(dfd)
+	}
 	if err == nil {
 		err = w.emptyScopeDir(dfd)
 	}
@@ -935,6 +974,9 @@ type rmTreeOpts struct {
 	listed    bool
 	listedNow func() bool
 	check     func(dfd int, st *unix.Stat_t) (why string, err error)
+	// afterTake, when set, runs on the scope directory once it is taken,
+	// before anything in it is touched.
+	afterTake func(dfd int) error
 }
 
 // rmBeforeTree, when set, runs as removeScopeTree starts, after
