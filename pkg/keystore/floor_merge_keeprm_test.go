@@ -19,6 +19,9 @@ package keystore
 import (
 	"bytes"
 	"context"
+	"errors"
+	"maps"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -82,5 +85,29 @@ func TestClassifyUndoDeletedSince(t *testing.T) {
 	kept := MergeReport{Kept: []string{"k"}}
 	if err := classifyUndo(&kept, rec, from); err == nil || !strings.Contains(err.Error(), "keys rm deleted it after the restore") {
 		t.Fatalf("classifyUndo with --keep k = %v, want it refused", err)
+	}
+}
+
+// TestFloorMergeBoundsAsidePointer (U192): a moved-aside tree pointer
+// above asidePointerBound (a forged one at MaxUint64-1) is reported
+// unverified and fenced past the moved-aside record only, so the mark
+// stays at or below the bound and a Rotate after the merge still seals
+// above it.
+func TestFloorMergeBoundsAsidePointer(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("one"))
+	live := floorOf(t, server)
+	from := maps.Clone(live)
+	p := planMerge(live, from, nil, nil, map[string]uint64{"k": math.MaxUint64 - 1})
+	if e := p.merged["k"]; e.HighWater > asidePointerBound {
+		t.Fatalf("k after the merge = %+v, want its mark at or below %d", e, asidePointerBound)
+	}
+	if !slices.Equal(p.r.AsideUnverified, []string{"k"}) {
+		t.Fatalf("AsideUnverified = %v, want k", p.r.AsideUnverified)
+	}
+	putFloorFile(t, server, p.merged)
+	if _, err := s.Rotate(ctx, "k", []byte("two")); errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Rotate after the merge: %v, want no ErrCorrupt", err)
 	}
 }

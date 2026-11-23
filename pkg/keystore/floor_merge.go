@@ -401,7 +401,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	} else {
 		pr.AlreadyMerged, pr.Dropped, plan.dropped = true, nil, nil
 	}
-	pr.Unverified, pr.AsideUnverified = unionNames(unverified, pr.Unverified), asideUnverified
+	pr.Unverified, pr.AsideUnverified = unionNames(unverified, pr.Unverified), unionNames(asideUnverified, pr.AsideUnverified)
 	// As Put and Rotate ask room before they write: a merge whose write
 	// would drop any burial is refused, with nothing written and the input
 	// left where it is, so the guard stays, unless opts.AcceptDrops says
@@ -488,7 +488,7 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	for _, name := range r.overRaise {
 		slog.Warn("keystore floor: the restored pointer of this entry is more than one sequence above the restored floor's record, more than a crash leaves, so the merge did not raise the record to it: that pointer is refused while it is at or below the fence the merge set, until a Rotate seals above the fence, and accepted above it; the record's own sequence stays accepted", "name", name)
 	}
-	for _, name := range asideUnverified {
+	for _, name := range r.AsideUnverified {
 		slog.Warn("keystore floor: the moved-aside tree's pointer of this entry did not authenticate under the master, so the merge fenced it one past the moved-aside floor's record, not past that pointer", "name", name)
 	}
 	r.MovedAside, r.MovedAsideType = moved.MovedAside, moved.MovedAsideType
@@ -818,7 +818,9 @@ type mergePlan struct {
 // nothing and reads nothing but its arguments.
 func planMerge(live, from floor, keep map[string]bool, ptrs, aside map[string]uint64) mergePlan {
 	merged := maps.Clone(live)
+	aside, over := boundAside(aside)
 	r, capDropped := merged.mergeFenced(from, keep, ptrs, aside)
+	r.AsideUnverified = over
 	l := mergeLoses(live, merged, capDropped, r.BuriedLive)
 	dropped := append(slices.Clone(capDropped), merged.prune()...)
 	r.Dropped = nil
@@ -1142,7 +1144,7 @@ func (s *FileStore) readGuard(l *floorLock) (*mergeInput, error) {
 // Each fence mark is also above aside[name], the authenticated pointer
 // sequence of the moved-aside tree's entry (stagedPointers), or nil: a
 // moved-aside floor that lagged its own pointer by any number of sequences
-// still fences above that pointer.
+// still fences above that pointer, up to asidePointerBound (boundAside).
 func (fl floor) mergeFenced(from floor, keep map[string]bool, ptrs, aside map[string]uint64) (MergeReport, []pruned) {
 	type at struct {
 		name string
@@ -1273,6 +1275,35 @@ func (fl floor) mergeFenced(from floor, keep map[string]bool, ptrs, aside map[st
 		r.renumbered = true
 	}
 	return r, out
+}
+
+// asidePointerBound is the highest moved-aside tree pointer sequence a
+// merge fences above. No entry reaches it by rotating, so a pointer above
+// it is forged or corrupt even when it authenticates; fencing above it
+// would leave fenceMark saturated at the sequence limit, where no Rotate
+// can seal above the fence.
+const asidePointerBound uint64 = 1 << 62
+
+// boundAside is aside, the moved-aside tree's authenticated pointer
+// sequences, without each one above asidePointerBound, and those names,
+// sorted, for AsideUnverified: the fence of each is one past the moved-aside
+// floor's record and mark, as for a pointer that did not authenticate. A
+// moved-aside floor may lag its pointer by any number of sequences below
+// the bound.
+func boundAside(aside map[string]uint64) (map[string]uint64, []string) {
+	if len(aside) == 0 {
+		return aside, nil
+	}
+	out := make(map[string]uint64, len(aside))
+	over := map[string]bool{}
+	for name, p := range aside {
+		if p > asidePointerBound {
+			over[name] = true
+			continue
+		}
+		out[name] = p
+	}
+	return out, sortedNames(over)
 }
 
 // fenceMark is the high-water mark a merge fences a live record of a's
