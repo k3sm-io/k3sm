@@ -494,10 +494,13 @@ func TestRemoveScopeSharedDirFlags(t *testing.T) {
 			}
 			return saved(fd, flags)
 		})
-		cleared, err := run(t, s, s.uid)
-		if err != nil {
-			t.Fatalf("removeScopeTree under a flagged .user the service user owns: %v", err)
+		// Through RemoveScope, whose service user is s.uid: the clear is
+		// a note of the clean result, never an error or a log warning.
+		res, err := s.RemoveScope(t.Context(), 1001)
+		if err != nil || !res.Recorded {
+			t.Fatalf("rm-scope under a flagged .user the service user owns: %v, recorded %v", err, res.Recorded)
 		}
+		cleared := res.Cleared
 		if sharedCalls != 1 {
 			t.Errorf(".user's flags were written %d times, want once", sharedCalls)
 		}

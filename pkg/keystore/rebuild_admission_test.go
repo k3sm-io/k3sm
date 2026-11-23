@@ -161,8 +161,8 @@ func TestRebuildForgedTombstoneFloodPresentUIDRefusesThenRmScope(t *testing.T) {
 	if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
 		t.Fatal("the refused rebuild changed the floor")
 	}
-	if recorded, err := s.RemoveScope(ctx, 1002); err != nil || !recorded {
-		t.Fatalf("rm-scope user/1002: %v, %v", recorded, err)
+	if res, err := s.RemoveScope(ctx, 1002); err != nil || !res.Recorded {
+		t.Fatalf("rm-scope user/1002: %v, %v", res.Recorded, err)
 	}
 	rep, _ := rebuild(t, s)
 	if rep.RemovedKeys == 0 {

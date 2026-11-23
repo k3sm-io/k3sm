@@ -30,11 +30,12 @@ import (
 type keysRmScopeStub struct {
 	keysStore
 	recorded bool
+	cleared  string
 	err      error
 }
 
-func (s keysRmScopeStub) RemoveScope(context.Context, uint32) (bool, error) {
-	return s.recorded, s.err
+func (s keysRmScopeStub) RemoveScope(context.Context, uint32) (keystore.RemoveScopeResult, error) {
+	return keystore.RemoveScopeResult{Recorded: s.recorded, Cleared: s.cleared}, s.err
 }
 
 // rm-scope exits 4, audited committed, both when the record is full (its
@@ -107,5 +108,29 @@ func TestKeysRmScopePartialExitsFour(t *testing.T) {
 				t.Errorf("rm-scope audit lines %q, want %q", lines, tc.audit)
 			}
 		})
+	}
+}
+
+// A clean rm-scope that cleared a user flag on the shared .user directory
+// prints that note as a line of its normal output, after the removal line,
+// and exits 0, audited ok; the note is not a warning on stderr.
+func TestKeysRmScopePrintsClearedNote(t *testing.T) {
+	const note = "rm-scope cleared a user flag (flags 0x2) on the shared directory \"/srv/keystore/.user\" (named for reading, not for pasting), which the service user owns and could clear itself, to remove the scope directory in it"
+	h := newKeysHarness(t)
+	var lines []string
+	h.wrap = func(s keysStore) keysStore {
+		return keysAuditRecorder{keysStore: keysRmScopeStub{keysStore: s, recorded: true, cleared: note}, lines: &lines}
+	}
+	h.euid = 0
+	h.mustRun(keysOK, "rm-scope", "user/1001", "--yes")
+	want := "removed user/1001; run sudo k3sm keys floor --rebuild to free its floor keys\n" + note + "\n"
+	if h.stdout.String() != want {
+		t.Errorf("rm-scope printed %q, want %q", h.stdout.String(), want)
+	}
+	if strings.Contains(h.stderr.String(), "cleared") {
+		t.Errorf("rm-scope wrote the note to stderr: %q", h.stderr.String())
+	}
+	if !slices.Equal(lines, []string{"rm-scope  ok"}) {
+		t.Errorf("rm-scope audit lines %q, want ok", lines)
 	}
 }

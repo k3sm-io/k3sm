@@ -38,6 +38,17 @@ import (
 // (docs/design/keystore.md § "rm-scope revokes first") is not built yet.
 var errScopeHasDeliveries = errors.New("the scope's delivery record names deliveries, and rm-scope does not yet delete their Secrets: withdraw each delivery first; nothing was changed")
 
+// RemoveScopeResult is what a clean RemoveScope did.
+type RemoveScopeResult struct {
+	// Recorded reports whether the removed scope is listed in the
+	// removed-scopes record; false when the record is full.
+	Recorded bool
+	// Cleared, when set, says rm-scope cleared a user flag on the shared
+	// .user directory to remove the scope directory in it: a line of the
+	// verb's output. A committed result carries it in the error instead.
+	Cleared string
+}
+
 // RemoveScope removes uid's user scope (rm-scope), as root: under the
 // floor lock and then the exclusive store lock (at most 30 s;
 // lockMaintenance) it opens the scope's key under W without the
@@ -55,7 +66,7 @@ var errScopeHasDeliveries = errors.New("the scope's delivery record names delive
 // every open, since its scope.key's identity is listed, and the next floor
 // --rebuild drops the uid's floor lines written before the recorded size,
 // and keeps the ones after it (a re-minted scope's). A full record does
-// not stop the removal: recorded reports false, the scope is removed
+// not stop the removal: Recorded reports false, the scope is removed
 // unlisted, and floor --rebuild keeps its floor keys (fail closed for a
 // copy-back). A record that does not read refuses, changing nothing.
 //
@@ -71,36 +82,36 @@ var errScopeHasDeliveries = errors.New("the scope's delivery record names delive
 // authenticate (errScopeKeyUntrusted) is treated as a missing one: the
 // tree is removed unlisted, its floor lines are kept, and the result is
 // errCommitted, saying so.
-func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool, err error) {
+func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeResult, error) {
 	if err := s.checkConfig(); err != nil {
-		return false, err
+		return RemoveScopeResult{}, err
 	}
 	if err := s.eligibleUID(uid); err != nil {
-		return false, err
+		return RemoveScopeResult{}, err
 	}
 	root, err := s.openDir(s.dir, false)
 	if err != nil {
-		return false, err
+		return RemoveScopeResult{}, err
 	}
 	defer func() { _ = root.Close() }() // removals are fsynced in their directories
 	fl, unlock, err := s.lockMaintenance(ctx, root)
 	if err != nil {
-		return false, err
+		return RemoveScopeResult{}, err
 	}
 	defer fl.unlock()
 	defer unlock()
 	k, err := s.loadMasterLocked()
 	if err != nil {
-		return false, err
+		return RemoveScopeResult{}, err
 	}
 	dfd, err := s.openLogDataRoot()
 	if err != nil {
-		return false, fmt.Errorf("%w; nothing was changed", err)
+		return RemoveScopeResult{}, fmt.Errorf("%w; nothing was changed", err)
 	}
 	defer func() { _ = unix.Close(dfd) }() // the record's rename is fsynced in it
 	removed, err := s.readRemovedScopes(dfd)
 	if err != nil {
-		return false, fmt.Errorf("%w; nothing was changed", err)
+		return RemoveScopeResult{}, fmt.Errorf("%w; nothing was changed", err)
 	}
 	name := strconv.FormatUint(uint64(uid), 10)
 	u := &UserScope{s: s, uid: uid, scope: userScopeOf(uid), allowRemoved: true}
@@ -112,13 +123,12 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		listed := removed.listed(uid)
 		tree, err := removeScopeTree(root, s.dir, name, s.uid, listed)
 		if err != nil {
-			return listed, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
+			return RemoveScopeResult{Recorded: listed}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
 		}
 		if listed {
-			warnCleared(u.scope, tree.cleared)
-			return true, nil
+			return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
 		}
-		return false, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedTaken(u.scope), tree.cleared))
+		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedTaken(u.scope), tree.cleared))
 	}
 	o, err := u.openScopeForRevoke(root, k)
 	var judged string
@@ -138,30 +148,29 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		// rm-scope for.
 		tree, rerr := removeScopeTree(root, s.dir, name, s.uid, removed.listed(uid))
 		if rerr != nil {
-			return false, rmStopped(rerr, tree.changed, fmt.Sprintf("the directory %s has a scope.key that cannot be trusted and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
+			return RemoveScopeResult{}, rmStopped(rerr, tree.changed, fmt.Sprintf("the directory %s has a scope.key that cannot be trusted and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
 		}
-		return false, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUntrusted(u.scope, err), tree.cleared))
+		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUntrusted(u.scope, err), tree.cleared))
 	}
 	if errors.Is(err, errNoScopeKey) && scopeDirPresent(root, name) {
 		// An earlier rm-scope removed scope.key, then stopped: no open
 		// serves the directory, and there is no key to list.
 		tree, err := removeScopeTree(root, s.dir, name, s.uid, removed.listed(uid))
 		if err != nil {
-			return false, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s has no scope.key and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
+			return RemoveScopeResult{}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s has no scope.key and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
 		}
 		if removed.listed(uid) {
-			warnCleared(u.scope, tree.cleared)
-			return true, nil
+			return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
 		}
 		// Not listed: an interrupted run that never listed it, or
 		// tampering. The tree is gone, but there was no key to list.
-		return false, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUnlisted(u.scope), tree.cleared))
+		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUnlisted(u.scope), tree.cleared))
 	}
 	if err != nil {
-		return false, fmt.Errorf("open the scope %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", u.scope, err)
+		return RemoveScopeResult{}, fmt.Errorf("open the scope %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", u.scope, err)
 	}
 	id := o.id
-	recorded = removed.has(uid, id)
+	recorded := removed.has(uid, id)
 	_, ds, derr := rmReadDeliveries(u, o)
 	_, eerr := o.dir.Lstat(scopeEntriesName)
 	o.close()
@@ -170,7 +179,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 	case recorded:
 		// An earlier rm-scope listed the key, then stopped part-way.
 	case derr == nil && len(ds) > 0:
-		return false, fmt.Errorf("%s: %w", u.scope, errScopeHasDeliveries)
+		return RemoveScopeResult{}, fmt.Errorf("%s: %w", u.scope, errScopeHasDeliveries)
 	case derr == nil:
 	case errors.Is(derr, ErrScopeAbsent) && errors.Is(eerr, os.ErrNotExist):
 		// An earlier rm-scope, unlisted (a full record), removed entries/
@@ -184,7 +193,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		// A transient failure (a cancelled context, EINTR, EMFILE, EIO)
 		// says nothing of the record: proceeding would leave its
 		// deliveries unchecked for no cause.
-		return false, fmt.Errorf("read the delivery record of %s: %s; nothing was changed; run it again", u.scope, safeText(derr.Error()))
+		return RemoveScopeResult{}, fmt.Errorf("read the delivery record of %s: %s; nothing was changed; run it again", u.scope, safeText(derr.Error()))
 	}
 	// wrote reports whether this run wrote the removed-scopes record: a
 	// change, so a later failure is a removal made in part.
@@ -192,11 +201,11 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 	if !recorded {
 		fid, size, err := s.floorSize(dfd)
 		if err != nil {
-			return false, fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", userFloorLogName, err)
+			return RemoveScopeResult{}, fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", userFloorLogName, err)
 		}
 		if removed.add(uid, id, fid, size) {
 			if err := writeRemovedScopes(dfd, removed); err != nil {
-				return false, fmt.Errorf("record the removed scope %s in %s: %w; the record may or may not list it, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", u.scope, removedScopesName, err, u.scope)
+				return RemoveScopeResult{}, fmt.Errorf("record the removed scope %s in %s: %w; the record may or may not list it, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", u.scope, removedScopesName, err, u.scope)
 			}
 			recorded, wrote = true, true
 		}
@@ -207,7 +216,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		if !recorded {
 			state = "is not listed in " + removedScopesName + ", which is full"
 		}
-		return recorded, rmStopped(err, wrote || tree.changed, fmt.Sprintf("the scope %s %s, and its directory %s is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", u.scope, state, quoteName("keystore/"+userScopesName+"/"+name), u.scope))
+		return RemoveScopeResult{Recorded: recorded}, rmStopped(err, wrote || tree.changed, fmt.Sprintf("the scope %s %s, and its directory %s is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", u.scope, state, quoteName("keystore/"+userScopesName+"/"+name), u.scope))
 	}
 	cleared := tree.cleared
 	var notes []string
@@ -218,10 +227,9 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		notes = append(notes, scopeRemovedUnread(u.scope, unread))
 	}
 	if len(notes) > 0 {
-		return recorded, fmt.Errorf("%w: %s", errCommitted, withCleared(strings.Join(notes, "; "), cleared))
+		return RemoveScopeResult{Recorded: recorded}, fmt.Errorf("%w: %s", errCommitted, withCleared(strings.Join(notes, "; "), cleared))
 	}
-	warnCleared(u.scope, cleared)
-	return recorded, nil
+	return RemoveScopeResult{Recorded: recorded, Cleared: cleared}, nil
 }
 
 // rmStopped is RemoveScope's error for a removeScopeTree that failed
@@ -244,15 +252,6 @@ func withCleared(note, cleared string) string {
 		return note
 	}
 	return note + "; " + cleared
-}
-
-// warnCleared reports removeScopeTree's clear of a flag on .user for a
-// removal whose result is otherwise clean: a note there would make the
-// result committed, so it is a warning on the verb's log instead.
-func warnCleared(scope, cleared string) {
-	if cleared != "" {
-		slog.Warn(cleared, "scope", scope)
-	}
 }
 
 // scopeRemovedJudged is rm-scope's committed note for a scope whose

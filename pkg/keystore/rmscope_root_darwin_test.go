@@ -554,8 +554,8 @@ func TestRemoveScopeRerunAfterTakeAsRoot(t *testing.T) {
 		}
 	}
 	rmTakeDir = saved
-	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
-		t.Fatalf("the rerun over root-owned directories: %v, recorded %v", err, recorded)
+	if res, err := s.RemoveScope(ctx, 1001); err != nil || !res.Recorded {
+		t.Fatalf("the rerun over root-owned directories: %v, recorded %v", err, res.Recorded)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the scope directory is still there after the rerun: %v", err)
@@ -587,7 +587,8 @@ func TestRemoveScopeLeavesForeignOwnedDirAsRoot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	recorded, err := s.RemoveScope(t.Context(), 1001)
+	res, err := s.RemoveScope(t.Context(), 1001)
+	recorded := res.Recorded
 	if !recorded || !errors.Is(err, errScopeForeignDir) {
 		t.Fatalf("rm-scope over another user's directory: %v, recorded %v; want errScopeForeignDir, listed", err, recorded)
 	}

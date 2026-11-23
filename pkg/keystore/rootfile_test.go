@@ -43,8 +43,8 @@ func TestRemovedScopesSecondLinkReads(t *testing.T) {
 	s, server, _ := fileLogScope(t)
 	saved := filepath.Join(t.TempDir(), "1001")
 	copyTree(t, scopeDir(server, "1001"), saved)
-	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
-		t.Fatalf("RemoveScope: %v, recorded %v", err, recorded)
+	if res, err := s.RemoveScope(ctx, 1001); err != nil || !res.Recorded {
+		t.Fatalf("RemoveScope: %v, recorded %v", err, res.Recorded)
 	}
 	linkAside(t, removedRecordPath(s))
 	if r := readRecord(t, s); !r.listed(1001) {

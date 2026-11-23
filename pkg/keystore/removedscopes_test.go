@@ -63,7 +63,8 @@ func TestRemovedScopeCopiedBackRefused(t *testing.T) {
 	s, server, _ := fileLogScope(t)
 	saved := filepath.Join(t.TempDir(), "1001")
 	copyTree(t, scopeDir(server, "1001"), saved)
-	recorded, err := s.RemoveScope(ctx, 1001)
+	res, err := s.RemoveScope(ctx, 1001)
+	recorded := res.Recorded
 	if err != nil || !recorded {
 		t.Fatalf("RemoveScope: %v, recorded %v", err, recorded)
 	}
@@ -76,8 +77,8 @@ func TestRemovedScopeCopiedBackRefused(t *testing.T) {
 
 	// A rerun of rm-scope on the copied-back directory finishes, and the
 	// record lists the key once.
-	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
-		t.Fatalf("rm-scope of the copied-back directory: %v, recorded %v", err, recorded)
+	if res, err := s.RemoveScope(ctx, 1001); err != nil || !res.Recorded {
+		t.Fatalf("rm-scope of the copied-back directory: %v, recorded %v", err, res.Recorded)
 	}
 	r := readRecord(t, s)
 	if r.keys() != 1 {
@@ -128,7 +129,8 @@ func TestRemovedScopesFullKeepsFloorKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = unix.Close(dfd)
-	recorded, err := s.RemoveScope(ctx, 1002)
+	res, err := s.RemoveScope(ctx, 1002)
+	recorded := res.Recorded
 	if err != nil || recorded {
 		t.Fatalf("RemoveScope with a full record: %v, recorded %v; want removed, unrecorded", err, recorded)
 	}
@@ -191,7 +193,8 @@ func TestRemoveScopeMissingKeyUnlistedCommitted(t *testing.T) {
 	if err := os.Remove(filepath.Join(scopeDir(server, "1002"), scopeKeyName)); err != nil {
 		t.Fatal(err)
 	}
-	recorded, err := s.RemoveScope(ctx, 1002)
+	res, err := s.RemoveScope(ctx, 1002)
+	recorded := res.Recorded
 	if recorded || !Committed(err) {
 		t.Fatalf("rm-scope of an unlisted keyless scope: %v, recorded %v; want committed, unlisted", err, recorded)
 	}
