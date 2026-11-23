@@ -132,6 +132,56 @@ func TestSappndMeasuredFacts(t *testing.T) {
 	}
 	wantErrno("root fchown back to root while flagged", unix.Fchown(int(f.Fd()), 0, 0), unix.EPERM)
 
+	// Rotate's clone (cloneFileAt): root may clone the service user's
+	// SF_APPEND file into a root-only directory; the clone is root's
+	// (CLONE_NOOWNERCOPY), 0600, whole, and keeps the flag, which refuses a
+	// read-write open and fchown until fchflags clears it on a read-only
+	// descriptor; then fchown, fchmod, a read-write open and ftruncate all
+	// work, and the source is unchanged.
+	stg := filepath.Join(dir, "clone-staging")
+	if err := os.Mkdir(stg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sfd, err := unix.Open(stg, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(sfd) }()
+	if err := cloneFileAt(int(f.Fd()), sfd, "c"); err != nil {
+		t.Errorf("root clone of the service user's flagged file: %v", err)
+	} else {
+		var cst unix.Stat_t
+		if err := unix.Fstatat(sfd, "c", &cst, unix.AT_SYMLINK_NOFOLLOW); err != nil || cst.Uid != 0 || cst.Mode&0o7777 != 0o600 || cst.Flags != sfAppend || cst.Nlink != 1 || cst.Size != 2 {
+			t.Errorf("the clone is uid %d mode %04o flags %#x nlink %d size %d (%v); want root's 0600, SF_APPEND, one link, the whole file", cst.Uid, cst.Mode&0o7777, cst.Flags, cst.Nlink, cst.Size, err)
+		}
+		_, err := unix.Openat(sfd, "c", unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		wantErrno("root read-write open of the flagged clone", err, unix.EPERM)
+		cfd, err := unix.Openat(sfd, "c", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantErrno("root fchown of the flagged clone", unix.Fchown(cfd, 0, 0), unix.EPERM)
+		if err := unix.Fchflags(cfd, 0); err != nil {
+			t.Errorf("fchflags 0 of the clone on a read-only descriptor: %v", err)
+		}
+		if err := unix.Fchown(cfd, 0, 0); err != nil {
+			t.Errorf("fchown of the clone once unflagged: %v", err)
+		}
+		_ = unix.Close(cfd)
+		cfd, err = unix.Openat(sfd, "c", unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Errorf("read-write open of the unflagged clone: %v", err)
+		} else {
+			if err := unix.Ftruncate(cfd, 1); err != nil {
+				t.Errorf("ftruncate of the unflagged clone: %v", err)
+			}
+			_ = unix.Close(cfd)
+		}
+		if err := unix.Fstat(int(f.Fd()), &st); err != nil || st.Uid != svcUID || st.Flags != sfAppend || st.Size != 2 {
+			t.Errorf("the clone's source is uid %d flags %#x size %d (%v); want it unchanged", st.Uid, st.Flags, st.Size, err)
+		}
+	}
+
 	p, _ = file(false)
 	rw, err := os.OpenFile(p, os.O_RDWR, 0)
 	if err != nil {

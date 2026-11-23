@@ -124,8 +124,11 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 
 // placeArchives is rotate's part of step 3, in the replacement directory
 // open at dir: archives/ created root's 0700, opened O_DIRECTORY|O_NOFOLLOW
-// and judged; in it .1 created root's 0600, O_CREAT|O_EXCL|O_NOFOLLOW,
-// filled with the old log's first old.size bytes and fsynced; then each
+// and judged; in it .1, the old log's first old.size bytes, root's 0600
+// and unflagged: a clone of the old log (cloneArchive), so rotate needs no
+// free space the size of a log the service user can grow, or, when the
+// volume refuses the clone, a copy after a free-space check
+// (copyArchive); then each
 // present archive .n of .1 to .3 hard-linked from the live archives/
 // (adir) as .n+1; archives/ is fsynced.
 func (s *FileStore) placeArchives(old *oldLog, adir, dir int, present [auditArchives + 1]bool) error {
@@ -144,21 +147,12 @@ func (s *FileStore) placeArchives(old *oldLog, adir, dir int, present [auditArch
 	if err := s.judgeArchivesDir(nad); err != nil {
 		return fmt.Errorf("the new %s: %w", archivesDirName, err)
 	}
-	name := auditArchiveName(1)
-	fd, err := unix.Openat(nad, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, logMode)
-	if err != nil {
-		return fmt.Errorf("create the new %s: %w", name, err)
-	}
-	af := os.NewFile(uintptr(fd), name)
-	defer func() { _ = af.Close() }() // fsynced below
-	if err := unix.Fchmod(fd, logMode); err != nil {
-		return fmt.Errorf("chmod the new %s: %w", name, err)
-	}
-	if _, err := io.Copy(af, io.NewSectionReader(old.f, 0, old.size)); err != nil {
-		return fmt.Errorf("copy %s to the new %s: %w", auditLogName, name, err)
-	}
-	if err := af.Sync(); err != nil {
-		return fmt.Errorf("fsync the new %s: %w", name, err)
+	if err := cloneArchive(old, nad, auditArchiveName(1)); errors.Is(err, errCloneRefused) {
+		if err := copyArchive(old, nad, auditArchiveName(1), err); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
 	}
 	for n := auditArchives - 1; n >= 1; n-- {
 		if !present[n] {
@@ -255,6 +249,125 @@ func (s *FileStore) judgeArchive(name string, st *unix.Stat_t) error {
 	}
 	if st.Nlink > 1 {
 		slog.Warn("a keystore audit archive has more than one link; it is root's 0600, so the other link gives no other user anything", "archive", name, "links", st.Nlink)
+	}
+	return nil
+}
+
+// errCloneRefused is a clone of the old log the volume refused: nothing
+// was created, and rotate copies instead.
+var errCloneRefused = errors.New("the audit log could not be cloned")
+
+// cloneArchive makes name in the root-only archives directory nad a clone
+// of the old log (cloneFileAt), then makes it the archive: the clone holds
+// the whole file and its flag, so on its own descriptor its flag is
+// cleared, it is made the caller's (root's) at mode 0600, and, reopened
+// for writing and checked as the same inode, it is truncated to the size
+// the old log had at open (the snapshot rule), fsynced and verified. It is
+// a fresh inode in a directory only root reaches, so no other process can
+// act on it meanwhile. A clone the volume refuses is errCloneRefused with
+// nothing created.
+func cloneArchive(old *oldLog, nad int, name string) error {
+	if err := cloneFileAt(int(old.f.Fd()), nad, name); err != nil {
+		return fmt.Errorf("%w: %w", errCloneRefused, err)
+	}
+	rfd, err := unix.Openat(nad, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open the cloned %s: %w", name, err)
+	}
+	defer func() { _ = unix.Close(rfd) }() // read-only
+	var st unix.Stat_t
+	if err := unix.Fstat(rfd, &st); err != nil {
+		return fmt.Errorf("stat the cloned %s: %w", name, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+		return fmt.Errorf("the cloned %s is not a regular file with one link", name)
+	}
+	if statFlags(&st) != 0 {
+		if err := unix.Fchflags(rfd, 0); err != nil {
+			return fmt.Errorf("clear the flags of the cloned %s: %w", name, err)
+		}
+	}
+	euid := os.Geteuid()
+	if err := unix.Fchown(rfd, euid, -1); err != nil {
+		return fmt.Errorf("chown the cloned %s: %w", name, err)
+	}
+	if err := unix.Fchmod(rfd, logMode); err != nil {
+		return fmt.Errorf("chmod the cloned %s: %w", name, err)
+	}
+	if st.Size < old.size {
+		return fmt.Errorf("the cloned %s holds %d bytes, fewer than the %d the audit log held at open", name, st.Size, old.size)
+	}
+	wfd, err := unix.Openat(nad, name, unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open the cloned %s for writing: %w", name, err)
+	}
+	defer func() { _ = unix.Close(wfd) }() // fsynced below
+	var w unix.Stat_t
+	if err := unix.Fstat(wfd, &w); err != nil {
+		return fmt.Errorf("stat the cloned %s: %w", name, err)
+	}
+	if w.Dev != st.Dev || w.Ino != st.Ino {
+		return fmt.Errorf("the cloned %s was replaced while it was made the archive", name)
+	}
+	if err := unix.Ftruncate(wfd, old.size); err != nil {
+		return fmt.Errorf("truncate the cloned %s to the log's size at open: %w", name, err)
+	}
+	if err := unix.Fsync(wfd); err != nil {
+		return fmt.Errorf("fsync the cloned %s: %w", name, err)
+	}
+	if err := unix.Fstat(wfd, &w); err != nil {
+		return fmt.Errorf("stat the cloned %s: %w", name, err)
+	}
+	if int(w.Uid) != euid || w.Mode&0o7777 != logMode || statFlags(&w) != 0 || w.Nlink != 1 || w.Size != old.size {
+		return fmt.Errorf("the cloned %s is not the caller's, mode %04o, unflagged, one link and %d bytes after it was set so", name, logMode, old.size)
+	}
+	return nil
+}
+
+// copyRoomSlack is the free space a copy leaves on the volume beyond the
+// copied bytes.
+const copyRoomSlack = 1 << 20
+
+// volumeFree is the free space, in bytes, of the volume holding the open
+// directory fd. It is a variable so a test can make a volume full.
+var volumeFree = defaultVolumeFree
+
+// defaultVolumeFree is volumeFree's fstatfs.
+func defaultVolumeFree(fd int) (int64, error) {
+	var sf unix.Statfs_t
+	if err := unix.Fstatfs(fd, &sf); err != nil {
+		return 0, err
+	}
+	return int64(sf.Bavail) * int64(sf.Bsize), nil
+}
+
+// copyArchive makes name in nad a copy of the old log's first old.size
+// bytes, root's 0600, when the clone was refused (why). It first checks
+// that the volume has room for the copy and refuses up front, before any
+// byte is written, when it does not: the service user can grow the log,
+// and a copy that fills the volume would stall every writer.
+func copyArchive(old *oldLog, nad int, name string, why error) error {
+	free, err := volumeFree(nad)
+	if err != nil {
+		return fmt.Errorf("read the free space of the data root's volume: %w", err)
+	}
+	if free < old.size+copyRoomSlack {
+		return fmt.Errorf("%w: %v, and copying it into %s needs %d bytes free on the data root's volume, which has %d; free space on that volume, then rerun; nothing was changed", errRotateRefused, why, name, old.size+copyRoomSlack, free)
+	}
+	fd, err := unix.Openat(nad, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, logMode)
+	if err != nil {
+		return fmt.Errorf("create the new %s: %w", name, err)
+	}
+	af := os.NewFile(uintptr(fd), name)
+	defer func() { _ = af.Close() }() // fsynced below
+	if err := unix.Fchmod(fd, logMode); err != nil {
+		return fmt.Errorf("chmod the new %s: %w", name, err)
+	}
+	if _, err := io.Copy(af, io.NewSectionReader(old.f, 0, old.size)); err != nil {
+		return fmt.Errorf("copy %s to the new %s: %w", auditLogName, name, err)
+	}
+	if err := af.Sync(); err != nil {
+		return fmt.Errorf("fsync the new %s: %w", name, err)
 	}
 	return nil
 }
