@@ -29,7 +29,6 @@ import (
 	"io/fs"
 	"os"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -135,6 +134,21 @@ type keysStore interface {
 	InterruptedRewrap(ctx context.Context) (fingerprint [sha256.Size]byte, ok bool, err error)
 	RecordsSealedUnder(ctx context.Context, key []byte) (bool, error)
 	UserScopesExist(ctx context.Context) (bool, error)
+	// AuditRoot appends the verb's one audit line, via root, once the
+	// audit log exists.
+	AuditRoot(ctx context.Context, op, name, result string) error
+}
+
+// keysAudit is what a root verb's audit line is made from (U52): the store
+// the verb opened, which a verb refused before it opens none leaves nil,
+// and the entry name it parsed. runKeysWith writes the line once the verb
+// returns.
+type keysAudit struct {
+	store keysStore
+	name  string
+	// roots are the verb's scrubbed roots (keysVerb.roots), which the
+	// warning of a line not written is scrubbed of.
+	roots []string
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -168,11 +182,13 @@ type keysEnv struct {
 	encryptionOn func(workDir string) bool
 	stdout       io.Writer
 	stderr       io.Writer
+	// audit collects the running verb's audit line; runKeysWith sets it.
+	audit *keysAudit
 }
 
 func defaultKeysEnv(stdout, stderr io.Writer) keysEnv {
 	return keysEnv{
-		euid:       os.Geteuid,
+		euid:       func() int { return euidSeam() },
 		serviceIDs: lookupServiceIDs,
 		open:       func(cfg keystore.Config) keysStore { return keystore.New(cfg) },
 		stdin:      os.Stdin,
@@ -190,7 +206,7 @@ func defaultKeysEnv(stdout, stderr io.Writer) keysEnv {
 
 // lookupServiceIDs resolves the installed service user's uid and gid.
 func lookupServiceIDs() (uid, gid uint32, err error) {
-	u, err := user.Lookup(install.DefaultServiceUser)
+	u, err := uidResolverSeam(install.DefaultServiceUser)
 	if err != nil {
 		return 0, 0, fmt.Errorf("look up the service user %s (is k3sm installed?): %w", install.DefaultServiceUser, err)
 	}
@@ -328,7 +344,11 @@ func (v *keysVerb) store() (keysStore, error) {
 		return nil, err
 	}
 	cfg.UID, cfg.GID = uid, gid
-	return v.env.open(cfg), nil
+	s := v.env.open(cfg)
+	if v.env.audit != nil {
+		v.env.audit.store, v.env.audit.roots = s, v.roots
+	}
+	return s, nil
 }
 
 // keystoreLayout is the store's Config, without its owner, for the server
@@ -455,6 +475,9 @@ func (v *keysVerb) nameArg(pos []string) (string, int) {
 	if err != nil {
 		return "", v.failf(keysBadUsage, "%v", err)
 	}
+	if v.env.audit != nil {
+		v.env.audit.name = name
+	}
 	return name, keysOK
 }
 
@@ -463,7 +486,32 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 		fmt.Fprint(env.stderr, keysUsage)
 		return keysBadUsage
 	}
-	verb, rest := args[0], args[1:]
+	audit := &keysAudit{}
+	env.audit = audit
+	code := runKeysVerb(ctx, args[0], args[1:], env)
+	if audit.store == nil {
+		return code
+	}
+	op := args[0]
+	if op == "ls" {
+		op = "list"
+	}
+	result := "refused"
+	switch code {
+	case keysOK:
+		result = "ok"
+	case keysResumed:
+		result = "resumed"
+	}
+	if err := audit.store.AuditRoot(ctx, op, audit.name, result); err != nil {
+		// The verb has run; what it did stands, and its exit code says so.
+		fmt.Fprintf(env.stderr, "k3sm keys %s: warning: its audit line was not written: %v\n", op, scrubPaths(err, audit.roots...))
+	}
+	return code
+}
+
+// runKeysVerb dispatches one verb.
+func runKeysVerb(ctx context.Context, verb string, rest []string, env keysEnv) int {
 	switch verb {
 	case "-h", "--help", "help":
 		fmt.Fprint(env.stdout, keysUsage)
