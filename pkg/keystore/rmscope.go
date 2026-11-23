@@ -469,10 +469,11 @@ func (r *rmRun) serviceUserRule(hk heldKey) string {
 func (r *rmRun) list(id string) error {
 	uid, scope := r.u.uid, r.u.scope
 	// A second list (check's, of a key found at the name other than the
-	// judged one) after this run wrote the record (added a key) is never a
-	// refusal: the record already changed. A rewrite of identical bytes
+	// judged one) after this run wrote the record (added a key), or after
+	// check removed the ACL of a root-owned directory at the name, is never
+	// a refusal: something already changed. A rewrite of identical bytes
 	// (renewed) changed nothing, so it does not count.
-	prior := r.wrote
+	prior := r.priorChange()
 	if r.removed.has(uid, id) {
 		if r.wrote || r.renewed {
 			return nil
@@ -485,8 +486,8 @@ func (r *rmRun) list(id string) error {
 		return nil
 	}
 	fid, size, err := r.s.floorSize(r.dfd)
-	if err != nil && prior {
-		r.stopErr = fmt.Errorf("%w: rm-scope listed %s in %s earlier in this run, then could not list the scope.key found at the scope's name: read the size of the user-scope floor %s: %w; the scope directory is untouched", errCommitted, scope, removedScopesName, userFloorLogName, err)
+	if err != nil && prior != "" {
+		r.stopErr = fmt.Errorf("%w: %s, then could not list the scope.key found at the scope's name: read the size of the user-scope floor %s: %w; nothing in the scope directory was taken or removed", errCommitted, prior, userFloorLogName, err)
 		return r.stopErr
 	}
 	if err != nil {
@@ -509,8 +510,8 @@ func (r *rmRun) list(id string) error {
 	if err != nil {
 		// Nothing landed: the key add listed is dropped again.
 		r.removed.drop(uid, id)
-		if prior {
-			r.stopErr = fmt.Errorf("%w: rm-scope listed %s in %s earlier in this run, then could not list the scope.key found at the scope's name: record it in %s: %w; the record does not list that key, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", errCommitted, scope, removedScopesName, removedScopesName, err, scope)
+		if prior != "" {
+			r.stopErr = fmt.Errorf("%w: %s, then could not list the scope.key found at the scope's name: record it in %s: %w; the record does not list that key, and nothing in the scope directory was taken or removed: rerun sudo k3sm keys rm-scope %s --yes", errCommitted, prior, removedScopesName, err, scope)
 			return r.stopErr
 		}
 		r.stopErr = fmt.Errorf("record the removed scope %s in %s: %w; the record does not list it, and nothing was changed: rerun sudo k3sm keys rm-scope %s --yes", scope, removedScopesName, err, scope)
@@ -518,6 +519,20 @@ func (r *rmRun) list(id string) error {
 	}
 	r.wrote = true
 	return nil
+}
+
+// priorChange says what this run already changed before a list, empty
+// when nothing: it added a key to the record (wrote), or check removed the
+// extended ACL of the root-owned directory at the name (aclStripped). A
+// failure after either is committed, never "nothing was changed".
+func (r *rmRun) priorChange() string {
+	switch {
+	case r.wrote:
+		return "rm-scope listed " + r.u.scope + " in " + removedScopesName + " earlier in this run"
+	case r.aclStripped:
+		return "rm-scope removed the extended ACL of the root-owned directory at the scope's name"
+	}
+	return ""
 }
 
 // proven reports whether the scope.key read in the held directory opened

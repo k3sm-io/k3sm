@@ -161,9 +161,11 @@ is its own `sudo k3sm keys rm-scope user/UID --yes`, with the number of the scop
 only where running it again can finish the removal. Messages about the removed-scopes record in
 `/var/lib/k3sm` (a root-owned file) keep the repair they always give for that file.
 
-In short, `rm-scope` exits 0 when it removed the scope and confirmed its key is listed; 4 when it
-changed something but could not confirm all of it (the message says what is unconfirmed), or
-stopped after changing something; and 1 when it refused, or stopped before changing anything.
+In short, `rm-scope` exits 0 when it removed the scope and confirmed its key is listed; 4 when
+this run changed something, or the durability of the record is uncertain (it saved a record that
+already listed the scope again, unchanged, and could not confirm that save reached the disk),
+and the message says what is unconfirmed or where it stopped; and 1 when it refused, or stopped
+before changing anything.
 When the message ends with `rerun sudo k3sm keys rm-scope user/UID --yes`, running that continues
 where it stopped. When it does not, running it again would meet the same state; the message
 names what it found, for you to read.

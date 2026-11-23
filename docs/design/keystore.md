@@ -2793,9 +2793,14 @@ service user can only add to.
   | the service user's with a valid unlisted key, or not what its path found | refuses | exit 1 (exit 4 if this run added a key to the record) |
   | absent at the walk's open | removes nothing | exit 4 "found absent" if this run added a key, else exit 1 |
 
-  "Added a key" is the record this run changed. A rerun that rewrites a record already listing
-  the key, to make it durable again, writes identical bytes: that rewrite by itself never turns
-  a later stop into exit 4. Before the walk, a scope directory simply absent is found absent,
+  *Exit 4* means: this run changed something (added a key to the record, removed an ACL,
+  unlinked an entry, took a directory, cleared a flag), or the durability of the record is
+  uncertain. "Added a key" is the record this run changed; removing the ACL of a root-owned
+  directory at the name is a change too, so a stop after it is exit 4, never "nothing was
+  changed". A rerun that rewrites a record already listing the key, to make it durable again,
+  writes identical bytes: that rewrite by itself never turns a later stop into exit 4, but a
+  rewrite that fails leaves the record's durability uncertain, which is exit 4 by the
+  definition. Before the walk, a scope directory simply absent is found absent,
   exit 1, with no repair advice and no rerun line; a directory the judge refuses (another
   owner, not a directory) is named for reading, exit 1, with no command and no rerun line,
   since a rerun meets the same state.

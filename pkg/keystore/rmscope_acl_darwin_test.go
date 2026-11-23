@@ -223,3 +223,33 @@ func TestRemoveScopeTakeStopAtEachStepRerunFinishes(t *testing.T) {
 		})
 	}
 }
+
+// A root-owned leftover whose ACL rm-scope removed, followed by a record
+// write that fails before its rename, is committed (the ACL removal
+// stands), never "nothing was changed".
+func TestRemoveScopeACLStrippedThenStopIsCommitted(t *testing.T) {
+	if asRoot() {
+		t.Skip("the seam's other service uid makes the store's own directories foreign as root")
+	}
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	addInheritableACL(t, dir)
+	asTakenRerun(t, s, dir)
+	// A non-empty directory at the record's temporary name fails the write
+	// before its rename.
+	block := filepath.Join(s.dataRoot, removedScopesTemp)
+	if err := os.MkdirAll(filepath.Join(block, "x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.RemoveScope(t.Context(), 1001)
+	if err == nil || !Committed(err) {
+		t.Fatalf("rm-scope stopped after stripping the ACL: %v, want committed", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "removed the extended ACL") || strings.Contains(msg, "nothing was changed") {
+		t.Errorf("the error %q does not say the ACL was removed, or says nothing was changed", msg)
+	}
+	if pathHasACL(t, dir) {
+		t.Fatal("the leftover still carries its ACL")
+	}
+}
