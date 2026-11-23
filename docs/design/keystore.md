@@ -811,9 +811,17 @@ means a live reader never sees a Rewrap in progress; this fallback exists for th
 the conservative way:
 
 - *What is re-sealed.* Every committed version (`v1` to the version `current` names) and
-  `current`, for every entry. A version above `current` (an interrupted Rotate's orphan) and
-  an interrupted Put are not entries that anything reads; they are left as they are, and the
-  next Rotate or Put discards them. `created` is kept.
+  `current`, for every entry. An interrupted Put is not an entry that anything reads; it is
+  left as it is, and the next Put discards it. A version above `current` that does not
+  authenticate is left too, and the next Rotate discards it. `created` is kept.
+- *A sealed version above `current`* (an interrupted Rotate's orphan, or a newer version
+  behind a copied-back pointer) refuses the Rewrap before anything is written, with
+  `ErrOrphanVersion` naming the entry and the version. Rewrap re-seals only the committed
+  range, so it would leave that version under the retired master, where it no longer
+  authenticates and the next Rotate unlinks it as a true orphan: for oauth, the only valid
+  refresh token. The break-glass procedure: the operator adopts it (`k3sm keys adopt`), or
+  removes that entry with `rm` (for a kind other than oauth, removing only the named version
+  file also clears it); then the Rewrap proceeds.
 - *An entry that does not open* (one `list` reports with `Err`) refuses the Rewrap before
   anything is written, since the swap would strand it under a master that no longer exists.
   It is removed with `rm`, or restored, first.
@@ -862,7 +870,15 @@ the conservative way:
   67,650 entries (4 MiB over the smallest entry's 62 bytes). Every directory listing fails
   closed past 131,072 names (`maxDirNames`), whatever put them there.
 - *Versions.* A pointer names at most version 65,536 (`maxVersion`), so an entry has at most
-  65,537 records, each a value of at most 64 KiB.
+  65,537 records, each a value of at most 64 KiB. An oauth entry is the exception: it keeps
+  only its current version and one previous, so it has at most three records whatever its
+  number, and its pointer may name up to version 2^32 (`maxOAuthVersion`), in the same
+  pointer format (the 24-byte pruned form, the only one an oauth pointer past version 2 has).
+  The choice, made for the refresher's cadence: at 65,536 a pair refreshed every minute stops
+  after 45 days, every 5 minutes after 227 days, and hourly after 7.5 years; at 2^32 a pair
+  refreshed every minute lasts over 8,000 years, so the ceiling needs no `doctor` warning. A
+  rotation at the ceiling is refused with `ErrCorrupt` before anything is written; the
+  recovery is `rm` and `put` of the pair, which restarts it at version 1.
 - *Passes.* Four, each a walk over every entry: the floor raise, which opens each pointer;
   the plan, which opens every record under the old key or the new; the seal, which opens each
   record still under the old key and writes its `.new`; and the commit, which opens each such
@@ -955,14 +971,18 @@ undeliver system/<name> --namespace NS [--secret NAME]
 
 Exit codes: 0 success, 1 refused (the sentinel's message), 2 bad usage, the three-value shape
 `secrets-encrypt` uses, plus 3 for `rewrap` alone: it completed an earlier interrupted rewrap
-with a key other than the one supplied (`ErrRewrapResumed`), so it must run again. 4 is `put`,
-`rotate`, `rm`, `list`, `show` (their floor raise) or `floor merge` done, but its floor write
+with a key other than the one supplied (`ErrRewrapResumed`), so it must run again. 4 is
+`put`, `rotate` and `adopt` on `ErrCommitted`: the change was made and a step after its
+commit point failed, so the new version is current. 4 is also `put`, `rotate`, `adopt`, `rm`,
+`list`, `show` (their floor raise) or `floor merge` done, but its floor write
 dropped a recorded deletion to stay within the floor's limits (a committed
 `ErrTombstoneEvicted`: `Committed` and `ErrTombstoneEvicted` both match; or a merge that reports
-a drop), so a copy of that deleted entry put back is accepted. Put, Rotate and RaiseFloor
+a drop), so a copy of that deleted entry put back is accepted. Put, Rotate, Adopt and RaiseFloor
 report their writes' prunes that way, as Delete does, and a Delete whose burial evicted one and
 whose tree removal then failed (the entry already deleted, its directory left behind) is
-committed too, so `rm` exits 4, not 1. Every verb
+committed too, so `rm` exits 4, not 1. `ErrCommitted` takes precedence: a write whose later
+step fails after an eviction returns `ErrCommitted` alone, with the eviction in its message,
+and `Committed` matches it too. Every verb
 in this list requires root (the non-root path is under "User scope"). The human output is not
 stable; `list -o json` and the exit codes are the stable surface. Value input is `--in FILE` or
 stdin only, never an argument: argv is visible to every local user via `ps` and lands in shell
@@ -1218,42 +1238,136 @@ a running server's flag, so it says "unless the server was started with the over
 ## Rotation and rollback
 
 **Crash-safe write order:** Rotate writes the new version file first (durable, not yet
-referenced), flips the current pointer, then raises the floor. A crash before the flip
-leaves the old version current and an unreferenced next-version file. **A retry always
-discards that orphan and seals fresh from the value it was given**; it never reuses it,
-because the orphan holds whatever value the interrupted attempt carried, and promoting it
-would publish a value the retry did not supply. The same applies to any version file
-numbered above the one `current` names. Seeing the orphan and removing it happens under
-the exclusive lock.
+referenced), flips the current pointer, then raises the floor. The version file is renamed
+into place and its directory fsynced as two steps, as the pointer is, so a failure at
+either, or anywhere else before the flip, leaves the old version current and removes the
+next-version file it wrote (best effort), and the retry seals fresh from the value it was
+given. Only a crash, or a failed removal, leaves that file behind. **oauth is the exception**:
+once its version file is in place (renamed, with or without its directory fsync), a failure
+before the flip keeps the file, since it holds the provider's new pair whose refresh token
+the provider may already have rotated, and returns an error matching `ErrOrphanVersion`
+(never `ErrCommitted`); the file is then an orphan for `Orphan` and `Adopt`. The refresher's
+contract on a failure that did not commit (documented beside `ErrCommitted`): retry `RotateIf`
+with the new pair held in memory, never refresh again from the stored pair; a retry over a
+kept file is refused with `ErrOrphanVersion`, and the refresher stops there. **A version file above the
+one `current` names is never reused**: it holds whatever value an interrupted attempt
+carried, and promoting it would publish a value the retry did not supply. Before it writes,
+a Rotate looks at every such file under the exclusive lock. One that does not open as this
+entry's sealed record of the version its name says (it fails authentication, is another
+generation's or another version's) is a true orphan and is unlinked. One that does open is
+refused, as `ErrCorrupt` and `ErrOrphanVersion`, and nothing is unlinked: see the floor-lag
+window below. A real crash between the version write and the flip leaves such a file, so the
+retry after that crash is refused, and the refusal names both causes. A crash leaves only
+the version after the current one, so a sealed version further out can only be behind a
+copied-back pointer, and the refusal then says only that: restore the newer pointer from
+backup. At the next version it says "inspect with `k3sm keys adopt system/NAME`"; for oauth
+it adds "do not delete the file: it may hold the only valid refresh token", and for the
+other kinds it offers removing the named version file as the alternative to adopting it.
 
-**Accepted window: a discard while the floor lags.** If a Rotate flips `current` and then
-fails to write the floor, the floor is one behind the pointer until the next root-run verb
-raises it. If, inside that window, a writer that cannot read the master copies the previous
-`current` back, the floor check passes it (its sequence equals the floor's), and the next
-Rotate takes the newer version, which the live pointer named, for an orphan and discards
-it before sealing its own value. Nothing forged is ever accepted, but the newer version is
-lost. This needs a failed floor write and a swap before any root verb runs, and it is
-accepted for this phase. No cheap guard tells it apart: a Rotate that crashed before its
-flip leaves the same state (a version above `current` that authenticates, a pointer at the
-floor's sequence, and no newer pointer anywhere, since the swap's rename replaces it), and
-that orphan must be discarded.
+**Adopting an orphaned version.** `FileStore.Orphan(ctx, name)` reports the lowest sealed
+version above the pointer next to the current one: each one's version number, kind and
+created time, and the pointer's sequence, never a value (a version file has no sequence of
+its own; adopting gives it the next pointer sequence, the one its rotation would have
+written). It also lists any further sealed versions. The orphan it reports is a `Version`
+carrying the orphan's identity, which covers its record digest (see the refresher's store
+interface). `FileStore.Adopt(ctx, name, orphan)` takes that `Version` and makes the orphan
+current, refusing with `ErrVersionStale` when the file at that version is no longer the record
+`Orphan` reported (replaced between inspection and adoption by another sealed record of the
+same version): it seals a pointer naming it at the next sequence, raises the
+floor, and for oauth keeps the retention rule (low becomes the old current, and the versions
+below are unlinked). It refuses unless the version is exactly the one after the current one,
+authenticates under this entry's generation, is of the entry's kind, and is the only sealed
+version above the pointer; it is root-only, as every write is (the floor is root's), and a
+failure after its pointer flip returns `ErrCommitted`. Adopting is right for both causes: it
+completes the flip a crash interrupted, and it rewrites the newer pointer a copy-back
+replaced. `sudo k3sm keys adopt system/NAME [--yes]` prints both sides from `Orphan`, then
+adopts with `--yes` or an interactive confirmation; without either, and without a terminal,
+it changes nothing.
 
-**Retention:** every version is kept indefinitely in Phase A; nothing deletes a single old
-version short of `rm` of the whole entry. Settled in this document: the simplest correct
-answer, left for a later phase to bound once real usage shows it matters.
+**Every read reports the orphan.** `CurrentCredential` and `GetCredential` of an oauth
+entry with a sealed version above its pointer refuse with `ErrOrphanVersion` rather than
+return the older pair: its refresh token may already be spent at the provider, and spending
+it again can make the provider revoke the grant. This is part of the refresher's contract:
+a refresher that gets `ErrOrphanVersion` stops refreshing the entry and leaves it to an
+operator's adopt; it never rotates around it (the rotation would be refused anyway). Token
+and ssh reads, and raw `Current` and `Get` of opaque and ed25519, refuse the same way: the
+orphan may be a newer committed version behind a copied-back pointer the floor still
+accepts, and reading the older one would be a silent downgrade. The check's cost is bounded:
+a read lists the entry's directory once and opens only the version after the current one. A
+version file numbered further out is refused by its name alone, as `ErrCorrupt` (a crash
+never leaves one), and a file at the next version whose kind byte this build does not know
+is refused by name as `ErrCorrupt`, never with the "newer k3sm" advice of
+`ErrKindUnsupported`: nothing newer writes above the pointer. A file at the next version that
+does not authenticate is a true orphan, which the next Rotate discards; it does not stop a
+read.
+
+**The downgrade note for opaque and ed25519 orphans.** These kinds keep every version, and
+an orphan of one may be removed rather than adopted. Removing it keeps the older version
+current, which is a downgrade when the orphan was a newer committed version behind a
+copied-back pointer. Before choosing, the operator compares both sides `k3sm keys adopt`
+prints; removal is right only for a version the operator knows was never committed.
+
+**Residual: the pointer does not commit its record's digest.** A version's identity covers
+its record digest (the first 16 bytes of the SHA-256 of the record's nonce and ciphertext),
+so `RotateIf` and `Adopt` cannot pass across two different records sharing a version number.
+The pointer itself still names a version by number only: a failed attempt's sealed file,
+saved and copied over the committed version of the same number, opens and is read as that
+version. Sealing the digest into the pointer was deferred because Rewrap re-seals every
+record under a fresh nonce, so the pointer would have to be re-sealed in step with its
+version, and a Rewrap crashed between the two renames would leave every reader refused
+until the Rewrap is finished. The copy needs write access to the entry's directory, which
+already permits the copied-back pointer this design's floor addresses; it is accepted until
+the pointer and its version are re-sealed as one step.
+
+**A write reports its commit outcome without ambiguity.** The pointer's rename is the
+commit point, for a Put (`Put`, `PutCredential`, `GenerateSSH`) as for a rotation (`Rotate`,
+`RotateCredential`, `RotateIf`, `RotateFrom`). The pointer is renamed into place first and
+its directory fsynced after, as a separate step, so a failed rename (nothing committed) is
+told apart from a failed fsync after it (committed). A failure after the rename, at the
+directory fsync, the floor write or the oauth prune, returns the committed `Version` (the
+new one, now current; `GenerateSSH` also returns its public key line) with an error matching
+the exported `ErrCommitted` (`errors.Is`), never a zero `Version` beside a bare error, which
+would read as nothing written. `ErrCommitted` takes precedence: the error matches no other
+sentinel, `ErrCorrupt` included, even when its cause is a floor refusal that does; the cause
+is in the message only. A refresher that gets `ErrCommitted` reads the entry again and works from what it
+reads; it never retries from the pair it held, which is no longer current and whose refresh token
+the provider may already have rotated. A failed prune is reported the same way rather than
+swallowed as best-effort: the change still stands and the next write prunes, but one rule for
+every post-commit step is simpler for a caller than a step that is silently skipped.
+
+**The floor-lag window can no longer delete a newer committed version.** If a Rotate flips
+`current` and then fails to write the floor (`ErrCommitted`), the floor is one behind the
+pointer until the next root-run verb raises it. If, inside that window, a writer that cannot
+read the master copies the previous `current` back, the floor check passes it (its sequence
+equals the floor's). The next Rotate then finds the newer version, which the live pointer
+named, above `current`, and it authenticates as this entry's, so the Rotate refuses with
+`ErrCorrupt`, naming the copied-back pointer, and unlinks nothing, for every kind. For oauth
+that version holds the only valid refresh token. Restoring the newer `current` from backup
+and raising the floor reads it again. A Rotate that crashed before its flip leaves the same
+files (a version above `current` that authenticates, a pointer at the floor's sequence), and
+no cheap guard tells the two apart, so that crash is refused the same way rather than have
+its orphan discarded.
+
+**Retention:** an `ed25519`, `opaque`, `token` or `ssh` entry keeps every version, up to the
+version ceiling; nothing deletes a single old version short of `rm` of the whole entry. An
+oauth entry keeps its current version and one previous: each rotation records the oldest
+retained version in the sealed pointer and unlinks the versions below it (the oauth prune,
+"Record kinds, the typed envelope and retention"), and `Adopt` keeps the same rule.
 
 **Delivered-Secret movement:** covered above under "Re-delivery on rotation" — automatic
 on the next sweep after a Rotate.
 
-**Rollback:** no dedicated verb. An operator rolls back by writing the old version's value
-forward as a *new* version, never by pointing `current` backward at an existing version:
+**Rollback:** `sudo k3sm keys rotate system/NAME --from-version N` (`FileStore.RotateFrom`)
+writes version N's value forward as a *new* version inside k3sm, so the value never leaves the
+store; it is refused for oauth (`ErrFromVersionOAuth`) and for a source version of another kind
+(`ErrKindMismatch`). Nothing points `current` backward at an existing version. The same new
+version can also be written through a pipe:
 
 ```
 sudo k3sm keys show system/NAME --version N --reveal | sudo k3sm keys rotate system/NAME --in -
 ```
 
-`sudo k3sm keys rotate system/NAME --from-version N` writes the same new version without the
-value leaving the store (row U1); the pipe stays the recipe G21 checks.
+`--from-version` is row U1; the pipe stays the recipe G21 checks.
 
 A pipe, not a process substitution: `sudo` closes inherited descriptors, so a `<( … )`
 path would not open, and each side of the pipe runs its own `sudo`. The round trip is
@@ -3911,7 +4025,13 @@ The record kinds as merged are `KindUnknown = 0` (never written), `KindEd25519 =
 | 5 | `oauth` | envelope: `accessToken`, `accessExpiresAt`, `accessIssuedAt`, `refreshToken`, `refreshExpiresAt` (optional), `tokenType` (optional, default `Bearer`), `refreshOwner` | keyed HMAC over the canonical envelope |
 
 - A credential that never expires is `opaque`. `token` always carries `expiresAt`, so "token"
-  always means "it expires".
+  always means "it expires", and a put or rotation refuses (`ErrInvalidCredential`) an
+  `expiresAt` that is not after the `issuedAt` the store stamps, which would seal a token
+  already expired. The two are compared as the envelope seals them, in whole seconds, so an
+  expiry within the issue second is refused; an oauth `accessExpiresAt` is held to the same
+  rule against `accessIssuedAt`. `typed.Encode` and `typed.Decode` both enforce the ordering
+  (`ErrInvalidCredential` and `ErrCorrupt`), so a sealed envelope that breaks it never reads. `RotateFrom` re-stamps nothing and checks nothing against the clock (see
+  "Rotation and rollback").
 - **An OAuth pair is one record**: one entry, one version per refresh. The access and refresh
   tokens move together under one pointer flip and one floor line. Two entries would need
   cross-entry atomicity, which the store does not have.
@@ -3929,8 +4049,14 @@ The record kinds as merged are `KindUnknown = 0` (never written), `KindEd25519 =
   ascending, no duplicates, every required tag present, the per-kind set closed.
 - Bounds: token value at most 16 KiB, access token 32 KiB, refresh token 8 KiB, comment 255
   printable ASCII bytes, `tokenType` 32 bytes of `[A-Za-z]`, `refreshOwner` 70 bytes in the
-  refresh-owner grammar. Times are Unix seconds, int64 big-endian. The whole envelope fits
+  refresh-owner grammar. Times are Unix seconds, int64 big-endian, from the Unix epoch to
+  9999-12-31T23:59:59Z (the range RFC 3339 renders). The whole envelope fits
   `MaxValueSize` (64 KiB).
+- **One encoding per envelope.** Every byte-string field is at least 1 byte; an optional field
+  (`comment`, `refreshExpiresAt`, `tokenType`) is absent rather than empty, and an absent
+  `tokenType` means `Bearer` without being written. So decode then encode is the identity, which
+  `FuzzEnvelopeParse` asserts. Any envelope version byte other than 1, 0 included, is
+  `ErrKindUnsupported`.
 - **`issuedAt` and `accessIssuedAt` are sealed**, stamped from the server's clock seam at `put`,
   `rotate` or refresh. The `Expiring` threshold and the refresh schedule use them, never the
   record's `created` header, which stays unauthenticated display metadata: a party who can write
@@ -3943,7 +4069,10 @@ The record kinds as merged are `KindUnknown = 0` (never written), `KindEd25519 =
   state.
 - **Tests pin the bytes.** Committed per-kind golden vectors under
   `pkg/keystore/typed/testdata/envelope/` (U143). `FuzzEnvelopeParse` asserts that an accepted
-  input re-encodes byte-identically and that an error never contains input bytes; its seeds live
+  input re-encodes byte-identically and that an error never contains input bytes: no 16-byte
+  window slid over the input appears in the error text (the sentinels' fixed texts aside), and
+  `TestEnvelopeRefusalsNeverCarryRefreshToken` plants a marker refresh token and triggers every
+  refusal around it; its seeds live
   in `testdata/fuzz/FuzzEnvelopeParse/`, which a lint keeps non-empty (U154).
 
 **Binding into the AAD.** The kind byte is already `LP(kind)` in the six-field AAD ("Record
@@ -3959,13 +4088,24 @@ them meaning.
 
 - `token` and `ssh` keep the unbounded retention of every other kind.
 - `oauth` keeps the current version and one previous. Otherwise refreshes would fill the 16 MiB
-  quota and keep dead refresh tokens forever; a pruned version's refresh token is gone, which is
-  the point.
+  quota and keep dead refresh tokens forever; a pruned version's file is unlinked, which is
+  the point. Unlinked is not erased: on APFS the unlink frees the file's blocks without
+  overwriting them, a local snapshot (Time Machine's included) taken before the prune still holds
+  the sealed file, and a copy-on-write clone shares its blocks. The record stays sealed under the
+  master, so reading it needs the master too; the provider's refresh-token rotation, not the
+  unlink, is what makes the old token useless.
 - **The mark lives in the current-pointer plaintext.** Today that is 16 bytes (`version`,
   `sequence`). A pointer that records a prune carries 24 bytes: `version`, `sequence`, `low`,
   where `low` is the oldest retained version and `1 ≤ low ≤ version`. A 16-byte pointer means
   `low = 1`, so every existing pointer and every `token` or `ssh` pointer stays byte-identical.
-  Any other size, or `low` out of range, is `ErrCorrupt`.
+  Any other size, or `low` out of range, is `ErrCorrupt`. So is a pointer outside its one
+  canonical form: a 24-byte pointer recording `low = 1` (the 16-byte form says that), or a
+  24-byte pointer over a version that is not `oauth`, which never prunes; otherwise a forged mark
+  could hide a `token` entry's committed versions. The read accepts exactly what the rotation
+  writes, which records `low = version - 1` for `oauth`: an `oauth` pointer is 16 bytes only at
+  versions 1 and 2, and from version 3 it is 24 bytes with `low = version - 1`. Any other `oauth`
+  window, wider or narrower, is `ErrCorrupt` on every read, not only once List opens a missing
+  version. `FuzzPointerPlaintext` holds the decoder to the writer's output.
 - *Why the pointer.* The mark must move in the same atomic step as `current`, and the pointer's
   rename is already the entry's one commit point, so a crash never leaves a mark that disagrees
   with `current`. It must be authenticated: the pointer is sealed under the entry's AAD, so a disk
@@ -3984,12 +4124,41 @@ them meaning.
   `low` fails the floor's sequence check as before (U151, U152).
 - `rotate --from-version` is refused for `oauth`: resurrecting a rotated refresh token can trip a
   provider's reuse detection and revoke the whole grant family (U153).
+- `rotate --from-version N` refuses, with `ErrKindMismatch`, a version N whose kind is not the
+  entry's current kind, and writes nothing (U146). It copies version N's sealed value as it is:
+  a `token` keeps the `issuedAt` and `expiresAt` it was sealed with, nothing is re-stamped or
+  checked against the clock, so a token restored past its expiry becomes the current version
+  already expired and reads as expired until a new value is rotated in.
 
 **The refresh token is write-only after `put`, and the store enforces it by type.**
 
-- For kinds 3 to 5, `Store.Get` and `Current` return the kind and a `typed.Credential`, decoded
-  inside the store. `typed.Credential` has no refresh field to fill, so the socket, both
+- For kinds 3 to 5, the store returns the kind and a `typed.Credential`, decoded inside the
+  store: `FileStore.CurrentCredential` and `GetCredential`. The raw reads `Store.Get` and
+  `Current` refuse a typed entry with `ErrTypedCredential`, so no raw read can carry an
+  envelope; a reconciler meeting one takes the unknown-kind path below. `typed.Credential` has no refresh field to fill, so the socket, both
   reconcilers, `exec`, `show --reveal` and `typed.Project` never hold the refresh token's bytes.
+- `typed.Envelope` and `typed.Credential` redact themselves wherever they are formatted:
+  `String`, `GoString`, `Format` (every `fmt` verb and flag, `%v`, `%+v`, `%#v`, `%s`, `%q`
+  and `%x` included, inside a slice or map too, and in a wrapped error) and `LogValue` (a
+  `log/slog` attribute) print the kind, each present field's name and its length, and never a
+  byte of `RefreshToken`, `AccessToken`, `Value` or `Seed`. A value logged by mistake shows its
+  shape, not its secret. The reflection encoders get the same redaction: `MarshalJSON`
+  (`encoding/json`, and so `slog`'s JSON handler for a slice or map of them), `MarshalText` and
+  `GobEncode`, with no matching decoder, so nothing round-trips a secret through them. One
+  path no method closes: `fmt` and the encoders cannot call a method on an unexported struct
+  field, so a struct with an unexported field of either type prints its bytes under `%v`.
+  No file in `pkg/keystore` declares one, and an AST test (`TestNoUnexportedSecretField`)
+  fails the build on one: an unexported field of either type, or a pointer, slice, array or
+  map of one.
+- Typed plaintext the store makes is cleared once it is no longer needed, best effort (Go
+  may have copied it, and only the buffers named here are cleared): the encoded envelope a
+  `PutCredential`, `RotateCredential` or `RotateIf` seals, on every outcome; both tokens
+  `sameRefreshOwner` decodes to compare the owner; and the field copies a `typed.Decode`
+  refused part way had already made. A buffer the caller passed in (a raw `Put` or `Rotate`
+  value, a `typed.Envelope`) is the caller's and is never cleared by the store
+  (`TestTypedPlaintextZeroedAfterSeal`, `TestDecodeRefusalClearsClones`). U149's clearing
+  covers the store's own buffers only: copies made inside `golang.org/x/crypto/ssh` while it
+  parses or marshals a key are that library's, and are not cleared.
 - The full envelope comes back only from an opener in `pkg/keystore/internal/refreshopen`.
   `pkg/keystore` installs the opener at init, and only `pkg/keystore/refresh` calls it. Go's
   internal-package rule keeps every package outside `pkg/keystore/...` from importing it, and an
@@ -4005,7 +4174,10 @@ them meaning.
 ### Unknown kinds, ownership and rollback
 
 - **No format bump.** `parseRecord`'s refusal splits: a kind byte in 6 to 0xFC, or an unknown
-  envelope version, is `ErrKindUnsupported`: "this entry was written by a newer k3sm; upgrade". It
+  envelope version, is `ErrKindUnsupported`: "this entry was written by a newer k3sm, or the file
+  was altered; upgrade, or, if this k3sm is current, restore it from backup". A single flipped
+  byte can make a record read as a newer kind, so the text never steers an operator to upgrade
+  alone; for an `oauth` entry the restore is followed by the re-login below. It
   is not wrapped in `ErrCorrupt`, whose text says to restore from backup. `list` shows such an
   entry as `unsupported` and exits 1, like `corrupt`.
 - **The reconcilers' mapping is unchanged.** Only `ErrNotFound` (and, once allowed,
@@ -4228,7 +4400,12 @@ Two observers; the server holds the durable record.
 - **Library.** OpenSSH key parsing and marshalling use `golang.org/x/crypto/ssh`
   (`ParseRawPrivateKey`, `MarshalPrivateKey`, `MarshalAuthorizedKey`, `FingerprintSHA256`) in
   `pkg/keystore/typed`. `golang.org/x/crypto` is already a direct dependency of k3sm. It parses
-  untrusted input, which stays on the maintained library.
+  untrusted input, which stays on the maintained library, behind k3sm's own limits: at most
+  4 KiB of input, exactly one `OPENSSH PRIVATE KEY` PEM block with no headers and nothing but
+  whitespace around it, an ed25519 key whose private half matches its seed, and one fixed
+  refusal message that quotes no input byte. `FuzzSSHImport` covers it, asserting that no 16-byte
+  window of the PEM body appears in a refusal, with seeds in
+  `testdata/fuzz/FuzzSSHImport/`. The key's own comment is not kept; `--comment` sets it.
 - **Tests do not compare the library with itself.** `TestSSHFingerprintMatchesOpenSSH` checks
   against a committed `ssh-keygen -l -E sha256` output for a committed key (U148).
 
@@ -4246,14 +4423,39 @@ Two observers; the server holds the durable record.
 - **Who holds the refresh token:** only the keystore, sealed under the owner's scope key. Only the
   refresher reads it, through the opener, in the server process, as the service user. It never
   reaches the socket, a Secret, `exec`, `show`, a log, an Event or an audit line.
+- **The owner is fixed per entry**, like the kind. `rotate`, `RotateIf` and the refresher's
+  write refuse a pair naming another owner with `ErrRefreshOwnerFixed`, which the socket answers
+  as `invalid-value` (the wire set does not grow); `local` to `server/<p>`, `server/<p>` to
+  `local` and one profile to another are all refused. `rotate --from-version` is refused for
+  `oauth` before any owner is compared. Changing owner is `rm` and `put` again, so a rotation can
+  neither hand a `local` pair to the server nor take a `server/` pair away from it. `pkg/keystore`
+  names the error itself rather than reusing `ErrKindMismatch`, whose text tells the operator the
+  entry holds another kind.
 - **A pod is never a refresh owner in this release.** Pods cannot reach the socket, and a
   pod-reachable write endpoint is deferred.
 - **No exec hooks.** The only refresh procedure built in is RFC 6749 §6, the `refresh_token`
   grant. A "hook" is a declared profile (data), never a program.
 - **The store interface.** The refresher is not a socket peer. Its consumer interface,
   `OAuthRefreshStore`, has the opener for a `server/`-owned pair's current version and
-  `RotateIf(name, expectVersion, value)`, a compare-and-swap Rotate, with bytes taken only from a
-  token-endpoint response. It has no reveal, show, list or rewrap method (U150).
+  `RotateIf(name, expect, value)`, a compare-and-swap Rotate, with bytes taken only from a
+  token-endpoint response. `expect` is the `Version` the refresher read, which carries an opaque,
+  unexported identity besides its number: a digest of the entry's generation, name, version and
+  record digest. The record digest makes two different sealed records of one version number
+  (a failed attempt's file copied over its retry's) two identities; a Rewrap re-seals every
+  record, so a `Version` read before a Rewrap is stale after it.
+  `RotateIf` refuses with `ErrVersionStale` unless both the number and the identity match the
+  current version, so an entry deleted and put again (a new generation, versions restarting at 1)
+  never matches a version read from the old one, even where the number and the fingerprint
+  repeat. A `Version` the caller builds has no identity and is always stale. The identity reveals
+  no generation, and `pkg/keystore` still exposes none. It has no reveal, show, list or rewrap method (U150).
+  The identity's limits: it is an in-process guard against a stale or recreated read, not a
+  capability. It is an unkeyed digest of values that are not secret, so anything that can see
+  or guess an entry's generation could compute it; it protects only because no code outside
+  the package can set the unexported field. It therefore never crosses the socket. If a
+  compare-and-swap ever does, the token on the wire must become a keyed MAC under the store's
+  key (over the name, generation and version), checked in constant time, and a remote caller
+  must present the token from its own read, never one it built or was handed
+  (`TestRotateIfRefusesVersionBuiltOutside`).
 - **A re-login by the owner always wins.** If the owner rotates a new pair while a refresh is in
   flight, `RotateIf` fails on the version check and the refresher's result is discarded (U185).
 - **`refresh-now`.** `k3sm keys refresh <entry>`, socket op `refresh-now`, is owner-only, 1 a minute
@@ -4608,7 +4810,8 @@ Pre-deploy: `sudo k3sm keys refresh-profile add`, then `refresh-profile test`, b
 `server/` pair is put; the server needs direct outbound HTTPS to profile endpoints (no proxy).
 Rollback is revert, rebuild, reinstall; rolling back past typed kinds or the refresher means
 owners sign in again for their `server/` pairs after rolling forward ("Unknown kinds, ownership
-and rollback").
+and rollback"). A build from before typed records reads them as corrupt and advises removing the
+entry with `rm`: do not follow that advice for a typed entry; upgrade again instead.
 
 ### Gate mechanics
 
@@ -4665,7 +4868,7 @@ last pull request lands and no row is pending.
 | G6 | The floor is root-owned and checked on the opened descriptor; a floor that is group- or other-writable, a symlink, or not root-owned is refused. The floor file names the `system` scope and is parsed strictly, and a verb that cannot write it changes nothing | unit with a fake FS for each case; a missing, other or unknown-field scope; a fuzz target over the parser with committed seeds; a read-only data root on a first Put |
 | G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock` |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
-| G9 | A Rotate retry discards an orphaned next version and seals the value it was given | unit: orphan with value A, retry with value B, expect B |
+| G9 | A Rotate retry never promotes an orphaned next version: a failed Rotate removes its own, the version's fsync failure included, a sealed one a crash left is refused (`ErrCorrupt` and `ErrOrphanVersion`, nothing removed, oauth told not to delete it), one that does not authenticate is discarded, and the retry seals the value it was given; only the attended, root-only `Adopt` (`k3sm keys adopt`) promotes a sealed orphan, at exactly the next version | unit: orphan with value A, refused; removed, retry with value B, expect B; a fault after the version's rename; an oauth crash, then adopt, then the new pair is current; adopt's refusals; the CLI verb |
 | G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts an operator-made key: `rewrap --key-in` refuses a key that is neither the recorded `master.next.sha256` nor one some record already opens under |
 | G11 | The master is opened with O_NOFOLLOW and judged by fstat on the open descriptor; wrong mode, owner or fingerprint is `ErrMasterUntrusted` | unit: one case each |
 | G12 | Rewrap resumes after a crash at every step, trying the old then the new key, and leaves no record readable by neither; a `master.next` that disagrees with its fingerprint is discarded only when no `.new` file exists, and refused with `ErrMasterUntrusted` otherwise | unit: fault injection at each of steps 2 to 5, then rerun; a corrupted `master.next` with and without a `.new` file |
@@ -4847,20 +5050,20 @@ carried by the unit rows.
 | U138 | `--listed` fails on a duplicated U or E id: in the script's rows, its expected-row list, one mode's row list, or the design's gate and leg tables | `hack/acceptance/keystore.sh --listed` (its duplicate-id lint, `lint_unique_ids`) | pending: the typed-credential design |
 | U139 | `items` required, no default, 1 to 8, unique keys, the key pattern with `.` and a `..` prefix refused, both `maxLength`s, immutable as a map (a reorder accepted, a change refused), CEL cost within budget; no `dataKey` | `apis/config/crd::TestKeyDeliveryItemsSchema`, `TestItemKeyMatchesIsConfigMapKey`, `TestKeyDeliveryHasNoDataKey`, `TestItemsReorderAcceptedChangeRefused`, `TestItemsCELCostWithinBudget` | pending: the typed KeyDelivery API |
 | U140 | the `field` enum equals the credential table's union; a KeyDelivery naming `refreshToken` is refused by the schema; rig leg E31 | `apis/config/crd::TestFieldEnumEqualsCredentialTable`, `TestSchemaRefusesRefreshTokenField` | pending: the typed KeyDelivery API |
-| U141 | the credential leaf: kind names, field table vectors, no refresh field, the item type, the refresh-owner vectors, closed validity, Event and `refresh_state` sets, the metadata keys; stdlib only | `apis/keystore/credential::TestFieldTableVectors`, `TestNoRefreshField`, `TestRefreshOwnerGrammarVectors`, `TestNameSetsClosed`, `TestImportsStdlibOnly` | pending: the typed KeyDelivery API |
+| U141 | the credential leaf: kind names, field table vectors, no refresh field, the item type, the refresh-owner vectors, closed validity, Event and `refresh_state` sets, the metadata keys; stdlib only | `apis/keystore/credential::TestFieldTableVectors`, `TestNoRefreshField`, `TestRefreshOwnerGrammarVectors`, `TestNameSetsClosed`, `TestImportsStdlibOnly` | checked: the credential names in apis |
 | U142 | the CRD descriptions list the `CredentialValid` reasons and `ProjectionInvalid`, say `Ready` means delivered and that Valid, Expiring and RefreshFailing share True; every condition has `observedGeneration` | `apis/config/crd::TestKeyDeliveryReasonDescriptions`, `TestConditionsCarryObservedGeneration` | pending: the typed KeyDelivery API |
-| U143 | the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is `ErrCorrupt`; the fuzz invariants hold | `k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors`, `TestEnvelopeRejectsUnknownTagDuplicateAndOrder`, `FuzzEnvelopeParse` | pending: the typed store |
-| U144 | token and oauth require a sealed `issuedAt`/`accessIssuedAt` stamped from the clock seam; editing the `created` header changes no typed time | `k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed`, `TestCreatedHeaderEditChangesNoTypedTime` | pending: the typed store |
-| U145 | a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are `ErrKindUnsupported`, 0xFD and 0xFE `ErrCorrupt`; `list` shows `unsupported` | `k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen`, `TestKindByteTable` | pending: the typed store |
-| U146 | `rotate` and `put` over an existing entry cannot change its kind (`ErrKindMismatch`) | `k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind` | pending: the typed store |
-| U147 | token needs `expiresAt`; oauth needs access token, access expiry, refresh token and an owner in the grammar | `k3sm/pkg/keystore::TestTypedPutValidation` | pending: the typed store |
-| U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH` | pending: the typed store |
-| U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential`, `TestRefreshOpenerImportGraph` | pending: the typed store |
-| U150 | `RotateIf` refuses a stale version | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused` | pending: the typed store |
-| U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test) | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep` | pending: the typed store |
-| U152 | a pruned oauth entry: List shows it healthy, Rewrap re-seals `low..current`, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught | `k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt`, `TestRewrapHandlesPrunedOAuth`, `TestDeletePrunedOAuthEntry`, `TestGapInsideCommittedRangeIsCorrupt`, `TestCopyBackAcrossPruneCaught` | pending: the typed store |
-| U153 | `--from-version` is refused for oauth | `k3sm/pkg/keystore::TestFromVersionRefusedForOAuth` | pending: the typed store |
-| U154 | every `Fuzz*` target in the keystore packages has a non-empty committed seed directory | `k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds` | pending: the typed store |
+| U143 | the envelope matches committed per-kind golden vectors; unknown tag, duplicate, disorder, missing field or out-of-bound field is `ErrCorrupt`; the fuzz invariants hold | `k3sm/pkg/keystore/typed::TestEnvelopeGoldenVectors`, `TestEnvelopeRejectsUnknownTagDuplicateAndOrder`, `FuzzEnvelopeParse`; each kind's field table is strictly increasing by tag, `TestFieldTablesSortedByTag` | checked: the typed envelope |
+| U144 | token and oauth require a sealed `issuedAt`/`accessIssuedAt` stamped from the clock seam; editing the `created` header changes no typed time | `k3sm/pkg/keystore::TestTypedIssuedAtStampedAndSealed`, `TestCreatedHeaderEditChangesNoTypedTime`, `TestExpiryCheckedOnSealedSeconds`, `k3sm/pkg/keystore/typed::TestExpiryOrderEnforced` | checked: the typed store |
+| U145 | a relabelled typed record fails to open; kind-byte table: 6 to 0xFC and an unknown envelope version are `ErrKindUnsupported`, 0xFD and 0xFE `ErrCorrupt`; `list` shows `unsupported` | `k3sm/pkg/keystore::TestTypedKindRelabelFailsOpen`, `TestKindByteTable`, `TestListShowsUnsupportedKind` | checked: the typed envelope and the typed store |
+| U146 | `rotate` and `put` over an existing entry cannot change its kind (`ErrKindMismatch`), nor can `rotate --from-version` from a version of another kind | `k3sm/pkg/keystore::TestRotateAndPutCannotChangeKind`, `TestRotateFromRefusesOtherKind` | checked: the typed store |
+| U147 | token needs `expiresAt`, after its stamped `issuedAt`; oauth needs access token, access expiry, refresh token and an owner in the grammar | `k3sm/pkg/keystore::TestTypedPutValidation` | checked: the typed store |
+| U148 | SSH generate uses the random seam; import accepts unencrypted OpenSSH ed25519 only; the fingerprint equals a committed `ssh-keygen -l` vector | `k3sm/pkg/keystore/typed::TestSSHGenerateAndImport`, `TestSSHFingerprintMatchesOpenSSH`, `TestSSHImportRefusesMalformed`, `k3sm/pkg/keystore::TestStoreGenerateSSHUsesRandomSeam` | checked: the typed envelope and the typed store |
+| U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential`, `k3sm/pkg/keystore/typed::TestEnvelopeRefusalsNeverCarryRefreshToken`, `TestShortSecretNeverInRefusals`, `TestSecretTypesRedactWhenFormatted`, `TestNoUnexportedSecretField`, `TestDecodeRefusalClearsClones`, `k3sm/pkg/keystore::TestTypedPlaintextZeroedAfterSeal` | partial: every exported method of `*FileStore` and `*UserScope`, enumerated by reflection (a method neither called by hand, callable with built arguments nor allowlisted with a reason fails the test), the typed reads and the deliveries path checked (the typed store); pending: the consumer interfaces and `internal/refreshopen`'s import graph, `TestRefreshOpenerImportGraph` (the refresher) |
+| U150 | `RotateIf` refuses a stale version, and a version read from an entry since deleted and put again; a rotation never changes an oauth entry's refresh owner | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused`, `TestRotateIfRefusesRecreatedEntry`, `TestRotateIfRefusesVersionBuiltOutside`, `TestRefreshOwnerFixedPerEntry`, `TestRotateIfRefusesSameNumberDifferentRecord` | checked: the typed store |
+| U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test); a failure after the pointer flip reports the commit | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep`; a failure after the flip returns the new version with `ErrCommitted`, `TestRotateReportsCommitAfterFlip`, and so does a failure after any write's pointer rename (the directory fsync, the floor, the prune; put, rotate and generate alike), never also `ErrCorrupt`, `TestCommitPointReported`; the floor-lag window refuses rather than unlink a newer committed version, `TestFloorLagNeverDeletesCommittedVersion`; the pointer has one canonical form, `TestPointerCanonicalForm`, the oauth retention window is checked on read, `TestOAuthRetentionWindowOnRead`, and the decoder accepts only the writer's output, `FuzzPointerPlaintext`; an oauth entry's version ceiling is 2^32 and every other kind's 2^16, `TestOAuthVersionCeiling` | checked: the typed store |
+| U152 | a pruned oauth entry: List shows it healthy, Rewrap re-seals `low..current`, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught | `k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt`, `TestRewrapHandlesPrunedOAuth`, `TestDeletePrunedOAuthEntry`, `TestGapInsideCommittedRangeIsCorrupt`, `TestCopyBackAcrossPruneCaught` | checked: the typed store |
+| U153 | `--from-version` is refused for oauth | `k3sm/pkg/keystore::TestFromVersionRefusedForOAuth` | checked: the typed store |
+| U154 | every `Fuzz*` target in the keystore packages has a non-empty committed seed directory | `k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds` | checked: the typed envelope |
 | U155 | HELLO lists capabilities; mutating ops refuse an unknown header (`unknown-header`), non-mutating ops tolerate it; the CLI refuses a typed request to a daemon without the capability | `k3sm/pkg/keystore/socket::TestHelloListsCapabilities`, `TestMutatingOpRefusesUnknownHeader`, `TestNonMutatingOpToleratesUnknownHeader`, `k3sm/cmd/k3sm::TestCLIRefusesTypedAgainstOldDaemon` | pending: the typed verbs |
 | U156 | an oauth put takes an RFC 6749 response, stamps times from the clock, drops `id_token` and unknown fields; an `error` response is refused printing only the code | `k3sm/pkg/keystore/socket::TestPutOAuthTokenResponse`, `TestTokenResponseWithErrorRefused`, `FuzzTokenResponseParse` | pending: the typed verbs |
 | U157 | `generate` returns only the public key; `pubkey` prints only the public line | `k3sm/pkg/keystore/socket::TestGenerateReturnsPublicKeyOnly`, `k3sm/cmd/k3sm::TestKeysPubkeyPrintsOnlyPublicKey` | pending: the typed verbs |

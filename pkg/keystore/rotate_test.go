@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -176,12 +177,20 @@ func TestFloorRefusesCopiedBackPointer(t *testing.T) {
 	t.Run("accepted with no floor entry for the name", func(t *testing.T) {
 		s, server := setup(t)
 		writeFile(t, floorPath(server), `{"version":1,"scope":"system","entries":{}}`)
-		mustCurrent(t, s, "k", "one")
+		// The floor accepts the pointer; the version above it is what
+		// refuses the read (review round 4, item 3).
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrOrphanVersion) {
+			t.Fatalf("Current over a copied-back pointer the floor accepts: %v, want ErrOrphanVersion", err)
+		}
 	})
 	t.Run("accepted with no floor file", func(t *testing.T) {
 		s, server := setup(t)
 		remove(t, floorPath(server))
-		mustCurrent(t, s, "k", "one")
+		// The floor accepts the pointer; the version above it is what
+		// refuses the read (review round 4, item 3).
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrOrphanVersion) {
+			t.Fatalf("Current over a copied-back pointer the floor accepts: %v, want ErrOrphanVersion", err)
+		}
 	})
 	t.Run("another generation is refused", func(t *testing.T) {
 		// An old copy of a deleted entry, put back over the entry re-created
@@ -376,7 +385,10 @@ func TestFloorRaised(t *testing.T) {
 		// that is the window the raise closes.
 		copyFile(t, entryPath(server, "k", currentName), filepath.Join(server, "seq3"))
 		copyFile(t, filepath.Join(server, "seq2"), entryPath(server, "k", currentName))
-		mustCurrent(t, s, "k", "two")
+		// The floor accepts it; version 3 above it refuses the read.
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrOrphanVersion) {
+			t.Fatalf("Current over the sequence-2 pointer: %v, want ErrOrphanVersion", err)
+		}
 		copyFile(t, filepath.Join(server, "seq3"), entryPath(server, "k", currentName))
 		// Nothing raises the floor on read: a read verb calls RaiseFloor.
 		mustCurrent(t, s, "k", "three")
@@ -402,8 +414,8 @@ func TestFloorRaised(t *testing.T) {
 		s, server := newTestStore(t)
 		mustPut(t, s, "a", KindOpaque, []byte("a"))
 		s.step = failAt("write " + floorName)
-		if _, err := s.Put(ctx, "k", KindOpaque, []byte("one")); err == nil || !strings.Contains(err.Error(), "the entry is stored") {
-			t.Fatalf("Put through a crash at the floor write: %v, want the stored-but-unrecorded error", err)
+		if v, err := s.Put(ctx, "k", KindOpaque, []byte("one")); !errors.Is(err, ErrCommitted) || v.Version != 1 {
+			t.Fatalf("Put through a crash at the floor write: %+v, %v, want version 1 and ErrCommitted", v, err)
 		}
 		s.step = func(string) error { return nil }
 		mustCurrent(t, s, "k", "one")
@@ -467,11 +479,11 @@ func TestRotateCrashAtEveryStep(t *testing.T) {
 		s.step = func(name string) error { steps = append(steps, name); return nil }
 		mustRotate(t, s, "k", "two")
 	}
-	want := "write v2,write current,write " + floorName
+	want := "write v2,sync v2,write current,sync current,write " + floorName
 	if strings.Join(steps, ",") != want {
 		t.Fatalf("Rotate steps = %v, want %s", steps, want)
 	}
-	for _, step := range steps[:2] { // the floor write comes after the flip (TestFloorRaised)
+	for _, step := range steps[:3] { // the pointer's sync and the floor write come after the flip (TestCommitPointReported)
 		t.Run(step, func(t *testing.T) {
 			s, server := newTestStore(t)
 			mustPut(t, s, "k", KindOpaque, []byte("one"))
@@ -493,28 +505,122 @@ func TestRotateCrashAtEveryStep(t *testing.T) {
 			}
 		})
 	}
+	t.Run("oauth prune", func(t *testing.T) { rotateCrashOAuthPrune(t) })
 }
 
-// TestRotateRetryDiscardsOrphan is G9: a Rotate interrupted after writing
-// its version but before the flip leaves an orphan holding the value it was
-// given; the retry discards it and seals its own value.
+// rotateCrashOAuthPrune is U151's crash cases: an oauth rotation that
+// prunes, crashed at every step, prune included, leaves a readable entry
+// whose committed range is either the old one or the new one, and the next
+// write finishes the prune.
+func rotateCrashOAuthPrune(t *testing.T) {
+	ctx := context.Background()
+	var steps []string
+	{
+		s, _ := newTypedStore(t)
+		mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+		mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+		s.step = func(name string) error { steps = append(steps, name); return nil }
+		mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a3", "r3"))
+	}
+	want := "write v3,sync v3,write current,sync current,write " + floorName + ",prune k"
+	if strings.Join(steps, ",") != want {
+		t.Fatalf("pruning Rotate steps = %v, want %s", steps, want)
+	}
+	for i, step := range steps {
+		t.Run(step, func(t *testing.T) {
+			s, server := newTypedStore(t)
+			mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+			mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+			s.step = failAt(step)
+			if _, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a3", "r3")); err == nil {
+				t.Fatal("Rotate succeeded through a crash")
+			}
+			s.step = func(string) error { return nil }
+			flipped := i >= 3 // the pointer is written before the floor and the prune
+			wantCur, wantAccess, wantVersions := uint64(2), "a2", 2
+			if flipped {
+				wantCur, wantAccess = 3, "a3"
+			}
+			if i == 1 || i == 2 {
+				// v3 was in place when the step failed: oauth keeps it
+				// for Adopt, which completes the flip.
+				if _, _, err := s.CurrentCredential(ctx, "k"); !errors.Is(err, ErrOrphanVersion) {
+					t.Fatalf("CurrentCredential over the kept v3: %v, want ErrOrphanVersion", err)
+				}
+				if _, err := s.Adopt(ctx, "k", mustOrphan(t, s, "k")); err != nil {
+					t.Fatalf("Adopt the kept v3: %v", err)
+				}
+				wantCur, wantAccess = 3, "a3"
+			}
+			v, c := mustCredential(t, s, "k")
+			if v.Version != wantCur || string(c.AccessToken) != wantAccess {
+				t.Fatalf("after the crash: version %d %q, want %d %q", v.Version, c.AccessToken, wantCur, wantAccess)
+			}
+			list, err := s.List(ctx)
+			if err != nil || len(list) != 1 || list[0].Err != nil || len(list[0].Versions) != wantVersions {
+				t.Fatalf("List after the crash = %+v, %v", list, err)
+			}
+			// The next write finishes whatever the crash left: the entry ends
+			// at the current version and one previous.
+			next := mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a9", "r9"))
+			if got, want := fmt.Sprint(versionFiles(t, server, "k")), fmt.Sprintf("[%d %d]", next.Version-1, next.Version); got != want {
+				t.Fatalf("versions after the next write %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+// TestRotateRetryDiscardsOrphan is G9: a Rotate that fails before its
+// pointer flip removes the version it wrote, and the retry seals the value
+// it was given. A crash there leaves that sealed version above the pointer,
+// which the files cannot tell from a newer committed version behind a
+// copied-back pointer, so the retry refuses it (ErrCorrupt) and removes
+// nothing; once the operator removes it, the retry discards what does not
+// authenticate (a stray copy) and seals its own value. It never promotes
+// the orphan.
 func TestRotateRetryDiscardsOrphan(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
 	mustPut(t, s, "k", KindOpaque, []byte("one"))
-	s.step = failAt("write current")
+	// The step seam fires once v2 is in place: a copy of it taken there is
+	// what a crash at that point leaves.
+	var orphan []byte
+	s.step = func(name string) error {
+		if name != "write current" {
+			return nil
+		}
+		b, err := os.ReadFile(entryPath(server, "k", "v2"))
+		if err != nil {
+			t.Errorf("v2 at the pointer write: %v", err)
+		}
+		orphan = b
+		return fmt.Errorf("injected crash at %s", name)
+	}
 	if _, err := s.Rotate(ctx, "k", []byte("A")); err == nil {
 		t.Fatal("Rotate succeeded through a crash")
 	}
 	s.step = func(string) error { return nil }
-	orphan, err := os.ReadFile(entryPath(server, "k", "v2"))
-	if err != nil {
-		t.Fatalf("the interrupted Rotate left no v2: %v", err)
+	if _, err := os.Lstat(entryPath(server, "k", "v2")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the failed Rotate left its v2: %v", err)
 	}
-	// An orphan further out, as a second interrupted attempt could not leave
-	// but a stray copy could, is discarded too.
-	copyFile(t, entryPath(server, "k", "v2"), entryPath(server, "k", "v7"))
 
+	// What a crash leaves: the sealed v2, and a stray copy further out.
+	writeFile(t, entryPath(server, "k", "v2"), string(orphan))
+	copyFile(t, entryPath(server, "k", "v2"), entryPath(server, "k", "v7"))
+	if v, err := s.Rotate(ctx, "k", []byte("B")); !errors.Is(err, ErrCorrupt) || v != (Version{}) {
+		t.Fatalf("Rotate over a sealed orphan = %+v, %v; want the ErrCorrupt refusal", v, err)
+	}
+	for _, n := range []string{"v2", "v7"} {
+		if _, err := os.Lstat(entryPath(server, "k", n)); err != nil {
+			t.Fatalf("the refused Rotate removed %s: %v", n, err)
+		}
+	}
+	// A read refuses the stray v7, further out than a crash reaches.
+	if _, _, err := s.Current(ctx, "k"); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "v7") {
+		t.Fatalf("Current over v2 and v7: %v, want ErrCorrupt naming v7", err)
+	}
+
+	remove(t, entryPath(server, "k", "v2"))
 	v := mustRotate(t, s, "k", "B")
 	if v.Version != 2 {
 		t.Fatalf("retried Rotate made version %d, want 2", v.Version)
@@ -667,4 +773,179 @@ func TestFloorMalformedAdvice(t *testing.T) {
 	if strings.Contains(msg, "restore it from backup") {
 		t.Errorf("malformed-floor advice %q carries ErrCorrupt's advice to restore from backup", msg)
 	}
+}
+
+// TestRotateReportsCommitAfterFlip is U151: a rotation that fails after its
+// pointer flip, at the floor write or at the oauth prune, has committed. It
+// returns the new version with an error matching ErrCommitted, never a
+// zero Version that reads as nothing written, and the new version is current.
+func TestRotateReportsCommitAfterFlip(t *testing.T) {
+	ctx := context.Background()
+	for _, step := range []string{"write " + floorName, "prune k"} {
+		for _, name := range []string{"RotateCredential", "RotateIf"} {
+			t.Run(step+" "+name, func(t *testing.T) {
+				s, _ := newTypedStore(t)
+				mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+				mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+				read, _ := mustCredential(t, s, "k")
+				s.step = failAt(step)
+				var (
+					v   Version
+					err error
+				)
+				if name == "RotateIf" {
+					v, err = s.RotateIf(ctx, "k", KindOAuth, read, oauthEnvelope("a3", "r3"))
+				} else {
+					v, err = s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a3", "r3"))
+				}
+				if !errors.Is(err, ErrCommitted) || v.Version != 3 {
+					t.Fatalf("%s failing at %s = %+v, %v; want version 3 and ErrCommitted", name, step, v, err)
+				}
+				s.step = func(string) error { return nil }
+				if cur, c := mustCredential(t, s, "k"); cur != v || string(c.AccessToken) != "a3" {
+					t.Fatalf("current %+v %q, returned %+v", cur, c.AccessToken, v)
+				}
+				// The returned Version is the one to read again from: a
+				// RotateIf holding it is current.
+				if next, err := s.RotateIf(ctx, "k", KindOAuth, v, oauthEnvelope("a4", "r4")); err != nil || next.Version != 4 {
+					t.Fatalf("RotateIf from the committed version = %+v, %v", next, err)
+				}
+			})
+		}
+	}
+	t.Run("opaque floor", func(t *testing.T) {
+		s, _ := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		s.step = failAt("write " + floorName)
+		v, err := s.Rotate(ctx, "k", []byte("two"))
+		if !errors.Is(err, ErrCommitted) || v.Version != 2 {
+			t.Fatalf("Rotate failing at the floor = %+v, %v; want version 2 and ErrCommitted", v, err)
+		}
+		s.step = func(string) error { return nil }
+		v, err = s.Rotate(ctx, "k", []byte("three"))
+		if err != nil || v.Version != 3 {
+			t.Fatalf("the next Rotate = %+v, %v", v, err)
+		}
+		s.step = failAt("write " + floorName)
+		v, err = s.RotateFrom(ctx, "k", 1)
+		if !errors.Is(err, ErrCommitted) || v.Version != 4 {
+			t.Fatalf("RotateFrom failing at the floor = %+v, %v; want version 4 and ErrCommitted", v, err)
+		}
+	})
+}
+
+// TestRotateVersionSyncFailureRemovesVersion is G9's cleanup half: a
+// rotation whose version file was renamed into place but whose directory
+// fsync failed, before the pointer flip, removes that version, so only a
+// crash leaves an orphan above the pointer.
+func TestRotateVersionSyncFailureRemovesVersion(t *testing.T) {
+	ctx := context.Background()
+	// A token, not oauth: an oauth rotation keeps the version it wrote
+	// (TestOAuthPreFlipFailureKeepsVersion).
+	s, server := newTypedStore(t)
+	mustPutCredential(t, s, "k", KindToken, tokenEnvelope("t1"))
+	s.step = failAt("sync v2")
+	if v, err := s.RotateCredential(ctx, "k", KindToken, tokenEnvelope("t2")); err == nil || v != (Version{}) {
+		t.Fatalf("RotateCredential failing at the version's fsync = %+v, %v; want a zero Version and an error", v, err)
+	}
+	s.step = func(string) error { return nil }
+	if _, err := os.Lstat(entryPath(server, "k", "v2")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the failed rotation left its v2: %v", err)
+	}
+	if v, c := mustCredential(t, s, "k"); v.Version != 1 || string(c.Value) != "t1" {
+		t.Fatalf("current after the failure: version %d %q, want 1 t1", v.Version, c.Value)
+	}
+	if v := mustRotateCredential(t, s, "k", KindToken, tokenEnvelope("t3")); v.Version != 2 {
+		t.Fatalf("the next rotation made version %d, want 2", v.Version)
+	}
+}
+
+// forgeAtVersion reseals name's version 1 as versions from..cur and seals a
+// pointer naming cur at sequence seq with low as its oldest retained
+// version, then removes version 1 when from is above it: an entry that has
+// been rotated up to cur, made without cur rotations.
+func forgeAtVersion(t *testing.T, s *FileStore, server, name string, from, cur, low, seq uint64) {
+	t.Helper()
+	k, err := s.loadMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(server, "keystore", name)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	e := &entry{root: root, name: name}
+	gen, err := os.ReadFile(filepath.Join(dir, generationName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hex.Decode(e.generation[:], bytes.TrimSpace(gen)); err != nil {
+		t.Fatal(err)
+	}
+	v1, val, err := e.version(k, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := from; n <= cur; n++ {
+		rec := record{kind: byte(v1.Kind), name: name, version: n, generation: e.generation, created: v1.Created.Unix()}
+		if err := rec.seal(k.seal, k.scope, val, rand.Reader); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(dir, versionName(n)), string(rec.marshal()))
+	}
+	ptr := record{kind: kindPointer, name: name, generation: e.generation, created: v1.Created.Unix()}
+	if err := ptr.seal(k.seal, k.scope, rangePlaintext(cur, seq, low), rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, currentName), string(ptr.marshal()))
+	if from > 1 {
+		remove(t, filepath.Join(dir, versionName(1)))
+	}
+}
+
+// TestOAuthVersionCeiling is the oauth ceiling: an oauth entry keeps only
+// two versions, so its pointer may name versions up to maxOAuthVersion
+// (2^32) in the same pointer format, and a rotation past the general
+// maxVersion (2^16) proceeds. Every other kind keeps every version and
+// stops at maxVersion; an oauth pointer past maxOAuthVersion is ErrCorrupt.
+func TestOAuthVersionCeiling(t *testing.T) {
+	ctx := context.Background()
+	t.Run("oauth past maxVersion", func(t *testing.T) {
+		s, server := newTypedStore(t)
+		mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+		forgeAtVersion(t, s, server, "k", maxVersion-1, maxVersion, maxVersion-1, 2)
+		v := mustRotateCredential(t, s, "k", KindOAuth, oauthEnvelope("a2", "r2"))
+		if v.Version != maxVersion+1 {
+			t.Fatalf("rotation at the general ceiling made version %d, want %d", v.Version, maxVersion+1)
+		}
+		cur, c := mustCredential(t, s, "k")
+		if cur.Version != maxVersion+1 || string(c.AccessToken) != "a2" {
+			t.Fatalf("current %d %q", cur.Version, c.AccessToken)
+		}
+		list, err := s.List(ctx)
+		if err != nil || len(list) != 1 || list[0].Err != nil || len(list[0].Versions) != 2 {
+			t.Fatalf("List = %+v, %v; want two versions", list, err)
+		}
+	})
+	t.Run("oauth at maxOAuthVersion", func(t *testing.T) {
+		s, server := newTypedStore(t)
+		mustPutCredential(t, s, "k", KindOAuth, oauthEnvelope("a1", "r1"))
+		forgeAtVersion(t, s, server, "k", maxOAuthVersion-1, maxOAuthVersion, maxOAuthVersion-1, 2)
+		mustCredential(t, s, "k")
+		if _, err := s.RotateCredential(ctx, "k", KindOAuth, oauthEnvelope("a2", "r2")); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "last version") {
+			t.Fatalf("rotation at the oauth ceiling: %v, want the ErrCorrupt last-version refusal", err)
+		}
+	})
+	t.Run("opaque at maxVersion", func(t *testing.T) {
+		s, server := newTestStore(t)
+		mustPut(t, s, "k", KindOpaque, []byte("one"))
+		// An opaque pointer at maxVersion whose version opens: the
+		// rotation is refused at the ceiling, before anything is written.
+		forgeAtVersion(t, s, server, "k", maxVersion, maxVersion, 1, 2)
+		if _, err := s.Rotate(ctx, "k", []byte("two")); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "last version") {
+			t.Fatalf("opaque rotation at maxVersion: %v, want the last-version refusal", err)
+		}
+	})
 }

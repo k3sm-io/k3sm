@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -51,6 +52,12 @@ const (
 	// it chooses. 65536 versions is far beyond any rotation cadence, and an
 	// entry directory at the bound still lists under maxDirNames.
 	maxVersion = 1 << 16
+	// maxOAuthVersion is maxVersion for an oauth entry, which keeps only its
+	// current version and one previous, so neither List nor Rewrap walks
+	// more than two versions whatever the number: the bound only keeps the
+	// number finite. 2^32 refreshes at one a minute is over 8000 years,
+	// where 2^16 would be 45 days.
+	maxOAuthVersion = 1 << 32
 )
 
 var (
@@ -124,9 +131,16 @@ type FileStore struct {
 	now      func() time.Time
 	chown    func(f *os.File, uid, gid int) error
 	lockWait time.Duration
+	// log is where the store logs; nil is slog.Default(), read at the
+	// call, so a default the binary sets after New still applies.
+	log *slog.Logger
 	// step is called at each durable step of a write; a non-nil return aborts
 	// the write there, as a crash would.
 	step func(name string) error
+	// owned is called with each typed plaintext buffer the store makes and
+	// clears before the call returns (an encoded envelope it seals, an
+	// access token it decodes to compare), where a test records it.
+	owned func(b []byte)
 	// floorUID and floorGID own the floor and the data root, from
 	// Config.FloorUID and Config.FloorGID: root in production, the test user
 	// in a non-root test. checkConfig refuses a negative one, so the
@@ -170,6 +184,7 @@ func New(cfg Config) *FileStore {
 		chown:          (*os.File).Chown,
 		lockWait:       lockTimeout,
 		step:           func(string) error { return nil },
+		owned:          func([]byte) {},
 		entryMade:      func(string) {},
 		dirMade:        func(string) {},
 		dataRootLocked: func() {},
@@ -223,11 +238,15 @@ func (s *FileStore) checkConfig() error {
 // the current pointer, then its floor; an entry directory without a pointer
 // in the shape a crashed Put leaves, whose generation the floor does not
 // record, is an interrupted Put, which the next Put of that name discards.
-// A Put whose floor writes drop a tombstone returns the version with a
-// committed ErrTombstoneEvicted (Committed).
+// The pointer's rename is the commit point: a failure after it (the
+// directory fsync, the floor line) returns the new version with an error
+// matching ErrCommitted. A Put whose floor writes drop a tombstone returns
+// the version with a committed ErrTombstoneEvicted (Committed).
 func (s *FileStore) Put(ctx context.Context, name string, kind Kind, value []byte) (Version, error) {
 	v, err := s.put(ctx, name, kind, value)
 	if err != nil {
+		// v is the committed version when err is Committed (ErrCommitted
+		// or a committed ErrTombstoneEvicted), and zero otherwise.
 		if Committed(err) {
 			return v, fmt.Errorf("put %s: %w", name, err)
 		}
@@ -246,6 +265,13 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 	if err := checkValue(kind, value); err != nil {
 		return Version{}, err
 	}
+	return s.putChecked(ctx, name, kind, func() ([]byte, error) { return value, nil })
+}
+
+// putChecked is put of a value already checked for kind, which value
+// returns once the store is locked: a typed value is stamped from the clock
+// then.
+func (s *FileStore) putChecked(ctx context.Context, name string, kind Kind, value func() ([]byte, error)) (Version, error) {
 	// The floor is judged writable before anything is created, and locked
 	// before anything is written, a master minted included.
 	if err := s.checkFloorWritable(); err != nil {
@@ -278,13 +304,24 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	e, err := s.createEntry(root, name, fl)
+	if errors.Is(err, ErrExists) {
+		// A put over an existing name of another kind is told apart: the
+		// kind is fixed when the entry is created.
+		if have := existingKind(root, name, k, fl); have != KindUnknown && have != kind {
+			return Version{}, fmt.Errorf("%w: %s is %s, not %s", ErrKindMismatch, name, have, kind)
+		}
+	}
 	if err != nil {
 		return Version{}, err
 	}
 	defer e.close()
-	v, err := s.writeEntry(e, k, kind, value)
+	val, err := value()
 	if err != nil {
 		return Version{}, err
+	}
+	v, err := s.writeEntry(e, k, kind, val)
+	if err != nil {
+		return v, err // v is the committed version when err is ErrCommitted
 	}
 	// A new generation replaces whatever an interrupted Delete left recorded
 	// live for the name, and buries it first (set).
@@ -296,7 +333,7 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 		return changed
 	})
 	if err != nil {
-		return Version{}, fmt.Errorf("the entry is stored, but recording its floor failed (the next keys verb records it): %w", err)
+		return v, committedf(err, "version 1 is current, but recording its floor failed (the next keys verb records it)")
 	}
 	var gs []string
 	if buried != "" {
@@ -306,6 +343,26 @@ func (s *FileStore) put(ctx context.Context, name string, kind Kind, value []byt
 	// The entry is stored; a tombstone a floor write here dropped is
 	// reported with it (evicted), committed.
 	return v, evicted(fdir, dropped, nil)
+}
+
+// existingKind is the kind of name's current version, or KindUnknown when it
+// does not open.
+func existingKind(root *os.Root, name string, k keys, fl floor) Kind {
+	e, err := openEntry(root, name, fl)
+	if err != nil {
+		return KindUnknown
+	}
+	defer e.close()
+	cur, _, err := e.checkedPointer(k, fl)
+	if err != nil {
+		return KindUnknown
+	}
+	v, val, err := e.version(k, cur)
+	clear(val) // only the kind is wanted
+	if err != nil {
+		return KindUnknown
+	}
+	return v.Kind
 }
 
 // createEntry makes name's directory with a fresh generation. A directory
@@ -374,7 +431,9 @@ func (s *FileStore) initEntry(root *os.Root, name string, made fs.FileInfo) (*en
 	return e, nil
 }
 
-// writeEntry seals value as version 1 of e, then the pointer naming it.
+// writeEntry seals value as version 1 of e, then the pointer naming it. A
+// failure after the pointer's rename returns version 1 with an error
+// matching ErrCommitted.
 func (s *FileStore) writeEntry(e *entry, k keys, kind Kind, value []byte) (Version, error) {
 	created := s.now().Unix()
 	rec := record{kind: byte(kind), name: e.name, version: 1, generation: e.generation, created: created}
@@ -388,13 +447,54 @@ func (s *FileStore) writeEntry(e *entry, k keys, kind Kind, value []byte) (Versi
 	if err := ptr.seal(k.seal, k.scope, pointerPlaintext(1, 1), s.rand); err != nil {
 		return Version{}, err
 	}
-	if err := s.writeFile(e.root, currentName, ptr.marshal()); err != nil {
+	committed, err := s.commitPointer(e, ptr.marshal())
+	if !committed {
 		return Version{}, err
 	}
-	return versionOf(rec, value, k.fingerprint), nil
+	v := versionOf(rec, value, k.fingerprint)
+	if err != nil {
+		return v, committedf(err, "version 1 is current, but syncing its directory failed")
+	}
+	return v, nil
+}
+
+// commitPointer writes data as e's current pointer, whose rename is a
+// write's commit point. committed reports whether the rename succeeded: a
+// failure before it committed nothing, and a failure after it (the directory
+// fsync, behind the "sync current" step) committed the pointer.
+func (s *FileStore) commitPointer(e *entry, data []byte) (committed bool, err error) {
+	if err := s.renameInto(e.root, currentName, data, s.uid, s.gid, fileMode); err != nil {
+		return false, err
+	}
+	if err := s.step("sync " + currentName); err != nil {
+		return true, err
+	}
+	return true, syncDir(e.root)
+}
+
+// committedf is the error a write returns for cause, a failure after its
+// commit point: it matches ErrCommitted and nothing else. The cause is kept
+// in the message only, so a cause that matches ErrCorrupt (a floor refusal)
+// never makes a committed write read as a corrupt entry; ErrCommitted takes
+// precedence.
+func committedf(cause error, format string, args ...any) error {
+	return fmt.Errorf("%w: %s: %v", ErrCommitted, fmt.Sprintf(format, args...), cause)
+}
+
+// alsoEvicted is the text committedf's message carries for ev, a committed
+// eviction (evicted) the same write made before the failure it reports, or
+// "" when ev is nil: ErrCommitted takes precedence, so ev is in the message
+// only.
+func alsoEvicted(ev error) string {
+	if ev == nil {
+		return ""
+	}
+	return "; and: " + ev.Error()
 }
 
 // Current returns the version the current pointer names, with its value.
+// A version above the pointer is refused as readAbove says: one that
+// authenticates as this entry's is ErrOrphanVersion.
 func (s *FileStore) Current(ctx context.Context, name string) (Version, []byte, error) {
 	var (
 		v   Version
@@ -406,9 +506,22 @@ func (s *FileStore) Current(ctx context.Context, name string) (Version, []byte, 
 			return err
 		}
 		v, val, err = e.version(k, cur)
-		return err
+		if err := rawOnly(v, err); err != nil {
+			clear(val) // a refused typed envelope never lingers
+			val = nil
+			return err
+		}
+		if err := readAbove(ctx, e, k, cur); err != nil {
+			clear(val)
+			val = nil
+			return err
+		}
+		return nil
 	})
-	return v, val, err
+	if err != nil {
+		return Version{}, nil, err
+	}
+	return v, val, nil
 }
 
 // Absent reports whether name is definitively not an entry, for a caller
@@ -531,17 +644,42 @@ func (s *FileStore) Get(ctx context.Context, name string, version uint64) (Versi
 		val []byte
 	)
 	err := s.read(ctx, name, func(e *entry, k keys, fl floor) error {
-		cur, _, err := e.checkedPointer(k, fl)
+		cur, _, low, err := e.checkedRange(k, fl)
 		if err != nil {
 			return err
 		}
-		if version == 0 || version > cur {
+		if version == 0 || version > cur || version < low {
 			return ErrVersionNotFound
 		}
 		v, val, err = e.version(k, version)
-		return err
+		if err := rawOnly(v, err); err != nil {
+			clear(val) // a refused typed envelope never lingers
+			val = nil
+			return err
+		}
+		if err := readAbove(ctx, e, k, cur); err != nil {
+			clear(val)
+			val = nil
+			return err
+		}
+		return nil
 	})
-	return v, val, err
+	if err != nil {
+		return Version{}, nil, err
+	}
+	return v, val, nil
+}
+
+// rawOnly is err, or ErrTypedCredential for a typed version v: a raw read
+// never returns a typed envelope, which for oauth holds the refresh token.
+func rawOnly(v Version, err error) error {
+	if err != nil {
+		return err
+	}
+	if _, typedKind := credentialKind(v.Kind); typedKind {
+		return fmt.Errorf("%w: %s is %s", ErrTypedCredential, v.Name, v.Kind)
+	}
+	return nil
 }
 
 // read runs fn on name's entry under the shared lock, with the recorded
@@ -654,13 +792,15 @@ func (s *FileStore) list(ctx context.Context) ([]Entry, error) {
 // listEntry opens every committed version of e for List. Any failure, a
 // pointer the floor rules out included, is the entry's Err.
 func listEntry(e *entry, k keys, fl floor) Entry {
-	cur, _, err := e.checkedPointer(k, fl)
+	cur, _, low, err := e.checkedRange(k, fl)
 	if err != nil {
 		return Entry{Name: e.name, Err: err}
 	}
-	out := Entry{Name: e.name, Versions: make([]Version, 0, cur)}
-	for n := uint64(1); n <= cur; n++ {
-		v, _, err := e.version(k, n)
+	// The committed range is low..cur: versions below low were pruned.
+	out := Entry{Name: e.name, Versions: make([]Version, 0, cur-low+1)}
+	for n := low; n <= cur; n++ {
+		v, val, err := e.version(k, n)
+		clear(val) // List carries metadata only
 		if err != nil {
 			return Entry{Name: e.name, Err: fmt.Errorf("version %d: %w", n, err)}
 		}
@@ -1096,14 +1236,28 @@ func logBuried(name string, buried []string, dropped []pruned, after floor) {
 
 // Rotate seals value as the next version of name, of the kind name already
 // has, then flips the current pointer to it at the next sequence, then raises
-// the floor: docs/design/keystore.md § "Rotation and rollback". A crash
-// before the flip leaves the old version current and an unreferenced next
-// version, which the next Rotate discards before sealing the value it was
-// given; it never promotes it. A Rotate whose floor writes drop a tombstone
-// returns the version with a committed ErrTombstoneEvicted (Committed).
+// the floor: docs/design/keystore.md § "Rotation and rollback". A failure
+// before the flip leaves the old version current and removes the next
+// version it wrote, except for oauth: there a failure after the version
+// file is in place keeps it, for Orphan and Adopt, and returns an error
+// matching ErrOrphanVersion. A crash there leaves that sealed version above the
+// pointer, which the next Rotate refuses as ErrCorrupt and ErrOrphanVersion,
+// since a newer committed version behind a copied-back pointer looks the
+// same; it never promotes or unlinks it, and Adopt is the attended
+// promotion. A failure after the flip returns the new version
+// with an error matching ErrCommitted. A Rotate whose floor writes drop a
+// tombstone returns the version with a committed ErrTombstoneEvicted
+// (Committed).
 func (s *FileStore) Rotate(ctx context.Context, name string, value []byte) (Version, error) {
-	v, err := s.rotate(ctx, name, value)
+	v, err := s.rotate(ctx, name, func(_ *entry, _ keys, old Version) ([]byte, error) {
+		if err := checkValue(old.Kind, value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	})
 	if err != nil {
+		// v is the committed version when err is Committed (ErrCommitted
+		// or a committed ErrTombstoneEvicted), and zero otherwise.
 		if Committed(err) {
 			return v, fmt.Errorf("rotate %s: %w", name, err)
 		}
@@ -1112,7 +1266,12 @@ func (s *FileStore) Rotate(ctx context.Context, name string, value []byte) (Vers
 	return v, nil
 }
 
-func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Version, error) {
+// nextValue returns the value a rotation seals as the version after old,
+// the current version of e, opened under k; it refuses with the rotation's
+// reason.
+type nextValue func(e *entry, k keys, old Version) ([]byte, error)
+
+func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) (Version, error) {
 	if err := s.checkConfig(); err != nil {
 		return Version{}, err
 	}
@@ -1150,24 +1309,26 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 	if fl, err = s.syncFloor(ctx, root, fdir, fl, k); err != nil {
 		return Version{}, err
 	}
-	cur, seq, err := e.checkedPointer(k, fl)
+	cur, seq, low, err := e.checkedRange(k, fl)
 	if err != nil {
 		return Version{}, err
 	}
 	// The current version is opened, not only named: the new version takes
 	// its kind, and a Rotate over a current version that does not open would
 	// hide the damage behind a new one.
-	old, _, err := e.version(k, cur)
+	old, oldVal, err := e.version(k, cur)
+	clear(oldVal)
 	if err != nil {
 		return Version{}, err
 	}
-	if err := checkValue(old.Kind, value); err != nil {
+	value, err := nextVal(e, k, old)
+	if err != nil {
 		return Version{}, err
 	}
 	// The next sequence is above the floor's high-water mark, when a floor
 	// merge set one: the history a restore set aside never outranks it.
 	base := max(seq, fl[name].HighWater)
-	if cur >= maxVersion || base == math.MaxUint64 {
+	if cur >= versionLimit(old.Kind) || base == math.MaxUint64 {
 		return Version{}, fmt.Errorf("%w: the pointer is at the last version or sequence", ErrCorrupt)
 	}
 	nextSeq := base + 1
@@ -1176,65 +1337,152 @@ func (s *FileStore) rotate(ctx context.Context, name string, value []byte) (Vers
 	if err := fl.room(name, floorEntry{Generation: hex.EncodeToString(e.generation[:]), Seq: nextSeq}); err != nil {
 		return Version{}, err
 	}
-	if err := discardOrphans(ctx, e, cur); err != nil {
+	if err := discardOrphans(ctx, e, k, low, cur); err != nil {
 		return Version{}, err
 	}
 	next := cur + 1
+	// oauth keeps the current version and one previous: the pointer records
+	// low = cur, and the versions below it are unlinked after the floor.
+	newLow := low
+	if old.Kind == KindOAuth {
+		newLow = cur
+	}
 	created := s.now().Unix()
 	rec := record{kind: byte(old.Kind), name: name, version: next, generation: e.generation, created: created}
 	if err := rec.seal(k.seal, k.scope, value, s.rand); err != nil {
 		return Version{}, err
 	}
-	if err := s.writeFile(e.root, versionName(next), rec.marshal()); err != nil {
+	// The version is renamed into place, then its directory synced, as
+	// commitPointer does, so that every failure after the rename and before
+	// the flip, the fsync's included, removes it below.
+	if err := s.renameInto(e.root, versionName(next), rec.marshal(), s.uid, s.gid, fileMode); err != nil {
 		return Version{}, err
+	}
+	err = s.step("sync " + versionName(next))
+	if err == nil {
+		err = syncDir(e.root)
 	}
 	ptr := record{kind: kindPointer, name: name, generation: e.generation, created: created}
-	if err := ptr.seal(k.seal, k.scope, pointerPlaintext(next, nextSeq), s.rand); err != nil {
+	if err == nil {
+		err = ptr.seal(k.seal, k.scope, rangePlaintext(next, nextSeq, newLow), s.rand)
+	}
+	flipped := false
+	if err == nil {
+		flipped, err = s.commitPointer(e, ptr.marshal())
+	}
+	if !flipped {
+		// Nothing committed. An oauth version is kept: it holds the
+		// provider's new pair, whose refresh token the provider may have
+		// already rotated, so it is left above the pointer for Orphan and
+		// Adopt, and the error says so with ErrOrphanVersion.
+		if old.Kind == KindOAuth {
+			return Version{}, fmt.Errorf("%w: version %d was written but the pointer flip failed, so version %d stays current; "+
+				"version %d is kept for `k3sm keys adopt %s`; do not delete it: it may hold the only valid refresh token: %w",
+				ErrOrphanVersion, next, cur, next, qualified(name), err)
+		}
+		// Any other kind: the version just written is removed, best
+		// effort, since the next Rotate refuses a sealed version above the
+		// pointer rather than discard it (discardOrphans). Only a crash,
+		// or a failed removal here, leaves it.
+		if e.root.Remove(versionName(next)) == nil {
+			_ = syncDir(e.root) // best effort: a left version is refused, never promoted
+		}
 		return Version{}, err
 	}
-	if err := s.writeFile(e.root, currentName, ptr.marshal()); err != nil {
-		return Version{}, err
+	// The pointer's rename was the commit point: from here a failure
+	// returns the committed version with ErrCommitted, never a zero Version
+	// that reads as nothing written.
+	committed := versionOf(rec, value, k.fingerprint)
+	if err != nil {
+		return committed, committedf(err, "version %d is current, but syncing its directory failed", next)
 	}
 	if _, err := fdir.update(func(fl floor) bool { return fl.raise(name, e.generation, nextSeq) }); err != nil {
-		return Version{}, fmt.Errorf("version %d is current, but recording its floor failed (the next keys verb records it): %w", next, err)
+		return committed, committedf(err, "version %d is current, but recording its floor failed (the next keys verb records it)", next)
 	}
-	return versionOf(rec, value, k.fingerprint), evicted(fdir, nil, nil)
+	// A tombstone the floor write dropped is reported with the version
+	// (evicted), committed. A later prune failure takes precedence as
+	// ErrCommitted, which matches no other sentinel, so the eviction is
+	// then named in its message only.
+	ev := evicted(fdir, nil, nil)
+	if newLow > low {
+		// A crash before or during the prune leaves versions below newLow,
+		// which are not committed: the next write, Rewrap or Delete
+		// unlinks them.
+		if err := s.step("prune " + name); err != nil {
+			return committed, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)%s", next, newLow, alsoEvicted(ev))
+		}
+		if err := discardOrphans(ctx, e, k, newLow, next); err != nil {
+			return committed, committedf(err, "version %d is current, but pruning the versions below %d failed (the next write prunes them)%s", next, newLow, alsoEvicted(ev))
+		}
+	}
+	return committed, ev
 }
 
-// discardOrphans removes every version file of e numbered above cur: what a
-// Rotate interrupted before its pointer flip leaves. Each holds the value the
-// interrupted attempt carried, so none is ever promoted. It stops with ctx's
-// error when ctx is done (see loopCtx); what it removed stays removed, and the
-// next Rotate removes the rest.
+// discardOrphans removes every version file of e numbered below low, and
+// every true orphan numbered above cur: a file that does not open, under k,
+// as this entry's sealed record of the version its name says. A version
+// below low is what an oauth prune interrupted after its pointer flip
+// leaves, and it is unlinked unopened. It stops with ctx's error when ctx is
+// done (see loopCtx); what it removed stays removed, and the next Rotate
+// removes the rest.
 //
-// While the floor lags its pointer (a Rotate whose floor write failed), an
-// older pointer copied back passes the floor check, and the version the live
-// pointer named is then discarded here as an orphan. docs/design/keystore.md
-// § "Rotation and rollback" accepts that window: a crash before the flip
-// leaves the same state, and its orphan must be discarded.
-func discardOrphans(ctx context.Context, e *entry, cur uint64) error {
+// A version above cur that does authenticate as this generation's is never
+// unlinked: either an older pointer was copied back over a newer committed
+// one, inside the window a failed floor write leaves (the floor lags its
+// pointer, so the copied-back pointer passes the floor check), or a Rotate
+// crashed between writing that version and its pointer flip. The two leave
+// the same files, and only the first holds a committed version, for oauth
+// the only valid refresh token, so both are refused as ErrCorrupt and
+// ErrOrphanVersion, before anything is unlinked; Adopt promotes it.
+// docs/design/keystore.md § "Rotation and rollback".
+func discardOrphans(ctx context.Context, e *entry, k keys, low, cur uint64) error {
 	names, err := readDirNames(e.root, maxDirNames)
 	if err != nil {
 		return err
 	}
-	removed := false
+	var doomed []string
 	for i, n := range names {
 		if err := loopCtx(ctx, i); err != nil {
 			return err
 		}
 		v, ok := parseVersionName(n)
-		if !ok || v <= cur {
+		if !ok || (v >= low && v <= cur) {
 			continue
+		}
+		if v > cur {
+			r, pt, err := e.openRecord(k, n, false, v)
+			clear(pt) // only whether it opens is wanted
+			switch {
+			case err == nil:
+				return orphanError(e, Kind(r.kind) == KindOAuth, v, cur)
+			case !errors.Is(err, ErrCorrupt):
+				return fmt.Errorf("check the orphaned %s: %w", n, err)
+			}
+		}
+		doomed = append(doomed, n)
+	}
+	for i, n := range doomed {
+		if err := loopCtx(ctx, i); err != nil {
+			return err
 		}
 		if err := e.root.Remove(n); err != nil {
 			return fmt.Errorf("discard the orphaned %s: %w", n, err)
 		}
-		removed = true
 	}
-	if !removed {
+	if len(doomed) == 0 {
 		return nil
 	}
 	return syncDir(e.root)
+}
+
+// versionLimit is the highest version an entry of kind may reach:
+// maxOAuthVersion for oauth, which keeps two versions, and maxVersion for
+// every other kind, which keeps them all.
+func versionLimit(kind Kind) uint64 {
+	if kind == KindOAuth {
+		return maxOAuthVersion
+	}
+	return maxVersion
 }
 
 // parseVersionName returns the version a version file name names, if it is
@@ -1529,7 +1777,8 @@ func (e *entry) openRecord(k keys, name string, pointer bool, version uint64) (r
 	if err != nil {
 		return record{}, nil, err
 	}
-	kindOK := r.kind == byte(KindEd25519) || r.kind == byte(KindOpaque)
+	_, typedKind := credentialKind(Kind(r.kind))
+	kindOK := r.kind == byte(KindEd25519) || r.kind == byte(KindOpaque) || typedKind
 	if pointer {
 		kindOK = r.kind == kindPointer
 	}
@@ -1548,36 +1797,110 @@ func (e *entry) openRecord(k keys, name string, pointer bool, version uint64) (r
 // (checkedPointer does). It is the one decoder of a pointer, so every reader
 // gets the bound.
 func (e *entry) pointer(k keys) (version, seq uint64, err error) {
+	version, seq, _, err = e.pointerRange(k)
+	return version, seq, err
+}
+
+// pointerRange is pointer with low, the oldest committed version. It
+// opens the pointer and decodes it with decodePointer, which takes the kind
+// of the version it names from that version's record header when the form
+// depends on it.
+func (e *entry) pointerRange(k keys) (version, seq, low uint64, err error) {
 	_, pt, err := e.openRecord(k, currentName, true, 0)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	if len(pt) != pointerSize {
-		return 0, 0, fmt.Errorf("%w: the pointer is %d bytes", ErrCorrupt, len(pt))
+	return decodePointer(pt, e.isOAuth)
+}
+
+// decodePointer is the one decoder of a pointer's plaintext, which accepts
+// exactly what the writers produce (rangePlaintext as Put and Rotate call
+// it): version and sequence, both nonzero, the version at most maxVersion,
+// and low, the oldest committed version. Every other plaintext is
+// ErrCorrupt. isOAuth reports whether the version named is oauth, the one
+// kind that prunes; it is asked only when the form depends on it.
+//
+// An oauth rotation records low = version-1, which rangePlaintext writes in
+// the 16-byte form (low 1) at versions 1 and 2 and in the 24-byte form from
+// version 3. So a 24-byte pointer must be oauth with low = version-1 and
+// low at least 2, and a 16-byte pointer at version 3 or above must not be
+// oauth. Every other kind never prunes and is always 16 bytes.
+func decodePointer(pt []byte, isOAuth func(version uint64) (bool, error)) (version, seq, low uint64, err error) {
+	low = 1
+	switch len(pt) {
+	case pointerSize:
+	case prunedPointerSize:
+		low = binary.BigEndian.Uint64(pt[16:])
+	default:
+		return 0, 0, 0, fmt.Errorf("%w: the pointer is %d bytes", ErrCorrupt, len(pt))
 	}
 	version = binary.BigEndian.Uint64(pt[:8])
-	seq = binary.BigEndian.Uint64(pt[8:])
+	seq = binary.BigEndian.Uint64(pt[8:16])
 	if version == 0 || seq == 0 {
-		return 0, 0, fmt.Errorf("%w: the pointer names version %d at sequence %d", ErrCorrupt, version, seq)
+		return 0, 0, 0, fmt.Errorf("%w: the pointer names version %d at sequence %d", ErrCorrupt, version, seq)
 	}
-	if version > maxVersion {
-		return 0, 0, fmt.Errorf("%w: the pointer names version %d, over the %d-version limit", ErrCorrupt, version, maxVersion)
+	if version > maxOAuthVersion {
+		return 0, 0, 0, fmt.Errorf("%w: the pointer names version %d, over the %d-version limit", ErrCorrupt, version, uint64(maxOAuthVersion))
 	}
-	return version, seq, nil
+	pruned := len(pt) == prunedPointerSize
+	// Only a pruned oauth pointer may name a version past maxVersion: the
+	// kind is asked only in the 24-byte form, which every other kind is
+	// refused below.
+	if version > maxVersion && !pruned {
+		return 0, 0, 0, fmt.Errorf("%w: the pointer names version %d, over the %d-version limit", ErrCorrupt, version, maxVersion)
+	}
+	if !pruned && version <= 2 {
+		return version, seq, low, nil
+	}
+	oauth, err := isOAuth(version)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	switch {
+	case pruned && !oauth:
+		return 0, 0, 0, fmt.Errorf("%w: the pointer records a prune of an entry that is not oauth, which never prunes", ErrCorrupt)
+	case pruned && (low < 2 || low != version-1):
+		return 0, 0, 0, fmt.Errorf("%w: the pointer records oldest retained version %d at version %d; an oauth rotation records %d, in the 24-byte form from version 3", ErrCorrupt, low, version, version-1)
+	case !pruned && oauth:
+		return 0, 0, 0, fmt.Errorf("%w: the oauth pointer at version %d records no prune; an oauth rotation records oldest retained version %d", ErrCorrupt, version, version-1)
+	}
+	return version, seq, low, nil
+}
+
+// isOAuth reports whether version of e is oauth, from its record's kind
+// header, without opening it. A header relabelled to or from oauth fails the
+// record's open, since the kind is in its additional data.
+func (e *entry) isOAuth(version uint64) (bool, error) {
+	name := versionName(version)
+	b, _, err := readFile(e.root, name, maxRecordSize)
+	if err != nil {
+		return false, readError(name, err)
+	}
+	r, err := parseRecord(b)
+	if err != nil {
+		return false, err
+	}
+	return Kind(r.kind) == KindOAuth, nil
 }
 
 // checkedPointer is pointer, refused (a staleError, matching ErrCorrupt)
 // when the floor rules it out (docs/design/keystore.md § "Pointer sequence
 // and floor").
 func (e *entry) checkedPointer(k keys, fl floor) (version, seq uint64, err error) {
-	version, seq, err = e.pointer(k)
+	version, seq, _, err = e.checkedRange(k, fl)
+	return version, seq, err
+}
+
+// checkedRange is checkedPointer with the pointer's low (see pointerRange).
+func (e *entry) checkedRange(k keys, fl floor) (version, seq, low uint64, err error) {
+	version, seq, low, err = e.pointerRange(k)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	if err := fl.check(e.name, e.generation, seq); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	return version, seq, nil
+	return version, seq, low, nil
 }
 
 // version opens version n of e.
@@ -1589,7 +1912,14 @@ func (e *entry) version(k keys, n uint64) (Version, []byte, error) {
 	// The value authenticated, so it is what a Put sealed; a value that does
 	// not validate is still refused rather than handed to a fingerprint that
 	// assumes a valid key.
-	if err := checkValue(Kind(r.kind), value); err != nil {
+	if err := checkStored(Kind(r.kind), value); err != nil {
+		clear(value)
+		// An envelope version this build does not know was written by a
+		// newer k3sm, or altered to read as one: ErrKindUnsupported names
+		// both remedies, so it is not wrapped in ErrCorrupt.
+		if errors.Is(err, ErrKindUnsupported) {
+			return Version{}, nil, fmt.Errorf("version %d: %w", n, err)
+		}
 		return Version{}, nil, fmt.Errorf("%w: version %d: %w", ErrCorrupt, n, err)
 	}
 	return versionOf(r, value, k.fingerprint), value, nil
@@ -1604,7 +1934,31 @@ func versionOf(r record, value, fpKey []byte) Version {
 		Kind:        kind,
 		Created:     time.Unix(r.created, 0).UTC(),
 		Fingerprint: fingerprint(kind, value, fpKey),
+		identity:    versionIdentity(r),
+		digest:      r.digest(),
 	}
+}
+
+// versionIdentity is the identity of the version r seals: a domain-separated
+// SHA-256 of its name, generation, version number and record digest,
+// truncated. The generation is 16 random bytes fresh for every life of a
+// name, so no two lives share an identity, and the digest does not reveal
+// it. The record digest makes two different records of one version (a
+// failed attempt's file copied over its retry) two identities, so RotateIf
+// and Adopt cannot pass across them; a Rewrap, which re-seals every record,
+// changes every identity too.
+func versionIdentity(r record) [identitySize]byte {
+	h := sha256.New()
+	h.Write([]byte("k3sm keystore version identity\x00"))
+	h.Write([]byte(r.name))
+	h.Write([]byte{0})
+	h.Write(r.generation[:])
+	h.Write(binary.BigEndian.AppendUint64(nil, r.version))
+	d := r.digest()
+	h.Write(d[:])
+	var id [identitySize]byte
+	copy(id[:], h.Sum(nil))
+	return id
 }
 
 // versionName is version n's file name.
@@ -1615,4 +1969,15 @@ func versionName(n uint64) string { return "v" + strconv.FormatUint(n, 10) }
 func pointerPlaintext(version, seq uint64) []byte {
 	b := binary.BigEndian.AppendUint64(nil, version)
 	return binary.BigEndian.AppendUint64(b, seq)
+}
+
+// rangePlaintext is pointerPlaintext recording low, the oldest retained
+// version: the 16-byte form when low is 1, so a pointer that records no
+// prune stays byte-identical, and the 24-byte form otherwise.
+func rangePlaintext(version, seq, low uint64) []byte {
+	b := pointerPlaintext(version, seq)
+	if low == 1 {
+		return b
+	}
+	return binary.BigEndian.AppendUint64(b, low)
 }

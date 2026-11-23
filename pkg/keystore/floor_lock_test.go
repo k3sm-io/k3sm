@@ -543,13 +543,13 @@ func TestLoopsStopOnContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer e.close()
-	if err := discardOrphans(cancelled, e, 2); !errors.Is(err, context.Canceled) {
+	if err := discardOrphans(cancelled, e, k, 1, 2); !errors.Is(err, context.Canceled) {
 		t.Fatalf("discardOrphans under a cancelled context: %v, want context.Canceled", err)
 	}
 	if _, err := os.Lstat(orphan); err != nil {
 		t.Fatalf("the stopped discardOrphans removed the orphan: %v", err)
 	}
-	if err := discardOrphans(context.Background(), e, 2); err != nil {
+	if err := discardOrphans(context.Background(), e, k, 1, 2); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(orphan); !errors.Is(err, os.ErrNotExist) {
