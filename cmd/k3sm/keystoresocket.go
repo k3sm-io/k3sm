@@ -362,6 +362,8 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 
 // runKeystoreSocket runs the built ks (superviseKeystoreSocket). A nil ks
 // (a worker) runs nothing and stops at once.
+//
+//lint:ignore U1000 not called until the listener's socket source is chosen; the server start then runs the socket it built through it
 func runKeystoreSocket(ctx context.Context, ks *keystoreSocket) (stop func()) {
 	if ks == nil {
 		return noStop
