@@ -90,7 +90,16 @@ func protocolErrorf(format string, args ...any) error {
 // starts is io.EOF; one inside a frame is io.ErrUnexpectedEOF. Every length
 // is checked against its cap and against what remains of the frame before
 // the buffer it sizes is allocated.
-func ReadFrame(r io.Reader) (Frame, error) {
+func ReadFrame(r io.Reader) (Frame, error) { return readFrame(r, false) }
+
+// ReadHello reads a connection's first frame, which must be a HELLO with no
+// value, as ReadFrame does but stricter: a frame of any other type is
+// refused as soon as its length and type are read, before its header
+// length, header or value is read or allocated, and a HELLO whose length
+// leaves room for a value is refused before its header is read.
+func ReadHello(r io.Reader) (Frame, error) { return readFrame(r, true) }
+
+func readFrame(r io.Reader, hello bool) (Frame, error) {
 	var prefix [4 + minFrame]byte
 	if _, err := io.ReadFull(r, prefix[:4]); err != nil {
 		return Frame{}, err
@@ -102,12 +111,18 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	if n < minFrame {
 		return Frame{}, protocolErrorf("frame length %d under the minimum %d", n, minFrame)
 	}
-	if err := readBody(r, prefix[4:]); err != nil {
+	if err := readBody(r, prefix[4:5]); err != nil {
 		return Frame{}, err
 	}
 	f := Frame{Type: FrameType(prefix[4])}
 	if !f.Type.known() {
 		return Frame{}, protocolErrorf("unknown frame type %#02x", byte(f.Type))
+	}
+	if hello && f.Type != TypeHello {
+		return Frame{}, protocolErrorf("first frame is type %#02x, not HELLO", byte(f.Type))
+	}
+	if err := readBody(r, prefix[5:]); err != nil {
+		return Frame{}, err
 	}
 	rest := n - minFrame
 	hl := binary.BigEndian.Uint32(prefix[5:])
@@ -116,6 +131,9 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	}
 	if hl > rest {
 		return Frame{}, protocolErrorf("header length %d past the frame", hl)
+	}
+	if hello && hl != rest {
+		return Frame{}, protocolErrorf("HELLO carries %d bytes after its header", rest-hl)
 	}
 	f.Header = make([]byte, hl)
 	if err := readBody(r, f.Header); err != nil {

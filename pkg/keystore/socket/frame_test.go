@@ -48,6 +48,7 @@ func isProtocolError(err error) bool {
 // the stream, and every frame it accepts re-encodes to the bytes it read.
 func FuzzFrameReader(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
+		checkReadHello(t, data)
 		r := bytes.NewReader(data)
 		off := 0
 		for {
@@ -212,5 +213,65 @@ func TestFrameCapCoversMaxValue(t *testing.T) {
 	}
 	if len(got.Header) != MaxHeader || len(got.Value) != keystore.MaxValueSize {
 		t.Fatalf("largest request read back as header %d, value %d", len(got.Header), len(got.Value))
+	}
+}
+
+// checkReadHello holds ReadHello to its contract on data: it returns a
+// HELLO with no value, or a protocol error or an end of stream; and a frame
+// that is not a HELLO is refused having read no more than its length and
+// type, a HELLO with a value having read no more than its length, type and
+// header length.
+func checkReadHello(t *testing.T, data []byte) {
+	t.Helper()
+	r := bytes.NewReader(data)
+	fr, err := ReadHello(r)
+	read := len(data) - r.Len()
+	if err != nil {
+		if !isProtocolError(err) && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("ReadHello error %v is neither a protocol error nor an end of stream", err)
+		}
+		if len(data) >= 5 && FrameType(data[4]) != TypeHello && read > 5 {
+			t.Fatalf("ReadHello read %d bytes of a frame of type %#02x, want at most 5", read, data[4])
+		}
+		return
+	}
+	if fr.Type != TypeHello || fr.Value != nil {
+		t.Fatalf("ReadHello accepted type %#02x with value %v", byte(fr.Type), fr.Value != nil)
+	}
+}
+
+// TestReadHelloRefusesBeforeTheBody checks that before HELLO a frame of
+// another type is refused after five bytes, whatever its header and value
+// say, and that a HELLO carrying a value is refused before its header is
+// read.
+func TestReadHelloRefusesBeforeTheBody(t *testing.T) {
+	req, err := AppendFrame(nil, Frame{Type: TypeRequest, Header: bytes.Repeat([]byte("h"), MaxHeader), Value: make([]byte, 1000)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := bytes.NewReader(req)
+	if _, err := ReadHello(r); !isProtocolError(err) {
+		t.Fatalf("ReadHello on a request = %v, want a protocol error", err)
+	}
+	if read := len(req) - r.Len(); read != 5 {
+		t.Fatalf("ReadHello read %d bytes of a request, want 5", read)
+	}
+	hv, err := AppendFrame(nil, Frame{Type: TypeHello, Header: []byte(helloV1), Value: []byte("v")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r = bytes.NewReader(hv)
+	if _, err := ReadHello(r); !isProtocolError(err) {
+		t.Fatalf("ReadHello on a HELLO with a value = %v, want a protocol error", err)
+	}
+	if read := len(hv) - r.Len(); read != 4+minFrame {
+		t.Fatalf("ReadHello read %d bytes of a HELLO with a value, want %d", read, 4+minFrame)
+	}
+	ok, err := AppendFrame(nil, Frame{Type: TypeHello, Header: []byte(helloV1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, err := ReadHello(bytes.NewReader(ok)); err != nil || string(f.Header) != helloV1 {
+		t.Fatalf("ReadHello on a HELLO = %q, %v", f.Header, err)
 	}
 }

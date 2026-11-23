@@ -100,12 +100,11 @@ func (h *Handler) Serve(ctx context.Context, c Conn) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	f, err := ReadFrame(c)
+	// Before HELLO the type is judged on the first five bytes: nothing of
+	// a frame of another type, or of a HELLO with a value, is read further.
+	f, err := ReadHello(c)
 	if err != nil {
 		return err
-	}
-	if f.Type != TypeHello {
-		return protocolErrorf("first frame is type %#02x, not HELLO", byte(f.Type))
 	}
 	var hello helloRequest
 	if err := json.Unmarshal(f.Header, &hello); err != nil {

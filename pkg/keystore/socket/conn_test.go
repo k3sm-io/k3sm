@@ -130,8 +130,12 @@ func TestHelloReadDeadline(t *testing.T) {
 		{"nothing sent", 0, nil, RequestBound, func(err error) bool { return errors.Is(err, os.ErrDeadlineExceeded) }},
 		{"half a HELLO", 0, hello[:len(hello)/2], RequestBound, func(err error) bool { return errors.Is(err, os.ErrDeadlineExceeded) }},
 		{"deadline from the injected clock", -4 * time.Second, nil, RequestBound - 4*time.Second, func(err error) bool { return errors.Is(err, os.ErrDeadlineExceeded) }},
+		// The server stops reading these after the first five bytes (a
+		// HELLO with a value after nine), so the rest of the write meets
+		// a closed pipe.
 		{"request before HELLO", 0, request, 0, isProtocolError},
 		{"reply type before HELLO", 0, cat(be(7), []byte{byte(TypeReply)}, be(2), []byte("{}")), 0, isProtocolError},
+		{"HELLO with a value", 0, cat(be(uint32(5+len(helloV1)+5)), []byte{byte(TypeHello)}, be(uint32(len(helloV1))), []byte(helloV1), be(1), []byte("v")), 0, isProtocolError},
 		{"HELLO for another protocol", 0, cat(be(5+22), []byte{byte(TypeHello)}, be(22), []byte(`{"proto":"x","max":1}`+" ")), 0, isProtocolError},
 		{"HELLO header not JSON", 0, cat(be(5+3), []byte{byte(TypeHello)}, be(3), []byte("{{{")), 0, isProtocolError},
 	} {
@@ -139,7 +143,7 @@ func TestHelloReadDeadline(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				s := serve(t, func() time.Time { return time.Now().Add(tc.skew) })
 				if len(tc.send) > 0 {
-					if _, err := s.client.Write(tc.send); err != nil {
+					if _, err := s.client.Write(tc.send); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 						t.Fatalf("write: %v", err)
 					}
 				}
