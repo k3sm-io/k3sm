@@ -1135,7 +1135,9 @@ func (l *appendLog) appendLineSlack(uid uint32, line []byte, budget, revoke, sla
 // checks are appendLine's, over every line: a line that starts at or past
 // the hard cap needs budget and room in uid's revocation budget, the keys
 // the lines add are judged together, and the free space must hold the
-// buffer plus extra bytes the caller appends after it (an rm's audit line).
+// buffer, and, with extra bytes the caller appends after it (an rm's audit
+// line), the buffer's block-rounded reservation plus those bytes, beyond
+// the margin, so the caller's append passes its own preflight.
 // An error means nothing was committed, except a *linesLanded one: a
 // write that failed or landed short after whole lines of the buffer
 // reached the file, which the reader reads and holds in force.
@@ -1232,7 +1234,16 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 			}
 		}
 	}
-	if err := l.preflight(f, len(out)+extra, slack); err != nil {
+	need := len(out)
+	if extra > 0 {
+		// The caller appends extra bytes after the buffer (an rm's audit
+		// line), whose own preflight asks revokeFreeSlack plus its line
+		// of what this append leaves: the free space less the buffer's
+		// block-rounded reservation. Held to that here, before anything
+		// is written, the second append's preflight passes too.
+		need = int(reserveSize(int64(len(out)))) + extra
+	}
+	if err := l.preflight(f, need, slack); err != nil {
 		return err
 	}
 	// Reserve the buffer's blocks on this descriptor before the write, so a
@@ -1620,7 +1631,8 @@ func (f *fileFloorLog) bury(scope, name string, gen [generationSize]byte) error 
 // short of a crash. rm is in the revocation class: past the hard cap its
 // tombstones draw on the uid's revocation budget, the free-space margin does
 // not hold them, and the free space must also hold the rm's audit line,
-// which follows them as one more append (maxAppendLine).
+// which follows them as one more append (maxAppendLine) held to
+// revokeFreeSlack after the burial's block-rounded reservation.
 func (f *fileFloorLog) buryAll(scope, name string, gens [][generationSize]byte) error {
 	lines := make([][]byte, 0, len(gens))
 	for _, g := range gens {

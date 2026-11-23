@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -143,5 +144,71 @@ func TestRevokeFreeSlackCoversTwoBlocks(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "token", currentName)); err != nil {
 		t.Fatalf("the entry's pointer after the refused rm: %v", err)
+	}
+}
+
+// blockVolume is a fake volume both logs share: free space as an
+// unprivileged writer sees it, which every append's reservation takes in
+// whole logBlock blocks, as the file system allocates them.
+type blockVolume struct{ avail uint64 }
+
+func (v *blockVolume) install(t *testing.T, s *FileStore) {
+	t.Helper()
+	free := func(int) (uint64, error) { return v.avail, nil }
+	reserve := func(_ *os.File, n int64) error {
+		blocks := uint64(n+logBlock-1) / logBlock * logBlock
+		if blocks > v.avail {
+			return errors.New("injected: no space for the reservation")
+		}
+		v.avail -= blocks
+		return nil
+	}
+	for _, l := range []*appendLog{s.userFloor.(*fileFloorLog).log, s.auditSink.(*fileAuditLog).log} {
+		l.freeSpace, l.reserve = free, reserve
+	}
+}
+
+// For every free-space value near the edge, an rm either is refused before
+// anything is written, or its burial and its audit line both land: the
+// burial's preflight covers its own block-rounded consumption and the
+// audit append's preflight after it.
+func TestRmBurialFreeSpaceCoversItsAuditLine(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := fileLogScope(t)
+	v := &blockVolume{}
+	v.install(t, s)
+	refused, landed := 0, 0
+	for avail := uint64(revokeFreeSlack); avail <= revokeFreeSlack+3*logBlock+2*maxAppendLine; avail += 256 {
+		name := fmt.Sprintf("e%d", avail)
+		v.avail = 1 << 40
+		userPut(t, u, "user/1001/"+name, "a value")
+		v.avail = avail
+		floorBefore, auditBefore := readLog(t, s, userFloorLogName), readLog(t, s, auditLogName)
+		err := u.Delete(ctx, "user/1001/"+name)
+		floorAfter, auditAfter := readLog(t, s, userFloorLogName), readLog(t, s, auditLogName)
+		buried := bytes.Contains(floorAfter[len(floorBefore):], []byte(" rm "))
+		audited := false
+		for _, l := range bytes.Split(auditAfter[len(auditBefore):], []byte{'\n'}) {
+			if r, perr := parseAuditLine(l); perr == nil && r.Op == "rm" && (r.Result == auditResultOK || r.Result == auditResultCommitted) {
+				audited = true
+			}
+		}
+		if err != nil && !errors.Is(err, errCommitted) {
+			if !errors.Is(err, errLogNoSpace) || buried || audited {
+				t.Fatalf("free %d: a refused rm (%v) wrote: tombstones %v, a committed audit line %v", avail, err, buried, audited)
+			}
+			if _, lerr := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, name, currentName)); lerr != nil {
+				t.Fatalf("free %d: the entry's pointer after a refused rm: %v", avail, lerr)
+			}
+			refused++
+			continue
+		}
+		if !buried || !audited {
+			t.Fatalf("free %d: rm (%v): buried %v, audited %v; want both", avail, err, buried, audited)
+		}
+		landed++
+	}
+	if refused == 0 || landed == 0 {
+		t.Fatalf("the sweep met %d refusals and %d landings; want both, so it spans the edge", refused, landed)
 	}
 }
