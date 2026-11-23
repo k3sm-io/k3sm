@@ -2969,7 +2969,9 @@ func TestKeysFloorMergeDryRun(t *testing.T) {
 // exits as it would. A kept entry the moved-aside floor records as deleted
 // is reported "revoked, kept live" and warned of on stderr; one the restored
 // floor does not record is reported as the moved-aside version recorded,
-// with no warning. A buried-live line names --keep for an undo.
+// with no warning. A buried-live line names --keep for an undo. A staged
+// tree holding user-scope entries exits 4 too, saying they were carried
+// over without a floor check.
 func TestKeysFloorMergeReportCodes(t *testing.T) {
 	restore := func(t *testing.T, h *keysHarness, b recipeBackup) {
 		t.Helper()
@@ -3064,6 +3066,26 @@ func TestKeysFloorMergeReportCodes(t *testing.T) {
 		}
 		if _, err := os.Lstat(filepath.Join(h.work, "keystore", "rb")); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("rb's directory after the merge: %v, want it removed", err)
+		}
+	})
+	t.Run("user scoped", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/rb", []byte("v"))
+		b := backup(t, h)
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		restore(t, h, b)
+		// The restored keystore holds a user scope: the merge carries it
+		// over with no floor check of its deletions.
+		if err := os.MkdirAll(filepath.Join(recipePreRestore(h), "restored", ".user", "501"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"floor", "merge", "--dry-run"}, {"floor", "merge"}} {
+			if code := h.run(args...); code != keysCommitted {
+				t.Fatalf("%v with user-scope entries staged: exit %d, stderr %q; want %d", args, code, h.stderr.String(), keysCommitted)
+			}
+			if !strings.Contains(h.stdout.String(), "user scope: ") || !strings.Contains(h.stderr.String(), "user-scope entries without a floor check") {
+				t.Fatalf("%v printed %q, %q; want the user-scope report line and the exit-4 reason", args, h.stdout.String(), h.stderr.String())
+			}
 		}
 	})
 }

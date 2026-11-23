@@ -117,9 +117,11 @@ Exit codes: 0 done; 1 refused or failed; 2 usage; 3 rewrap completed an
 earlier interrupted rewrap instead (run it again with a new key); 4 the verb
 (put, rotate, rm or floor merge) is done, but the floor dropped a recorded
 deletion to stay within its limits, so a copy of that deleted entry put back
-is accepted, or floor merge kept an entry with --keep or left one
-unverified (read its report); 5 floor merge written, input not renamed:
-rerun to clear the guard (it wins over 4, and the report lists any drops).
+is accepted, or floor merge kept an entry with --keep, left one
+unverified, moved a target aside, or carried over user-scope entries
+without a floor check (read its report); 5 floor merge written, input not
+renamed: rerun to clear the guard (it wins over 4, and the report lists any
+drops).
 floor merge --dry-run exits as the merge itself would.
 `
 
@@ -1110,7 +1112,8 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysNotRenamed, "%v; to recover, fix what this names, leave keystore-floor.json and keystore-floor.json.pre-restore as they are, and run sudo k3sm keys floor merge again: it never plans the written merge again, only finishes the steps after the floor write (docs/user/keys.md)", err)
 	}
 	// Done, but what the floor refuses changed in a way to read: a drop, a
-	// kept entry or an unverified one. A dry run exits as the merge would.
+	// kept entry, an unverified one, a target moved aside, or user-scope
+	// entries carried over unchecked. A dry run exits as the merge would.
 	var why []string
 	if n := len(r.Dropped); n > 0 {
 		why = append(why, fmt.Sprintf("dropped %d deleted generation(s) to keep the floor within its caps", n))
@@ -1123,6 +1126,9 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	}
 	if r.MovedAside != "" {
 		why = append(why, fmt.Sprintf("moved aside the %s it found at the keystore directory", r.MovedAsideType))
+	}
+	if r.UserScoped {
+		why = append(why, "carried over the restored user-scope entries without a floor check, so a user/<uid>/ entry deleted since the backup is back")
 	}
 	if len(why) > 0 {
 		lead := "the merge is written, but it"
