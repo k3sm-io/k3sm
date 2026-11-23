@@ -231,7 +231,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 			continue
 		}
 		last = ""
-		ln, err := s.cfg.Listen(ctx)
+		ln, err := guard(func() (net.Listener, error) { return s.cfg.Listen(ctx) })
 		if err == nil && ln == nil {
 			err = errors.New("the listener source returned no socket")
 		}
@@ -306,24 +306,31 @@ type Preconditions struct {
 // maintenance marker, the mount flags, the installed files, a server count
 // of exactly one) and returns the first reason the listener may not start,
 // with its error's text, or "" when every check passes.
+//
+// A check that panics is recovered and fails as that check: its reason,
+// with the panic as its detail.
 func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
-	if euid := p.EUID(); euid < 0 || uint64(euid) != uint64(p.ServiceUID) {
+	euid, err := guard(func() (int, error) { return p.EUID(), nil })
+	if err != nil {
+		return OffNotInstalledServer, err.Error()
+	}
+	if euid < 0 || uint64(euid) != uint64(p.ServiceUID) {
 		return OffNotInstalledServer, fmt.Sprintf("effective uid %d is not the service uid %d", euid, p.ServiceUID)
 	}
-	if marked, err := p.MaintenanceMarked(); err != nil {
+	if marked, err := guard(p.MaintenanceMarked); err != nil {
 		return OffMaintenanceUnknown, err.Error()
 	} else if marked {
 		return OffMaintenance, ""
 	}
-	if ignores, err := p.IgnoresOwnership(); err != nil {
+	if ignores, err := guard(p.IgnoresOwnership); err != nil {
 		return OffMountUnknown, err.Error()
 	} else if ignores {
 		return OffIgnoresOwnership, "MNT_IGNORE_OWNERSHIP is set"
 	}
-	if err := p.CheckInstall(ctx); err != nil {
+	if _, err := guard(func() (struct{}, error) { return struct{}{}, p.CheckInstall(ctx) }); err != nil {
 		return OffInstall, err.Error()
 	}
-	n, err := p.ServerCount(ctx)
+	n, err := guard(func() (int, error) { return p.ServerCount(ctx) })
 	switch {
 	case err != nil:
 		return OffServersUnknown, err.Error()
@@ -333,6 +340,23 @@ func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
 		return OffServersUnknown, fmt.Sprintf("%d servers registered", n)
 	}
 	return "", ""
+}
+
+// errPanicked is an injected step that panicked; the supervisor treats it
+// as that step failing.
+var errPanicked = errors.New("keystore socket: recovered a panic")
+
+// guard calls f, turning a panic in it into an error wrapping errPanicked
+// that names the panic. The supervisor logs it with the step's off or
+// backoff line; the stack is not kept, so a doctor detail stays one line.
+func guard[T any](f func() (T, error)) (v T, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			var zero T
+			v, err = zero, fmt.Errorf("%w: %v", errPanicked, r)
+		}
+	}()
+	return f()
 }
 
 // Remedy is the command the server log and doctor name for r, or "" when
@@ -467,7 +491,7 @@ func (s *Supervisor) serve(ctx context.Context, ln net.Listener) (runEnd, error)
 			return endDone, nil
 		case <-tick:
 		}
-		marked, err := s.cfg.MaintenanceMarked()
+		marked, err := guard(s.cfg.MaintenanceMarked)
 		if err == nil && !marked {
 			continue
 		}

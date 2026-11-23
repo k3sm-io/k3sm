@@ -22,9 +22,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -147,29 +149,77 @@ func (l *Listener) Serve(ctx context.Context) error {
 		_ = l.ln.Close() // ends Accept; a close error leaves nothing to undo
 	})
 	connCtx, cut := context.WithCancel(ctx)
-	defer cut()
 	var wg sync.WaitGroup
+	// Every exit, a panic included, stops the close (so it cannot reach a
+	// socket a later run reuses), cuts and waits for the connections and
+	// queues the last summaries, all before the audit queue is drained.
+	defer func() {
+		stopClose()
+		cut()
+		wg.Wait()
+		l.refusals.summarize()
+	}()
 	wg.Go(func() {
 		defer l.recovered("refusal summary")
 		l.summarizeEvery(connCtx)
 	})
-	var err error
+	retry := time.Duration(0)
 	for {
-		c, aerr := l.ln.Accept()
-		if aerr != nil {
-			err = aerr
-			break
+		c, err := l.ln.Accept()
+		if err == nil {
+			retry = 0
+			l.admit(connCtx, &wg, c)
+			continue
 		}
-		l.admit(connCtx, &wg, c)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !transientAcceptError(err) {
+			return err
+		}
+		retry = min(max(2*retry, AcceptRetryMin), AcceptRetryMax)
+		if !l.sleep(ctx, retry) {
+			return nil
+		}
 	}
-	stopClose()
-	cut()
-	wg.Wait()
-	l.refusals.summarize()
-	if ctx.Err() != nil {
-		return nil
+}
+
+// The accept loop's wait after a transient Accept error: AcceptRetryMin,
+// doubling on each further one up to AcceptRetryMax, back to the start
+// after an Accept succeeds. Neither connections nor the supervisor's
+// backoff are touched.
+const (
+	AcceptRetryMin = 5 * time.Millisecond
+	AcceptRetryMax = time.Second
+)
+
+// transientAcceptError reports whether err is an Accept error the loop
+// waits out: out of descriptors (EMFILE, ENFILE), a connection aborted
+// before it was accepted (ECONNABORTED), an interrupted call (EINTR), or a
+// net.Error that says it is temporary and is not a deadline (an expired
+// deadline is how a paused socket ends Accept).
+func transientAcceptError(err error) bool {
+	switch {
+	case errors.Is(err, syscall.EMFILE), errors.Is(err, syscall.ENFILE),
+		errors.Is(err, syscall.ECONNABORTED), errors.Is(err, syscall.EINTR):
+		return true
+	case errors.Is(err, os.ErrDeadlineExceeded), errors.Is(err, net.ErrClosed):
+		return false
 	}
-	return err
+	var t interface{ Temporary() bool }
+	return errors.As(err, &t) && t.Temporary()
+}
+
+// sleep waits d on the clock, reporting false when ctx ends it first.
+func (l *Listener) sleep(ctx context.Context, d time.Duration) bool {
+	tick, stop := l.clock.After(d)
+	defer stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-tick:
+		return true
+	}
 }
 
 // drainAudit closes the audit queue and waits for the writer to drain it,
@@ -207,6 +257,17 @@ func (l *Listener) summarizeEvery(ctx context.Context) {
 // admit refuses c, closes it over a cap, or serves it until it ends or ctx
 // is done.
 func (l *Listener) admit(ctx context.Context, wg *sync.WaitGroup, c net.Conn) {
+	// A panic deciding admission closes c before it goes on to end the
+	// run, so the connection is never left open.
+	served := false
+	defer func() {
+		if !served {
+			if v := recover(); v != nil {
+				_ = c.Close() // never admitted: nothing was written
+				panic(v)
+			}
+		}
+	}()
 	uid, reason := l.check(c)
 	if reason != "" {
 		_ = c.Close() // refused: nothing was written, nothing is owed
@@ -217,6 +278,7 @@ func (l *Listener) admit(ctx context.Context, wg *sync.WaitGroup, c net.Conn) {
 		_ = c.Close() // over a cap: nothing was written, nothing is owed
 		return
 	}
+	served = true
 	wg.Go(func() {
 		// A panic serving one connection ends that connection only: it is
 		// recovered here, after the deferred close and release have run.

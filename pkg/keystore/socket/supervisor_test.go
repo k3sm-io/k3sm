@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -121,6 +122,14 @@ type startChecks struct {
 	listens    int
 	counted    int
 	ln         net.Listener // what the listener source returns
+	panics     string       // the step that panics: euid, marker, mount, install, count or listen
+}
+
+// boom panics when step is the one set to.
+func (c *startChecks) boom(step string) {
+	if c.panics == step {
+		panic("fake: " + step + " panicked")
+	}
 }
 
 func (c *startChecks) set(f func(c *startChecks)) {
@@ -234,25 +243,29 @@ func (r *supRig) config() SupervisorConfig {
 			ck.mu.Lock()
 			defer ck.mu.Unlock()
 			ck.listens++
+			ck.boom("listen")
 			return ck.ln, nil
 		},
-		EUID:       func() int { ck.mu.Lock(); defer ck.mu.Unlock(); return ck.euid },
+		EUID:       func() int { ck.mu.Lock(); defer ck.mu.Unlock(); ck.boom("euid"); return ck.euid },
 		ServiceUID: serviceUID,
 		IgnoresOwnership: func() (bool, error) {
 			ck.mu.Lock()
 			defer ck.mu.Unlock()
+			ck.boom("mount")
 			return ck.ignores, ck.mountErr
 		},
-		CheckInstall: func(context.Context) error { ck.mu.Lock(); defer ck.mu.Unlock(); return ck.install },
+		CheckInstall: func(context.Context) error { ck.mu.Lock(); defer ck.mu.Unlock(); ck.boom("install"); return ck.install },
 		ServerCount: func(context.Context) (int, error) {
 			ck.mu.Lock()
 			defer ck.mu.Unlock()
 			ck.counted++
+			ck.boom("count")
 			return ck.servers, ck.serversErr
 		},
 		MaintenanceMarked: func() (bool, error) {
 			ck.mu.Lock()
 			defer ck.mu.Unlock()
+			ck.boom("marker")
 			return ck.marked, ck.markerErr
 		},
 		Creds:   r.creds,
@@ -521,10 +534,16 @@ func TestListenerRecoversPanic(t *testing.T) {
 		// A panic in the accept loop: recovered, logged, connections cut,
 		// and the listener restarted after MinBackoff on the same socket.
 		r.creds.boom.Store(true)
-		boom, _ := net.Pipe()
+		boom, boomClient := net.Pipe()
 		r.ln.conns <- boom
 		synctest.Wait()
 		r.wantState(t, PhaseBackingOff, OffListenerFailed, MinBackoff)
+		// The connection whose admission panicked is closed, not leaked.
+		var b [1]byte
+		_ = boomClient.SetReadDeadline(time.Now().Add(time.Second)) // a leaked conn fails, not hangs
+		if n, err := boomClient.Read(b[:]); n != 0 || !errors.Is(err, io.EOF) {
+			t.Fatalf("the panicking admission's peer read %d bytes, %v; want EOF", n, err)
+		}
 		if n := r.log.count("level=ERROR", "listener panicked", "peer-credential source panicked"); n != 1 {
 			t.Fatalf("%d lines logging the panic, want 1", n)
 		}
