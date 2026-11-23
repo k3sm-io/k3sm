@@ -44,7 +44,16 @@ func TestSappndMeasuredFacts(t *testing.T) {
 		t.Skip("root-run (U195): run as root through hack/acceptance/keystore.sh --root")
 	}
 	svcUID, svcGID := serviceIDs(t)
-	dir := t.TempDir()
+	// The service user must reach the source files for the link probes
+	// below: a t.TempDir() sits under root's 0700 directories, where its
+	// link fails with EACCES for the path, not the flag. So the files live
+	// in a root-created 0755 directory under the sticky, world-searchable
+	// /private/tmp, and each link lands in a directory the service user
+	// owns.
+	dir, err := os.MkdirTemp("/private/tmp", "k3sm-sappnd-")
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 			if err == nil && d.Type()&fs.ModeSymlink == 0 {
@@ -52,6 +61,7 @@ func TestSappndMeasuredFacts(t *testing.T) {
 			}
 			return nil
 		})
+		_ = os.RemoveAll(dir) // the flags are clear, so every name goes
 	})
 	if err := os.Chmod(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -137,7 +147,7 @@ func TestSappndMeasuredFacts(t *testing.T) {
 	unchanged("the pre-flag descriptor's pwrite and ftruncate", p)
 
 	own := filepath.Join(dir, "service-own")
-	if err := os.Mkdir(own, 0o700); err != nil {
+	if err := os.Mkdir(own, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chown(own, int(svcUID), int(svcGID)); err != nil {
@@ -164,11 +174,8 @@ func TestSappndMeasuredFacts(t *testing.T) {
 	}
 	p, _ = file(true)
 	err = asService(func() error { return unix.Link(p, filepath.Join(own, "alias-flagged")) })
-	if err == nil {
-		t.Errorf("the service user's link of a flagged file succeeded, want a failure")
-	} else {
-		t.Logf("the service user's link of a flagged file: %v", err)
-	}
+	t.Logf("the service user's link of a flagged file: %v", err)
+	wantErrno("the service user's link of a flagged file (the flag, not the path, must refuse it)", err, unix.EPERM)
 	if err := unix.Lstat(p, &st); err != nil || st.Nlink != 1 {
 		t.Errorf("after the service user's link the flagged file has nlink %d (%v), want 1", st.Nlink, err)
 	}
