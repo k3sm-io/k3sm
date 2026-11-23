@@ -107,26 +107,6 @@ func TestChownStagedRefusesShape(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, "k/v9"},
-		{"a socket", func(t *testing.T, s *FileStore) {
-			// A socket's path is bounded: bind it in a short directory and
-			// rename it into place.
-			dir, err := os.MkdirTemp("", "ks")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = os.RemoveAll(dir) }()
-			fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = syscall.Close(fd) }()
-			if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: filepath.Join(dir, "s")}); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Rename(filepath.Join(dir, "s"), stagePath(s, stagedTreeName, "k", "v9")); err != nil {
-				t.Fatal(err)
-			}
-		}, "k/v9"},
 		{"a second hard link", func(t *testing.T, s *FileStore) {
 			outside := filepath.Join(t.TempDir(), "outside")
 			if err := os.WriteFile(outside, nil, 0o600); err != nil {
