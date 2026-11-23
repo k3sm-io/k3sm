@@ -114,25 +114,69 @@ func TestCloneArchiveStripsXattrsAndACL(t *testing.T) {
 	}
 }
 
-// An extended attribute that cannot be removed refuses the clone, naming
-// it: none is skipped.
-func TestCloneArchiveRefusesUnremovableXattr(t *testing.T) {
+// An extended attribute on the clone that cannot be removed, as a
+// protected system attribute cannot, does not refuse rotate: the clone is
+// discarded and the archive is a copy, which carries no extended
+// attribute, holds the whole log at open and is the caller's 0600.
+func TestCloneArchiveProtectedXattr(t *testing.T) {
 	f, nad, dir := cloneSource(t)
 	withDecoratedClone(t, dir)
+	var cloned bool
+	prevClone := cloneFileAt
+	cloneFileAt = func(src, d int, name string) error {
+		err := prevClone(src, d, name)
+		cloned = err == nil
+		return err
+	}
 	prev := fremovexattr
+	var refused bool
 	fremovexattr = func(fd int, name string) error {
 		if name == "com.k3sm.planted" {
+			refused = true
 			return unix.EPERM
 		}
 		return prev(fd, name)
 	}
-	t.Cleanup(func() { fremovexattr = prev })
-	err := cloneArchive(&oldLog{f: f, size: 8}, nad, "one")
-	if errors.Is(err, errCloneRefused) {
-		t.Skipf("this volume refuses clonefile: %v", err)
+	volumeSpace = func(int) (int64, int64, error) { return 1 << 40, 1 << 40, nil }
+	t.Cleanup(func() { cloneFileAt = prevClone; fremovexattr = prev; volumeSpace = defaultVolumeSpace })
+	if err := archiveLog(&oldLog{f: f, size: 8}, nad, "one"); err != nil {
+		t.Fatalf("archiving with an unremovable attribute on the clone: %v, want the copy", err)
 	}
-	if err == nil || !strings.Contains(err.Error(), `remove the extended attribute "com.k3sm.planted"`) || !errors.Is(err, unix.EPERM) {
-		t.Fatalf("cloneArchive with an unremovable attribute: %v, want a refusal naming it", err)
+	if !cloned {
+		t.Skip("this volume refuses clonefile; the copy path is tested elsewhere")
+	}
+	if !refused {
+		t.Fatal("the attribute removal was never tried")
+	}
+	p := filepath.Join(dir, "one")
+	if b, err := os.ReadFile(p); err != nil || string(b) != "one\ntwo\n" {
+		t.Fatalf("the archive holds %q (%v), want the whole log at open", b, err)
+	}
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if names, err := listXattrs(fd); err != nil || len(names) != 0 {
+		t.Fatalf("the archive carries extended attributes %q (%v), want none", names, err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		t.Fatal(err)
+	}
+	if int(st.Uid) != os.Geteuid() || st.Mode&0o7777 != logMode || statFlags(&st) != 0 || st.Nlink != 1 {
+		t.Fatalf("the archive is uid %d mode %04o flags %#x nlink %d, want the caller's 0600, unflagged, one link", st.Uid, st.Mode&0o7777, statFlags(&st), st.Nlink)
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	if strings.Join(names, ",") != "log,one" {
+		t.Fatalf("the directory holds %q, want only the log and its archive: no clone left behind", names)
 	}
 }
 
