@@ -413,39 +413,17 @@ func TestRebuildKeepsDamagedEntryCorrupt(t *testing.T) {
 	}
 }
 
-// U80 (rm-scope and floor --rebuild): the walks of .user/<uid>/ refuse a
-// planted symlink, FIFO or misplaced directory, changing nothing, and
-// rm-scope removes the tree once it holds only what the layout puts there.
+// U80 (rm-scope and floor --rebuild): floor --rebuild refuses a symlink
+// planted in a scope's tree, changing nothing; rm-scope removes a planted
+// symlink, FIFO and extra directories without following any of them.
 func TestRootWalksRefusePlantedNames(t *testing.T) {
 	ctx := context.Background()
 	s, server, _ := fileLogScope(t)
 	dir := scopeDir(server, "1001")
 	entry := filepath.Join(dir, scopeEntriesName, "token")
-	plants := []struct {
-		name  string
-		plant func(p string) error
-		at    string
-	}{
-		{"symlink", func(p string) error { return os.Symlink("/etc/passwd", p) }, filepath.Join(entry, "evil")},
-		{"fifo", func(p string) error { return syscall.Mkfifo(p, 0o600) }, filepath.Join(dir, "evil")},
-		{"directory", func(p string) error { return os.Mkdir(p, 0o700) }, filepath.Join(entry, "evil")},
-		{"directory in the scope", func(p string) error { return os.Mkdir(p, 0o700) }, filepath.Join(dir, "evil")},
-	}
-	for _, tc := range plants {
-		if err := tc.plant(tc.at); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := s.RemoveScope(ctx, 1001); !errors.Is(err, errPlanted) {
-			t.Fatalf("rm-scope over a planted %s: %v, want errPlanted", tc.name, err)
-		}
-		for _, n := range []string{filepath.Join(dir, scopeKeyName), filepath.Join(dir, deliveriesName), filepath.Join(entry, currentName)} {
-			if _, err := os.Lstat(n); err != nil {
-				t.Fatalf("a refused rm-scope over a planted %s removed %s: %v", tc.name, n, err)
-			}
-		}
-		if err := os.Remove(tc.at); err != nil {
-			t.Fatal(err)
-		}
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("not the scope's"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	// floor --rebuild refuses a symlink planted at the delivery record.
 	p := filepath.Join(dir, deliveriesName)
@@ -464,10 +442,77 @@ func TestRootWalksRefusePlantedNames(t *testing.T) {
 	if err := os.Rename(p+".aside", p); err != nil {
 		t.Fatal(err)
 	}
+	plants := []struct {
+		name  string
+		plant func(p string) error
+		at    string
+	}{
+		{"symlink", func(p string) error { return os.Symlink(outside, p) }, filepath.Join(entry, "evil")},
+		{"symlink to a directory", func(p string) error { return os.Symlink(filepath.Dir(outside), p) }, filepath.Join(dir, "evil-link")},
+		{"fifo", func(p string) error { return syscall.Mkfifo(p, 0o600) }, filepath.Join(dir, "evil")},
+		{"directory", func(p string) error { return os.MkdirAll(filepath.Join(p, "a", "b"), 0o700) }, filepath.Join(entry, "evil-dir")},
+		{"fifo in a directory in the scope", func(p string) error {
+			if err := os.Mkdir(p, 0o700); err != nil {
+				return err
+			}
+			return syscall.Mkfifo(filepath.Join(p, "fifo"), 0o600)
+		}, filepath.Join(dir, "evil-dir")},
+	}
+	for _, tc := range plants {
+		if err := tc.plant(tc.at); err != nil {
+			t.Fatalf("plant a %s: %v", tc.name, err)
+		}
+	}
 	if _, err := s.RemoveScope(ctx, 1001); err != nil {
-		t.Fatalf("rm-scope of a clean tree: %v", err)
+		t.Fatalf("rm-scope over planted names: %v", err)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the scope directory is still there: %v", err)
+	}
+	if b, err := os.ReadFile(outside); err != nil || string(b) != "not the scope's" {
+		t.Fatalf("rm-scope followed a planted symlink: %q, %v", b, err)
+	}
+}
+
+// rm-scope that stops part-way says what state it left, and a rerun
+// finishes the removal.
+func TestRemoveScopeRerunFinishesPartialRemoval(t *testing.T) {
+	if asRoot() {
+		t.Skip("root removes in a read-only directory; the partial removal needs a non-root run")
+	}
+	ctx := context.Background()
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	entry := filepath.Join(dir, scopeEntriesName, "token")
+	if err := os.Chmod(entry, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(entry, 0o700) })
+	_, err := s.RemoveScope(ctx, 1001)
+	if err == nil || !strings.Contains(err.Error(), "is listed as removed") || !strings.Contains(err.Error(), "partly or wholly present") || !strings.Contains(err.Error(), "rerun sudo k3sm keys rm-scope user/1001 --yes") || strings.Contains(err.Error(), "nothing was changed") {
+		t.Fatalf("a stopped rm-scope: %v; want the recorded, partly present state and the rerun", err)
+	}
+	if r := readRecord(t, s); r.keys() != 1 {
+		t.Fatalf("the record lists %d keys, want 1", r.keys())
+	}
+	if err := os.Chmod(entry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
+		t.Fatalf("the rerun: %v, recorded %v", err, recorded)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there after the rerun: %v", err)
+	}
+
+	// A directory left without scope.key is finished as it stands.
+	if err := os.MkdirAll(filepath.Join(dir, scopeEntriesName, "left"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
+		t.Fatalf("rm-scope of a directory without scope.key: %v, recorded %v", err, recorded)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the keyless scope directory is still there: %v", err)
 	}
 }
