@@ -75,7 +75,7 @@ func TestKeystoreFilesReportsCommittedMarker(t *testing.T) {
 				t.Fatal(err)
 			}
 			line := `"op":"floor-rebuild","via":"root","scope":"system","name":"-","namespace":"","result":"committed"`
-			want := "install: an earlier floor --rebuild committed and dropped 2 lines, and was not reported: dropped=2, keys=5\n"
+			want := "install: an earlier floor --rebuild committed and dropped 2 lines, and was not reported: dropped=2, keys=5; install does not exit 4 for it: run sudo k3sm doctor and check its keystore-floor row\n"
 			if !committed {
 				if stderr.Len() != 0 || strings.Contains(string(audit), line) {
 					t.Fatalf("a marker that never committed was reported: %q / %q", stderr.String(), audit)
@@ -89,5 +89,16 @@ func TestKeystoreFilesReportsCommittedMarker(t *testing.T) {
 				t.Fatalf("the audit log %q holds no committed floor-rebuild line", audit)
 			}
 		})
+	}
+}
+
+// Install adds the doctor hint only to an earlier run that dropped lines.
+func TestEarlierRunDropHint(t *testing.T) {
+	if h := earlierRunDropHint(&keystore.EarlierRun{Verb: "floor-rebuild", Report: map[string]int64{"keys": 5}}); h != "" {
+		t.Fatalf("a clean earlier run got the hint %q", h)
+	}
+	h := earlierRunDropHint(&keystore.EarlierRun{Verb: "floor-rebuild", Report: map[string]int64{"absent": 1, "keys": 5}})
+	if !strings.Contains(h, "sudo k3sm doctor") || !strings.Contains(h, "keystore-floor row") {
+		t.Fatalf("a lossy earlier run got %q, want doctor and the keystore-floor row", h)
 	}
 }

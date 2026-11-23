@@ -171,7 +171,7 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 		// A committed run the marker records was not reported: report it
 		// and audit it before the marker goes.
 		if r := keystore.EarlierRunAtInstall(dfd, g.lfd, rootUID, time.Now()); r != nil {
-			fmt.Fprintf(keystoreStderr, "install: %s\n", r)
+			fmt.Fprintf(keystoreStderr, "install: %s%s\n", r, earlierRunDropHint(r))
 		}
 		if err := unix.Unlinkat(dfd, keystore.MaintenanceMarkerName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			return fmt.Errorf("remove the stale %s: %w", keystore.MaintenanceMarkerName, err)
@@ -181,6 +181,17 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 		}
 	}
 	return nil
+}
+
+// earlierRunDropHint is what install adds to an earlier run's line when
+// that run dropped lines: a verb that reports such a run exits 4, but
+// install keeps its own exit codes, so the line itself sends the operator
+// to doctor and names the row. Only floor --rebuild drops lines.
+func earlierRunDropHint(r *keystore.EarlierRun) string {
+	if r.Dropped() == 0 {
+		return ""
+	}
+	return "; install does not exit 4 for it: run sudo k3sm doctor and check its keystore-floor row"
 }
 
 // errLogOldLocation is a log at a location no release keeps one at: the
