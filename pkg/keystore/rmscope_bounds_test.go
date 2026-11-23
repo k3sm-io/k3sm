@@ -91,7 +91,7 @@ func TestRemoveScopeForeignDirCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	_, err = removeScopeTree(root, s.dir, "1001", s.uid, true)
+	_, err = removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true})
 	if !errors.Is(err, errScopeForeignDir) {
 		t.Fatalf("removeScopeTree over %d foreign directories: %v, want errScopeForeignDir", n, err)
 	}
@@ -149,7 +149,7 @@ func TestRemoveScopeDepthLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	_, err = removeScopeTree(root, s.dir, "1001", s.uid, true)
+	_, err = removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true})
 	if !errors.Is(err, errScopeTreeDeep) {
 		t.Fatalf("removeScopeTree over a chain past the limit: %v, want errScopeTreeDeep", err)
 	}

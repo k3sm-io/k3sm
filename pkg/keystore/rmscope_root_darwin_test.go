@@ -123,7 +123,7 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = root.Close() }()
-			_, err = removeScopeTree(root, s.dir, "1001", s.uid, true)
+			_, err = removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true})
 			if plant == sfAppend {
 				var st unix.Stat_t
 				if !errors.Is(err, unix.EPERM) {
@@ -214,7 +214,7 @@ func TestRemoveScopeClearsServiceUserFIFOAndSocketAsRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	if _, err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+	if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 		t.Fatalf("removeScopeTree over the service user's flagged FIFO and socket, as root: %v", err)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
@@ -300,13 +300,13 @@ func TestRemoveScopeNameSwapAsRoot(t *testing.T) {
 			t.Fatal(err)
 		}
 		for range 5 {
-			_, _ = removeScopeTree(root, ks, "1001", svcUID, true) // the race may leave it busy
+			_, _ = removeScopeTree(root, ks, "1001", svcUID, rmTreeOpts{listed: true}) // the race may leave it busy
 		}
 		close(stop)
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
-		_, _ = removeScopeTree(root, ks, "1001", svcUID, true)
+		_, _ = removeScopeTree(root, ks, "1001", svcUID, rmTreeOpts{listed: true})
 		_ = root.Close()
 		var st unix.Stat_t
 		if err := unix.Lstat(victim, &st); err != nil || st.Flags != 0 {
@@ -496,7 +496,7 @@ func TestRemoveScopeTakesDirsFromServiceUserAsRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	_, rerr := removeScopeTree(root, s.dir, "1001", s.uid, true)
+	_, rerr := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true})
 	removed.Store(true)
 	wait(after) // and after the removal
 	close(stop)
@@ -635,7 +635,7 @@ func TestRemoveScopeRefusesForeignScopeDirAsRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	_, err = removeScopeTree(root, s.dir, "1001", s.uid, true)
+	_, err = removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true})
 	checkScopeDirRefused(t, err, s, fmt.Sprintf("uid %d owns it", other))
 	if *takes != 0 {
 		t.Errorf("rmTakeDir ran %d times, want none", *takes)

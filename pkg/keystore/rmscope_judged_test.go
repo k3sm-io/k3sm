@@ -1,0 +1,291 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package keystore
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"golang.org/x/sys/unix"
+)
+
+// rmScopeOf is uid's scope as RemoveScope builds it: a removed key opens.
+func rmScopeOf(s *FileStore, uid uint32) *UserScope {
+	return &UserScope{s: s, uid: uid, scope: userScopeOf(uid), allowRemoved: true}
+}
+
+// The service user owns .user and can rename another of its scope
+// directories onto the judged one's name after RemoveScope judged and
+// listed it (the seam does, just before the tree is removed): the
+// directory now at the name holds another scope's scope.key, so nothing of
+// it is taken or removed, its key is not listed, and the error names the
+// directory as not the judged scope, with no command and no rerun.
+func TestRemoveScopeRefusesSwappedScope(t *testing.T) {
+	s, server, _ := fileLogScope(t)
+	userPut(t, userScope(t, s, 1002), "user/1002/x", "x")
+	dir, other := scopeDir(server, "1001"), scopeDir(server, "1002")
+	away := filepath.Join(filepath.Dir(dir), "away")
+	before := treeNames(t, other)
+	var mode os.FileMode
+	ran := false
+	setSeam(t, &rmBeforeTree, func() {
+		ran = true
+		if err := os.Rename(dir, away); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(other, dir); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mode = fi.Mode()
+	})
+	takes := countTakes(t)
+	_, err := s.RemoveScope(t.Context(), 1001)
+	if !ran {
+		t.Fatal("the seam never ran")
+	}
+	if !errors.Is(err, errNotJudgedScope) {
+		t.Fatalf("rm-scope over a swapped-in scope directory: %v, want errNotJudgedScope", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, quoteName(dir)+" (named for reading, not for pasting)") || !strings.Contains(msg, "took nothing, changed nothing and removed nothing in it") {
+		t.Errorf("the error %q does not name the directory as untouched", msg)
+	}
+	for _, bad := range []string{"sudo", "rm -", "rerun"} {
+		if strings.Contains(msg, bad) {
+			t.Errorf("the error %q offers %q, which cannot help", msg, bad)
+		}
+	}
+	if *takes != 0 {
+		t.Errorf("rmTakeDir ran %d times, want none", *takes)
+	}
+	if after := treeNames(t, dir); !slices.Equal(before, after) {
+		t.Fatalf("the swapped-in directory holds %v, want %v untouched", after, before)
+	}
+	if fi, err := os.Lstat(dir); err != nil || fi.Mode() != mode {
+		t.Fatalf("the swapped-in directory: %v (%v), want mode %v", fi, err, mode)
+	}
+	k, err := s.loadMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dfd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(dfd) }()
+	for _, uid := range []uint32{1001, 1002} {
+		hk, err := rmScopeOf(s, uid).scopeKeyAt(dfd, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hk.id != "" && readRecord(t, s).has(uid, hk.id) {
+			t.Fatalf("the swapped-in scope's key is listed for uid %d", uid)
+		}
+	}
+}
+
+// rerunTree runs removeScopeTree over keystore/.user/1001 with the check
+// of a rerun path; through the seam the service user is another uid, so
+// the test's own 0700 directories are root's, as an earlier run left them.
+func rerunTree(t *testing.T, s *FileStore, path rerunPath) error {
+	t.Helper()
+	k, err := s.loadMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dfd, err := s.openLogDataRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(dfd) }()
+	removed, err := s.readRemovedScopes(dfd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := s.openDir(s.dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	svc := s.uid + 1
+	_, err = removeScopeTree(root, s.dir, "1001", svc, rmTreeOpts{listed: removed.listed(1001), check: rmScopeOf(s, 1001).rerunScope(k, removed, svc, path)})
+	return err
+}
+
+// takeLeftover makes uid 1001's scope directory look as an earlier run
+// left it after its take: every directory in it at 0700.
+func takeLeftover(t *testing.T, dir string) {
+	t.Helper()
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return err
+		}
+		return os.Chmod(p, 0o700)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A rerun finishes what an interrupted rm-scope left: a taken directory
+// (root's at 0700) holding no scope.key, or holding the scope.key the
+// record lists for the uid, is removed; and through RemoveScope, an
+// unlisted run (an untrusted scope.key) that stopped after its take, which
+// took scope.key first, leaves a directory the rerun removes.
+func TestRemoveScopeRerunAcceptsOwnLeftover(t *testing.T) {
+	t.Run("taken, no scope.key", func(t *testing.T) {
+		if asRoot() {
+			t.Skip("the seam's other service uid makes the store's own directories foreign as root")
+		}
+		s, server, _ := fileLogScope(t)
+		dir := scopeDir(server, "1001")
+		if err := os.Remove(filepath.Join(dir, scopeKeyName)); err != nil {
+			t.Fatal(err)
+		}
+		takeLeftover(t, dir)
+		if err := rerunTree(t, s, rerunTaken); err != nil {
+			t.Fatalf("the rerun over a taken directory without scope.key: %v", err)
+		}
+		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the scope directory is still there: %v", err)
+		}
+	})
+	t.Run("taken, listed scope.key", func(t *testing.T) {
+		if asRoot() {
+			t.Skip("the seam's other service uid makes the store's own directories foreign as root")
+		}
+		s, server, _ := fileLogScope(t)
+		dir := scopeDir(server, "1001")
+		saved := rmTakeDir
+		setSeam(t, &rmTakeDir, func(int) error { return unix.EIO })
+		if _, err := s.RemoveScope(t.Context(), 1001); !Committed(err) {
+			t.Fatalf("run 1, stopped at the take after listing: %v, want committed", err)
+		}
+		rmTakeDir = saved
+		takeLeftover(t, dir)
+		if err := rerunTree(t, s, rerunTaken); err != nil {
+			t.Fatalf("the rerun over a taken directory whose scope.key is listed: %v", err)
+		}
+		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the scope directory is still there: %v", err)
+		}
+	})
+	t.Run("unlisted run stopped after its take", func(t *testing.T) {
+		s, server, _ := fileLogScope(t)
+		dir := scopeDir(server, "1001")
+		if err := os.WriteFile(filepath.Join(dir, scopeKeyName), []byte("not a key record"), fileMode); err != nil {
+			t.Fatal(err)
+		}
+		saved := rmReadBatch
+		setSeam(t, &rmReadBatch, func(int, int, map[string]bool) ([]string, error) { return nil, unix.EIO })
+		_, err := s.RemoveScope(t.Context(), 1001)
+		if !Committed(err) || !errors.Is(err, unix.EIO) {
+			t.Fatalf("run 1, stopped after its take: %v, want committed wrapping EIO", err)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, scopeKeyName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("scope.key after an unlisted run stopped past its take: %v, want it taken first", err)
+		}
+		rmReadBatch = saved
+		if _, err := s.RemoveScope(t.Context(), 1001); !Committed(err) || !strings.Contains(err.Error(), "without listing it") {
+			t.Fatalf("the rerun: %v, want the unlisted removal, committed", err)
+		}
+		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the scope directory is still there: %v", err)
+		}
+	})
+}
+
+// A rerun path has no judged key identity, so it accepts no directory that
+// holds what it was not judged to hold: a taken directory (root's at 0700)
+// holding a scope.key that is not listed, valid or untrusted, and a
+// service-user directory holding a valid, unlisted scope.key on the
+// no-key path (through RemoveScope: its scope.key is put back after the
+// judge) are refused, with nothing taken, changed or removed in them, and
+// no command or rerun offered.
+func TestRemoveScopeRerunRefusesForeignLeftover(t *testing.T) {
+	check := func(t *testing.T, err error, dir string, before []string) {
+		t.Helper()
+		if !errors.Is(err, errNotJudgedScope) {
+			t.Fatalf("the rerun over a foreign leftover: %v, want errNotJudgedScope", err)
+		}
+		for _, bad := range []string{"sudo", "rm -", "rerun"} {
+			if strings.Contains(err.Error(), bad) {
+				t.Errorf("the error %q offers %q", err, bad)
+			}
+		}
+		if after := treeNames(t, dir); !slices.Equal(before, after) {
+			t.Fatalf("the directory holds %v, want %v untouched", after, before)
+		}
+	}
+	for name, damage := range map[string]func(t *testing.T, p string){
+		"taken, valid unlisted scope.key": func(*testing.T, string) {},
+		"taken, untrusted scope.key": func(t *testing.T, p string) {
+			if err := os.WriteFile(p, []byte("not a key record"), fileMode); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if asRoot() {
+				t.Skip("the seam's other service uid makes the store's own directories foreign as root")
+			}
+			s, server, _ := fileLogScope(t)
+			dir := scopeDir(server, "1001")
+			damage(t, filepath.Join(dir, scopeKeyName))
+			takeLeftover(t, dir)
+			before := treeNames(t, dir)
+			takes := countTakes(t)
+			check(t, rerunTree(t, s, rerunTaken), dir, before)
+			if *takes != 0 {
+				t.Errorf("rmTakeDir ran %d times, want none", *takes)
+			}
+		})
+	}
+	t.Run("no-key path, a valid scope.key put back", func(t *testing.T) {
+		s, server, _ := fileLogScope(t)
+		dir := scopeDir(server, "1001")
+		key := filepath.Join(dir, scopeKeyName)
+		hidden := filepath.Join(server, "scope.key.saved")
+		if err := os.Rename(key, hidden); err != nil {
+			t.Fatal(err)
+		}
+		var before []string
+		setSeam(t, &rmBeforeTree, func() {
+			if err := os.Rename(hidden, key); err != nil {
+				t.Fatal(err)
+			}
+			before = treeNames(t, dir)
+		})
+		takes := countTakes(t)
+		_, err := s.RemoveScope(t.Context(), 1001)
+		check(t, err, dir, before)
+		if Committed(err) || *takes != 0 {
+			t.Errorf("the refusal is committed (%v) or took %d directories", Committed(err), *takes)
+		}
+		if readRecord(t, s).listed(1001) {
+			t.Error("the scope was listed")
+		}
+	})
+}

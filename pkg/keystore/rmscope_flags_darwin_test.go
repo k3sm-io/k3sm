@@ -177,7 +177,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if _, err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+		if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 			t.Fatalf("removeScopeTree over user flags: %v", err)
 		}
 		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
@@ -215,7 +215,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if _, err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+		if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 			t.Fatalf("removeScopeTree over a uchg FIFO: %v", err)
 		}
 		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
@@ -365,7 +365,7 @@ func TestRemoveScopeClearsForeignFlags(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = root.Close() }()
-			_, err = removeScopeTree(root, s.dir, "1001", s.uid+1, true)
+			_, err = removeScopeTree(root, s.dir, "1001", s.uid+1, rmTreeOpts{listed: true})
 			if linked {
 				var st unix.Stat_t
 				if !errors.Is(err, unix.EPERM) || !strings.Contains(err.Error(), "has 2 links") || strings.Contains(err.Error(), "sudo") || strings.Contains(err.Error(), "chflags") {
@@ -431,7 +431,7 @@ func TestRemoveScopeSwappedNameGetsZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	if _, err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+	if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 		t.Fatalf("removeScopeTree over a swapped name: %v", err)
 	}
 	if !swapped {
@@ -471,7 +471,7 @@ func TestRemoveScopeSharedDirFlags(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		tree, err := removeScopeTree(root, s.dir, "1001", svc, true)
+		tree, err := removeScopeTree(root, s.dir, "1001", svc, rmTreeOpts{listed: true})
 		return tree.cleared, err
 	}
 	t.Run("the service user's", func(t *testing.T) {
