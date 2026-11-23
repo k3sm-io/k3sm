@@ -422,6 +422,66 @@ func TestRevokeHeldAcrossKeystoreRestore(t *testing.T) {
 	}
 }
 
+// TestRevokeHeldByFloorAfterRestore: a real store; three entries delivered,
+// then an older keystore/ holding only one of them is restored the
+// documented way: stop, move the live one aside, ditto the backup in,
+// start. The floor still records the two the backup lacks, so neither the
+// first sweep after the start nor the second deletes their Secrets, and one
+// Warn per name says why. A real rm afterwards takes its name out of the
+// floor, and its Secret is deleted.
+func TestRevokeHeldByFloorAfterRestore(t *testing.T) {
+	h, s, dir := newRealStoreHarness(t)
+	ctx := context.Background()
+	mustStorePut(t, s, "a")
+	backup := dir + ".backup"
+	copyTree(t, dir, backup)
+	mustStorePut(t, s, "b")
+	mustStorePut(t, s, "c")
+	mustStorePut(t, s, "d")
+	h.declare(t,
+		Target{Entry: "system/a", Namespace: "payments"},
+		Target{Entry: "system/b", Namespace: "payments"},
+		Target{Entry: "system/c", Namespace: "payments"},
+		Target{Entry: "system/d", Namespace: "payments"})
+	h.r.Sweep(ctx)
+	// stop
+	if err := os.Rename(dir, dir+".pre-restore"); err != nil {
+		t.Fatal(err)
+	}
+	copyTree(t, backup, dir)
+	// start
+	restarted := h.reconciler(true, false)
+	restarted.store = s
+	h.client.ClearActions()
+	restarted.Sweep(ctx)
+	restarted.Sweep(ctx)
+	restarted.Sweep(ctx)
+	if n := h.deletes(); n != 0 {
+		t.Fatalf("sweeps after a restore deleted %d Secrets the floor still records: %v", n, h.verbs())
+	}
+	for _, n := range []string{"a", "b", "c", "d"} {
+		h.secret(t, "payments", n)
+	}
+	logs := h.logs.String()
+	if got := strings.Count(logs, "level=WARN msg=\"keystore delivery: the keystore floor still records this entry"); got != 3 {
+		t.Fatalf("got %d floor-hold Warns over three sweeps, want one per name (3)\n%s", got, logs)
+	}
+	for _, n := range []string{"b", "c", "d"} {
+		if !strings.Contains(logs, "entry=system/"+n) {
+			t.Fatalf("the floor-hold Warn does not name system/%s\n%s", n, logs)
+		}
+	}
+	// A real rm takes a out of the floor, and its Secret goes.
+	if err := s.Delete(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	restarted.Sweep(ctx)
+	h.gone(t, "payments", "a")
+	for _, n := range []string{"b", "c", "d"} {
+		h.secret(t, "payments", n)
+	}
+}
+
 // TestRmDeletesWithRealStore: a real store whose keystore/ stays the same;
 // a plain rm of one entry deletes its Secret on the next sweep and leaves the
 // other's.

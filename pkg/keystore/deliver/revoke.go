@@ -18,6 +18,7 @@ package deliver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -26,6 +27,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"k3sm.io/k3sm/pkg/keystore"
 )
 
 // Revocation: a keys rm must not leave the deleted value readable in the
@@ -40,6 +43,14 @@ import (
 //     sees it, and the first sweep after a start, revoke nothing, so a restore
 //     holds revocation for one sweep. Absent's own identity must match the
 //     sweep's too, so a swap in the middle of a sweep deletes nothing;
+//   - the floor (keystore-floor.json) is the durable witness of a delete:
+//     Delete removes the name from it, so Absent answers
+//     ErrFloorRecordsEntry, not absent, for a name the floor records whose
+//     directory is missing. That is a restored or rolled-back keystore/, and
+//     it holds that name's revocation for as long as it lasts (a Warn once
+//     per name), not for one sweep. Where the floor proves nothing (removed
+//     and rebuilt by the restore procedure, or full), the identity hold is
+//     what stands;
 //   - the breaker: when more than revokeLimit of the recorded Secrets would be
 //     revoked in one sweep, none is. It holds until the absent set drops back
 //     to the limit: the entries are put back, or the operator deletes the
@@ -95,6 +106,35 @@ func (r *Reconciler) observeKeystore(ctx context.Context, sw *sweep) {
 	r.keystore = id
 }
 
+// floorHolds reports whether err is Absent's ErrFloorRecordsEntry: the
+// floor still records name and its directory is missing, a restored or
+// rolled-back keystore/ rather than an rm, so its Secrets are kept. It logs
+// a Warn once per name while that lasts (pruneFloorHolds forgets a name the
+// sweep no longer saw held).
+func (r *Reconciler) floorHolds(sw *sweep, name string, err error) bool {
+	if !errors.Is(err, keystore.ErrFloorRecordsEntry) {
+		return false
+	}
+	sw.floorHeld[name] = true
+	if !r.floorHeld[name] {
+		r.floorHeld[name] = true
+		r.logger.Warn("keystore delivery: the keystore floor still records this entry but its directory is missing, "+
+			"which a restored or rolled-back keystore/ leaves and an rm does not; its delivered Secrets are kept",
+			"entry", EntryPrefix+name)
+	}
+	return true
+}
+
+// pruneFloorHolds forgets the names this sweep did not see held, so a name
+// held again later logs again.
+func (r *Reconciler) pruneFloorHolds(sw *sweep) {
+	for n := range r.floorHeld {
+		if !sw.floorHeld[n] {
+			delete(r.floorHeld, n)
+		}
+	}
+}
+
 // revokeRefused is a refused target's revocation: Get its Secret and, when it
 // is ours and the entry is gone, gather it. It reads no value and writes
 // nothing but the delete.
@@ -114,6 +154,8 @@ func (r *Reconciler) revokeRefused(ctx context.Context, sw *sweep, t Target) {
 func (r *Reconciler) collect(ctx context.Context, sw *sweep, t Target, cur *corev1.Secret, quiet bool) {
 	absent, id, err := r.store.Absent(ctx, t.Name())
 	switch {
+	case r.floorHolds(sw, t.Name(), err):
+		return
 	case err != nil:
 		r.note(t, "error:absent:"+err.Error(), slog.LevelWarn,
 			"the entry is not found but its absence cannot be confirmed, so the Secret is kept; will retry", "err", err)
@@ -178,6 +220,9 @@ func (r *Reconciler) withdrawn(ctx context.Context, sw *sweep, namespace, name s
 	}
 	absent, id, err := r.store.Absent(ctx, t.Name())
 	switch {
+	case r.floorHolds(sw, t.Name(), err):
+		sw.keep[k] = true
+		return
 	case err != nil:
 		sw.keep[k] = true
 		r.logger.Warn("keystore delivery: cannot confirm whether a withdrawn target's entry is gone; will retry",

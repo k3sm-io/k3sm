@@ -168,6 +168,8 @@ type Reconciler struct {
 	keystore      string
 	keystoreState string
 	heldState     string
+	// floorHeld are the entry names whose floor-held revocation was logged.
+	floorHeld map[string]bool
 	// revokeLimit is the most revocations one sweep makes, given the number
 	// of recorded Secrets; more than that and it makes none (production:
 	// defaultRevokeLimit).
@@ -204,6 +206,7 @@ func New(cfg Config) *Reconciler {
 			return watchFile(dir, name, logger)
 		},
 		targetState: map[string]string{},
+		floorHeld:   map[string]bool{},
 		revokeLimit: defaultRevokeLimit,
 	}
 }
@@ -331,7 +334,7 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 		return
 	}
 	r.stateFileState = ""
-	sw := &sweep{state: st, recordedSecrets: len(st.owned), keep: map[string]bool{}}
+	sw := &sweep{state: st, recordedSecrets: len(st.owned), keep: map[string]bool{}, floorHeld: map[string]bool{}}
 	r.observeKeystore(ctx, sw)
 	seen := make(map[string]bool, len(d.Targets))
 	declared := make(map[string]bool, len(d.Targets))
@@ -357,6 +360,7 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 		}
 	}
 	r.revokeAll(ctx, sw)
+	r.pruneFloorHolds(sw)
 	// Forget a withdrawn target, so declaring it again logs again. Its Secret
 	// stays unless it was revoked above, but it is no longer recorded as
 	// ours, so declaring it again leaves it alone. A record whose revocation
@@ -410,6 +414,9 @@ type sweep struct {
 	// the withdrawn records kept for a pending revocation.
 	revokes []revocation
 	keep    map[string]bool
+	// floorHeld are the entry names whose revocation the floor held this
+	// sweep (see floorHolds).
+	floorHeld map[string]bool
 }
 
 // targetKey identifies a target for the once-per-state log.
