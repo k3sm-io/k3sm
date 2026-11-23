@@ -137,8 +137,10 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		return RemoveScopeResult{}, fmt.Errorf("%w; nothing was changed", err)
 	}
 	defer func() { _ = unix.Close(dfd) }() // the record's rename is fsynced in it
-	removed, err := s.readRemovedScopes(dfd)
+	removed, err := rmReadRemovedScopes(s, dfd)
 	if err != nil {
+		// The record is root's, in the data root: its errors keep the
+		// shared reader's wording (readRemovedScopes, judgeRootFile).
 		return RemoveScopeResult{}, fmt.Errorf("%w; nothing was changed", err)
 	}
 	name := strconv.FormatUint(uint64(uid), 10)
@@ -240,10 +242,20 @@ func rmOpenRefusal(scope string, err error) error {
 	case errors.Is(err, errNoScopeKey):
 		return fmt.Errorf("rm-scope found the scope directory of %s absent: nothing was changed and nothing removed", scope)
 	case errors.Is(err, ErrCorrupt):
-		return fmt.Errorf("open the scope %s: %s (named for reading, not for pasting); it is not a scope directory rm-scope removes, so nothing was changed", scope, rmErrText(err))
+		return &rmTextErr{fmt.Sprintf("open the scope %s: %s (named for reading, not for pasting); it is not a scope directory rm-scope removes, so nothing was changed", scope, rmErrText(err)), err}
 	}
-	return fmt.Errorf("open the scope %s: %s; nothing was changed; run it again", scope, rmErrText(err))
+	return &rmTextErr{fmt.Sprintf("open the scope %s: %s; nothing was changed; run it again", scope, rmErrText(err)), err}
 }
+
+// rmTextErr is an rm-scope report whose text is rewritten (rmErrText)
+// while it still wraps the error it reports, for errors.Is.
+type rmTextErr struct {
+	msg string
+	err error
+}
+
+func (e *rmTextErr) Error() string { return e.msg }
+func (e *rmTextErr) Unwrap() error { return e.err }
 
 // rmErrText is err's text for an rm-scope report about the service user's
 // tree: control bytes removed (safeText), and ErrCorrupt's shared advice
@@ -252,6 +264,10 @@ func rmOpenRefusal(scope string, err error) error {
 func rmErrText(err error) string {
 	return safeText(strings.ReplaceAll(err.Error(), ErrCorrupt.Error(), "it failed authentication or does not parse, or is not as the layout puts it"))
 }
+
+// rmReadRemovedScopes is RemoveScope's read of the removed-scopes record;
+// tests replace it to inject a failure.
+var rmReadRemovedScopes = (*FileStore).readRemovedScopes
 
 // rmServiceUID is the service user RemoveScope judges owners by; tests
 // replace it to stand for another uid, so their own 0700 directories are
