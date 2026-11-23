@@ -27,7 +27,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -345,8 +344,8 @@ func rootRmScopeBase(t *testing.T) (*FileStore, string) {
 // root-run: while it removes a scope, a service-user process tries, in a
 // loop, to create a file in, rename a file into and rename a file out of
 // the scope directory and a subdirectory. Once root has taken a directory
-// (the seam marks it, and holds each take a little so the loop meets it),
-// every attempt there fails with EACCES, or with ENOENT once the directory
+// (the seam marks it, and holds each take until the loop has met it a
+// fixed number of times), every attempt there fails with EACCES, or with ENOENT once the directory
 // is gone; none succeeds. The removal completes.
 func TestRemoveScopeTakesDirsFromServiceUserAsRoot(t *testing.T) {
 	if !asRoot() {
@@ -373,7 +372,26 @@ func TestRemoveScopeTakesDirsFromServiceUserAsRoot(t *testing.T) {
 		}
 		inos[i] = st.Ino
 	}
-	var taken [2]atomic.Bool
+	// The loop and the removal meet through channels, never a clock: the
+	// loop closes warm after warmIters passes over both directories, met[i]
+	// after metAttempts attempts on directory i once it was taken, and after
+	// after afterIters passes that began once removeScopeTree returned. It
+	// closes exited when it returns, so no wait outlives a failed check.
+	const warmIters, metAttempts, afterIters = 20, 9, 20
+	var (
+		taken   [2]atomic.Bool
+		removed atomic.Bool
+		warm    = make(chan struct{})
+		met     = [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+		after   = make(chan struct{})
+		exited  = make(chan struct{})
+	)
+	wait := func(ch <-chan struct{}) {
+		select {
+		case <-ch:
+		case <-exited:
+		}
+	}
 	saved := rmTakeDir
 	setSeam(t, &rmTakeDir, func(fd int) error {
 		err := saved(fd)
@@ -382,7 +400,7 @@ func TestRemoveScopeTakesDirsFromServiceUserAsRoot(t *testing.T) {
 			for i, ino := range inos {
 				if st.Ino == ino {
 					taken[i].Store(true)
-					time.Sleep(50 * time.Millisecond) // let the loop meet the taken directory
+					wait(met[i]) // let the loop meet the taken directory
 				}
 			}
 		}
@@ -393,15 +411,20 @@ func TestRemoveScopeTakesDirsFromServiceUserAsRoot(t *testing.T) {
 	done := make(chan error, 1)
 	var got tally
 	go func() {
+		defer close(exited)
 		runtime.LockOSThread() // never unlocked: the thread dies with the goroutine
 		if _, _, errno := syscall.Syscall(syscall.SYS_SETTID, uintptr(svcUID), uintptr(svcGID), 0); errno != 0 {
 			done <- fmt.Errorf("settid: %w", errno)
 			return
 		}
+		var metN [2]int
 		check := func(i int, was bool, what string, err error) error {
 			if !was {
 				got.before++
 				return nil
+			}
+			if metN[i]++; metN[i] == metAttempts {
+				defer close(met[i])
 			}
 			switch {
 			case err == nil:
@@ -418,12 +441,22 @@ func TestRemoveScopeTakesDirsFromServiceUserAsRoot(t *testing.T) {
 			}
 			return nil
 		}
+		afterN := 0
 		for n := 0; ; n++ {
+			if n == warmIters {
+				close(warm)
+			}
+			if afterN == afterIters {
+				close(after)
+			}
 			select {
 			case <-stop:
 				done <- nil
 				return
 			default:
+			}
+			if removed.Load() {
+				afterN++
 			}
 			for i, d := range targets {
 				was := taken[i].Load()
@@ -456,14 +489,15 @@ func TestRemoveScopeTakesDirsFromServiceUserAsRoot(t *testing.T) {
 			}
 		}
 	}()
-	time.Sleep(20 * time.Millisecond) // the loop runs before the take
+	wait(warm) // the loop runs before the take
 	root, err := s.openDir(s.dir, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
 	rerr := removeScopeTree(root, s.dir, "1001", s.uid, true)
-	time.Sleep(20 * time.Millisecond) // and after the removal
+	removed.Store(true)
+	wait(after) // and after the removal
 	close(stop)
 	if err := <-done; err != nil {
 		t.Fatal(err)
