@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -111,28 +112,25 @@ func setScopeFlags(t *testing.T, p string, flags int, link bool) uint64 {
 }
 
 // TestRemoveScopeClearsUserFlags: the service user can set a user flag
-// (uchg, uappnd, uunlnk) on its own files, which makes unlinkat fail with
+// (uchg, uappnd, uunlnk) on its own entries, which makes unlinkat fail with
 // EPERM, root's included. rm-scope's tree removal clears such a flag on a
 // descriptor of the entry (the flag write seam sees the entry's own inode,
 // a symlink's included) and removes the tree: a uchg scope.key, entry
-// directory and version file, a uappnd delivery record, a uunlnk FIFO and
-// a uchg symlink, and a uchg regular file with two links both in the tree.
-// A flagged file with a link outside the tree is never cleared: the
-// removal fails naming the outside link, and the outside file keeps its
-// flag. Non-root, the test user is the service user and sets the flags
-// itself; as root, the tree and the outside file are handed to the
-// service user first, and root sets the flags.
+// directory and version file, a uappnd delivery record, a uchg symlink, a
+// uchg regular file with two links in the tree, and a uchg file whose
+// other link is outside the tree (the owner could clear that flag itself,
+// so leaving it would only stall the removal). A uchg FIFO is not opened,
+// since an open has side effects: the removal fails with EPERM, naming the
+// FIFO and the chflags that clears it, and the FIFO keeps its flag.
+// Non-root, the test user is the service user and sets the flags itself;
+// as root, the tree and the outside file are handed to the service user
+// first, and root sets the flags.
 func TestRemoveScopeClearsUserFlags(t *testing.T) {
-	const ufNoUnlinkFlag = 0x10
 	t.Run("flags in the tree", func(t *testing.T) {
 		s, server, _ := fileLogScope(t)
 		dir := scopeDir(server, "1001")
 		t.Cleanup(func() { unflagScopeTree(dir) })
 		entry := filepath.Join(dir, scopeEntriesName, "token")
-		fifo := filepath.Join(dir, "planted-fifo")
-		if err := unix.Mkfifo(fifo, 0o600); err != nil {
-			t.Fatal(err)
-		}
 		link := filepath.Join(dir, "planted-link")
 		if err := os.Symlink(filepath.Join(t.TempDir(), "target"), link); err != nil {
 			t.Fatal(err)
@@ -144,7 +142,16 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 		if err := os.Link(twin, filepath.Join(dir, scopeEntriesName, "twin-alias")); err != nil {
 			t.Fatal(err)
 		}
+		outside := filepath.Join(filepath.Dir(server), "outside")
+		t.Cleanup(func() { unflagScopeTree(outside) })
+		if err := os.WriteFile(outside, []byte("the service user's"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(outside, filepath.Join(dir, "linked-in")); err != nil {
+			t.Fatal(err)
+		}
 		giveScopeTree(t, dir)
+		giveToService(t, outside)
 		want := map[uint64]string{}
 		names, err := os.ReadDir(entry)
 		if err != nil || len(names) == 0 {
@@ -158,9 +165,9 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 		}
 		want[setScopeFlags(t, entry, unix.UF_IMMUTABLE, false)] = "the entry directory"
 		want[setScopeFlags(t, filepath.Join(dir, deliveriesName), unix.UF_APPEND, false)] = deliveriesName
-		want[setScopeFlags(t, fifo, ufNoUnlinkFlag, false)] = "the FIFO"
 		want[setScopeFlags(t, link, unix.UF_IMMUTABLE, true)] = "the symlink"
 		want[setScopeFlags(t, twin, unix.UF_IMMUTABLE, false)] = "the twice-linked file"
+		want[setScopeFlags(t, outside, unix.UF_IMMUTABLE, false)] = "the file linked outside the tree"
 		want[setScopeFlags(t, filepath.Join(dir, scopeKeyName), unix.UF_IMMUTABLE, false)] = scopeKeyName
 		calls := recordScopeFlags(t)
 		root, err := s.openDir(s.dir, false)
@@ -168,7 +175,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if err := removeScopeTree(root, "1001", s.uid); err != nil {
+		if err := removeScopeTree(root, s.dir, "1001", s.uid); err != nil {
 			t.Fatalf("removeScopeTree over user flags: %v", err)
 		}
 		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
@@ -187,37 +194,39 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 			}
 		}
 	})
-	t.Run("a link outside the tree", func(t *testing.T) {
+	t.Run("a flagged FIFO", func(t *testing.T) {
 		s, server, _ := fileLogScope(t)
 		dir := scopeDir(server, "1001")
-		outside := filepath.Join(t.TempDir(), "outside")
-		t.Cleanup(func() { unflagScopeTree(dir); unflagScopeTree(filepath.Dir(outside)) })
-		if err := os.WriteFile(outside, []byte("not the scope's"), 0o600); err != nil {
+		t.Cleanup(func() { unflagScopeTree(dir) })
+		fifo := filepath.Join(dir, "planted-fifo")
+		if err := unix.Mkfifo(fifo, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		in := filepath.Join(dir, "linked-in")
-		if err := os.Link(outside, in); err != nil {
-			t.Skipf("the temp dir is on another volume than the data root: %v", err)
-		}
-		giveToService(t, outside)
-		ino := setScopeFlags(t, outside, unix.UF_IMMUTABLE, false)
+		giveScopeTree(t, dir)
+		ino := setScopeFlags(t, fifo, unix.UF_IMMUTABLE, false)
 		calls := recordScopeFlags(t)
 		root, err := s.openDir(s.dir, false)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if err := removeScopeTree(root, "1001", s.uid); !errors.Is(err, errScopeFlagLinked) {
-			t.Fatalf("removeScopeTree over a flagged file linked outside: %v, want errScopeFlagLinked", err)
+		err = removeScopeTree(root, s.dir, "1001", s.uid)
+		if !errors.Is(err, unix.EPERM) {
+			t.Fatalf("removeScopeTree over a uchg FIFO: %v, want EPERM", err)
+		}
+		for _, want := range []string{fifo, "sudo chflags nouchg,nouappnd " + fifo} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the error %q does not name %q", err, want)
+			}
 		}
 		for _, c := range *calls {
 			if c.ino == ino {
-				t.Errorf("rm-scope cleared the flag of a file linked outside the tree: %+v", c)
+				t.Errorf("rm-scope opened the FIFO to clear its flag: %+v", c)
 			}
 		}
 		var st unix.Stat_t
-		if err := unix.Lstat(outside, &st); err != nil || st.Flags&unix.UF_IMMUTABLE == 0 {
-			t.Errorf("the outside file's flags are %#x (%v); want uchg kept", st.Flags, err)
+		if err := unix.Lstat(fifo, &st); err != nil || st.Flags&unix.UF_IMMUTABLE == 0 {
+			t.Errorf("the FIFO's flags are %#x (%v); want uchg kept", st.Flags, err)
 		}
 	})
 }

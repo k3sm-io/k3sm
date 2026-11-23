@@ -624,7 +624,7 @@ func TestRemoveScopeWalksJudgedRoot(t *testing.T) {
 	if err := os.WriteFile(keep, []byte("decoy"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := removeScopeTree(root, "1001", s.uid); err != nil {
+	if err := removeScopeTree(root, s.dir, "1001", s.uid); err != nil {
 		t.Fatalf("removeScopeTree: %v", err)
 	}
 	if _, err := os.Lstat(keep); err != nil {

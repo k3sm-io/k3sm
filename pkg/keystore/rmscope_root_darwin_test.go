@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -35,7 +36,8 @@ import (
 // EPERM; rm-scope's tree removal, as root, clears them through descriptors
 // and removes the scope. A uchg file root owns, planted in the tree, is
 // not the service user's, so its flag is not cleared: the removal fails
-// with EPERM, naming it, and the file keeps its flag.
+// with EPERM, naming it and the chflags that clears it, and the file keeps
+// its flag.
 func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 	if !asRoot() {
 		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
@@ -117,11 +119,13 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = root.Close() }()
-			err = removeScopeTree(root, "1001", s.uid)
+			err = removeScopeTree(root, s.dir, "1001", s.uid)
 			if rootPlant {
 				var st unix.Stat_t
 				if !errors.Is(err, unix.EPERM) {
 					t.Errorf("removeScopeTree over a root-owned uchg file: %v, want EPERM", err)
+				} else if want := "sudo chflags nouchg,nouappnd " + planted; !strings.Contains(err.Error(), want) {
+					t.Errorf("the error %q does not name the repair %q", err, want)
 				}
 				if serr := unix.Lstat(planted, &st); serr != nil || st.Flags&unix.UF_IMMUTABLE == 0 {
 					t.Errorf("the root-owned plant has flags %#x (%v); want uchg kept", st.Flags, serr)

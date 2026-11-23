@@ -2718,10 +2718,14 @@ service user can only add to.
   (`uchg`, `uappnd`, `uunlnk`) the service user set on its own file or directory, which makes
   root's `unlinkat` fail with `EPERM`, is cleared first with `fchflags` on a descriptor opened
   `O_NOFOLLOW` (`O_SYMLINK` for a symlink) and re-checked as the name, never by path, at most
-  4096 opens in all; only a file the service user owns is cleared, and a non-directory with
-  more than one link only when it is a regular file whose every link was met in the scope
-  tree in the same pass (its other names go in the next pass); a flagged file linked outside
-  the tree stops rm-scope, which says so. Names that keep
+  4096 opens in all. Every entry the service user owns is cleared, whatever its link count:
+  a link outside the tree shares the flag, but its owner could clear it itself, so refusing
+  would only let it stall the removal. A FIFO or device is not opened (an open can unblock a
+  writer or start a driver), and macOS refuses to open a socket (`EOPNOTSUPP`), so a flag on
+  one of those stays: its `unlinkat` fails with `EPERM`, and rm-scope stops with an error
+  that names the entry and the repair (`sudo chflags nouchg,nouappnd <path>`, then rerun). An
+  entry another user owns, root included, is left alone and stops rm-scope the same way.
+  Names that keep
   appearing stop it after three passes with a message that a process running as the service
   user is still writing there and to stop it (`sudo k3sm stop`). An rm-scope that stops after
   the record is written says so (the scope listed as removed, its directory partly or wholly
