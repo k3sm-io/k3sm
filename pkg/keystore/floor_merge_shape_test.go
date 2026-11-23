@@ -509,28 +509,30 @@ func TestStagedPreFrameDroppedAccepted(t *testing.T) {
 
 // TestStagedPreFrameDroppedRefused: a staged persisted count, or its
 // temporary file, is refused by the read-only walk and the handover when
-// it is over its size cap, a symlink, a FIFO, hard-linked, at another
-// mode, or does not parse.
+// it is over its size cap, a symlink, a FIFO or hard-linked; the count
+// itself also at another mode or when it does not parse (a temporary
+// file's content is never read, TestStagedPreFrameDroppedTempNotParsed).
 func TestStagedPreFrameDroppedRefused(t *testing.T) {
 	for _, name := range []string{PreFrameDroppedName, droppedTempName} {
 		for _, tc := range []struct {
-			name  string
-			plant func(t *testing.T, s *FileStore, p string)
+			name     string
+			plant    func(t *testing.T, s *FileStore, p string)
+			onlyFile bool
 		}{
 			{"over the cap", func(t *testing.T, s *FileStore, p string) {
 				b := append(wellFormedDropped(), bytes.Repeat([]byte("1 login 1\n"), maxPreFrameDroppedSize/10+1)...)
 				writeStaged(t, s, name, b)
-			}},
+			}, false},
 			{"a symlink", func(t *testing.T, s *FileStore, p string) {
 				if err := os.Symlink("/etc/passwd", p); err != nil {
 					t.Fatal(err)
 				}
-			}},
+			}, false},
 			{"a FIFO", func(t *testing.T, s *FileStore, p string) {
 				if err := syscall.Mkfifo(p, 0o600); err != nil {
 					t.Fatal(err)
 				}
-			}},
+			}, false},
 			{"hard-linked", func(t *testing.T, s *FileStore, p string) {
 				outside := filepath.Join(t.TempDir(), "outside")
 				if err := os.WriteFile(outside, wellFormedDropped(), 0o600); err != nil {
@@ -540,20 +542,23 @@ func TestStagedPreFrameDroppedRefused(t *testing.T) {
 				if err := os.Link(outside, p); err != nil {
 					t.Fatal(err)
 				}
-			}},
+			}, false},
 			{"another mode", func(t *testing.T, s *FileStore, p string) {
 				writeStaged(t, s, name, wellFormedDropped())
 				if err := os.Chmod(p, 0o400); err != nil {
 					t.Fatal(err)
 				}
-			}},
+			}, true},
 			{"malformed", func(t *testing.T, s *FileStore, p string) {
 				writeStaged(t, s, name, []byte(preFrameDroppedHeader+"501 login 0\n"))
-			}},
+			}, true},
 			{"no header", func(t *testing.T, s *FileStore, p string) {
 				writeStaged(t, s, name, []byte("501 login 1\n"))
-			}},
+			}, true},
 		} {
+			if tc.onlyFile && name != PreFrameDroppedName {
+				continue
+			}
 			t.Run(name+"/"+tc.name, func(t *testing.T) {
 				s, server := newTestStore(t)
 				stageRecipe(t, s, server, 0)
@@ -616,6 +621,65 @@ func TestStagedPreFrameDroppedUnknownOwner(t *testing.T) {
 			if err := s.chownStaged(context.Background(), st2); err != nil {
 				t.Fatalf("chownStaged with %s at uid %d: %v", name, unknownUID, err)
 			}
+		})
+	}
+}
+
+// TestStagedPreFrameDroppedTempNotParsed: a backup taken while the server
+// was mid-write holds its half-written temporary file. Its content is never
+// read, so it is accepted on its type, one link, owner and size cap alone,
+// whatever it holds and at any mode, and carried into place with the tree
+// as an entry's temporary file is. A name that only resembles the temporary
+// file's is still no name the keystore writes.
+func TestStagedPreFrameDroppedTempNotParsed(t *testing.T) {
+	half := wellFormedDropped()
+	half = half[:len(half)-3]
+	for _, tc := range []struct {
+		name string
+		data []byte
+		mode os.FileMode
+	}{
+		{"half-written", half, 0o600},
+		{"empty", nil, 0o600},
+		{"garbage at another mode", []byte("\x00\xffnot a count"), 0o644},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			stageRecipe(t, s, server, 0)
+			p := writeStaged(t, s, droppedTempName, tc.data)
+			if err := os.Chmod(p, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			st := openTestStaging(t, s)
+			if err := s.checkStaged(context.Background(), st); err != nil {
+				t.Fatalf("checkStaged: %v", err)
+			}
+			if _, err := s.MergeFloor(context.Background(), MergeOptions{}); err != nil {
+				t.Fatalf("MergeFloor with a %s temporary file staged: %v", tc.name, err)
+			}
+			got, err := os.ReadFile(filepath.Join(s.dir, droppedTempName))
+			if err != nil || !bytes.Equal(got, tc.data) {
+				t.Fatalf("temporary file after the merge: %q, %v; want it carried into place unchanged", got, err)
+			}
+			if _, err := os.Lstat(filepath.Join(s.dir, PreFrameDroppedName)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s after the merge: %v, want none made from the temporary file", PreFrameDroppedName, err)
+			}
+		})
+	}
+	for _, n := range []string{
+		"." + PreFrameDroppedName + ".0102030405060708.tmp.x",
+		"." + PreFrameDroppedName + ".01020304050607.tmp",
+		"." + PreFrameDroppedName + ".010203040506070809.tmp",
+		"." + PreFrameDroppedName + ".010203040506070G.tmp",
+		"." + PreFrameDroppedName + ".010203040506070A.tmp",
+		"." + PreFrameDroppedName + ".tmp",
+		PreFrameDroppedName + ".0102030405060708.tmp",
+	} {
+		t.Run("resembling/"+n, func(t *testing.T) {
+			s, server := newTestStore(t)
+			stageRecipe(t, s, server, 0)
+			writeStaged(t, s, n, nil)
+			wantShapeRefused(t, s, n)
 		})
 	}
 }

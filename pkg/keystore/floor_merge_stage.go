@@ -314,9 +314,9 @@ func (s *FileStore) moveTargetAside(st *mergeStaging, name string) error {
 
 // stagedKind is what a node of the staged tree is, by where it sits: the
 // tree itself, an entry's directory, the user scopes' directory, one user
-// scope, a user scope's entries' directory, a file, or the persisted
-// pre-frame refusal counts (PreFrameDroppedName) or their temporary file,
-// a file judged more strictly and parsed.
+// scope, a user scope's entries' directory, a file, the persisted
+// pre-frame refusal counts (PreFrameDroppedName), a file judged more
+// strictly and parsed, or their temporary file, judged as any other file.
 type stagedKind int
 
 const (
@@ -327,15 +327,12 @@ const (
 	stagedScopeEntries
 	stagedFile
 	stagedDropped
+	stagedDroppedTemp
 )
 
 // file reports whether a node of kind k is a file.
-func (k stagedKind) file() bool { return k == stagedFile || k == stagedDropped }
-
-// droppedFileName reports whether n is PreFrameDroppedName or the
-// temporary file writeFile makes for it.
-func droppedFileName(n string) bool {
-	return n == PreFrameDroppedName || isTempName(n, PreFrameDroppedName)
+func (k stagedKind) file() bool {
+	return k == stagedFile || k == stagedDropped || k == stagedDroppedTemp
 }
 
 // stagedChild is what name may be inside a node of kind parent, and, for a
@@ -351,8 +348,16 @@ func stagedChild(parent stagedKind, name string) (kind stagedKind, maxSize int64
 			return stagedFile, 0, true
 		case name == userScopesName:
 			return stagedUsers, 0, true
-		case droppedFileName(name):
+		case name == PreFrameDroppedName:
 			return stagedDropped, maxPreFrameDroppedSize, true
+		case isTempName(name, PreFrameDroppedName):
+			// A backup taken mid-write can hold the server's half-written
+			// temporary file. Its content is never read, so it is judged
+			// as an entry's temporary file is (type, one link, owner, the
+			// cap), never parsed, and carried into place with the tree as
+			// those are: the merge discards no staged temporary file and
+			// keeps no count of one.
+			return stagedDroppedTemp, maxPreFrameDroppedSize, true
 		case checkName(name) == nil:
 			return stagedEntry, 0, true
 		}
@@ -671,8 +676,8 @@ func (s *FileStore) judgeStaged(fd int, rel string, st *unix.Stat_t, k stagedKin
 	return nil
 }
 
-// judgeStagedDropped reads the persisted pre-frame refusal counts, or
-// their temporary file, through f, at most maxSize bytes, and refuses a
+// judgeStagedDropped reads the persisted pre-frame refusal counts through
+// f, at most maxSize bytes, and refuses a
 // copy that does not parse strictly (parsePreFrameDropped), as any other
 // malformed staged content is refused.
 func judgeStagedDropped(f *os.File, rel string, maxSize int64) error {
