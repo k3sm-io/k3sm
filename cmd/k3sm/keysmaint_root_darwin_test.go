@@ -42,7 +42,9 @@ import (
 // real file-attribute writer and SF_APPEND set for real; non-root it skips,
 // and the root-run row fails on a SKIP. Every failure names the step, the
 // operation, the route, the errno got and wanted, and the verb's exit code
-// and full stderr, so a root run's log alone says what went wrong.
+// and full stderr, quoted on the message's one line (the root run's log
+// keeps only the lines go test prefixes with the file and line), so that
+// log alone says what went wrong.
 
 // keysSFAppend is SF_APPEND, the system append-only file flag.
 const keysSFAppend = 0x00040000
@@ -405,7 +407,7 @@ func (r *keysSwapRun) failf(format string, args ...any) {
 func (r *keysSwapRun) report(t *testing.T, what string) {
 	t.Helper()
 	for _, f := range r.failures {
-		t.Errorf("%s: %s\nverb exit %d, stderr:\n%s", what, f, r.code, r.stderr)
+		t.Errorf("%s: %s; verb exit %d, stderr %q", what, f, r.code, r.stderr)
 	}
 }
 
@@ -707,7 +709,7 @@ func keysDirEmpty(fd int) (bool, []string) {
 func (r *keysSwapRun) checkDone(what string) {
 	r.m.t.Helper()
 	fail := func(format string, args ...any) {
-		r.m.t.Errorf("%s: %s\nverb exit %d, stdout:\n%s\nstderr:\n%s", what, fmt.Sprintf(format, args...), r.code, r.stdout, r.stderr)
+		r.m.t.Errorf("%s: %s; verb exit %d, stdout %q, stderr %q", what, fmt.Sprintf(format, args...), r.code, r.stdout, r.stderr)
 	}
 	r.m.checkLive(r.v, what, r.code, r.stderr)
 	if ino := r.liveIno(); ino == r.oldIno {
@@ -723,7 +725,7 @@ func (r *keysSwapRun) checkDone(what string) {
 func (m *keysRootMaint) checkLive(v keysMaintVerb, what string, code int, stderr string) {
 	m.t.Helper()
 	fail := func(format string, args ...any) {
-		m.t.Errorf("%s: %s\nverb exit %d, stderr:\n%s", what, fmt.Sprintf(format, args...), code, stderr)
+		m.t.Errorf("%s: %s; verb exit %d, stderr %q", what, fmt.Sprintf(format, args...), code, stderr)
 	}
 	var st unix.Stat_t
 	if err := unix.Lstat(m.logPath(v.log), &st); err != nil {
@@ -746,7 +748,7 @@ func (m *keysRootMaint) checkLive(v keysMaintVerb, what string, code int, stderr
 func (m *keysRootMaint) checkArchives(oldIno uint64, old string, sole bool, what, stderr string) {
 	m.t.Helper()
 	fail := func(format string, args ...any) {
-		m.t.Errorf("%s: %s\nverb stderr:\n%s", what, fmt.Sprintf(format, args...), stderr)
+		m.t.Errorf("%s: %s; verb stderr %q", what, fmt.Sprintf(format, args...), stderr)
 	}
 	p := filepath.Join(filepath.Dir(m.logPath(keystore.AuditLogName)), keystore.AuditLogName+".1")
 	var st unix.Stat_t
@@ -789,7 +791,7 @@ func TestMaintenanceSwapRefusesServiceUser(t *testing.T) {
 			r := m.runProbed(v, "", true)
 			r.report(t, v.name)
 			if r.code != v.code {
-				t.Fatalf("exit %d, want %d\nstdout:\n%s\nstderr:\n%s", r.code, v.code, r.stdout, r.stderr)
+				t.Fatalf("exit %d, want %d; stdout %q; stderr %q", r.code, v.code, r.stdout, r.stderr)
 			}
 			if !slices.Equal(r.steps, keystore.SwapSteps) {
 				t.Errorf("the steps reached are %v; want %v", r.steps, keystore.SwapSteps)
@@ -852,7 +854,7 @@ func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
 			r := m.runProbed(v, "", false)
 			r.report(t, "uncrashed")
 			if r.code != v.code {
-				t.Fatalf("exit %d, want %d\nstdout:\n%s\nstderr:\n%s", r.code, v.code, r.stdout, r.stderr)
+				t.Fatalf("exit %d, want %d; stdout %q; stderr %q", r.code, v.code, r.stdout, r.stderr)
 			}
 			ref = r.stdout
 		})
@@ -862,13 +864,13 @@ func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
 				r := m.runProbed(v, step, false)
 				r.report(t, "the crashed run")
 				if r.code == keysOK {
-					t.Fatalf("the run crashed before %s reported success\nstderr:\n%s", step, r.stderr)
+					t.Fatalf("the run crashed before %s reported success; stderr %q", step, r.stderr)
 				}
 				m.checkLive(v, "after the crash before "+step, r.code, r.stderr)
 				rerun := m.runProbed(v, "", false)
 				rerun.report(t, "the rerun after a crash before "+step)
 				if rerun.code != v.code || (ref != "" && rerun.stdout != ref) {
-					t.Fatalf("the rerun after a crash before %s: exit %d, want %d; stdout:\n%s\nwant (the uncrashed run's):\n%s\ncrashed run's stderr:\n%s\nrerun's stderr:\n%s", step, rerun.code, v.code, rerun.stdout, ref, r.stderr, rerun.stderr)
+					t.Fatalf("the rerun after a crash before %s: exit %d, want %d; stdout %q; want (the uncrashed run's) %q; crashed run's stderr %q; rerun's stderr %q", step, rerun.code, v.code, rerun.stdout, ref, r.stderr, rerun.stderr)
 				}
 				m.checkLive(v, "the rerun after a crash before "+step, rerun.code, rerun.stderr)
 				if v.log == keystore.AuditLogName {
@@ -880,26 +882,26 @@ func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
 				r := m.runProbed(v, step, false)
 				r.report(t, "the crashed run")
 				if r.code == keysOK {
-					t.Fatalf("the run crashed before %s reported success\nstderr:\n%s", step, r.stderr)
+					t.Fatalf("the run crashed before %s reported success; stderr %q", step, r.stderr)
 				}
 				before := keysState(t, m.logPath(v.log))
 				o := v.other()
 				code := m.h.run(o.args...)
 				stdout, stderr := m.h.stdout.String(), m.h.stderr.String()
 				if code != keysOK && code != keysCommitted {
-					t.Fatalf("%s after %s crashed before %s: exit %d\nstdout:\n%s\nstderr:\n%s", o.name, v.name, step, code, stdout, stderr)
+					t.Fatalf("%s after %s crashed before %s: exit %d; stdout %q; stderr %q", o.name, v.name, step, code, stdout, stderr)
 				}
 				m.checkLive(o, o.name+" after the crash before "+step, code, stderr)
 				after := keysState(t, m.logPath(v.log))
 				// The other verb's audit line may follow the audit log's
 				// bytes; nothing else of the first verb's log changes.
 				if after.ino != before.ino || after.flags != before.flags || after.uid != before.uid || after.mode != before.mode || !strings.HasPrefix(after.data, before.data) {
-					t.Errorf("%s changed %s's log: %+v, was %+v\nstderr:\n%s", o.name, v.name, after, before, stderr)
+					t.Errorf("%s changed %s's log: %+v, was %+v; stderr %q", o.name, v.name, after, before, stderr)
 				}
 				rerun := m.runProbed(v, "", false)
 				rerun.report(t, "the first verb's rerun")
 				if rerun.code != keysOK && rerun.code != keysCommitted {
-					t.Fatalf("%s's rerun after %s: exit %d\nstdout:\n%s\nstderr:\n%s", v.name, o.name, rerun.code, rerun.stdout, rerun.stderr)
+					t.Fatalf("%s's rerun after %s: exit %d; stdout %q; stderr %q", v.name, o.name, rerun.code, rerun.stdout, rerun.stderr)
 				}
 				m.checkLive(v, v.name+"'s rerun after "+o.name, rerun.code, rerun.stderr)
 				if v.log == keystore.AuditLogName {
@@ -946,13 +948,13 @@ func TestMaintenanceOldLogRetiredNeverReowned(t *testing.T) {
 			stderr := m.h.stderr.String()
 			m.h.attrs = realFileAttrWriter{}
 			if code != v.code {
-				t.Fatalf("exit %d, want %d\nstderr:\n%s", code, v.code, stderr)
+				t.Fatalf("exit %d, want %d; stderr %q", code, v.code, stderr)
 			}
 			newSt := keysState(t, m.logPath(v.log))
 			build, report, swap, clean := attrs.index("step build", 0), attrs.index("step report", 0), attrs.index("step swap", 0), attrs.index("step clean", 0)
 			chown, chmod, chflags := attrs.index("fchown", newSt.ino), attrs.index("fchmod", newSt.ino), attrs.index("fchflags", newSt.ino)
 			if build < 0 || !(build < chown && chown < chmod && chmod < chflags && chflags < report && report < swap) {
-				t.Errorf("the new log's calls: build %d, fchown %d, fchmod %d, fchflags %d, report %d, swap %d; want them in that order\nevents %+v", build, chown, chmod, chflags, report, swap, attrs.events)
+				t.Errorf("the new log's calls: build %d, fchown %d, fchmod %d, fchflags %d, report %d, swap %d; want them in that order; events %+v", build, chown, chmod, chflags, report, swap, attrs.events)
 			} else if e := attrs.events[chown]; e.uid != 0 || e.arg != int(m.svcUID) {
 				t.Errorf("the new log's fchown was to %d while uid %d; want to the service user %d while root's", e.arg, e.uid, m.svcUID)
 			} else if e := attrs.events[chflags]; e.arg != keysSFAppend || e.uid != m.svcUID {
@@ -968,7 +970,7 @@ func TestMaintenanceOldLogRetiredNeverReowned(t *testing.T) {
 				}
 			}
 			if len(oldCalls) != 1 || oldCalls[0].call != "fchflags" || oldCalls[0].arg != 0 {
-				t.Errorf("the old %s's attribute calls are %+v; want its flag clear alone\nstderr:\n%s", v.log, oldCalls, stderr)
+				t.Errorf("the old %s's attribute calls are %+v; want its flag clear alone; stderr %q", v.log, oldCalls, stderr)
 			}
 			var held unix.Stat_t
 			if err := unix.Fstat(int(old.Fd()), &held); err != nil || held.Nlink != 0 || held.Uid != oldSt.uid || held.Mode&0o7777 != 0o600 {
@@ -1157,35 +1159,35 @@ func TestMaintenanceRefusesPlantedNames(t *testing.T) {
 				code := m.h.run(v.args...)
 				stdout, stderr := m.h.stdout.String(), m.h.stderr.String()
 				if got := keysState(t, decoy); got != decoyBefore {
-					t.Errorf("%s: the decoy a planted name points at changed: %+v, was %+v\nstderr:\n%s", pl.name, got, decoyBefore, stderr)
+					t.Errorf("%s: the decoy a planted name points at changed: %+v, was %+v; stderr %q", pl.name, got, decoyBefore, stderr)
 				}
 				if ok, names := keysDirEmptyPath(decoyDir); !ok && !slices.Equal(names, []string{v.log}) {
-					t.Errorf("%s: the decoy directory now lists %v\nstderr:\n%s", pl.name, names, stderr)
+					t.Errorf("%s: the decoy directory now lists %v; stderr %q", pl.name, names, stderr)
 				}
 				if pl.clean {
 					if code != v.code {
-						t.Fatalf("%s: exit %d, want %d (staging cleaned, the verb finishes)\nstdout:\n%s\nstderr:\n%s", pl.name, code, v.code, stdout, stderr)
+						t.Fatalf("%s: exit %d, want %d (staging cleaned, the verb finishes); stdout %q; stderr %q", pl.name, code, v.code, stdout, stderr)
 					}
 					m.checkLive(v, pl.name, code, stderr)
 					return
 				}
 				if code != keysRefused {
-					t.Fatalf("%s: exit %d, want %d (refused)\nstdout:\n%s\nstderr:\n%s", pl.name, code, keysRefused, stdout, stderr)
+					t.Fatalf("%s: exit %d, want %d (refused); stdout %q; stderr %q", pl.name, code, keysRefused, stdout, stderr)
 				}
 				after := m.snapshot()
 				m.allowRefusedAuditLine(before, after)
 				for n, b := range before {
 					if a, ok := after[n]; !ok || a != b {
-						t.Errorf("%s: %s changed: %+v, was %+v\nstderr:\n%s", pl.name, n, after[n], b, stderr)
+						t.Errorf("%s: %s changed: %+v, was %+v; stderr %q", pl.name, n, after[n], b, stderr)
 					}
 				}
 				for n := range after {
 					if _, ok := before[n]; !ok {
-						t.Errorf("%s: the refused verb left %s\nstderr:\n%s", pl.name, n, stderr)
+						t.Errorf("%s: the refused verb left %s; stderr %q", pl.name, n, stderr)
 					}
 				}
 				if got := keysState(t, filepath.Join(m.root, planted)); got != plantedBefore {
-					t.Errorf("%s: the planted %s changed: %+v, was %+v\nstderr:\n%s", pl.name, planted, got, plantedBefore, stderr)
+					t.Errorf("%s: the planted %s changed: %+v, was %+v; stderr %q", pl.name, planted, got, plantedBefore, stderr)
 				}
 			})
 		}
