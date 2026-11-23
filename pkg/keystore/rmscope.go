@@ -579,15 +579,17 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, opts rmTree
 			return rmTree{}, cerr
 		}
 	}
+	// The scope directory stays held through its rmdir, which checks on
+	// this descriptor that it was the directory removed.
+	defer func() { _ = unix.Close(dfd) }() // fsynced in emptyScopeDir
 	err = w.take(dfd, &dst, "")
 	if err == nil {
 		err = w.emptyScopeDir(dfd)
 	}
-	_ = unix.Close(dfd) // fsynced in emptyScopeDir
 	if err != nil {
 		return rmTree{}, err
 	}
-	err = w.rmdirHeld(ufd, uid, &dst)
+	err = w.rmdirHeld(ufd, uid, dfd, &dst)
 	if errors.Is(err, unix.EPERM) {
 		// .user is shared by every scope: its user locking flags are
 		// cleared only when its removal of this one needs it, and only
@@ -596,16 +598,14 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, opts rmTree
 		tree.cleared, unlocked, err = w.unlockShared(ufd, err)
 		if unlocked {
 			w.changed = true
-			err = w.rmdirHeld(ufd, uid, &dst)
+			err = w.rmdirHeld(ufd, uid, dfd, &dst)
 		}
 	}
 	switch {
 	case err == nil:
 		w.changed = true
 		return tree, unix.Fsync(ufd)
-	case errors.Is(err, unix.ENOTEMPTY):
-		return tree, w.busy("")
-	case errors.Is(err, errScopeTreeBusy), errors.Is(err, errScopeDirMoved):
+	case errors.Is(err, errScopeDirMoved):
 		return tree, err
 	}
 	return tree, fmt.Errorf("remove the scope directory: %w", err)
@@ -778,19 +778,43 @@ func (u *UserScope) rerunScope(k keys, removed *removedScopes, svc uint32, path 
 // at its name in .user when it came to remove it.
 var errScopeDirMoved = errors.New("the scope directory was moved away from its name after rm-scope emptied it, and is not removed")
 
-// rmBeforeScopeRmdir, when set, runs just before rm-scope checks the
-// scope directory's name for its final removal; tests swap the name.
-var rmBeforeScopeRmdir func()
+// rmdirStep is where rmBeforeScopeRmdir runs in rmdirHeld.
+type rmdirStep int
+
+const (
+	// rmdirBeforeStat: before the name is stat'ed.
+	rmdirBeforeStat rmdirStep = iota
+	// rmdirBeforeUnlink: after the stat matched, before the unlinkat.
+	rmdirBeforeUnlink
+)
+
+// rmBeforeScopeRmdir, when set, runs at each step of rm-scope's final
+// removal of the scope directory; tests swap the name.
+var rmBeforeScopeRmdir func(rmdirStep)
+
+// rmGoneProbe is the name rmdirHeld creates in the held scope directory to
+// learn whether the unlinkat removed it: a removed directory refuses a new
+// name (ENOENT), one still linked takes it.
+const rmGoneProbe = ".rm-scope-removed-check"
 
 // rmdirHeld removes the name uid from .user, held at ufd, only while it is
-// still the emptied directory held describes: .user is the service user's,
-// so the name can be renamed away or another directory put at it. The name
-// is stat'ed (not followed) first, and a different device or inode fails as
-// busy, removing nothing; a name missing then, or at the unlinkat, is
-// errScopeDirMoved, never success.
-func (w *rmWalk) rmdirHeld(ufd int, uid string, held *unix.Stat_t) error {
+// still the emptied directory held at fd, which held describes: .user is
+// the service user's, so the name can be renamed away or another
+// directory put at it. The name is stat'ed (not followed) first, and a
+// different device or inode removes nothing; a name missing then, or at
+// the unlinkat, is errScopeDirMoved, never success. The name can still
+// change between the stat and the unlinkat, so after the unlinkat removes a
+// directory the held one is asked whether it was it: on macOS (APFS) an
+// fstat of a removed directory still held open reports its link count as
+// before (2), so the link count cannot say; mkdirat of rmGoneProbe in it
+// fails with ENOENT once it is removed, on macOS and Linux alike. When it
+// is still linked, the probe is removed again and the error says another
+// directory was removed at the name and the emptied one remains. Every
+// failure here is errScopeDirMoved: the emptied directory is not at the
+// name, and a rerun would meet whatever is.
+func (w *rmWalk) rmdirHeld(ufd int, uid string, fd int, held *unix.Stat_t) error {
 	if rmBeforeScopeRmdir != nil {
-		rmBeforeScopeRmdir()
+		rmBeforeScopeRmdir(rmdirBeforeStat)
 	}
 	var st unix.Stat_t
 	err := unix.Fstatat(ufd, uid, &st, unix.AT_SYMLINK_NOFOLLOW)
@@ -801,13 +825,34 @@ func (w *rmWalk) rmdirHeld(ufd int, uid string, held *unix.Stat_t) error {
 		return fmt.Errorf("stat the scope directory: %w", err)
 	}
 	if st.Dev != held.Dev || st.Ino != held.Ino {
-		return fmt.Errorf("%w: the name %s (named for reading, not for pasting) is no longer the directory rm-scope emptied, so nothing at it was removed", errScopeTreeBusy, quoteName(w.base))
+		return fmt.Errorf("%w: the name %s (named for reading, not for pasting) is no longer the directory rm-scope emptied, so nothing at it was removed", errScopeDirMoved, quoteName(w.base))
+	}
+	if rmBeforeScopeRmdir != nil {
+		rmBeforeScopeRmdir(rmdirBeforeUnlink)
 	}
 	err = unix.Unlinkat(ufd, uid, unix.AT_REMOVEDIR)
-	if errors.Is(err, unix.ENOENT) {
+	switch {
+	case errors.Is(err, unix.ENOENT):
 		return w.moved()
+	case errors.Is(err, unix.ENOTEMPTY), errors.Is(err, unix.EEXIST):
+		return fmt.Errorf("%w: a non-empty directory is now at the name %s (named for reading, not for pasting), so nothing at it was removed", errScopeDirMoved, quoteName(w.base))
+	case errors.Is(err, unix.ENOTDIR):
+		return fmt.Errorf("%w: something other than a directory is now at the name %s (named for reading, not for pasting), so nothing at it was removed", errScopeDirMoved, quoteName(w.base))
+	case err != nil:
+		return err
 	}
-	return err
+	w.changed = true
+	err = unix.Mkdirat(fd, rmGoneProbe, 0o700)
+	switch {
+	case errors.Is(err, unix.ENOENT):
+		return nil
+	case err == nil:
+		_ = unix.Unlinkat(fd, rmGoneProbe, unix.AT_REMOVEDIR) // the held directory is root's; the probe goes again
+		fallthrough
+	case errors.Is(err, unix.EEXIST):
+		return fmt.Errorf("%w: another directory was removed at the name %s (named for reading, not for pasting), and the emptied one remains, no longer at that name", errScopeDirMoved, quoteName(w.base))
+	}
+	return fmt.Errorf("%w: a directory was removed at the name %s (named for reading, not for pasting), and rm-scope could not tell whether it was the emptied one: %w", errScopeDirMoved, quoteName(w.base), err)
 }
 
 // moved is errScopeDirMoved naming the scope directory's name.

@@ -519,7 +519,10 @@ func TestRemoveScopeSharedDirFlags(t *testing.T) {
 	t.Run("the service user's, then the removal stops", func(t *testing.T) {
 		s, shared, dir, _ := setup(t)
 		calls := 0
-		setSeam(t, &rmBeforeScopeRmdir, func() {
+		setSeam(t, &rmBeforeScopeRmdir, func(step rmdirStep) {
+			if step != rmdirBeforeStat {
+				return
+			}
 			calls++
 			if calls == 2 {
 				if err := os.Rename(dir, filepath.Join(shared, "away")); err != nil {

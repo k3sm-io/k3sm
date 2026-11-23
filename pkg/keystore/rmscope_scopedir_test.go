@@ -219,32 +219,49 @@ func TestRemoveScopeLeavesOtherDeviceDir(t *testing.T) {
 
 // .user is the service user's, so the emptied scope directory's name can be
 // renamed away, or another directory put at it, just before rm-scope
-// removes it (the seam does either once). Neither is reported removed: a
-// name gone is errScopeDirMoved, never success, and the directory moved
-// away is still there; a name now naming another directory fails as busy,
-// and the swapped-in directory survives.
+// removes it: before its stat, or between the stat and the unlinkat (the
+// seam does one of them once). None is reported removed: each is
+// errScopeDirMoved, never success, the directory moved away is still
+// there and empty, and the error offers no rerun. A swapped-in directory
+// survives when it holds a name (ENOTEMPTY, said as a non-empty directory
+// now at the name); an empty one swapped in after the stat is what the
+// unlinkat removes, and the error says another directory was removed at
+// the name and the emptied one remains.
 func TestRemoveScopeDirMovedBeforeRmdir(t *testing.T) {
-	for _, swapIn := range []bool{false, true} {
-		name := "moved away"
-		if swapIn {
-			name = "another directory at the name"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		step     rmdirStep
+		swapIn   bool
+		nonEmpty bool
+		want     string
+	}{
+		{"moved away", rmdirBeforeStat, false, false, "moved away from its name"},
+		{"another directory at the name", rmdirBeforeStat, true, false, "is no longer the directory rm-scope emptied"},
+		{"moved away after the stat", rmdirBeforeUnlink, false, false, "moved away from its name"},
+		{"an empty directory at the name after the stat", rmdirBeforeUnlink, true, false, "another directory was removed at the name"},
+		{"a non-empty directory at the name after the stat", rmdirBeforeUnlink, true, true, "a non-empty directory is now at the name"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			s, server, _ := fileLogScope(t)
 			dir := scopeDir(server, "1001")
 			away := filepath.Join(filepath.Dir(dir), "away")
 			var swapped uint64
-			setSeam(t, &rmBeforeScopeRmdir, func() {
-				if swapped != 0 {
+			setSeam(t, &rmBeforeScopeRmdir, func(step rmdirStep) {
+				if swapped != 0 || step != tc.step {
 					return
 				}
 				if err := os.Rename(dir, away); err != nil {
 					t.Fatal(err)
 				}
 				swapped = 1
-				if swapIn {
+				if tc.swapIn {
 					if err := os.Mkdir(dir, 0o700); err != nil {
 						t.Fatal(err)
+					}
+					if tc.nonEmpty {
+						if err := os.WriteFile(filepath.Join(dir, "theirs"), nil, 0o600); err != nil {
+							t.Fatal(err)
+						}
 					}
 					swapped, _ = inoOf(t, dir)
 				}
@@ -258,23 +275,27 @@ func TestRemoveScopeDirMovedBeforeRmdir(t *testing.T) {
 			if swapped == 0 {
 				t.Fatal("the seam never ran")
 			}
-			want := errScopeDirMoved
-			if swapIn {
-				want = errScopeTreeBusy
+			if !errors.Is(err, errScopeDirMoved) {
+				t.Fatalf("removeScopeTree with the name swapped before its rmdir: %v, want errScopeDirMoved", err)
 			}
-			if !errors.Is(err, want) {
-				t.Fatalf("removeScopeTree with the name swapped before its rmdir: %v, want %v", err, want)
+			msg := err.Error()
+			if !strings.Contains(msg, quoteName(dir)+" (named for reading, not for pasting)") || !strings.Contains(msg, tc.want) {
+				t.Errorf("the error %q does not name the scope directory for reading and say %q", msg, tc.want)
 			}
-			if !strings.Contains(err.Error(), quoteName(dir)+" (named for reading, not for pasting)") {
-				t.Errorf("the error %q does not name the scope directory for reading", err)
+			if strings.Contains(msg, "which only root can now do") {
+				t.Errorf("the error %q says only root can change the names", msg)
 			}
 			if names, err := os.ReadDir(away); err != nil || len(names) != 0 {
 				t.Fatalf("the emptied directory moved away: %v (%v), want it present and empty", names, err)
 			}
-			if swapIn {
+			_, lerr := os.Lstat(dir)
+			switch {
+			case tc.swapIn && (tc.step == rmdirBeforeStat || tc.nonEmpty):
 				if ino, _ := inoOf(t, dir); ino != swapped {
 					t.Fatalf("the directory at the name is inode %d, want the swapped-in %d", ino, swapped)
 				}
+			case !errors.Is(lerr, os.ErrNotExist):
+				t.Fatalf("the name after the stop: %v, want nothing at it", lerr)
 			}
 		})
 	}
