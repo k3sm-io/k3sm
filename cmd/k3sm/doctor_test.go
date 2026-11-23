@@ -556,6 +556,9 @@ func TestDoctorKeystoreUserScopeRow(t *testing.T) {
 		{name: "rootless server", seam: userScopeChecks(func(p *socket.Preconditions) {
 			p.EUID = func() int { return 501 }
 		}), status: statusWarn, detail: "keystore user scope: off (user scope needs the installed server)"},
+		{name: "service uid in the login range", seam: userScopeChecks(func(p *socket.Preconditions) {
+			p.EUID, p.ServiceUID = func() int { return 600 }, 600
+		}), status: statusWarn, detail: "keystore user scope: off (the service uid is in the login range)", detailHas: "the service uid 600 is not below 501"},
 		{name: "service user unknown", seam: func() (doctorUserScope, error) {
 			return doctorUserScope{}, boom
 		}, status: statusWarn, detail: "keystore user scope: off (user scope needs the installed server)", detailHas: "boom"},

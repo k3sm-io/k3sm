@@ -63,6 +63,7 @@ type OffReason string
 // The reasons the listener is off.
 const (
 	OffNotInstalledServer   OffReason = "user scope needs the installed server"
+	OffServiceUIDLoginRange OffReason = "the service uid is in the login range"
 	OffMaintenance          OffReason = "a maintenance verb is running"
 	OffMaintenanceUnknown   OffReason = "the maintenance marker cannot be read"
 	OffIgnoresOwnership     OffReason = "the data root is mounted ignoring ownership"
@@ -386,6 +387,13 @@ func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
 	}
 	if euid < 0 || uint64(euid) != uint64(p.ServiceUID) {
 		return OffNotInstalledServer, fmt.Sprintf("effective uid %d is not the service uid %d", euid, p.ServiceUID)
+	}
+	// The service uid is a system account: refused as a peer before the
+	// login range is judged, it must lie below the range, or a login user
+	// sharing it would be refused as the service uid and a refusal under
+	// it would be charged as a login line's.
+	if p.ServiceUID >= MinPeerUID {
+		return OffServiceUIDLoginRange, fmt.Sprintf("the service uid %d is not below %d", p.ServiceUID, MinPeerUID)
 	}
 	if ignores, err := guard(p.IgnoresOwnership); err != nil {
 		return OffMountUnknown, err.Error()

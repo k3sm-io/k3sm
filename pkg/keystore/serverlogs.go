@@ -203,6 +203,8 @@ type ServerLogs struct {
 	// pending is each uid's dropped count, by class, not yet in a summary
 	// line.
 	pending map[preFrameKey]uint64
+	// sync fsyncs the held audit file after an append; a test replaces it.
+	sync func(*os.File) error
 }
 
 // preFrameKey is one uid within one class.
@@ -230,6 +232,7 @@ func (s *FileStore) ServerLogs() *ServerLogs {
 		pending:     map[preFrameKey]uint64{},
 		usedByClass: map[preFrameClass]int64{},
 		usedByUID:   map[preFrameKey]int64{},
+		sync:        (*os.File).Sync,
 	}
 }
 
@@ -565,11 +568,16 @@ func (l *ServerLogs) appendLocked(rec preFrameRec) error {
 	if err == nil && n < len(out) {
 		err = io.ErrShortWrite
 	}
-	if serr := h.f.Sync(); err == nil {
-		err = serr
-	}
 	if err != nil {
+		_ = h.f.Sync() // what part of the line reached the file is the recount's
 		return fmt.Errorf("append to %s: %w", auditLogName, err)
+	}
+	// The whole line is in the file, so it is written, not dropped: a
+	// failed fsync leaves only its durability unknown. It is logged here,
+	// once, and the call succeeds, so the line is never also counted as
+	// dropped.
+	if serr := l.sync(h.f); serr != nil {
+		l.s.logger().Warn("keystore: a pre-frame audit line was written but its fsync failed; its durability is unknown", "result", rec.Result, "uid", rec.Caller.UID, "err", serr)
 	}
 	// The running count reads on through what this append wrote, with the
 	// recount's one rule, so it charges the line now and charges it as a

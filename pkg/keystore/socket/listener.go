@@ -28,6 +28,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"k3sm.io/k3sm/pkg/keystore"
 )
 
 // The bounds on connections (docs/design/keystore.md, "Bounds"). A
@@ -42,9 +44,11 @@ const (
 // The eligible peer uids: login users. Below MinPeerUID are system accounts;
 // above MaxPeerUID, nobody among them, no login user, and a signed 32-bit
 // reading would turn the uid negative. The service uid is refused too.
+// They are the store's login range (keystore.MinLoginUID and MaxLoginUID),
+// the one copy of 501 and 2147483647.
 const (
-	MinPeerUID = 501
-	MaxPeerUID = 2147483647
+	MinPeerUID = keystore.MinLoginUID
+	MaxPeerUID = keystore.MaxLoginUID
 )
 
 // Clock is the listener's time: Now for the rate limit, and After for the

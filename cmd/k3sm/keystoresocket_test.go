@@ -161,9 +161,9 @@ func newWiringFixture(t *testing.T) *wiringFixture {
 		client:   fake.NewClientset(serverNode("s1"), serverNode("s2")),
 		listen:   func(context.Context) (net.Listener, error) { return nil, f.lnErr },
 		nodeRole: func() (install.Role, bool) { return install.RoleServer, true },
-		euid:     func() int { return 777 },
+		euid:     func() int { return 277 },
 		serviceIDs: func() (uint32, uint32, error) {
-			return 777, 20, nil
+			return 277, 20, nil
 		},
 		openDataRoot: func(path string) (*os.File, error) {
 			if path != f.dataRoot {
@@ -201,11 +201,11 @@ func TestKeystoreSocketWiring(t *testing.T) {
 		if _, err := cfg.Listen(ctx); !errors.Is(err, f.lnErr) {
 			t.Errorf("Listen is not the given source: %v", err)
 		}
-		if got := cfg.EUID(); got != 777 {
-			t.Errorf("EUID = %d, want the euid source's 777", got)
+		if got := cfg.EUID(); got != 277 {
+			t.Errorf("EUID = %d, want the euid source's 277", got)
 		}
-		if cfg.ServiceUID != 777 {
-			t.Errorf("ServiceUID = %d, want the service lookup's 777", cfg.ServiceUID)
+		if cfg.ServiceUID != 277 {
+			t.Errorf("ServiceUID = %d, want the service lookup's 277", cfg.ServiceUID)
 		}
 		if ignores, err := cfg.IgnoresOwnership(); !ignores || err != nil {
 			t.Errorf("IgnoresOwnership = %v, %v; want the fake's true", ignores, err)
@@ -274,8 +274,8 @@ func TestKeystoreSocketWiring(t *testing.T) {
 			synctest.Wait()
 			st := ks.sup.State()
 			stop()
-			if st.Phase != socket.PhaseOff || st.Reason != socket.OffNotInstalledServer || !strings.Contains(st.Detail, "777") {
-				t.Fatalf("state = %+v, want off for the service uid 777", st)
+			if st.Phase != socket.PhaseOff || st.Reason != socket.OffNotInstalledServer || !strings.Contains(st.Detail, "277") {
+				t.Fatalf("state = %+v, want off for the service uid 277", st)
 			}
 		})
 	})
@@ -288,7 +288,7 @@ func TestKeystoreSocketWiring(t *testing.T) {
 			if lookups.Add(1) <= 2 {
 				return 0, 0, errors.New("fake: no _k3sm user yet")
 			}
-			return 777, 20, nil
+			return 277, 20, nil
 		}
 		logs := &bytes.Buffer{}
 		log := slog.New(slog.NewTextHandler(logs, nil))
@@ -344,8 +344,8 @@ func TestKeystoreSocketWiring(t *testing.T) {
 			release := make(chan struct{})
 			sup, err := socket.NewSupervisor(socket.SupervisorConfig{
 				Listen:            func(context.Context) (net.Listener, error) { return nil, errors.New("none") },
-				EUID:              func() int { return 777 },
-				ServiceUID:        777,
+				EUID:              func() int { return 277 },
+				ServiceUID:        277,
 				IgnoresOwnership:  func() (bool, error) { return false, nil },
 				CheckInstall:      func(context.Context) error { return nil },
 				MaintenanceMarked: func() (bool, error) { return false, nil },

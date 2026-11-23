@@ -3637,7 +3637,12 @@ directory is root's"). A worker node runs no listener (E18).
   effective uid is the service uid, the `_k3sm` uid `sudo k3sm install` creates. A rootless
   `k3sm server` is a supported development mode whose Pods inherit the daemon's login uid
   ("Pod denies", layer 2), so a peer at that uid could be a Pod. The server logs, and `doctor`
-  shows, "user scope needs the installed server" (U113).
+  shows, "user scope needs the installed server" (U113). The next check refuses a service uid
+  at 501 or above: the service user is a system account, and one in the login range would make
+  a login user indistinguishable from it and its refusal lines login lines; the off reason is
+  "the service uid is in the login range", which `doctor` shows. The socket's eligible range
+  (`socket.MinPeerUID`, `socket.MaxPeerUID`) is the store's (`keystore.MinLoginUID`,
+  `keystore.MaxLoginUID`), one copy of 501 and 2147483647.
 - The server never creates, unlinks or replaces `keys.sock`; launchd owns the name. In the
   deny-plus-pin fallback only, it unlinks a stale `keys.sock` at start only after an `lstat`
   shows a socket owned by the service user; anything else at that path is refused with a Warn.

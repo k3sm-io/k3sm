@@ -124,7 +124,10 @@ its `keystore-user-scope` row says only what it can check:
 - `keystore user scope: off (<reason>)` (WARN): a check fails, with the server's own reason.
   For a missing, wrong or unflagged log or socket directory it adds `run sudo k3sm install`;
   for `more than one server registered` it names the servers (up to 8, then how many more);
-  for `the append-only logs cannot be opened (logs-unavailable)` it shows the error.
+  for `the append-only logs cannot be opened (logs-unavailable)` it shows the error;
+  `the service uid is in the login range` means the service user's uid is 501 or above, where
+  login users' uids start, and the listener does not start until the service user is a system
+  account below 501.
 - `keystore user scope: the server count cannot be read as this user` (WARN): run
   `sudo k3sm doctor`; this does not mean the user scope is off.
 

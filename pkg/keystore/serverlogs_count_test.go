@@ -17,10 +17,13 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -237,5 +240,38 @@ func TestPreFrameRunningCountIsTheRecount(t *testing.T) {
 		if got := l.countsOf().byClass[c]; got == 0 || got > c.budget() {
 			t.Fatalf("class %s charged %d bytes, want some and at most %d", c, got, c.budget())
 		}
+	}
+}
+
+// TestPreFrameFsyncFailureIsWrittenNotDropped checks that a whole line
+// whose fsync fails is counted as written, with its durability unknown,
+// and logged once: it is in the log and charged, the call succeeds, and
+// nothing is added to the uid's dropped count.
+func TestPreFrameFsyncFailureIsWrittenNotDropped(t *testing.T) {
+	s, auditPath := newServerLogsStore(t)
+	var buf bytes.Buffer
+	s.log = slog.New(slog.NewTextHandler(&buf, nil))
+	ctx := t.Context()
+	l := s.ServerLogs()
+	t.Cleanup(func() { _ = l.Close() })
+	l.sync = func(*os.File) error { return unix.EIO }
+	if err := l.Refused(ctx, 1001, "sandboxed"); err != nil {
+		t.Fatalf("Refused = %v, want the written line to succeed", err)
+	}
+	if got := l.PendingDropped(1001); got != 0 {
+		t.Fatalf("a written line was also counted as dropped: %d", got)
+	}
+	b, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(b, []byte(`"result":"sandboxed"`)) {
+		t.Fatalf("the line is not in the log: %q", b)
+	}
+	if got, want := l.PreFrameUsed(), int64(len(b)); got != want {
+		t.Fatalf("charged %d bytes, want the line's %d", got, want)
+	}
+	if n := strings.Count(buf.String(), "fsync failed"); n != 1 {
+		t.Fatalf("logged the fsync failure %d times, want once:\n%s", n, buf.String())
 	}
 }

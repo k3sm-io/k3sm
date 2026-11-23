@@ -49,6 +49,19 @@ func TestPreconditionsCheck(t *testing.T) {
 	}{
 		{"all pass", func(*Preconditions) {}, ""},
 		{"rootless", func(p *Preconditions) { p.EUID = func() int { return 501 } }, OffNotInstalledServer},
+		{"service uid in the login range", func(p *Preconditions) {
+			p.EUID, p.ServiceUID = func() int { return MinPeerUID }, MinPeerUID
+		}, OffServiceUIDLoginRange},
+		{"service uid high", func(p *Preconditions) {
+			p.EUID, p.ServiceUID = func() int { return 1 << 31 }, 1<<31
+		}, OffServiceUIDLoginRange},
+		{"service uid just below the range", func(p *Preconditions) {
+			p.EUID, p.ServiceUID = func() int { return MinPeerUID - 1 }, MinPeerUID-1
+		}, ""},
+		{"service uid range before mount", func(p *Preconditions) {
+			p.EUID, p.ServiceUID = func() int { return 600 }, 600
+			p.IgnoresOwnership = func() (bool, error) { return true, nil }
+		}, OffServiceUIDLoginRange},
 		{"marker", func(p *Preconditions) { p.MaintenanceMarked = func() (bool, error) { return true, nil } }, OffMaintenance},
 		{"marker unreadable", func(p *Preconditions) { p.MaintenanceMarked = func() (bool, error) { return false, boom } }, OffMaintenanceUnknown},
 		{"ignore ownership", func(p *Preconditions) { p.IgnoresOwnership = func() (bool, error) { return true, nil } }, OffIgnoresOwnership},
@@ -99,7 +112,7 @@ func TestPreconditionsCheck(t *testing.T) {
 			}
 		})
 	}
-	for _, r := range []OffReason{OffNotInstalledServer, OffMaintenance, OffMaintenanceUnknown, OffIgnoresOwnership, OffMountUnknown, OffLogsUnavailable, OffServers, OffServersUnknown, OffListenerUnavailable, OffListenerFailed, OffSandboxCheckUnusable} {
+	for _, r := range []OffReason{OffNotInstalledServer, OffServiceUIDLoginRange, OffMaintenance, OffMaintenanceUnknown, OffIgnoresOwnership, OffMountUnknown, OffLogsUnavailable, OffServers, OffServersUnknown, OffListenerUnavailable, OffListenerFailed, OffSandboxCheckUnusable} {
 		if got := r.Remedy(); got != "" {
 			t.Errorf("%q names the remedy %q, want none", r, got)
 		}
