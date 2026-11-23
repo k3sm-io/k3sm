@@ -85,7 +85,7 @@ func TestEarlierCommittedRunReported(t *testing.T) {
 			// The audit line was written before the marker was replaced: a
 			// rotate carries it into .1, a rebuild leaves it in the live log.
 			logs := readLog(t, s, auditLogName)
-			if one, err := os.ReadFile(filepath.Join(s.dataRoot, logsDirName, auditDirName, auditArchiveName(1))); err == nil {
+			if one, err := os.ReadFile(filepath.Join(s.dataRoot, logsDirName, auditDirName, archivesDirName, auditArchiveName(1))); err == nil {
 				logs = append(logs, one...)
 			}
 			found := false

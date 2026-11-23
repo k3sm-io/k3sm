@@ -250,7 +250,7 @@ func keystoreSoftCapHint(env doctorEnv) (checkResult, bool) {
 	var details, remedies []string
 	if sz.Audit > sz.SoftCap {
 		details = append(details, fmt.Sprintf("the audit log is %d bytes, past its soft cap of %d", sz.Audit, sz.SoftCap))
-		remedies = append(remedies, "export the audit archives first: copy keystore-audit.log.1 to .4 from keystore-logs/audit/ in the data root off the Mac, then run sudo k3sm keys audit --rotate (with --discard-oldest once .4 exists)")
+		remedies = append(remedies, "export the audit archives first: as root (only root can read them), copy keystore-audit.log.1 to .4 from keystore-logs/audit/archives/ in the data root off the Mac, then run sudo k3sm keys audit --rotate (with --discard-oldest once .4 exists)")
 	}
 	if sz.UserFloor > sz.SoftCap {
 		details = append(details, fmt.Sprintf("the user-scope floor log is %d bytes, past its soft cap of %d", sz.UserFloor, sz.SoftCap))

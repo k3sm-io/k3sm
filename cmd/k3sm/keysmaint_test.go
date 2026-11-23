@@ -185,7 +185,7 @@ func keysIno(t *testing.T, path string) uint64 {
 // it refuses, changing nothing, unless --discard-oldest, which deletes .4
 // first; the swapped-in directory holds a fresh .1 with the old log's
 // bytes, the older archives carried by hard link as .2 to .4, root's 0600
-// and unflagged, and an empty new log, so every uid's share of it starts
+// and unflagged, in archives/, root's 0700, and an empty new log, so every uid's share of it starts
 // at 0. Usage and a non-root caller are refused before the store
 // opens; the verb's audit line is audit-rotate, via root (AuditRoot).
 func TestAuditRotateKeepsFourArchives(t *testing.T) {
@@ -220,11 +220,15 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	if err := os.MkdirAll(adir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	archives := filepath.Join(adir, keystore.ArchivesDirName)
+	if err := os.Mkdir(archives, keystore.ArchivesDirMode); err != nil {
+		t.Fatal(err)
+	}
 	name := func(n int) string {
 		if n == 0 {
 			return filepath.Join(adir, keystore.AuditLogName)
 		}
-		return filepath.Join(adir, fmt.Sprintf("%s.%d", keystore.AuditLogName, n))
+		return filepath.Join(archives, fmt.Sprintf("%s.%d", keystore.AuditLogName, n))
 	}
 	write := func(n int, s string) {
 		t.Helper()
@@ -293,10 +297,13 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	if got := rec.calls[keysIno(t, name(0))]; !slices.Equal(got, []string{"fchown", "fchmod 600", flagged}) {
 		t.Errorf("the new log saw %q, want the service user, 0600, then the flag", got)
 	}
-	for _, d := range []string{logs, adir} {
+	for _, d := range []string{logs, adir, archives} {
 		if got := rec.calls[keysIno(t, d)]; len(got) != 0 {
 			t.Errorf("%s saw %q, want no attribute call: there is no gate", d, got)
 		}
+	}
+	if fi, err := os.Lstat(archives); err != nil || !fi.IsDir() || fi.Mode().Perm() != keystore.ArchivesDirMode {
+		t.Errorf("the rotated %s: %v, %v, want a 0700 directory only root reaches", archives, fi, err)
 	}
 	for _, n := range []string{"keystore-maintenance", "keystore-staging"} {
 		if _, err := os.Lstat(filepath.Join(root, n)); !errors.Is(err, os.ErrNotExist) {
@@ -352,6 +359,7 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	}
 	r := checkKeystoreLogs(env)
 	if r.status != statusWarn || !strings.Contains(r.remedy, "export the audit archives first") || !strings.Contains(r.remedy, "sudo k3sm keys audit --rotate") ||
+		!strings.Contains(r.remedy, "keystore-logs/audit/archives/") || !strings.Contains(r.remedy, "as root") ||
 		strings.Index(r.remedy, "export") > strings.Index(r.remedy, "audit --rotate") {
 		t.Errorf("doctor past the audit log's soft cap: %v %q / %q, want a WARN saying to export first, then rotate", r.status, r.detail, r.remedy)
 	}

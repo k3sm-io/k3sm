@@ -30,14 +30,15 @@ import (
 
 // The root maintenance verb audit --rotate (docs/design/keystore.md § "Root
 // maintenance verbs", "audit --rotate keeps four archives"): it swaps in a
-// replacement audit/ directory holding an empty, flagged log, the old log's
-// bytes as keystore-audit.log.1 and the older archives one number up, by the
-// same directory swap as floor --rebuild.
+// replacement audit/ directory holding an empty, flagged log and an
+// archives/ directory (root's 0700) with the old log's bytes as
+// keystore-audit.log.1 and the older archives one number up, by the same
+// directory swap as floor --rebuild.
 
 // auditArchives is how many archives rotate keeps: .1, the newest, to .4.
 const auditArchives = 4
 
-// auditArchiveName is the n-th archive's name in audit/.
+// auditArchiveName is the n-th archive's name in audit/archives/.
 func auditArchiveName(n int) string { return auditLogName + "." + strconv.Itoa(n) }
 
 // errRotateRefused marks a rotate that refused before its swap: nothing
@@ -53,14 +54,16 @@ type RotateReport struct {
 
 // RotateAudit rotates the audit log (audit --rotate). Run as root: it
 // takes the floor lock, then the exclusive store lock, waiting at most 30
-// s, writes the maintenance marker, and judges every archive present in
-// audit/ (judgeArchives: root's 0600, unflagged, regular). It refuses,
+// s, writes the maintenance marker, opens and judges audit/archives/
+// (openArchivesDir: root's 0700, unflagged, no ACL; absent, no archives)
+// and every archive present in it (judgeArchives: root's 0600, unflagged,
+// regular). It refuses,
 // changing nothing, when keystore-audit.log.4 exists unless discardOldest.
 // It opens and judges the old log (openOldLog) and builds the replacement
-// directory (buildLogDir): an empty, flagged new log; .1, a fresh root 0600
-// copy of the old log's bytes, read once and bounded by its size at open;
-// and .2 to .4, hard links of the old .1 to .3 (link leaves the live
-// directory untouched). The old .4 is not linked, so the swap drops it. The
+// directory (buildLogDir): an empty, flagged new log; and archives/, root's
+// 0700, holding .1, a fresh root 0600 copy of the old log's bytes, read
+// once and bounded by its size at open, and .2 to .4, hard links of the old
+// .1 to .3 (link leaves the live directory untouched). The old .4 is not linked, so the swap drops it. The
 // directory is swapped in (swapLogDir). A rerun after a crash past the swap
 // reports the crashed run and does not rotate again.
 func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, discardOldest bool) (RotateReport, error) {
@@ -84,12 +87,19 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 		return rep, fmt.Errorf("%w: the audit log %s cannot be opened: %w", errRotateRefused, auditLogName, err)
 	}
 	defer old.close()
-	present, err := s.judgeArchives(old.dir)
+	adir, err := s.openArchivesDir(old.dir)
+	if err != nil {
+		return rep, fmt.Errorf("%w: %w", errRotateRefused, err)
+	}
+	if adir >= 0 {
+		defer func() { _ = unix.Close(adir) }() // read-only directory descriptor
+	}
+	present, err := s.judgeArchives(adir)
 	if err != nil {
 		return rep, fmt.Errorf("%w: %w", errRotateRefused, err)
 	}
 	if present[auditArchives] && !discardOldest {
-		return rep, fmt.Errorf("%w: %s exists, and rotate keeps %d archives: export the archives first (copy them off the Mac), then rerun with --discard-oldest, which deletes it", errRotateRefused, auditArchiveName(auditArchives), auditArchives)
+		return rep, fmt.Errorf("%w: %s exists, and rotate keeps %d archives: export the archives first (as root, copy them from %s/%s/%s/ in the data root off the Mac), then rerun with --discard-oldest, which deletes it", errRotateRefused, auditArchiveName(auditArchives), auditArchives, logsDirName, auditDirName, archivesDirName)
 	}
 	rep.Archives, rep.Discarded = 1, present[auditArchives]
 	for n := 1; n < auditArchives; n++ {
@@ -97,7 +107,7 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 			rep.Archives++
 		}
 	}
-	extra := func(dir int) error { return s.placeArchives(old, dir, present) }
+	extra := func(dir int) error { return s.placeArchives(old, adir, dir, present) }
 	report := map[string]int64{"archives": int64(rep.Archives), "discarded": 0}
 	if rep.Discarded {
 		report["discarded"] = 1
@@ -110,12 +120,29 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 }
 
 // placeArchives is rotate's part of step 3, in the replacement directory
-// open at dir: .1 created root's 0600, O_CREAT|O_EXCL|O_NOFOLLOW, filled
-// with the old log's first old.size bytes and fsynced; then each present
-// archive .n of .1 to .3 hard-linked from the live audit/ as .n+1.
-func (s *FileStore) placeArchives(old *oldLog, dir int, present [auditArchives + 1]bool) error {
+// open at dir: archives/ created root's 0700, opened O_DIRECTORY|O_NOFOLLOW
+// and judged; in it .1 created root's 0600, O_CREAT|O_EXCL|O_NOFOLLOW,
+// filled with the old log's first old.size bytes and fsynced; then each
+// present archive .n of .1 to .3 hard-linked from the live archives/
+// (adir) as .n+1; archives/ is fsynced.
+func (s *FileStore) placeArchives(old *oldLog, adir, dir int, present [auditArchives + 1]bool) error {
+	if err := unix.Mkdirat(dir, archivesDirName, archivesDirMode); err != nil {
+		return fmt.Errorf("create the new %s: %w", archivesDirName, err)
+	}
+	nad, err := unix.Openat(dir, archivesDirName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open the new %s: %w", archivesDirName, err)
+	}
+	defer func() { _ = unix.Close(nad) }() // fsynced below
+	// The umask may have narrowed the mode; it is set on the descriptor.
+	if err := unix.Fchmod(nad, archivesDirMode); err != nil {
+		return fmt.Errorf("chmod the new %s: %w", archivesDirName, err)
+	}
+	if err := s.judgeArchivesDir(nad); err != nil {
+		return fmt.Errorf("the new %s: %w", archivesDirName, err)
+	}
 	name := auditArchiveName(1)
-	fd, err := unix.Openat(dir, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, logMode)
+	fd, err := unix.Openat(nad, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, logMode)
 	if err != nil {
 		return fmt.Errorf("create the new %s: %w", name, err)
 	}
@@ -134,14 +161,60 @@ func (s *FileStore) placeArchives(old *oldLog, dir int, present [auditArchives +
 		if !present[n] {
 			continue
 		}
-		if err := unix.Linkat(old.dir, auditArchiveName(n), dir, auditArchiveName(n+1), 0); err != nil {
+		if err := unix.Linkat(adir, auditArchiveName(n), nad, auditArchiveName(n+1), 0); err != nil {
 			return fmt.Errorf("link %s as the new %s: %w", auditArchiveName(n), auditArchiveName(n+1), err)
 		}
+	}
+	if err := unix.Fsync(nad); err != nil {
+		return fmt.Errorf("fsync the new %s: %w", archivesDirName, err)
 	}
 	return nil
 }
 
-// judgeArchives reports, by number, which archives are present, refusing
+// openArchivesDir opens archives/ in the live audit/ directory dir
+// O_DIRECTORY|O_NOFOLLOW and judges it (judgeArchivesDir). An absent
+// archives/ holds no archive: it returns -1 and no error.
+func (s *FileStore) openArchivesDir(dir int) (int, error) {
+	fd, err := unix.Openat(dir, archivesDirName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return -1, nil
+	}
+	if err != nil {
+		return -1, fmt.Errorf("%w: open %s/%s: %w; as root, move it aside, recreate it root's 0700 and put the archives back in it, then rerun", errLogUntrusted, auditDirName, archivesDirName, err)
+	}
+	if err := s.judgeArchivesDir(fd); err != nil {
+		_ = unix.Close(fd) // read-only
+		return -1, err
+	}
+	return fd, nil
+}
+
+// judgeArchivesDir refuses the archives directory open at fd unless it is
+// a directory of the data root's owner (root) at mode 0700, with no file
+// flag and no extended ACL.
+func (s *FileStore) judgeArchivesDir(fd int) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("stat %s: %w", archivesDirName, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR || int64(st.Uid) != int64(s.floorUID) || st.Mode&0o7777 != archivesDirMode {
+		return fmt.Errorf("%w: %s/%s is not a directory of the data root's owner at mode 0700; as root, set it so (sudo chown root:wheel and sudo chmod 0700), then rerun", errLogUntrusted, auditDirName, archivesDirName)
+	}
+	fl, err := fdFlags(fd)
+	if err != nil {
+		return fmt.Errorf("%w: read the flags of %s: %w", errLogUntrusted, archivesDirName, err)
+	}
+	if fl != 0 {
+		return fmt.Errorf("%w: %s/%s carries a file flag; as root, clear it (sudo chflags 0), then rerun", errLogUntrusted, auditDirName, archivesDirName)
+	}
+	if err := judgeFlagsACL(fd, func(int) (uint32, error) { return fl, nil }); err != nil {
+		return fmt.Errorf("%s/%s: %w; as root, remove the ACL (sudo chmod -N), then rerun", auditDirName, archivesDirName, err)
+	}
+	return nil
+}
+
+// judgeArchives reports, by number, which archives are present in the
+// archives directory dir (none when dir is -1), refusing
 // any name that is not a regular file of the data root's owner (root) at
 // mode 0600, unflagged: a planted symlink or FIFO, or a file the service user owns, at
 // an archive's name refuses the rotate before anything changes. An archive
@@ -149,6 +222,9 @@ func (s *FileStore) placeArchives(old *oldLog, dir int, present [auditArchives +
 // root 0600 file gives the service user nothing.
 func (s *FileStore) judgeArchives(dir int) ([auditArchives + 1]bool, error) {
 	var present [auditArchives + 1]bool
+	if dir < 0 {
+		return present, nil
+	}
 	for n := 1; n <= auditArchives; n++ {
 		name := auditArchiveName(n)
 		var st unix.Stat_t
@@ -172,7 +248,7 @@ func (s *FileStore) judgeArchives(dir int) ([auditArchives + 1]bool, error) {
 // when it has more than one link.
 func (s *FileStore) judgeArchive(name string, st *unix.Stat_t) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFREG || int64(st.Uid) != int64(s.floorUID) || st.Mode&0o7777 != logMode || statFlags(st) != 0 {
-		return fmt.Errorf("%w: %s is not an unflagged regular file, root's 0600", errLogUntrusted, name)
+		return fmt.Errorf("%w: %s is not an unflagged regular file, root's 0600; as root, move it out of %s/%s/ or set it so, then rerun", errLogUntrusted, name, auditDirName, archivesDirName)
 	}
 	if st.Nlink > 1 {
 		slog.Warn("a keystore audit archive has more than one link; it is root's 0600, so the other link gives no other user anything", "archive", name, "links", st.Nlink)

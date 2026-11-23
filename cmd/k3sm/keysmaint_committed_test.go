@@ -86,7 +86,7 @@ func TestKeysMaintenanceCommittedAfterSwap(t *testing.T) {
 	if strings.Contains(h.stderr.String(), "not written") {
 		t.Errorf("the earlier run's audit line was not written: %q", h.stderr.String())
 	}
-	one, err := os.ReadFile(filepath.Join(h.cfg.DataRoot, keystore.LogsDirName, keystore.AuditDirName, "keystore-audit.log.1"))
+	one, err := os.ReadFile(filepath.Join(h.cfg.DataRoot, keystore.LogsDirName, keystore.AuditDirName, keystore.ArchivesDirName, "keystore-audit.log.1"))
 	if err != nil || !strings.Contains(string(one), `"op":"floor-rebuild","via":"root","scope":"system","name":"-","namespace":"","result":"committed"`) {
 		t.Errorf("the rotated log %q (%v) holds no committed floor-rebuild line", one, err)
 	}

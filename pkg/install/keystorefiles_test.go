@@ -117,7 +117,8 @@ func (r *attrRecorder) fakeStat(svcUID int) func(int, *unix.Stat_t) error {
 
 // U21 (install's half): the keystore step creates keystore-run/,
 // keystore-logs/ and both logs, each built with its own directory in
-// keystore-staging/: the log created root's 0600 with nothing written,
+// keystore-staging/ (the audit log's with an empty archives/, root's
+// 0700): the log created root's 0600 with nothing written,
 // handed to the service user, set to 0600 and flagged SF_APPEND on the held
 // descriptor and judged, all before the directory is placed in
 // keystore-logs/ with RENAME_EXCL; a rerun leaves judged logs alone; a
@@ -169,6 +170,16 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 		}
 		if fi, err := os.Lstat(filepath.Join(root, logs)); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755 {
 			t.Fatalf("%s: %v, %v, want a 0755 directory", logs, fi, err)
+		}
+		archives := filepath.Join(root, logs, keystore.AuditDirName, keystore.ArchivesDirName)
+		if fi, err := os.Lstat(archives); err != nil || !fi.IsDir() || fi.Mode().Perm() != keystore.ArchivesDirMode {
+			t.Fatalf("%s: %v, %v, want a 0700 directory", archives, fi, err)
+		}
+		if names, err := os.ReadDir(archives); err != nil || len(names) != 0 {
+			t.Fatalf("%s holds %v (%v), want it empty", archives, names, err)
+		}
+		if _, err := os.Lstat(filepath.Join(root, logs, keystore.FloorDirName, keystore.ArchivesDirName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the floor's directory holds %s: %v", keystore.ArchivesDirName, err)
 		}
 		if _, err := os.Lstat(filepath.Join(root, keystore.StagingDirName)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s left behind: %v", keystore.StagingDirName, err)

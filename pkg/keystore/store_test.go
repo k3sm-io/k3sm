@@ -67,6 +67,14 @@ func newTestStore(t *testing.T) (*FileStore, string) {
 			t.Fatal(err)
 		}
 	}
+	// The audit archives' directory, root's 0700, as install makes it.
+	archives := filepath.Join(data, logsDirName, auditDirName, archivesDirName)
+	if err := os.Mkdir(archives, archivesDirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(archives, archivesDirMode); err != nil {
+		t.Fatal(err)
+	}
 	// Non-root, a test cannot create a root-owned file, so the test user
 	// stands in for root as the floor's owner.
 	floorUID, floorGID := floorIDs()

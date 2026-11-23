@@ -44,6 +44,10 @@ const (
 	FloorDirName   = floorDirName
 	AuditDirName   = auditDirName
 	StagingDirName = stagingDirName
+	// ArchivesDirName is the audit archives' directory in AuditDirName,
+	// root's ArchivesDirMode, which only root can reach.
+	ArchivesDirName = archivesDirName
+	ArchivesDirMode = archivesDirMode
 	// FloorLockName is keystore-lock in the data root, which every
 	// maintenance verb holds while it runs.
 	FloorLockName = floorLockName

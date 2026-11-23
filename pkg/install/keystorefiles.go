@@ -399,7 +399,9 @@ func (g *keystoreLogs) ensureLog(name string, svcUID, svcGID int) error {
 // new, empty log name: the directory created and opened
 // O_DIRECTORY|O_NOFOLLOW and judged; the log created root's 0600 with
 // O_CREAT|O_EXCL|O_NOFOLLOW, handed to the service user, set to 0600 and
-// flagged SF_APPEND on its descriptor and judged (flagAndJudge); the
+// flagged SF_APPEND on its descriptor and judged (flagAndJudge); for the
+// audit log, the empty archives directory, root's 0700, created and judged
+// (rotate places its archives there, out of every other user's reach); the
 // directory set to root's 0755 and fsynced.
 func (g *keystoreLogs) buildLogDir(nd, name string, svcUID, svcGID int) error {
 	if err := unix.Mkdirat(g.sfd, nd, keystoreStagingDirMode); err != nil {
@@ -424,6 +426,27 @@ func (g *keystoreLogs) buildLogDir(nd, name string, svcUID, svcGID int) error {
 	}
 	if err := flagAndJudge(fd, name, svcUID); err != nil {
 		return err
+	}
+	if name == keystore.AuditLogName {
+		if err := unix.Mkdirat(dfd, keystore.ArchivesDirName, keystore.ArchivesDirMode); err != nil {
+			return fmt.Errorf("create %s in %s: %w", keystore.ArchivesDirName, nd, err)
+		}
+		// The umask may have narrowed the mode; it is set on the descriptor.
+		afd, err := unix.Openat(dfd, keystore.ArchivesDirName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("open %s: %w: %w", keystore.ArchivesDirName, err, errKeystoreFileUntrusted)
+		}
+		err = unix.Fchmod(afd, keystore.ArchivesDirMode)
+		if err == nil {
+			err = judgeRootDir(afd, keystore.ArchivesDirName, g.rootUID, keystore.ArchivesDirMode)
+		}
+		if err == nil {
+			err = unix.Fsync(afd)
+		}
+		_ = unix.Close(afd) // fsynced above
+		if err != nil {
+			return fmt.Errorf("the new %s/%s: %w", keystore.AuditDirName, keystore.ArchivesDirName, err)
+		}
 	}
 	if err := unix.Fchmod(dfd, keystoreLogsDirMode); err != nil {
 		return fmt.Errorf("chmod %s: %w", nd, err)

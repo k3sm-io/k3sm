@@ -137,6 +137,14 @@ func keysMaintRoot(t *testing.T, row string) *keysRootMaint {
 			t.Fatal(err)
 		}
 	}
+	// The audit archives' directory, root's 0700, as install makes it.
+	archives := filepath.Join(m.root, keysLogsDir, keystore.AuditDirName, keystore.ArchivesDirName)
+	if err := os.Mkdir(archives, keystore.ArchivesDirMode); err != nil && !errors.Is(err, os.ErrExist) {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(archives, keystore.ArchivesDirMode); err != nil {
+		t.Fatal(err)
+	}
 	m.placeLog(keystore.UserFloorLogName, keysFloorGarbage, true, true)
 	m.placeLog(keystore.AuditLogName, "", true, true)
 	// An audit line, so the audit log holds bytes the swap must keep.
@@ -836,7 +844,7 @@ func (m *keysRootMaint) checkArchives(n int, oldIno uint64, old string, sole boo
 		m.t.Errorf("%s: %s; verb stderr %q", what, fmt.Sprintf(format, args...), stderr)
 	}
 	name := fmt.Sprintf(".%d", n)
-	p := filepath.Join(filepath.Dir(m.logPath(keystore.AuditLogName)), keystore.AuditLogName+name)
+	p := filepath.Join(filepath.Dir(m.logPath(keystore.AuditLogName)), keystore.ArchivesDirName, keystore.AuditLogName+name)
 	var st unix.Stat_t
 	if err := unix.Lstat(p, &st); err != nil {
 		fail("stat %s: %v", name, err)
@@ -1027,7 +1035,7 @@ func TestMaintenanceOldLogRetiredNeverReowned(t *testing.T) {
 			var archives []keysFileState
 			if v.log == keystore.AuditLogName {
 				for n := 1; n <= 2; n++ {
-					p := filepath.Join(filepath.Dir(m.logPath(v.log)), fmt.Sprintf("%s.%d", v.log, n))
+					p := filepath.Join(filepath.Dir(m.logPath(v.log)), keystore.ArchivesDirName, fmt.Sprintf("%s.%d", v.log, n))
 					if err := os.WriteFile(p, fmt.Appendf(nil, "archive %d\n", n), 0o600); err != nil {
 						t.Fatal(err)
 					}
@@ -1082,7 +1090,7 @@ func TestMaintenanceOldLogRetiredNeverReowned(t *testing.T) {
 			}
 			m.checkArchives(1, oldSt.ino, oldSt.data, false, v.name, stderr)
 			for n, a := range archives {
-				got := keysState(t, filepath.Join(filepath.Dir(m.logPath(v.log)), fmt.Sprintf("%s.%d", v.log, n+2)))
+				got := keysState(t, filepath.Join(filepath.Dir(m.logPath(v.log)), keystore.ArchivesDirName, fmt.Sprintf("%s.%d", v.log, n+2)))
 				if got.ino != a.ino || got.data != a.data || got.uid != 0 || got.flags != 0 || got.mode != 0o600 || got.nlink != 1 {
 					t.Errorf(".%d ends %+v; want the old .%d %+v, carried by link, one link once the retired set is cleaned", n+2, got, n+1, a)
 				}

@@ -74,6 +74,11 @@ const (
 	logsDirName  = "keystore-logs"
 	floorDirName = "floor"
 	auditDirName = "audit"
+	// archivesDirName is the audit archives' directory in audit/: root's
+	// 0700 (archivesDirMode), with no flag and no ACL, so no other user
+	// can reach an archive, hard-link it or pin its blocks.
+	archivesDirName = "archives"
+	archivesDirMode = 0o700
 	// logsDirMode is the mode of keystore-logs/ and of each log's
 	// directory.
 	logsDirMode = 0o755

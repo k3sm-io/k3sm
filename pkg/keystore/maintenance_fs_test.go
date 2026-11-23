@@ -105,7 +105,7 @@ func inoOf(t *testing.T, p string) (uint64, uint16) {
 // 0600, as rotate leaves it.
 func placeArchive(t *testing.T, s *FileStore, n int, data string) string {
 	t.Helper()
-	p := filepath.Join(s.dataRoot, logsDirName, auditDirName, auditArchiveName(n))
+	p := filepath.Join(s.dataRoot, logsDirName, auditDirName, archivesDirName, auditArchiveName(n))
 	if err := os.WriteFile(p, []byte(data), logMode); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestMaintenanceRepairsHardLinkedLog(t *testing.T) {
 			if v.log != auditLogName {
 				return
 			}
-			one := filepath.Join(s.dataRoot, logsDirName, auditDirName, auditArchiveName(1))
+			one := filepath.Join(s.dataRoot, logsDirName, auditDirName, archivesDirName, auditArchiveName(1))
 			if ino, nl := inoOf(t, one); ino == oldIno || nl != 1 {
 				t.Fatalf(".1 is inode %d with %d links, want a fresh copy, not the old log (%d)", ino, nl, oldIno)
 			}
@@ -371,6 +371,20 @@ func TestMaintenanceJudgesMarkerAndStale(t *testing.T) {
 		if _, err := s.RotateAudit(context.Background(), &inoRecorder{}, false); err != nil {
 			t.Fatalf("rotate over a linked root 0600 archive: %v, want a Warn only", err)
 		}
+		archives := filepath.Join(s.dataRoot, logsDirName, auditDirName, archivesDirName)
+		var st unix.Stat_t
+		if err := unix.Lstat(archives, &st); err != nil || st.Mode&0o7777 != archivesDirMode {
+			t.Fatalf("the rotated %s is at mode %04o (%v), want 0700", archivesDirName, st.Mode&0o7777, err)
+		}
+		if _, err := os.Stat(filepath.Join(archives, auditArchiveName(2))); err != nil {
+			t.Fatalf("the old .1 is not .2 in %s: %v", archivesDirName, err)
+		}
+		if err := os.Chmod(archives, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.RotateAudit(context.Background(), &inoRecorder{}, false); !errors.Is(err, errRotateRefused) || !errors.Is(err, errLogUntrusted) {
+			t.Fatalf("rotate over a 0755 %s: %v, want refused as untrusted", archivesDirName, err)
+		}
 	})
 }
 
@@ -466,7 +480,7 @@ func TestSwapRerunFromEachStep(t *testing.T) {
 						t.Errorf("the rerun reports %d dropped lines, want the crashed run's 1", rb.Dropped)
 					}
 					if v.log == auditLogName && !other {
-						one, err := os.ReadFile(filepath.Join(s.dataRoot, logsDirName, auditDirName, auditArchiveName(1)))
+						one, err := os.ReadFile(filepath.Join(s.dataRoot, logsDirName, auditDirName, archivesDirName, auditArchiveName(1)))
 						if err != nil || !bytes.Equal(one, old) {
 							t.Errorf(".1 after the rerun holds %q, %v; want the old log %q", one, err, old)
 						}

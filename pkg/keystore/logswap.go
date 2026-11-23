@@ -619,7 +619,7 @@ var errSwapCommitted = fmt.Errorf("the swap committed and the new log is in plac
 func swapCommitted(err error) error { return fmt.Errorf("%w; %w", errSwapCommitted, err) }
 
 // maxStagingDepth bounds cleanStaging's descent: a replacement directory
-// holds files only.
+// holds files and, audit/'s, the archives/ directory of files.
 const maxStagingDepth = 2
 
 // cleanStaging removes everything in the staging directory sfd, which no
