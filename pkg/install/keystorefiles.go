@@ -185,13 +185,15 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 
 // earlierRunDropHint is what install adds to an earlier run's line when
 // that run dropped lines: a verb that reports such a run exits 4, but
-// install keeps its own exit codes, so the line itself sends the operator
-// to doctor and names the row. Only floor --rebuild drops lines.
+// install keeps its own exit codes, and the drop counts are in this line
+// and in no other record (the audit log holds only a committed line for
+// that run), so the line tells the operator to copy it down. Only floor
+// --rebuild drops lines.
 func earlierRunDropHint(r *keystore.EarlierRun) string {
 	if r.Dropped() == 0 {
 		return ""
 	}
-	return "; install does not exit 4 for it: run sudo k3sm doctor and check its keystore-floor row"
+	return "; install does not exit 4 for it: the earlier run's drop counts are in this line and in no other record (the audit log holds a committed line for that run, without them), so copy this line down"
 }
 
 // errLogOldLocation is a log at a location no release keeps one at: the

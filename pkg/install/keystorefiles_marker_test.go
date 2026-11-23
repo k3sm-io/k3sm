@@ -75,7 +75,7 @@ func TestKeystoreFilesReportsCommittedMarker(t *testing.T) {
 				t.Fatal(err)
 			}
 			line := `"op":"floor-rebuild","via":"root","scope":"system","name":"-","namespace":"","result":"committed"`
-			want := "install: an earlier floor --rebuild committed and dropped 2 lines, and was not reported: dropped=2, keys=5; install does not exit 4 for it: run sudo k3sm doctor and check its keystore-floor row\n"
+			want := "install: an earlier floor --rebuild committed and dropped 2 lines, and was not reported: dropped=2, keys=5; install does not exit 4 for it: the earlier run's drop counts are in this line and in no other record (the audit log holds a committed line for that run, without them), so copy this line down\n"
 			if !committed {
 				if stderr.Len() != 0 || strings.Contains(string(audit), line) {
 					t.Fatalf("a marker that never committed was reported: %q / %q", stderr.String(), audit)
@@ -92,13 +92,17 @@ func TestKeystoreFilesReportsCommittedMarker(t *testing.T) {
 	}
 }
 
-// Install adds the doctor hint only to an earlier run that dropped lines.
+// Install adds the copy-it-down hint only to an earlier run that dropped
+// lines, and it no longer points at doctor, whose row reads PASS.
 func TestEarlierRunDropHint(t *testing.T) {
 	if h := earlierRunDropHint(&keystore.EarlierRun{Verb: "floor-rebuild", Report: map[string]int64{"keys": 5}}); h != "" {
 		t.Fatalf("a clean earlier run got the hint %q", h)
 	}
 	h := earlierRunDropHint(&keystore.EarlierRun{Verb: "floor-rebuild", Report: map[string]int64{"absent": 1, "keys": 5}})
-	if !strings.Contains(h, "sudo k3sm doctor") || !strings.Contains(h, "keystore-floor row") {
-		t.Fatalf("a lossy earlier run got %q, want doctor and the keystore-floor row", h)
+	if !strings.Contains(h, "drop counts are in this line and in no other record") || !strings.Contains(h, "committed line for that run") || !strings.Contains(h, "copy this line down") {
+		t.Fatalf("a lossy earlier run got %q, want the counts only here, the committed audit line and copy it down", h)
+	}
+	if strings.Contains(h, "doctor") || strings.Contains(h, "keystore-floor") {
+		t.Fatalf("a lossy earlier run got %q, which points at doctor's keystore-floor row", h)
 	}
 }
