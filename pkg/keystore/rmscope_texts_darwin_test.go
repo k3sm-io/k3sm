@@ -27,14 +27,55 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Every stop of RemoveScope that a rerun would meet the same way returns
-// text, at the layer the operator reads, that names what it left for
-// reading and offers no command: no sudo line, no rm, no "remove it as
-// root", no rerun. Each case drives RemoveScope into one stop through its
-// seams: the emptied scope directory moved away before its rmdir, a
-// symlink planted at the scope's name, another user's flag on .user (the
-// seam stands for its owner), another scope's directory at the name, a
-// directory on another device in the tree, and a tree nested too deep.
+// rmRerunLine is the one command rm-scope ever prints for uid 1001: its
+// own rerun, built from the integer uid.
+const rmRerunLine = "rerun sudo k3sm keys rm-scope user/1001 --yes"
+
+// checkRmScopeText checks a stop's text at the layer the operator reads:
+// no by-hand action (no rm, no "remove it as root", no flag to clear, no
+// delete), the rerun line present exactly when rerun is set, and no command
+// but sudo k3sm keys rm-scope user/1001 --yes, nor the word rerun at all
+// where a rerun cannot help.
+func checkRmScopeText(t *testing.T, msg string, rerun bool) {
+	t.Helper()
+	for _, bad := range []string{"rm -", "remove it as root", "clear the flag", "Root may", "its owner may", "by hand", "administrator", "chflags", "delete", "k3sm doctor"} {
+		if strings.Contains(msg, bad) {
+			t.Errorf("the error %q offers %q, an action by hand", msg, bad)
+		}
+	}
+	if got := strings.Contains(msg, rmRerunLine); got != rerun {
+		t.Errorf("the error %q holds the rerun line: %v, want %v", msg, got, rerun)
+	}
+	if !rerun && strings.Contains(strings.ToLower(msg), "rerun") {
+		t.Errorf("the error %q says rerun, and a rerun cannot help", msg)
+	}
+	for rest := msg; ; {
+		i := strings.Index(rest, "sudo")
+		if i < 0 {
+			break
+		}
+		if !strings.HasPrefix(rest[i:], "sudo k3sm keys rm-scope user/1001 --yes") {
+			t.Errorf("the error %q holds a command other than sudo k3sm keys rm-scope user/1001 --yes", msg)
+			break
+		}
+		rest = rest[i+len("sudo"):]
+	}
+}
+
+// Every stop of RemoveScope returns text, at the layer the operator reads,
+// that names what it left for reading and offers no action by hand, and
+// holds the rerun line exactly where a rerun can help (rmRerunCannotHelp)
+// and nowhere else. Each case drives RemoveScope into one stop through its
+// seams. A rerun cannot help: the emptied scope directory moved away
+// before its rmdir, a symlink planted at the scope's name, another user's
+// flag on .user (the seam stands for its owner), another scope's directory
+// at the name, a directory on another device in the tree, a tree nested
+// too deep, a twice-linked flagged FIFO rm-scope does not clear, and a
+// final rmdir whose probe fails. A rerun can help: a take that stops, a
+// flag set again on scope.key after rm-scope cleared it, and a record
+// whose data-root fsync fails after its rename. A system flag cannot be
+// set without root; its text is pinned at the flagKept layer
+// (TestRmScopeOffersNoCommand).
 func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 	if asRoot() {
 		t.Skip("the cases set the test user's own flags and own its tree; the root cases are in the root-run tests")
@@ -42,9 +83,10 @@ func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		want  error
+		rerun bool
 		setup func(t *testing.T, s *FileStore, server, dir string)
 	}{
-		{"moved before its rmdir", errScopeDirMoved, func(t *testing.T, _ *FileStore, _, dir string) {
+		{"moved before its rmdir", errScopeDirMoved, false, func(t *testing.T, _ *FileStore, _, dir string) {
 			done := false
 			setSeam(t, &rmBeforeScopeRmdir, func(step rmdirStep) {
 				if done || step != rmdirBeforeStat {
@@ -56,7 +98,7 @@ func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 				}
 			})
 		}},
-		{"planted at the scope's name", errPlanted, func(t *testing.T, _ *FileStore, _, dir string) {
+		{"planted at the scope's name", errPlanted, false, func(t *testing.T, _ *FileStore, _, dir string) {
 			setSeam(t, &rmBeforeTree, func() {
 				if err := os.Rename(dir, dir+".away"); err != nil {
 					t.Fatal(err)
@@ -66,13 +108,13 @@ func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 				}
 			})
 		}},
-		{"another user's flag on .user", errSharedDirFlag, func(t *testing.T, s *FileStore, _, dir string) {
+		{"another user's flag on .user", errSharedDirFlag, false, func(t *testing.T, s *FileStore, _, dir string) {
 			shared := filepath.Dir(dir)
 			t.Cleanup(func() { _ = unix.Chflags(shared, 0) })
 			setScopeFlags(t, shared, unix.UF_IMMUTABLE, false)
 			setSeam(t, &rmSharedOwner, func(*unix.Stat_t) uint32 { return s.uid + 1 })
 		}},
-		{"another scope at the name", errNotJudgedScope, func(t *testing.T, s *FileStore, server, dir string) {
+		{"another scope at the name", errNotJudgedScope, false, func(t *testing.T, s *FileStore, server, dir string) {
 			userPut(t, userScope(t, s, 1002), "user/1002/x", "x")
 			setSeam(t, &rmBeforeTree, func() {
 				if err := os.Rename(dir, dir+".away"); err != nil {
@@ -83,7 +125,7 @@ func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 				}
 			})
 		}},
-		{"a directory on another device", errScopeForeignDir, func(t *testing.T, _ *FileStore, _, dir string) {
+		{"a directory on another device", errScopeForeignDir, false, func(t *testing.T, _ *FileStore, _, dir string) {
 			mount := filepath.Join(dir, scopeEntriesName, "mounted")
 			if err := os.Mkdir(mount, 0o700); err != nil {
 				t.Fatal(err)
@@ -91,7 +133,7 @@ func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 			ino, _ := inoOf(t, mount)
 			otherDeviceFor(t, ino)
 		}},
-		{"nested too deep", errScopeTreeDeep, func(t *testing.T, _ *FileStore, _, dir string) {
+		{"nested too deep", errScopeTreeDeep, false, func(t *testing.T, _ *FileStore, _, dir string) {
 			p := filepath.Join(dir, scopeEntriesName)
 			for i := 0; i <= maxScopeTreeDepth; i++ {
 				p = filepath.Join(p, fmt.Sprintf("c%d", i))
@@ -99,6 +141,41 @@ func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+		}},
+		{"a twice-linked flagged FIFO", errFlagLeft, false, func(t *testing.T, _ *FileStore, _, dir string) {
+			t.Cleanup(func() { unflagScopeTree(dir) })
+			fifo := filepath.Join(dir, "planted-fifo")
+			if err := unix.Mkfifo(fifo, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Link(fifo, filepath.Join(dir, scopeEntriesName, "fifo-alias")); err != nil {
+				t.Fatal(err)
+			}
+			setScopeFlagsByPath(t, fifo, unix.UF_IMMUTABLE)
+		}},
+		{"the rmdir's probe fails", errScopeRmdirUnconfirmed, false, func(t *testing.T, _ *FileStore, _, _ string) {
+			setSeam(t, &rmProbeMkdir, func(int, string, uint32) error { return unix.EIO })
+		}},
+		{"a take that stops", unix.EIO, true, func(t *testing.T, _ *FileStore, _, _ string) {
+			setSeam(t, &rmTakeDir, func(int) error { return unix.EIO })
+		}},
+		{"a flag set again on scope.key", unix.EPERM, true, func(t *testing.T, _ *FileStore, _, dir string) {
+			t.Cleanup(func() { unflagScopeTree(dir) })
+			ino := setScopeFlags(t, filepath.Join(dir, scopeKeyName), unix.UF_IMMUTABLE, false)
+			saved := scopeFchflags
+			setSeam(t, &scopeFchflags, func(fd, flags int) error {
+				if err := saved(fd, flags); err != nil {
+					return err
+				}
+				var st unix.Stat_t
+				if err := unix.Fstat(fd, &st); err != nil || st.Ino != ino {
+					return err
+				}
+				return unix.Fchflags(fd, flags|unix.UF_IMMUTABLE)
+			})
+		}},
+		{"the record's fsync fails after its rename", errCommitted, true, func(t *testing.T, _ *FileStore, _, _ string) {
+			setSeam(t, &removedScopesFsync, func(int) error { return unix.EIO })
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -109,12 +186,12 @@ func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("rm-scope: %v, want %v", err, tc.want)
 			}
-			msg := err.Error()
-			for _, bad := range []string{"sudo", "rm -", "remove it as root", "rerun"} {
-				if strings.Contains(msg, bad) {
-					t.Errorf("the error %q offers %q, and a rerun cannot help", msg, bad)
-				}
+			// The record's own errors and errNotJudgedScope are not rmStopped's
+			// to judge; every other stop follows the cannot-help list.
+			if tc.want != errCommitted && tc.want != errNotJudgedScope && rmRerunCannotHelp(err) == tc.rerun {
+				t.Errorf("rmRerunCannotHelp(%v) = %v, and the case says a rerun helps: %v", err, !tc.rerun, tc.rerun)
 			}
+			checkRmScopeText(t, err.Error(), tc.rerun)
 		})
 	}
 	// A scope directory that is gone when the walk comes to open it was not
@@ -136,6 +213,7 @@ func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 			t.Fatalf("rm-scope of a keyless scope found absent: %v, want a refusal", err)
 		}
 		msg := err.Error()
+		checkRmScopeText(t, msg, false)
 		if !strings.Contains(msg, "absent at its name") || strings.Contains(msg, "removed user/1001") || strings.Contains(msg, "removed the directory") {
 			t.Errorf("the report %q does not say the scope was found absent, or says it was removed", msg)
 		}
