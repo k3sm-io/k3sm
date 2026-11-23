@@ -17,7 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
 	"strings"
@@ -98,6 +100,25 @@ func TestDoctorChecksTable(t *testing.T) {
 		{"sip/warn-probe-error", checkSIP, func(e *doctorEnv) {
 			e.sipEnabled = func() (bool, error) { return false, errors.New("no csrutil") }
 		}, statusWarn},
+
+		// keystore-logs: both logs flagged and the service user's → PASS;
+		// missing → WARN naming install; refused (flag clear, wrong owner) →
+		// FAIL; unreadable as an ordinary account → WARN; a worker → SKIP.
+		{"keystore-logs/pass", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return nil }
+		}, statusPass},
+		{"keystore-logs/warn-missing", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return fmt.Errorf("no log: %w", fs.ErrNotExist) }
+		}, statusWarn},
+		{"keystore-logs/warn-permission", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return fmt.Errorf("open: %w", fs.ErrPermission) }
+		}, statusWarn},
+		{"keystore-logs/fail-unflagged", checkKeystoreLogs, func(e *doctorEnv) {
+			e.keystoreLogs = func(context.Context) error { return errors.New("the log is not flagged append-only") }
+		}, statusFail},
+		{"keystore-logs/skip-worker", checkKeystoreLogs, func(e *doctorEnv) {
+			e.nodeRole = func() (install.Role, bool) { return install.RoleAgent, true }
+		}, statusSkip},
 
 		// netd-helper: installed+running → PASS, installed-only → WARN, absent → WARN.
 		{"helper/pass-running", checkHelper, func(e *doctorEnv) {
@@ -378,7 +399,7 @@ func TestDoctorChecksTable(t *testing.T) {
 				t.Errorf("registry entry %q returns checkResult.name %q — must match", dc.name, r.name)
 			}
 		}
-		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon"} {
+		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon", "keystore-logs"} {
 			if !seen[want] {
 				t.Errorf("registry missing check %q", want)
 			}

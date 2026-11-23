@@ -35,6 +35,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/version"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -127,6 +128,11 @@ type doctorEnv struct {
 	daemonInfo   func(label string) status.DaemonInfo
 	reportDir    func(requested string) (string, error)
 	writeReport  func(dir, name string, contents []byte) error
+	// keystoreLogs judges the keystore's two append-only logs on their
+	// descriptors (keystore.FileStore.CheckLogFlags): nil when both are the
+	// service user's, mode 0600 and flagged SF_APPEND. A nil seam leaves the
+	// row unprobed.
+	keystoreLogs func(context.Context) error
 	// interconnect is the interconnect section's seams (doctorinterconnect.go).
 	// Nil leaves the section out of the report.
 	interconnect *interconnectEnv
@@ -150,7 +156,35 @@ func doctorChecks() []doctorCheck {
 		{"datastore", checkDatastore},
 		{"toolchain", checkXcodeToolchain},
 		{"agent-daemon", checkAgentDaemon},
+		{"keystore-logs", checkKeystoreLogs},
 	}
+}
+
+// checkKeystoreLogs is the keystore's append-only files row: the flag and
+// owner check the server's start step makes before it starts the user
+// scope. A worker has no keystore. A log install has not made is a WARN
+// naming install; a log the check refuses (its flag clear, not the
+// service user's, at another mode) is a FAIL, since the server keeps the
+// user scope off until it is put right; a log an ordinary account cannot
+// open is a WARN naming sudo.
+func checkKeystoreLogs(env doctorEnv) checkResult {
+	const name = "keystore-logs"
+	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+		return checkResult{name: name, status: statusSkip, detail: "a worker keeps no keystore"}
+	}
+	if env.keystoreLogs == nil {
+		return checkResult{name: name, status: statusSkip, detail: "not probed"}
+	}
+	err := env.keystoreLogs(context.Background())
+	switch {
+	case err == nil:
+		return checkResult{name: name, status: statusPass, detail: "both append-only logs are the service user's, mode 0600, flagged SF_APPEND"}
+	case errors.Is(err, fs.ErrNotExist):
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("the keystore user scope is off: %v", err), remedy: "sudo k3sm install"}
+	case errors.Is(err, fs.ErrPermission):
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("could not read the keystore logs: %v", err), remedy: "sudo k3sm doctor   # the data root's keystore files are root's and the service user's"}
+	}
+	return checkResult{name: name, status: statusFail, detail: fmt.Sprintf("the keystore user scope stays off: %v", err)}
 }
 
 // checkArch verifies the binary runs on Apple Silicon (arm64). k3sm is
@@ -794,6 +828,15 @@ func realDoctorEnv(workDir string) doctorEnv {
 		daemonInfo:   probeDaemonInfo,
 		reportDir:    makeReportDir,
 		writeReport:  writeReportFile,
+		keystoreLogs: func(ctx context.Context) error {
+			uid, _, err := lookupServiceIDs()
+			if err != nil {
+				return err
+			}
+			cfg := keystoreLayout(workDir)
+			cfg.UID = uid
+			return keystore.New(cfg).CheckLogFlags(ctx)
+		},
 		interconnect: realInterconnectEnv(),
 	}
 }

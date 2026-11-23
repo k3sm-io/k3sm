@@ -104,8 +104,7 @@ const (
 	// DefaultLinkDir is the directory the installer lays the `k3sm` launcher
 	// SYMLINK into, pointing back at installedBinary(). It exists because
 	// nothing about copying the binary into DefaultInstallDir puts `k3sm` on a
-	// shell's PATH, and every post-install instruction k3sm prints assumes it is
-	// there.
+	// shell's PATH, and every post-install instruction k3sm prints assumes it.
 	//
 	// /usr/local/bin is the choice because macOS ships it as the FIRST line of
 	// /etc/paths, which path_helper(8) expands into PATH for every login shell —
@@ -612,6 +611,7 @@ type System interface {
 	// are re-applied to the directory AND to those files on every install,
 	// repairing a previously mis-created or over-permissive tree.
 	EnsureLogDir(dir string, uid uint32) error
+	keystoreFilesSystem
 	// WriteDataRootMarker writes dataroot.MarkerName into dir, root:wheel 0644,
 	// naming dir itself (dataroot.WriteMarker). Install writes one into the data
 	// root and one into the log dir on every install, and `k3sm uninstall

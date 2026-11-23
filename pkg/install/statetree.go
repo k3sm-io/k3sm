@@ -537,6 +537,9 @@ func ensureStateTree(sys System, cfg Config, uid uint32) error {
 	if err := ensureRuntimeRootLock(sys, cfg, uid); err != nil {
 		return err
 	}
+	if err := keystoreStep(sys, cfg, uid); err != nil {
+		return err
+	}
 	cfg.Logger.Info("ensured the data root and the service user's trees under it", "root", cfg.DataRoot, "trees", len(ServiceLevels()))
 	return nil
 }

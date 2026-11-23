@@ -311,6 +311,7 @@ func TestFlagCheckRefusesUnflagged(t *testing.T) {
 			t.Fatalf("put over a symlinked audit log: %v, want errLogUntrusted", err)
 		}
 	})
+	t.Run("start step and doctor check", testLogCheckRefusesAtStart)
 }
 
 // U23: every audited operation writes one v:1 line, and no line carries

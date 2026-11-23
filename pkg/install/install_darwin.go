@@ -666,6 +666,12 @@ func statKind(mode uint16) EntryKind {
 // uid, group staff, mode 0700 — the directory the _k3sm node binds its runtimed
 // control socket in. See the System interface for why the installer, not a
 // daemon, must be the one to create it.
+// EnsureKeystoreFiles is ensureKeystoreFiles for the service uid, group
+// staff, in a root-owned data root.
+func (darwinSystem) EnsureKeystoreFiles(dataRoot string, uid uint32) error {
+	return ensureKeystoreFiles(dataRoot, int(uid), ServiceTreeGID, 0)
+}
+
 func (darwinSystem) EnsureRunDir(dir string, uid uint32) error {
 	return ensureServiceOwnedDir(dir, uid, "run dir")
 }

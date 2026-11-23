@@ -29,7 +29,7 @@ import (
 // happens before any of them is a refusal that left nothing to unpick, which is
 // the whole claim the preflight makes.
 var writeCalls = []string{
-	"EnsureServiceUser:", "CopyToRootOwned:", "WriteLaunchDaemon:", "EnsureLogDir:",
+	"EnsureServiceUser:", "CopyToRootOwned:", "WriteLaunchDaemon:", "EnsureLogDir:", "EnsureKeystoreFiles:",
 	"EnsureContainerLogDir:", "EnsureRunDir:", "EnsureVMRunDir:", "EnsureMeshKeyDir:", "EnsureOwnedDir:", "EnsureOwnedFile:", "RemoveEntry:",
 	"WriteServiceUserFile:", "WriteRootOnlyFile:", "EnsureSymlink:", "Bootstrap:",
 	"WriteUserKubeconfig:", "WriteAgentArgsRecord:", "Chown:",
