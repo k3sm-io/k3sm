@@ -912,7 +912,15 @@ func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, []del
 				// appended.
 				return ns, false, nil, nil
 			}
-			return ns, true, nil, u.s.userFloor.append(u.scope, deliveriesFloorName, o.gen, seq, true)
+			// The same catch-up as catchUpDeliveryLine's, liveRefused
+			// included: a live line the floor's damage refuses is not
+			// written, and the withdrawn record changes nothing.
+			if err := u.catchUpDeliveryLine(o.gen, rd); errors.Is(err, errFloorDegraded) {
+				return ns, false, nil, nil
+			} else if err != nil {
+				return ns, true, nil, err
+			}
+			return ns, true, nil, nil
 		}
 		if errors.Is(rd.unverified, errFloorDegraded) {
 			// The floor's damage could name the record, so a line above
