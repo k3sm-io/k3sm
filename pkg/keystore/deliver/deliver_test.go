@@ -67,11 +67,14 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-// fakeStore is a ValueSource over a map; it counts Current calls.
+// fakeStore is a ValueSource over a map; it counts Current calls. absentErr,
+// when set, is Absent's answer, standing in for a store that cannot confirm
+// an absence (a missing entries' directory).
 type fakeStore struct {
-	mu      sync.Mutex
-	entries map[string]fakeEntry
-	reads   int
+	mu        sync.Mutex
+	entries   map[string]fakeEntry
+	reads     int
+	absentErr error
 }
 
 type fakeEntry struct {
@@ -92,6 +95,23 @@ func (s *fakeStore) Current(_ context.Context, name string) (keystore.Version, [
 	// The fingerprint stands for the real store's: derived from the value.
 	sum := sha256.Sum256(e.value)
 	return keystore.Version{Name: name, Version: e.version, Kind: keystore.KindOpaque, Fingerprint: hex.EncodeToString(sum[:8])}, bytes.Clone(e.value), nil
+}
+
+func (s *fakeStore) Absent(_ context.Context, name string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.absentErr != nil {
+		return false, s.absentErr
+	}
+	_, ok := s.entries[name]
+	return !ok, nil
+}
+
+// rm deletes name, as keys rm does.
+func (s *fakeStore) rm(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.entries, name)
 }
 
 func (s *fakeStore) set(name string, version uint64, value []byte) {
@@ -225,8 +245,8 @@ func (h *harness) verbs() []string {
 
 // assertOnlyGetCreateUpdateSecrets fails on any recorded call that is not a
 // get, create or update of a Secret, or a delete under a UID precondition
-// (an owned immutable Secret's): no list, no watch, no other delete, no other
-// kind.
+// (an owned immutable Secret's, or one whose entry is gone): no list, no
+// watch, no other delete, no other kind.
 func (h *harness) assertOnlyGetCreateUpdateSecrets(t *testing.T) {
 	t.Helper()
 	for _, a := range h.client.Actions() {
@@ -234,7 +254,7 @@ func (h *harness) assertOnlyGetCreateUpdateSecrets(t *testing.T) {
 		case a.GetResource().Resource != "secrets":
 			t.Errorf("touched another kind: %s %s", a.GetVerb(), a.GetResource().Resource)
 		case a.GetVerb() == "delete":
-			// The one delete allowed: an owned immutable Secret, under a
+			// The one delete shape allowed: an owned Secret, under a
 			// precondition on its UID.
 			d, ok := a.(k8stesting.DeleteAction)
 			if !ok || d.GetDeleteOptions().Preconditions == nil || d.GetDeleteOptions().Preconditions.UID == nil || *d.GetDeleteOptions().Preconditions.UID == "" {

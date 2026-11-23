@@ -794,7 +794,7 @@ lengths exactly at Put time.
 
 A reconciler beside the embedded add-on reconciler in `pkg/addons`: converges one
 labelled Secret per declared target, never LISTs, never prunes anything it did not itself
-apply, log-and-continue on a per-target failure (the same posture `pkg/addons/doc.go`
+apply, deletes the Secret it delivered once its entry is deleted, log-and-continue on a per-target failure (the same posture `pkg/addons/doc.go`
 already documents and justifies).
 
 **Target declaration.** `k3sm keys deliver` and `undeliver` write
@@ -833,8 +833,8 @@ backstop, so a Rotate reaches its Secret within one interval.
 process already holds for the embedded add-on reconciler (the `system:masters` admin
 kubeconfig). **It adds no role, no binding and no ServiceAccount.** What it does with that
 client is narrower than the client allows: get, create and update of one named `Opaque`
-Secret per declared target, labelled as below; delete only an owned immutable Secret, under a
-UID precondition; and nothing else — no list, no other delete, no other kind, no Secret it
+Secret per declared target, labelled as below; delete only an owned Secret, under a UID
+precondition (an immutable one to re-deliver it, or one whose entry is deleted); and nothing else — no list, no other delete, no other kind, no Secret it
 does not own. The set of principals who can cause a write stays
 {root on the node} because only root can edit the declaration. A bounded ServiceAccount in
 the manner of `kube-system/k3sm-manifests` would need a new Role granting Secret write,
@@ -892,9 +892,29 @@ new value, and `pkg/keystore` exposes no generation, so the value's fingerprint 
 tells the two apart. A changed item list re-applies too, and a stale key leaves `data`. An
 `immutable` Secret the reconciler owns cannot be updated, so a re-delivery deletes it with
 `DeleteOptions{Preconditions: {UID: <recorded UID>}}`, creates it again and records the new
-UID, logging both steps without the value. It is the reconciler's only delete, and it is safe
-because the precondition proves the object is the one this server created; a failed
-precondition deletes and creates nothing.
+UID, logging both steps without the value. It is safe because the precondition proves the
+object is the one this server created; a failed precondition deletes and creates nothing.
+
+**Revocation on delete:** a `keys rm` must not leave the deleted value readable in the
+cluster, so a sweep deletes the Secret of a still-declared target whose entry is gone. It
+deletes only when all of these hold: the Secret carries the recorded UID and is `Opaque` (the
+ownership check above, made before any store read); `Store.Current` answers `ErrNotFound`;
+`Store.Absent` confirms the absence; and the Secret still carries the marks a delivery sets
+(the ownership label naming the entry and both annotations). The delete carries
+`DeleteOptions{Preconditions: {UID: <recorded UID>}}`, so a Secret replaced after the Get is not
+the one deleted, and each delete is logged with the entry, namespace and Secret names, never a
+value. A Secret without the marks, or of another UID, is left alone and logged. `Absent`
+(`keystore.FileStore.Absent`) is the one read added for this: `Current` answers `ErrNotFound`
+both for a name with no entry and for an entries' directory that is not there, and only the
+first is an answer about the name. A data root restored without its `keystore/`, or not yet
+mounted, must not read as every entry deleted and empty every delivered Secret, so `Absent` is
+true only when the entries' directory opens and is trusted under the shared lock, the floor
+reads, and the name has no directory (or only what an interrupted Put leaves); any other state
+is false with its error, and the Secret is kept. It reads no record and loads no master key.
+The state record of a deleted Secret is kept: its UID matches nothing, and a later create
+replaces it. Withdrawing a target (`undeliver`) still deletes nothing; only the entry's own
+deletion does. While secrets encryption is off without the override, every target is refused
+before any read, so a revocation waits for the override or for encryption.
 
 **Refusal while secrets encryption is off.** Delivery is refused by default; the override
 is explicit, as the maintainer answered on the issue. Two facts the first revision got

@@ -70,9 +70,13 @@ const targetTimeout = 10 * time.Second
 // write-rename, an editor's write-rename-chmod) into one sweep.
 const changeDebounce = 500 * time.Millisecond
 
-// ValueSource is the slice of keystore.Store the reconciler reads.
+// ValueSource is the slice of keystore.Store the reconciler reads. Absent is
+// keystore.FileStore.Absent: true only when the entry is definitively gone,
+// which Current's ErrNotFound alone does not say (a missing entries'
+// directory answers it too); a delivered Secret is deleted only on true.
 type ValueSource interface {
 	Current(ctx context.Context, name string) (keystore.Version, []byte, error)
+	Absent(ctx context.Context, name string) (bool, error)
 }
 
 // Config is what New needs.
@@ -88,8 +92,8 @@ type Config struct {
 	StateDirOwners []uint32
 	// Client is the server's admin client, the one the embedded add-on
 	// reconciler uses. The reconciler only Gets, creates and updates Secrets
-	// through it, and deletes an owned immutable one under a UID
-	// precondition.
+	// through it, and deletes an owned one under a UID precondition: an
+	// immutable one to re-deliver it, or one whose entry is gone.
 	Client kubernetes.Interface
 	// Store supplies each entry's current version.
 	Store ValueSource
@@ -102,8 +106,9 @@ type Config struct {
 }
 
 // Reconciler converges one labelled Opaque Secret per declared target. It
-// never lists, deletes only an owned immutable Secret under a UID
-// precondition, and never touches another kind (see doc.go).
+// never lists, deletes only an owned Secret under a UID precondition (an
+// immutable one to re-deliver it, or one whose entry is gone), and never
+// touches another kind (see doc.go).
 //
 // Sweep and Run never return an error: every failure is logged here, at the
 // boundary that handles it, and the sweep moves on to the next target.
@@ -380,8 +385,9 @@ func (r *Reconciler) note(t Target, state string, level slog.Level, msg string, 
 // converge delivers one target: refuse it while encryption is off without
 // the override, else Get its Secret and create it (absent), update it
 // (present, with the UID this server recorded when it created it, at another
-// value; only its metadata when the value is current), or leave it alone
-// (any other Secret, labelled or not).
+// value; only its metadata when the value is current), delete it (present,
+// owned and marked, and its entry definitively gone; see revoke), or leave it
+// alone (any other Secret, labelled or not).
 func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 	ctx, cancel := context.WithTimeout(ctx, r.targetTimeout)
 	defer cancel()
@@ -413,6 +419,10 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 
 	ver, value, err := r.store.Current(ctx, t.Name())
 	defer clear(value)
+	if err != nil && cur != nil && errors.Is(err, keystore.ErrNotFound) {
+		r.revoke(ctx, t, cur)
+		return
+	}
 	if err != nil {
 		r.note(t, "error:store:"+err.Error(), slog.LevelWarn, "cannot read the entry; will retry", "err", err)
 		return
@@ -496,7 +506,7 @@ func (r *Reconciler) updateMetadata(ctx context.Context, t Target, cur *corev1.S
 // recreateImmutable re-delivers an immutable Secret this server owns, which
 // cannot be updated: it deletes it under a precondition on the recorded UID,
 // so only that object can go, then creates it again and records the new UID.
-// It is the only delete the reconciler makes. The state file is proven
+// It is one of the reconciler's two deletes; revoke is the other. The state file is proven
 // writable first, so the Secret created after the delete can be recorded; a
 // state file that cannot be written deletes nothing. A refused delete (the
 // precondition failed, or any error) creates nothing.
@@ -516,6 +526,73 @@ func (r *Reconciler) recreateImmutable(ctx context.Context, sw *sweep, t Target,
 		r.logger.Info("keystore delivery: re-created the immutable Secret",
 			"entry", t.Entry, "namespace", t.Namespace, "secret", t.Secret(), "version", ver.Version)
 	}
+}
+
+// revoke deletes cur, the Secret this server delivered for t, once t's entry
+// is gone: an rm must not leave the revoked value readable in the cluster.
+// The caller has established that cur carries the UID this server recorded
+// when it created it, is Opaque, and that Current answered ErrNotFound. That
+// answer alone is not enough: the store must also confirm the entry is
+// definitively absent (Absent), since a missing entries' directory reads as
+// ErrNotFound too and must not delete every delivered Secret. The Secret must
+// still carry the marks a delivery sets (the label naming t's entry and the
+// version and fingerprint annotations): one stripped of them is left alone
+// and logged. The delete carries a precondition on the UID, so a Secret
+// replaced since the Get is not the one deleted. Each delete is logged with
+// names only, never a value. The state record is kept: it names a UID no
+// Secret has any more, which matches nothing, and a later create replaces it.
+func (r *Reconciler) revoke(ctx context.Context, t Target, cur *corev1.Secret) {
+	absent, err := r.store.Absent(ctx, t.Name())
+	if err != nil {
+		r.note(t, "error:absent:"+err.Error(), slog.LevelWarn,
+			"the entry is not found but its absence cannot be confirmed, so the Secret is kept; will retry", "err", err)
+		return
+	}
+	if !absent {
+		r.note(t, "error:absent:present", slog.LevelWarn,
+			"the entry was not found and then found again, so the Secret is kept; will retry")
+		return
+	}
+	if reason := unmarked(t, cur); reason != "" {
+		r.note(t, "kept:unmarked:"+reason, slog.LevelWarn,
+			"the entry is gone but the Secret is not deleted: it lacks the marks a delivery sets; delete it by hand", "reason", reason)
+		return
+	}
+	if cur.DeletionTimestamp != nil {
+		r.note(t, "waiting:terminating", slog.LevelInfo, "the Secret is being deleted; waiting")
+		return
+	}
+	uid := cur.UID
+	err = r.client.CoreV1().Secrets(t.Namespace).Delete(ctx, t.Secret(), metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+	switch {
+	case apierrors.IsNotFound(err):
+		r.note(t, "revoked:gone", slog.LevelInfo, "the entry is gone and so is its Secret")
+	case apierrors.IsConflict(err):
+		r.note(t, "kept:replaced", slog.LevelWarn,
+			"the entry is gone but the Secret was replaced before it could be deleted, so it is left alone", "err", err)
+	case err != nil:
+		r.note(t, "error:revoke:"+err.Error(), slog.LevelWarn, "cannot delete the Secret of a deleted entry; will retry", "err", err)
+	default:
+		// Logged every time: each delete is its own event.
+		r.targetState[targetKey(t)] = "revoked"
+		r.logger.Info("keystore delivery: deleted the Secret; its keystore entry no longer exists",
+			"entry", t.Entry, "namespace", t.Namespace, "secret", t.Secret())
+	}
+}
+
+// unmarked is why cur lacks the marks a delivery sets for t, or "" when it
+// carries them all: the LabelKey label naming t's entry, and the version and
+// fingerprint annotations.
+func unmarked(t Target, cur *corev1.Secret) string {
+	switch {
+	case cur.Labels[LabelKey] != t.Name():
+		return "its " + LabelKey + " label does not name this entry"
+	case cur.Annotations[VersionAnnotation] == "":
+		return "it has no " + VersionAnnotation + " annotation"
+	case cur.Annotations[FingerprintAnnotation] == "":
+		return "it has no " + FingerprintAnnotation + " annotation"
+	}
+	return ""
 }
 
 // notOurs is why cur is not a Secret this server created for t, or "" when it

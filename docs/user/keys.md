@@ -200,7 +200,10 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
   label alone does not count: a Secret of that name that someone else created first, or that was deleted and created
   again, is "not created by this server". The server leaves it alone and logs why: delete it, or
   pick another `--secret`. The server never lists Secrets, and deletes one only to re-create an
-  immutable Secret it created after a rotation or a change to its data.
+  immutable Secret it created after a rotation or a change to its data, or after an `rm`.
+  After an `rm`, the next sweep deletes the Secret the server delivered for that entry, if it
+  still has the recorded UID, the label and both annotations, and logs the names; a Secret
+  without them is left alone and logged.
 - **A namespace that does not exist yet.** Delivering into it goes to whoever later creates that
   namespace.
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
