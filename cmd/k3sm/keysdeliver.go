@@ -82,9 +82,11 @@ func (v *keysVerb) readDeclaration(path string) (keydeliver.Declaration, error) 
 }
 
 // warnDeclared warns, after rm deleted entry name, about each target still
-// declaring it for delivery: the reconciler can no longer read the entry, but
-// the Secret it delivered keeps the value. It prints the namespace and
-// Secret, never a path or a value, and only warns: rm has already succeeded.
+// declaring it for delivery: the server deletes the Secret it delivered on its
+// next sweep, undeliver or not, unless the delivery breaker or a restore hold
+// stops it (the server logs that), and a Pod that read the value keeps it. It
+// prints the namespace and Secret, never a path or a value, and only warns:
+// rm has already succeeded.
 func (v *keysVerb) warnDeclared(name string) {
 	path, err := v.deliveryPath()
 	if err == nil {
@@ -93,7 +95,9 @@ func (v *keysVerb) warnDeclared(name string) {
 			for _, t := range d.Targets {
 				if t.Entry == qualify(name) {
 					fmt.Fprintf(v.env.stderr, "k3sm keys rm: warning: %s is still declared for delivery to %s/%s; "+
-						"the Secret keeps its value: run `k3sm keys undeliver` and delete the Secret\n",
+						"the server deletes that Secret on its next sweep, unless the delivery breaker or a restore hold stops it; the server log says so; "+
+						"running `k3sm keys undeliver` does not change that; "+
+						"a Pod that read the value still has it, so rotate the credential where it is accepted\n",
 						qualify(name), t.Namespace, t.Secret())
 				}
 			}

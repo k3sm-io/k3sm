@@ -78,6 +78,12 @@ var (
 	errLostPointer = fmt.Errorf("%w, although the floor records that this entry committed one", errNoPointer)
 	// errInvalidConfig reports a Config every operation refuses.
 	errInvalidConfig = errors.New("invalid keystore config")
+	// ErrFloorRecordsEntry is Absent's answer for a name the floor still
+	// records live whose directory is missing. Delete buries the live
+	// record, so that state is not an rm: it is a restored or rolled-back
+	// keystore/ (or an interrupted Delete), and a caller about to act on the
+	// deletion must hold.
+	ErrFloorRecordsEntry = errors.New("the keystore floor still records this entry but its directory is missing (a restored or rolled-back keystore, not a delete)")
 )
 
 // Config locates a FileStore and names the user it belongs to.
@@ -516,6 +522,118 @@ func (s *FileStore) Current(ctx context.Context, name string) (Version, []byte, 
 		return Version{}, nil, err
 	}
 	return v, val, nil
+}
+
+// Absent reports whether name is definitively not an entry, for a caller
+// that must act on a deletion (the delivery reconciler deletes the Secret it
+// delivered for a deleted entry), with the Identity of the entries'
+// directory it read, so the caller can tell that directory from one restored
+// or recreated since. Current answers ErrNotFound both for a name with no
+// entry and for an entries' directory that is not there; only the first is an
+// answer about name, since a data root restored without its keystore, or not
+// yet mounted, is not every entry deleted. So Absent is true only when the
+// entries' directory opens and is trusted under the shared lock, the recorded
+// floor reads, name has no directory there, and the floor holds no live
+// record for name. Delete buries the live record's generation and keeps the
+// name, so a name the floor holds only burials for was removed and is
+// absent, while a live record with no directory is a restored or
+// rolled-back tree, not a delete: that is false with ErrFloorRecordsEntry. An interrupted Put (a directory
+// with no pointer, in the shape a crashed Put leaves) is not an entry for
+// Current, but it is not a proven deletion either: false with its error. A
+// missing entries' directory, an entry Current reports as corrupt (a lost
+// pointer included) and any other failure is false with the error. Where
+// the floor proves nothing (absent, rebuilt, or full so that it records only
+// some names), the caller's own guards are all that stand. It reads no
+// record and does not load the master key, so it names no value.
+func (s *FileStore) Absent(ctx context.Context, name string) (absent bool, identity string, err error) {
+	absent, identity, err = s.absent(ctx, name)
+	if err != nil {
+		return false, "", fmt.Errorf("%s: %w", name, err)
+	}
+	return absent, identity, nil
+}
+
+func (s *FileStore) absent(ctx context.Context, name string) (bool, string, error) {
+	if err := s.checkConfig(); err != nil {
+		return false, "", err
+	}
+	if err := checkName(name); err != nil {
+		return false, "", err
+	}
+	// Unlike read, a missing entries' directory stays fs.ErrNotExist: it is
+	// not an answer about name.
+	root, done, err := s.openLocked(ctx, false, false)
+	if err != nil {
+		return false, "", err
+	}
+	defer done()
+	id, err := rootIdentity(root)
+	if err != nil {
+		return false, "", err
+	}
+	fdir, fl, err := s.openFloor()
+	if err != nil {
+		return false, "", err
+	}
+	_ = fdir.Close() // read-only; nothing to flush
+	e, err := openEntry(root, name, fl)
+	switch {
+	case err == nil:
+		e.close()
+		return false, id, nil
+	case errors.Is(err, errInterruptedPut):
+		return false, "", err
+	case errors.Is(err, ErrNotFound):
+		// Delete buries the live generation and keeps the name, so only a
+		// live record proves the directory should be there: a name the
+		// floor holds only burials for was removed.
+		if f, recorded := fl[name]; recorded && f.live() {
+			return false, "", ErrFloorRecordsEntry
+		}
+		return true, id, nil
+	default:
+		return false, "", err
+	}
+}
+
+// Identity names the entries' directory as it stands: its device and inode,
+// as "<dev>:<ino>". A restore that moves keystore/ aside and puts a copy in
+// its place, or a keystore deleted and created again by the next Put, gets a
+// new one; a Put, Rotate or Delete inside it does not change it. It is what
+// the delivery reconciler compares across sweeps before it deletes a Secret
+// on Absent's word. It reads only the directory's metadata, after the
+// directory checks every open makes, and takes no lock. A missing entries'
+// directory is an error matching fs.ErrNotExist.
+func (s *FileStore) Identity(ctx context.Context) (string, error) {
+	if err := s.checkConfig(); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	root, err := s.openDir(s.dir, false)
+	if err != nil {
+		return "", fmt.Errorf("the keystore identity: %w", err)
+	}
+	defer func() { _ = root.Close() }() // read-only
+	id, err := rootIdentity(root)
+	if err != nil {
+		return "", fmt.Errorf("the keystore identity: %w", err)
+	}
+	return id, nil
+}
+
+// rootIdentity is the device and inode of the directory root is open on.
+func rootIdentity(root *os.Root) (string, error) {
+	fi, err := root.Stat(".")
+	if err != nil {
+		return "", err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return "", errors.New("the entries' directory has no device and inode")
+	}
+	return strconv.FormatUint(uint64(st.Dev), 10) + ":" + strconv.FormatUint(st.Ino, 10), nil
 }
 
 // Get returns version of name with its value. A version above the one the

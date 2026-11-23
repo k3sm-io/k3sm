@@ -993,7 +993,7 @@ lengths exactly at Put time.
 
 A reconciler beside the embedded add-on reconciler in `pkg/addons`: converges one
 labelled Secret per declared target, never LISTs, never prunes anything it did not itself
-apply, log-and-continue on a per-target failure (the same posture `pkg/addons/doc.go`
+apply, deletes the Secret it delivered once its entry is deleted, log-and-continue on a per-target failure (the same posture `pkg/addons/doc.go`
 already documents and justifies).
 
 **Target declaration.** `k3sm keys deliver` and `undeliver` write
@@ -1032,8 +1032,8 @@ backstop, so a Rotate reaches its Secret within one interval.
 process already holds for the embedded add-on reconciler (the `system:masters` admin
 kubeconfig). **It adds no role, no binding and no ServiceAccount.** What it does with that
 client is narrower than the client allows: get, create and update of one named `Opaque`
-Secret per declared target, labelled as below; delete only an owned immutable Secret, under a
-UID precondition; and nothing else — no list, no other delete, no other kind, no Secret it
+Secret per declared target, labelled as below; delete only an owned Secret, under a UID
+precondition (an immutable one to re-deliver it, or one whose entry is deleted); and nothing else — no list, no other delete, no other kind, no Secret it
 does not own. The set of principals who can cause a write stays
 {root on the node} because only root can edit the declaration. A bounded ServiceAccount in
 the manner of `kube-system/k3sm-manifests` would need a new Role granting Secret write,
@@ -1091,9 +1091,115 @@ new value, and `pkg/keystore` exposes no generation, so the value's fingerprint 
 tells the two apart. A changed item list re-applies too, and a stale key leaves `data`. An
 `immutable` Secret the reconciler owns cannot be updated, so a re-delivery deletes it with
 `DeleteOptions{Preconditions: {UID: <recorded UID>}}`, creates it again and records the new
-UID, logging both steps without the value. It is the reconciler's only delete, and it is safe
-because the precondition proves the object is the one this server created; a failed
-precondition deletes and creates nothing.
+UID, logging both steps without the value. It is safe because the precondition proves the
+object is the one this server created; a failed precondition deletes and creates nothing.
+
+**Revocation on delete:** a `keys rm` must not leave the deleted value readable in the
+cluster, so a sweep deletes the Secret of a target whose entry is gone, declared or withdrawn
+(an `undeliver` after the `rm` does not stop it: the withdrawn record is kept until the
+revocation is done). The recorded UID decides, as for an update: the Secret must carry it, and the
+delete carries it as `DeleteOptions{Preconditions: {UID: <recorded UID>}}`, so a Secret replaced
+after the Get is not the one deleted. A Secret missing the label or an annotation is still
+deleted and the missing mark logged at Warn; one of another UID is left alone and logged, and
+so is one that is not `Opaque`, withdrawn or declared. A delete is done only when its effect is
+seen: after a Delete that succeeds, a Get by name must answer NotFound or another UID. A Secret
+still there with the recorded UID (a tenant finalizer holds it terminating) is a stuck
+revocation, not a done one: its record is kept, it Warns, and every sweep checks it again
+until it is gone, when the record is dropped.
+
+*Which entry.* The state record stores the entry a Secret delivers (`entry`, an optional
+field: a record written before it has none), set on create and brought up to date when a
+declared target's owned Secret is seen (root re-pointing a target updates it). A withdrawn
+target is checked against the record's entry, never the label: the label is on an object any
+namespace writer can edit, and relabelled to a live entry it would keep a deleted entry's value
+readable, or relabelled to another deleted entry get the Secret deleted early. A record without
+the field falls back to the label, with a Warn; that fallback is confined to the upgrade window,
+since a declared target's record gets its entry on the first sweep that sees its Secret and
+every record written since names one, so only a target withdrawn before this build's first
+sweep is decided by its label. A label that disagrees with the record is logged
+at Warn and keeps the record, whatever the entry's state, so the target is never silently
+dropped. The field is additive for this build, which reads an older file; an older build reads
+the state file strictly and refuses one carrying it, so a rollback past this change delivers
+nothing until the state file is removed, which fails closed.
+
+*Gone.* The entry must be gone by two reads: `Store.Current` answers `ErrNotFound`, and
+`Store.Absent` confirms it. `Absent` (`keystore.FileStore.Absent`) is a read added for this:
+`Current` answers `ErrNotFound` both for a name with no entry and for an entries' directory that
+is not there, and only the first is an answer about the name. `Absent` is true only when the
+entries' directory opens and is trusted under the shared lock, the floor reads, the name has no
+directory, **and the floor holds no live record for the name** (only burials, or nothing).
+Any other state is false with its error,
+and the Secret is kept. It reads no record and loads no master key. Revocation writes no value,
+so it runs while plaintext delivery is refused too (a refused target is only read for it: one
+Get, one `Absent`).
+
+Because a delete cannot be undone, these stand between an absent entry and a delete:
+
+- *The floor as the durable witness.* `Delete` buries the name's live generation in
+  `keystore-floor.json` (`fl.bury`): the name stays in the floor with its burials (tombstones)
+  and no live record. So the floor tells the two states of a missing directory apart. A name
+  the floor holds only burials for was removed with `rm` (or by `keys floor merge`): `Absent`
+  is true, and the Secret is revoked under the guards below. A name the floor still records
+  live whose directory is missing is not an `rm`: it is a restored or rolled-back `keystore/`
+  (a tree put back without its floor, or an entry `--keep` kept that the restored tree lacks).
+  `Absent` answers `ErrFloorRecordsEntry`, the reconciler keeps that name's Secrets for as long
+  as it lasts, not for one sweep, and logs a Warn once per name. A name buried and put again
+  has a live record beside its burials, so a restore without it holds too. An interrupted Put
+  (a directory with no pointer, in the shape a crashed Put leaves) is not an entry for
+  `Current`, and not a proven deletion either: `Absent` answers false with its error. Where
+  the floor proves nothing, the identity hold below is what stands: a floor that is absent and
+  rebuilt (the "Restoring an older keystore/" procedure removes it, and the next root verb
+  writes it from the restored pointers), full (it records only the entries it has room for),
+  or unreadable (`Absent` fails, and the Secret is kept). While a restore is unfinished
+  (`MergePending`, the floor merge has not run), the sweep returns before it reads the
+  declaration, so it neither delivers nor revokes: the restored floor lacks the deletions since
+  the backup, and the restored tree the entries made since it. The residual: a `Delete` from an
+  earlier build, interrupted after it removed the directory but before its floor write, leaves
+  a live record and holds that name's revocation; it fails closed, the Warn names the entry,
+  and a second `rm` clears it (with the directory gone, `Delete` still buries the live record).
+- *Keystore identity and the restore hold.* `keystore.FileStore.Identity` names the entries'
+  directory by device and inode; a Put, Rotate or Delete inside it leaves that alone, and a
+  restore that moves `keystore/` aside, or a keystore deleted and created again, changes it.
+  Each sweep reads it. The first sweep after start, and a sweep that sees it changed (logged at
+  Error, naming both), start the restore hold: no revocation is made until **both** that sweep
+  has passed **and** `revokeHold` (10 minutes) has elapsed. The hold's start is logged at Warn
+  naming the time it ends, so the operator has 10 minutes after `start` (or after the swap) to
+  put back an entry the restored keystore lacks. `Absent` returns the identity it read under the
+  lock, and a delete needs it to be the sweep's, so a swap in the middle of a sweep deletes
+  nothing. The identity is held in memory, not in the state file: every start holds, which is
+  stricter than comparing with a recorded value. The duration is a seam of the reconciler;
+  there is no override verb.
+- *Breaker.* It counts distinct entries, not Secrets: one `rm` of an entry delivered into many
+  namespaces is a single fresh revocation. When the entries one sweep would revoke are above 3
+  **and** above a quarter of the live delivered entries (`max(3, entries/4)`), none of their
+  Secrets is deleted; an Error carries the count, and repeats at most hourly while it holds,
+  until the absent set is back within the limit (entries put back, or the Secrets deleted by
+  hand with kubectl). The base counts live deliveries only: a revoked target's record is dropped
+  with its Secret (a record a failed write left is dropped on a later sweep), so old records do
+  not widen the limit; a record an older build wrote, with no entry, counts as an entry of its
+  own. A stuck revocation does not count toward the breaker: a Secret already terminating, one
+  whose Delete failed on an earlier sweep and is retrying, or one still there after a Delete
+  that succeeded, so a few that never finish cannot hold every later `rm` back. A Warn marks
+  each when it first gets stuck and each time its state changes. The limit is a seam of the
+  reconciler; there is no override verb.
+- *Held states repeat.* A revocation held for a reason that names it (the floor, by entry; an
+  absence `Absent` cannot confirm, an entry found again, a keystore swapped during the sweep, a
+  refused target's Secret that cannot be read, a withdrawn target whose entry cannot be
+  confirmed, each by namespace/name) Warns once when it is first held and again only if its
+  reason changes, never every sweep. The held and the stuck repeat together in one summary at
+  most hourly while any lasts, each with its count and every name, why, and for how long. A
+  refused target's unreadable Secret Warns only when a record exists for it, naming its entry,
+  namespace and Secret: the revocation pending on it.
+- *Re-check before the delete.* Gathering and deleting are a sweep apart, so `revokeOne` asks
+  `Absent` again, and compares the identity it read with the sweep's, immediately before each
+  Delete; an entry put back in between keeps its Secret.
+
+The guarantee is the delete from the API only. A tenant that can read a Secret already has its
+value, and a copy a Pod already read, the datastore's history and its backups keep it, so
+revoking a credential still means rotating it where it is accepted. The re-check and the delete
+are not atomic: an entry put back between them loses its Secret, and the next sweep creates it
+again; that race is accepted. A revoked target whose entry stays gone logs nothing on later
+sweeps (after a restart, its first sweep logs once that the entry cannot be read).
 
 **Refusal while secrets encryption is off.** Delivery is refused by default; the override
 is explicit, as the maintainer answered on the issue. Two facts the first revision got
@@ -1122,7 +1228,8 @@ Reinstall"). To turn the override off, remove the flag from the plist, restart, 
 
 The override is applied per target at the time of that sweep; a target already delivered
 before the flag was removed is left as it is, since this converge-only reconciler does not
-retroactively delete a Secret an operator may be relying on. A refusal is logged at Warn
+retroactively delete a Secret an operator may be relying on, unless its entry is deleted
+(revocation, above). A refusal is logged at Warn
 once per target per state change (there is no Kubernetes object for a keystore entry to
 attach an Event to in Phase A), and `k3sm keys deliver` prints the same refusal when it
 declares a target on a data root with encryption off, from the files alone: it cannot see

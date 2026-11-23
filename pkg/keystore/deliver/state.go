@@ -29,6 +29,7 @@ import (
 	"syscall"
 
 	"k3sm.io/k3sm/pkg/addons"
+	"k3sm.io/k3sm/pkg/keystore"
 )
 
 // StateFileName is the reconciler's record of the Secrets it created, in the
@@ -92,19 +93,28 @@ func StateDirCheck(uid uint32, also ...uint32) FileCheck {
 func chownNone(*os.File) error { return nil }
 
 // Owned is one Secret the reconciler created: its namespace, name and the UID
-// the apiserver gave it. The label on a Secret is forgeable by anyone who can
-// write Secrets in its namespace; the UID is not, since a recreated object
-// gets a new one.
+// the apiserver gave it, and the entry it delivers. The label on a Secret is
+// forgeable by anyone who can write Secrets in its namespace; the UID is not,
+// since a recreated object gets a new one, and the entry recorded here is
+// what a withdrawn target's revocation checks, not the label. Entry is
+// optional: a record an older build wrote has none.
 type Owned struct {
 	Namespace  string `json:"namespace"`
 	SecretName string `json:"secretName"`
 	UID        string `json:"uid"`
+	Entry      string `json:"entry,omitempty"`
 }
 
 // State is the state file's content: the UIDs of the Secrets the reconciler
-// created, keyed by namespace/name.
+// created, and the entries they deliver, keyed by namespace/name.
 type State struct {
-	owned map[string]string
+	owned map[string]ownedRecord
+}
+
+// ownedRecord is one record's UID and entry ("" when an older build wrote
+// it).
+type ownedRecord struct {
+	uid, entry string
 }
 
 // stateDoc is State as the file holds it.
@@ -116,14 +126,50 @@ type stateDoc struct {
 func stateKey(namespace, name string) string { return namespace + "/" + name }
 
 // UID is the recorded UID of namespace/name, or "" when none is recorded.
-func (s *State) UID(namespace, name string) string { return s.owned[stateKey(namespace, name)] }
+func (s *State) UID(namespace, name string) string { return s.owned[stateKey(namespace, name)].uid }
 
-// Set records uid for namespace/name.
-func (s *State) Set(namespace, name, uid string) {
+// Entry is the entry recorded for namespace/name, or "" when none is (no
+// record, or one an older build wrote).
+func (s *State) Entry(namespace, name string) string {
+	return s.owned[stateKey(namespace, name)].entry
+}
+
+// Set records uid for namespace/name, with no entry.
+func (s *State) Set(namespace, name, uid string) { s.SetDelivered(namespace, name, uid, "") }
+
+// SetDelivered records uid for namespace/name and the entry it delivers.
+func (s *State) SetDelivered(namespace, name, uid, entry string) {
 	if s.owned == nil {
-		s.owned = map[string]string{}
+		s.owned = map[string]ownedRecord{}
 	}
-	s.owned[stateKey(namespace, name)] = uid
+	s.owned[stateKey(namespace, name)] = ownedRecord{uid: uid, entry: entry}
+}
+
+// entries is the number of distinct entries the records name. A record an
+// older build wrote, with no entry, counts as one of its own.
+func (s *State) entries() int {
+	seen := make(map[string]bool, len(s.owned))
+	for k, rec := range s.owned {
+		if rec.entry == "" {
+			seen["\x00"+k] = true
+			continue
+		}
+		seen[rec.entry] = true
+	}
+	return len(seen)
+}
+
+// setEntry records entry for an existing namespace/name record, and reports
+// whether that changed it.
+func (s *State) setEntry(namespace, name, entry string) bool {
+	k := stateKey(namespace, name)
+	rec, ok := s.owned[k]
+	if !ok || rec.entry == entry {
+		return false
+	}
+	rec.entry = entry
+	s.owned[k] = rec
+	return true
 }
 
 // Retain drops every record whose namespace/name keep does not report, and
@@ -157,16 +203,19 @@ func ParseState(data []byte) (State, error) {
 	if len(d.Secrets) > MaxTargets {
 		return State{}, fmt.Errorf("%d records, the limit is %d", len(d.Secrets), MaxTargets)
 	}
-	s := State{owned: make(map[string]string, len(d.Secrets))}
+	s := State{owned: make(map[string]ownedRecord, len(d.Secrets))}
 	for i, o := range d.Secrets {
 		if o.Namespace == "" || o.SecretName == "" || o.UID == "" || strings.Contains(o.Namespace, "/") {
 			return State{}, fmt.Errorf("record %d is incomplete", i)
+		}
+		if o.Entry != "" && (!strings.HasPrefix(o.Entry, EntryPrefix) || keystore.CheckName(strings.TrimPrefix(o.Entry, EntryPrefix)) != nil) {
+			return State{}, fmt.Errorf("record %d names no system entry", i)
 		}
 		k := stateKey(o.Namespace, o.SecretName)
 		if _, dup := s.owned[k]; dup {
 			return State{}, fmt.Errorf("record %d repeats a Secret", i)
 		}
-		s.owned[k] = o.UID
+		s.owned[k] = ownedRecord{uid: o.UID, entry: o.Entry}
 	}
 	return s, nil
 }
@@ -174,9 +223,9 @@ func ParseState(data []byte) (State, error) {
 // Marshal encodes s as the file holds it, sorted, with a trailing newline.
 func (s State) Marshal() ([]byte, error) {
 	d := stateDoc{Version: SchemaVersion, Secrets: make([]Owned, 0, len(s.owned))}
-	for k, uid := range s.owned {
+	for k, rec := range s.owned {
 		ns, name, _ := strings.Cut(k, "/")
-		d.Secrets = append(d.Secrets, Owned{Namespace: ns, SecretName: name, UID: uid})
+		d.Secrets = append(d.Secrets, Owned{Namespace: ns, SecretName: name, UID: rec.uid, Entry: rec.entry})
 	}
 	slices.SortFunc(d.Secrets, func(a, b Owned) int {
 		return strings.Compare(stateKey(a.Namespace, a.SecretName), stateKey(b.Namespace, b.SecretName))
@@ -197,7 +246,7 @@ func ReadState(path string, open Opener, dirCheck, check FileCheck) (State, erro
 		return State{}, err
 	}
 	if !exists {
-		return State{owned: map[string]string{}}, nil
+		return State{owned: map[string]ownedRecord{}}, nil
 	}
 	s, err := ParseState(data)
 	if err != nil {
