@@ -18,7 +18,9 @@ package keystore
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -26,9 +28,13 @@ import (
 
 // The floor's damage is scoped (docs/design/keystore.md § "The user-scope
 // floor", "Damage and taint"). Every floor line ends in a checksum
-// (appendFloorCRC), so a line torn or flipped in place never parses: it is
-// skipped and classified by what of it still parses, its leading fields
-// read strictly, each with the space after it:
+// (appendFloorCRC), so a line torn or flipped in place never parses. A
+// skipped line is read by whether it could be a tear (taintLine): a tear
+// is classified by the prefix it is, the ladder below (classifyFloorLadder);
+// any other line is corrected or unrecovered. The torn last line, while it
+// is the file's last bytes, is classified by what of it still parses, its
+// leading fields read strictly, each with the space after it
+// (classifyFloorDamage):
 //
 //   - a whole line in the grammar, five fields, whose checksum does not
 //     match is corruption in place, not a tear, and the flip could be in
@@ -222,66 +228,237 @@ func namePrefixOK(p string) bool {
 }
 
 // taintLine records the taint of the damaged line line, without its
-// newline, that starts at off: into the taint set, or, past its cap, as the
-// taint set's overflow, or, for a line no key can be read from, as
-// unattributable damage at off.
+// newline, that starts at off. Whether the line could be a tear decides how
+// it is read, never whether it looks whole: shape is itself data a flip can
+// change. A tear only shortens an append buffer, so a torn line is a strict
+// prefix of one line in the grammar (couldBeTear), classified by the prefix
+// it is (classifyFloorLadder). Any other line was flipped: it taints the
+// keys of its one single-bit correction (correctFloorLine), the lines a
+// newline flipped away included, or, with none or more than one, it is
+// unrecovered: it could have been any key's tombstone, so every generation
+// of every key is refused while it counts.
 func (s *logState) taintLine(off int64, line []byte) {
-	if k, ok := correctFloorFlip(line); ok {
-		s.taintKey(off, taintGen, k)
-	} else if wholeFloorLine(line) {
-		// A whole line flipped beyond one bit: it could have been any
-		// key's tombstone, the known generations' included.
-		s.unattributable(off)
-		if !s.unrecovered || off > s.unrecoveredAt {
-			s.unrecovered, s.unrecoveredAt = true, off
+	if couldBeTear(line) && !separatorsFlippedAway(line) {
+		kind, k := classifyFloorLadder(line)
+		s.taintKey(off, kind, k)
+		return
+	}
+	if keys, ok := correctFloorLine(line); ok {
+		for _, k := range keys {
+			s.taintKey(off, taintGen, k)
 		}
+		return
 	}
-	kind, k := classifyFloorDamage(line)
-	if kind == taintNameFlip {
-		s.unattributable(off)
-		kind = taintName
+	s.unattributable(off)
+	if !s.unrecovered || off > s.unrecoveredAt {
+		s.unrecovered, s.unrecoveredAt = true, off
 	}
-	s.taintKey(off, kind, k)
 }
 
-// wholeFloorLine reports whether line, a damaged floor line without its
-// newline, cannot be a tear: it ends in a field shaped like a checksum (8
-// lowercase hex digits) after four separators, or five, one flipped in. A
-// tear only shortens a line, and every shorter prefix of a line with that
-// last field has fewer separators.
-func wholeFloorLine(line []byte) bool {
-	n := bytes.Count(line, []byte{' '})
-	if n != 4 && n != 5 {
+// couldBeTear reports whether line, a floor line without its newline, is a
+// prefix of some line in the grammar, itself included: a scope prefix, then
+// a name prefix, then a generation prefix, then a sequence or tombstone
+// prefix, then a prefix of the checksum of the bytes before it, each field
+// before the last whole and canonical, at most four separators, and no
+// longer than a line. It is pure and reads nothing else.
+func couldBeTear(line []byte) bool {
+	if len(line)+1 > maxLogLine || bytes.IndexByte(line, '\n') >= 0 {
 		return false
 	}
-	_, canonical, _ := splitFloorCRC(line)
-	return canonical
+	f := bytes.Split(line, []byte{' '})
+	if len(f) > 5 {
+		return false
+	}
+	last := len(f) - 1
+	// The scope.
+	if last == 0 {
+		return userScopeTextPrefix(f[0])
+	}
+	scope := string(f[0])
+	if uid := scopeUID(scope); uid == 0 || userScopeOf(uid) != scope {
+		return false
+	}
+	// The name.
+	name := string(f[1])
+	if last == 1 {
+		return namePrefixOK(name)
+	}
+	if name != deliveriesFloorName && checkName(name) != nil {
+		return false
+	}
+	// The generation.
+	g := f[2]
+	if len(g) > 2*generationSize || (last > 2 && len(g) != 2*generationSize) {
+		return false
+	}
+	for _, c := range g {
+		if unhex(c) < 0 {
+			return false
+		}
+	}
+	if last == 2 {
+		return true
+	}
+	// The sequence, or the tombstone marker.
+	if !seqFieldPrefix(f[3], name != deliveriesFloorName, last > 3) {
+		return false
+	}
+	if last == 3 {
+		return true
+	}
+	// The checksum of the body before it.
+	body := line[:len(line)-len(f[4])-1]
+	want := fmt.Appendf(nil, "%08x", floorCRC(body))
+	return bytes.HasPrefix(want, f[4])
 }
 
-// correctFloorFlip returns the key of the one line in the grammar that a
+// separatorsFlippedAway reports whether line, a floor line without its
+// newline, with fewer than four separators and a last field shaped like a
+// checksum, parses with one or two of its bytes flipped back to a space by
+// one bit each: two separators flipped to '0' merge a name, a generation and
+// "rm" into one valid name, a line couldBeTear accepts that names another
+// key. The pair is found through the checksum's syndrome, so the search is
+// linear in the line.
+func separatorsFlippedAway(line []byte) bool {
+	n := bytes.Count(line, []byte{' '})
+	if n >= 4 || len(line)+1 > maxLogLine {
+		return false
+	}
+	body, canonical, _ := splitFloorCRC(line)
+	if !canonical {
+		return false
+	}
+	var stored uint32
+	for _, c := range line[len(body)+1:] {
+		stored = stored<<4 | uint32(unhex(c))
+	}
+	syndrome := floorCRC(body) ^ stored
+	// d[i] is the checksum change of flipping body[i] to a space.
+	type flip struct {
+		i    int
+		mask byte
+	}
+	byDelta := map[uint32][]flip{}
+	var flips []flip
+	var deltas []uint32
+	for i, c := range body {
+		m := c ^ ' '
+		if m == 0 || m&(m-1) != 0 {
+			continue
+		}
+		d := floorCRCTable[m]
+		for range len(body) - 1 - i {
+			d = floorCRCTable[byte(d)] ^ d>>8
+		}
+		byDelta[d] = append(byDelta[d], flip{i, m})
+		flips = append(flips, flip{i, m})
+		deltas = append(deltas, d)
+	}
+	p := append([]byte(nil), line...)
+	parses := func(fs ...flip) bool {
+		for _, f := range fs {
+			p[f.i] ^= f.mask
+		}
+		_, err := parseFloorLine(p)
+		for _, f := range fs {
+			p[f.i] ^= f.mask
+		}
+		return err == nil
+	}
+	for x, a := range flips {
+		if deltas[x] == syndrome && parses(a) {
+			return true
+		}
+		for _, b := range byDelta[syndrome^deltas[x]] {
+			if b.i > a.i && parses(a, b) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// userScopeTextPrefix reports whether p, with no space, is a prefix of the
+// canonical text of some user scope: a prefix of "user/", or "user/" and
+// digits that extend to a uid in range (scopePrefixOK).
+func userScopeTextPrefix(p []byte) bool {
+	if len(p) <= len(userScopePrefix) {
+		return strings.HasPrefix(userScopePrefix, string(p))
+	}
+	return scopePrefixOK(p)
+}
+
+// seqFieldPrefix reports whether p is a prefix of a floor line's fourth
+// field, or, when whole, the field itself: a canonical decimal uint64, or,
+// when tomb allows it, the tombstone marker.
+func seqFieldPrefix(p []byte, tomb, whole bool) bool {
+	if tomb && (string(p) == floorTombstone || (!whole && strings.HasPrefix(floorTombstone, string(p)))) {
+		return true
+	}
+	if len(p) == 0 {
+		return !whole
+	}
+	for _, c := range p {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	if len(p) > 1 && p[0] == '0' {
+		return false
+	}
+	_, err := strconv.ParseUint(string(p), 10, 64)
+	return err == nil
+}
+
+// correctFloorLine returns the keys of the lines in the grammar that one
 // single-bit flip of line, a damaged floor line without its newline, came
-// from, and false when there is none or more than one. CRC-32C detects and
-// locates every single-bit error in a line this short, so a whole line with
-// one bit flipped has exactly one correction: a flip that restores a
-// separator, removes a separator flipped in, or restores a byte of a field,
-// the checksum's own digits included. A flip inside the body is found
-// through the checksum's syndrome, so the search is linear in the line.
-func correctFloorFlip(line []byte) (floorKey, bool) {
+// from, and false when no correction or more than one parses. CRC-32C
+// detects and locates every single-bit error in a line this short, so a
+// whole line with one bit flipped has exactly one correction: a flip that
+// restores a separator, removes a separator flipped in, or restores a byte
+// of a field, the checksum's own digits included. A flip inside the body is
+// found through the checksum's syndrome, so the search is linear in the
+// line. A newline flipped away merged two lines into one: a byte one bit
+// from a newline, flipped back, splits it into pieces that are each empty
+// or a line that parses, and each such line's key is returned.
+func correctFloorLine(line []byte) ([]floorKey, bool) {
 	if len(line)+1 > maxLogLine {
-		return floorKey{}, false
+		return nil, false
 	}
 	var (
-		found floorKey
+		found []floorKey
 		n     int
 	)
 	p := append([]byte(nil), line...)
 	try := func(i int, mask byte) {
 		p[i] ^= mask
 		if r, err := parseFloorLine(p); err == nil {
-			found = r.key
+			found = []floorKey{r.key}
 			n++
 		}
 		p[i] ^= mask
+	}
+	for i, c := range line {
+		if m := c ^ '\n'; m&(m-1) != 0 {
+			continue
+		}
+		var keys []floorKey
+		ok := true
+		for _, piece := range [][]byte{line[:i], line[i+1:]} {
+			if len(piece) == 0 {
+				continue
+			}
+			r, err := parseFloorLine(piece)
+			if err != nil {
+				ok = false
+				break
+			}
+			keys = append(keys, r.key)
+		}
+		if ok && len(keys) > 0 {
+			found = keys
+			n++
+		}
 	}
 	switch bytes.Count(line, []byte{' '}) {
 	case 3:

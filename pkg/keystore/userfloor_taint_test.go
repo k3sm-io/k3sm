@@ -185,33 +185,57 @@ func TestTornWithdrawLineTaintsDeliveryRecord(t *testing.T) {
 	}
 }
 
-// Unattributable garbage keeps the floor-wide rule: a put of any name is
-// refused, a generation the floor has no line for is refused, and a known
-// generation is served.
+// Unattributable damage that could be a tear keeps the floor-wide rule: a
+// put of any name is refused, a generation the floor has no line for is
+// refused, and a known generation is served. Damage that cannot be a tear
+// and has no one-bit correction is unrecovered: the known generation is
+// refused too. A whole line flipped in place by one bit is corrected: its
+// own key is tainted and the known generation is served.
 func TestUnattributableDamageKeepsFloorWideRefusal(t *testing.T) {
 	ctx := context.Background()
-	s, server, u := fileLogScope(t)
+	s, _, u := fileLogScope(t)
 	ff := s.userFloor.(*fileFloorLog)
 	flipped, err := floorLine("user/1001", "gone", guid(0x76), 5)
 	if err != nil {
 		t.Fatal(err)
 	}
 	flipped[len(flipped)-2] ^= 1 // the checksum's last digit: a line flipped in place
-	for _, garbage := range []string{"\nuser/\n", "\ngarbage line\n", "\nuser/0 gone\n", "\nuser/1001 a b c d e\n", "\n" + string(flipped)} {
+	for _, c := range []struct {
+		garbage     string
+		unrecovered bool
+	}{
+		{"\nuser/\n", false},
+		{"\nus\n", false},
+		{"\ngarbage line\n", true},
+		{"\nuser/0 gone\n", true},
+		{"\nuser/1001 a b c d e\n", true},
+	} {
 		base := readLog(t, s, userFloorLogName)
-		appendLogBytes(t, s, userFloorLogName, []byte(garbage))
+		appendLogBytes(t, s, userFloorLogName, []byte(c.garbage))
 		if _, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v")); !errors.Is(err, errFloorDegraded) {
-			t.Fatalf("%q: put over unattributable damage: %v, want errFloorDegraded", garbage, err)
+			t.Fatalf("%q: put over unattributable damage: %v, want errFloorDegraded", c.garbage, err)
 		}
 		if _, err := ff.floor("user/1001", "gone", guid(0x77)); !errors.Is(err, errFloorDegraded) {
-			t.Fatalf("%q: an unknown generation over unattributable damage: %v, want errFloorDegraded", garbage, err)
+			t.Fatalf("%q: an unknown generation over unattributable damage: %v, want errFloorDegraded", c.garbage, err)
 		}
-		if _, _, err := u.Current(ctx, "user/1001/token"); err != nil {
-			t.Fatalf("%q: current of a known generation: %v", garbage, err)
+		_, _, err := u.Current(ctx, "user/1001/token")
+		if c.unrecovered && !errors.Is(err, errFloorDegraded) {
+			t.Fatalf("%q: current of a known generation over unrecovered damage: %v, want errFloorDegraded", c.garbage, err)
 		}
-		_ = server
+		if !c.unrecovered && err != nil {
+			t.Fatalf("%q: current of a known generation: %v", c.garbage, err)
+		}
 		setFloorBytes(t, s, base)
 	}
+	base := readLog(t, s, userFloorLogName)
+	appendLogBytes(t, s, userFloorLogName, append([]byte("\n"), flipped...))
+	if _, err := ff.floor("user/1001", "gone", guid(0x76)); !errors.Is(err, errFloorDegraded) {
+		t.Fatalf("the corrected line's own generation: %v, want errFloorDegraded", err)
+	}
+	if _, _, err := u.Current(ctx, "user/1001/token"); err != nil {
+		t.Fatalf("current of a known generation beside a corrected line: %v", err)
+	}
+	setFloorBytes(t, s, base)
 }
 
 // classifyFloorDamage on every prefix of a valid line for key K taints K

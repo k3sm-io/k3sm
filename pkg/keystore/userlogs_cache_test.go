@@ -46,15 +46,21 @@ func cachedFloor(t *testing.T, s *FileStore, u *UserScope) (first, last int64, l
 	return first, first + int64(len(a)), len(b)
 }
 
-// spoilLineAt overwrites, in place, the seq digit of the line ending at
-// end, so the line no longer parses and the file keeps its inode and size.
+// spoilLineAt flips, in place, one bit of the checksum's last digit of the
+// line ending at end, so the line no longer parses, its one correction taints
+// only its own key, and the file keeps its inode and size.
 func spoilLineAt(t *testing.T, s *FileStore, end int64) {
 	t.Helper()
-	f, err := os.OpenFile(filepath.Join(s.dataRoot, userFloorLogName), os.O_WRONLY, 0)
+	f, err := os.OpenFile(filepath.Join(s.dataRoot, userFloorLogName), os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteAt([]byte("x"), end-2); err != nil {
+	c := make([]byte, 1)
+	if _, err := f.ReadAt(c, end-2); err != nil {
+		t.Fatal(err)
+	}
+	c[0] ^= 0x01
+	if _, err := f.WriteAt(c, end-2); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {

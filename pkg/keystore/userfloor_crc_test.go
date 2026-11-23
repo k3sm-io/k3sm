@@ -287,3 +287,14 @@ func TestCorruptTombstoneOfKnownGenerationRefused(t *testing.T) {
 		t.Fatal("the copied-back tree of a known generation is served over its corrupted tombstone")
 	}
 }
+
+// correctFloorFlip returns the key of the one line in the grammar that a
+// single-bit flip of line came from (correctFloorLine), and false when there
+// is none, more than one, or the correction is two lines.
+func correctFloorFlip(line []byte) (floorKey, bool) {
+	keys, ok := correctFloorLine(line)
+	if !ok || len(keys) != 1 {
+		return floorKey{}, false
+	}
+	return keys[0], true
+}

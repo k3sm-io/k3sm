@@ -60,22 +60,26 @@ func TestLogErrorsNameNoFigures(t *testing.T) {
 		// offset is root's, kept and logged.
 		s, _, u := fileLogScope(t)
 		appendLogBytes(t, s, userFloorLogName, []byte("not a floor line\n"))
-		if _, _, err := u.Current(ctx, "user/1001/token"); err != nil {
-			t.Fatalf("current over a malformed line: %v, want it skipped", err)
+		// It cannot be a tear and no one-bit correction parses: it is
+		// unrecovered, so the read is refused, naming no offset.
+		want := int64(len(readLog(t, s, userFloorLogName)) - len("not a floor line\n"))
+		if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, errFloorDegraded) || strings.Contains(err.Error(), strconv.FormatInt(want, 10)) {
+			t.Fatalf("current over a malformed line: %v, want errFloorDegraded naming no offset", err)
 		}
 		l := s.userFloor.(*fileFloorLog).log
 		l.mu.Lock()
 		at := l.state.badAt
 		l.mu.Unlock()
-		if want := int64(len(readLog(t, s, userFloorLogName)) - len("not a floor line\n")); at != want {
+		if at != want {
 			t.Fatalf("the kept offset is %d, want %d", at, want)
 		}
 	})
 	t.Run("field count", func(t *testing.T) {
 		s, _, u := fileLogScope(t)
 		appendLogBytes(t, s, userFloorLogName, []byte("one two three four five six seven\n"))
-		if _, _, err := u.Current(ctx, "user/1001/token"); err != nil {
-			t.Fatalf("current over a floor line with the wrong field count: %v, want it skipped", err)
+		// More fields than the grammar's cannot be a tear: unrecovered.
+		if _, _, err := u.Current(ctx, "user/1001/token"); !errors.Is(err, errFloorDegraded) {
+			t.Fatalf("current over a floor line with the wrong field count: %v, want errFloorDegraded", err)
 		}
 		if n := floorDamage(t, s); n != 1 {
 			t.Fatalf("%d damaged lines, want 1", n)
