@@ -1,0 +1,36 @@
+# keystore-activation-probe Pod leg; see run.sh's header. Render with
+#   sed 's/__NODE__/<node>/' pod.yaml.tmpl | kubectl apply -f -
+# while run.sh holds (KEYSTORE_PROBE_HOLD_SECS). The probe binary is over the
+# 1 MiB ConfigMap limit, so the Pod runs a shell check: it tries the host copy
+# of the probe, then connects with nc, which prints the server's accept line
+# (sandbox_check and code lookup of this Pod's process).
+apiVersion: v1
+kind: Namespace
+metadata: {name: keystore-probe}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: probe, namespace: keystore-probe}
+spec:
+  nodeName: __NODE__
+  nodeSelector: {kubernetes.io/os: darwin}
+  tolerations: [{key: k3sm.io/provider, operator: Exists}]
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: native
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      s=/var/lib/k3sm/keystore-probe/keys.sock
+      p=/var/lib/k3sm/keystore-probe/bin/probe
+      echo "ID uid=$(id -u) gid=$(id -g) pid=$$"
+      ls -ld /var/lib/k3sm/keystore-probe "$s" 2>&1 | sed 's/^/LS /'
+      if [ -x "$p" ]; then
+        echo "PROBE connect"; "$p" connect "$s" 2>&1; echo "PROBE connect rc=$?"
+        echo "PROBE grab"; "$p" grab keys 2>&1; echo "PROBE grab rc=$?"
+      else
+        echo "PROBE host copy not executable from the Pod"
+      fi
+      echo "NC"; /usr/bin/nc -U -w 3 "$s" </dev/null 2>&1; echo "NC rc=$?"
+      echo DONE

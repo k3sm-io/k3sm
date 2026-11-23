@@ -29,6 +29,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/keystore"
+	"k3sm.io/k3sm/pkg/keystore/socket"
 	"k3sm.io/k3sm/pkg/status"
 )
 
@@ -451,7 +452,7 @@ func TestDoctorChecksTable(t *testing.T) {
 				t.Errorf("registry entry %q returns checkResult.name %q — must match", dc.name, r.name)
 			}
 		}
-		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon", "keystore-logs", "keystore-floor", "keystore-maintenance", "keystore-maintenance-runs"} {
+		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon", "keystore-logs", "keystore-floor", "keystore-maintenance", "keystore-maintenance-runs", "keystore-user-scope"} {
 			if !seen[want] {
 				t.Errorf("registry missing check %q", want)
 			}
@@ -483,4 +484,149 @@ func TestDoctorKeystoreMaintenanceNamesVerb(t *testing.T) {
 	if r.status != statusWarn || !strings.Contains(r.detail, "left by keys audit --rotate") || !strings.HasPrefix(r.remedy, "sudo k3sm keys audit --rotate") {
 		t.Fatalf("the row is %+v, want WARN naming audit --rotate and its rerun", r)
 	}
+}
+
+// userScopeChecks is a doctor seam over socket.Preconditions under which
+// every start check passes and a socket of the service user's is at the
+// path; mut changes the one under test.
+func userScopeChecks(mut func(*socket.Preconditions)) func() (doctorUserScope, error) {
+	return userScope(func(u *doctorUserScope) { mut(&u.pre) })
+}
+
+// userScope is userScopeChecks over the whole seam.
+func userScope(mut func(*doctorUserScope)) func() (doctorUserScope, error) {
+	return func() (doctorUserScope, error) {
+		p := socket.Preconditions{
+			EUID:              func() int { return 260 },
+			ServiceUID:        260,
+			MaintenanceMarked: func() (bool, error) { return false, nil },
+			OpenLogs:          func(context.Context) error { return nil },
+			SandboxCheck:      func() error { return nil },
+			IgnoresOwnership:  func() (bool, error) { return false, nil },
+			CheckInstall:      func(context.Context) error { return nil },
+			ServerCount:       func(context.Context) (int, error) { return 1, nil },
+		}
+		u := doctorUserScope{
+			pre:       p,
+			release:   func() {},
+			sockPath:  "/var/lib/k3sm/keystore-sock/keys.sock",
+			sockState: func() error { return nil },
+		}
+		mut(&u)
+		return u, nil
+	}
+}
+
+// TestDoctorKeystoreUserScopeRow checks the user scope's row re-runs the
+// server's start checks and says why it is off with the supervisor's reason
+// for each, naming `sudo k3sm install` only for the installed files: two
+// servers registered, a rootless or uninstalled server, a data root mounted
+// ignoring ownership, a failed install check, a standing maintenance marker
+// and a server count that cannot be read.
+func TestDoctorKeystoreUserScopeRow(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("boom")
+	for _, tt := range []struct {
+		name      string
+		seam      func() (doctorUserScope, error)
+		status    doctorStatus
+		detail    string
+		remedy    string
+		detailHas string
+	}{
+		{name: "start checks pass", seam: userScopeChecks(func(*socket.Preconditions) {}), status: statusPass, detail: "keystore user scope: start checks pass; a socket owned by the service user is at /var/lib/k3sm/keystore-sock/keys.sock"},
+		{name: "start checks pass, no socket", seam: userScope(func(u *doctorUserScope) {
+			u.sockState = func() error { return fmt.Errorf("%w: nothing is at the path", errNoListeningSocket) }
+		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path"},
+		{name: "two servers", seam: userScope(func(u *doctorUserScope) {
+			u.pre.ServerCount = func(context.Context) (int, error) { return 2, nil }
+			u.servers = func() ([]string, error) { return []string{"mac-a", "mac-b"}, nil }
+		}), status: statusWarn, detail: "keystore user scope: off (more than one server registered)", detailHas: "2 servers registered] servers: mac-a, mac-b"},
+		{name: "ten servers", seam: userScope(func(u *doctorUserScope) {
+			u.pre.ServerCount = func(context.Context) (int, error) { return 10, nil }
+			u.servers = func() ([]string, error) {
+				return []string{"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"}, nil
+			}
+		}), status: statusWarn, detail: "keystore user scope: off (more than one server registered)", detailHas: "servers: s0, s1, s2, s3, s4, s5, s6, s7 and 2 more"},
+		{name: "count unreadable as this user", seam: userScope(func(u *doctorUserScope) {
+			denied := fmt.Errorf("read the admin kubeconfig: %w", fs.ErrPermission)
+			u.pre.ServerCount = func(context.Context) (int, error) { return 0, denied }
+			u.servers = func() ([]string, error) { return nil, denied }
+		}), status: statusWarn, detail: "keystore user scope: the server count cannot be read as this user", remedy: "sudo k3sm doctor   # the admin kubeconfig is root's"},
+		{name: "rootless server", seam: userScopeChecks(func(p *socket.Preconditions) {
+			p.EUID = func() int { return 501 }
+		}), status: statusWarn, detail: "keystore user scope: off (user scope needs the installed server)"},
+		{name: "service uid in the login range", seam: userScopeChecks(func(p *socket.Preconditions) {
+			p.EUID, p.ServiceUID = func() int { return 600 }, 600
+		}), status: statusWarn, detail: "keystore user scope: off (the service uid is in the login range)", detailHas: "the service uid 600 is not below 501"},
+		{name: "service user unknown", seam: func() (doctorUserScope, error) {
+			return doctorUserScope{}, boom
+		}, status: statusWarn, detail: "keystore user scope: off (user scope needs the installed server)", detailHas: "boom"},
+		{name: "ignore-ownership mount", seam: userScopeChecks(func(p *socket.Preconditions) {
+			p.IgnoresOwnership = func() (bool, error) { return true, nil }
+		}), status: statusWarn, detail: "keystore user scope: off (the data root is mounted ignoring ownership)"},
+		{name: "install check failed", seam: userScopeChecks(func(p *socket.Preconditions) {
+			p.CheckInstall = func(context.Context) error { return errors.New("the socket directory keystore-sock is missing") }
+		}), status: statusWarn, detail: "keystore user scope: off (the socket directory or an append-only log is missing, wrong or unflagged); run `sudo k3sm install`", remedy: "sudo k3sm install", detailHas: "keystore-sock is missing"},
+		{name: "install predates the logs", seam: userScopeChecks(func(p *socket.Preconditions) {
+			// An install with no audit log: the marker and the log judgement
+			// fail too, but the install check runs first and names install.
+			missing := errors.New("the append-only log keystore-audit.log is missing")
+			p.CheckInstall = func(context.Context) error { return missing }
+			p.MaintenanceMarked = func() (bool, error) { return false, missing }
+			p.OpenLogs = func(context.Context) error { return missing }
+		}), status: statusWarn, detail: "keystore user scope: off (the socket directory or an append-only log is missing, wrong or unflagged); run `sudo k3sm install`", remedy: "sudo k3sm install", detailHas: "keystore-audit.log is missing"},
+		{name: "logs unavailable", seam: userScopeChecks(func(p *socket.Preconditions) {
+			p.OpenLogs = func(context.Context) error { return boom }
+		}), status: statusWarn, detail: "keystore user scope: off (the append-only logs cannot be opened (logs-unavailable))", detailHas: "boom"},
+		{name: "maintenance", seam: userScopeChecks(func(p *socket.Preconditions) {
+			p.MaintenanceMarked = func() (bool, error) { return true, nil }
+		}), status: statusWarn, detail: "keystore user scope: off (a maintenance verb is running)"},
+		{name: "server count unknown", seam: userScopeChecks(func(p *socket.Preconditions) {
+			p.ServerCount = func(context.Context) (int, error) { return 0, boom }
+		}), status: statusWarn, detail: "keystore user scope: off (the server count is unknown)", detailHas: "boom"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := healthyDoctorEnv()
+			e.keystoreUserScope = tt.seam
+			r := checkKeystoreUserScope(e)
+			if r.name != "keystore-user-scope" || r.status != tt.status {
+				t.Fatalf("row = %+v, want %v", r, tt.status)
+			}
+			if !strings.HasPrefix(r.detail, tt.detail) {
+				t.Errorf("detail = %q, want it to start %q", r.detail, tt.detail)
+			}
+			if tt.detailHas != "" && !strings.Contains(r.detail, tt.detailHas) {
+				t.Errorf("detail = %q, want it to carry %q", r.detail, tt.detailHas)
+			}
+			if r.remedy != tt.remedy {
+				t.Errorf("remedy = %q, want %q", r.remedy, tt.remedy)
+			}
+			if strings.Contains(r.detail, "scope: on") || (tt.name == "count unreadable as this user" && strings.Contains(r.detail, "off")) {
+				t.Errorf("detail = %q claims a state doctor cannot establish", r.detail)
+			}
+			if tt.remedy == "" && strings.Contains(r.detail, "sudo k3sm install") {
+				t.Errorf("detail = %q names install for a reason install does not fix", r.detail)
+			}
+		})
+	}
+
+	t.Run("a worker is skipped", func(t *testing.T) {
+		t.Parallel()
+		e := agentEnv()
+		e.keystoreUserScope = func() (doctorUserScope, error) {
+			t.Error("a worker ran the user scope's checks")
+			return doctorUserScope{}, nil
+		}
+		if r := checkKeystoreUserScope(e); r.status != statusSkip {
+			t.Fatalf("row = %+v, want SKIP", r)
+		}
+	})
+	t.Run("an unprobed row is skipped", func(t *testing.T) {
+		t.Parallel()
+		if r := checkKeystoreUserScope(healthyDoctorEnv()); r.status != statusSkip {
+			t.Fatalf("row = %+v, want SKIP", r)
+		}
+	})
 }

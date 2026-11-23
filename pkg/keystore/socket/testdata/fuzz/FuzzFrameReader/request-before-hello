@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("\x00\x00\x00U\x02\x00\x00\x00\x0c{\"op\":\"put\"}\x00\x00\x00@xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")

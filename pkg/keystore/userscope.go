@@ -82,6 +82,14 @@ const (
 	maxScopeUID = 2147483647
 )
 
+// MinLoginUID and MaxLoginUID are the login range, minScopeUID to
+// maxScopeUID, for the socket listener, which takes its eligible peer
+// range from them so the two cannot drift apart.
+const (
+	MinLoginUID = minScopeUID
+	MaxLoginUID = maxScopeUID
+)
+
 // errIneligibleUID reports a uid that has no user scope.
 var errIneligibleUID = errors.New("the uid has no user scope: a user scope belongs to a login uid from 501 to 2147483647 that is not the service user's")
 

@@ -84,7 +84,7 @@ func TestRuntimedSocketPathIsAlwaysDenied(t *testing.T) {
 	for _, root := range []string{"", "/var/lib/k3sm", "/opt/k3sm-lab/data", "/Users/lab/.k3sm/rt"} {
 		t.Run(root, func(t *testing.T) {
 			served := RuntimedSocketPath(root)
-			denied := baseSocketDenies(root)
+			denied := baseSocketDenies(root, "", nil)
 			if !slices.Contains(denied, served) {
 				t.Fatalf("served socket %q (root %q) is not in the pod deny-set %v", served, root, denied)
 			}

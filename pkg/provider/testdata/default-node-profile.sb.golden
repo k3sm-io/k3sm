@@ -69,6 +69,8 @@
 ;; AF_UNIX: explicitly deny connect() to the privileged helper
 ;; socket(s) — same-uid pods can't be kept off them any other way.
 (deny network-outbound
+  (remote unix-socket (literal "/var/lib/k3sm/keystore-sock/keys.sock"))
+  (remote unix-socket (literal "/private/var/lib/k3sm/keystore-sock/keys.sock"))
   (remote unix-socket (literal "/var/lib/k3sm/run/netd.sock"))
   (remote unix-socket (literal "/private/var/lib/k3sm/run/netd.sock"))
   (remote unix-socket (literal "/var/lib/k3sm/run/runtimed.sock"))

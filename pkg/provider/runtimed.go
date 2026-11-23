@@ -53,6 +53,7 @@ import (
 	"k3sm.io/k3sm/pkg/version"
 	"k3sm.io/runtimed/pkg/hostshare"
 	"k3sm.io/runtimed/pkg/image"
+	"k3sm.io/runtimed/pkg/keystorepaths"
 	"k3sm.io/runtimed/pkg/mount"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -1067,7 +1068,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		// Derived HERE, in the one constructor production and the fake-injected
 		// tests share, so no caller can construct a provider whose pods are missing
 		// the base deny-set.
-		deniedSocks: unionSocketDenies(baseSocketDenies(cfg.Root), cfg.DeniedUnixSocketPaths),
+		deniedSocks: unionSocketDenies(baseSocketDenies(cfg.Root, cfg.DataRoot, log), cfg.DeniedUnixSocketPaths),
 		// Computed HERE for the same reason: a node fact the pod path must
 		// never re-derive per pod.
 		deniedLocalPorts: deniedLocalPorts,
@@ -1420,17 +1421,54 @@ func (r *runtimedRuntime) StartLogMaintenance(ctx context.Context) {
 // remembered to pass it is the exact defect this base set exists to remove — and
 // netd being the ONE the caller did remember is not a reason to leave it the one
 // that can be forgotten. Both are unioned, so the caller's list stays additive.
-func baseSocketDenies(root string) []string {
+//
+// The keystore's user socket is in the base set too (docs/design/keystore.md §
+// "Pod denies"): keystorepaths.SocketPath(dataRoot), runtimed's one spelling of
+// <dataRoot>/keystore-sock/keys.sock, never a literal here. dataRoot is
+// RuntimedConfig.DataRoot; empty (the standalone `k3sm node`, which names no
+// data root) falls back to the runtime root, which is the data root on a node
+// whose pod root is left at its default. Like every entry here it renders in
+// the AF_UNIX deny stanza, after every network allow, since SBPL is
+// last-match-wins.
+//
+// A Seatbelt literal matches the path the kernel resolved, so a data root
+// reached through a symlink is denied by its resolved spelling too: the data
+// root is resolved the way realExposeDir resolves it for the exposed paths
+// (evalDataRoot, filepath.EvalSymlinks), and the socket under the resolved
+// root is added beside the literal one, which is kept. A resolution that
+// only adds the /private firmlink is left to the profile renderer, which
+// writes the /private spelling of every /var path itself. A data root that
+// cannot be resolved keeps today's literals, and log says so; the one
+// constructor calls this once per node.
+func baseSocketDenies(root, dataRoot string, log *slog.Logger) []string {
 	if root == "" {
 		root = sandbox.DefaultWorkDir
 	}
-	return []string{
+	if dataRoot == "" {
+		dataRoot = root
+	}
+	denies := []string{
 		runtimed.DefaultSocketPath,
 		RuntimedSocketPath(root),
 		netd.DefaultSocketPath,
 		filepath.Join(root, sandbox.RunSubdir, filepath.Base(netd.DefaultSocketPath)),
+		keystorepaths.SocketPath(dataRoot),
 	}
+	resolved, err := evalDataRoot(dataRoot)
+	switch {
+	case err != nil:
+		if log != nil {
+			log.Warn("the data root could not be resolved; pods are denied the keystore socket by its literal path only", "data_root", dataRoot, "err", err)
+		}
+	case withoutFirmlink(resolved) != withoutFirmlink(dataRoot):
+		denies = append(denies, keystorepaths.SocketPath(resolved))
+	}
+	return denies
 }
+
+// evalDataRoot resolves the data root's symlinks for baseSocketDenies; a
+// test replaces it.
+var evalDataRoot = filepath.EvalSymlinks
 
 // RuntimedSocketPath returns the unix socket a node whose runtime root is root
 // serves its runtimed gRPC control API on: <root>/run/runtimed.sock, the leaf

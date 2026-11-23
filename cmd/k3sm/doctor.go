@@ -36,6 +36,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/keystore"
+	"k3sm.io/k3sm/pkg/keystore/socket"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/version"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -141,10 +142,22 @@ type doctorEnv struct {
 	// (keystore.FileStore.FloorDamage), and the damage of a floor past the
 	// reader's bounds as its error. A nil seam leaves the row unprobed.
 	keystoreFloorDamage func(context.Context) (int, error)
+	// keystorePreFrameDropped reads the persisted pre-frame refusal counts
+	// not yet in the audit log (keystore.FileStore.PreFrameDropped),
+	// read-only. A nil seam leaves that part of the keystore-logs row
+	// unprobed.
+	keystorePreFrameDropped func(context.Context) (keystore.PreFrameDroppedCounts, error)
 	// keystoreMaintenance reads a standing maintenance marker
 	// (keystore.FileStore.StandingMaintenance): whether one stands and the
 	// command of the run that wrote it. A nil seam leaves the row unprobed.
 	keystoreMaintenance func(context.Context) (verb string, present bool, err error)
+	// keystoreUserScope builds the user scope's start checks as doctor
+	// re-runs them in its own process (doctorKeystoreUserScope): the same
+	// socket.Preconditions the server's supervisor runs, what releases what
+	// they hold, the servers the count saw and an lstat of the socket path.
+	// An error is a service user that cannot be resolved. A nil seam leaves
+	// the row unprobed.
+	keystoreUserScope func() (doctorUserScope, error)
 	// keystoreLossyRuns reads the lossy-run record
 	// (keystore.FileStore.LossyMaintenanceRuns): the committed maintenance
 	// runs that dropped lines or keys, oldest first. A nil seam leaves the
@@ -177,6 +190,7 @@ func doctorChecks() []doctorCheck {
 		{"keystore-floor", checkKeystoreFloor},
 		{"keystore-maintenance", checkKeystoreMaintenance},
 		{"keystore-maintenance-runs", checkKeystoreLossyRuns},
+		{"keystore-user-scope", checkKeystoreUserScope},
 	}
 }
 
@@ -200,10 +214,11 @@ func checkKeystoreLogs(env doctorEnv) checkResult {
 	err := env.keystoreLogs(context.Background())
 	switch {
 	case err == nil:
-		if r, past := keystoreSoftCapHint(env); past {
-			return r
+		r, past := keystoreSoftCapHint(env)
+		if !past {
+			r = checkResult{name: name, status: statusPass, detail: "both append-only logs are the service user's, mode 0600, flagged SF_APPEND"}
 		}
-		return checkResult{name: name, status: statusPass, detail: "both append-only logs are the service user's, mode 0600, flagged SF_APPEND"}
+		return keystorePreFrameDroppedHint(env, r)
 	case errors.Is(err, fs.ErrNotExist):
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("the keystore user scope is off: %v", err), remedy: "sudo k3sm install"}
 	case errors.Is(err, fs.ErrPermission):
@@ -269,6 +284,81 @@ func checkKeystoreMaintenance(env doctorEnv) checkResult {
 	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, left by keys %s, which stopped or did not report; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName, verb), remedy: "sudo k3sm keys " + verb + "   # finishes the run, or prints its committed report"}
 }
 
+// doctorServersShown bounds how many server names the user-scope row
+// lists when more than one is registered.
+const doctorServersShown = 8
+
+// checkKeystoreUserScope is the user scope's row. Doctor is its own process
+// and cannot read the server's supervisor, so it re-runs the same start
+// checks through the same evaluator (socket.Preconditions.Check), judging
+// the logs read-only where the server reopens them. When every check passes
+// it says "start checks pass" and not "on": all it can add is what an
+// lstat of the socket path shows (it never connects; root and the service
+// user would be refused and write a refusal line), and no socket of the
+// service user's there is a WARN. A failed check is "off (<reason>)" with
+// the supervisor's reason, naming `sudo k3sm install` where that puts it
+// right, and the servers by name when more than one is registered; off is a
+// WARN, since the system scope is unaffected. A server count this user may
+// not read is a WARN naming sudo that does not call the scope off. A worker
+// runs no listener.
+func checkKeystoreUserScope(env doctorEnv) checkResult {
+	const name = "keystore-user-scope"
+	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+		return checkResult{name: name, status: statusSkip, detail: "a worker runs no keystore listener"}
+	}
+	if env.keystoreUserScope == nil {
+		return checkResult{name: name, status: statusSkip, detail: "not probed"}
+	}
+	var reason socket.OffReason
+	var why string
+	scope, err := env.keystoreUserScope()
+	if err != nil {
+		reason, why = socket.OffNotInstalledServer, err.Error()
+	} else {
+		reason, why = scope.pre.Check(context.Background())
+		if scope.release != nil {
+			scope.release()
+		}
+	}
+	var servers []string
+	var countErr error
+	if err == nil && scope.servers != nil {
+		servers, countErr = scope.servers()
+	}
+	switch {
+	case reason == "":
+		if serr := scope.sockState(); serr != nil {
+			return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: start checks pass, but no listening socket at %s [%v]", scope.sockPath, serr)}
+		}
+		return checkResult{name: name, status: statusPass, detail: "keystore user scope: start checks pass; a socket owned by the service user is at " + scope.sockPath}
+	case reason == socket.OffServersUnknown && errors.Is(countErr, fs.ErrPermission):
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: the server count cannot be read as this user, so the start checks are not all known [%v]", countErr), remedy: "sudo k3sm doctor   # the admin kubeconfig is root's"}
+	}
+	detail := "keystore user scope: off (" + string(reason) + ")"
+	r := checkResult{name: name, status: statusWarn}
+	if remedy := reason.Remedy(); remedy != "" {
+		detail += "; " + remedy
+		r.remedy = strings.Trim(strings.TrimPrefix(remedy, "run "), "`")
+	}
+	if why != "" {
+		detail += " [" + why + "]"
+	}
+	if reason == socket.OffServers && len(servers) > 1 {
+		detail += " servers: " + boundedNames(servers, doctorServersShown)
+	}
+	r.detail = detail
+	return r
+}
+
+// boundedNames joins the first max of names with ", ", adding how many
+// more there are.
+func boundedNames(names []string, max int) string {
+	if len(names) <= max {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(names[:max], ", "), len(names)-max)
+}
+
 // checkKeystoreLossyRuns is the lossy-run record's row: the maintenance
 // runs that committed and dropped lines or keys, which the record keeps
 // after the marker that held their report is gone. None is PASS; some is
@@ -294,6 +384,41 @@ func checkKeystoreLossyRuns(env doctorEnv) checkResult {
 	}
 	latest := runs[len(runs)-1]
 	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore maintenance: %d lossy run(s), latest %s dropped %d line(s)", len(runs), latest.Time.UTC().Format(time.RFC3339), latest.Dropped()), remedy: "as root, read " + keystore.MaintenanceRunsName + " in the data root: each lossy run's drop counts by reason, the newest 64 kept"}
+}
+
+// keystorePreFrameDroppedHint adds to r, the keystore-logs row as the flag
+// and size checks left it, the pre-frame refusals the server counted as
+// dropped and has not yet written to the audit log, read-only from the
+// file it persists them in: a WARN with the count and the uids named, or a
+// WARN that the persisted count is unreadable. A file this user may not
+// read adds nothing: the logs row already passed, and doctor as root
+// reads it.
+func keystorePreFrameDroppedHint(env doctorEnv, r checkResult) checkResult {
+	if env.keystorePreFrameDropped == nil {
+		return r
+	}
+	c, err := env.keystorePreFrameDropped(context.Background())
+	var detail string
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return r
+	case err != nil:
+		detail = fmt.Sprintf("the persisted pre-frame refusal count is unreadable, so refusals the server dropped are not shown: %v", err)
+	case c.Refusals == 0:
+		return r
+	default:
+		detail = fmt.Sprintf("%d pre-frame refusal(s) not recorded for %d uid(s)", c.Refusals, c.UIDs)
+		if c.Others > 0 {
+			detail += fmt.Sprintf(", %d of them for further uids not named", c.Others)
+		}
+	}
+	remedy := "sudo k3sm keys audit --rotate   # writes the counts to the new audit log"
+	if r.status == statusWarn {
+		r.detail += "; " + detail
+		r.remedy += "; " + remedy
+		return r
+	}
+	return checkResult{name: r.name, status: statusWarn, detail: detail, remedy: remedy}
 }
 
 // keystoreSoftCapHint is the keystore-logs row's WARN when either log is
@@ -984,6 +1109,15 @@ func realDoctorEnv(workDir string) doctorEnv {
 			cfg.UID = uid
 			return keystore.New(cfg).LogSizes(ctx)
 		},
+		keystorePreFrameDropped: func(ctx context.Context) (keystore.PreFrameDroppedCounts, error) {
+			uid, _, err := lookupServiceIDs()
+			if err != nil {
+				return keystore.PreFrameDroppedCounts{}, err
+			}
+			cfg := keystoreLayout(workDir)
+			cfg.UID = uid
+			return keystore.New(cfg).PreFrameDropped(ctx)
+		},
 		keystoreFloorDamage: func(ctx context.Context) (int, error) {
 			uid, _, err := lookupServiceIDs()
 			if err != nil {
@@ -995,6 +1129,9 @@ func realDoctorEnv(workDir string) doctorEnv {
 		},
 		keystoreMaintenance: func(ctx context.Context) (string, bool, error) {
 			return keystore.New(keystoreLayout(workDir)).StandingMaintenance(ctx)
+		},
+		keystoreUserScope: func() (doctorUserScope, error) {
+			return doctorKeystoreUserScope(workDir)
 		},
 		keystoreLossyRuns: func(ctx context.Context) ([]keystore.MaintenanceRun, error) {
 			return keystore.New(keystoreLayout(workDir)).LossyMaintenanceRuns(ctx)

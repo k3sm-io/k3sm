@@ -19,6 +19,7 @@ package keystore
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,7 +32,8 @@ import (
 
 // The root maintenance verb audit --rotate (docs/design/keystore.md § "Root
 // maintenance verbs", "audit --rotate keeps four archives"): it swaps in a
-// replacement audit/ directory holding an empty, flagged log and an
+// replacement audit/ directory holding a flagged log, empty but for the
+// server's persisted pre-frame refusal counts (rotateDroppedLines), and an
 // archives/ directory (root's 0700) with the old log's bytes as
 // keystore-audit.log.1 and the older archives one number up, by the same
 // directory swap as floor --rebuild.
@@ -64,7 +66,9 @@ type RotateReport struct {
 // regular). It refuses,
 // changing nothing, when keystore-audit.log.4 exists unless discardOldest.
 // It opens and judges the old log (openOldLog) and builds the replacement
-// directory (buildLogDir): an empty, flagged new log; and archives/, root's
+// directory (buildLogDir): a flagged new log holding only one line per class
+// of the persisted pre-frame refusal counts (rotateDroppedLines), which are
+// taken out of the file once the swap committed (clearRotatedDropped); and archives/, root's
 // 0700, holding .1, a fresh root 0600 copy of the old log's bytes, read
 // once and bounded by its size at open, and .2 to .4, hard links of the old
 // .1 to .3 (link leaves the live directory untouched). The old .4 is not linked, so the swap drops it. The
@@ -116,11 +120,68 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 	if rep.Discarded {
 		report["discarded"] = 1
 	}
-	empty := func(io.Writer) error { return nil }
-	if err := s.swapLogDir(m, auditLogName, empty, extra, report, attrs); err != nil {
+	dropped, lines := s.rotateDroppedLines(m.root)
+	content := func(w io.Writer) error {
+		_, err := w.Write(lines)
+		return err
+	}
+	if err := s.swapLogDir(m, auditLogName, content, extra, report, attrs); err != nil {
 		return rep, err
 	}
+	s.clearRotatedDropped(m.root, dropped)
 	return rep, nil
+}
+
+// rotateDroppedLines reads the server's persisted pre-frame refusal counts
+// (PreFrameDroppedName) through root, the store directory the run judged
+// and holds, and returns them with the lines rotate writes at the start of
+// the new audit log for them: one per class with a count, in class order,
+// the summary-line form the server writes (preFrameRecord) with via root
+// and caller uid 0, so it reads as no pre-frame line and is charged to no
+// uid's share nor to the pre-frame part (docs/design/keystore.md §
+// "Per-uid fairness": root's next audit --rotate writes any count still
+// unwritten as one line charged to no uid). A file that does not read
+// writes no line and is left for doctor to report.
+func (s *FileStore) rotateDroppedLines(root *os.Root) (preFrameDropped, []byte) {
+	d, err := s.readPreFrameDropped(root)
+	if err != nil {
+		slog.Warn("keystore audit --rotate: the persisted pre-frame refusal count does not read, so the new audit log carries no line for it; doctor reports it", "file", PreFrameDroppedName, "err", err)
+		return newPreFrameDropped(), nil
+	}
+	totals := d.totals()
+	var out []byte
+	for _, c := range preFrameClasses {
+		if totals[c] == 0 {
+			continue
+		}
+		rec := preFrameRecord(0, auditResultDropped, c, totals[c], s.now())
+		rec.Via = auditViaRoot
+		line, err := json.Marshal(rec)
+		if err != nil {
+			continue // a fixed shape of strings and integers always encodes
+		}
+		out = append(append(out, line...), '\n')
+	}
+	return d, out
+}
+
+// clearRotatedDropped takes the counts rotate wrote (written) out of the
+// persisted file once the swap committed, through root: what the server
+// added since rotate read it stays. A failure is logged, not returned: the
+// rotate stands, and the counts left are written again by the next one.
+func (s *FileStore) clearRotatedDropped(root *os.Root, written preFrameDropped) {
+	if written.empty() {
+		return
+	}
+	cur, err := s.readPreFrameDropped(root)
+	if err == nil {
+		mergeDelta(cur.uids, nil, written.uids)
+		mergeDelta(cur.others, nil, written.others)
+		err = s.writePreFrameDropped(root, cur)
+	}
+	if err != nil {
+		slog.Warn("keystore audit --rotate: the new audit log carries the pre-frame refusal counts, but they were not taken out of the persisted file; the next rotate writes them again", "file", PreFrameDroppedName, "err", err)
+	}
 }
 
 // placeArchives is rotate's part of step 3, in the replacement directory
