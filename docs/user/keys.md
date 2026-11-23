@@ -68,7 +68,14 @@ name.
 `/var/lib/k3sm/server`. The data root is its parent.
 
 Exit codes: 0 done, 1 refused or failed, 2 usage error, 3 `rewrap` finished an earlier
-interrupted rewrap instead of yours (run it again with a new key).
+interrupted rewrap instead of yours (run it again with a new key), 4 `put`, `rotate`, `rm` or
+`floor merge` wrote the floor, but the floor dropped a recorded deletion to stay within its
+limits, so a copy of that deleted entry put back is accepted. An `rm` that exits 4 and prints
+`deleted` deleted the entry, even when it says its files were left behind; one that prints no
+`deleted` found nothing to delete. `list` and `show` print such a drop as a warning and exit 0.
+Delete entries you no longer use to make room. 5 `floor merge` wrote the merge, but did not
+rename `keystore-floor.json.pre-restore`: run it again to finish the restore. Exit 5 wins over 4,
+and the report still lists every dropped deletion.
 
 ## Giving a Value
 
@@ -203,16 +210,49 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
   label alone does not count: a Secret of that name that someone else created first, or that was deleted and created
   again, is "not created by this server". The server leaves it alone and logs why: delete it, or
   pick another `--secret`. The server never lists Secrets, and deletes one only to re-create an
-  immutable Secret it created after a rotation or a change to its data.
+  immutable Secret it created after a rotation or a change to its data, or after an `rm`.
+  After an `rm`, the next sweep deletes the Secret the server delivered for that entry, if it
+  still has the recorded UID, and logs the names.
 - **A namespace that does not exist yet.** Delivering into it goes to whoever later creates that
   namespace.
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
   declaration (with `--secret S`, only the one into Secret `S`), and prints: the Secret stays; delete it with kubectl, and rotate the entry to
   revoke. A Pod that read the value still has it, which is why revoking it means rotating.
 - **Deleting a delivered entry.** `rm` does not withdraw its deliveries. For each one still
-  declared, it warns: still declared for delivery to `<namespace>/<secret>`; the Secret keeps its
-  value: run `k3sm keys undeliver` and delete the Secret. Until you do, the server logs that it
-  cannot read the entry, and the Secret holds the last value it delivered.
+  declared, it warns: still declared for delivery to `<namespace>/<secret>`; the server deletes
+  that Secret on its next sweep, unless the delivery breaker or a restore hold stops it; the
+  server log says so. `k3sm keys undeliver` does not change that. The delete is made only on
+  the Secret with the UID the server recorded when it created it, for the entry it recorded
+  then (a label someone changed on the Secret does not count), and it runs while plaintext
+  delivery is refused too. It removes the Secret from the Kubernetes API and nothing more: a
+  Pod that already read the value still has it, and the datastore's history and its backups
+  keep it, so revoking a credential still means rotating or disabling it where it is
+  accepted. Anyone who can read the Secret already has the value. Since the delete cannot be
+  undone, these hold it back:
+  - `rm` records the entry as deleted in root's record, `/var/lib/k3sm/keystore-floor.json`,
+    and it is no longer current there. An entry that record still lists as current but whose
+    files are missing was not removed with `rm`: it is a restored or rolled-back `keystore/`,
+    and its Secret is kept, with a warning naming the entry in the server log (see
+    [Restoring an older keystore/](#restoring-an-older-keystore)). If an earlier `rm` was
+    interrupted after removing the files, run `rm` again: it records the deletion even with
+    the files gone.
+  - The restore hold: after the server starts, and after `keystore/` is replaced, nothing is
+    deleted until the first sweep has passed **and** 10 minutes have. The server warns when
+    the hold starts, naming the time it ends. There is no flag to shorten it.
+  - The breaker counts entries, not Secrets: an `rm` of one entry delivered into many
+    namespaces is one. When the number of delivered entries gone at once is above 3 **and**
+    above a quarter of the live delivered entries, none of their Secrets is deleted and the
+    server logs an error with the count, again every hour while it holds. It keeps holding
+    until enough entries are back, or until you delete those Secrets yourself with kubectl.
+  - A delete counts as done only once the Secret is gone. A Secret already being deleted (a
+    finalizer holds it), still there after its delete, or whose delete keeps failing is
+    stuck: it is retried every sweep and does not count toward the breaker.
+  - The entry is checked again just before each delete, so one put back meanwhile keeps its
+    Secret.
+  - Every Secret kept back for a reason that names it (root's record still lists the entry,
+    the entry's absence cannot be confirmed, the Secret cannot be read) and every stuck
+    delete gets one warning when it starts, and a summary every hour while any lasts,
+    naming each, why, and for how long.
 
 The declaration is `/var/lib/k3sm/keystore-delivery.json`, owned by root, mode 0644, and only
 `k3sm keys deliver` and `undeliver` write it. It decides which namespace the server writes a
@@ -250,7 +290,8 @@ on:
 
 To turn it off, remove the flag from the plist, restart the server daemon, and run
 `sudo k3sm install`. If the record still carries the flag, remove it there too. A Secret delivered
-while the override was on stays as it is: the server does not delete it, and stops updating it.
+while the override was on stays as it is: the server stops updating it, and deletes it only
+after an `rm` of its entry.
 
 ## Backing Up and Restoring
 
@@ -271,30 +312,281 @@ with the master key that was current when they were saved, so take both again af
 Your datastore backups copy `/var/lib/k3sm/server/cred`, which holds the master key directory too.
 Exclude `cred/keystore-master/` from them, and back the master key up on its own, as below.
 
-To save, while no `k3sm keys` verb is running (`ditto` keeps owners and modes):
+To save, while no `k3sm keys` verb is running (`ditto` keeps owners and modes), give the backup a
+name, here `2026-11-22`, and save its floor under that name:
 
 ```
-sudo ditto /var/lib/k3sm/server/keystore /path/to/backup/keystore
+B=2026-11-22
+sudo install -d -o root -g wheel -m 0755 /path/to/backup
+sudo install -d -o root -g wheel -m 0700 /path/to/backup/$B
+sudo ditto /var/lib/k3sm/server/keystore /path/to/backup/$B/keystore
 sudo ditto /var/lib/k3sm/server/cred/keystore-master /other/place/keystore-master
-sudo cp -p /var/lib/k3sm/keystore-floor.json /path/to/backup/
+sudo install -d -o root -g wheel -m 0700 /var/root/keystore-floor-backup/$B
+sudo install -o root -g wheel -m 0644 /var/lib/k3sm/keystore-floor.json /var/root/keystore-floor-backup/$B/keystore-floor.json
+sudo shasum -a 256 /var/root/keystore-floor-backup/$B/keystore-floor.json | sudo tee /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256
 ```
 
-To restore the same backup, for example after deleting an entry by mistake, move the live copy
-aside rather than deleting it, so a bad restore can be undone:
+Keep `/path/to/backup` owned by root with no write access for group or others, and each backup's
+directory in it owned by root with mode 0700, as the `install -d` lines make them: the restore
+copies from there as root, and checks both first. Save `keystore/` and the floor file in the same run, and keep them as a pair. A floor file saved
+at another moment does not describe the saved entries: some of them are refused, or deletions
+recorded after it are lost. Each backup keeps its own floor, in the directory named after it, so
+an older backup still has the floor that matches it. Never save every backup's floor to one
+path: the newest would replace the floor an older backup needs.
+
+The saved floor file goes to a directory on this Mac owned by root with mode 0700, such as
+`/var/root/keystore-floor-backup/$B` above, not beside `keystore/` in a path your user can write.
+The floor decides which entries are live, so a floor someone else could replace would let them
+mark a revoked entry live again. Never keep the saved floor on a volume that ignores ownership,
+such as an external drive set to ignore ownership, or on a volume others can write, such as a
+network share. The SHA-256 that the last line records stays in root's directory on this Mac,
+and the restore checks it before it puts the floor back, so a floor damaged since you saved it
+is never used. The SHA-256 catches corruption, not tampering: anyone who could replace the saved
+floor could replace its SHA-256 beside it, which is why the directory must be root's alone. If this Mac is lost, its saved floors are lost with it: restore as in
+"Restoring an older keystore/" below.
+
+To restore a backup, for example after deleting an entry by mistake, you move the live
+`keystore/` and the live `keystore-floor.json` aside rather than deleting or overwriting them, so
+a bad restore can be undone, and put back the `keystore-floor.json` you saved with that backup.
+First stop the server, check that no copy from an earlier restore is still set aside, and check
+the saved floor against its SHA-256, as root:
 
 ```
 sudo k3sm stop
-sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/server/keystore.pre-restore
-sudo ditto /path/to/backup/keystore /var/lib/k3sm/server/keystore
+B=2026-11-22
+sudo ls -d /var/lib/k3sm/pre-restore.d /var/lib/k3sm/keystore-floor.json.pre-restore
+sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256
+```
+
+`ls` must report both paths missing ("No such file or directory"). If either exists, an earlier
+restore was never finished or undone, and moving the live copies aside now would replace it:
+finish or undo that restore first, as below, and do not go on. `shasum` must print `OK`. If it
+does not, the saved floor has changed since you saved it: do not use it. Then move the live
+copies aside and put the backup in place. `mkdir` makes a new directory that only root can
+open, in `/var/lib/k3sm`, which root owns, and fails if the name already exists. `mv` then moves the live `keystore/` into it, so
+nothing running as the service user can reach the moved-aside entries or copy one back into the
+restored keystore. The files inside are not changed: they keep their owner and mode, so an undo
+needs no ownership change. Never run `chown -R` or `chmod -R` as root over the moved-aside
+`keystore/`. The service user wrote that tree, and a hard link it placed there would make root
+change a file somewhere else. `ditto` copies the backup into `pre-restore.d/restored`, beside
+the moved-aside copy, not into `server/`: the merge below moves it into place and hands it to the
+service user itself, one file at a time, never following a link. It first checks the whole copy
+and refuses it, changing nothing, if it holds anything the keystore does not write: a name the
+keystore does not use, a link, a FIFO or socket, a file with a second hard link, a setuid, setgid
+or sticky bit, an ACL or a file flag, a file larger than its kind can be, or a file owned by
+anyone but the service user (or the unknown owner a volume that ignores ownership reports). A
+file owned by root is refused too. The message names the path inside the copy. Leave
+`/var/lib/k3sm/server/keystore` absent. If anything is there when the merge runs, such as a
+directory or link the service user made, the merge moves it into `pre-restore.d` as
+`planted-<time>`, where only root can reach it, without reading it or following a link. It says
+so on stderr and in a `moved aside` line of its report, then goes on, and exits 4 so you read it. With `--dry-run` it prints
+where it would move it and moves nothing. Every line ends in
+`|| exit 1`, so the first one that fails stops the steps (and closes the shell), and no later
+line moves a copy into or over one that is set aside. Before anything moves, the first three
+lines check that nothing runs as the service user, that `/path/to/backup` is owned by root with
+no write access for group or others, and that `/path/to/backup/$B` is owned by root with mode
+0700.
+If `pgrep` prints process IDs, the server has not stopped yet: wait for it and start the steps
+again. If the second or third check fails, fix the owner or mode it names (`sudo chown root:wheel`
+on either directory, `sudo chmod go-w /path/to/backup`, `sudo chmod 0700 /path/to/backup/$B`)
+and start again. The
+`test ! -L` before `ditto` stops if the backup's `keystore` is a link, which `ditto` would follow:
+
+```
+! pgrep -u _k3sm || exit 1
+test "$(sudo find /path/to/backup -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 1 || exit 1
+test "$(sudo find /path/to/backup/$B -maxdepth 0 -user root -perm 0700 | grep -c .)" -eq 1 || exit 1
+sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
+sudo test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo test ! -L /path/to/backup/$B/keystore || exit 1
+sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json || exit 1
+```
+
+Before you start the server, carry over every deletion recorded since the backup. The floor you
+moved aside records every entry deleted while it was live. Until you merge it, `put`, `rotate`
+and `rewrap` refuse with a message that names `keys floor merge`, and `list` and `show` run with a
+warning on stderr but find no entries, since the restored ones are not in place yet. `rm` still deletes, with
+the same warning, and the merge keeps each deletion it records. An `rm` at this point records
+the deletion, but the restored entry's files are still in `pre-restore.d/restored`, out of its
+reach. The merge removes those files before it moves the restored copy into place, so you do not
+need to run `rm` again. A server started before the merge delivers no keys to the cluster and
+deletes no delivered Secret: it logs an error and tries again until the merge has run. Once it
+has, the server deletes the Secret delivered from each entry the merge or an `rm` deleted, as
+after any `rm`: once the restore hold has passed and unless the breaker holds (see [Delivering
+an Entry as a Secret](#delivering-an-entry-as-a-secret)). Merge those deletions into the restored floor:
+
+```
+sudo k3sm keys floor merge
+```
+
+Once the merge is written, it moves `pre-restore.d/restored` to `/var/lib/k3sm/server/keystore`,
+then renames the file to `keystore-floor.json.merged-<time>`, the time in
+seconds since 1970, and the other verbs work again. If it prints its report and exits 5, the merge is
+written, but the restored copy was not moved into place or the file was not renamed: run the same
+command again. The second run never works the merge out again: it checks that the floor is the one
+the first run recorded writing in `keystore-floor.json.pre-restore.retired`, writes nothing more,
+prints `already merged` with the first run's report, moves the restored copy if it is still staged
+and renames the file. `k3sm keys rm` still works before that second run: the second run accepts
+the floor the first run wrote plus the deletions `rm` recorded since, keeps them, and removes the
+restored files of each entry deleted. If the floor changed in any other way, it refuses, says so
+and exits 5. The merge takes no file name: it reads only `/var/lib/k3sm/keystore-floor.json.pre-restore`,
+the floor the steps above moved aside, so it never reads the floor saved with the backup or any
+other copy. It refuses, and changes nothing, if that file is missing, if the restored
+`keystore-floor.json` is not in place yet (put it back with `install` first), if the file is
+the live floor itself, or if the restored floor holds none of the entries the moved-aside floor
+holds, which means it is not the floor saved with this backup. It also refuses, and changes
+nothing, if `/var/lib/k3sm/pre-restore.d` is on another volume than `/var/lib/k3sm/server`: it
+moves the restored copy into place with a rename, which cannot cross volumes, so make
+`pre-restore.d` in `/var/lib/k3sm` as the steps above do. `rm` also refuses until the
+restored `keystore-floor.json` is in place.
+
+The merge keeps every system-store key revoked since the backup refused: a key created after the
+backup, every older version of a name deleted more than once, and an entry the backup holds that
+you deleted since. User-scope entries (`user/<uid>/...`) have no floor the merge reads yet, so a
+user-scope deletion since the backup is not carried over: such an entry comes back with the
+restore, and when the restored keystore holds user-scope entries the merge prints a `user scope`
+line saying so. That last kind is restored and then deleted again by the merge, because a deletion since
+the backup may have revoked the key. To bring back an entry you deleted by mistake, which is the
+reason to restore, name it with `--keep`, once for each entry:
+
+```
+sudo k3sm keys floor merge --keep system/<name>
+```
+
+Decide before you run the merge: once it has deleted an entry again, running it once more with
+`--keep` does not bring that entry back. To see what it would do first, add `--dry-run`: it
+prints the same report and changes nothing. The merge also deletes each version that was current in
+the floor you moved aside but is not the restored one, such as an entry you put again after
+deleting it since the backup: by restoring the backup you chose its version, so a copy of the
+newer one put back is refused. `--keep` keeps only the restored version: an entry you deleted and
+put again since the backup comes back as the backup's version, and the version you put since is
+still retired, so a copy of it stays refused even after you remove the entry. Only an entry the
+backup does not hold at all keeps its newer version when `--keep` names it: the merge records
+that version as current, so a copy of an older one put back is refused. An entry you rotated since the
+backup is restored at its older version, and the merge records how far it had been rotated, so a
+copy of a newer version from before the restore is refused, before and after the next `rotate`
+(which numbers past it). The merge prints how many
+deletions it merged, how many the restored floor already had, how many restored entries it
+deleted again, how many it kept because `--keep` named them, how many moved-aside versions it
+retired, how many it had to drop to stay within the floor's limits, and how many restored entries
+it fenced off from their newer pre-restore copies. It
+lists each entry it deleted again as `buried live system/<name>`, each one it kept as `kept
+system/<name>` and each one whose pre-restore version it retired as `retired system/<name>`. A
+`kept` line says `revoked, kept live` for an entry deleted since the backup, and `recorded the
+moved-aside version` for an entry the backup does not hold. It warns on stderr about each
+revoked entry it keeps, since keeping it brings back a key that may have been deleted to revoke
+it. A `--keep` name the merge would not delete, such as a
+typo, makes it refuse and change nothing. The merge removes the restored files of each entry it
+deletes again before it moves the copy into place, so you do not run `rm` for them.
+A line starting `dropped` names a deletion the floor could not keep: a copy of that entry put
+back is accepted. If the merge would drop any deletion to fit, even one the restored floor
+already held, it refuses with a message that the floor is full, changes nothing and leaves the
+file in place, so the other verbs still refuse. To make room, delete each entry you no longer
+need with `sudo k3sm keys rm system/<name> --yes`, which works while the merge is pending, then
+run the merge again. When the message names `--accept-drops`, deleting entries cannot help, and
+`--accept-drops` lets the merge drop the oldest deletions to fit. It never drops the deletion of
+an entry the merge deletes again: the restored copy would then be accepted with nothing to
+refuse it. If that is the only way to fit, the merge refuses even with `--accept-drops` and names
+the entries: delete each one with `sudo k3sm keys rm system/<name> --yes` first, then run the
+merge again. A line starting `unverified` names a restored entry whose current version the
+merge could not check with the master key, most often because the master key is missing. The
+merge then leaves the restored floor's record of that entry as it is. A copy older than that
+record is refused and a copy at it is accepted. If the merge also fenced the entry, a newer copy
+up to the fence is refused until the next `rotate`, so if the backup's copy is newer than the
+floor saved with it, `show` refuses the entry as a copy from before the restore. An
+`unverified` line that names the moved-aside pointer is about the copy in
+`pre-restore.d/keystore`: the merge could not check its current version with the master key, so
+it fences the entry only past the version the moved-aside floor records, and a copy from before
+the restore numbered above that may still be accepted.
+
+The merge exits 0 when it is written and there is nothing to read in the report. It exits 4 when
+it is written but dropped a deletion, kept an entry because `--keep` named it, left an entry
+`unverified` (with no `pre-restore.d/keystore`, each entry the moved-aside floor holds live), or
+moved aside what it found at `server/keystore`, or carried over user-scope entries without a
+floor check, so read the report. It exits 5 when it is written
+but the restored copy was not moved into place, the move may not survive a crash, or the file was
+not renamed (run it again), and 1 when it refuses and changes
+nothing. A run after an exit 5 finds the merge already written, so if it then refuses the
+restored copy, or cannot move aside what is at `server/keystore`, it says the merge is written
+and exits 5 again, with `--dry-run` too: fix what it names and run it once more. With `--dry-run` it exits with the code the merge itself would return. Then start the server and check the entries:
+
+```
 sudo k3sm start
 sudo k3sm keys list
 ```
 
-Only when `list` shows every entry `ok`, delete the copy you moved aside:
+Restore the floor file with `install` as shown. The floor is refused unless root owns it,
+and on a volume that ignores ownership, such as an external drive set to ignore
+ownership or a network share, `cp -p` gives the copy a non-root owner. `install -o root -g wheel
+-m 0644` sets the owner and mode whatever the volume reports. The merge reads the floor you
+moved aside only from a directory root owns that group and others cannot write, such as
+`/var/lib/k3sm`, where the recipe leaves it.
+
+Restore the floor file too, or the entry stays refused. When you delete an entry, root's record
+notes the deletion, and any copy of that entry put back later is refused with a message saying
+the floor records it as deleted, because the check cannot tell your restore from someone
+putting a deleted key back. The floor file saved with the backup still lists the entry as live,
+so restoring it with `keystore/`, and naming the entry with `--keep` in the merge, brings the
+entry back.
+
+A restore puts back the whole keystore as it was when you saved it, not one entry:
+
+- Every `rotate` since the backup is undone. Each entry's current version is the one it had
+  then.
+- Every entry you deleted since the backup comes back, and root's record of those deletions is
+  gone, until the merge above carries those deletions over. The merge deletes each of those
+  entries again unless `--keep` names it, so a key you deleted to revoke it stays deleted.
+
+Only when `list` shows every entry `ok`, delete the copies you moved aside:
 
 ```
-sudo rm -rf /var/lib/k3sm/server/keystore.pre-restore
+sudo rm -rf /var/lib/k3sm/pre-restore.d
+sudo rm /var/lib/k3sm/keystore-floor.json.merged-*
 ```
+
+To undo the restore instead, stop the server and stage the two copies the other way round inside
+`pre-restore.d`: the copy you moved aside becomes `restored`, which the merge moves into place,
+and the restored `keystore/` becomes the moved-aside copy. Every line ends in `|| exit 1`, as
+above. The floors swap places: the floor you moved aside
+goes back in place, and the restored floor becomes `keystore-floor.json.pre-restore`, so the
+merge runs in reverse and keeps every deletion you made after the restore. If you already ran
+the merge, the floor you moved aside is now `keystore-floor.json.merged-<time>`: use that name
+in the first floor `mv` instead. `--undo` tells the reverse merge to read the record the first
+merge left beside that file, `keystore-floor.json.merged-<time>.retired`, which lists what the
+first merge retired; leave that record in place. `--undo` uses only the record whose merge read
+the floor you put back, so it refuses when that floor is not the first merge's input, or when no
+record matches it, and says so. If you never ran the first merge there is no record and `--undo`
+refuses: run the two merge lines without `--undo`. The `pgrep` line stops
+the steps while anything still runs as the service user, as in the restore.
+
+```
+sudo k3sm stop
+! pgrep -u _k3sm || exit 1
+sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1
+sudo k3sm keys floor merge --undo --dry-run
+sudo k3sm keys floor merge --undo
+sudo rm -rf /var/lib/k3sm/pre-restore.d
+sudo k3sm start
+```
+
+The last `rm -rf` removes the restored copy, which the steps above left in `pre-restore.d`.
+
+Read the `--dry-run` report before you run the merge. A `buried live` line names an entry that
+the restored floor records as deleted, and says which kind it is. `retired by the restore` is a
+version the first merge retired, live again in the keystore you moved back: the reverse merge
+deletes it, files and all, unless you run the merge with `--keep system/<name>` for it, so name
+each one with `--keep` and run `--dry-run` with the same flags first to check that none is left.
+`deleted since the restore` is an entry you deleted after the restore: it stays deleted, the
+merge removes its files, and `--keep` on it is refused.
 
 The values come back byte for byte: `show --reveal` prints exactly what it printed before. Restore
 the master key the same way, from its own backup, if it was lost too.
@@ -316,4 +608,26 @@ is deliberate:
 6. Once `sudo k3sm keys list` shows every entry `ok`, delete the copy you moved aside.
 
 Only remove the record when you know the restored entries are the ones you want current, since
-the next keys verb accepts them as the newest.
+the next keys verb accepts them as the newest. Removing it also discards every deletion it
+recorded: a copy of a deleted entry put back later is no longer refused.
+
+A restore also changes which entries exist, and the server does not delete a delivered Secret
+because a restore lost its entry:
+
+- After a restore of a backup with its saved floor and `keys floor merge` (the steps under
+  "Backing Up and Restoring"), the merge records as deleted each entry the backup lacks and the
+  moved-aside floor holds, unless `--keep` names it, so the server deletes their Secrets as after
+  an `rm`, once the restore hold has passed and unless the breaker holds. Root's record still
+  lists as current an entry whose files are missing only when the restored `keystore/` lacks
+  what the record names, such as an entry `--keep` kept that the backup does not hold, or a
+  `keystore/` put back without its floor. The server keeps those Secrets for as long as that
+  lasts and warns once per entry in its log. To revoke one, `rm` it, or delete the Secret with
+  kubectl.
+- After the steps above, which remove root's record and write it again from the restored
+  entries, the record no longer lists the entries the restored copy lacks, so it cannot tell
+  them from an `rm`. The server holds back for 10 minutes after `start` (and after
+  `keystore/` is replaced while it runs), and for every sweep while the breaker holds (above
+  3 and above a quarter of the delivered entries gone at once). You have those 10 minutes
+  after `start` to put back any entry that is still delivered. After that, an entry the
+  restored copy does not hold has its Secret deleted, as after an `rm`, so restore every entry
+  you still deliver.

@@ -25,10 +25,11 @@ import (
 	"k3sm.io/k3sm/pkg/keystore"
 )
 
-// keysFloor is `k3sm keys floor --rebuild`, the root maintenance verb that
-// rebuilds the user-scope floor log (docs/design/keystore.md § "Root
-// maintenance verbs").
-func keysFloor(ctx context.Context, args []string, env keysEnv) int {
+// keysFloorRebuild is `k3sm keys floor --rebuild`, the root maintenance
+// verb that rebuilds the user-scope floor log (docs/design/keystore.md §
+// "Root maintenance verbs"). keysFloor hands it every floor invocation but
+// floor merge, so its usage line names both forms.
+func keysFloorRebuild(ctx context.Context, args []string, env keysEnv) int {
 	v := newKeysVerb("floor", env)
 	rebuild := v.fs.Bool("rebuild", false, "rebuild the user-scope floor log")
 	pos, err := v.parse(args)
@@ -36,7 +37,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		return keysBadUsage
 	}
 	if len(pos) != 0 || !*rebuild {
-		return v.failf(keysBadUsage, "usage: sudo k3sm keys floor --rebuild")
+		return v.failf(keysBadUsage, "usage: %s, or %s", keysFloorRebuildUsage, keysFloorMergeUsage)
 	}
 	if code := v.requireRoot(); code != keysOK {
 		return code

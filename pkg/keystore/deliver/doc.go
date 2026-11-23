@@ -58,6 +58,15 @@ limitations under the License.
 //     on the recorded UID, created again and the new UID recorded, both
 //     steps logged once without the value; while it is already being
 //     deleted, it is left to finish;
+//   - present with the recorded UID and its entry deleted: once Store.Absent
+//     confirms the entry is definitively gone (Current's ErrNotFound alone is
+//     not enough: a missing entries' directory answers it too), deletes it
+//     under a precondition on the recorded UID and logs the names, never a
+//     value; a missing label or annotation is logged at Warn. A withdrawn
+//     target's entry is the one its state record names, not its label. The
+//     keystore floor, the restore hold and the breaker (revoke.go) hold the
+//     delete after a restore, for 10 minutes after a start, and when many
+//     entries go at once; the delete is done once a Get no longer finds it;
 //   - anything else (no recorded UID, or a UID other than the recorded one,
 //     whatever its label): leaves it alone and logs why. The
 //     label is forgeable by anyone who can write Secrets in the namespace;
@@ -69,9 +78,10 @@ limitations under the License.
 // alone; an absent declaration withdraws nothing and keeps every record,
 // and warns once with the number of Secrets rotations no longer reach.
 //
-// It never lists, deletes only an owned immutable Secret (under a UID
-// precondition) and touches no other kind, so withdrawing a
-// target (`k3sm keys undeliver`) leaves its Secret in place. A per-target
+// It never lists, deletes only an owned Secret under a UID precondition (an
+// immutable one to re-deliver it, or one whose entry is deleted, declared or
+// withdrawn) and touches no other kind, so withdrawing a target of a live
+// entry (`k3sm keys undeliver`) leaves its Secret in place. A per-target
 // failure is logged and the sweep moves on; each target's calls have their
 // own ten-second deadline, so one hung call cannot stall the rest. The data
 // root holding the declaration, the state file and the lock is itself judged
@@ -87,5 +97,6 @@ limitations under the License.
 // server's own start-time verdict (executor.EncryptionAtStart), handed in at
 // construction, so the reconciler cannot disagree with the apiserver. A
 // refusal is logged at Warn once per target per state change. A target
-// delivered before the override was removed is left as it is.
+// delivered before the override was removed is left as it is, but revoked
+// when its entry is deleted: a delete writes no value.
 package deliver

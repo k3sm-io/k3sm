@@ -1,0 +1,417 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package keystore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// capSetup is a live floor whose k holds a live record and the per-name
+// cap of burials, and a moved-aside floor whose merge adds one burial
+// elsewhere, so an rm of k under the guard drops k's oldest burial at the
+// cap.
+func capSetup(t *testing.T, s *FileStore, server string) {
+	t.Helper()
+	setSeam(t, &buriedPerNameLimit, smallBuriedPerName)
+	k := floorEntry{Generation: mgen(50), Seq: 1}
+	for i := range smallBuriedPerName {
+		k.Buried = append(k.Buried, burial{Generation: mgen(10 + i), Deleted: uint64(i + 1)})
+	}
+	putFloorFile(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}, "k": k})
+	writeAsideFloor(t, server, floor{
+		"keep": {Generation: mgen(2), Seq: 1},
+		"k":    {Generation: mgen(50), Seq: 1},
+		"gone": {Buried: []burial{{Generation: mgen(1), Deleted: 1}}},
+	})
+}
+
+// commitThenRm runs setup, a merge whose floor write commits and whose tree
+// move fails, so the guard stays, then an rm of name under the guard, which
+// must drop a burial the written floor holds (ErrTombstoneEvicted).
+func commitThenRm(t *testing.T, setup func(*testing.T, *FileStore, string), opts MergeOptions, name string) (*FileStore, string) {
+	t.Helper()
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	setup(t, s, server)
+	stageTree(t, s)
+	failStepOnce(s, "merge tree rename")
+	if _, err := s.MergeFloor(ctx, opts); !Committed(err) {
+		t.Fatalf("first run: %v, want committed with the tree move failing", err)
+	}
+	if err := s.Delete(ctx, name); !errors.Is(err, ErrTombstoneEvicted) || !DeleteDone(err) {
+		t.Fatalf("Delete %s under the guard: %v, want it done with ErrTombstoneEvicted", name, err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dataRoot, rmDroppedName)); err != nil {
+		t.Fatalf("the rm-dropped record after the Delete: %v, want it written", err)
+	}
+	return s, server
+}
+
+// TestFloorMergeRerunAfterRmPrune (U192): an rm under a pending merge whose
+// floor is written drops a burial that floor holds, at the per-name cap or
+// in the prune at the tombstone budget (certain after --accept-drops). The
+// rerun accepts the floor written plus rm's burials minus what the
+// rm-dropped record lists, finishes the merge and clears the guard. A
+// burial gone that the record does not list, and a record that is not in
+// its one encoding or is group-writable, still refuse the rerun.
+func TestFloorMergeRerunAfterRmPrune(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, *FileStore, string)
+		opts  MergeOptions
+		rm    string
+	}{
+		{"per-name cap", capSetup, MergeOptions{}, "k"},
+		{"tombstone budget", dropsSetup, MergeOptions{AcceptDrops: true}, "keep"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, server := commitThenRm(t, tc.setup, tc.opts, tc.rm)
+			r, err := s.MergeFloor(ctx, MergeOptions{})
+			if err != nil || !r.AlreadyMerged {
+				t.Fatalf("rerun after the rm = %+v, %v; want it already merged", r, err)
+			}
+			if err := s.MergePending(); err != nil {
+				t.Fatalf("MergePending after the rerun: %v, want the guard cleared", err)
+			}
+			if _, err := os.Lstat(filepath.Join(s.dataRoot, rmDroppedName)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the rm-dropped record after the merge: %v, want it removed", err)
+			}
+			if fl := floorOf(t, server); fl[tc.rm].live() {
+				t.Fatalf("%s after the merge = %+v, want it deleted", tc.rm, fl[tc.rm])
+			}
+		})
+		t.Run(tc.name+": an unlisted burial gone still refuses", func(t *testing.T) {
+			s, server := commitThenRm(t, tc.setup, tc.opts, tc.rm)
+			fl := floorOf(t, server)
+			removed := false
+			for name, e := range fl {
+				if name != tc.rm && len(e.burials()) > 0 {
+					e.Buried = nil
+					if !e.live() {
+						delete(fl, name)
+					} else {
+						fl[name] = e
+					}
+					removed = true
+					break
+				}
+			}
+			if !removed {
+				t.Fatal("no burial to remove")
+			}
+			putFloorFile(t, server, fl)
+			if _, err := s.MergeFloor(ctx, MergeOptions{}); !Committed(err) || !strings.Contains(err.Error(), "is gone") {
+				t.Fatalf("rerun with an unlisted burial gone: %v, want a committed refusal naming it", err)
+			}
+			if s.MergePending() == nil {
+				t.Fatal("the refused rerun cleared the guard")
+			}
+		})
+		t.Run(tc.name+": a tampered record refuses", func(t *testing.T) {
+			for what, tamper := range map[string]func(string) error{
+				"another encoding": func(p string) error {
+					b, err := os.ReadFile(p)
+					if err != nil {
+						return err
+					}
+					return os.WriteFile(p, append([]byte(" "), b...), floorFileMode)
+				},
+				"group-writable": func(p string) error { return os.Chmod(p, 0o664) },
+			} {
+				s, _ := commitThenRm(t, tc.setup, tc.opts, tc.rm)
+				if err := tamper(filepath.Join(s.dataRoot, rmDroppedName)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.MergeFloor(ctx, MergeOptions{}); err == nil || !strings.Contains(err.Error(), rmDroppedName) {
+					t.Fatalf("rerun with the record %s: %v, want it refused naming %s", what, err, rmDroppedName)
+				}
+				if s.MergePending() == nil {
+					t.Fatalf("the rerun with the record %s cleared the guard", what)
+				}
+			}
+		})
+	}
+}
+
+// TestPendingSinceReadFloorNotCommitted (U192): a live floor that is the
+// floor a first run read, changed since by more than rm's burials, is
+// refused without claiming the merge wrote the floor.
+func TestPendingSinceReadFloorNotCommitted(t *testing.T) {
+	read := floor{"a": {Generation: mgen(1), Seq: 1}}
+	written := floor{"a": {Generation: mgen(1), Seq: 1}, "gone": {Buried: []burial{{Generation: mgen(2), Deleted: 1}}}}
+	rb, err := marshalFloor(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := marshalFloor(written)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec retiredRecord
+	rec.setFloors(rb, wb)
+	// A burial numbered below guardEraSeq is not one rm writes under the
+	// guard.
+	live := floor{"a": {Generation: mgen(1), Seq: 1}, "x": {Buried: []burial{{Generation: mgen(3), Deleted: 1}}}}
+	_, err = pendingSince(rec, live, nil)
+	var nw *notWrittenError
+	if !errors.As(err, &nw) {
+		t.Fatalf("pendingSince on the read floor changed = %v, want notWrittenError", err)
+	}
+}
+
+// TestFloorMergeCrashBetweenRenames (U192): a merge that renames its
+// retired record and stops before renaming its input leaves no pending
+// record. The rerun finds the renamed record of this input and this floor,
+// only renames the input, and writes no second, empty record, so the
+// record an undo reads still holds what the merge retired.
+func TestFloorMergeCrashBetweenRenames(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	putFloorFile(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}})
+	writeAsideFloor(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}, "ret": {Generation: mgen(3), Seq: 1}})
+	input, err := os.ReadFile(floorPath(server) + ".pre-restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageTree(t, s)
+	failStepOnce(s, "merge rename input")
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); !Committed(err) {
+		t.Fatalf("first run with the input's rename failing: %v, want committed", err)
+	}
+	if s.MergePending() == nil {
+		t.Fatal("the first run cleared the guard, want the input left in place")
+	}
+	r, err := s.MergeFloor(ctx, MergeOptions{})
+	if err != nil || !r.AlreadyMerged || len(r.Retired) != 1 || r.Retired[0] != "ret" {
+		t.Fatalf("rerun = %+v, %v; want already merged, retiring ret", r, err)
+	}
+	if err := s.MergePending(); err != nil {
+		t.Fatalf("MergePending after the rerun: %v, want the guard cleared", err)
+	}
+	if recs := mergedRecords(t, s); len(recs) != 1 {
+		t.Fatalf("retired records after the rerun: %v, want only the first run's", recs)
+	}
+	fdir, _, err := s.lockFloor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fdir.unlock()
+	rec, err := s.readRetired(fdir, sha256Hex(input))
+	if err != nil || len(rec.Retired) != 1 || rec.Retired[0] != "ret" {
+		t.Fatalf("the record an undo reads = %+v, %v; want it to retire ret", rec, err)
+	}
+}
+
+// TestFloorMergeFirstRunRemovesRmDroppedStaged (U192): a first run that
+// wrote its commit marker and stopped before the floor write, then an rm
+// under the guard that prunes the burial of generation G at the per-name
+// cap, leaves a pending record whose base is not the live floor. The next
+// run plans again from the floor rm left, which lacks G's burial: the
+// staged directory of G is removed as the rm-dropped record lists it, as
+// a rerun removes it, never moved into keystore/.
+func TestFloorMergeFirstRunRemovesRmDroppedStaged(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	capSetup(t, s, server)
+	stageTree(t, s)
+	failStepOnce(s, "write "+floorName)
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err == nil || Committed(err) {
+		t.Fatalf("first run with the floor write failing: %v, want a refusal not committed", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dataRoot, retiredPendingName)); err != nil {
+		t.Fatalf("the pending record after the first run: %v, want it written", err)
+	}
+	// k's staged generation is its oldest burial, the one the rm drops at
+	// the cap.
+	g := mgen(10)
+	if err := os.Mkdir(stagePath(s, stagedTreeName, "k"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	giveToService(t, stagePath(s, stagedTreeName, "k"))
+	writeStaged(t, s, "k/"+generationName, []byte(g+"\n"))
+	if err := s.Delete(ctx, "k"); !errors.Is(err, ErrTombstoneEvicted) || !DeleteDone(err) {
+		t.Fatalf("Delete k under the guard: %v, want it done with ErrTombstoneEvicted", err)
+	}
+	if fl := floorOf(t, server); fl["k"].buries(g) {
+		t.Fatalf("k after the rm = %+v, want %s's burial dropped at the cap", fl["k"], g)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dataRoot, rmDroppedName)); err != nil {
+		t.Fatalf("the rm-dropped record after the Delete: %v, want it written", err)
+	}
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); err != nil {
+		t.Fatalf("the run after the rm: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dir, "k")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("k's directory after the merge: %v, want its staged generation %s removed, not moved into keystore/", err, g)
+	}
+	if err := s.MergePending(); err != nil {
+		t.Fatalf("MergePending after the merge: %v, want the guard cleared", err)
+	}
+}
+
+// TestDeleteUnderGuardNeverRefusedBySidecar (U192): rm is never refused
+// under the guard for the rm-dropped record. With the record already
+// listing maxRmDropped burials, the next guarded rm that drops one more,
+// and with the record corrupt, an rm that drops one, each buries its
+// generation, marks the record unusable, root-owned and bound to the
+// pending record, and the merge's rerun, dry run included, stops,
+// committed, naming the record, accepting no drops and leaving the guard.
+func TestDeleteUnderGuardNeverRefusedBySidecar(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		plant func(t *testing.T, s *FileStore, rec retiredRecord) []byte
+	}{
+		{"full", func(t *testing.T, _ *FileStore, rec retiredRecord) []byte {
+			full := rmDropRecord{Input: rec.Input, Base: rec.Base}
+			for i := range maxRmDropped {
+				full.Dropped = append(full.Dropped, rmDrop{Name: fmt.Sprintf("n-%04d", i), Generation: mgen(1000 + i)})
+			}
+			b, err := marshalRmDropped(full)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return b
+		}},
+		{"corrupt", func(*testing.T, *FileStore, retiredRecord) []byte { return []byte("{\n") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			capSetup(t, s, server)
+			stageTree(t, s)
+			failStepOnce(s, "merge tree rename")
+			if _, err := s.MergeFloor(ctx, MergeOptions{}); !Committed(err) {
+				t.Fatalf("first run: %v, want committed with the tree move failing", err)
+			}
+			rec := readRecordFile(t, s, retiredPendingName)
+			p := filepath.Join(s.dataRoot, rmDroppedName)
+			if err := os.WriteFile(p, tc.plant(t, s, rec), floorFileMode); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Delete(ctx, "k"); !errors.Is(err, ErrTombstoneEvicted) || !DeleteDone(err) {
+				t.Fatalf("Delete k under the guard with the record %s: %v, want it done with ErrTombstoneEvicted", tc.name, err)
+			}
+			if fl := floorOf(t, server); fl["k"].live() || !fl["k"].buries(mgen(50)) {
+				t.Fatalf("k after the rm = %+v, want %s buried", fl["k"], mgen(50))
+			}
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := parseRmDropped(b)
+			if err != nil || !got.Unusable || got.Input != rec.Input || got.Base != rec.Base || len(got.Dropped) != 0 {
+				t.Fatalf("the rm-dropped record after the rm = %+v, %v; want the mark of the pending record", got, err)
+			}
+			for _, dry := range []bool{true, false} {
+				r, err := s.MergeFloor(ctx, MergeOptions{DryRun: dry, AcceptDrops: true})
+				if !Committed(err) || !strings.Contains(err.Error(), rmDroppedName) || !strings.Contains(err.Error(), "unusable") {
+					t.Fatalf("rerun (dry run %v) with the record marked: %+v, %v; want a committed refusal naming %s", dry, r, err, rmDroppedName)
+				}
+			}
+			if s.MergePending() == nil {
+				t.Fatal("the refused rerun cleared the guard")
+			}
+		})
+	}
+}
+
+// TestParseRmDroppedMark (U192): the mark parses in its one encoding, and
+// a mark that lists burials does not.
+func TestParseRmDroppedMark(t *testing.T) {
+	sum := sha256Hex([]byte("x"))
+	b, err := marshalRmDropped(rmDropRecord{Input: sum, Base: sum, Unusable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := parseRmDropped(b); err != nil || !got.Unusable {
+		t.Fatalf("parseRmDropped(the mark) = %+v, %v; want it marked", got, err)
+	}
+	bad, err := marshalRmDropped(rmDropRecord{Input: sum, Base: sum, Unusable: true, Dropped: []rmDrop{{Name: "k", Generation: mgen(1)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseRmDropped(bad); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("parseRmDropped(a mark listing a burial) = %v, want ErrCorrupt", err)
+	}
+	plain, err := marshalRmDropped(rmDropRecord{Input: sum, Base: sum})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "unusable") {
+		t.Fatalf("an unmarked record encodes %q, want no unusable field", plain)
+	}
+}
+
+// TestFloorMergeCrashBetweenRenamesClearsRmDropped (U192): a merge that
+// renames its retired record and stops before renaming its input, with an
+// rm-dropped record left in the data root, is finished by a rerun that
+// only renames the input (finishRenamed); that rerun removes the
+// rm-dropped record too, as renameMerged does, so none outlives the guard.
+func TestFloorMergeCrashBetweenRenamesClearsRmDropped(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	putFloorFile(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}})
+	writeAsideFloor(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}, "ret": {Generation: mgen(3), Seq: 1}})
+	input, err := os.ReadFile(floorPath(server) + ".pre-restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageTree(t, s)
+	failStepOnce(s, "merge rename input")
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); !Committed(err) {
+		t.Fatalf("first run with the input's rename failing: %v, want committed", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dataRoot, retiredPendingName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the pending record after the crash seam: %v, want it renamed", err)
+	}
+	// What a crash leaves when an rm under the guard wrote the record
+	// before the rename: renameMerged removes it only after the record's
+	// rename.
+	sum := sha256Hex(input)
+	b, err := marshalRmDropped(rmDropRecord{Input: sum, Base: sum, Dropped: []rmDrop{{Name: "k", Generation: mgen(9)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(s.dataRoot, rmDroppedName)
+	if err := os.WriteFile(p, b, floorFileMode); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.MergeFloor(ctx, MergeOptions{DryRun: true})
+	if err != nil || !r.AlreadyMerged {
+		t.Fatalf("dry run of the finish = %+v, %v; want already merged", r, err)
+	}
+	if _, err := os.Lstat(p); err != nil {
+		t.Fatalf("the rm-dropped record after the dry run: %v, want it left", err)
+	}
+	r, err = s.MergeFloor(ctx, MergeOptions{})
+	if err != nil || !r.AlreadyMerged {
+		t.Fatalf("finishing rerun = %+v, %v; want already merged", r, err)
+	}
+	if err := s.MergePending(); err != nil {
+		t.Fatalf("MergePending after the finish: %v, want the guard cleared", err)
+	}
+	if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the rm-dropped record after the finish: %v, want it removed", err)
+	}
+}

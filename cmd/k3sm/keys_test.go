@@ -28,6 +28,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -35,6 +36,7 @@ import (
 	"syscall"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"k3sm.io/k3sm/pkg/keystore"
 )
@@ -555,33 +557,773 @@ func copyTree(t *testing.T, src, dst string) {
 	}
 }
 
-// TestKeysRollbackRoundTrip is G21's CLI test: the rollback recipes in
-// docs/user/keys.md run as written. A restore of a saved keystore/ brings an
-// entry back, and `show --version N --reveal` piped into `rotate --in -`
-// stores a version whose value equals version N's byte for byte
-// (bytes.Equal, the comparison cmp makes), for an opaque and an Ed25519 entry.
-func TestKeysRollbackRoundTrip(t *testing.T) {
-	t.Run("save rm restore", func(t *testing.T) {
-		h := newKeysHarness(t)
-		value := []byte("rollback\x00value\n")
-		h.put("system/rb", value)
-		backup := filepath.Join(t.TempDir(), "keystore")
-		copyTree(t, h.keystoreDir(), backup)
-		h.mustRun(0, "rm", "system/rb", "--yes")
-		h.mustRun(1, "show", "system/rb", "--reveal")
-		// The recipe moves the live copy aside, never deletes it first.
-		aside := h.keystoreDir() + ".pre-restore"
-		if err := os.Rename(h.keystoreDir(), aside); err != nil {
+// recipeBackup is one backup as the save recipe in docs/user/keys.md leaves
+// it: keystore/ under a directory named after the backup, and the floor
+// saved under the same name in a root-only directory, with its SHA-256 in a
+// file beside it, in the format shasum writes.
+type recipeBackup struct {
+	keystore, floor, sum string
+}
+
+// saveRecipeBackup saves h's keystore/ and floor as the backup named name,
+// its floor under floorRoot (the recipe's /var/root/keystore-floor-backup).
+func saveRecipeBackup(t *testing.T, h *keysHarness, floorRoot, name string) recipeBackup {
+	t.Helper()
+	b := recipeBackup{keystore: filepath.Join(t.TempDir(), name, "keystore")}
+	if err := os.MkdirAll(filepath.Dir(b.keystore), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	copyTree(t, h.keystoreDir(), b.keystore)
+	// install -d -m 0700, then install -m 0644, under the backup's name.
+	dir := filepath.Join(floorRoot, name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b.floor = filepath.Join(dir, "keystore-floor.json")
+	raw, err := os.ReadFile(recipeFloor(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b.floor, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// shasum -a 256 FILE | tee FILE.sha256
+	sum := sha256.Sum256(raw)
+	b.sum = b.floor + ".sha256"
+	if err := os.WriteFile(b.sum, fmt.Appendf(nil, "%x  %s\n", sum, b.floor), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// recipeFloor is h's live floor file.
+func recipeFloor(h *keysHarness) string {
+	return filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+}
+
+// checkRecipeSum is shasum -a 256 -c on b's recorded SHA-256: shasum itself
+// when the host has it, and the same comparison in Go otherwise.
+func checkRecipeSum(b recipeBackup) error {
+	if shasum, err := exec.LookPath("shasum"); err == nil {
+		out, err := exec.Command(shasum, "-a", "256", "-c", b.sum).CombinedOutput()
+		if err != nil || !bytes.HasSuffix(bytes.TrimSpace(out), []byte(": OK")) {
+			return fmt.Errorf("shasum -c: %s, %v", out, err)
+		}
+		return nil
+	}
+	line, err := os.ReadFile(b.sum)
+	if err != nil {
+		return err
+	}
+	f := strings.Fields(string(line))
+	if len(f) != 2 {
+		return fmt.Errorf("%s: malformed", b.sum)
+	}
+	raw, err := os.ReadFile(f[1])
+	if err != nil {
+		return err
+	}
+	if sum := sha256.Sum256(raw); hex.EncodeToString(sum[:]) != f[0] {
+		return fmt.Errorf("%s: FAILED", f[1])
+	}
+	return nil
+}
+
+// recipePreRestore is h's pre-restore.d in the data root (a parent only
+// root can write), the root-only directory the recipe moves the live
+// keystore/ into.
+func recipePreRestore(h *keysHarness) string {
+	return filepath.Join(filepath.Dir(recipeFloor(h)), "pre-restore.d")
+}
+
+// restoreRecipeBackup restores b over h as the recipe does, with the saved
+// floor when withFloor is set, and returns the moved-aside keystore/. Before
+// anything moves, it refuses (an error, nothing changed) when pre-restore.d
+// or the floor's .pre-restore copy is still set aside (the ls -d check) or,
+// with the floor, when the saved floor no longer matches its SHA-256
+// (shasum -c). The live keystore/ is moved, its files untouched, into a new
+// 0700 pre-restore.d (mkdir, which fails on an existing name), and the live
+// floor aside after its test ! -e guard: neither is overwritten.
+func restoreRecipeBackup(t *testing.T, h *keysHarness, b recipeBackup, withFloor bool) (string, error) {
+	t.Helper()
+	floor := recipeFloor(h)
+	aside := filepath.Join(recipePreRestore(h), "keystore")
+	for _, p := range []string{recipePreRestore(h), floor + ".pre-restore"} {
+		if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("%s is still set aside from an earlier restore (%v)", p, err)
+		}
+	}
+	if withFloor {
+		if err := checkRecipeSum(b); err != nil {
+			return "", err
+		}
+	}
+	if err := os.Mkdir(recipePreRestore(h), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(h.keystoreDir(), aside); err != nil {
+		t.Fatal(err)
+	}
+	// test ! -e, then the root ditto into the staging directory; the merge
+	// moves it into place.
+	staged := filepath.Join(recipePreRestore(h), "restored")
+	if !withFloor {
+		// A restore without the floor never merges: the copy goes
+		// straight into place, where the floor refuses it.
+		staged = h.keystoreDir()
+	}
+	if _, err := os.Lstat(staged); !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("%s exists (%v)", staged, err)
+	}
+	copyTree(t, b.keystore, staged)
+	if withFloor {
+		if err := os.Rename(floor, floor+".pre-restore"); err != nil {
 			t.Fatal(err)
 		}
-		copyTree(t, backup, h.keystoreDir())
+		raw, err := os.ReadFile(b.floor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// install -o root -g wheel -m 0644: the owner is this test's floor
+		// owner, and the mode is set whatever the umask.
+		if err := os.WriteFile(floor, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(floor, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return aside, nil
+}
+
+// stageKeystore stages h's live keystore/ as the restore recipe leaves the
+// restored one, in a root-only pre-restore.d as restored, for a test that
+// sets the guard file up by hand: the merge moves it back into place.
+func stageKeystore(t *testing.T, h *keysHarness) {
+	t.Helper()
+	if err := os.Mkdir(recipePreRestore(h), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(h.keystoreDir(), filepath.Join(recipePreRestore(h), "restored")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// refusedDeleted fails t unless show of name is refused as a deleted entry
+// put back, printing no value.
+func refusedDeleted(t *testing.T, h *keysHarness, name string) {
+	t.Helper()
+	if code := h.run("show", name, "--reveal"); code == 0 || h.stdout.Len() != 0 || !strings.Contains(h.stderr.String(), "records as deleted") {
+		t.Fatalf("show of the copy of %s put back: exit %d, stdout %q, stderr %q; want it refused as deleted", name, code, h.stdout.String(), h.stderr.String())
+	}
+}
+
+// recipeDeletedNames is plutil -extract tombstones raw on the moved-aside
+// floor: the names it records as deleted, sorted. It runs plutil itself
+// when the host has it, and reads the same field in Go otherwise. Only
+// plutil's exact "No value at that key path" means no deletions; any other
+// failure (an unreadable or malformed file) stops the test.
+func recipeDeletedNames(t *testing.T, h *keysHarness) []string {
+	t.Helper()
+	p := recipeFloor(h) + ".pre-restore"
+	if plutil, err := exec.LookPath("plutil"); err == nil {
+		var stderr bytes.Buffer
+		cmd := exec.Command(plutil, "-extract", "tombstones", "raw", "-o", "-", p)
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			if strings.Contains(stderr.String()+string(out), "No value at that key path") {
+				return nil // no tombstones: nothing deleted
+			}
+			t.Fatalf("plutil on the moved-aside floor: %v: %s%s", err, out, stderr.String())
+		}
+		names := strings.Fields(string(out))
+		slices.Sort(names)
+		return names
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Tombstones map[string]json.RawMessage `json:"tombstones"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for n := range f.Tombstones {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// recipeLines is each line inside a fenced code block of a Markdown doc,
+// keyed by its 1-based line number.
+func recipeLines(doc string) map[int]string {
+	out := map[int]string{}
+	fenced := false
+	for i, line := range strings.Split(doc, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			fenced = !fenced
+			continue
+		}
+		if fenced {
+			out[i+1] = line
+		}
+	}
+	return out
+}
+
+// recursiveChange reports whether line runs chown, chgrp, chmod or chflags
+// with a short-option cluster holding -R.
+func recursiveChange(line string) bool {
+	fields := strings.Fields(line)
+	for i, f := range fields {
+		switch filepath.Base(f) {
+		case "chown", "chgrp", "chmod", "chflags":
+		default:
+			continue
+		}
+		for _, opt := range fields[i+1:] {
+			if !strings.HasPrefix(opt, "-") || strings.HasPrefix(opt, "--") {
+				break
+			}
+			if strings.Contains(opt, "R") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestKeysRollbackRoundTrip is G21's CLI test: the rollback recipes in
+// docs/user/keys.md run as written. A restore of a saved keystore/, with the
+// floor saved at the same moment, under the backup's name, into a directory
+// only its owner can open, brings a deleted entry back, and without the
+// floor it is refused. The restore refuses before it moves anything when a
+// .pre-restore copy is still set aside or the saved floor no longer matches
+// the SHA-256 recorded for it; an older backup keeps its own floor; the
+// names the moved-aside floor records as deleted are listed, and a revoked
+// one deleted again before start stays deleted. The undo steps, the restored
+// copies renamed first, put the live state back; and `show --version N
+// --reveal` piped into `rotate --in -` stores a version whose value equals
+// version N's byte for byte (bytes.Equal, the comparison cmp makes), for an
+// opaque and an Ed25519 entry.
+// mergedFloors is the one renamed merge input beside floor,
+// keystore-floor.json.merged-<unix>, its retired record not counted.
+func mergedFloors(t *testing.T, floor string) []string {
+	t.Helper()
+	all, err := filepath.Glob(floor + ".merged-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var merged []string
+	for _, p := range all {
+		if !strings.HasSuffix(p, ".retired") {
+			merged = append(merged, p)
+		}
+	}
+	if len(merged) != 1 {
+		t.Fatalf("the merged floor: %v; want one", merged)
+	}
+	return merged
+}
+
+func TestKeysRollbackRoundTrip(t *testing.T) {
+	// saveRmRestore saves keystore/ and the floor, rm's the entry, then
+	// restores keystore/ as the recipe does, with the saved floor when
+	// withFloor is set (the live floor moved aside first, never overwritten),
+	// and returns the entry's value and the moved-aside copy.
+	saveRmRestore := func(t *testing.T, h *keysHarness, withFloor bool) ([]byte, string) {
+		t.Helper()
+		value := []byte("rollback\x00value\n")
+		h.put("system/rb", value)
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		h.mustRun(1, "show", "system/rb", "--reveal")
+		aside, err := restoreRecipeBackup(t, h, b, withFloor)
+		if err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		return value, aside
+	}
+	t.Run("the recipe in docs/user/keys.md has these steps", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "user", "keys.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc := strings.Join(strings.Fields(string(raw)), " ")
+		steps := []string{
+			"sudo install -d -o root -g wheel -m 0755 /path/to/backup",
+			"sudo install -d -o root -g wheel -m 0700 /path/to/backup/$B",
+			"sudo ditto /var/lib/k3sm/server/keystore /path/to/backup/$B/keystore",
+			"sudo install -o root -g wheel -m 0644 /var/lib/k3sm/keystore-floor.json /var/root/keystore-floor-backup/$B/keystore-floor.json",
+			"sudo shasum -a 256 /var/root/keystore-floor-backup/$B/keystore-floor.json | sudo tee /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
+			"Never keep the saved floor on a volume that ignores ownership",
+			"sudo k3sm stop",
+			"sudo ls -d /var/lib/k3sm/pre-restore.d /var/lib/k3sm/keystore-floor.json.pre-restore",
+			"sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256",
+			// Before anything moves: the service is down, the backups'
+			// directory is root's with no group or other write, and the
+			// backup's own directory root's at mode 0700.
+			"! pgrep -u _k3sm || exit 1",
+			`test "$(sudo find /path/to/backup -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 1 || exit 1`,
+			`test "$(sudo find /path/to/backup/$B -maxdepth 0 -user root -perm 0700 | grep -c .)" -eq 1 || exit 1`,
+			"sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1",
+			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
+			"sudo test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
+			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo test ! -L /path/to/backup/$B/keystore || exit 1",
+			"sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json || exit 1",
+			"sudo k3sm keys floor merge",
+			"sudo k3sm keys rm system/<name> --yes",
+			"sudo k3sm start",
+			// The undo: the floors moved back, then the reverse merge, the
+			// restored floor as the input, so a deletion made after the
+			// restore survives the undo.
+			"sudo k3sm stop",
+			"! pgrep -u _k3sm || exit 1",
+			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1",
+			"sudo k3sm keys floor merge --undo --dry-run",
+			"sudo k3sm keys floor merge --undo",
+			"sudo rm -rf /var/lib/k3sm/pre-restore.d",
+			"sudo k3sm start",
+		}
+		at := 0
+		for _, step := range steps {
+			i := strings.Index(doc[at:], step)
+			if i < 0 {
+				t.Fatalf("docs/user/keys.md does not say %q after the step before it", step)
+			}
+			at += i + len(step)
+		}
+	})
+	// A recursive ownership, mode or flag change run as root over a tree the
+	// service user wrote follows a hard link it planted there to any inode
+	// on the volume, so no recipe line in the user docs makes one.
+	t.Run("no recipe line changes owner, mode or flags recursively", func(t *testing.T) {
+		docs, err := filepath.Glob(filepath.Join("..", "..", "docs", "user", "*.md"))
+		if err != nil || len(docs) == 0 {
+			t.Fatalf("docs/user/*.md: %v, %d files", err, len(docs))
+		}
+		for _, doc := range docs {
+			raw, err := os.ReadFile(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for n, line := range recipeLines(string(raw)) {
+				if recursiveChange(line) {
+					t.Errorf("%s: recipe line %d %q changes owner, mode or flags recursively", filepath.Base(doc), n, line)
+				}
+			}
+		}
+	})
+	t.Run("save rm restore", func(t *testing.T) {
+		h := newKeysHarness(t)
+		value, aside := saveRmRestore(t, h, true)
+		floor := recipeFloor(h)
+		// The moved-aside floor is the live one, tombstone and all.
+		if b, err := os.ReadFile(floor + ".pre-restore"); err != nil || !strings.Contains(string(b), `"tombstones":{"rb":`) {
+			t.Fatalf("moved-aside floor = %s, %v; want the live floor with rb's tombstone", b, err)
+		}
+		if got := recipeDeletedNames(t, h); !slices.Equal(got, []string{"rb"}) {
+			t.Fatalf("names the moved-aside floor records as deleted = %q, want rb", got)
+		}
+		if fi, err := os.Stat(recipePreRestore(h)); err != nil || fi.Mode().Perm() != 0o700 {
+			t.Fatalf("pre-restore.d = %v, %v; want mode 0700", fi, err)
+		}
+		if _, err := os.Lstat(h.keystoreDir()); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("keystore/ before the merge: %v, want it absent, the restored tree staged", err)
+		}
+		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/rb")
 		h.mustRun(0, "list")
 		h.mustRun(0, "show", "system/rb", "--reveal")
 		if !bytes.Equal(h.stdout.Bytes(), value) {
 			t.Fatalf("restored value = %q, want %q", h.stdout.Bytes(), value)
 		}
-		if err := os.RemoveAll(aside); err != nil {
+		if filepath.Dir(aside) != recipePreRestore(h) {
+			t.Fatalf("moved-aside keystore/ = %s, want it inside pre-restore.d", aside)
+		}
+		if fi, err := os.Stat(recipePreRestore(h)); err != nil || fi.Mode().Perm() != 0o700 {
+			t.Fatalf("pre-restore.d = %v, %v; want mode 0700", fi, err)
+		}
+		for _, p := range []string{recipePreRestore(h), floor + ".pre-restore"} {
+			if err := os.RemoveAll(p); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	// A key deleted to revoke it since the backup is deleted again by the
+	// merge, which buries the restored generation, reports it as buried
+	// live and removes its restored directory, so no rm is needed and it
+	// stays deleted.
+	t.Run("save rm restore, the revoked key buried by the merge", func(t *testing.T) {
+		h := newKeysHarness(t)
+		saveRmRestore(t, h, true)
+		h.mustRun(0, "floor", "merge")
+		if got := h.stdout.String(); !strings.Contains(got, "merged 1\nalready present 0\nburied live 1\nkept 0\nretired 0\ndropped 0\n") || !strings.Contains(got, "buried live system/rb:") {
+			t.Fatalf("floor merge printed %q, want rb buried live", got)
+		}
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "rb")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("rb's directory after the merge: %v, want it removed", err)
+		}
+		h.mustRun(1, "show", "system/rb", "--reveal")
+		if h.stdout.Len() != 0 {
+			t.Fatalf("show printed %q for the key buried by the merge", h.stdout.Bytes())
+		}
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "rb")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("rb's directory after rm: %v, want it removed", err)
+		}
+	})
+	// --keep keeps the restored generation of an entry deleted since the
+	// backup live: the entry restored on purpose.
+	t.Run("save rm restore, the key kept with --keep", func(t *testing.T) {
+		h := newKeysHarness(t)
+		value, _ := saveRmRestore(t, h, true)
+		h.mustRun(2, "floor", "merge", "--keep", "rb")
+		// A --keep name that matches nothing refuses the merge, nothing
+		// written, and the input stays for the merge run again.
+		before, err := os.ReadFile(recipeFloor(h))
+		if err != nil {
 			t.Fatal(err)
+		}
+		if code := h.run("floor", "merge", "--keep", "system/rb", "--keep", "system/typo"); code != keysRefused || !strings.Contains(h.stderr.String(), "typo") {
+			t.Fatalf("floor merge with an unmatched --keep: exit %d, stderr %q; want %d naming typo", code, h.stderr.String(), keysRefused)
+		}
+		if after, err := os.ReadFile(recipeFloor(h)); err != nil || !bytes.Equal(after, before) {
+			t.Fatalf("live floor after the refused merge = %s, %v; want it unchanged", after, err)
+		}
+		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/rb")
+		if got := h.stdout.String(); !strings.Contains(got, "merged 0\nalready present 0\nburied live 0\nkept 1\nretired 0\ndropped 0\n") || !strings.Contains(got, "kept system/rb:") {
+			t.Fatalf("floor merge --keep printed %q, want rb kept", got)
+		}
+		if got := h.stderr.String(); !strings.Contains(got, "warning: system/rb is kept live") {
+			t.Fatalf("floor merge --keep stderr %q, want the kept name warned about", got)
+		}
+		h.mustRun(0, "show", "system/rb", "--reveal")
+		if !bytes.Equal(h.stdout.Bytes(), value) {
+			t.Fatalf("kept value = %q, want %q", h.stdout.Bytes(), value)
+		}
+	})
+	// A key created after the backup and revoked before the restore is in
+	// neither the backup nor the restored floor; the merge carries its
+	// tombstone over, so its copy put back is refused.
+	t.Run("a key created and revoked after the backup stays refused", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/base", []byte("base"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		h.put("system/late", []byte("late"))
+		late := filepath.Join(t.TempDir(), "late")
+		copyTree(t, filepath.Join(h.keystoreDir(), "late"), late)
+		h.mustRun(0, "rm", "system/late", "--yes")
+		if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		h.mustRun(0, "floor", "merge")
+		if got := h.stdout.String(); !strings.HasPrefix(got, "merged 1\nalready present 0\nburied live 0\nkept 0\nretired 0\ndropped 0\n") {
+			t.Fatalf("floor merge printed %q, want late's burial merged", got)
+		}
+		copyTree(t, late, filepath.Join(h.keystoreDir(), "late"))
+		refusedDeleted(t, h, "system/late")
+		h.mustRun(0, "show", "system/base", "--reveal")
+	})
+	// N is live as G1 at the backup, deleted, then put again as G2. The
+	// restore puts G1 back, which the merge buries; G2, live in the floor
+	// moved aside, is buried too, since choosing the backup retired it, so
+	// G2's directory put back is refused.
+	t.Run("a generation put after the backup is retired by the merge", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/n", []byte("g1"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		h.mustRun(0, "rm", "system/n", "--yes")
+		h.put("system/n", []byte("g2"))
+		g2 := filepath.Join(t.TempDir(), "n")
+		copyTree(t, filepath.Join(h.keystoreDir(), "n"), g2)
+		if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		h.mustRun(0, "floor", "merge")
+		merged := h.stdout.String()
+		// The merge buried G1 live and removed its restored directory.
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "n")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("n's directory after the merge: %v, want it removed", err)
+		}
+		copyTree(t, g2, filepath.Join(h.keystoreDir(), "n"))
+		refusedDeleted(t, h, "system/n")
+		if !strings.Contains(merged, "retired 1\n") || !strings.Contains(merged, "\nretired system/n:") {
+			t.Fatalf("floor merge printed %q, want G2 retired and named", merged)
+		}
+	})
+	// --keep keeps only the restored generation: with N live as G1 at the
+	// backup, deleted and put again as G2, a merge keeping N keeps G1 live
+	// and still retires G2, so after rm N a copy of G2 put back is refused.
+	t.Run("--keep keeps only the restored generation", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/n", []byte("g1"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		h.mustRun(0, "rm", "system/n", "--yes")
+		h.put("system/n", []byte("g2"))
+		g2 := filepath.Join(t.TempDir(), "n")
+		copyTree(t, filepath.Join(h.keystoreDir(), "n"), g2)
+		if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/n")
+		if got := h.stdout.String(); !strings.Contains(got, "kept 1\nretired 1\n") || !strings.Contains(got, "\nretired system/n:") {
+			t.Fatalf("floor merge --keep printed %q, want n kept and G2 retired", got)
+		}
+		h.mustRun(0, "show", "system/n", "--reveal")
+		if got := h.stdout.String(); got != "g1" {
+			t.Fatalf("kept n = %q, want g1", got)
+		}
+		h.mustRun(0, "rm", "system/n", "--yes")
+		copyTree(t, g2, filepath.Join(h.keystoreDir(), "n"))
+		refusedDeleted(t, h, "system/n")
+	})
+	// A name with two generations buried after the backup keeps both
+	// burials through the merge: a copy of either is refused.
+	t.Run("two generations buried after the backup stay refused", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/base", []byte("base"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		var copies []string
+		for i := range 2 {
+			h.put("system/twice", []byte(fmt.Sprintf("gen %d", i)))
+			c := filepath.Join(t.TempDir(), "twice")
+			copyTree(t, filepath.Join(h.keystoreDir(), "twice"), c)
+			copies = append(copies, c)
+			h.mustRun(0, "rm", "system/twice", "--yes")
+		}
+		if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		h.mustRun(0, "floor", "merge")
+		if got := h.stdout.String(); !strings.HasPrefix(got, "merged 2\n") {
+			t.Fatalf("floor merge printed %q, want both burials merged", got)
+		}
+		for _, c := range copies {
+			copyTree(t, c, filepath.Join(h.keystoreDir(), "twice"))
+			refusedDeleted(t, h, "system/twice")
+			if err := os.RemoveAll(filepath.Join(h.keystoreDir(), "twice")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	// A .pre-restore copy left by an earlier restore is never replaced:
+	// the check refuses before anything moves.
+	t.Run("a pre-restore copy still set aside refuses", func(t *testing.T) {
+		for _, which := range []string{"keystore", "floor"} {
+			t.Run(which, func(t *testing.T) {
+				h := newKeysHarness(t)
+				h.put("system/rb", []byte("v"))
+				b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+				left := recipeFloor(h) + ".pre-restore"
+				if which == "keystore" {
+					left = recipePreRestore(h)
+				}
+				if err := os.WriteFile(left, []byte("earlier\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				live, err := os.ReadFile(recipeFloor(h))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := restoreRecipeBackup(t, h, b, true); err == nil {
+					t.Fatal("restore with a .pre-restore copy set aside went on")
+				}
+				if got, err := os.ReadFile(left); err != nil || string(got) != "earlier\n" {
+					t.Fatalf("the earlier .pre-restore copy = %q, %v; want it untouched", got, err)
+				}
+				if got, err := os.ReadFile(recipeFloor(h)); err != nil || !bytes.Equal(got, live) {
+					t.Fatalf("the live floor = %s, %v; want it untouched", got, err)
+				}
+				h.mustRun(0, "show", "system/rb", "--reveal")
+			})
+		}
+	})
+	// A saved floor changed since the save fails its SHA-256 check, and the
+	// restore stops before anything moves.
+	t.Run("a saved floor changed since the save refuses", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/rb", []byte("v"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		raw, err := os.ReadFile(b.floor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(b.floor, append(raw, ' '), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := restoreRecipeBackup(t, h, b, true); err == nil {
+			t.Fatal("restore with a changed saved floor went on")
+		}
+		if _, err := os.Lstat(recipePreRestore(h)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("keystore/ was moved aside before the check: %v", err)
+		}
+		h.mustRun(1, "show", "system/rb", "--reveal")
+	})
+	// Each backup keeps the floor saved under its name, so an older backup
+	// restores with its own floor after a newer one is saved.
+	t.Run("an older backup keeps its own floor", func(t *testing.T) {
+		h := newKeysHarness(t)
+		floorRoot := filepath.Join(t.TempDir(), "keystore-floor-backup")
+		h.put("system/rb", []byte("old"))
+		older := saveRecipeBackup(t, h, floorRoot, "2026-11-01")
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		h.put("system/other", []byte("new"))
+		newer := saveRecipeBackup(t, h, floorRoot, "2026-11-22")
+		if older.floor == newer.floor {
+			t.Fatalf("both backups saved their floor to %s", older.floor)
+		}
+		if _, err := restoreRecipeBackup(t, h, older, true); err != nil {
+			t.Fatalf("restore of the older backup: %v", err)
+		}
+		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/rb")
+		h.mustRun(0, "list")
+		h.mustRun(0, "show", "system/rb", "--reveal")
+		if got := h.stdout.String(); got != "old" {
+			t.Fatalf("restored rb = %q, want old", got)
+		}
+	})
+	// The undo steps: the restored keystore/ is renamed out of the way
+	// first, since mv onto a directory that exists moves the source inside
+	// it, then the moved-aside copy goes back; the floors swap places, the
+	// restored one becoming the guard file, and the merge runs in reverse.
+	// The live state, rb deleted, is what the CLI sees, and other, deleted
+	// after the restore, stays deleted.
+	t.Run("save rm restore, then undo", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/other", []byte("o"))
+		_, aside := saveRmRestore(t, h, true)
+		h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/rb")
+		h.mustRun(0, "rm", "system/other", "--yes")
+		floor := recipeFloor(h)
+		merged := mergedFloors(t, floor)
+		staged := filepath.Join(recipePreRestore(h), "restored")
+		if _, err := os.Lstat(staged); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("test ! -e %s: %v", staged, err)
+		}
+		for _, mv := range [][2]string{
+			{aside, staged},
+			{h.keystoreDir(), aside},
+			{merged[0], floor + ".undo"},
+			{floor, floor + ".pre-restore"},
+			{floor + ".undo", floor},
+		} {
+			if err := os.Rename(mv[0], mv[1]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		h.mustRun(0, "floor", "merge", "--undo", "--dry-run")
+		if out := h.stdout.String(); !strings.Contains(out, "buried live system/other: deleted since the restore") {
+			t.Fatalf("the reverse merge --dry-run printed %q, want other buried live, deleted since the restore", out)
+		}
+		h.mustRun(0, "floor", "merge", "--undo")
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "other")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("other's directory after the reverse merge: %v, want it removed", err)
+		}
+		h.mustRun(1, "show", "system/other", "--reveal")
+		// The merge moved the staged tree into place; the restored tree is
+		// left in pre-restore.d as keystore, and rm -rf removes it.
+		if _, err := os.Lstat(staged); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("staged tree after the reverse merge: %v, want it moved", err)
+		}
+		if err := os.RemoveAll(recipePreRestore(h)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "keystore")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("undo nested a keystore/ inside the live one: %v", err)
+		}
+		h.mustRun(0, "list")
+		h.mustRun(1, "show", "system/rb", "--reveal")
+		if b, err := os.ReadFile(floor); err != nil || !strings.Contains(string(b), `"rb":[{"generation"`) || !strings.Contains(string(b), `"other":[{"generation"`) {
+			t.Fatalf("floor after the undo = %s, %v; want the live floor with rb's tombstone and other's from after the restore", b, err)
+		}
+	})
+	// The reverse merge with --undo reads the retired record the restore's
+	// merge left: late, put after the backup and retired by the restore, is
+	// reported apart from other, deleted since the restore; --keep brings
+	// late back and is refused on other; and with no record --undo refuses.
+	t.Run("undo reports what the restore retired apart from later deletions", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/other", []byte("o"))
+		b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+		h.put("system/late", []byte("l"))
+		aside, err := restoreRecipeBackup(t, h, b, true)
+		if err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		h.mustRun(0, "floor", "merge")
+		if out := h.stdout.String(); !strings.Contains(out, "retired system/late:") {
+			t.Fatalf("the restore's merge printed %q, want late retired", out)
+		}
+		h.mustRun(0, "rm", "system/other", "--yes")
+		floor := recipeFloor(h)
+		merged := mergedFloors(t, floor)
+		staged := filepath.Join(recipePreRestore(h), "restored")
+		for _, mv := range [][2]string{
+			{aside, staged},
+			{h.keystoreDir(), aside},
+			{merged[0], floor + ".undo"},
+			{floor, floor + ".pre-restore"},
+			{floor + ".undo", floor},
+		} {
+			if err := os.Rename(mv[0], mv[1]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		record := merged[0] + ".retired"
+		if err := os.Rename(record, record+".aside"); err != nil {
+			t.Fatal(err)
+		}
+		h.mustRun(keysRefused, "floor", "merge", "--undo", "--dry-run")
+		if !strings.Contains(h.stderr.String(), "there is none") {
+			t.Fatalf("--undo with no retired record: stderr %q, want it refused for the missing record", h.stderr.String())
+		}
+		if err := os.Rename(record+".aside", record); err != nil {
+			t.Fatal(err)
+		}
+		h.mustRun(0, "floor", "merge", "--undo", "--dry-run")
+		out := h.stdout.String()
+		if !strings.Contains(out, "buried live system/late: retired by the restore: pass --keep system/late") || !strings.Contains(out, "buried live system/other: deleted since the restore: stays deleted") {
+			t.Fatalf("the reverse merge --dry-run printed %q, want late retired by the restore and other deleted since, apart", out)
+		}
+		h.mustRun(keysRefused, "floor", "merge", "--undo", "--keep", "system/other")
+		if !strings.Contains(h.stderr.String(), "deleted since the restore") {
+			t.Fatalf("--keep on other: stderr %q, want it refused as deleted since the restore", h.stderr.String())
+		}
+		h.mustRun(keysCommitted, "floor", "merge", "--undo", "--keep", "system/late")
+		h.mustRun(0, "show", "system/late", "--reveal")
+		if got := h.stdout.String(); got != "l" {
+			t.Fatalf("late after the undo = %q, want l", got)
+		}
+		if _, err := os.Lstat(filepath.Join(h.keystoreDir(), "other")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("other's directory after the reverse merge: %v, want it removed", err)
+		}
+		h.mustRun(1, "show", "system/other", "--reveal")
+	})
+	// Without its floor, the restored entry is the deleted one put back, and
+	// the floor's tombstone refuses it.
+	t.Run("save rm restore without the floor is refused", func(t *testing.T) {
+		h := newKeysHarness(t)
+		saveRmRestore(t, h, false)
+		h.mustRun(1, "list")
+		h.mustRun(1, "show", "system/rb", "--reveal")
+		if h.stdout.Len() != 0 {
+			t.Fatalf("show printed %q for a refused entry", h.stdout.Bytes())
+		}
+		if msg := h.stderr.String(); !strings.Contains(msg, "the floor records as deleted") {
+			t.Fatalf("show of an entry restored without its floor: %q, want the floor's refusal", msg)
 		}
 	})
 	seed := bytes.Repeat([]byte{0x00, 0x0a, 0xff, 0x20}, 8)
@@ -1785,6 +2527,569 @@ func TestRewrapWarnsWhenUserScopesExist(t *testing.T) {
 		h.mustRun(0, "rewrap", "--key-out", filepath.Join(t.TempDir(), "new-master"))
 		if got := strings.Count(h.stderr.String(), keystore.UserScopeRewrapWarning); got != 1 {
 			t.Fatalf("rewrap printed the user-scope warning %d times, want the closing one:\n%s", got, h.stderr.String())
+		}
+	})
+}
+
+// plantBurials sets name's tombstones in the floor file at p to n
+// generations numbered from start, at delete sequences numbered from start,
+// keeping the file's mode.
+func plantBurials(t *testing.T, p, name string, start, n int) {
+	t.Helper()
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The floor's own encoding, field for field, which parses only in the
+	// form a keys verb writes.
+	type burial struct {
+		Generation string `json:"generation"`
+		Deleted    int    `json:"deleted"`
+	}
+	var f struct {
+		Version    int                        `json:"version"`
+		Scope      string                     `json:"scope"`
+		Entries    map[string]json.RawMessage `json:"entries"`
+		Tombstones map[string][]burial        `json:"tombstones,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.Tombstones == nil {
+		f.Tombstones = map[string][]burial{}
+	}
+	var bs []burial
+	for i := range n {
+		bs = append(bs, burial{fmt.Sprintf("%032x", start+i), start + i})
+	}
+	f.Tombstones[name] = bs
+	out, err := json.Marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// keysPerNameCap is the floor's cap of buried generations a name
+// (pkg/keystore's maxBuriedPerName).
+const keysPerNameCap = 64
+
+// TestKeysEvictionExitsCommitted: rm whose floor write evicts a tombstone,
+// here at the per-name cap, deletes the entry and exits 4, the change made;
+// floor merge whose write drops a burial prints its report and exits 4 too.
+func TestKeysEvictionExitsCommitted(t *testing.T) {
+	t.Run("rm", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		plantBurials(t, recipeFloor(h), "k", 1000, keysPerNameCap)
+		if code := h.run("rm", "system/k", "--yes"); code != keysCommitted {
+			t.Fatalf("rm at the per-name cap: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		}
+		if !strings.Contains(h.stdout.String(), "deleted system/k") || !strings.Contains(h.stderr.String(), "1 tombstone(s) evicted") {
+			t.Fatalf("rm at the per-name cap printed %q, %q; want deleted and the eviction named", h.stdout.String(), h.stderr.String())
+		}
+		h.mustRun(1, "show", "system/k")
+	})
+	// rm whose burial evicts one and whose tree removal then fails (.lock
+	// replaced by a directory) deleted the entry: exit 4, not 1.
+	t.Run("rm with its tree left behind", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		plantBurials(t, recipeFloor(h), "k", 1000, keysPerNameCap)
+		lock := filepath.Join(h.keystoreDir(), ".lock")
+		if err := os.Remove(lock); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(lock, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if code := h.run("rm", "system/k", "--yes"); code != keysCommitted {
+			t.Fatalf("rm at the cap with its tree left behind: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		}
+		if !strings.Contains(h.stderr.String(), "already deleted") || !strings.Contains(h.stdout.String(), "deleted system/k") {
+			t.Fatalf("rm printed %q, %q; want deleted, and the tree left behind named", h.stdout.String(), h.stderr.String())
+		}
+	})
+	// put over a live record of another generation (a Delete interrupted
+	// before its floor write) at the per-name cap buries it and evicts the
+	// oldest: the entry is created, exit 4.
+	t.Run("put", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		plantBurials(t, recipeFloor(h), "k", 1000, keysPerNameCap)
+		if err := os.RemoveAll(filepath.Join(h.keystoreDir(), "k")); err != nil {
+			t.Fatal(err)
+		}
+		h.stdin = strings.NewReader("w")
+		if code := h.run("put", "system/k", "--in", "-"); code != keysCommitted {
+			t.Fatalf("put at the cap: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		}
+		if !strings.Contains(h.stdout.String(), "created system/k") || !strings.Contains(h.stderr.String(), "tombstone(s) evicted") {
+			t.Fatalf("put printed %q, %q; want created and the eviction named", h.stdout.String(), h.stderr.String())
+		}
+		h.mustRun(0, "show", "system/k", "--reveal")
+	})
+	t.Run("floor merge", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		h.mustRun(0, "rm", "system/k", "--yes")
+		aside := recipeFloor(h) + ".pre-restore"
+		raw, err := os.ReadFile(recipeFloor(h))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(aside, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		plantBurials(t, aside, "k", 1000, keysPerNameCap)
+		stageKeystore(t, h)
+		// Any drop refuses without --accept-drops, the restored floor's
+		// own burial included.
+		if code := h.run("floor", "merge"); code != keysRefused {
+			t.Fatalf("floor merge that drops a burial: exit %d, stderr %q; want %d", code, h.stderr.String(), keysRefused)
+		}
+		if code := h.run("floor", "merge", "--accept-drops"); code != keysCommitted {
+			t.Fatalf("floor merge --accept-drops that drops a burial: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		}
+		if got := h.stdout.String(); !strings.Contains(got, "dropped 1\n") || !strings.Contains(got, "dropped system/k:") {
+			t.Fatalf("floor merge printed %q, want the drop reported", got)
+		}
+	})
+}
+
+// TestKeysPendingMergeGuard (U192): while the restore's
+// keystore-floor.json.pre-restore is in the data root, put and rotate
+// refuse, naming keys floor merge, and list, show and rm still run, with a
+// warning on stderr (show finds nothing: the restored tree is staged until
+// the merge moves it into place); floor merge renames it to
+// keystore-floor.json.merged-<unix>, and the verbs work again.
+func TestKeysPendingMergeGuard(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	h.put("system/j", []byte("j"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	for _, args := range [][]string{
+		{"put", "system/n", "--in", "-"},
+		{"rotate", "system/k", "--in", "-"},
+	} {
+		h.stdin = strings.NewReader("value")
+		if code := h.run(args...); code != keysRefused || !strings.Contains(h.stderr.String(), "keys floor merge") {
+			t.Fatalf("%s with a merge pending: exit %d, stderr %q; want %d naming keys floor merge", args[0], code, h.stderr.String(), keysRefused)
+		}
+	}
+	h.mustRun(0, "list")
+	if !strings.Contains(h.stderr.String(), "warning: a restore is unfinished") {
+		t.Fatalf("list with a merge pending: stderr %q; want the warning", h.stderr.String())
+	}
+	// The restored tree is staged until the merge moves it into place, so
+	// show finds no entry yet, with the same warning.
+	h.mustRun(1, "show", "system/k")
+	if !strings.Contains(h.stderr.String(), "warning: a restore is unfinished") {
+		t.Fatalf("show with a merge pending: stderr %q; want the warning", h.stderr.String())
+	}
+	h.mustRun(0, "rm", "system/j", "--yes")
+	if !strings.Contains(h.stderr.String(), "warning: a restore is unfinished") {
+		t.Fatalf("rm with a merge pending: stderr %q; want the warning", h.stderr.String())
+	}
+	h.mustRun(keysCommitted, "floor", "merge", "--keep", "system/k")
+	merged := mergedFloors(t, recipeFloor(h))
+	if _, err := os.Lstat(merged[0] + ".retired"); err != nil {
+		t.Fatalf("the merge's retired record: %v, want it beside the renamed input", err)
+	}
+	if _, err := os.Lstat(recipeFloor(h) + ".pre-restore"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("keystore-floor.json.pre-restore after the merge: %v, want it renamed", err)
+	}
+	h.put("system/n", []byte("n"))
+	h.mustRun(0, "rm", "system/k", "--yes")
+}
+
+// TestKeysFloorMergeCommittedRerun (U192): a merge whose floor write landed
+// but whose rename failed (every keystore-floor.json.merged-<unix> name the
+// clock can reach during the run is taken) prints its full report and exits
+// keysNotRenamed (5), not keysCommitted, which means a burial was dropped;
+// the guard stays, and a rerun of the same input, with the
+// names freed, prints "already merged", renames the input and clears it.
+func TestKeysFloorMergeCommittedRerun(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	now := time.Now().Unix()
+	var taken []string
+	for at := now - 2; at <= now+60; at++ {
+		p := fmt.Sprintf("%s.merged-%d", recipeFloor(h), at)
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		taken = append(taken, p)
+	}
+	aside := recipeFloor(h) + ".pre-restore"
+	if code := h.run("floor", "merge"); code != 5 {
+		t.Fatalf("merge with the rename failing: exit %d, stdout %q, stderr %q; want 5", code, h.stdout.String(), h.stderr.String())
+	}
+	if out := h.stdout.String(); !strings.Contains(out, "buried live 1\n") || !strings.Contains(out, "buried live system/k:") {
+		t.Fatalf("merge with the rename failing printed %q; want the full report", out)
+	}
+	if !strings.Contains(h.stderr.String(), "run the same merge again") {
+		t.Fatalf("merge with the rename failing: stderr %q; want it to say the rerun renames it", h.stderr.String())
+	}
+	h.stdin = strings.NewReader("value")
+	if code := h.run("put", "system/n", "--in", "-"); code != keysRefused {
+		t.Fatalf("put after the failed rename: exit %d, want the guard still set", code)
+	}
+	for _, p := range taken {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.mustRun(0, "floor", "merge")
+	if !strings.Contains(h.stdout.String(), "already merged\n") {
+		t.Fatalf("the rerun printed %q; want already merged", h.stdout.String())
+	}
+	if _, err := os.Lstat(aside); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the input after the rerun: %v, want it renamed", err)
+	}
+	h.put("system/n", []byte("n"))
+}
+
+// TestKeysFloorMergeMovesPlantedAside (U192): a symlink planted at the
+// keystore directory while the restored tree is staged is reported on
+// stdout and stderr; --dry-run names where it would go and moves nothing,
+// and the merge moves it into pre-restore.d and exits 4, dry run too, so the
+// report is read.
+func TestKeysFloorMergeMovesPlantedAside(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	elsewhere := t.TempDir()
+	if err := os.Symlink(elsewhere, h.keystoreDir()); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun(keysCommitted, "floor", "merge", "--dry-run")
+	if out, errOut := h.stdout.String(), h.stderr.String(); !strings.Contains(out, "would move aside symlink "+h.keystoreDir()+" to ") || !strings.Contains(errOut, "warning: ") {
+		t.Fatalf("dry run printed %q, %q; want the move aside reported", out, errOut)
+	}
+	if fi, err := os.Lstat(h.keystoreDir()); err != nil || fi.Mode().Type() != fs.ModeSymlink {
+		t.Fatalf("keystore dir after the dry run: %v, %v; want the symlink left", fi, err)
+	}
+	h.mustRun(keysCommitted, "floor", "merge")
+	if out, errOut := h.stdout.String(), h.stderr.String(); !strings.Contains(out, "moved aside symlink "+h.keystoreDir()+" to "+recipePreRestore(h)+"/planted-") || !strings.Contains(errOut, "warning: ") {
+		t.Fatalf("merge printed %q, %q; want the move aside reported", out, errOut)
+	}
+	if names, err := os.ReadDir(elsewhere); err != nil || len(names) != 0 {
+		t.Fatalf("symlink target after the merge holds %v, %v; want nothing written through it", names, err)
+	}
+}
+
+// TestKeysFloorMergeCommittedRerunRefused (U192): a rerun after exit 5
+// finds the floor already written, so a staged tree it refuses, dry run
+// included, exits 5 with committed wording, never "Nothing is written".
+func TestKeysFloorMergeCommittedRerunRefused(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	now := time.Now().Unix()
+	for at := now - 2; at <= now+60; at++ {
+		p := fmt.Sprintf("%s.merged-%d", recipeFloor(h), at)
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Remove(p) })
+	}
+	if code := h.run("floor", "merge"); code != keysNotRenamed {
+		t.Fatalf("merge with the rename failing: exit %d, stderr %q; want %d", code, h.stderr.String(), keysNotRenamed)
+	}
+	// A tree staged again, holding a file where an entry's directory goes.
+	restored := filepath.Join(recipePreRestore(h), "restored")
+	if err := os.Mkdir(restored, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(restored, "bogus"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"floor", "merge", "--dry-run"}, {"floor", "merge"}} {
+		code := h.run(args...)
+		if errOut := h.stderr.String(); code != keysNotRenamed || !strings.Contains(errOut, "the merge is written") || strings.Contains(strings.ToLower(errOut), "nothing is written") {
+			t.Fatalf("%v after exit 5 with a misshaped staged tree: exit %d, stderr %q; want %d with committed wording", args, code, errOut, keysNotRenamed)
+		}
+	}
+}
+
+// keysEvictingRaiseStore's RaiseFloor reports a floor raise whose write
+// evicted a tombstone, as the store does after making it.
+type keysEvictingRaiseStore struct{ keysStore }
+
+func (s keysEvictingRaiseStore) RaiseFloor(ctx context.Context) error {
+	if err := s.keysStore.RaiseFloor(ctx); err != nil {
+		return err
+	}
+	return fmt.Errorf("raise the floor: %w: 1 tombstone(s) evicted", keystore.ErrTombstoneEvicted)
+}
+
+// TestKeysReadVerbsWarnEviction: list and show change nothing the operator
+// asked for, so a floor raise before them whose write evicted a tombstone
+// is a warning on stderr, and they exit 0.
+func TestKeysReadVerbsWarnEviction(t *testing.T) {
+	for _, verb := range [][]string{{"list"}, {"show", "system/k"}} {
+		t.Run(verb[0], func(t *testing.T) {
+			h := newKeysHarness(t)
+			h.put("system/k", []byte("v"))
+			h.wrap = func(s keysStore) keysStore { return keysEvictingRaiseStore{s} }
+			h.mustRun(0, verb...)
+			if got := h.stderr.String(); !strings.Contains(got, "warning") || !strings.Contains(got, "tombstone(s) evicted") {
+				t.Fatalf("%s after an evicting raise: stderr %q, want the eviction as a warning", verb[0], got)
+			}
+			if !strings.Contains(h.stdout.String(), "system/k") && verb[0] == "list" {
+				t.Fatalf("list printed %q, want the entry", h.stdout.String())
+			}
+		})
+	}
+}
+
+// TestKeysFloorMergeTakesNoFile (U192): floor merge reads only the data
+// root's keystore-floor.json.pre-restore, so naming any file, the backup's
+// saved floor or the guard file itself, is a usage error that changes
+// nothing, the guard left in place.
+func TestKeysFloorMergeTakesNoFile(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	before, err := os.ReadFile(recipeFloor(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{b.floor, recipeFloor(h) + ".pre-restore"} {
+		if code := h.run("floor", "merge", p); code != keysBadUsage || !strings.Contains(h.stderr.String(), "takes no file") {
+			t.Fatalf("floor merge %s: exit %d, stderr %q; want %d saying it takes no file", p, code, h.stderr.String(), keysBadUsage)
+		}
+	}
+	if after, _ := os.ReadFile(recipeFloor(h)); string(after) != string(before) {
+		t.Fatalf("floor after the refused merges changed: %s", after)
+	}
+	if _, err := os.Lstat(recipeFloor(h) + ".pre-restore"); err != nil {
+		t.Fatalf("the guard file after the refused merges: %v, want it in place", err)
+	}
+	h.mustRun(0, "floor", "merge")
+}
+
+// TestKeysFloorMergeAcceptDrops (U192): a merge that would drop a deletion
+// since the backup because the per-name cap binds is refused (exit 1),
+// naming the cap and --accept-drops; an rm under the guard is kept, and
+// --accept-drops writes the merge, prints each burial dropped, exits 4 and
+// clears the guard. --dry-run exits as the real run would: 1, and 4 with
+// --accept-drops.
+func TestKeysFloorMergeAcceptDrops(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	h.put("system/other", []byte("v"))
+	aside := recipeFloor(h) + ".pre-restore"
+	raw, err := os.ReadFile(recipeFloor(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aside, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plantBurials(t, aside, "k", 1000, keysPerNameCap)
+	h.mustRun(0, "rm", "system/k", "--yes")
+	stageKeystore(t, h)
+	if code := h.run("floor", "merge"); code != keysRefused || !strings.Contains(h.stderr.String(), "per-name cap") || !strings.Contains(h.stderr.String(), "--accept-drops") {
+		t.Fatalf("floor merge at the per-name cap: exit %d, stderr %q; want %d naming the cap and --accept-drops", code, h.stderr.String(), keysRefused)
+	}
+	// A dry run exits with the code the real run would.
+	if code := h.run("floor", "merge", "--dry-run"); code != keysRefused || !strings.Contains(h.stdout.String(), "dropped system/k:") {
+		t.Fatalf("floor merge --dry-run at the per-name cap: exit %d, stdout %q; want %d with the drop reported", code, h.stdout.String(), keysRefused)
+	}
+	if code := h.run("floor", "merge", "--dry-run", "--accept-drops"); code != keysCommitted || !strings.Contains(h.stdout.String(), "dropped system/k:") {
+		t.Fatalf("floor merge --dry-run --accept-drops: exit %d, stdout %q, stderr %q; want %d, as the real run", code, h.stdout.String(), h.stderr.String(), keysCommitted)
+	}
+	if code := h.run("floor", "merge", "--accept-drops"); code != keysCommitted {
+		t.Fatalf("floor merge --accept-drops: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+	}
+	if got := h.stdout.String(); !strings.Contains(got, "dropped 1\n") || !strings.Contains(got, "dropped system/k:") {
+		t.Fatalf("floor merge --accept-drops printed %q, want the drop reported", got)
+	}
+	if _, err := os.Lstat(aside); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the guard file after --accept-drops: %v, want it renamed", err)
+	}
+	h.mustRun(1, "show", "system/k")
+}
+
+// TestKeysFloorMergeDryRun (U192): floor merge --dry-run prints the full
+// report the merge would make, writes nothing and renames nothing, so the
+// guard stays; the merge run after it writes that report.
+func TestKeysFloorMergeDryRun(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/k", []byte("v"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(0, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	before, err := os.ReadFile(recipeFloor(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun(0, "floor", "merge", "--dry-run")
+	if out := h.stdout.String(); !strings.Contains(out, "dry run: nothing written\n") || !strings.Contains(out, "buried live 1\n") || !strings.Contains(out, "buried live system/k:") {
+		t.Fatalf("floor merge --dry-run printed %q, want the full report", out)
+	}
+	if after, _ := os.ReadFile(recipeFloor(h)); string(after) != string(before) {
+		t.Fatalf("floor after --dry-run changed: %s", after)
+	}
+	if _, err := os.Lstat(recipeFloor(h) + ".pre-restore"); err != nil {
+		t.Fatalf("the guard file after --dry-run: %v, want it in place", err)
+	}
+	h.mustRun(0, "floor", "merge")
+	if out := h.stdout.String(); !strings.Contains(out, "buried live system/k:") {
+		t.Fatalf("floor merge after --dry-run printed %q, want k buried live", out)
+	}
+}
+
+// TestKeysFloorMergeReportCodes (U192): floor merge exits 4 when it keeps an
+// entry with --keep or leaves one unverified (a restored pointer, or a
+// moved-aside one, that does not authenticate), as for a drop, and its dry run
+// exits as it would. A kept entry the moved-aside floor records as deleted
+// is reported "revoked, kept live" and warned of on stderr; one the restored
+// floor does not record is reported as the moved-aside version recorded,
+// with no warning. A buried-live line names --keep for an undo. A staged
+// tree holding user-scope entries exits 4 too, saying they were carried
+// over without a floor check.
+func TestKeysFloorMergeReportCodes(t *testing.T) {
+	restore := func(t *testing.T, h *keysHarness, b recipeBackup) {
+		t.Helper()
+		if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+	}
+	backup := func(t *testing.T, h *keysHarness) recipeBackup {
+		return saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	}
+	t.Run("revoked kept", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/rb", []byte("v"))
+		b := backup(t, h)
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		restore(t, h, b)
+		for _, args := range [][]string{{"floor", "merge", "--keep", "system/rb", "--dry-run"}, {"floor", "merge", "--keep", "system/rb"}} {
+			if code := h.run(args...); code != keysCommitted {
+				t.Fatalf("%v: exit %d, stderr %q; want %d", args, code, h.stderr.String(), keysCommitted)
+			}
+			if !strings.Contains(h.stdout.String(), "kept system/rb: revoked, kept live") || !strings.Contains(h.stderr.String(), "warning: system/rb is kept live") {
+				t.Fatalf("%v printed %q, %q; want rb reported revoked and kept live, and warned of", args, h.stdout.String(), h.stderr.String())
+			}
+		}
+	})
+	t.Run("recorded", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/base", []byte("base"))
+		b := backup(t, h)
+		h.put("system/late", []byte("late"))
+		restore(t, h, b)
+		if code := h.run("floor", "merge", "--keep", "system/late"); code != keysCommitted {
+			t.Fatalf("merge --keep of a name the backup lacks: exit %d, stderr %q; want %d", code, h.stderr.String(), keysCommitted)
+		}
+		if !strings.Contains(h.stdout.String(), "kept system/late: recorded the moved-aside version") || strings.Contains(h.stdout.String(), "revoked, kept live") || strings.Contains(h.stderr.String(), "warning: system/late") {
+			t.Fatalf("merge --keep printed %q, %q; want late reported as recorded, not revoked, and no warning", h.stdout.String(), h.stderr.String())
+		}
+	})
+	t.Run("unverified", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		b := backup(t, h)
+		h.put("system/x", []byte("x"))
+		h.mustRun(0, "rm", "system/x", "--yes")
+		restore(t, h, b)
+		master := filepath.Join(h.work, "cred", "keystore-master", "master")
+		if err := os.Rename(master, master+".aside"); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"floor", "merge", "--dry-run"}, {"floor", "merge"}} {
+			if code := h.run(args...); code != keysCommitted {
+				t.Fatalf("%v with no master: exit %d, stderr %q; want %d", args, code, h.stderr.String(), keysCommitted)
+			}
+			if out := h.stdout.String(); !strings.Contains(out, "unverified system/k:") || !strings.Contains(out, "refused until a rotate numbers past the fence") {
+				t.Fatalf("%v printed %q; want k unverified, saying what is refused", args, out)
+			}
+		}
+	})
+	t.Run("aside unverified", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/k", []byte("v"))
+		b := backup(t, h)
+		h.put("system/late", []byte("late"))
+		restore(t, h, b)
+		p := filepath.Join(recipePreRestore(h), "keystore", "k", "current")
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw[len(raw)-1] ^= 0xff
+		if err := os.WriteFile(p, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"floor", "merge", "--dry-run"}, {"floor", "merge"}} {
+			if code := h.run(args...); code != keysCommitted {
+				t.Fatalf("%v with the moved-aside pointer refused: exit %d, stderr %q; want %d", args, code, h.stderr.String(), keysCommitted)
+			}
+			if out := h.stdout.String(); !strings.Contains(out, "unverified system/k: the moved-aside pointer") {
+				t.Fatalf("%v printed %q; want k's moved-aside pointer unverified", args, out)
+			}
+		}
+	})
+	t.Run("buried live", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/rb", []byte("v"))
+		b := backup(t, h)
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		restore(t, h, b)
+		h.mustRun(0, "floor", "merge")
+		if out := h.stdout.String(); !strings.Contains(out, "buried live system/rb: ") || !strings.Contains(out, "removes its restored files") || strings.Contains(out, "keys rm") {
+			t.Fatalf("merge printed %q; want the buried-live line to say its files are removed, naming no rm", out)
+		}
+		if _, err := os.Lstat(filepath.Join(h.work, "keystore", "rb")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("rb's directory after the merge: %v, want it removed", err)
+		}
+	})
+	t.Run("user scoped", func(t *testing.T) {
+		h := newKeysHarness(t)
+		h.put("system/rb", []byte("v"))
+		b := backup(t, h)
+		h.mustRun(0, "rm", "system/rb", "--yes")
+		restore(t, h, b)
+		// The restored keystore holds a user scope: the merge carries it
+		// over with no floor check of its deletions.
+		if err := os.MkdirAll(filepath.Join(recipePreRestore(h), "restored", ".user", "501"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"floor", "merge", "--dry-run"}, {"floor", "merge"}} {
+			if code := h.run(args...); code != keysCommitted {
+				t.Fatalf("%v with user-scope entries staged: exit %d, stderr %q; want %d", args, code, h.stderr.String(), keysCommitted)
+			}
+			if !strings.Contains(h.stdout.String(), "user scope: ") || !strings.Contains(h.stderr.String(), "user-scope entries without a floor check") {
+				t.Fatalf("%v printed %q, %q; want the user-scope report line and the exit-4 reason", args, h.stdout.String(), h.stderr.String())
+			}
 		}
 	})
 }

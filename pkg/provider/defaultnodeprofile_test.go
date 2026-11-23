@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
@@ -159,9 +160,38 @@ func TestDefaultNodeProfileGolden(t *testing.T) {
 		t.Errorf("the default node's pod profile differs from %s; every running pod would be recreated on upgrade.\n--- got ---\n%s\n--- want ---\n%s", defaultNodeProfileGolden, got, want)
 	}
 
+	// The keystore stanza closing the profile names the state dir as well as the
+	// work dir and data root (an existence test on a keystore-named file there
+	// must not answer), so it is split off. Everything above it stays strict.
+	// runtimed exports no stanza renderer, so the stanza is checked against the
+	// roots the posture names, not against its rendering.
+	const stanzaHead = ";; KEYSTORE:"
+	split := func(profile []byte) (string, string) {
+		i := bytes.LastIndex(profile, []byte(stanzaHead))
+		if i < 0 {
+			t.Fatalf("no keystore stanza in:\n%s", profile)
+		}
+		return string(profile[:i]), string(profile[i:])
+	}
 	bare := posture
 	bare.StatusRecordDir, bare.DataRoot, bare.StateDir = "", "", ""
-	if without := render(bare); !bytes.Equal(got, without) {
-		t.Errorf("the status, data root or state dir deny added a line on a default node:\n--- with ---\n%s\n--- without ---\n%s", got, without)
+	above, stanza := split(got)
+	aboveBare, stanzaBare := split(render(bare))
+	if above != aboveBare {
+		t.Errorf("the status, data root or state dir deny added a line above the keystore stanza on a default node:\n--- with ---\n%s\n--- without ---\n%s", above, aboveBare)
+	}
+	for _, line := range strings.Split(stanzaBare, "\n") {
+		if line != "" && !strings.Contains(stanza, line+"\n") {
+			t.Errorf("the keystore stanza lost a line the work dir alone renders: %q", line)
+		}
+	}
+	for _, root := range []string{posture.WorkDir, posture.DataRoot, posture.StateDir} {
+		for _, form := range []string{root, "/private" + root, "/System/Volumes/Data/private" + root} {
+			for _, tree := range []string{"keystore-run", "keystore-sock"} {
+				if want := "(subpath \"" + filepath.Join(form, tree) + "\")\n"; !strings.Contains(stanza, want) {
+					t.Errorf("the keystore stanza lacks %s", want)
+				}
+			}
+		}
 	}
 }

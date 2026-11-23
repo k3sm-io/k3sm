@@ -413,9 +413,9 @@ func shapeOf(fi fs.FileInfo) string {
 // floor's revocation headroom through one rm.
 const maxTreeGenerations = 4
 
-// burial is the generations rm buries for one name, and the source that
+// userBurial is the generations rm buries for one name, and the source that
 // named each.
-type burial struct {
+type userBurial struct {
 	name    string
 	gens    [][generationSize]byte
 	sources []string
@@ -430,8 +430,8 @@ type burial struct {
 	capped bool
 }
 
-func newBurial(name string, live [][generationSize]byte) *burial {
-	b := &burial{name: name, floor: live}
+func newBurial(name string, live [][generationSize]byte) *userBurial {
+	b := &userBurial{name: name, floor: live}
 	for _, g := range live {
 		b.add("the floor", g)
 	}
@@ -440,7 +440,7 @@ func newBurial(name string, live [][generationSize]byte) *burial {
 
 // treeOnly is how many of gens only the tree names: neither the floor holds
 // it live nor the authenticated pointer carries it.
-func (b *burial) treeOnly() int {
+func (b *userBurial) treeOnly() int {
 	n := len(b.floor)
 	if b.authed != nil && !slices.Contains(b.floor, *b.authed) {
 		n++
@@ -451,7 +451,7 @@ func (b *burial) treeOnly() int {
 // addAuthenticated adds the generation the entry's pointer authenticates
 // under K_u. It is no tree claim, so maxTreeGenerations does not count it,
 // and the reservation covers it with the rest.
-func (b *burial) addAuthenticated(g [generationSize]byte) {
+func (b *userBurial) addAuthenticated(g [generationSize]byte) {
 	b.authed = &g
 	b.add("the authenticated pointer", g)
 }
@@ -475,7 +475,7 @@ func (u *UserScope) authenticatedGeneration(root *os.Root, e *entry) ([generatio
 	return g, ok
 }
 
-func (b *burial) add(source string, g [generationSize]byte) {
+func (b *userBurial) add(source string, g [generationSize]byte) {
 	b.sources = append(b.sources, fmt.Sprintf("%s %x", source, g[:]))
 	if !slices.Contains(b.gens, g) {
 		b.gens = append(b.gens, g)
@@ -490,7 +490,7 @@ func (b *burial) add(source string, g [generationSize]byte) {
 // Past maxTreeGenerations distinct generations beyond the floor's live ones
 // it stops reading and keeps only the floor's and the pointer header's
 // (capped).
-func (b *burial) addTree(e *entry, name string) {
+func (b *userBurial) addTree(e *entry, name string) {
 	if g, ok := headerGeneration(e.root, currentName, name, true); ok {
 		b.pointer = &g
 	}
@@ -548,7 +548,7 @@ func (b *burial) addTree(e *entry, name string) {
 // nothing written, and once any has landed the entry is revoked, so a later
 // one that fails is reported after the commit (errCommitted): the rm is
 // audited as a revocation, the tree stays, and a retry buries the rest.
-func (b *burial) bury(u *UserScope) error {
+func (b *userBurial) bury(u *UserScope) error {
 	order := b.ordered()
 	if ff, ok := u.s.userFloor.(*fileFloorLog); ok {
 		err := ff.buryAll(u.scope, b.name, order)
@@ -591,7 +591,7 @@ func (b *burial) bury(u *UserScope) error {
 // served is the generation a reader serves for the entry: the one its
 // pointer authenticates under K_u, or, with none, the pointer header's; nil
 // when neither was read.
-func (b *burial) served() *[generationSize]byte {
+func (b *userBurial) served() *[generationSize]byte {
 	if b.authed != nil {
 		return b.authed
 	}
@@ -600,7 +600,7 @@ func (b *burial) served() *[generationSize]byte {
 
 // ordered is gens with the generation a reader serves first (served), so
 // the line a reader serves is the first a burial records.
-func (b *burial) ordered() [][generationSize]byte {
+func (b *userBurial) ordered() [][generationSize]byte {
 	first := b.served()
 	if first == nil || !slices.Contains(b.gens, *first) {
 		return b.gens
@@ -617,7 +617,7 @@ func (b *burial) ordered() [][generationSize]byte {
 // landedWhat says what a partial burial whose tombstones for took landed
 // revoked: the entry, refused as deleted, when the served generation's
 // tombstone is among them, and otherwise only the generations it names.
-func (b *burial) landedWhat(took [][generationSize]byte) string {
+func (b *userBurial) landedWhat(took [][generationSize]byte) string {
 	if s := b.served(); s != nil && slices.Contains(took, *s) {
 		return "so the entry is refused as deleted"
 	}
@@ -631,7 +631,7 @@ func (b *burial) landedWhat(took [][generationSize]byte) string {
 // report is what rm reports after its commit: generations that disagree,
 // since the tree was altered. An rm with no generation to bury never
 // commits (errRmNoGeneration).
-func (b *burial) report() error {
+func (b *userBurial) report() error {
 	if b.capped {
 		return fmt.Errorf("the entry's tree named more than %d generations beyond the floor's live ones, so it was altered; rm buried the floor's live generations and the pointer header's, and removed it", maxTreeGenerations)
 	}

@@ -1,0 +1,5 @@
+go test fuzz v1
+[]byte("{\"version\":1,\"scope\":\"system\",\"entries\":{\"j\":{\"generation\":\"00000000000000000000000000000002\",\"seq\":5},\"k\":{\"generation\":\"00000000000000000000000000000001\",\"seq\":5}}}")
+[]byte("{\"version\":1,\"scope\":\"system\",\"entries\":{\"j\":{\"generation\":\"00000000000000000000000000000002\",\"seq\":9},\"k\":{\"generation\":\"00000000000000000000000000000001\",\"seq\":9}}}")
+string("")
+string("k=8,j=6")

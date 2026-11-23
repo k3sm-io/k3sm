@@ -20,20 +20,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"log/slog"
 	"strings"
 	"testing"
 )
-
-// captureWarn routes the default logger to a buffer for the test.
-func captureWarn(t *testing.T) *bytes.Buffer {
-	t.Helper()
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	return &buf
-}
 
 // A change already committed part way whose audit line then fails keeps
 // both failures: the result is still errCommitted, carries the audit

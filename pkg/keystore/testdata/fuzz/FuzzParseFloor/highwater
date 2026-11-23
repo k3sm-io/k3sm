@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"version\":1,\"scope\":\"system\",\"entries\":{\"signer-key\":{\"generation\":\"0123456789abcdef0123456789abcdef\",\"seq\":7,\"highwater\":12}}}")

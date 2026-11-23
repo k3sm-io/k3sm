@@ -68,6 +68,36 @@ func TestStateDirReachesTheRuntimeConfig(t *testing.T) {
 	}
 }
 
+// sameAboveKeystore reports whether the profiles are byte-equal above the
+// keystore stanza that closes each, and fails the test unless the stanza of with
+// denies stateDir's keystore-run and keystore-sock trees (in every firmlink
+// spelling when stateDir is under /var). The stanza is where the state dir adds
+// its own keystore denies; nothing above it may change.
+func sameAboveKeystore(t *testing.T, with, without, stateDir string) bool {
+	t.Helper()
+	split := func(profile string) (string, string) {
+		i := strings.LastIndex(profile, ";; KEYSTORE:")
+		if i < 0 {
+			t.Fatalf("no keystore stanza in:\n%s", profile)
+		}
+		return profile[:i], profile[i:]
+	}
+	above, stanza := split(with)
+	aboveWithout, _ := split(without)
+	forms := []string{stateDir}
+	if strings.HasPrefix(stateDir, "/var/") {
+		forms = append(forms, "/private"+stateDir, "/System/Volumes/Data/private"+stateDir)
+	}
+	for _, form := range forms {
+		for _, tree := range []string{"keystore-run", "keystore-sock"} {
+			if want := `(subpath "` + filepath.Join(form, tree) + `")`; !strings.Contains(stanza, want) {
+				t.Errorf("the keystore stanza lacks %s", want)
+			}
+		}
+	}
+	return above == aboveWithout
+}
+
 // TestDefaultLeafStateDirKeepsTheProfile pins the no-drift half: a work dir with
 // the default leaf names a tree the profile denies already, so a node's profile is
 // byte for byte the one it had without the field.
@@ -85,8 +115,9 @@ func TestDefaultLeafStateDirKeepsTheProfile(t *testing.T) {
 		return out
 	}
 	for _, leaf := range []string{"server", "agent"} {
-		if profile(filepath.Join(root, leaf)) != profile("") {
-			t.Errorf("a default %s leaf changed the profile, which refuses every re-attach as drift", leaf)
+		dir := filepath.Join(root, leaf)
+		if !sameAboveKeystore(t, profile(dir), profile(""), dir) {
+			t.Errorf("a default %s leaf changed the profile above the keystore stanza, which refuses every re-attach as drift", leaf)
 		}
 	}
 	if custom := profile(filepath.Join(root, "cp")); !strings.Contains(custom, `(subpath "`+root+`/cp")`) {
@@ -279,7 +310,7 @@ func TestStateDirIsCleaned(t *testing.T) {
 					t.Errorf("runtime.New would refuse %q: %v", got, err)
 				}
 				switch prof := profile(t, got); {
-				case leaf != "cp" && prof != unset:
+				case leaf != "cp" && !sameAboveKeystore(t, prof, unset, got):
 					t.Errorf("the spelling %q changed a default node's profile", spelling)
 				case leaf == "cp" && !strings.Contains(prof, `(subpath "`+want+`")`):
 					t.Errorf("the spelling %q does not deny %q", spelling, want)

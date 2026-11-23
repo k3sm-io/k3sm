@@ -99,7 +99,7 @@ func TestRmBurialReservedBeforeFirstTombstone(t *testing.T) {
 			tc.setup(l)
 			l.mu.Unlock()
 			before := readLog(t, s, userFloorLogName)
-			b := &burial{name: "gone"}
+			b := &userBurial{name: "gone"}
 			for _, g := range gens {
 				b.add("the generation file", g)
 			}

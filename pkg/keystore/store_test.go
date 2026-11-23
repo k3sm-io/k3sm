@@ -595,8 +595,8 @@ func TestDeleteDirectoryAtCurrent(t *testing.T) {
 	if err := s.Delete(ctx, "a"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if f, ok := floorOf(t, server)["a"]; ok {
-		t.Fatalf("floor entry for a after Delete = %+v, want it removed with the entry", f)
+	if f := floorOf(t, server)["a"]; len(f.burials()) == 0 {
+		t.Fatalf("floor entry for a after Delete = %+v, want it replaced by a tombstone", f)
 	}
 	if _, err := os.Lstat(filepath.Join(server, "keystore", "a")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("entry directory after Delete: %v, want it gone", err)
@@ -1309,9 +1309,19 @@ func TestEntryWithNoPointer(t *testing.T) {
 			if _, _, err := s.Get(ctx, "a", 1); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("Get: %v, want ErrNotFound", err)
 			}
-			// Delete answers ErrNotFound, since there is no entry, and still
-			// removes the directory, which may hold a sealed v1.
-			if err := s.Delete(ctx, "a"); !errors.Is(err, ErrNotFound) {
+			// Delete removes the directory, which may hold a sealed v1. With
+			// no live record for the name it answers ErrNotFound, since there
+			// is no entry; a live record (an interrupted Delete's, or one whose
+			// directory a decoy replaced) it buries, and succeeds.
+			server := filepath.Dir(filepath.Dir(dir))
+			live := floorOf(t, server)["a"]
+			err := s.Delete(ctx, "a")
+			switch {
+			case live.live() && err != nil:
+				t.Fatalf("Delete over a live record: %v, want it buried", err)
+			case live.live() && !floorOf(t, server)["a"].buries(live.Generation):
+				t.Fatalf("floor a after Delete = %+v, want %s buried", floorOf(t, server)["a"], live.Generation)
+			case !live.live() && !errors.Is(err, ErrNotFound):
 				t.Fatalf("Delete: %v, want ErrNotFound", err)
 			}
 			if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
@@ -1545,12 +1555,12 @@ func TestPutCrashAtEveryStep(t *testing.T) {
 			t.Fatal("Delete succeeded through a crash")
 		}
 		s.step = func(string) error { return nil }
-		// The floor still records the entry, so what the interrupted Delete
-		// left is a committed entry without its pointer, which a retried
-		// Delete clears, not a crashed Put that would hide the sealed v1 from
-		// rm until the next Put.
-		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, errLostPointer) {
-			t.Fatalf("Current after an interrupted Delete: %v, want the lost-pointer refusal", err)
+		// The Delete buried the entry before it removed anything, so what the
+		// interrupted Delete left is a deleted entry without its pointer,
+		// refused as deleted, which a retried Delete clears, not a crashed
+		// Put that would hide the sealed v1 from rm until the next Put.
+		if _, _, err := s.Current(ctx, "k"); !errors.Is(err, errNoPointer) || !strings.Contains(err.Error(), "records as deleted") {
+			t.Fatalf("Current after an interrupted Delete: %v, want the refusal of a deleted entry", err)
 		}
 		if _, err := s.Put(ctx, "k", KindOpaque, []byte("again")); !errors.Is(err, ErrExists) {
 			t.Fatalf("Put over an interrupted Delete: %v, want ErrExists", err)
@@ -1698,7 +1708,7 @@ func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 					swapped = true
 				}
 				var chowned []string
-				s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }
+				s.chown = chownedExceptFloorLock(&chowned)
 
 				if _, err := s.Put(ctx, "b", KindOpaque, []byte("b")); !errors.Is(err, ErrCorrupt) {
 					t.Fatalf("Put over a directory swapped in after its mkdir: %v, want ErrCorrupt", err)
@@ -1719,7 +1729,7 @@ func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 		s, server := newTestStore(t)
 		s.euid = func() int { return os.Geteuid() + 1 }
 		var chowned []string
-		s.chown = func(f *os.File, uid, gid int) error { chowned = append(chowned, f.Name()); return nil }
+		s.chown = chownedExceptFloorLock(&chowned)
 		if _, err := s.Put(ctx, "a", KindOpaque, []byte("a")); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("Put: %v, want ErrCorrupt", err)
 		}
@@ -1730,6 +1740,19 @@ func TestMkdirRefusesSwappedDirectory(t *testing.T) {
 			t.Fatalf("the refused Put went on to create cred/: %v", err)
 		}
 	})
+}
+
+// chownedExceptFloorLock is a chown seam that records each file it is asked
+// to chown in *chowned, except keystore-lock: root's own lock file, which a
+// write verb creates under the data root before it touches keystore/ (the
+// lock order), and which is never in a tree the service user controls.
+func chownedExceptFloorLock(chowned *[]string) func(f *os.File, uid, gid int) error {
+	return func(f *os.File, uid, gid int) error {
+		if filepath.Base(f.Name()) != floorLockName {
+			*chowned = append(*chowned, f.Name())
+		}
+		return nil
+	}
 }
 
 // dirContents maps each name in dir to its content.
