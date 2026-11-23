@@ -40,8 +40,8 @@ import (
 // one link, is debris of the tree being removed: its flag is cleared too
 // and the scope removed. A file root planted with a system flag (sappnd)
 // is left: the removal fails with EPERM, the error names it for reading
-// only, says a system flag is set and offers no command, and the file
-// keeps its flag.
+// only, says it carries a system flag that rm-scope clears none of,
+// offers no command and no rerun, and the file keeps its flag.
 func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 	if !asRoot() {
 		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
@@ -128,8 +128,8 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 				var st unix.Stat_t
 				if !errors.Is(err, unix.EPERM) {
 					t.Errorf("removeScopeTree over a root-owned sappnd file: %v, want EPERM", err)
-				} else if msg := err.Error(); !strings.Contains(msg, quoteName(planted)+" (named for reading, not for pasting)") || !strings.Contains(msg, "a system flag is set") || strings.Contains(msg, "sudo") || strings.Contains(msg, "chflags") {
-					t.Errorf("the error %q does not name the plant for reading only, say a system flag is set, and offer no command", msg)
+				} else {
+					checkSystemFlagKept(t, err, planted, plant)
 				}
 				if serr := unix.Lstat(planted, &st); serr != nil || st.Flags&sfAppend == 0 {
 					t.Errorf("the root-owned plant has flags %#x (%v); want sappnd kept", st.Flags, serr)
@@ -143,6 +143,40 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 				t.Fatalf("the scope directory is still there: %v", err)
 			}
 		})
+	}
+}
+
+// checkSystemFlagKept checks flagKept's text for a root-owned entry
+// planted carrying the system flag plant, as removeScopeTree returns it
+// with the scope listed: the entry named for reading only, the flag it
+// carries, its owner, that rm-scope clears no system flag and leaves it
+// (errFlagLeft, which a rerun meets again), the listed state, and no
+// command and no rerun.
+func checkSystemFlagKept(t *testing.T, err error, planted string, plant int) {
+	t.Helper()
+	if !errors.Is(err, errFlagLeft) {
+		t.Errorf("the error %v does not wrap errFlagLeft", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"remove the entry " + quoteName(planted) + " (named for reading, not for pasting)",
+		fmt.Sprintf("it carries a system flag (flags %#x)", plant),
+		"another user (uid 0) owns it",
+		"only root sets a system flag and rm-scope clears none",
+		errFlagLeft.Error(),
+		"The scope is already listed as removed, so no open serves it",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the error %q does not say %q", msg, want)
+		}
+	}
+	for _, bad := range []string{"sudo", "chflags", "rm -"} {
+		if strings.Contains(msg, bad) {
+			t.Errorf("the error %q offers a command (%q)", msg, bad)
+		}
+	}
+	if strings.Contains(strings.ToLower(msg), "rerun") {
+		t.Errorf("the error %q offers a rerun, and a rerun meets the same flag", msg)
 	}
 }
 
