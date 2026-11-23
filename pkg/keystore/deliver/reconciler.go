@@ -168,6 +168,7 @@ type Reconciler struct {
 	keystore      string
 	keystoreState string
 	heldState     string
+	heldAt        time.Time
 	// floorHeld are the entry names whose floor-held revocation was logged.
 	floorHeld map[string]bool
 	// recordState is the last logged state of a withdrawn record's entry
@@ -424,7 +425,8 @@ type sweep struct {
 	dirty bool
 
 	// recordedSecrets is the number of records at the sweep's start, the
-	// base of the revocation breaker.
+	// base of the revocation breaker: live deliveries only, since a revoked
+	// target's record is dropped with its Secret (see revokeOne).
 	recordedSecrets int
 	// keystore is the identity of the entries' directory this sweep saw, and
 	// hold why revocations are held this sweep ("" when they are not).
@@ -508,7 +510,9 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 			return
 		}
 		if r.targetState[targetKey(t)] == stateRevoked {
-			// Revoked, and the entry is still gone: nothing to say.
+			// Revoked, and the entry is still gone: nothing to say. A record
+			// a failed write left is dropped again.
+			r.dropRecord(sw, t.Namespace, t.Secret())
 			return
 		}
 	}

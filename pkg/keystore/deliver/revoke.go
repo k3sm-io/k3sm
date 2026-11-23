@@ -261,6 +261,14 @@ func (r *Reconciler) withdrawn(ctx context.Context, sw *sweep, namespace, name s
 	})
 }
 
+// dropRecord drops namespace/name's record, written at the end of the sweep.
+func (r *Reconciler) dropRecord(sw *sweep, namespace, name string) {
+	if _, ok := sw.state.owned[stateKey(namespace, name)]; ok {
+		delete(sw.state.owned, stateKey(namespace, name))
+		sw.dirty = true
+	}
+}
+
 // recordNote logs msg at Warn for the withdrawn record k once per state.
 func (r *Reconciler) recordNote(k, state, msg string, attrs ...any) {
 	if r.recordState[k] == state {
@@ -294,15 +302,13 @@ func (r *Reconciler) revokeAll(ctx context.Context, sw *sweep) {
 		}
 	}
 	if sw.hold != "" {
-		if sig := "hold:" + sw.hold + ":" + strconv.Itoa(n); r.heldState != sig {
-			r.heldState = sig
+		if r.heldLog("hold:" + sw.hold + ":" + strconv.Itoa(n)) {
 			r.logger.Warn(fmt.Sprintf("keystore delivery: %d Secrets of deleted entries are kept this sweep: %s; will retry", n, sw.hold))
 		}
 		return
 	}
 	if limit := r.revokeLimit(sw.recordedSecrets); fresh > limit {
-		if sig := "breaker:" + strconv.Itoa(fresh); r.heldState != sig {
-			r.heldState = sig
+		if r.heldLog("breaker:" + strconv.Itoa(fresh)) {
 			r.logger.Error(fmt.Sprintf("keystore delivery: %d of %d delivered Secrets' entries are gone at once, more than the %d one sweep revokes, so none is deleted; "+
 				"put the entries back if this was not meant, or delete those Secrets with kubectl", fresh, sw.recordedSecrets, limit))
 		}
@@ -313,6 +319,21 @@ func (r *Reconciler) revokeAll(ctx context.Context, sw *sweep) {
 		r.revokeOne(ctx, sw, rv)
 	}
 }
+
+// heldLog reports whether a held or tripped sweep with signature sig logs:
+// when sig differs from the last one logged, or heldRepeatEvery has passed
+// since, so a hold that lasts stays in the log.
+func (r *Reconciler) heldLog(sig string) bool {
+	if r.heldState == sig && r.now().Sub(r.heldAt) < heldRepeatEvery {
+		return false
+	}
+	r.heldState, r.heldAt = sig, r.now()
+	return true
+}
+
+// heldRepeatEvery is how often a hold or a tripped breaker logs again while
+// it lasts.
+const heldRepeatEvery = time.Hour
 
 // The states of a stuck revocation.
 const (
@@ -445,7 +466,11 @@ func (r *Reconciler) revokeOne(ctx context.Context, sw *sweep, rv revocation) {
 		return
 	}
 	if done {
+		// The record goes with the Secret: its UID matches nothing now, and
+		// a revoked record would count as a live delivery in the breaker's
+		// base. A later create records the target again.
 		r.targetState[targetKey(rv.target)] = stateRevoked
+		r.dropRecord(sw, rv.namespace, rv.secret)
 	}
 }
 

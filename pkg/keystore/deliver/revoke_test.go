@@ -19,6 +19,7 @@ package deliver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -469,6 +470,56 @@ func TestRevokeBreaker(t *testing.T) {
 	}
 	h.secret(t, "payments", "a")
 	h.secret(t, "payments", "e")
+}
+
+// TestBreakerCountsLiveDeliveriesOnly: a revoked target's record goes with
+// its Secret, so it no longer widens the breaker's limit. Sixteen delivered
+// (limit 4): four removed are deleted; of the twelve left (limit 3), four
+// more removed trip the breaker. Its Error repeats once an hour has passed,
+// not every sweep.
+func TestBreakerCountsLiveDeliveriesOnly(t *testing.T) {
+	h := newHarness(t, true, false)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.r.now = func() time.Time { return now }
+	var targets []Target
+	for i := range 16 {
+		n := fmt.Sprintf("e%02d", i)
+		h.store.set(n, 1, []byte("v-"+n))
+		targets = append(targets, Target{Entry: "system/" + n, Namespace: "payments"})
+	}
+	h.declare(t, targets...)
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	for i := range 4 {
+		h.store.rm(fmt.Sprintf("e%02d", i))
+	}
+	h.r.Sweep(ctx)
+	for i := range 4 {
+		h.gone(t, "payments", fmt.Sprintf("e%02d", i))
+	}
+	st := h.state(t)
+	if st.UID("payments", "e00") != "" {
+		t.Fatal("a revoked target's record was kept")
+	}
+	for i := 4; i < 8; i++ {
+		h.store.rm(fmt.Sprintf("e%02d", i))
+	}
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	if n := h.deletes(); n != 0 {
+		t.Fatalf("4 of 12 live deliveries gone drew %d deletes: %v", n, h.verbs())
+	}
+	const breaker = "level=ERROR msg=\"keystore delivery: 4 of 12 delivered Secrets' entries are gone at once"
+	if n := strings.Count(h.logs.String(), breaker); n != 1 {
+		t.Fatalf("got %d breaker Errors over two sweeps, want 1\n%s", n, h.logs.String())
+	}
+	now = now.Add(time.Hour)
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	if n := strings.Count(h.logs.String(), breaker); n != 2 {
+		t.Fatalf("got %d breaker Errors after an hour, want 2\n%s", n, h.logs.String())
+	}
 }
 
 // TestStuckRevocationsSkipBreaker: two stuck revocations (a Secret that is
