@@ -177,6 +177,10 @@ this run changed something, or the durability of the record is uncertain (it sav
 already listed the scope again, unchanged, and could not confirm that save reached the disk),
 and the message says what is unconfirmed or where it stopped; and 1 when it refused, or stopped
 before changing anything.
+Exit 0 means the directory at the scope's name was removed and its key is listed, so no copy of
+that scope opens again. It does not mean no other scope of that user exists: if the server's
+user moved the scope directory away before `rm-scope` ran and the server then made a new scope
+in its place, `rm-scope` removes and lists only the new one, and the moved one, put back, opens.
 When the message ends with `rerun sudo k3sm keys rm-scope user/UID --yes`, running that continues
 where it stopped. When it does not, running it again would meet the same state; the message
 names what it found, for you to read.
