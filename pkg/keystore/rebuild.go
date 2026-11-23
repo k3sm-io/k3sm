@@ -158,6 +158,12 @@ func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (Reb
 	}
 	rep.Dropped, rep.OverLong, rep.PastShare, rep.AbsentScopes, rep.RemovedKeys = old.dropped, old.overLong, old.pastShare, old.absent, old.removed
 	lines, keys := mergeFloor(old, in.disk)
+	if bound := s.floorLog().readKeyBound(); keys > bound {
+		// readOldFloorFrom holds the admitted keys to the reader's bound, so
+		// this never fires; it keeps a floor the reader would call damage
+		// from being written.
+		return rep, fmt.Errorf("%w: the new floor would hold %d keys, past the reader's key bound of %d", errRebuildRefused, keys, bound)
+	}
 	rep.Keys = keys
 	content := func(w io.Writer) error {
 		for _, l := range lines {
@@ -277,7 +283,8 @@ func (s *FileStore) readOldFloor(lfd int, in rebuildInput, removed *removedScope
 	}
 	defer o.close()
 	in.removed = removed.dropBefore(o.id)
-	return readOldFloorFrom(o.f, o.size, in, s.floorLog().keyBound(), s.floorLog().keyShare(), maxLogLine)
+	l := s.floorLog()
+	return readOldFloorFrom(o.f, o.size, in, l.keyBound(), l.readKeyBound(), l.keyShare(), maxLogLine)
 }
 
 // readOldFloorFrom reads the first size bytes of the old floor f in
@@ -302,13 +309,18 @@ func (s *FileStore) readOldFloor(lfd int, in rebuildInput, removed *removedScope
 //
 // A line over lineBound is skipped to its newline and counted, and a line
 // that does not parse and a torn last line are dropped and counted. The
-// one refusal left is rule 1 alone past keyBound; it names the scopes with
-// the most keys, and rm-scope of one is the repair. Forged tombstones for
-// a present uid can force it, and then the repair removes that uid's
-// scope. Memory is the keys and names on disk, which rebuildScopes held to
-// keyBound before this read, the admitted keys, at most keyBound, the
-// present scopes' counts and one line's buffer, whatever the file's size.
-func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, share, lineBound int) (*oldFloor, error) {
+// one refusal left is rule 1 alone past readBound, the steady-state
+// reader's key bound (keyBound plus the revocation headroom): the writer
+// takes a revocation's key into that headroom, so a floor the server can
+// read is one rebuild can carry. It names the scopes with the most keys,
+// and rm-scope of one is the repair. Forged tombstones for a present uid
+// can force it, and then the repair removes that uid's scope. Rules 2 and
+// 3 stop admitting at keyBound, so the admitted keys are at most
+// max(rule 1's, keyBound), never past readBound. Memory is the keys and
+// names on disk, which rebuildScopes held to keyBound before this read,
+// the admitted keys, at most readBound, the present scopes' counts and one
+// line's buffer, whatever the file's size.
+func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, readBound, share, lineBound int) (*oldFloor, error) {
 	o := &oldFloor{maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
 	total := len(in.disk)
 	uidKeys := map[string]int{}
@@ -357,8 +369,8 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, shar
 		case !onDisk && !admitted(r.key):
 			uidKeys[r.key.scope]++
 			total++
-			if total > keyBound {
-				return fmt.Errorf("the keys of the scopes on disk and their tombstones pass the new floor's key bound of %d, so dropping any would lower a real scope's floor or reopen a copy-back; remove a scope (sudo k3sm keys rm-scope); the scopes with the most keys: %s", keyBound, topScopes(uidKeys, 3))
+			if total > readBound {
+				return fmt.Errorf("the keys of the scopes on disk and their tombstones pass the reader's key bound of %d, so dropping any would lower a real scope's floor or reopen a copy-back; remove a scope (sudo k3sm keys rm-scope); the scopes with the most keys: %s", readBound, topScopes(uidKeys, 3))
 			}
 		}
 		take(r)

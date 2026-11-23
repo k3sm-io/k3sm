@@ -186,7 +186,7 @@ func TestOldFloorReaderAbsentFirstAppearanceOrder(t *testing.T) {
 		}
 	}
 	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{}, names: map[nameKey]bool{}, removed: map[string]int64{}}
-	o, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, 10, 4, maxLogLine)
+	o, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, 10, 10, 4, maxLogLine)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestOldFloorReaderRefusesRealScopesPastBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = readOldFloorFrom(bytes.NewReader(line), int64(len(line)), in, 6, 8, maxLogLine)
+	_, err = readOldFloorFrom(bytes.NewReader(line), int64(len(line)), in, 6, 6, 8, maxLogLine)
 	if err == nil || !strings.Contains(err.Error(), "user/1002 (4 keys)") || !strings.Contains(err.Error(), "rm-scope") {
 		t.Fatalf("readOldFloorFrom: %v, want a refusal naming user/1002 (4 keys) and rm-scope", err)
 	}
@@ -255,7 +255,7 @@ func TestOldFloorReaderAbsentLiveAfterTombstones(t *testing.T) {
 	add(tombLine(userScopeOf(7002), "t", [generationSize]byte{}))
 	read := func(bound int) map[string]int {
 		in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{}, names: map[nameKey]bool{}, removed: map[string]int64{}}
-		o, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, bound, 4, maxLogLine)
+		o, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, bound, bound, 4, maxLogLine)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -277,5 +277,111 @@ func TestOldFloorReaderAbsentLiveAfterTombstones(t *testing.T) {
 	add(floorLine(userScopeOf(7002), "l", [generationSize]byte{}, 3))
 	if got := read(1); got["user/7001 tomb"] != 1 || got["user/7002"] != 0 {
 		t.Fatalf("admitted %v, want one tombstone and no live line once a tombstone was left out", got)
+	}
+}
+
+// headroomFloor gives s a floor at the key bound holding n real tombstones
+// in the revocation headroom (of n keys): the writer's revocation path
+// buries n generations the floor lacks past the key bound. It returns the
+// buried keys.
+func headroomFloor(t *testing.T, s *FileStore, n int) []floorKey {
+	t.Helper()
+	fl := s.userFloor.(*fileFloorLog)
+	l := syncedFloor(t, s)
+	l.mu.Lock()
+	l.maxKeys, l.maxHeadroom = l.state.keys, n
+	l.mu.Unlock()
+	var buried []floorKey
+	for i := range n {
+		name := fmt.Sprintf("gone%d", i)
+		if err := fl.bury("user/1001", name, guid(0x30+byte(i))); err != nil {
+			t.Fatalf("tombstone %d in the headroom: %v", i, err)
+		}
+		buried = append(buried, floorKey{"user/1001", name, guid(0x30 + byte(i))})
+	}
+	if err := s.userFloor.check(); err != nil {
+		t.Fatalf("the floor the writer filled to the headroom reads as damage: %v", err)
+	}
+	return buried
+}
+
+// A floor the writer produced with real tombstones between the key bound
+// and the reader's key bound rebuilds and keeps every one: rule 1 is held
+// to the reader's bound, not the key bound, and the new floor reads.
+func TestRebuildKeepsTombstonesInHeadroom(t *testing.T) {
+	s, _, _ := fileLogScope(t)
+	buried := headroomFloor(t, s, 3)
+	l := s.floorLog()
+	if keys := l.keyBound() + len(buried); keys != l.readKeyBound() {
+		t.Fatalf("the floor holds %d keys, want the reader's key bound %d", keys, l.readKeyBound())
+	}
+	rep, _ := rebuild(t, s)
+	if rep.Keys != l.readKeyBound() || rep.Dropped+rep.OverLong+rep.PastShare+rep.AbsentScopes+rep.RemovedKeys != 0 {
+		t.Fatalf("rebuild report %+v, want %d keys and nothing dropped", rep, l.readKeyBound())
+	}
+	if rep.Keys > l.readKeyBound() {
+		t.Fatalf("the new floor holds %d keys, past the reader's key bound %d", rep.Keys, l.readKeyBound())
+	}
+	kept := map[floorKey]bool{}
+	for _, r := range floorRecs(t, s) {
+		if r.tomb {
+			kept[r.key] = true
+		}
+	}
+	for _, k := range buried {
+		if !kept[k] {
+			t.Fatalf("the rebuild dropped the headroom tombstone %v", k)
+		}
+	}
+	if err := s.userFloor.check(); err != nil {
+		t.Fatalf("the rebuilt floor reads as damage: %v", err)
+	}
+}
+
+// Rule 1 past the reader's key bound refuses, naming the top scopes and
+// rm-scope, and changes nothing.
+func TestRebuildRefusesPastReadKeyBound(t *testing.T) {
+	s, _, _ := fileLogScope(t)
+	headroomFloor(t, s, 3)
+	before := readLog(t, s, userFloorLogName)
+	l := s.floorLog()
+	keys := l.readKeyBound()
+	l.maxHeadroom = 2
+	bound := fmt.Sprintf("the reader's key bound of %d", l.readKeyBound())
+	top := fmt.Sprintf("user/1001 (%d keys)", keys)
+	_, err := s.RebuildFloor(context.Background(), &attrRecorder{})
+	if !errors.Is(err, errRebuildRefused) || !strings.Contains(err.Error(), bound) || !strings.Contains(err.Error(), top) || !strings.Contains(err.Error(), "rm-scope") {
+		t.Fatalf("a rebuild with rule 1 past the reader's key bound: %v, want a refusal naming %q, %s and rm-scope", err, bound, top)
+	}
+	if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
+		t.Fatal("the refused rebuild changed the floor")
+	}
+}
+
+// The admitted keys never pass the reader's key bound: with rule 1 in the
+// headroom, rules 2 and 3 admit nothing more, and with rule 1 under the key
+// bound they stop at it.
+func TestOldFloorReaderAdmitsAtMostReadBound(t *testing.T) {
+	var b bytes.Buffer
+	add := func(line []byte, err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Write(line)
+	}
+	for i := range 5 {
+		add(tombLine("user/1001", fmt.Sprintf("t%d", i), [generationSize]byte{}))
+		add(floorLine("user/1001", fmt.Sprintf("l%d", i), [generationSize]byte{}, 2))
+		add(tombLine(userScopeOf(7001), fmt.Sprintf("a%d", i), [generationSize]byte{}))
+	}
+	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{"user/1001": true}, names: map[nameKey]bool{}, removed: map[string]int64{}}
+	for _, tc := range []struct{ keyBound, readBound, want int }{{4, 6, 5}, {8, 10, 8}} {
+		o, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, tc.keyBound, tc.readBound, 100, maxLogLine)
+		if err != nil {
+			t.Fatalf("bounds %d/%d: %v", tc.keyBound, tc.readBound, err)
+		}
+		if _, keys := mergeFloor(o, in.disk); keys != tc.want || keys > tc.readBound {
+			t.Fatalf("bounds %d/%d: %d keys, want %d", tc.keyBound, tc.readBound, keys, tc.want)
+		}
 	}
 }
