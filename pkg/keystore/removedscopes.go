@@ -288,22 +288,29 @@ func (s *FileStore) readRemovedScopes(dfd int) (*removedScopes, error) {
 	return r, nil
 }
 
+// removedScopesFsync is the data root's fsync after the record's rename;
+// tests replace it to inject a failure.
+var removedScopesFsync = unix.Fsync
+
 // writeRemovedScopes writes r through the data root dfd: a temporary file,
 // created O_EXCL|O_NOFOLLOW after any leftover is unlinked, set to
 // removedScopesMode, written, fsynced, renamed over the record, and the
-// data root fsynced. Root runs it, so the file is root's.
-func writeRemovedScopes(dfd int, r *removedScopes) error {
+// data root fsynced. Root runs it, so the file is root's. renamed reports
+// whether the rename was made: a failure after it (the data root's fsync)
+// leaves the record listing r, of unknown durability, and one before it
+// leaves the record as it was.
+func writeRemovedScopes(dfd int, r *removedScopes) (renamed bool, err error) {
 	b, err := json.Marshal(r)
 	if err != nil {
-		return err
+		return false, err
 	}
 	b = append(b, '\n')
 	if err := unix.Unlinkat(dfd, removedScopesTemp, 0); err != nil && !errors.Is(err, unix.ENOENT) {
-		return fmt.Errorf("remove a leftover %s: %w", removedScopesTemp, err)
+		return false, fmt.Errorf("remove a leftover %s: %w", removedScopesTemp, err)
 	}
 	fd, err := unix.Openat(dfd, removedScopesTemp, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, removedScopesMode)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", removedScopesTemp, err)
+		return false, fmt.Errorf("create %s: %w", removedScopesTemp, err)
 	}
 	f := os.NewFile(uintptr(fd), removedScopesTemp)
 	err = unix.Fchmod(fd, removedScopesMode)
@@ -318,12 +325,15 @@ func writeRemovedScopes(dfd int, r *removedScopes) error {
 	}
 	if err != nil {
 		_ = unix.Unlinkat(dfd, removedScopesTemp, 0) // a partial temporary file is never read
-		return fmt.Errorf("write %s: %w", removedScopesTemp, err)
+		return false, fmt.Errorf("write %s: %w", removedScopesTemp, err)
 	}
 	if err := unix.Renameat(dfd, removedScopesTemp, dfd, removedScopesName); err != nil {
-		return fmt.Errorf("rename %s: %w", removedScopesTemp, err)
+		return false, fmt.Errorf("rename %s: %w", removedScopesTemp, err)
 	}
-	return unix.Fsync(dfd)
+	if err := removedScopesFsync(dfd); err != nil {
+		return true, fmt.Errorf("fsync the data root after renaming %s: %w", removedScopesName, err)
+	}
+	return true, nil
 }
 
 // checkScopeNotRemoved refuses a scope key root removed: it reads the

@@ -211,8 +211,14 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 			return RemoveScopeResult{}, fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", userFloorLogName, err)
 		}
 		if removed.add(uid, id, fid, size) {
-			if err := writeRemovedScopes(dfd, removed); err != nil {
-				return RemoveScopeResult{}, fmt.Errorf("record the removed scope %s in %s: %w; the record may or may not list it, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", u.scope, removedScopesName, err, u.scope)
+			renamed, err := writeRemovedScopes(dfd, removed)
+			if err != nil && renamed {
+				// The rename landed: the record lists the scope, as far as
+				// any later read sees, though a crash may yet lose it.
+				return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: record the removed scope %s in %s: %w; the record lists the scope but its durability is unknown, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", errCommitted, u.scope, removedScopesName, err, u.scope)
+			}
+			if err != nil {
+				return RemoveScopeResult{}, fmt.Errorf("record the removed scope %s in %s: %w; the record does not list it, and nothing was changed: rerun sudo k3sm keys rm-scope %s --yes", u.scope, removedScopesName, err, u.scope)
 			}
 			recorded, wrote = true, true
 		}

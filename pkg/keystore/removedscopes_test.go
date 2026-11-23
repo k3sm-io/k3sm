@@ -125,7 +125,7 @@ func TestRemovedScopesFullKeepsFloorKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeRemovedScopes(dfd, full); err != nil {
+	if _, err := writeRemovedScopes(dfd, full); err != nil {
 		t.Fatal(err)
 	}
 	_ = unix.Close(dfd)
@@ -255,5 +255,30 @@ func TestLogOldLocationTextNamesRestore(t *testing.T) {
 		if strings.Contains(msg, bad) {
 			t.Errorf("the text %q names %q", msg, bad)
 		}
+	}
+}
+
+// The data root's fsync after the record's rename fails (through the
+// seam): the record already lists the scope, so rm-scope stops committed
+// (exit 4, audited committed), saying the record lists it but its
+// durability is unknown, and leaves the scope directory untouched.
+func TestRmScopeRecordFsyncFailureIsCommitted(t *testing.T) {
+	s, server, _ := fileLogScope(t)
+	setSeam(t, &removedScopesFsync, func(int) error { return unix.EIO })
+	res, err := s.RemoveScope(t.Context(), 1001)
+	if !Committed(err) || !errors.Is(err, unix.EIO) {
+		t.Fatalf("rm-scope with the record's fsync failing: %v, want committed wrapping EIO", err)
+	}
+	if !res.Recorded {
+		t.Error("the result says the scope is not listed")
+	}
+	if !strings.Contains(err.Error(), "the record lists the scope but its durability is unknown") {
+		t.Errorf("the error %q does not say the record lists the scope of unknown durability", err)
+	}
+	if !readRecord(t, s).listed(1001) {
+		t.Fatal("the record does not list the scope after its rename")
+	}
+	if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeKeyName)); err != nil {
+		t.Fatalf("scope.key after a stop at the record: %v, want the directory untouched", err)
 	}
 }
