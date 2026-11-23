@@ -633,13 +633,21 @@ func (u *UserScope) openScopeKey(r record, k keys) ([]byte, error) {
 	return ku, nil
 }
 
+// errScopeKeyUntrusted marks an openScopeForRevoke whose scope directory
+// opened but whose scope.key is present and untrusted (ErrCorrupt: a
+// second link, a mode wider than 0600, content that does not parse or
+// open), all of which the service user can cause. rm-scope treats it as a
+// missing scope.key.
+var errScopeKeyUntrusted = errors.New("the scope's scope.key cannot be trusted")
+
 // openScopeForRevoke opens the scope for a revocation: a withdraw, which
 // only ever adds a tombstone. It reads no live GeneratedUID: the bound
 // generation is the one scope.key's record authenticates under W, so a
 // directory service that is slow, down, or answering for a new owner of the
 // uid never keeps a revoked credential delivered. It opens scope.key under
 // the live W or master.next's, so it runs at every step of a Rewrap, and
-// needs no entries/ directory.
+// needs no entries/ directory. A scope.key that is present but ErrCorrupt
+// is also errScopeKeyUntrusted.
 func (u *UserScope) openScopeForRevoke(root *os.Root, k keys) (*openedScope, error) {
 	dir, err := u.openScopeDir(root, false)
 	if err != nil {
@@ -652,6 +660,9 @@ func (u *UserScope) openScopeForRevoke(root *os.Root, k keys) (*openedScope, err
 	}
 	if err != nil {
 		_ = dir.Close() // read-only so far
+		if errors.Is(err, ErrCorrupt) {
+			err = fmt.Errorf("%w: %w", errScopeKeyUntrusted, err)
+		}
 		return nil, err
 	}
 	uk, err := deriveKeys(ku, u.scope)

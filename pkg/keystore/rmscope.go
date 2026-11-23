@@ -59,6 +59,9 @@ var errScopeHasDeliveries = errors.New("the scope's delivery record names delive
 // A rerun finishes an rm-scope that stopped part-way: a scope whose key is
 // already listed is removed without reading its delivery record again, and
 // a scope directory left without its scope.key is removed as it stands.
+// A scope.key that is present but cannot be trusted (errScopeKeyUntrusted)
+// is treated as a missing one: the tree is removed unlisted, its floor
+// lines are kept, and the result is errCommitted, saying so.
 func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool, err error) {
 	if err := s.checkConfig(); err != nil {
 		return false, err
@@ -93,6 +96,17 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 	name := strconv.FormatUint(uint64(uid), 10)
 	u := &UserScope{s: s, uid: uid, scope: userScopeOf(uid), allowRemoved: true}
 	o, err := u.openScopeForRevoke(root, k)
+	if errors.Is(err, errScopeKeyUntrusted) {
+		// scope.key is present but cannot be trusted, which the service
+		// user can cause: there is no key identity to list, so the scope
+		// is removed unlisted, as with no scope.key, and its floor lines
+		// are kept. Refusing would leave a scope rebuild refuses and names
+		// rm-scope for.
+		if err := removeScopeTree(root, s.dir, name, s.uid); err != nil {
+			return false, fmt.Errorf("%w; the directory %s has a scope.key that cannot be trusted and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, quoteName("keystore/"+userScopesName+"/"+name), u.scope)
+		}
+		return false, fmt.Errorf("%w: %s", errCommitted, scopeRemovedUntrusted(u.scope, err))
+	}
 	if errors.Is(err, errNoScopeKey) && scopeDirPresent(root, name) {
 		// An earlier rm-scope removed scope.key, then stopped: no open
 		// serves the directory, and there is no key to list.
@@ -184,6 +198,12 @@ func (s *FileStore) floorSize(dfd int) (floorIdentity, int64, error) {
 // directory with no scope.key whose uid the record does not list.
 func scopeRemovedUnlisted(scope string) string {
 	return "removed " + scope + " without listing it in " + removedScopesName + ", because its scope.key was absent (an interrupted earlier rm-scope, or tampering): a copy of its directory put back would open; its floor lines are kept, so the floor still refuses rolled-back or deleted entries"
+}
+
+// scopeRemovedUntrusted is rm-scope's committed report for a scope
+// directory whose scope.key was present but could not be trusted (err).
+func scopeRemovedUntrusted(scope string, err error) string {
+	return "removed " + scope + " without listing it in " + removedScopesName + ", because its scope.key could not be trusted (" + safeText(err.Error()) + "): a copy of its directory put back would open; its floor lines are kept, so the floor still refuses rolled-back or deleted entries"
 }
 
 // scopeDirPresent reports whether keystore/.user/<name> names anything.
