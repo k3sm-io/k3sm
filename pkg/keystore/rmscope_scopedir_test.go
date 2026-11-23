@@ -151,11 +151,10 @@ func TestRemoveScopeRefusesOtherDeviceScopeDir(t *testing.T) {
 	}
 	defer func() { _ = root.Close() }()
 	_, err = removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true})
-	why := "on another device than .user"
-	if asRoot() {
-		why = ""
-	}
-	checkScopeDirRefused(t, err, s, why)
+	// Root or not, the store owns the scope directory as its service uid
+	// (s.uid, the walk's svc) at 0700, so the owner rule passes and the
+	// refusal names the device (foreignWhy).
+	checkScopeDirRefused(t, err, s, "it is on another device than .user")
 	if *takes != 0 {
 		t.Errorf("rmTakeDir ran %d times, want none", *takes)
 	}
