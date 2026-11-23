@@ -40,6 +40,7 @@ func TestRemoveScopeTakesEachDirBeforeListing(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "sub", "deeper", "f"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	giveToService(t, filepath.Join(dir, "sub"), filepath.Join(dir, "sub", "deeper"), filepath.Join(dir, "sub", "deeper", "f"))
 	// The planted directories are the service user's: the test's uid.
 	type takeRec struct {
 		ino  uint64
@@ -99,6 +100,9 @@ func TestRemoveScopeTakesEachDirBeforeListing(t *testing.T) {
 // with the file inside it, and the removal fails naming it for reading
 // only, saying who owns it, with no command. Everything else is removed.
 func TestRemoveScopeLeavesForeignDir(t *testing.T) {
+	if asRoot() {
+		t.Skip("the seam's other service uid makes the store's own directories foreign as root; TestRemoveScopeLeavesForeignOwnedDirAsRoot is the root case")
+	}
 	s, server, _ := fileLogScope(t)
 	dir := scopeDir(server, "1001")
 	foreign := filepath.Join(dir, scopeEntriesName, "foreign\x1b[31m")

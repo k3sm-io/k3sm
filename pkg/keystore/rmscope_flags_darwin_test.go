@@ -345,6 +345,19 @@ func TestRemoveScopeClearsForeignFlags(t *testing.T) {
 				t.Fatal(err)
 			}
 			giveScopeTree(t, dir)
+			if asRoot() {
+				// The seam's service user is another uid than the tree's
+				// owner, so rm-scope descends only into directories root
+				// owns at 0700, as an earlier run leaves them.
+				for _, d := range []string{dir, filepath.Join(dir, scopeEntriesName), filepath.Join(dir, scopeEntriesName, "token")} {
+					if err := os.Chown(d, 0, 0); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chmod(d, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
 			setScopeFlags(t, plant, unix.UF_IMMUTABLE, false)
 			setScopeFlagsByPath(t, fifo, unix.UF_IMMUTABLE|unix.UF_NODUMP)
 			root, err := s.openDir(s.dir, false)
