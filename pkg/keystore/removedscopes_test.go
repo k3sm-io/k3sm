@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -207,5 +208,49 @@ func TestRemoveScopeMissingKeyUnlistedCommitted(t *testing.T) {
 	}
 	if readRecord(t, s).listed(1002) {
 		t.Fatal("the keyless scope was listed")
+	}
+}
+
+// The repair text names the mode the judge accepts and the service user
+// can read: a record restored at that mode reads, and opens a scope.
+func TestRemovedScopesBadNamesAcceptedMode(t *testing.T) {
+	msg := errRemovedScopesBad.Error()
+	i := strings.Index(msg, "mode 0")
+	if i < 0 || !strings.Contains(msg, "root:wheel") {
+		t.Fatalf("the repair text %q names no owner and mode", msg)
+	}
+	mode, err := strconv.ParseUint(msg[i+len("mode "):i+len("mode 0644")], 8, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode != removedScopesMode || mode&0o004 == 0 {
+		t.Fatalf("the repair text names mode %04o, want %04o, readable by the service user", mode, removedScopesMode)
+	}
+	s, _, _ := fileLogScope(t)
+	if err := os.WriteFile(removedRecordPath(s), []byte(`{"version":1,"scopes":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(removedRecordPath(s), os.FileMode(mode)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UserScope(1001); err != nil {
+		t.Fatalf("a scope under a record restored at mode %04o: %v", mode, err)
+	}
+}
+
+// A log at a location no release keeps one at is not a supported layout:
+// the text says where the logs belong and names a restore from backup,
+// never an unflag or a delete.
+func TestLogOldLocationTextNamesRestore(t *testing.T) {
+	msg := errLogOldLocation(userFloorLogName).Error()
+	for _, want := range []string{"not a supported layout", "keystore-logs/floor/", "keystore-logs/audit/", "restore the data root from a backup"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the text %q does not say %q", msg, want)
+		}
+	}
+	for _, bad := range []string{"chflags", "sudo rm", "k3sm install"} {
+		if strings.Contains(msg, bad) {
+			t.Errorf("the text %q names %q", msg, bad)
+		}
 	}
 }

@@ -725,7 +725,20 @@ func (s *FileStore) judgeLogDir(fd int, dir string) error {
 // of the data root, or directly in keystore-logs/. The logs live in their
 // own directories in keystore-logs/.
 func errLogOldLocation(name string) error {
-	return fmt.Errorf("%w: %s is at a location this build keeps no log at (the log lives in %s/%s/); clear its flag and remove it (sudo chflags nosappnd and sudo rm), then run sudo k3sm install", errLogUntrusted, name, logsDirName, logDirOf(name))
+	return fmt.Errorf("%w: %s", errLogUntrusted, oldLocationText(name, logsDirName, floorDirName, auditDirName))
+}
+
+// oldLocationText is the one text for a log at a location no release
+// keeps one at (install says it too): not a supported layout, where the
+// logs belong, and the restore that repairs it. It names no unflag or
+// delete: no release wrote that layout.
+func oldLocationText(name, logs, floor, audit string) string {
+	return name + " is at a location that is not a supported layout: the logs belong under " + logs + "/" + floor + "/ and " + logs + "/" + audit + "/; restore the data root from a backup"
+}
+
+// OldLogLocationText is oldLocationText for install.
+func OldLogLocationText(name string) string {
+	return oldLocationText(name, logsDirName, floorDirName, auditDirName)
 }
 
 // oldLogLocation reports whether the log name stands at an earlier

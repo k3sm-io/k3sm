@@ -186,7 +186,7 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 // errLogOldLocation is a log at a location no release keeps one at: the
 // top of the data root, or directly in keystore-logs/.
 func errLogOldLocation(name string) error {
-	return fmt.Errorf("%s is at a location this build keeps no log at (the log lives in %s/%s/): clear its flag and remove it (sudo chflags nosappnd, then sudo rm), then rerun sudo k3sm install: %w", name, keystore.LogsDirName, keystore.LogDirOf(name), errKeystoreFileUntrusted)
+	return fmt.Errorf("%s: %w", keystore.OldLogLocationText(name), errKeystoreFileUntrusted)
 }
 
 // lockMaintenanceFree takes keystore-lock in the data root dfd without

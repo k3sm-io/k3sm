@@ -3326,6 +3326,16 @@ service user can only add to.
   backup, then `floor --rebuild`), never `install`; and `install` refuses to create a floor
   while user scopes exist, unless root gives it an explicit flag that says it lowers the
   floor (`TestLogMissingWithScopesNamesRestore`; the install side lands with install).
+  *Residual (the guard reads through the service user's directory).* Install's "floor missing
+  while scopes exist" guard decides whether scopes exist by reading `.user` through
+  `keystore/`, which the service user owns, so that user can hide its scopes from the guard.
+  It only matters when the floor is already absent, which only root can cause: the floor's
+  directory is root's.
+- **A log at a location no release keeps one.** A log at the top of the data root, or
+  directly in `keystore-logs/`, is not a supported layout: no release wrote one there. Install
+  and the store refuse it, saying it is not a supported layout, that the logs belong under
+  `keystore-logs/floor/` and `keystore-logs/audit/`, and to restore the data root from a
+  backup. They never tell the operator to unflag or delete it.
 - **Backup and restore.** The flag does not survive `cp`, rsync or Time Machine, so a restore
   always ends with `floor --rebuild`, and `audit --rotate` swaps in a fresh flagged audit log.
   Until then
