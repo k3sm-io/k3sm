@@ -29,6 +29,7 @@ func passing() Preconditions {
 		ServiceUID:        260,
 		MaintenanceMarked: func() (bool, error) { return false, nil },
 		OpenLogs:          func(context.Context) error { return nil },
+		SandboxCheck:      func() error { return nil },
 		IgnoresOwnership:  func() (bool, error) { return false, nil },
 		CheckInstall:      func(context.Context) error { return nil },
 		ServerCount:       func(context.Context) (int, error) { return 1, nil },
@@ -60,7 +61,7 @@ func TestPreconditionsCheck(t *testing.T) {
 		{"count error", func(p *Preconditions) { p.ServerCount = func(context.Context) (int, error) { return 0, boom } }, OffServersUnknown},
 		{"sandbox check unusable", func(p *Preconditions) { p.SandboxCheck = func() error { return boom } }, OffSandboxCheckUnusable},
 		{"sandbox check panics", func(p *Preconditions) { p.SandboxCheck = func() error { panic("fake") } }, OffSandboxCheckUnusable},
-		{"sandbox check usable", func(p *Preconditions) { p.SandboxCheck = func() error { return nil } }, ""},
+		{"sandbox check missing", func(p *Preconditions) { p.SandboxCheck = nil }, OffSandboxCheckUnusable},
 		{"euid before mount", func(p *Preconditions) {
 			p.EUID = func() int { return 0 }
 			p.IgnoresOwnership = func() (bool, error) { return true, nil }

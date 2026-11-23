@@ -495,6 +495,7 @@ func userScopeChecks(mut func(*socket.Preconditions)) func() (socket.Preconditio
 			ServiceUID:        260,
 			MaintenanceMarked: func() (bool, error) { return false, nil },
 			OpenLogs:          func(context.Context) error { return nil },
+			SandboxCheck:      func() error { return nil },
 			IgnoresOwnership:  func() (bool, error) { return false, nil },
 			CheckInstall:      func(context.Context) error { return nil },
 			ServerCount:       func(context.Context) (int, error) { return 1, nil },

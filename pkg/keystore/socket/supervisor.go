@@ -137,7 +137,8 @@ type SupervisorConfig struct {
 	// recounts what is charged from the new files (Preconditions.OpenLogs);
 	// production passes (*keystore.ServerLogs).Reopen.
 	OpenLogs func(ctx context.Context) error
-	// SandboxCheck is Preconditions.SandboxCheck; nil skips it.
+	// SandboxCheck is Preconditions.SandboxCheck; production passes
+	// SandboxSelfCheck.
 	SandboxCheck func() error
 	// Creds, Sandbox, Audit and Handler are given to each run's Listener.
 	Creds   PeerCredSource
@@ -182,6 +183,8 @@ func NewSupervisor(cfg SupervisorConfig) (*Supervisor, error) {
 		missing = "maintenance marker check"
 	case cfg.OpenLogs == nil:
 		missing = "log reopen"
+	case cfg.SandboxCheck == nil:
+		missing = "sandbox self-check"
 	case cfg.Creds == nil:
 		missing = "peer-credential source"
 	case cfg.Sandbox == nil:
@@ -342,8 +345,8 @@ type Preconditions struct {
 	ServerCount func(ctx context.Context) (int, error)
 	// SandboxCheck is the start-time control on the peer-sandbox check;
 	// production passes SandboxSelfCheck. An error keeps the listener off
-	// with OffSandboxCheckUnusable. It runs before the server count; nil
-	// skips it.
+	// with OffSandboxCheckUnusable, and so does a nil one. It runs before
+	// the server count.
 	SandboxCheck func() error
 }
 
@@ -381,10 +384,11 @@ func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
 	if _, err := guard(func() (struct{}, error) { return struct{}{}, p.OpenLogs(ctx) }); err != nil {
 		return OffLogsUnavailable, err.Error()
 	}
-	if p.SandboxCheck != nil {
-		if _, err := guard(func() (struct{}, error) { return struct{}{}, p.SandboxCheck() }); err != nil {
-			return OffSandboxCheckUnusable, err.Error()
-		}
+	if p.SandboxCheck == nil {
+		return OffSandboxCheckUnusable, "no sandbox self-check"
+	}
+	if _, err := guard(func() (struct{}, error) { return struct{}{}, p.SandboxCheck() }); err != nil {
+		return OffSandboxCheckUnusable, err.Error()
 	}
 	n, err := guard(func() (int, error) { return p.ServerCount(ctx) })
 	switch {

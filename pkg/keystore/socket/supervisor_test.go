@@ -118,13 +118,14 @@ type startChecks struct {
 	mountErr   error
 	install    error
 	logsErr    error
+	sandboxErr error
 	reopens    int
 	servers    int
 	serversErr error
 	listens    int
 	counted    int
 	ln         net.Listener // what the listener source returns
-	panics     string       // the step that panics: euid, marker, mount, install, logs, count or listen
+	panics     string       // the step that panics: euid, marker, mount, install, logs, sandbox, count or listen
 }
 
 // boom panics when step is the one set to.
@@ -270,6 +271,7 @@ func (r *supRig) config() SupervisorConfig {
 			ck.boom("marker")
 			return ck.marked, ck.markerErr
 		},
+		SandboxCheck: func() error { ck.mu.Lock(); defer ck.mu.Unlock(); ck.boom("sandbox"); return ck.sandboxErr },
 		OpenLogs: func(context.Context) error {
 			ck.mu.Lock()
 			defer ck.mu.Unlock()
@@ -344,6 +346,7 @@ func TestSupervisorRequiresDependencies(t *testing.T) {
 			{"server count", func(c *SupervisorConfig) { c.ServerCount = nil }},
 			{"maintenance marker check", func(c *SupervisorConfig) { c.MaintenanceMarked = nil }},
 			{"log reopen", func(c *SupervisorConfig) { c.OpenLogs = nil }},
+			{"sandbox self-check", func(c *SupervisorConfig) { c.SandboxCheck = nil }},
 			{"peer-credential source", func(c *SupervisorConfig) { c.Creds = nil }},
 			{"peer-sandbox source", func(c *SupervisorConfig) { c.Sandbox = nil }},
 			{"refusal auditor", func(c *SupervisorConfig) { c.Audit = nil }},
@@ -710,5 +713,23 @@ func TestCheckBackoffResetsOnPassingChecks(t *testing.T) {
 		r.ck.set(func(c *startChecks) { c.install = errors.New("fake: unflagged") })
 		advance(MinBackoff)
 		r.wantState(t, PhaseOff, OffInstall, MinBackoff)
+	})
+}
+
+// TestSandboxSelfCheckKeepsListenerOff checks the supervisor runs its
+// sandbox self-check before each start and stays off while it fails.
+func TestSandboxSelfCheckKeepsListenerOff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, func(c *startChecks) { c.sandboxErr = errors.New("fake: unsandboxed self reads sandboxed") })
+		st := r.wantState(t, PhaseOff, OffSandboxCheckUnusable, MinBackoff)
+		if !strings.Contains(st.Detail, "unsandboxed self") {
+			t.Fatalf("detail %q", st.Detail)
+		}
+		if got := r.ck.get(); got.listens != 0 || got.counted != 0 {
+			t.Fatalf("source ran %d times, count %d; want neither", got.listens, got.counted)
+		}
+		r.ck.set(func(c *startChecks) { c.sandboxErr = nil })
+		advance(MinBackoff)
+		r.wantState(t, PhaseServing, "", 0)
 	})
 }

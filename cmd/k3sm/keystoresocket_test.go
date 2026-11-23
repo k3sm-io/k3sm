@@ -173,10 +173,11 @@ func newWiringFixture(t *testing.T) *wiringFixture {
 			f.sawDir = dir
 			return true, nil
 		},
-		creds:   fakePeerCreds{},
-		sandbox: fakePeerSandbox{},
-		clock:   f.clock,
-		log:     f.logger,
+		creds:        fakePeerCreds{},
+		sandbox:      fakePeerSandbox{},
+		sandboxCheck: func() error { return errFakeSandboxCheck },
+		clock:        f.clock,
+		log:          f.logger,
 	}
 	return f
 }
@@ -233,6 +234,9 @@ func TestKeystoreSocketWiring(t *testing.T) {
 		// it fails closed.
 		if err := cfg.OpenLogs(ctx); err == nil {
 			t.Error("OpenLogs succeeded with no logs to reopen; want the reopen's error")
+		}
+		if err := cfg.SandboxCheck(); !errors.Is(err, errFakeSandboxCheck) {
+			t.Errorf("SandboxCheck = %v, want the given self-check's error", err)
 		}
 		if _, ok := cfg.Creds.(fakePeerCreds); !ok {
 			t.Errorf("Creds = %T, want the given source", cfg.Creds)
@@ -294,6 +298,7 @@ func TestKeystoreSocketWiring(t *testing.T) {
 				CheckInstall:      func(context.Context) error { return nil },
 				MaintenanceMarked: func() (bool, error) { return false, nil },
 				OpenLogs:          func(context.Context) error { return nil },
+				SandboxCheck:      func() error { return nil },
 				ServerCount: func(ctx context.Context) (int, error) {
 					close(entered)
 					<-ctx.Done()
@@ -333,6 +338,9 @@ func TestKeystoreSocketWiring(t *testing.T) {
 		})
 	})
 }
+
+// errFakeSandboxCheck is the wiring fixture's sandbox self-check result.
+var errFakeSandboxCheck = errors.New("fake: sandbox self-check")
 
 type discardAuditor struct{}
 

@@ -100,11 +100,13 @@ type keystoreSocketDeps struct {
 	// supervisor's life; ignoresOwnership reads its mount flags.
 	openDataRoot     func(path string) (*os.File, error)
 	ignoresOwnership func(dir *os.File) (bool, error)
-	// creds and sandbox are the listener's peer sources.
-	creds   socket.PeerCredSource
-	sandbox socket.PeerSandboxSource
-	clock   socket.Clock
-	log     *slog.Logger
+	// creds and sandbox are the listener's peer sources; sandboxCheck is
+	// the start-time control on the sandbox source (socket.SandboxSelfCheck).
+	creds        socket.PeerCredSource
+	sandbox      socket.PeerSandboxSource
+	sandboxCheck func() error
+	clock        socket.Clock
+	log          *slog.Logger
 }
 
 // keystoreSocket is a built supervisor and what it holds open: the data-root
@@ -185,6 +187,7 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 		ServerCount:       func(ctx context.Context) (int, error) { return countKeystoreServers(ctx, cs) },
 		MaintenanceMarked: logs.MaintenanceMarked,
 		OpenLogs:          logs.Reopen,
+		SandboxCheck:      deps.sandboxCheck,
 		Creds:             deps.creds,
 		Sandbox:           deps.sandbox,
 		Audit:             audit,
@@ -245,6 +248,7 @@ func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Inte
 		ignoresOwnership: socket.DataRootIgnoresOwnership,
 		creds:            socket.KernelPeerCreds{},
 		sandbox:          socket.KernelPeerSandbox{},
+		sandboxCheck:     socket.SandboxSelfCheck,
 		clock:            wallClock{},
 		log:              logger,
 	})
@@ -300,6 +304,7 @@ func doctorKeystoreUserScope(workDir string) (socket.Preconditions, func(), erro
 		ServiceUID:        uid,
 		MaintenanceMarked: store.MaintenanceMarked,
 		OpenLogs:          store.CheckLogFlags,
+		SandboxCheck:      socket.SandboxSelfCheck,
 		IgnoresOwnership:  ignores,
 		CheckInstall:      store.CheckSocketInstall,
 		ServerCount:       count,
