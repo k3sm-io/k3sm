@@ -176,8 +176,7 @@ func TestOldFloorReaderMemoryBounded(t *testing.T) {
 	}
 }
 
-// The keys of scopes on disk, each within its share, past the key bound
-// refuse, naming the scopes with the most keys: the one refusal left.
+// The keys and tombstones of scopes on disk past the key bound refuse, naming the scopes with the most keys: the one refusal left.
 func TestOldFloorReaderRefusesTombstonesPastBound(t *testing.T) {
 	var b bytes.Buffer
 	for i := range 5 {

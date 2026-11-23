@@ -274,29 +274,33 @@ func (s *FileStore) readOldFloor(lfd int, in rebuildInput, removed *removedScope
 }
 
 // readOldFloorFrom reads the first size bytes of the old floor f in
-// streamed passes and admits its keys, in four classes
+// streamed passes and admits its keys by these rules
 // (docs/design/keystore.md § "Rebuild reads a flooded floor"):
 //
-//  1. a scope present on disk, a line whose key is on disk: every one;
-//  2. a scope present on disk, every other line (a tombstone, another
-//     generation): oldest first, up to the uid's key share, which the
-//     writer never lets a uid pass, so a real scope loses nothing; the rest
-//     is dropped and counted in pastShare;
-//  3. a scope absent from disk and not recorded as removed: per uid up to
-//     the same share, uids in first-appearance order, while the total
-//     stays under keyBound; the rest is dropped and counted in absent;
+//  1. a scope present on disk: every line whose key is on disk, and every
+//     tombstone, whatever the uid's share: the writer takes a revocation's
+//     tombstone past the share, and dropping one would reopen a copy-back;
+//  2. a scope present on disk, every other live line (another generation
+//     with no entry): oldest first, up to the uid's key share and while the
+//     total stays under keyBound; the rest is dropped and counted in
+//     pastShare;
+//  3. a scope absent from disk and not recorded as removed: its tombstones
+//     first, uids in first-appearance order, while the total stays under
+//     keyBound; then, only when every such tombstone is in, its live lines,
+//     per uid up to the share, in the same order; the rest is dropped and
+//     counted in absent;
 //  4. a scope rm-scope recorded: a line starting before its recorded floor
 //     offset is dropped and its key counted in removed; a later line is a
-//     re-minted scope's, and falls in class 1, 2 or 3.
+//     re-minted scope's, and falls in rule 1, 2 or 3.
 //
 // A line over lineBound is skipped to its newline and counted, and a line
 // that does not parse and a torn last line are dropped and counted. The
-// one refusal left is classes 1 and 2 together past keyBound (too many
-// real scopes); it names the scopes with the most keys, and rm-scope of
-// one is the repair. Memory is the keys and names on disk, which
-// rebuildScopes held to keyBound before this read, the admitted keys, at
-// most keyBound, the present scopes' counts and one line's buffer,
-// whatever the file's size.
+// one refusal left is rule 1 alone past keyBound; it names the scopes with
+// the most keys, and rm-scope of one is the repair. Forged tombstones for
+// a present uid can force it, and then the repair removes that uid's
+// scope. Memory is the keys and names on disk, which rebuildScopes held to
+// keyBound before this read, the admitted keys, at most keyBound, the
+// present scopes' counts and one line's buffer, whatever the file's size.
 func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, share, lineBound int) (*oldFloor, error) {
 	o := &oldFloor{maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
 	total := len(in.disk)
@@ -320,7 +324,7 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, shar
 			o.maxSeq[r.key] = max(o.maxSeq[r.key], r.seq)
 		}
 	}
-	// Pass 1: classes 1, 2 and 4.
+	// Pass 1: rules 1 and 4, and the lines that do not parse.
 	off, torn, err := floorLines(io.NewSectionReader(f, 0, size), lineBound, func(line []byte, start int64, lerr error) error {
 		if lerr != nil {
 			o.overLong++
@@ -340,20 +344,17 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, shar
 				}
 				o.removed++
 			}
-		case !in.present[r.key.scope]:
-			// class 3, pass 2
-		case onDisk || admitted(r.key):
-			take(r)
-		case uidKeys[r.key.scope] >= share:
-			o.pastShare++
-		default:
+			return nil
+		case !in.present[r.key.scope] || (!onDisk && !r.tomb):
+			return nil // rule 3 or 2, a later pass
+		case !onDisk && !admitted(r.key):
 			uidKeys[r.key.scope]++
 			total++
 			if total > keyBound {
-				return fmt.Errorf("the keys of the scopes on disk, each within its share, pass the new floor's key bound of %d, so dropping any would lower a real scope's floor; remove a scope (sudo k3sm keys rm-scope); the scopes with the most keys: %s", keyBound, topScopes(uidKeys, 3))
+				return fmt.Errorf("the keys of the scopes on disk and their tombstones pass the new floor's key bound of %d, so dropping any would lower a real scope's floor or reopen a copy-back; remove a scope (sudo k3sm keys rm-scope); the scopes with the most keys: %s", keyBound, topScopes(uidKeys, 3))
 			}
-			take(r)
 		}
+		take(r)
 		return nil
 	})
 	if err != nil {
@@ -362,55 +363,96 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, shar
 	if torn {
 		o.dropped++
 	}
-	// Pass 2: class 3. Holders are the absent scopes holding admitted
-	// keys, in first-appearance order; once the bound is met, an earlier
-	// scope's new key evicts one of the last holder's, so the result is the
-	// first scopes' shares, in order, whatever the interleaving.
-	type holder struct {
-		scope string
-		keys  []floorKey
-	}
-	var holders []*holder
-	held := map[string]*holder{}
-	err = floorLinesAbsent(f, off, lineBound, in, gone, func(r floorRec) {
-		if admitted(r.key) {
-			take(r)
-			return
-		}
-		h := held[r.key.scope]
+	// Pass 2: rule 2.
+	err = floorRecsIn(f, off, lineBound, func(r floorRec, start int64) {
+		_, onDisk := in.disk[r.key]
 		switch {
-		case h != nil && len(h.keys) >= share:
-			return
-		case total < keyBound:
-		case h == nil || holders[len(holders)-1] == h:
-			return
+		case gone(r.key, start) || !in.present[r.key.scope] || onDisk || r.tomb:
+		case admitted(r.key):
+			take(r)
+		case uidKeys[r.key.scope] >= share || total >= keyBound:
+			o.pastShare++
 		default:
-			last := holders[len(holders)-1]
-			ev := last.keys[len(last.keys)-1]
-			last.keys = last.keys[:len(last.keys)-1]
-			delete(o.maxSeq, ev)
-			delete(o.buried, ev)
-			total--
-			if len(last.keys) == 0 {
-				holders = holders[:len(holders)-1]
-				delete(held, last.scope)
-			}
+			uidKeys[r.key.scope]++
+			total++
+			take(r)
 		}
-		if h == nil {
-			h = &holder{scope: r.key.scope}
-			holders = append(holders, h)
-			held[r.key.scope] = h
-		}
-		h.keys = append(h.keys, r.key)
-		total++
-		take(r)
 	})
 	if err != nil {
 		return nil, err
 	}
-	// Pass 3: count the class 3 lines left out.
-	err = floorLinesAbsent(f, off, lineBound, in, gone, func(r floorRec) {
-		if !admitted(r.key) {
+	// Pass 3: rule 3. fill admits the absent scopes' lines want selects:
+	// holders are the absent scopes holding keys fill admitted, in
+	// first-appearance order; once the bound is met, an earlier scope's new
+	// key evicts one of the last holder's, so the result is the first
+	// scopes' keys, in order, whatever the interleaving. A scope holds at
+	// most limit(scope) keys. It reports whether it left any key out.
+	fill := func(want func(floorRec) bool, limit func(string) int) (map[string]int, bool, error) {
+		type holder struct {
+			scope string
+			keys  []floorKey
+		}
+		var holders []*holder
+		held := map[string]*holder{}
+		short := false
+		err := floorRecsIn(f, off, lineBound, func(r floorRec, start int64) {
+			if in.present[r.key.scope] || gone(r.key, start) || !want(r) {
+				return
+			}
+			if admitted(r.key) {
+				take(r)
+				return
+			}
+			h := held[r.key.scope]
+			switch {
+			case h != nil && len(h.keys) >= limit(r.key.scope):
+				short = true
+				return
+			case total < keyBound:
+			case h == nil || holders[len(holders)-1] == h:
+				short = true
+				return
+			default:
+				last := holders[len(holders)-1]
+				ev := last.keys[len(last.keys)-1]
+				last.keys = last.keys[:len(last.keys)-1]
+				delete(o.maxSeq, ev)
+				delete(o.buried, ev)
+				total--
+				short = true
+				if len(last.keys) == 0 {
+					holders = holders[:len(holders)-1]
+					delete(held, last.scope)
+				}
+			}
+			if h == nil {
+				h = &holder{scope: r.key.scope}
+				holders = append(holders, h)
+				held[r.key.scope] = h
+			}
+			h.keys = append(h.keys, r.key)
+			total++
+			take(r)
+		})
+		count := make(map[string]int, len(holders))
+		for _, h := range holders {
+			count[h.scope] = len(h.keys)
+		}
+		return count, short, err
+	}
+	tombs, short, err := fill(func(r floorRec) bool { return r.tomb }, func(string) int { return keyBound })
+	if err != nil {
+		return nil, err
+	}
+	if !short {
+		_, _, err = fill(func(r floorRec) bool { return !r.tomb }, func(sc string) int { return max(share-tombs[sc], 0) })
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Pass 4: count the rule 3 lines left out.
+	err = floorRecsIn(f, off, lineBound, func(r floorRec, start int64) {
+		if !in.present[r.key.scope] && !gone(r.key, start) && !admitted(r.key) {
 			o.absent++
 		}
 	})
@@ -420,18 +462,16 @@ func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, shar
 	return o, nil
 }
 
-// floorLinesAbsent streams the first off bytes of f and calls fn with each
-// parsed line of a scope absent from disk that is not dropped as removed.
-func floorLinesAbsent(f io.ReaderAt, off int64, lineBound int, in rebuildInput, gone func(floorKey, int64) bool, fn func(floorRec)) error {
+// floorRecsIn streams the first off bytes of f and calls fn with each line
+// that parses and the offset it starts at.
+func floorRecsIn(f io.ReaderAt, off int64, lineBound int, fn func(floorRec, int64)) error {
 	_, _, err := floorLines(io.NewSectionReader(f, 0, off), lineBound, func(line []byte, start int64, lerr error) error {
 		if lerr != nil {
 			return nil
 		}
-		r, err := parseFloorLine(line)
-		if err != nil || in.present[r.key.scope] || gone(r.key, start) {
-			return nil
+		if r, err := parseFloorLine(line); err == nil {
+			fn(r, start)
 		}
-		fn(r)
 		return nil
 	})
 	return err

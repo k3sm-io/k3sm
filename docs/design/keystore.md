@@ -2638,33 +2638,39 @@ service user can only add to.
   buffer of the per-line bound (1 KiB), and its memory is the admitted keys, at most the key
   bound, plus that buffer, whatever the file's size. A line over the per-line bound is skipped
   to its newline and counted; a line that does not parse is dropped and counted. It reads the
-  floor in passes and admits its lines in four classes: (1) for a scope present on disk, the
-  lines whose key is on disk, all of them; (2) for a scope present on disk, every other line
-  (its tombstones, other generations), oldest first, up to the uid's lifetime key share, the
-  per-uid share the writer already enforces (`uidKeyShare`, 4,112 keys), so a real scope,
-  whose lines the writer never let past it, loses nothing; the excess is dropped and counted
-  as "past the uid's share"; (3) for a scope absent from disk and not recorded as removed,
-  per uid up to the same share, uids in first-appearance order, while the total stays under
-  the key bound; the rest is dropped and counted as "absent scopes"; (4) for a scope root
-  removed and recorded, its lines before the recorded offset are dropped ("Rebuild drops a
-  removed scope's keys"), and later lines, a re-minted scope's, fall in (1) to (3). Any drop
-  exits 4 with the counts by class. The one refusal left is classes (1) and (2) together
-  passing the key bound, too many real scopes: rebuild refuses, changing nothing, names the
-  scopes with the most keys, and `rm-scope` of one is the repair. Rebuild bounds what it
-  collects from disk the same way: while it walks the scopes (a walk bounded by the listing
-  bound of `.user/`), it checks the keys and entry names it has collected against the key
-  bound, stops once they pass it, and refuses before reading the old floor, naming the scopes
-  with the most entries, so its memory is the key bound's whatever the tree holds.
+  floor in passes and admits its lines by four rules: (1) for a scope present on disk, every
+  line whose key is on disk, and every tombstone, whatever the uid's share: the writer takes a
+  revocation's tombstone past the per-uid share (only the global bound is checked then), so a
+  real scope's tombstones can lie past its share, and dropping one would reopen a copy-back;
+  (2) for a scope present on disk, its other live lines (other generations with no entry),
+  oldest first, up to the uid's lifetime key share (`uidKeyShare`, 4,112 keys) and while the
+  total stays under the key bound; the excess is dropped and counted as "past the uid's
+  share"; (3) for a scope absent from disk and not recorded as removed, its tombstones first,
+  uids in first-appearance order, while the total stays under the key bound; then, only once
+  every tombstone of every absent uid is in, their live lines, per uid up to the share, in the
+  same order; the rest is dropped and counted as "absent scopes"; (4) for a scope root removed
+  and recorded, its lines before the recorded offset are dropped ("Rebuild drops a removed
+  scope's keys"), and later lines, a re-minted scope's, fall under (1) to (3). Any drop exits
+  4 with the counts by class. The one refusal left is rule (1) alone passing the key bound:
+  rebuild refuses, changing nothing, names the scopes with the most keys, and `rm-scope` of
+  one is the repair, which works whatever the scope's delivery record holds once it does not
+  name a delivery, and also when that record does not read ("rm-scope revokes first"). Rebuild
+  bounds what it collects from disk the same way: while it walks the scopes (a walk bounded by
+  the listing bound of `.user/`), it checks the keys and entry names it has collected against
+  the key bound, stops once they pass it, and refuses before reading the old floor, naming the
+  scopes with the most entries, so its memory is the key bound's whatever the tree holds.
   *Residual (forged lines).*
-  Floor lines are CRC-checked only, so the service user can write any line. It can no longer
-  block the rebuild with them: forged lines of absent uids are held to a share each and to the
-  key bound, and forged lines of a real uid to that uid's share. What it can still do: fill
-  the room absent scopes may take, so an absent scope's real tombstones (a directory deleted
-  by hand, a record full) can be dropped behind forged uids that appear earlier in the file,
-  and a copy of that scope put back is then served at what is on disk; and spend a real
-  uid's share with forged keys, which the writer already charges to that uid, so its later
-  grants are refused (the self-lockout of "Per-uid fairness"); every line the writer accepted
-  for a real uid is within its share, so rebuild drops none of them.
+  Floor lines are CRC-checked only, so the service user can write any line. Forged live lines
+  of a real uid are held to that uid's share, and forged lines of absent uids to the key
+  bound. What it can still do: fill the room absent scopes may take, so an absent scope's real
+  tombstones (a directory deleted by hand, a record full) can be dropped behind forged
+  tombstones of uids that appear earlier in the file, and a copy of that scope put back is
+  then served at what is on disk; spend a real uid's share with forged keys, which the writer
+  already charges to that uid, so its later grants are refused (the self-lockout of "Per-uid
+  fairness"); and, since a present scope's tombstones are never dropped, write forged
+  tombstones for a present uid past the key bound, which forces the one refusal; its repair,
+  `rm-scope` of the scope it names, removes that uid's scope. Rebuild never drops a tombstone
+  of a scope present on disk.
 - **Rebuild drops a removed scope's keys.** Once root has removed a user scope with
   `rm-scope`, which lists the scope key's identity in `keystore-removed-scopes.json` with the
   floor's byte size at that moment and then deletes the scope directory, `floor --rebuild`

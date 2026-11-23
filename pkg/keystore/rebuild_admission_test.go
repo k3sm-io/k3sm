@@ -78,16 +78,16 @@ func TestRebuildForgedAbsentTombstoneFlood(t *testing.T) {
 	assertRealKept(t, s, token, gone)
 }
 
-// A flood of forged tombstones for one real uid is trimmed to the uid's
-// share, oldest first: its real lines, older, are kept, and the excess is
-// counted as past the share.
-func TestRebuildForgedFloodOneRealUIDTrimmed(t *testing.T) {
+// A flood of forged live lines for one real uid, other generations with
+// no entry, is trimmed to the uid's share, oldest first: its real lines,
+// older, are kept, and the excess is counted as past the share.
+func TestRebuildForgedLiveFloodOneRealUIDTrimmed(t *testing.T) {
 	s, server, u := fileLogScope(t)
 	token, gone := realLines(t, s, server, u)
 	var flood bytes.Buffer
 	const forged = 100
 	for i := range forged {
-		line, err := tombLine("user/1001", fmt.Sprintf("t%d", i), [generationSize]byte{byte(i)})
+		line, err := floorLine("user/1001", fmt.Sprintf("t%d", i), [generationSize]byte{byte(i)}, 7)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,9 +104,76 @@ func TestRebuildForgedFloodOneRealUIDTrimmed(t *testing.T) {
 	assertRealKept(t, s, token, gone)
 }
 
-// Absent scopes are admitted in first-appearance order: the first uid
-// seen gets its whole share whatever the interleaving, and the last only
-// what is left.
+// A tombstone the writer took past the uid's share, as it takes a
+// revocation's, survives the rebuild: dropping it would reopen a
+// copy-back of the deleted entry.
+func TestRebuildKeepsRevocationTombstonePastShare(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := fileLogScope(t)
+	for i := range 4 {
+		userPut(t, u, fmt.Sprintf("user/1001/e%d", i), "v")
+	}
+	gone := entryGen(t, server, "1001", "e0")
+	l := syncedFloor(t, s)
+	l.mu.Lock()
+	l.maxShare = l.state.uidKeys[1001]
+	l.mu.Unlock()
+	if err := u.Delete(ctx, "user/1001/e0"); err != nil {
+		t.Fatalf("rm at the share: %v, want the revocation path to take it", err)
+	}
+	// The scope's keys on disk alone fill the share at rebuild.
+	s.floorLog().maxKeys, s.floorLog().maxShare = 1000, 2
+	rep, _ := rebuild(t, s)
+	kept := false
+	for _, r := range floorRecs(t, s) {
+		kept = kept || (r.key.scope == "user/1001" && r.key.name == "e0" && r.key.gen == gone && r.tomb)
+	}
+	if !kept || rep.PastShare != 0 {
+		t.Fatalf("the rebuild kept the tombstone past the share: %v, %d past the share; want it kept and 0", kept, rep.PastShare)
+	}
+}
+
+// A flood of forged tombstones for a present uid is never trimmed: past
+// the key bound it ends in the one refusal, naming the uid's scope, and
+// rm-scope of that scope lets the rebuild run.
+func TestRebuildForgedTombstoneFloodPresentUIDRefusesThenRmScope(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := fileLogScope(t)
+	token, gone := realLines(t, s, server, u)
+	v := userScope(t, s, 1002)
+	userPut(t, v, "user/1002/x", "x")
+	var flood bytes.Buffer
+	const forged = 40
+	for i := range forged {
+		line, err := tombLine("user/1002", fmt.Sprintf("t%d", i), [generationSize]byte{byte(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		flood.Write(line)
+	}
+	appendLogBytes(t, s, userFloorLogName, flood.Bytes())
+	s.floorLog().maxKeys, s.floorLog().maxShare = 20, 4
+	before := readLog(t, s, userFloorLogName)
+	_, err := s.RebuildFloor(ctx, &attrRecorder{})
+	if !errors.Is(err, errRebuildRefused) || !strings.Contains(err.Error(), "the scopes with the most keys: user/1002") || !strings.Contains(err.Error(), "rm-scope") {
+		t.Fatalf("a rebuild under a forged tombstone flood: %v, want the refusal naming user/1002 and rm-scope", err)
+	}
+	if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
+		t.Fatal("the refused rebuild changed the floor")
+	}
+	if recorded, err := s.RemoveScope(ctx, 1002); err != nil || !recorded {
+		t.Fatalf("rm-scope user/1002: %v, %v", recorded, err)
+	}
+	rep, _ := rebuild(t, s)
+	if rep.RemovedKeys == 0 {
+		t.Fatalf("the rebuild after rm-scope dropped no removed keys: %+v", rep)
+	}
+	assertRealKept(t, s, token, gone)
+}
+
+// Absent scopes' tombstones are admitted in first-appearance order, with
+// no share: the first uid seen gets all of its tombstones whatever the
+// interleaving, and the next only what the key bound leaves.
 func TestOldFloorReaderAbsentFirstAppearanceOrder(t *testing.T) {
 	var b bytes.Buffer
 	for i := range 6 {
@@ -127,8 +194,8 @@ func TestOldFloorReaderAbsentFirstAppearanceOrder(t *testing.T) {
 	for k := range o.buried {
 		count[k.scope]++
 	}
-	if count["user/7001"] != 4 || count["user/7002"] != 4 || count["user/7003"] != 2 || o.absent != 18-10 {
-		t.Fatalf("admitted %v, %d absent, want 4, 4, 2 and 8", count, o.absent)
+	if count["user/7001"] != 6 || count["user/7002"] != 4 || count["user/7003"] != 0 || o.absent != 18-10 {
+		t.Fatalf("admitted %v, %d absent, want 6, 4, 0 and 8", count, o.absent)
 	}
 }
 
@@ -167,5 +234,48 @@ func TestRebuildRefusesDiskPastBound(t *testing.T) {
 	}
 	if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
 		t.Fatal("the refused rebuild changed the floor")
+	}
+}
+
+// Absent scopes' live lines come only after every absent tombstone is in,
+// per uid up to the share less its tombstones, in first-appearance order;
+// with a tombstone left out, no absent live line is admitted.
+func TestOldFloorReaderAbsentLiveAfterTombstones(t *testing.T) {
+	var b bytes.Buffer
+	add := func(line []byte, err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Write(line)
+	}
+	for i := range 6 {
+		add(floorLine(userScopeOf(7001), fmt.Sprintf("l%d", i), [generationSize]byte{}, 3))
+		add(floorLine(userScopeOf(7002), fmt.Sprintf("l%d", i), [generationSize]byte{}, 3))
+	}
+	add(tombLine(userScopeOf(7002), "t", [generationSize]byte{}))
+	read := func(bound int) map[string]int {
+		in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{}, names: map[nameKey]bool{}, removed: map[string]int64{}}
+		o, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, bound, 4, maxLogLine)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := map[string]int{}
+		for k := range o.maxSeq {
+			count[k.scope]++
+		}
+		for k := range o.buried {
+			count[k.scope+" tomb"]++
+		}
+		return count
+	}
+	if got := read(7); got["user/7002 tomb"] != 1 || got["user/7001"] != 4 || got["user/7002"] != 2 {
+		t.Fatalf("admitted %v, want the tombstone, 4 live of 7001 and 2 of 7002", got)
+	}
+	b.Reset()
+	add(tombLine(userScopeOf(7001), "t1", [generationSize]byte{}))
+	add(tombLine(userScopeOf(7001), "t2", [generationSize]byte{}))
+	add(floorLine(userScopeOf(7002), "l", [generationSize]byte{}, 3))
+	if got := read(1); got["user/7001 tomb"] != 1 || got["user/7002"] != 0 {
+		t.Fatalf("admitted %v, want one tombstone and no live line once a tombstone was left out", got)
 	}
 }
