@@ -469,7 +469,8 @@ the restore numbered above that may still be accepted.
 The merge exits 0 when it is written and there is nothing to read in the report. It exits 4 when
 it is written but dropped a deletion, kept an entry because `--keep` named it, left an entry
 `unverified` (with no `pre-restore.d/keystore`, each entry the moved-aside floor holds live), or
-moved aside what it found at `server/keystore`, so read the report. It exits 5 when it is written
+moved aside what it found at `server/keystore`, or carried over user-scope entries without a
+floor check, so read the report. It exits 5 when it is written
 but the restored copy was not moved into place, the move may not survive a crash, or the file was
 not renamed (run it again), and 1 when it refuses and changes
 nothing. A run after an exit 5 finds the merge already written, so if it then refuses the
