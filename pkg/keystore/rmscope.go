@@ -45,7 +45,8 @@ type RemoveScopeResult struct {
 	Recorded bool
 	// Cleared, when set, says rm-scope cleared a user flag on the shared
 	// .user directory to remove the scope directory in it: a line of the
-	// verb's output. A committed result carries it in the error instead.
+	// verb's output. When the run is committed, or stops after clearing
+	// it, the error carries it instead (withCleared, rmStopped).
 	Cleared string
 }
 
@@ -130,7 +131,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		listed := removed.listed(uid)
 		tree, err := removeScopeTree(root, s.dir, name, s.uid, rmTreeOpts{listed: listed, check: u.rerunScope(k, removed, s.uid, rerunTaken)})
 		if err != nil {
-			return RemoveScopeResult{Recorded: listed}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope)
+			return RemoveScopeResult{Recorded: listed}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope, tree.cleared)
 		}
 		if listed {
 			return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
@@ -155,7 +156,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		// rm-scope for.
 		tree, rerr := removeScopeTree(root, s.dir, name, s.uid, rmTreeOpts{listed: removed.listed(uid), keyFirst: true, check: u.rerunScope(k, removed, s.uid, rerunUntrusted)})
 		if rerr != nil {
-			return RemoveScopeResult{}, rmStopped(rerr, tree.changed, fmt.Sprintf("the directory %s has a scope.key that cannot be trusted and is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope)
+			return RemoveScopeResult{}, rmStopped(rerr, tree.changed, fmt.Sprintf("the directory %s has a scope.key that cannot be trusted and is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope, tree.cleared)
 		}
 		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUntrusted(u.scope, err), tree.cleared))
 	}
@@ -164,7 +165,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		// serves the directory, and there is no key to list.
 		tree, err := removeScopeTree(root, s.dir, name, s.uid, rmTreeOpts{listed: removed.listed(uid), keyFirst: true, check: u.rerunScope(k, removed, s.uid, rerunNoKey)})
 		if err != nil {
-			return RemoveScopeResult{}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s has no scope.key and is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope)
+			return RemoveScopeResult{}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s has no scope.key and is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope, tree.cleared)
 		}
 		if removed.listed(uid) {
 			return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
@@ -235,7 +236,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		if !recorded {
 			state = "is not listed in " + removedScopesName + ", which is full"
 		}
-		return RemoveScopeResult{Recorded: recorded}, rmStopped(err, wrote || tree.changed, fmt.Sprintf("the scope %s %s, and its directory %s is partly or wholly present", u.scope, state, quoteName("keystore/"+userScopesName+"/"+name)), u.scope)
+		return RemoveScopeResult{Recorded: recorded}, rmStopped(err, wrote || tree.changed, fmt.Sprintf("the scope %s %s, and its directory %s is partly or wholly present", u.scope, state, quoteName("keystore/"+userScopesName+"/"+name)), u.scope, tree.cleared)
 	}
 	cleared := tree.cleared
 	var notes []string
@@ -258,26 +259,30 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 // a rerun the same way, so neither is offered one: their own text says
 // what to do. A directory at the name that is not the scope judged
 // (errNotJudgedScope) is not what remains of the scope, so neither state
-// nor a rerun is said. When this run changed something first (changed: it wrote the
+// nor a rerun is said. cleared, removeScopeTree's note of a flag it
+// cleared on .user before it stopped, is carried at the end. When this run changed something first (changed: it wrote the
 // removed-scopes record, or the walk unlinked an entry, took a directory or
 // cleared a flag), the removal was made in part and the error is committed
 // (exit 4, audited committed); otherwise it is a refusal.
-func rmStopped(err error, changed bool, state, scope string) error {
+func rmStopped(err error, changed bool, state, scope, cleared string) error {
 	switch {
 	case errors.Is(err, errNotJudgedScope):
 		// The directory at the name is not the scope's: what remains of
 		// the scope is not there, and a rerun would judge that directory.
-		if changed {
-			return fmt.Errorf("%w: rm-scope began removing the scope, then stopped: %w", errCommitted, err)
-		}
-		return err
+		state = ""
 	case !errors.Is(err, errScopeForeignDir) && !errors.Is(err, errScopeTreeDeep):
 		state += ": rerun sudo k3sm keys rm-scope " + scope + " --yes to finish removing it"
 	}
-	if changed {
-		return fmt.Errorf("%w: rm-scope began removing the scope, then stopped: %w; %s", errCommitted, err, state)
+	if state != "" {
+		err = fmt.Errorf("%w; %s", err, state)
 	}
-	return fmt.Errorf("%w; %s", err, state)
+	if cleared != "" {
+		err = fmt.Errorf("%w; %s", err, cleared)
+	}
+	if changed {
+		return fmt.Errorf("%w: rm-scope began removing the scope, then stopped: %w", errCommitted, err)
+	}
+	return err
 }
 
 // withCleared is the committed note with removeScopeTree's report of a

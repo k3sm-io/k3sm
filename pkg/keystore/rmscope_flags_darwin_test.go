@@ -513,6 +513,33 @@ func TestRemoveScopeSharedDirFlags(t *testing.T) {
 			t.Fatalf("the scope directory is still there: %v", err)
 		}
 	})
+	// Through RemoveScope: the flag is cleared, then the retried removal
+	// stops (the seam moves the emptied directory away before it): the
+	// stop's error, committed, still carries the note of the clear.
+	t.Run("the service user's, then the removal stops", func(t *testing.T) {
+		s, shared, dir, _ := setup(t)
+		calls := 0
+		setSeam(t, &rmBeforeScopeRmdir, func() {
+			calls++
+			if calls == 2 {
+				if err := os.Rename(dir, filepath.Join(shared, "away")); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+		_, err := s.RemoveScope(t.Context(), 1001)
+		if calls != 2 {
+			t.Fatalf("the scope directory's removal was tried %d times, want twice", calls)
+		}
+		if !Committed(err) || !errors.Is(err, errScopeDirMoved) {
+			t.Fatalf("rm-scope stopped after clearing .user's flag: %v, want committed wrapping errScopeDirMoved", err)
+		}
+		for _, want := range []string{"cleared a user flag", "the shared directory " + quoteName(shared) + " (named for reading, not for pasting)"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the error %q does not say %q", err, want)
+			}
+		}
+	})
 	t.Run("another user's", func(t *testing.T) {
 		s, shared, dir, ino := setup(t)
 		calls := recordScopeFlags(t)
