@@ -133,6 +133,29 @@ func TestDoctorChecksTable(t *testing.T) {
 			e.nodeRole = func() (install.Role, bool) { return install.RoleAgent, true }
 		}, statusSkip},
 
+		// keystore-floor: no damage → PASS; damaged lines or a floor past
+		// the reader's bounds → WARN naming floor --rebuild; a floor not
+		// read (missing, permission) → SKIP, the keystore-logs row's; a
+		// worker or no seam → SKIP.
+		{"keystore-floor/pass", checkKeystoreFloor, func(e *doctorEnv) {
+			e.keystoreFloorDamage = func(context.Context) (int, error) { return 0, nil }
+		}, statusPass},
+		{"keystore-floor/warn-damaged", checkKeystoreFloor, func(e *doctorEnv) {
+			e.keystoreFloorDamage = func(context.Context) (int, error) { return 3, nil }
+		}, statusWarn},
+		{"keystore-floor/warn-past-bounds", checkKeystoreFloor, func(e *doctorEnv) {
+			e.keystoreFloorDamage = func(context.Context) (int, error) {
+				return 1, errors.New("the keystore append-only log is larger than the reader's bound")
+			}
+		}, statusWarn},
+		{"keystore-floor/skip-missing", checkKeystoreFloor, func(e *doctorEnv) {
+			e.keystoreFloorDamage = func(context.Context) (int, error) { return 0, fmt.Errorf("no log: %w", fs.ErrNotExist) }
+		}, statusSkip},
+		{"keystore-floor/skip-unprobed", checkKeystoreFloor, func(e *doctorEnv) { e.keystoreFloorDamage = nil }, statusSkip},
+		{"keystore-floor/skip-worker", checkKeystoreFloor, func(e *doctorEnv) {
+			e.nodeRole = func() (install.Role, bool) { return install.RoleAgent, true }
+		}, statusSkip},
+
 		// netd-helper: installed+running → PASS, installed-only → WARN, absent → WARN.
 		{"helper/pass-running", checkHelper, func(e *doctorEnv) {
 			e.helperState = func() (bool, bool) { return true, true }
@@ -412,7 +435,7 @@ func TestDoctorChecksTable(t *testing.T) {
 				t.Errorf("registry entry %q returns checkResult.name %q — must match", dc.name, r.name)
 			}
 		}
-		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon", "keystore-logs"} {
+		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon", "keystore-logs", "keystore-floor"} {
 			if !seen[want] {
 				t.Errorf("registry missing check %q", want)
 			}

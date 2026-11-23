@@ -137,6 +137,10 @@ type doctorEnv struct {
 	// (keystore.FileStore.LogSizes), for the soft-cap hint. A nil seam
 	// leaves the sizes unread.
 	keystoreLogSizes func(context.Context) (keystore.LogSizes, error)
+	// keystoreFloorDamage reads the user-scope floor's damaged-line count
+	// (keystore.FileStore.FloorDamage), and the damage of a floor past the
+	// reader's bounds as its error. A nil seam leaves the row unprobed.
+	keystoreFloorDamage func(context.Context) (int, error)
 	// interconnect is the interconnect section's seams (doctorinterconnect.go).
 	// Nil leaves the section out of the report.
 	interconnect *interconnectEnv
@@ -161,6 +165,7 @@ func doctorChecks() []doctorCheck {
 		{"toolchain", checkXcodeToolchain},
 		{"agent-daemon", checkAgentDaemon},
 		{"keystore-logs", checkKeystoreLogs},
+		{"keystore-floor", checkKeystoreFloor},
 	}
 }
 
@@ -197,6 +202,35 @@ func checkKeystoreLogs(env doctorEnv) checkResult {
 		return checkResult{name: name, status: statusFail, detail: fmt.Sprintf("the keystore user scope stays off: %v", err), remedy: verb + "   # replaces the hard-linked log with a fresh file"}
 	}
 	return checkResult{name: name, status: statusFail, detail: fmt.Sprintf("the keystore user scope stays off: %v", err), remedy: "after a restore: sudo k3sm keys floor --rebuild; sudo k3sm keys audit --rotate   # each flags its log append-only again"}
+}
+
+// checkKeystoreFloor is the keystore-floor row: the user-scope floor's
+// damage (keystore.FileStore.FloorDamage). No damaged line is PASS;
+// damaged lines, which the reader skips and which refuse the grants and
+// reads of every key they could name, are WARN with the count; a floor past
+// the reader's bounds is WARN with that damage. floor --rebuild repairs
+// both: it streams the floor with no size bound and reports what it
+// dropped. A floor that cannot be opened is the keystore-logs row's, so it
+// is SKIP here.
+func checkKeystoreFloor(env doctorEnv) checkResult {
+	const name = "keystore-floor"
+	const remedy = "sudo k3sm keys floor --rebuild   # rewrites the floor from the old one and every scope's entries, and lists what it dropped (exit 4)"
+	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+		return checkResult{name: name, status: statusSkip, detail: "a worker keeps no keystore"}
+	}
+	if env.keystoreFloorDamage == nil {
+		return checkResult{name: name, status: statusSkip, detail: "not probed"}
+	}
+	n, err := env.keystoreFloorDamage(context.Background())
+	switch {
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, fs.ErrPermission):
+		return checkResult{name: name, status: statusSkip, detail: fmt.Sprintf("the floor was not read (see keystore-logs): %v", err)}
+	case err != nil:
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("the user-scope floor is damaged past what the reader reads (%d damaged lines before it): %v", n, err), remedy: remedy}
+	case n > 0:
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("the user-scope floor holds %d damaged lines, which the reader skips; grants and reads of every key they could name are refused", n), remedy: remedy}
+	}
+	return checkResult{name: name, status: statusPass, detail: "the user-scope floor holds no damaged line"}
 }
 
 // keystoreSoftCapHint is the keystore-logs row's WARN when either log is
@@ -886,6 +920,15 @@ func realDoctorEnv(workDir string) doctorEnv {
 			cfg := keystoreLayout(workDir)
 			cfg.UID = uid
 			return keystore.New(cfg).LogSizes(ctx)
+		},
+		keystoreFloorDamage: func(ctx context.Context) (int, error) {
+			uid, _, err := lookupServiceIDs()
+			if err != nil {
+				return 0, err
+			}
+			cfg := keystoreLayout(workDir)
+			cfg.UID = uid
+			return keystore.New(cfg).FloorDamage(ctx)
 		},
 		interconnect: realInterconnectEnv(),
 	}
