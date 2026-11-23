@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -377,6 +378,73 @@ func TestRevokeBreaker(t *testing.T) {
 	}
 	h.secret(t, "payments", "a")
 	h.secret(t, "payments", "e")
+}
+
+// TestStuckRevocationsSkipBreaker: two stuck revocations (a Secret that is
+// terminating, and one whose Delete keeps failing) plus two fresh removals,
+// at the breaker's floor of 3: the stuck ones do not count, so the two fresh
+// ones are deleted. Each stuck one logs a Warn when it first gets stuck, and
+// a summary naming both and how long repeats at most hourly.
+func TestStuckRevocationsSkipBreaker(t *testing.T) {
+	h := newHarness(t, true, false)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.r.now = func() time.Time { return now }
+	names := []string{"a", "b", "c", "d", "e", "f"}
+	var targets []Target
+	for _, n := range names {
+		h.store.set(n, 1, []byte("v-"+n))
+		targets = append(targets, Target{Entry: "system/" + n, Namespace: "payments"})
+	}
+	h.declare(t, targets...)
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	term := h.secret(t, "payments", "a")
+	ts := metav1.NewTime(now)
+	term.DeletionTimestamp = &ts
+	term.Finalizers = []string{"example.com/hold"}
+	if _, err := h.client.CoreV1().Secrets("payments").Update(ctx, term, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h.client.PrependReactor("delete", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if a.(k8stesting.DeleteAction).GetName() != "b" {
+			return false, nil, nil
+		}
+		return true, nil, apierrors.NewInternalError(errors.New("etcd unavailable"))
+	})
+	h.store.rm("a")
+	h.store.rm("b")
+	h.r.Sweep(ctx)
+	h.store.rm("c")
+	h.store.rm("d")
+	now = now.Add(10 * time.Minute)
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	h.gone(t, "payments", "c")
+	h.gone(t, "payments", "d")
+	h.secret(t, "payments", "a")
+	h.secret(t, "payments", "b")
+	h.secret(t, "payments", "e")
+	logs := h.logs.String()
+	if strings.Contains(logs, "level=ERROR") {
+		t.Fatalf("the stuck revocations tripped the breaker\n%s", logs)
+	}
+	if n := strings.Count(logs, `level=WARN msg="keystore delivery: the revocation of a deleted entry's Secret is stuck`); n != 2 {
+		t.Fatalf("got %d first-stuck Warns, want 2\n%s", n, logs)
+	}
+	const summary = `level=WARN msg="keystore delivery: 2 revocations of deleted entries' Secrets are still stuck`
+	if strings.Contains(logs, summary) {
+		t.Fatalf("a summary before an hour passed\n%s", logs)
+	}
+	now = now.Add(time.Hour)
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	logs = h.logs.String()
+	if n := strings.Count(logs, summary); n != 1 {
+		t.Fatalf("got %d summaries an hour later, want 1\n%s", n, logs)
+	}
+	if !strings.Contains(logs, "payments/a (terminating, stuck for 1h10m0s)") || !strings.Contains(logs, "payments/b (delete failing, stuck for 1h10m0s)") {
+		t.Fatalf("the summary does not name both and how long\n%s", logs)
+	}
 }
 
 // TestRevokeHeldAcrossKeystoreRestore: a real store; three entries

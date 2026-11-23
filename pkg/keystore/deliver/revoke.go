@@ -21,7 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
+	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -242,12 +245,27 @@ func (r *Reconciler) withdrawn(ctx context.Context, sw *sweep, namespace, name s
 }
 
 // revokeAll deletes the gathered Secrets, unless this sweep holds them (the
-// keystore's identity is new or unread) or the breaker trips.
+// keystore's identity is new or unread) or the breaker trips. A stuck
+// revocation (its Secret terminating, or its Delete failing and retrying)
+// does not count toward the breaker, so a few that never finish cannot hold
+// every later rm back; they are logged instead (see markStuck).
 func (r *Reconciler) revokeAll(ctx context.Context, sw *sweep) {
+	defer r.reportStuck(sw)
 	n := len(sw.revokes)
 	if n == 0 {
 		r.heldState = ""
 		return
+	}
+	fresh := 0
+	for _, rv := range sw.revokes {
+		switch {
+		case rv.terminating:
+			r.markStuck(rv, stuckTerminating, nil)
+		case r.retrying(rv):
+			// Its Delete failed on an earlier sweep: retried, not counted.
+		default:
+			fresh++
+		}
 	}
 	if sw.hold != "" {
 		if sig := "hold:" + sw.hold + ":" + strconv.Itoa(n); r.heldState != sig {
@@ -256,11 +274,11 @@ func (r *Reconciler) revokeAll(ctx context.Context, sw *sweep) {
 		}
 		return
 	}
-	if limit := r.revokeLimit(sw.recordedSecrets); n > limit {
-		if sig := "breaker:" + strconv.Itoa(n); r.heldState != sig {
+	if limit := r.revokeLimit(sw.recordedSecrets); fresh > limit {
+		if sig := "breaker:" + strconv.Itoa(fresh); r.heldState != sig {
 			r.heldState = sig
 			r.logger.Error(fmt.Sprintf("keystore delivery: %d of %d delivered Secrets' entries are gone at once, more than the %d one sweep revokes, so none is deleted; "+
-				"put the entries back if this was not meant, or delete those Secrets with kubectl", n, sw.recordedSecrets, limit))
+				"put the entries back if this was not meant, or delete those Secrets with kubectl", fresh, sw.recordedSecrets, limit))
 		}
 		return
 	}
@@ -270,6 +288,83 @@ func (r *Reconciler) revokeAll(ctx context.Context, sw *sweep) {
 	}
 }
 
+// The states of a stuck revocation.
+const (
+	stuckTerminating   = "terminating"
+	stuckDeleteFailing = "delete failing"
+)
+
+// stuckRevocation is one revocation that has not finished: its state, since
+// when it is stuck, and its names for the logs.
+type stuckRevocation struct {
+	entry, namespace, secret string
+	state                    string
+	since                    time.Time
+}
+
+// retrying reports whether rv's Delete failed on an earlier sweep.
+func (r *Reconciler) retrying(rv revocation) bool {
+	st := r.stuck[stateKey(rv.namespace, rv.secret)]
+	return st != nil && st.state == stuckDeleteFailing
+}
+
+// stuckSummaryEvery is how often the summary of stuck revocations repeats
+// while any is stuck.
+const stuckSummaryEvery = time.Hour
+
+// markStuck records rv as stuck in state, logging a Warn when it first gets
+// stuck and again each time its state changes.
+func (r *Reconciler) markStuck(rv revocation, state string, err error) {
+	k := stateKey(rv.namespace, rv.secret)
+	attrs := []any{"entry", rv.entry, "namespace", rv.namespace, "secret", rv.secret, "state", state}
+	if err != nil {
+		attrs = append(attrs, "err", err)
+	}
+	cur := r.stuck[k]
+	switch {
+	case cur == nil:
+		if len(r.stuck) == 0 {
+			r.stuckSummary = r.now()
+		}
+		r.stuck[k] = &stuckRevocation{entry: rv.entry, namespace: rv.namespace, secret: rv.secret, state: state, since: r.now()}
+		r.logger.Warn("keystore delivery: the revocation of a deleted entry's Secret is stuck; it does not count toward the delivery breaker, and is retried every sweep", attrs...)
+	case cur.state != state:
+		cur.state = state
+		r.logger.Warn("keystore delivery: a stuck revocation changed state; it is still stuck", append(attrs, "stuckFor", r.now().Sub(cur.since).Round(time.Second).String())...)
+	}
+}
+
+// reportStuck forgets the stuck revocations this sweep did not gather (the
+// entry is back, or the record is gone) or finished, and, while any is
+// still stuck, logs a summary Warn at most every stuckSummaryEvery naming
+// each and how long it has been stuck.
+func (r *Reconciler) reportStuck(sw *sweep) {
+	gathered := make(map[string]bool, len(sw.revokes))
+	for _, rv := range sw.revokes {
+		gathered[stateKey(rv.namespace, rv.secret)] = true
+	}
+	for k := range r.stuck {
+		if !gathered[k] || sw.unstuck[k] {
+			delete(r.stuck, k)
+		}
+	}
+	if len(r.stuck) == 0 || r.now().Sub(r.stuckSummary) < stuckSummaryEvery {
+		return
+	}
+	r.stuckSummary = r.now()
+	keys := make([]string, 0, len(r.stuck))
+	for k := range r.stuck {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		st := r.stuck[k]
+		parts = append(parts, fmt.Sprintf("%s (%s, stuck for %s)", k, st.state, r.now().Sub(st.since).Round(time.Second)))
+	}
+	r.logger.Warn(fmt.Sprintf("keystore delivery: %d revocations of deleted entries' Secrets are still stuck: %s", len(keys), strings.Join(parts, ", ")))
+}
+
 // revokeOne deletes one gathered Secret under a precondition on its recorded
 // UID, logging the names, never a value.
 func (r *Reconciler) revokeOne(ctx context.Context, sw *sweep, rv revocation) {
@@ -277,6 +372,7 @@ func (r *Reconciler) revokeOne(ctx context.Context, sw *sweep, rv revocation) {
 	defer cancel()
 	attrs := []any{"entry", rv.entry, "namespace", rv.namespace, "secret", rv.secret}
 	if rv.terminating {
+		// Logged by markStuck, at Warn, when it first gets stuck.
 		r.logger.Debug("keystore delivery: the Secret of a deleted entry is being deleted; waiting", attrs...)
 		return
 	}
@@ -290,9 +386,13 @@ func (r *Reconciler) revokeOne(ctx context.Context, sw *sweep, rv revocation) {
 		r.logger.Warn("keystore delivery: the entry is gone but the Secret was replaced before it could be deleted, so it is left alone", append(attrs, "err", err)...)
 	case err != nil:
 		done = false
-		r.logger.Warn("keystore delivery: cannot delete the Secret of a deleted entry; will retry", append(attrs, "err", err)...)
+		r.markStuck(rv, stuckDeleteFailing, err)
+		r.logger.Debug("keystore delivery: cannot delete the Secret of a deleted entry; will retry", append(attrs, "err", err)...)
 	default:
 		r.logger.Info("keystore delivery: deleted the Secret; its keystore entry no longer exists", attrs...)
+	}
+	if done {
+		sw.unstuck[stateKey(rv.namespace, rv.secret)] = true
 	}
 	if rv.withdrawn {
 		if done {

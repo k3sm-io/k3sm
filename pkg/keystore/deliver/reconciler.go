@@ -170,6 +170,13 @@ type Reconciler struct {
 	heldState     string
 	// floorHeld are the entry names whose floor-held revocation was logged.
 	floorHeld map[string]bool
+	// stuck are the revocations that have not finished, by namespace/name,
+	// and stuckSummary when their summary was last logged (see markStuck).
+	stuck        map[string]*stuckRevocation
+	stuckSummary time.Time
+	// now is the clock the stuck and held logs repeat by (production:
+	// time.Now).
+	now func() time.Time
 	// revokeLimit is the most revocations one sweep makes, given the number
 	// of recorded Secrets; more than that and it makes none (production:
 	// defaultRevokeLimit).
@@ -207,6 +214,8 @@ func New(cfg Config) *Reconciler {
 		},
 		targetState: map[string]string{},
 		floorHeld:   map[string]bool{},
+		stuck:       map[string]*stuckRevocation{},
+		now:         time.Now,
 		revokeLimit: defaultRevokeLimit,
 	}
 }
@@ -334,7 +343,7 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 		return
 	}
 	r.stateFileState = ""
-	sw := &sweep{state: st, recordedSecrets: len(st.owned), keep: map[string]bool{}, floorHeld: map[string]bool{}}
+	sw := &sweep{state: st, recordedSecrets: len(st.owned), keep: map[string]bool{}, floorHeld: map[string]bool{}, unstuck: map[string]bool{}}
 	r.observeKeystore(ctx, sw)
 	seen := make(map[string]bool, len(d.Targets))
 	declared := make(map[string]bool, len(d.Targets))
@@ -417,6 +426,8 @@ type sweep struct {
 	// floorHeld are the entry names whose revocation the floor held this
 	// sweep (see floorHolds).
 	floorHeld map[string]bool
+	// unstuck are the revocations finished this sweep.
+	unstuck map[string]bool
 }
 
 // targetKey identifies a target for the once-per-state log.
