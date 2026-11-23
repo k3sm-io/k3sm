@@ -169,22 +169,31 @@ type Reconciler struct {
 	keystoreState string
 	heldState     string
 	heldAt        time.Time
-	// floorHeld are the entry names whose floor-held revocation was logged.
-	floorHeld map[string]bool
+	// held are the revocations held for a reason that names them (the floor,
+	// an unconfirmed absence, a keystore change mid-sweep, an unreadable
+	// Secret), by key (see holdNote).
+	held map[string]*heldRevocation
+	// holdUntil is when the restore hold that began at the first sweep since
+	// start, or at the last identity change, ends (see observeKeystore).
+	holdUntil time.Time
 	// recordState is the last logged state of a withdrawn record's entry
 	// (see withdrawn), by namespace/name.
 	recordState map[string]string
 	// stuck are the revocations that have not finished, by namespace/name,
-	// and stuckSummary when their summary was last logged (see markStuck).
+	// and stuckSummary when the summary of them and the held ones was last
+	// logged (see markStuck and reportStuck).
 	stuck        map[string]*stuckRevocation
 	stuckSummary time.Time
 	// now is the clock the stuck and held logs repeat by (production:
 	// time.Now).
 	now func() time.Time
-	// revokeLimit is the most revocations one sweep makes, given the number
-	// of recorded Secrets; more than that and it makes none (production:
+	// revokeLimit is the most entries one sweep revokes, given the number of
+	// live delivered entries; more than that and it revokes none (production:
 	// defaultRevokeLimit).
-	revokeLimit func(recorded int) int
+	revokeLimit func(entries int) int
+	// revokeHold is how long the restore hold lasts after start or an
+	// identity change (production: defaultRevokeHold). There is no override.
+	revokeHold time.Duration
 }
 
 // New returns a reconciler for cfg.
@@ -217,11 +226,12 @@ func New(cfg Config) *Reconciler {
 			return watchFile(dir, name, logger)
 		},
 		targetState: map[string]string{},
-		floorHeld:   map[string]bool{},
+		held:        map[string]*heldRevocation{},
 		recordState: map[string]string{},
 		stuck:       map[string]*stuckRevocation{},
 		now:         time.Now,
 		revokeLimit: defaultRevokeLimit,
+		revokeHold:  defaultRevokeHold,
 	}
 }
 
@@ -348,7 +358,7 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 		return
 	}
 	r.stateFileState = ""
-	sw := &sweep{state: st, recordedSecrets: len(st.owned), keep: map[string]bool{}, floorHeld: map[string]bool{}, unstuck: map[string]bool{}}
+	sw := &sweep{state: st, deliveredEntries: st.entries(), keep: map[string]bool{}, held: map[string]bool{}, unstuck: map[string]bool{}}
 	r.observeKeystore(ctx, sw)
 	seen := make(map[string]bool, len(d.Targets))
 	declared := make(map[string]bool, len(d.Targets))
@@ -374,7 +384,6 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 		}
 	}
 	r.revokeAll(ctx, sw)
-	r.pruneFloorHolds(sw)
 	// Forget a withdrawn target, so declaring it again logs again. Its Secret
 	// stays unless it was revoked above, but it is no longer recorded as
 	// ours, so declaring it again leaves it alone. A record whose revocation
@@ -424,10 +433,11 @@ type sweep struct {
 	// dirty is a record changed this sweep that no write since has saved.
 	dirty bool
 
-	// recordedSecrets is the number of records at the sweep's start, the
-	// base of the revocation breaker: live deliveries only, since a revoked
-	// target's record is dropped with its Secret (see revokeOne).
-	recordedSecrets int
+	// deliveredEntries is the number of distinct entries the records name at
+	// the sweep's start, the base of the revocation breaker: live deliveries
+	// only, since a revoked target's record is dropped with its Secret (see
+	// revokeOne).
+	deliveredEntries int
 	// keystore is the identity of the entries' directory this sweep saw, and
 	// hold why revocations are held this sweep ("" when they are not).
 	keystore string
@@ -436,9 +446,8 @@ type sweep struct {
 	// the withdrawn records kept for a pending revocation.
 	revokes []revocation
 	keep    map[string]bool
-	// floorHeld are the entry names whose revocation the floor held this
-	// sweep (see floorHolds).
-	floorHeld map[string]bool
+	// held are the keys of the revocations held this sweep (see holdNote).
+	held map[string]bool
 	// unstuck are the revocations finished this sweep.
 	unstuck map[string]bool
 }
@@ -509,10 +518,19 @@ func (r *Reconciler) converge(ctx context.Context, sw *sweep, t Target) {
 			r.collect(ctx, sw, t, cur, false)
 			return
 		}
-		if r.targetState[targetKey(t)] == stateRevoked {
+		switch {
+		case r.targetState[targetKey(t)] == stateRevoked:
 			// Revoked, and the entry is still gone: nothing to say. A record
 			// a failed write left is dropped again.
 			r.dropRecord(sw, t.Namespace, t.Secret())
+			return
+		case sw.state.UID(t.Namespace, t.Secret()) != "":
+			// The Secret it records is gone (a stuck revocation finished, or
+			// someone deleted it): the record names nothing now.
+			r.targetState[targetKey(t)] = stateRevoked
+			r.dropRecord(sw, t.Namespace, t.Secret())
+			r.logger.Info("keystore delivery: the entry is gone and so is its Secret",
+				"entry", t.Entry, "namespace", t.Namespace, "secret", t.Secret())
 			return
 		}
 	}

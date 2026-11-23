@@ -64,9 +64,9 @@ limitations under the License.
 //     under a precondition on the recorded UID and logs the names, never a
 //     value; a missing label or annotation is logged at Warn. A withdrawn
 //     target's entry is the one its state record names, not its label. The
-//     keystore floor, the identity guard and the breaker (revoke.go) hold
-//     the delete after a restore, after a start, and when many entries go
-//     at once;
+//     keystore floor, the restore hold and the breaker (revoke.go) hold the
+//     delete after a restore, for 10 minutes after a start, and when many
+//     entries go at once; the delete is done once a Get no longer finds it;
 //   - anything else (no recorded UID, or a UID other than the recorded one,
 //     whatever its label): leaves it alone and logs why. The
 //     label is forgeable by anyone who can write Secrets in the namespace;

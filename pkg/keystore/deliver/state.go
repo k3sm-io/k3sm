@@ -145,6 +145,20 @@ func (s *State) SetDelivered(namespace, name, uid, entry string) {
 	s.owned[stateKey(namespace, name)] = ownedRecord{uid: uid, entry: entry}
 }
 
+// entries is the number of distinct entries the records name. A record an
+// older build wrote, with no entry, counts as one of its own.
+func (s *State) entries() int {
+	seen := make(map[string]bool, len(s.owned))
+	for k, rec := range s.owned {
+		if rec.entry == "" {
+			seen["\x00"+k] = true
+			continue
+		}
+		seen[rec.entry] = true
+	}
+	return len(seen)
+}
+
 // setEntry records entry for an existing namespace/name record, and reports
 // whether that changed it.
 func (s *State) setEntry(namespace, name, entry string) bool {

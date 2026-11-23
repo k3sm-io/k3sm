@@ -460,7 +460,7 @@ func TestRevokeBreaker(t *testing.T) {
 		}
 	}
 	logs := h.logs.String()
-	if n := strings.Count(logs, "level=ERROR msg=\"keystore delivery: 4 of 5 delivered Secrets' entries are gone at once"); n != 1 {
+	if n := strings.Count(logs, "level=ERROR msg=\"keystore delivery: 4 of 5 delivered entries are gone at once"); n != 1 {
 		t.Fatalf("got %d breaker Errors over two sweeps, want 1\n%s", n, logs)
 	}
 	h.store.set("a", 1, []byte("v-a"))
@@ -510,7 +510,7 @@ func TestBreakerCountsLiveDeliveriesOnly(t *testing.T) {
 	if n := h.deletes(); n != 0 {
 		t.Fatalf("4 of 12 live deliveries gone drew %d deletes: %v", n, h.verbs())
 	}
-	const breaker = "level=ERROR msg=\"keystore delivery: 4 of 12 delivered Secrets' entries are gone at once"
+	const breaker = "level=ERROR msg=\"keystore delivery: 4 of 12 delivered entries are gone at once"
 	if n := strings.Count(h.logs.String(), breaker); n != 1 {
 		t.Fatalf("got %d breaker Errors over two sweeps, want 1\n%s", n, h.logs.String())
 	}
@@ -796,4 +796,269 @@ func copyTree(t *testing.T, src, dst string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestDeleteConfirmedByEffect: the apiserver answers the Delete but only
+// marks the Secret terminating (a tenant finalizer holds it). The delete is
+// confirmed by a Get, not by its answer: the record is kept, the revocation
+// is stuck with a Warn, and the next sweep checks again without a second
+// Delete. Once the finalizer lets go, the next sweep drops the record.
+func TestDeleteConfirmedByEffect(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	uid := string(h.secret(t, "payments", "api-token").UID)
+	gvr := corev1.SchemeGroupVersion.WithResource("secrets")
+	h.client.PrependReactor("delete", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		obj, err := h.client.Tracker().Get(gvr, "payments", "api-token")
+		if err != nil {
+			return true, nil, err
+		}
+		s := obj.(*corev1.Secret).DeepCopy()
+		ts := metav1.Now()
+		s.DeletionTimestamp = &ts
+		s.Finalizers = []string{"tenant.example/hold"}
+		return true, nil, h.client.Tracker().Update(gvr, s, "payments")
+	})
+	h.store.rm("api-token")
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	if got := h.deleteUIDs("api-token"); len(got) != 1 || got[0] != uid {
+		t.Fatalf("deletes %q, want one under the precondition %q", got, uid)
+	}
+	if h.stateUID(t, "payments", "api-token") != uid {
+		t.Fatal("the record was dropped although the Secret is still there")
+	}
+	logs := h.logs.String()
+	if strings.Contains(logs, "deleted the Secret; its keystore entry no longer exists") {
+		t.Fatalf("a terminating Secret was logged as deleted\n%s", logs)
+	}
+	const stuck = `level=WARN msg="keystore delivery: the revocation of a deleted entry's Secret is stuck`
+	if n := strings.Count(logs, stuck); n != 1 || !strings.Contains(logs, "state=terminating") {
+		t.Fatalf("got %d stuck Warns (want 1, state terminating)\n%s", n, logs)
+	}
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	if n := h.deletes(); n != 0 {
+		t.Fatalf("a terminating Secret drew %d more deletes: %v", n, h.verbs())
+	}
+	if !strings.Contains(strings.Join(h.verbs(), " "), "get/secrets") {
+		t.Fatalf("the next sweep did not check the Secret again: %v", h.verbs())
+	}
+	if h.stateUID(t, "payments", "api-token") != uid {
+		t.Fatal("the record was dropped while the Secret is terminating")
+	}
+	if n := strings.Count(h.logs.String(), stuck); n != 1 {
+		t.Fatalf("the stuck Warn repeated: %d\n%s", n, h.logs.String())
+	}
+	// The finalizer lets go: the Secret is gone, and so is the record.
+	if err := h.client.Tracker().Delete(gvr, "payments", "api-token"); err != nil {
+		t.Fatal(err)
+	}
+	h.r.Sweep(ctx)
+	if h.stateUID(t, "payments", "api-token") != "" {
+		t.Fatal("the record was kept after the Secret went")
+	}
+	if len(h.r.stuck) != 0 {
+		t.Fatalf("still stuck after the Secret went: %v", h.r.stuck)
+	}
+}
+
+// TestBreakerCountsEntriesNotSecrets: twelve live entries (limit 3), one of
+// them delivered into five namespaces. Its rm is one fresh revocation, not
+// five, so all five Secrets are deleted.
+func TestBreakerCountsEntriesNotSecrets(t *testing.T) {
+	h := newHarness(t, true, false)
+	var targets []Target
+	h.store.set("shared", 1, []byte("v-shared"))
+	nss := []string{"ns1", "ns2", "ns3", "ns4", "ns5"}
+	for _, ns := range nss {
+		targets = append(targets, Target{Entry: "system/shared", Namespace: ns})
+	}
+	for i := range 11 {
+		n := fmt.Sprintf("e%02d", i)
+		h.store.set(n, 1, []byte("v-"+n))
+		targets = append(targets, Target{Entry: "system/" + n, Namespace: "payments"})
+	}
+	h.declare(t, targets...)
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	h.store.rm("shared")
+	h.r.Sweep(ctx)
+	for _, ns := range nss {
+		h.gone(t, ns, "shared")
+	}
+	if strings.Contains(h.logs.String(), "level=ERROR") {
+		t.Fatalf("one entry in five namespaces tripped the breaker\n%s", h.logs.String())
+	}
+	h.secret(t, "payments", "e00")
+}
+
+// TestRestoreHoldLastsTenMinutes: after a start, and again after an identity
+// change, revocation is held until the first sweep has passed and ten
+// minutes have; each hold Warns once, naming when it ends.
+func TestRestoreHoldLastsTenMinutes(t *testing.T) {
+	h := newHarness(t, true, false)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.r.now = func() time.Time { return now }
+	h.r.revokeHold = defaultRevokeHold
+	h.store.set("a", 1, []byte("v-a"))
+	h.store.set("b", 1, []byte("v-b"))
+	h.declare(t, Target{Entry: "system/a", Namespace: "payments"}, Target{Entry: "system/b", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	if !strings.Contains(h.logs.String(), `level=WARN msg="keystore delivery: revocation is held after the start`) ||
+		!strings.Contains(h.logs.String(), "until=2026-01-01T00:10:00Z") {
+		t.Fatalf("the hold's start is not Warned with its end\n%s", h.logs.String())
+	}
+	h.store.rm("a")
+	for _, d := range []time.Duration{time.Minute, 5 * time.Minute, 10*time.Minute - time.Second} {
+		now = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(d)
+		h.r.Sweep(ctx)
+		if n := h.deletes(); n != 0 {
+			t.Fatalf("a sweep %s after start deleted: %v", d, h.verbs())
+		}
+	}
+	now = time.Date(2026, 1, 1, 0, 10, 0, 0, time.UTC)
+	h.r.Sweep(ctx)
+	h.gone(t, "payments", "a")
+	// An identity change starts the hold again.
+	h.store.identity = "2:2"
+	h.store.rm("b")
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	now = now.Add(10*time.Minute - time.Second)
+	h.r.Sweep(ctx)
+	if n := h.deletes(); n != 0 {
+		t.Fatalf("sweeps inside the hold after an identity change deleted: %v", h.verbs())
+	}
+	if !strings.Contains(h.logs.String(), "revocation is held after a keystore directory change") ||
+		!strings.Contains(h.logs.String(), "until=2026-01-01T00:20:00Z") {
+		t.Fatalf("the identity change's hold is not Warned with its end\n%s", h.logs.String())
+	}
+	now = now.Add(time.Second)
+	h.r.Sweep(ctx)
+	h.gone(t, "payments", "b")
+}
+
+// TestHeldRevocationsRepeatInSummary: a revocation held because the entry's
+// absence cannot be confirmed Warns once per name, not every sweep, and the
+// held set repeats in the hourly summary with its count and names. The floor
+// hold feeds the same summary, by entry.
+func TestHeldRevocationsRepeatInSummary(t *testing.T) {
+	h := newHarness(t, true, false)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	h.r.now = func() time.Time { return now }
+	h.store.set("a", 1, []byte("v-a"))
+	h.store.set("b", 1, []byte("v-b"))
+	h.declare(t, Target{Entry: "system/a", Namespace: "payments"}, Target{Entry: "system/b", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	h.store.rm("a")
+	h.store.rm("b")
+	h.store.absentErr = fs.ErrNotExist
+	for range 3 {
+		now = now.Add(5 * time.Minute)
+		h.r.Sweep(ctx)
+	}
+	logs := h.logs.String()
+	if n := strings.Count(logs, "but its absence cannot be confirmed"); n != 2 {
+		t.Fatalf("got %d unconfirmed-absence Warns over three sweeps, want one per name (2)\n%s", n, logs)
+	}
+	const summary = `level=WARN msg="keystore delivery: 2 revocations of deleted entries' Secrets are still held`
+	if strings.Contains(logs, summary) {
+		t.Fatalf("a summary before an hour passed\n%s", logs)
+	}
+	now = now.Add(time.Hour)
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	logs = h.logs.String()
+	if n := strings.Count(logs, summary); n != 1 {
+		t.Fatalf("got %d held summaries an hour later, want 1\n%s", n, logs)
+	}
+	if !strings.Contains(logs, "payments/a ("+heldUnconfirmed+", held for 1h") || !strings.Contains(logs, "payments/b ("+heldUnconfirmed) {
+		t.Fatalf("the summary does not name both and why\n%s", logs)
+	}
+	if n := strings.Count(logs, "but its absence cannot be confirmed"); n != 2 {
+		t.Fatalf("the per-name Warn repeated: %d\n%s", n, logs)
+	}
+	// The floor's hold, by entry, replaces them in the summary.
+	h.store.absentErr = fmt.Errorf("wrapped: %w", keystore.ErrFloorRecordsEntry)
+	h.r.Sweep(ctx)
+	now = now.Add(time.Hour)
+	h.r.Sweep(ctx)
+	logs = h.logs.String()
+	if !strings.Contains(logs, "still held: system/a ("+heldFloor) || strings.Contains(logs[strings.LastIndex(logs, "still held"):], "payments/a") {
+		t.Fatalf("the summary does not name the floor-held entries alone\n%s", logs)
+	}
+	if n := h.deletes(); n != 0 {
+		t.Fatalf("held revocations drew %d deletes", n)
+	}
+}
+
+// TestRevokeRefusedGetFailureNamesRevocation: with delivery refused, a
+// recorded Secret that cannot be read Warns once, naming the target whose
+// revocation is pending, and feeds the held summary.
+func TestRevokeRefusedGetFailureNamesRevocation(t *testing.T) {
+	h := newHarness(t, false, true)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	restarted := h.reconciler(false, false)
+	restarted.now = func() time.Time { return now }
+	h.client.PrependReactor("get", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInternalError(errors.New("etcd unavailable"))
+	})
+	for range 3 {
+		restarted.Sweep(ctx)
+	}
+	logs := h.logs.String()
+	const warn = `level=WARN msg="keystore delivery: cannot read a refused target's Secret, so its pending revocation`
+	if n := strings.Count(logs, warn); n != 1 {
+		t.Fatalf("got %d Warns over three sweeps, want 1\n%s", n, logs)
+	}
+	if !strings.Contains(logs, "entry=system/api-token namespace=payments secret=api-token") {
+		t.Fatalf("the Warn does not name the pending revocation\n%s", logs)
+	}
+	now = now.Add(time.Hour)
+	restarted.Sweep(ctx)
+	if !strings.Contains(h.logs.String(), "1 revocations of deleted entries' Secrets are still held: payments/api-token ("+heldUnreadable) {
+		t.Fatalf("the summary does not name it\n%s", h.logs.String())
+	}
+}
+
+// TestWithdrawnNonOpaqueLeftAlone: as for a declared target, a withdrawn
+// target's Secret that is not Opaque is left alone, even with the recorded
+// UID and its entry gone, with a Warn.
+func TestWithdrawnNonOpaqueLeftAlone(t *testing.T) {
+	h := newHarness(t, true, false)
+	ctx := context.Background()
+	s := secretObj("payments", "tok", map[string]string{LabelKey: "tok"}, map[string][]byte{"tls.crt": []byte("c"), "tls.key": []byte("k")})
+	s.Type = corev1.SecretTypeTLS
+	s.UID = "uid-tls"
+	if _, err := h.client.CoreV1().Secrets("payments").Create(ctx, s, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h.own(t, s)
+	h.declare(t)
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	if got := h.deleteUIDs("tok"); len(got) != 0 {
+		t.Fatalf("a non-Opaque withdrawn Secret drew deletes %q", got)
+	}
+	h.secret(t, "payments", "tok")
+	if !strings.Contains(h.logs.String(), "a withdrawn target's Secret is not Opaque, so it is left alone") {
+		t.Fatalf("the non-Opaque Secret is not logged\n%s", h.logs.String())
+	}
+}
+
+// stateUID is the UID the harness's state file records for ns/name.
+func (h *harness) stateUID(t *testing.T, ns, name string) string {
+	t.Helper()
+	st := h.state(t)
+	return st.UID(ns, name)
 }

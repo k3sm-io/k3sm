@@ -194,6 +194,9 @@ func (h *harness) reconciler(encryptionOn, allowPlaintext bool) *Reconciler {
 	// The declaration stands the test user in for root; the state file's
 	// checks are production's, since the server's euid owns it.
 	r.check = testCheck
+	// The restore hold's duration is tested on its own
+	// (TestRestoreHoldLastsTenMinutes); elsewhere only its first sweep holds.
+	r.revokeHold = 0
 	return r
 }
 
