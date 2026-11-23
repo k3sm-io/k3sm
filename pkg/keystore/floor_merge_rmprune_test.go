@@ -362,3 +362,56 @@ func TestParseRmDroppedMark(t *testing.T) {
 		t.Fatalf("an unmarked record encodes %q, want no unusable field", plain)
 	}
 }
+
+// TestFloorMergeCrashBetweenRenamesClearsRmDropped (U192): a merge that
+// renames its retired record and stops before renaming its input, with an
+// rm-dropped record left in the data root, is finished by a rerun that
+// only renames the input (finishRenamed); that rerun removes the
+// rm-dropped record too, as renameMerged does, so none outlives the guard.
+func TestFloorMergeCrashBetweenRenamesClearsRmDropped(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	putFloorFile(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}})
+	writeAsideFloor(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}, "ret": {Generation: mgen(3), Seq: 1}})
+	input, err := os.ReadFile(floorPath(server) + ".pre-restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageTree(t, s)
+	failStepOnce(s, "merge rename input")
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); !Committed(err) {
+		t.Fatalf("first run with the input's rename failing: %v, want committed", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.dataRoot, retiredPendingName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the pending record after the crash seam: %v, want it renamed", err)
+	}
+	// What a crash leaves when an rm under the guard wrote the record
+	// before the rename: renameMerged removes it only after the record's
+	// rename.
+	sum := sha256Hex(input)
+	b, err := marshalRmDropped(rmDropRecord{Input: sum, Base: sum, Dropped: []rmDrop{{Name: "k", Generation: mgen(9)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(s.dataRoot, rmDroppedName)
+	if err := os.WriteFile(p, b, floorFileMode); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.MergeFloor(ctx, MergeOptions{DryRun: true})
+	if err != nil || !r.AlreadyMerged {
+		t.Fatalf("dry run of the finish = %+v, %v; want already merged", r, err)
+	}
+	if _, err := os.Lstat(p); err != nil {
+		t.Fatalf("the rm-dropped record after the dry run: %v, want it left", err)
+	}
+	r, err = s.MergeFloor(ctx, MergeOptions{})
+	if err != nil || !r.AlreadyMerged {
+		t.Fatalf("finishing rerun = %+v, %v; want already merged", r, err)
+	}
+	if err := s.MergePending(); err != nil {
+		t.Fatalf("MergePending after the finish: %v, want the guard cleared", err)
+	}
+	if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the rm-dropped record after the finish: %v, want it removed", err)
+	}
+}

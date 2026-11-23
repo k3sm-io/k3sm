@@ -577,14 +577,20 @@ func (s *FileStore) finishRerun(ctx context.Context, st *mergeStaging, in *merge
 // finishRenamed finishes a merge whose retired record, rec, is already
 // renamed and whose input is not: it renames the input to to, the record's
 // name without .retired, or to the first free name when that one is taken,
-// and reports from rec, already merged. A dry run renames nothing. A
-// failed rename is committed.
+// and reports from rec, already merged. The rm-dropped record goes first,
+// as in renameMerged, so none outlives the guard. A dry run renames
+// nothing. A failed rename is committed.
 func (s *FileStore) finishRenamed(in *mergeInput, rec retiredRecord, to string, dryRun bool) (MergeReport, error) {
 	r := MergeReport{AlreadyMerged: true, Retired: rec.Retired, BuriedLive: rec.BuriedLive, Kept: rec.Kept, Recorded: rec.Recorded, Dropped: rec.Dropped}
 	if dryRun {
 		return r, nil
 	}
 	err := in.same()
+	if err == nil {
+		if err = in.dir.Remove(rmDroppedName); errors.Is(err, fs.ErrNotExist) {
+			err = nil
+		}
+	}
 	if err == nil {
 		err = renameExclIn(in.dir, in.base, to)
 		if errors.Is(err, fs.ErrExist) {
