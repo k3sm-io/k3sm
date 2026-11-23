@@ -243,3 +243,68 @@ func TestRealPrimitivesUnreachable(t *testing.T) {
 		})
 	}
 }
+
+// The keystore step refuses while the maintenance marker stands in the data
+// root, naming the verbs to rerun: it changes nothing, so it never flags or
+// hands over a log a stopped floor --rebuild or audit --rotate left
+// root-owned. Once the marker is gone it runs as usual.
+func TestKeystoreFilesRefuseDuringMaintenance(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec := &attrRecorder{}
+	setSeam(t, &euidSeam, func() int { return 0 })
+	setSeam[fileAttrWriter](t, &fileAttrSeam, rec)
+	// A stopped rotate's state: the root-owned new log, unflagged.
+	log := filepath.Join(root, keystore.AuditLogName)
+	if err := os.WriteFile(log, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, keystore.MaintenanceMarkerName)
+	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := ensureKeystoreFiles(root, 271, 20, os.Getuid())
+	if !errors.Is(err, errKeystoreMaintenance) || !strings.Contains(err.Error(), "floor --rebuild") || !strings.Contains(err.Error(), "audit --rotate") {
+		t.Fatalf("install while the marker stands: %v, want errKeystoreMaintenance naming both verbs", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("install made file-attribute calls while the marker stands: %q", rec.calls)
+	}
+	for _, n := range []string{keystore.UserFloorLogName, keystore.RunDirName} {
+		if _, err := os.Lstat(filepath.Join(root, n)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("install created %s while the marker stands: %v", n, err)
+		}
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureKeystoreFiles(root, 271, 20, os.Getuid()); err != nil {
+		t.Fatalf("install once the marker is gone: %v", err)
+	}
+}
+
+// The keystore step judges the data root's flags and ACL as the keystore
+// does (keystore.JudgeDirFlagsACL): a data root carrying a file flag beside
+// SF_APPEND is refused, changing nothing.
+func TestKeystoreFilesJudgeDataRootFlags(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec := &attrRecorder{}
+	setSeam(t, &euidSeam, func() int { return 0 })
+	setSeam[fileAttrWriter](t, &fileAttrSeam, rec)
+	if err := unix.Chflags(root, unix.UF_HIDDEN); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Chflags(root, 0) })
+	err := ensureKeystoreFiles(root, 271, 20, os.Getuid())
+	if !errors.Is(err, errKeystoreFileUntrusted) {
+		t.Fatalf("install over a flagged data root: %v, want errKeystoreFileUntrusted", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("install made file-attribute calls over a flagged data root: %q", rec.calls)
+	}
+}

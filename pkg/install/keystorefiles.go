@@ -53,6 +53,11 @@ var (
 	errKeystoreFileUntrusted = errors.New("a keystore file in the data root is not what install creates; it is kept as found")
 	// errKeystoreFloorWithScopes is a missing floor while user scopes exist:
 	// a new, empty floor would lower every scope's floor.
+	// errKeystoreMaintenance is the keystore step run while the maintenance
+	// marker stands: a maintenance verb is running or stopped part-way, and
+	// handing a log to the service user then could hand over a log the verb
+	// has not finished.
+	errKeystoreMaintenance     = errors.New("keystore-maintenance exists in the data root, so a keystore maintenance verb is running or stopped part-way; install changes nothing while it stands: rerun the verb that stopped (sudo k3sm keys floor --rebuild or sudo k3sm keys audit --rotate), which removes the marker, then rerun install")
 	errKeystoreFloorWithScopes = errors.New("the user-scope floor is missing while user scopes exist; a new floor would lower every scope's floor, so install does not create one: restore keystore/, keystore/.user/ and both logs from one backup, then rebuild the floor")
 )
 
@@ -80,7 +85,9 @@ func keystoreStep(sys System, cfg Config, uid uint32) error {
 // dataRoot, for the service user svcUID:svcGID, and keeps what an earlier
 // install made. rootUID is the data root's owner: 0 in production; only a
 // non-root test passes its own uid. Every step goes through one descriptor
-// on the data root, opened O_DIRECTORY|O_NOFOLLOW and judged on fstat.
+// on the data root, opened O_DIRECTORY|O_NOFOLLOW and judged on fstat, its
+// flags and its ACL as the keystore judges it (keystore.JudgeDirFlagsACL).
+// While the maintenance marker stands it refuses, changing nothing.
 //
 // A new log is made in the order that leaves no window for the service user:
 // created root-owned 0600 with O_CREAT|O_EXCL|O_NOFOLLOW, nothing written,
@@ -104,6 +111,14 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 	}
 	if int64(st.Uid) != int64(rootUID) || st.Mode&0o022 != 0 {
 		return fmt.Errorf("the data root %s is not root's, or is group- or other-writable: %w", dataRoot, errKeystoreFileUntrusted)
+	}
+	if err := keystore.JudgeDirFlagsACL(dfd); err != nil {
+		return fmt.Errorf("the data root %s: %w: %w", dataRoot, err, errKeystoreFileUntrusted)
+	}
+	if err := unix.Fstatat(dfd, keystore.MaintenanceMarkerName, &st, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+		return errKeystoreMaintenance
+	} else if !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("look for %s: %w", keystore.MaintenanceMarkerName, err)
 	}
 	if err := ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID); err != nil {
 		return err
