@@ -278,7 +278,7 @@ func TestKeysDeliverWritersSerialize(t *testing.T) {
 }
 
 // TestKeysRmWarnsDeclared: rm of an entry still declared for delivery warns
-// once per declared target, naming the namespace and Secret and what to do,
+// once per declared target, naming the namespace and Secret and what happens,
 // and prints no path and no value; an undeclared entry draws no warning.
 func TestKeysRmWarnsDeclared(t *testing.T) {
 	h := newKeysHarness(t)
@@ -291,7 +291,7 @@ func TestKeysRmWarnsDeclared(t *testing.T) {
 	h.mustRun(keysOK, "rm", "system/api-token", "--yes")
 	errOut := h.stderr.String()
 	for _, want := range []string{
-		"system/api-token is still declared for delivery to payments/api-token; the Secret keeps its value: run `k3sm keys undeliver` and delete the Secret",
+		"system/api-token is still declared for delivery to payments/api-token; the server deletes that Secret on its next sweep, whether or not you run `k3sm keys undeliver`",
 		"still declared for delivery to ops/tok",
 	} {
 		if !strings.Contains(errOut, want) {
