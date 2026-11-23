@@ -145,6 +145,11 @@ type doctorEnv struct {
 	// (keystore.FileStore.StandingMaintenance): whether one stands and the
 	// command of the run that wrote it. A nil seam leaves the row unprobed.
 	keystoreMaintenance func(context.Context) (verb string, present bool, err error)
+	// keystoreLossyRuns reads the lossy-run record
+	// (keystore.FileStore.LossyMaintenanceRuns): the committed maintenance
+	// runs that dropped lines or keys, oldest first. A nil seam leaves the
+	// row unprobed.
+	keystoreLossyRuns func(context.Context) ([]keystore.MaintenanceRun, error)
 	// interconnect is the interconnect section's seams (doctorinterconnect.go).
 	// Nil leaves the section out of the report.
 	interconnect *interconnectEnv
@@ -171,6 +176,7 @@ func doctorChecks() []doctorCheck {
 		{"keystore-logs", checkKeystoreLogs},
 		{"keystore-floor", checkKeystoreFloor},
 		{"keystore-maintenance", checkKeystoreMaintenance},
+		{"keystore-maintenance-runs", checkKeystoreLossyRuns},
 	}
 }
 
@@ -261,6 +267,33 @@ func checkKeystoreMaintenance(env doctorEnv) checkResult {
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, naming no maintenance verb this build knows; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName), remedy: "sudo k3sm install   # removes a stale marker"}
 	}
 	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, left by keys %s, which stopped or did not report; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName, verb), remedy: "sudo k3sm keys " + verb + "   # finishes the run, or prints its committed report"}
+}
+
+// checkKeystoreLossyRuns is the lossy-run record's row: the maintenance
+// runs that committed and dropped lines or keys, which the record keeps
+// after the marker that held their report is gone. None is PASS; some is
+// WARN with the count, the newest's time and its total; a record that does
+// not read is WARN, never PASS: it is left as found and no run appends to
+// it.
+func checkKeystoreLossyRuns(env doctorEnv) checkResult {
+	const name = "keystore-maintenance-runs"
+	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+		return checkResult{name: name, status: statusSkip, detail: "a worker keeps no keystore"}
+	}
+	if env.keystoreLossyRuns == nil {
+		return checkResult{name: name, status: statusSkip, detail: "not probed"}
+	}
+	runs, err := env.keystoreLossyRuns(context.Background())
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("could not read %s: %v", keystore.MaintenanceRunsName, err), remedy: "sudo k3sm doctor   # the record is root's"}
+	case err != nil:
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore maintenance: %s could not be read, so earlier runs' drop counts are not shown: %v", keystore.MaintenanceRunsName, err), remedy: "as root, move " + keystore.MaintenanceRunsName + " in the data root aside and keep it; the next lossy run starts a new one"}
+	case len(runs) == 0:
+		return checkResult{name: name, status: statusPass, detail: "keystore maintenance: no lossy run recorded"}
+	}
+	latest := runs[len(runs)-1]
+	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore maintenance: %d lossy run(s), latest %s dropped %d line(s)", len(runs), latest.Time.UTC().Format(time.RFC3339), latest.Dropped()), remedy: "as root, read " + keystore.MaintenanceRunsName + " in the data root: each lossy run's drop counts by reason, the newest 64 kept"}
 }
 
 // keystoreSoftCapHint is the keystore-logs row's WARN when either log is
@@ -962,6 +995,9 @@ func realDoctorEnv(workDir string) doctorEnv {
 		},
 		keystoreMaintenance: func(ctx context.Context) (string, bool, error) {
 			return keystore.New(keystoreLayout(workDir)).StandingMaintenance(ctx)
+		},
+		keystoreLossyRuns: func(ctx context.Context) ([]keystore.MaintenanceRun, error) {
+			return keystore.New(keystoreLayout(workDir)).LossyMaintenanceRuns(ctx)
 		},
 		interconnect: realInterconnectEnv(),
 	}
