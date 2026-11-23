@@ -125,6 +125,36 @@ func (d diffLog) sync(t *testing.T) *logState {
 	return state
 }
 
+// syncSeeded reads buf from scratch, seeded with the torn fragments an
+// incremental reader froze (logState.frozen): a reader from scratch cannot
+// know where a torn tail ended before a foreign append grew it, so it is
+// told, and must then agree on everything else.
+func syncSeeded(t *testing.T, s *FileStore, whole bool, maxKeys int, buf *[]byte, frozen map[int64][]byte) *logState {
+	t.Helper()
+	var empty []byte
+	d := newDiffLog(s, whole, maxKeys, &empty)
+	d.sync(t)
+	d.l.state.frozen = maps.Clone(frozen)
+	d.buf = buf
+	d.l.readAt = func(*os.File) io.ReaderAt { return bytes.NewReader(*buf) }
+	return d.sync(t)
+}
+
+// stripOffsets maps frozen offsets in b to those in stripEmptyLines(b).
+func stripOffsets(b []byte, frozen map[int64][]byte) map[int64][]byte {
+	out := map[int64][]byte{}
+	for off, frag := range frozen {
+		n := int64(0)
+		for i := int64(0); i < off && i < int64(len(b)); i++ {
+			if b[i] == '\n' && (i == 0 || b[i-1] == '\n') {
+				n++
+			}
+		}
+		out[off-n] = frag
+	}
+	return out
+}
+
 // diffClass names the kind of a bad verdict.
 func diffClass(err error) string {
 	for _, c := range []struct {
@@ -161,7 +191,9 @@ func stripEmptyLines(b []byte) []byte {
 // damage count and verdict, and on both logs' past-cap charges per uid and
 // the revocation room they leave, under small caps, budget and key bound.
 // Garbage, over-long and torn lines are skipped as damage, so the readers
-// are compared on the lines after them too; an empty line (an append's
+// are compared on the lines after them too; a torn tail is frozen where it
+// was first read, so the reader from scratch is seeded with the fragments
+// the incremental one froze before the batch; an empty line (an append's
 // leading newline) is benign, so the floor read without its empty lines
 // must agree on keys, damage, seqs and tombstones. The seeds are committed under
 // testdata/fuzz/FuzzLogSyncDifferential.
@@ -175,6 +207,7 @@ func FuzzLogSyncDifferential(f *testing.F) {
 		incFloor, incAudit := newDiffLog(s, true, maxKeys, &floorBuf), newDiffLog(s, false, maxKeys, &auditBuf)
 		probe := append([]byte(nil), d.b...)
 		defer diffPrefixTaints(t, s, maxKeys, &floorBuf, &diffInput{probe})
+		frozen := map[bool]map[int64][]byte{true: {}, false: {}}
 		for i, batch := range diffStream(d) {
 			for _, it := range batch {
 				floorBuf = append(floorBuf, it.floor...)
@@ -184,8 +217,11 @@ func FuzzLogSyncDifferential(f *testing.F) {
 				name string
 				inc  diffLog
 			}{{"floor", incFloor}, {"audit", incAudit}} {
+				hist := frozen[lg.inc.l.whole]
+				seed := maps.Clone(hist)
 				got := lg.inc.sync(t)
-				want := newDiffLog(s, lg.inc.l.whole, maxKeys, lg.inc.buf).sync(t)
+				maps.Copy(hist, got.frozen)
+				want := syncSeeded(t, s, lg.inc.l.whole, maxKeys, lg.inc.buf, seed)
 				where := fmt.Sprintf("%s after batch %d (%d bytes, hard cap %d)", lg.name, i, len(*lg.inc.buf), s.logHardCap)
 				if gc, wc := diffClass(got.bad), diffClass(want.bad); gc != wc {
 					t.Fatalf("%s: incremental verdict %q (%v), from scratch %q (%v)", where, gc, got.bad, wc, want.bad)
@@ -224,7 +260,7 @@ func FuzzLogSyncDifferential(f *testing.F) {
 					// Empty lines, an append's leading newlines, are benign:
 					// the floor without them reads the same.
 					bare := stripEmptyLines(*lg.inc.buf)
-					strip := newDiffLog(s, true, maxKeys, &bare).sync(t)
+					strip := syncSeeded(t, s, true, maxKeys, &bare, stripOffsets(*lg.inc.buf, seed))
 					if diffClass(strip.bad) != "" {
 						continue
 					}

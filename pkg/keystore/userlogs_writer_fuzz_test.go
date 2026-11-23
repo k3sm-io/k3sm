@@ -205,6 +205,12 @@ func writerFuzzTornBurial(t *testing.T, s *FileStore, fl *fileFloorLog, maxKeys 
 	for cut := 0; cut <= len(burial); cut++ {
 		b := append(append([]byte(nil), base...), burial[:cut]...)
 		rewriteLog(t, s, userFloorLogName, b, false)
+		// Each cut is a crash point of its own, not a torn tail a foreign
+		// append grew: drop the fragment the cached reader froze at the
+		// last cut, which would otherwise fix that cut's classification.
+		fl.log.mu.Lock()
+		fl.log.state.frozen = nil
+		fl.log.mu.Unlock()
 		want := writerFuzzFresh(t, s, true, maxKeys)
 		got := writerFuzzSync(t, fl.log)
 		where := fmt.Sprintf("torn burial of %s %s at %d", scope, name, cut)

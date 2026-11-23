@@ -553,6 +553,15 @@ type logState struct {
 	// refused while it counts.
 	unrecovered   bool
 	unrecoveredAt int64
+	// frozen holds the torn last line's bytes as first read, by its
+	// offset: its classification is fixed there. The line that later
+	// starts at that offset is damage unless it is exactly those bytes and
+	// a newline (the server's next append leads with one), so bytes a
+	// foreign writer appends with no leading newline can never complete
+	// the fragment into a line that parses or that names another key. It
+	// holds one entry at most, dropped once the line is read whole; it is
+	// kept for this reading of the file only, never across a fresh read.
+	frozen map[int64][]byte
 }
 
 // damaged is the count of damaged lines: those skipped, and a last line
@@ -830,10 +839,28 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 				s.badAt = off
 			}
 			s.off, s.tornSize = off, st.Size
+			if _, ok := s.frozen[off]; !ok {
+				s.frozen = map[int64][]byte{off: line}
+			}
 			if l.whole {
-				s.tornTaint(off, line)
+				s.tornTaint(off, s.frozen[off])
 			}
 			return s, nil
+		}
+		if frag, ok := s.frozen[off]; ok {
+			delete(s.frozen, off)
+			if !bytes.Equal(line[:len(line)-1], frag) {
+				// Bytes appended to a torn line with no leading newline
+				// are a foreign writer's: the merged line is damage,
+				// classified by the fragment as first read.
+				s.skip(off)
+				if l.whole {
+					s.taintLine(off, frag)
+				}
+				s.lastAt, s.last = off, line
+				off += int64(len(line))
+				continue
+			}
 		}
 		if errors.Is(err, errLogLineTooLong) {
 			// An over-long line is damage, skipped and charged to no uid. It
