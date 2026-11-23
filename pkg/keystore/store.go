@@ -69,6 +69,12 @@ var (
 	errLostPointer = fmt.Errorf("%w, although the floor records that this entry committed one", errNoPointer)
 	// errInvalidConfig reports a Config every operation refuses.
 	errInvalidConfig = errors.New("invalid keystore config")
+	// ErrFloorRecordsEntry is Absent's answer for a name the floor still
+	// records whose directory is missing. Delete removes the name from the
+	// floor, so that state is not an rm: it is a restored or rolled-back
+	// keystore/ (or an interrupted Delete), and a caller about to act on the
+	// deletion must hold.
+	ErrFloorRecordsEntry = errors.New("the keystore floor still records this entry but its directory is missing (a restored or rolled-back keystore, not a delete)")
 )
 
 // Config locates a FileStore and names the user it belongs to.
@@ -381,11 +387,17 @@ func (s *FileStore) Current(ctx context.Context, name string) (Version, []byte, 
 // answer about name, since a data root restored without its keystore, or not
 // yet mounted, is not every entry deleted. So Absent is true only when the
 // entries' directory opens and is trusted under the shared lock, the recorded
-// floor reads, and name has no directory there or holds only what an
-// interrupted Put leaves (not an entry, as for Current). A missing entries'
-// directory, an entry Current reports as corrupt (a lost pointer included)
-// and any other failure is false with the error. It reads no record and does
-// not load the master key, so it names no value.
+// floor reads, name has no directory there, and the floor does not record
+// name. Delete removes the name from the floor, so a floor that records a
+// name with no directory is a restored or rolled-back tree, not a delete:
+// that is false with ErrFloorRecordsEntry. An interrupted Put (a directory
+// with no pointer, in the shape a crashed Put leaves) is not an entry for
+// Current, but it is not a proven deletion either: false with its error. A
+// missing entries' directory, an entry Current reports as corrupt (a lost
+// pointer included) and any other failure is false with the error. Where
+// the floor proves nothing (absent, rebuilt, or full so that it records only
+// some names), the caller's own guards are all that stand. It reads no
+// record and does not load the master key, so it names no value.
 func (s *FileStore) Absent(ctx context.Context, name string) (absent bool, identity string, err error) {
 	absent, identity, err = s.absent(ctx, name)
 	if err != nil {
@@ -422,7 +434,12 @@ func (s *FileStore) absent(ctx context.Context, name string) (bool, string, erro
 	case err == nil:
 		e.close()
 		return false, id, nil
+	case errors.Is(err, errInterruptedPut):
+		return false, "", err
 	case errors.Is(err, ErrNotFound):
+		if _, recorded := fl[name]; recorded {
+			return false, "", ErrFloorRecordsEntry
+		}
 		return true, id, nil
 	default:
 		return false, "", err

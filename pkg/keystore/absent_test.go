@@ -22,6 +22,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -86,5 +87,46 @@ func TestAbsent(t *testing.T) {
 	mustPut(t, s, "fresh", KindOpaque, []byte("fresh"))
 	if after, err := s.Identity(ctx); err != nil || after == before {
 		t.Fatalf("Identity of a recreated entries' directory = %q %v, want other than %q", after, err, before)
+	}
+}
+
+// TestAbsentHoldsWhatTheFloorRecords: the floor is the witness of a delete.
+// An older keystore/ restored the documented way (moved aside, a backup put
+// in its place) lacks a name the live floor still records: Absent refuses
+// to call that an absence. An interrupted Put is not an absence either. A
+// real Delete removes the name from the floor, and then it is absent.
+func TestAbsentHoldsWhatTheFloorRecords(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	ks := filepath.Join(server, "keystore")
+	mustPut(t, s, "a", KindOpaque, []byte("a"))
+	copyTree(t, ks, ks+".backup")
+	mustPut(t, s, "b", KindOpaque, []byte("b"))
+	if err := os.Rename(ks, ks+".pre-restore"); err != nil {
+		t.Fatal(err)
+	}
+	copyTree(t, ks+".backup", ks)
+	if got, _, err := s.Absent(ctx, "b"); got || !errors.Is(err, ErrFloorRecordsEntry) {
+		t.Fatalf("Absent(b) after a restore without it = %v %v, want false and ErrFloorRecordsEntry", got, err)
+	}
+	if got, _, err := s.Absent(ctx, "never"); !got || err != nil {
+		t.Fatalf("Absent(never) = %v %v, want true", got, err)
+	}
+
+	// An interrupted Put: generation and v1, no pointer, and a floor that
+	// does not record that generation.
+	mustPut(t, s, "half", KindOpaque, []byte("half"))
+	remove(t, filepath.Join(ks, "half", currentName))
+	writeFile(t, filepath.Join(ks, "half", generationName), strings.Repeat("ab", generationSize)+"\n")
+	if got, _, err := s.Absent(ctx, "half"); got || !errors.Is(err, errInterruptedPut) {
+		t.Fatalf("Absent(half) for an interrupted Put = %v %v, want false and the interrupted-put error", got, err)
+	}
+
+	// A real rm takes the name out of the floor.
+	if err := s.Delete(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := s.Absent(ctx, "a"); !got || err != nil {
+		t.Fatalf("Absent(a) after Delete = %v %v, want true", got, err)
 	}
 }
