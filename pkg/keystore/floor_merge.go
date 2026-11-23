@@ -774,7 +774,7 @@ func rmSince(old, now floor, gone map[floorBurial]bool) bool {
 func goneDrops(gone map[floorBurial]bool) []pruned {
 	out := make([]pruned, 0, len(gone))
 	for b := range gone {
-		out = append(out, pruned{name: b.name, generation: b.generation})
+		out = append(out, pruned(b))
 	}
 	slices.SortFunc(out, func(a, b pruned) int {
 		return strings.Compare(a.name+"\x00"+a.generation, b.name+"\x00"+b.generation)
