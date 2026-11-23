@@ -28,7 +28,6 @@ import (
 	"syscall"
 	"testing"
 	"testing/synctest"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -92,13 +91,13 @@ func (r *inoRecorder) of(ino uint64) []string {
 	return out
 }
 
-func inoOf(t *testing.T, p string) (uint64, uint16) {
+func inoOf(t *testing.T, p string) (uint64, uint64) {
 	t.Helper()
 	var st unix.Stat_t
 	if err := unix.Lstat(p, &st); err != nil {
 		t.Fatal(err)
 	}
-	return st.Ino, st.Nlink
+	return st.Ino, uint64(st.Nlink)
 }
 
 // placeArchive writes the audit archive n, root's (the data root's owner's)
@@ -299,15 +298,6 @@ func TestMaintenanceStagingDirIsRootOnly(t *testing.T) {
 	}
 }
 
-// fcntlGetPath fills buf with the path of the file open at fd (fcntl
-// F_GETPATH).
-func fcntlGetPath(fd int, buf []byte) error {
-	if _, _, errno := unix.Syscall(unix.SYS_FCNTL, uintptr(fd), unix.F_GETPATH, uintptr(unsafe.Pointer(&buf[0]))); errno != 0 {
-		return errno
-	}
-	return nil
-}
-
 // TestMaintenanceJudgesMarkerAndStale: a root marker with a second link is
 // read, with a Warn; a staging file a crash left is cleaned; an
 // archive that is not 0600 refuses rotate, and one with a second link does
@@ -506,7 +496,7 @@ func TestOldLogUnflaggedServiceOwnedRefused(t *testing.T) {
 		name  string
 		owner uint32
 		flags uint32
-		nlink uint16
+		nlink int
 		acl   bool
 		want  error
 	}{
@@ -520,7 +510,10 @@ func TestOldLogUnflaggedServiceOwnedRefused(t *testing.T) {
 		{"unflagged, the service user's, with an ACL", 501, 0, 1, true, errOldLogUnflagged},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			st := unix.Stat_t{Mode: unix.S_IFREG | logMode, Uid: tt.owner, Nlink: tt.nlink}
+			st := unix.Stat_t{Mode: unix.S_IFREG | logMode, Uid: tt.owner}
+			for range tt.nlink { // Stat_t.Nlink's type differs by OS
+				st.Nlink++
+			}
 			err := s.judgeOldLog(userFloorLogName, &st, tt.flags, tt.acl)
 			if tt.want == nil && err != nil || tt.want != nil && !errors.Is(err, tt.want) {
 				t.Fatalf("got %v, want %v", err, tt.want)
@@ -643,7 +636,7 @@ func TestRemoveScopeWalksJudgedRoot(t *testing.T) {
 	if err := os.WriteFile(keep, []byte("decoy"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+	if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 		t.Fatalf("removeScopeTree: %v", err)
 	}
 	if _, err := os.Lstat(keep); err != nil {

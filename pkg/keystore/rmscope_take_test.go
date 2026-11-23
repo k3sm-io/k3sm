@@ -73,7 +73,7 @@ func TestRemoveScopeTakesEachDirBeforeListing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+	if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 		t.Fatalf("removeScopeTree: %v", err)
 	}
 	got := map[uint64]uint32{}
@@ -121,7 +121,7 @@ func TestRemoveScopeLeavesForeignDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	err = removeScopeTree(root, s.dir, "1001", s.uid+1, true)
+	_, err = removeScopeTree(root, s.dir, "1001", s.uid+1, rmTreeOpts{listed: true})
 	if !errors.Is(err, errScopeForeignDir) {
 		t.Fatalf("removeScopeTree over a foreign directory: %v, want errScopeForeignDir", err)
 	}
@@ -151,10 +151,23 @@ func TestRemoveScopeLeavesForeignDir(t *testing.T) {
 
 // A directory holding more names than one batch is emptied batch by batch,
 // each read from the start: with a batch of 3 the walk never holds more
-// than 3 names of a listing, and the scope directory, its subdirectory of
-// 40 files and its own 12 names are all removed, with no count refused.
+// than 3 names of a listing (every listing it makes, through the seam, asks
+// for at most 3 and gets at most 3), and the scope directory, its
+// subdirectory of 40 files and its own 12 names are all removed, with no
+// count refused.
 func TestRemoveScopeBatchesHugeDir(t *testing.T) {
 	setSeam(t, &rmDirBatch, 3)
+	var listings, most int
+	saved := rmReadBatch
+	setSeam(t, &rmReadBatch, func(dfd, n int, skip map[string]bool) ([]string, error) {
+		names, err := saved(dfd, n, skip)
+		listings++
+		if n > rmDirBatch || len(names) > rmDirBatch {
+			t.Errorf("a listing asked for %d names and got %d, past the batch of %d", n, len(names), rmDirBatch)
+		}
+		most = max(most, len(names))
+		return names, err
+	})
 	s, server, _ := fileLogScope(t)
 	dir := scopeDir(server, "1001")
 	big := filepath.Join(dir, "big")
@@ -176,8 +189,13 @@ func TestRemoveScopeBatchesHugeDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+	if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 		t.Fatalf("removeScopeTree over more names than a batch: %v", err)
+	}
+	// 52 names in batches of at most 3 take at least 18 listings; a full
+	// batch shows the bound was reached, not just respected.
+	if listings < 18 || most != rmDirBatch {
+		t.Errorf("the walk made %d listings, the largest of %d names; want at least 18, the largest %d", listings, most, rmDirBatch)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the scope directory is still there: %v", err)

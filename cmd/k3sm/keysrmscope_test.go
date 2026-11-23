@@ -30,11 +30,12 @@ import (
 type keysRmScopeStub struct {
 	keysStore
 	recorded bool
+	cleared  string
 	err      error
 }
 
-func (s keysRmScopeStub) RemoveScope(context.Context, uint32) (bool, error) {
-	return s.recorded, s.err
+func (s keysRmScopeStub) RemoveScope(context.Context, uint32) (keystore.RemoveScopeResult, error) {
+	return keystore.RemoveScopeResult{Recorded: s.recorded, Cleared: s.cleared}, s.err
 }
 
 // rm-scope exits 4, audited committed, both when the record is full (its
@@ -67,5 +68,71 @@ func TestKeysRmScopeUnlistedExitsCommitted(t *testing.T) {
 				t.Errorf("rm-scope audit lines %q, want committed", lines)
 			}
 		})
+	}
+}
+
+// An rm-scope that stopped part-way after it changed something (the
+// committed class) exits 4, audited committed, and prints what remains and
+// that a rerun continues; one that stopped before changing anything is a
+// refusal, exit 1, audited refused. The stub's errors are the shape
+// rmStopped gives a stop a rerun can finish (a failed take, a failed
+// stat), which is the only kind it pairs with the rerun line.
+func TestKeysRmScopePartialExitsFour(t *testing.T) {
+	const remains = "its directory \"keystore/.user/1001\" is partly or wholly present: rerun sudo k3sm keys rm-scope user/1001 --yes to finish removing it"
+	for _, tc := range []struct {
+		name  string
+		err   error
+		code  int
+		audit string
+	}{
+		{"changed, then stopped", fmt.Errorf("%w: rm-scope began removing the scope, then stopped: take the directory \"/srv/keystore/.user/1001/entries\" (named for reading, not for pasting) from the service user: input/output error; the scope user/1001 is listed as removed in keystore-removed-scopes.json, so no open serves it, and %s", keystore.ErrCommitted, remains), keysCommitted, "rm-scope  committed"},
+		{"stopped before any change", fmt.Errorf("stat \"c0\": input/output error; the scope user/1001 is listed as removed in keystore-removed-scopes.json, so no open serves it, and %s", remains), keysRefused, "rm-scope  refused"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newKeysHarness(t)
+			var lines []string
+			h.wrap = func(s keysStore) keysStore {
+				return keysAuditRecorder{keysStore: keysRmScopeStub{keysStore: s, recorded: true, err: tc.err}, lines: &lines}
+			}
+			h.euid = 0
+			h.mustRun(tc.code, "rm-scope", "user/1001", "--yes")
+			out := h.stdout.String() + h.stderr.String()
+			if !strings.Contains(out, remains) {
+				t.Errorf("rm-scope printed %q, want what remains and the rerun", out)
+			}
+			if tc.code == keysCommitted && !strings.Contains(out, "(exit 4)") {
+				t.Errorf("rm-scope printed %q, want it to name exit 4", out)
+			}
+			if strings.Contains(out, "removed user/1001;") {
+				t.Errorf("a stopped rm-scope printed the success line: %q", out)
+			}
+			if !slices.Equal(lines, []string{tc.audit}) {
+				t.Errorf("rm-scope audit lines %q, want %q", lines, tc.audit)
+			}
+		})
+	}
+}
+
+// A clean rm-scope that cleared a user flag on the shared .user directory
+// prints that note as a line of its normal output, after the removal line,
+// and exits 0, audited ok; the note is not a warning on stderr.
+func TestKeysRmScopePrintsClearedNote(t *testing.T) {
+	const note = "rm-scope cleared a user flag (flags 0x2) on the shared directory \"/srv/keystore/.user\" (named for reading, not for pasting), which the service user owns and could clear itself, to remove the scope directory in it"
+	h := newKeysHarness(t)
+	var lines []string
+	h.wrap = func(s keysStore) keysStore {
+		return keysAuditRecorder{keysStore: keysRmScopeStub{keysStore: s, recorded: true, cleared: note}, lines: &lines}
+	}
+	h.euid = 0
+	h.mustRun(keysOK, "rm-scope", "user/1001", "--yes")
+	want := "removed user/1001; run sudo k3sm keys floor --rebuild to free its floor keys\n" + note + "\n"
+	if h.stdout.String() != want {
+		t.Errorf("rm-scope printed %q, want %q", h.stdout.String(), want)
+	}
+	if strings.Contains(h.stderr.String(), "cleared") {
+		t.Errorf("rm-scope wrote the note to stderr: %q", h.stderr.String())
+	}
+	if !slices.Equal(lines, []string{"rm-scope  ok"}) {
+		t.Errorf("rm-scope audit lines %q, want ok", lines)
 	}
 }

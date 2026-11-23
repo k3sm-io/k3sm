@@ -572,6 +572,62 @@ func (u *UserScope) openScopeDir(root *os.Root, create bool) (*os.Root, error) {
 	return dir, nil
 }
 
+// openScopeDirForRm is openScopeDir for rm-scope's judge only, never for
+// a serving path: .user and .user/<uid>/ are each opened as openSubdir
+// does (Lstat, OpenRoot, the same file on the descriptor) and must be the
+// service user's, but their mode is not judged. The service user can set
+// either directory's mode, and a judge that refused it would let the
+// principal being revoked veto its revocation; the take then forces the
+// scope directory to 0700. A missing level is errNoScopeKey; another owner
+// is ErrCorrupt, as with openScopeDir.
+func (u *UserScope) openScopeDirForRm(root *os.Root) (*os.Root, error) {
+	users, err := u.s.openSubdirAnyMode(root, userScopesName)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, errNoScopeKey
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, userScopesName, err)
+	}
+	defer func() { _ = users.Close() }() // the scope directory is opened; .user is done with
+	dir, err := u.s.openSubdirAnyMode(users, strconv.FormatUint(uint64(u.uid), 10))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, errNoScopeKey
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: the scope directory: %w", ErrCorrupt, err)
+	}
+	return dir, nil
+}
+
+// openSubdirAnyMode opens the existing directory name under parent as
+// openSubdir does, checking on the descriptor that it is the directory
+// Lstat named and that the service user owns it, whatever its mode.
+func (s *FileStore) openSubdirAnyMode(parent *os.Root, name string) (*os.Root, error) {
+	named, err := parent.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !named.IsDir() {
+		return nil, fmt.Errorf("%s is not a directory (mode %s)", name, named.Mode())
+	}
+	root, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := root.Stat(".")
+	if err == nil && !os.SameFile(named, opened) {
+		err = errors.New("changed while it was opened")
+	}
+	if err == nil {
+		err = s.checkOwned(opened, fs.ModePerm)
+	}
+	if err != nil {
+		_ = root.Close() // the open is abandoned; its close has nothing to report
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	return root, nil
+}
+
 // readScopeKey reads, checks and opens dir's scope.key and returns K_u, which
 // the caller clears. The file must be a regular file reached without a
 // symlink, owned by the service user, at most 0600, and of a scope key's
@@ -654,6 +710,40 @@ func (u *UserScope) openScopeForRevoke(root *os.Root, k keys) (*openedScope, err
 	if err != nil {
 		return nil, err
 	}
+	return u.openRevokeIn(dir, k)
+}
+
+// openScopeForRm is rm-scope's judge: openScopeForRevoke over the scope
+// directory openScopeDirForRm opens, so neither .user's nor the scope
+// directory's mode refuses it. pin is the device and inode of the scope
+// directory it opened, set whenever it opened one, also when its
+// scope.key is then missing or untrusted, so rm-scope can require the
+// directory its walk holds at the name to be the one judged.
+func (u *UserScope) openScopeForRm(root *os.Root, k keys) (*openedScope, rmDirPin, error) {
+	dir, err := u.openScopeDirForRm(root)
+	if err != nil {
+		return nil, rmDirPin{}, err
+	}
+	var pin rmDirPin
+	if fi, serr := dir.Stat("."); serr == nil {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			pin = rmDirPin{dev: uint64(st.Dev), ino: st.Ino, set: true}
+		}
+	}
+	o, err := u.openRevokeIn(dir, k)
+	return o, pin, err
+}
+
+// rmDirPin is the device and inode of the scope directory rm-scope's
+// judge opened (set when it opened one).
+type rmDirPin struct {
+	dev, ino uint64
+	set      bool
+}
+
+// openRevokeIn is openScopeForRevoke over the opened scope directory dir,
+// which it closes on a failure.
+func (u *UserScope) openRevokeIn(dir *os.Root, k keys) (*openedScope, error) {
 	r, err := u.s.readScopeKeyRecord(dir)
 	var ku []byte
 	if err == nil {
@@ -700,7 +790,7 @@ var errScopeKeyJudgeOnly = errors.New("scope.key's link count and mode are as th
 // link count and mode pass is errScopeKeyJudgeOnly, and one that does not
 // parse or authenticate is ErrCorrupt: both leave the removal unlisted.
 func (u *UserScope) openScopeForRmLoose(root *os.Root, k keys) (o *openedScope, why string, err error) {
-	dir, err := u.openScopeDir(root, false)
+	dir, err := u.openScopeDirForRm(root)
 	if err != nil {
 		return nil, "", err
 	}

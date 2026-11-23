@@ -142,6 +142,9 @@ type maintenance struct {
 	// saved is the report of a crashed run of this verb whose swap
 	// committed: the verb prints it and does not run again.
 	saved map[string]int64
+	// savedErr is why saved's drop counts were not recorded in the
+	// lossy-run record (recordLossyRun); the verb returns it, committed.
+	savedErr error
 	// refusal is the verb's refused-and-changed-nothing error.
 	refusal error
 	// keep leaves the marker in place: the run failed past step 4, so a
@@ -200,7 +203,8 @@ func (s *FileStore) lockMaintenance(ctx context.Context, root *os.Root) (*floorL
 // that died: when it is this verb's, its report says the swap was reached,
 // and the live log is the inode it recorded for the new log, the swap
 // committed, and m.saved is its report (the verb prints it and does not
-// run again). Otherwise, the other verb's marker among them, the live set
+// run again), whose drop counts are then recorded (recordLossyRun) unless
+// that run recorded them before it died. Otherwise, the other verb's marker among them, the live set
 // is valid and this run writes its own marker and runs from the start; a
 // committed run of the other verb is first reported (reportEarlierRun).
 func (s *FileStore) beginMaintenance(ctx context.Context, verb, logName string, refusal error, attrs FileAttrWriter) (*maintenance, error) {
@@ -249,6 +253,9 @@ func (s *FileStore) beginMaintenance(ctx context.Context, verb, logName string, 
 		if s.statLog(m.lfd, logName, &st) == nil && uint64(st.Dev) == prior.dev && st.Ino == prior.ino {
 			m.marker = true // it goes in end
 			m.saved = prior.report
+			if err := s.recordLossyRun(m.dfd, prior.run, prior.verb, prior.ino, prior.report); err != nil {
+				m.savedErr = swapCommitted(err)
+			}
 			return m, nil
 		}
 	}
@@ -257,7 +264,7 @@ func (s *FileStore) beginMaintenance(ctx context.Context, verb, logName string, 
 		// log's live inode is the one it recorded.
 		var st unix.Stat_t
 		if pl := verbLog(prior.verb); pl != "" && s.statLog(m.lfd, pl, &st) == nil && uint64(st.Dev) == prior.dev && st.Ino == prior.ino {
-			s.reportEarlierRun(ctx, prior)
+			s.reportEarlierRun(ctx, m.dfd, prior)
 		}
 	}
 	var run [8]byte
@@ -627,6 +634,13 @@ func (s *FileStore) swapLogDir(m *maintenance, name string, content func(io.Writ
 		return swapCommitted(err)
 	}
 	m.keep = false
+	// A lossy report outlives the marker: its drop counts are recorded
+	// before end removes it. A record that does not read is left as found,
+	// and the run, committed, says so; the marker still goes, since a rerun
+	// would meet the same record.
+	if err := s.recordLossyRun(m.dfd, m.mk.run, m.mk.verb, m.mk.ino, report); err != nil {
+		return swapCommitted(err)
+	}
 	return nil
 }
 
