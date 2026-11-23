@@ -172,7 +172,7 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 	}
 	defer done()
 	defer func() { // before done: the line is appended under the lock
-		l := auditLine{op: "rm", name: name, revoke: err == nil || errors.Is(err, errCommitted)}
+		l := auditLine{op: "rm", name: name, revoke: err == nil || Committed(err)}
 		err = u.keepAuditFailure("rm", err, u.appendAudit(l, err))
 	}()
 	return u.deleteBody(root, name)

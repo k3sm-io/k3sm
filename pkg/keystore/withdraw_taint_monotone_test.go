@@ -19,7 +19,6 @@ package keystore
 import (
 	"bytes"
 	"context"
-	"errors"
 	"testing"
 )
 
@@ -40,7 +39,7 @@ func TestWithdrawUnderTaintNeverRevivesLostWithdraw(t *testing.T) {
 	_, olderSeq := recordedDelivery(t, s, server, 3)
 	fl := s.userFloor.(*fileFloorLog).log
 	tornFloorWrite(fl)
-	if err := u.withdrawDelivery(ctx, testDelivery(3).uid); err != nil && !errors.Is(err, errCommitted) {
+	if err := u.withdrawDelivery(ctx, testDelivery(3).uid); err != nil && !Committed(err) {
 		t.Fatalf("withdraw whose floor line tears: %v", err)
 	}
 	fl.write = nil
@@ -78,7 +77,7 @@ func TestWithdrawUnderTaintAuditsEverySealed(t *testing.T) {
 	}
 	fl := s.userFloor.(*fileFloorLog).log
 	tornFloorWrite(fl)
-	if err := u.withdrawDelivery(ctx, testDelivery(3).uid); err != nil && !errors.Is(err, errCommitted) {
+	if err := u.withdrawDelivery(ctx, testDelivery(3).uid); err != nil && !Committed(err) {
 		t.Fatalf("withdraw whose floor line tears: %v", err)
 	}
 	fl.write = nil

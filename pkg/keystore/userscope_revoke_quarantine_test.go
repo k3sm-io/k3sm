@@ -30,8 +30,8 @@ func quarantineScope1001(t *testing.T, s *FileStore, u *UserScope) *FileStore {
 	ctx := context.Background()
 	fl := s.userFloor.(*fileFloorLog).log
 	tornFloorWrite(fl)
-	if _, err := u.Put(ctx, "user/1001/lost", KindOpaque, []byte("v")); !errors.Is(err, errCommitted) {
-		t.Fatalf("put whose floor line tears: %v, want errCommitted", err)
+	if _, err := u.Put(ctx, "user/1001/lost", KindOpaque, []byte("v")); !Committed(err) {
+		t.Fatalf("put whose floor line tears: %v, want Committed", err)
 	}
 	fl.write = nil
 	s2 := reopenStore(t, s)
@@ -91,8 +91,8 @@ func TestFullVolumeAtStartDoesNotQuarantine(t *testing.T) {
 	s, _, u := fileLogScope(t)
 	fl := s.userFloor.(*fileFloorLog).log
 	fl.write = func(*os.File, []byte) (int, error) { return 0, errors.New("injected failed floor write") }
-	if _, err := u.Put(ctx, "user/1001/lost", KindOpaque, []byte("v")); !errors.Is(err, errCommitted) {
-		t.Fatalf("put whose floor line failed: %v, want errCommitted", err)
+	if _, err := u.Put(ctx, "user/1001/lost", KindOpaque, []byte("v")); !Committed(err) {
+		t.Fatalf("put whose floor line failed: %v, want Committed", err)
 	}
 	fl.write = nil
 	s2 := reopenStore(t, s)
@@ -133,7 +133,7 @@ func TestWithdrawRunsUnderDeliveryRecordTaint(t *testing.T) {
 	older := readDeliveriesBytes(t, server)
 	fl := s.userFloor.(*fileFloorLog).log
 	tornFloorWrite(fl)
-	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil && !errors.Is(err, errCommitted) {
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil && !Committed(err) {
 		t.Fatalf("withdraw whose floor line tears: %v", err)
 	}
 	fl.write = nil

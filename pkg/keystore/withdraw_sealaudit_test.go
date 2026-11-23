@@ -74,7 +74,7 @@ func TestWithdrawMassSealAuditsEveryDeliveryAtBudgetEdge(t *testing.T) {
 			}
 			fl := s.userFloor.(*fileFloorLog).log
 			tornFloorWrite(fl)
-			if err := u.withdrawDelivery(ctx, testDelivery(deliveries).uid); err != nil && !errors.Is(err, errCommitted) {
+			if err := u.withdrawDelivery(ctx, testDelivery(deliveries).uid); err != nil && !Committed(err) {
 				t.Fatalf("withdraw whose floor line tears: %v", err)
 			}
 			fl.write = nil
@@ -111,7 +111,7 @@ func TestWithdrawMassSealAuditsEveryDeliveryAtBudgetEdge(t *testing.T) {
 					named[r.DeliveryUID] = true
 				}
 			}
-			if err != nil && !errors.Is(err, errCommitted) {
+			if err != nil && !Committed(err) {
 				if !errors.Is(err, ErrLogFull) || !bytes.Equal(floorAfter, floorBefore) || len(named) != 0 {
 					t.Fatalf("a refused mass seal (%v) wrote: floor grew %d bytes, audited %v", err, len(floorAfter)-len(floorBefore), named)
 				}
@@ -151,8 +151,8 @@ func TestAuditSealedKeepsGoingPastFailure(t *testing.T) {
 	u.s.auditSink = a
 	sealed := []delivery{testDelivery(1), testDelivery(2), testDelivery(3)}
 	err := u.auditSealed(sealed, nil)
-	if !errors.Is(err, errCommitted) || !strings.Contains(err.Error(), "2 of 3 written") {
-		t.Fatalf("auditSealed with one line failing: %v, want errCommitted counting 2 of 3 written", err)
+	if !Committed(err) || !strings.Contains(err.Error(), "2 of 3 written") {
+		t.Fatalf("auditSealed with one line failing: %v, want Committed counting 2 of 3 written", err)
 	}
 	if len(a.lines) != 2 || a.lines[0].delivery != testDelivery(1).uid || a.lines[1].delivery != testDelivery(3).uid {
 		t.Fatalf("auditSealed wrote %+v, want deliveries 1 and 3", a.lines)

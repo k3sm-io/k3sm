@@ -38,8 +38,8 @@ func TestWithdrawRefusesRollbackAfterFloorLineFailed(t *testing.T) {
 	old := readDeliveriesBytes(t, server)
 	fl, _ := userLogs(s)
 	fl.failAppend = true
-	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, errCommitted) {
-		t.Fatalf("withdraw with a failing floor append: %v, want errCommitted", err)
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !Committed(err) {
+		t.Fatalf("withdraw with a failing floor append: %v, want Committed", err)
 	}
 	fl.failAppend = false
 	putBackDeliveries(t, server, old)
@@ -65,8 +65,8 @@ func TestRepeatWithdrawCatchUpIsRevocation(t *testing.T) {
 			}
 			fl := s.userFloor.(*fileFloorLog).log
 			fl.freeSpace = func(int) (uint64, error) { return 64, nil }
-			if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, errCommitted) {
-				t.Fatalf("withdraw with its floor line refused: %v, want errCommitted", err)
+			if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !Committed(err) {
+				t.Fatalf("withdraw with its floor line refused: %v, want Committed", err)
 			}
 			before := readLog(t, s, userFloorLogName)
 			switch tc {

@@ -25,7 +25,7 @@ import (
 )
 
 // A change already committed part way whose audit line then fails keeps
-// both failures: the result is still errCommitted, carries the audit
+// both failures: the result is still Committed, carries the audit
 // failure, and is logged at Warn with the scope and verb, never a figure.
 func TestCommittedChangeKeepsAuditFailure(t *testing.T) {
 	ctx := context.Background()
@@ -65,8 +65,8 @@ func TestCommittedChangeKeepsAuditFailure(t *testing.T) {
 
 func checkCommittedAuditFailure(t *testing.T, err error, logs, verb string) {
 	t.Helper()
-	if !errors.Is(err, errCommitted) {
-		t.Fatalf("%s committed part way with its audit failing: %v, want errCommitted", verb, err)
+	if !Committed(err) {
+		t.Fatalf("%s committed part way with its audit failing: %v, want Committed", verb, err)
 	}
 	if !strings.Contains(err.Error(), "injected audit append failure") {
 		t.Errorf("%s: %v, want the audit failure kept beside the commit", verb, err)
@@ -87,6 +87,9 @@ func TestAuditResultCommitted(t *testing.T) {
 	if got := auditResult(errCommitted); got != "committed" {
 		t.Errorf("auditResult(errCommitted) = %q, want committed", got)
 	}
+	if got := auditResult(committedf(errors.New("x"), "y")); got != "committed" {
+		t.Errorf("auditResult(ErrCommitted) = %q, want committed", got)
+	}
 	ctx := context.Background()
 	s, _, u := newDeliveryScope(t)
 	fl, _ := userLogs(s)
@@ -96,7 +99,7 @@ func TestAuditResultCommitted(t *testing.T) {
 	}
 	fl.buryLimit = fl.buried + 1
 	fl.mu.Unlock()
-	if err := u.Delete(ctx, "user/1001/gone"); !errors.Is(err, errCommitted) {
+	if err := u.Delete(ctx, "user/1001/gone"); !Committed(err) {
 		t.Fatalf("rm whose second tombstone failed: %v", err)
 	}
 	if l := lastAudit(t, s); l.result != "committed" {

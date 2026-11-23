@@ -854,7 +854,7 @@ func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (err error) 
 		// A revocation is a withdraw that wrote its tombstone or a catch-up
 		// line, whether or not its floor line then failed (errCommitted); a
 		// no-op repeat that wrote neither is not, as for rm.
-		revoke := revoked && (err == nil || errors.Is(err, errCommitted))
+		revoke := revoked && (err == nil || Committed(err))
 		l := auditLine{op: "withdraw", namespace: ns, delivery: id, revoke: revoke}
 		aerr := u.appendAudit(l, err)
 		if revoke && len(sealed) > 0 {
@@ -1516,7 +1516,7 @@ func (u *UserScope) keepAuditFailure(op string, err, aerr error) error {
 	if err == nil {
 		return aerr
 	}
-	if errors.Is(err, errCommitted) {
+	if Committed(err) {
 		slog.Warn("the audit line of a change committed in part was not written", "scope", u.scope, "op", op)
 		return errors.Join(err, aerr)
 	}

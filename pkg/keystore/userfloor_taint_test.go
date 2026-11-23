@@ -164,7 +164,7 @@ func TestTornWithdrawLineTaintsDeliveryRecord(t *testing.T) {
 		}
 		return n, errors.New("injected torn floor write")
 	}
-	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil && !errors.Is(err, errCommitted) {
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); err != nil && !Committed(err) {
 		t.Fatalf("withdraw whose floor line tears: %v", err)
 	}
 	fl.write = nil

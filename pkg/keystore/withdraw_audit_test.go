@@ -18,7 +18,6 @@ package keystore
 
 import (
 	"context"
-	"errors"
 	"testing"
 )
 
@@ -58,8 +57,8 @@ func TestWithdrawAuditRevokeFlag(t *testing.T) {
 	}
 	fl, _ := userLogs(s)
 	fl.failAppend = true
-	if err := u.withdrawDelivery(ctx, testDelivery(2).uid); !errors.Is(err, errCommitted) {
-		t.Fatalf("withdraw with a failing floor append: %v, want errCommitted", err)
+	if err := u.withdrawDelivery(ctx, testDelivery(2).uid); !Committed(err) {
+		t.Fatalf("withdraw with a failing floor append: %v, want Committed", err)
 	}
 	fl.failAppend = false
 	if l := lastAudit(t, s); !l.revoke {

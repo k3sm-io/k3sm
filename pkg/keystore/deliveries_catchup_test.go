@@ -52,8 +52,8 @@ func TestDeliveriesCatchUpSurvivesRestart(t *testing.T) {
 	old := readDeliveriesBytes(t, server)
 	fl := s.userFloor.(*fileFloorLog).log
 	fl.freeSpace = func(int) (uint64, error) { return 64, nil }
-	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, errCommitted) {
-		t.Fatalf("withdraw with its floor line refused: %v, want errCommitted", err)
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !Committed(err) {
+		t.Fatalf("withdraw with its floor line refused: %v, want Committed", err)
 	}
 	fl.freeSpace = nil
 	if err := u.withdrawDelivery(ctx, testDelivery(3).uid); !errors.Is(err, ErrNotFound) {
@@ -82,8 +82,8 @@ func TestDeliverCatchesUpFloor(t *testing.T) {
 	old := readDeliveriesBytes(t, server)
 	fl := s.userFloor.(*fileFloorLog).log
 	fl.freeSpace = func(int) (uint64, error) { return 64, nil }
-	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, errCommitted) {
-		t.Fatalf("withdraw with its floor line refused: %v, want errCommitted", err)
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !Committed(err) {
+		t.Fatalf("withdraw with its floor line refused: %v, want Committed", err)
 	}
 	fl.freeSpace = nil
 	if err := u.addDelivery(ctx, testDelivery(2)); !errors.Is(err, ErrExists) {
@@ -111,8 +111,8 @@ func TestCatchUpUserAtStartSurvivesRestart(t *testing.T) {
 	old := readDeliveriesBytes(t, server)
 	fl := s.userFloor.(*fileFloorLog).log
 	fl.freeSpace = func(int) (uint64, error) { return 64, nil }
-	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !errors.Is(err, errCommitted) {
-		t.Fatalf("withdraw with its floor line refused: %v, want errCommitted", err)
+	if err := u.withdrawDelivery(ctx, testDelivery(1).uid); !Committed(err) {
+		t.Fatalf("withdraw with its floor line refused: %v, want Committed", err)
 	}
 	fl.freeSpace = nil
 	forgetDeliveriesSeen(s)
