@@ -592,22 +592,52 @@ var rmDirBatch = dirBatch
 // wrap it to see every listing the walk makes.
 var rmReadBatch = readBatch
 
-// rmTakeDir takes the directory held at fd from the service user: fchown to
-// root, fchmod 0700 and its extended ACL removed, all on the descriptor, so
-// no service-user process can then create a name in it or rename one into
-// it. On macOS an entry in it that carries an ACL entry allowing its
-// deletion can still be renamed out of it or unlinked by that process; the
-// walk takes each name as it finds it. Tests wrap it to stop a walk
-// part-way.
+// rmTakeDir takes the directory held at fd from the service user, all on
+// the descriptor: fchmod 0700, fchown to root, fchmod 0700 again, its
+// extended ACL removed, then fstat, which must show root's at 0700. No
+// service-user process can then create a name in it or rename one into
+// it. The first fchmod comes before the fchown, so a take that stops after
+// it leaves a service user's 0700 directory, and one that stops after the
+// fchown a root-owned 0700 one: the owner rule accepts both, and a rerun
+// finishes either. On macOS an entry in it that carries an ACL entry
+// allowing its deletion can still be renamed out of it or unlinked by that
+// process; the walk takes each name as it finds it. Tests wrap it to stop
+// a walk part-way.
 var rmTakeDir = func(fd int) error {
-	if err := unix.Fchown(fd, rmRootUID, rmRootGID); err != nil {
-		return err
+	for step := range rmTakeSteps {
+		if rmTakeStep != nil {
+			if err := rmTakeStep(step); err != nil {
+				return err
+			}
+		}
+		if err := rmTakeSteps[step](fd); err != nil {
+			return err
+		}
 	}
-	if err := unix.Fchmod(fd, 0o700); err != nil {
-		return err
-	}
-	return removeExtendedACL(fd)
+	return nil
 }
+
+// rmTakeSteps are rmTakeDir's steps, in order.
+var rmTakeSteps = [...]func(fd int) error{
+	func(fd int) error { return unix.Fchmod(fd, 0o700) },
+	func(fd int) error { return unix.Fchown(fd, rmRootUID, rmRootGID) },
+	func(fd int) error { return unix.Fchmod(fd, 0o700) },
+	removeExtendedACL,
+	func(fd int) error {
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			return err
+		}
+		if int(st.Uid) != rmRootUID || st.Mode&0o7777 != 0o700 {
+			return fmt.Errorf("after the take it is uid %d's at mode %#o, not root's at 0700", st.Uid, st.Mode&0o7777)
+		}
+		return nil
+	},
+}
+
+// rmTakeStep, when set, runs before each of rmTakeDir's steps (its index
+// in rmTakeSteps); tests return an error to stop the take there.
+var rmTakeStep func(step int) error
 
 // errScopeTreeBusy is a name in a scope directory after the walk emptied
 // it, or a name that kept changing, although rm-scope had taken the

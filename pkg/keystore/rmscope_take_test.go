@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -235,5 +236,58 @@ func TestReadBatchBounded(t *testing.T) {
 	}
 	if none, err := readBatch(fd, 3, skip); err != nil || len(none) != 0 {
 		t.Fatalf("readBatch with every name skipped: %v, %v; want none", none, err)
+	}
+}
+
+// A take stopped after its first fchmod, before any later step (through
+// the seam: the fchown, the second fchmod, the ACL removal, the final fstat)
+// leaves a directory the owner rule accepts, and the rerun finishes the
+// removal, listed. Once the fchown ran the directory is root's, which the
+// rerun sees through the service-uid seam (the test's own uid stands for
+// root); the directories below it, untaken, stand for the service user's
+// at 0700, which the owner rule accepts either way.
+func TestRemoveScopeTakeStopAtEachStepRerunFinishes(t *testing.T) {
+	if asRoot() {
+		t.Skip("the seam's other service uid makes the store's own directories foreign as root")
+	}
+	for step := 1; step < len(rmTakeSteps); step++ {
+		t.Run(strconv.Itoa(step), func(t *testing.T) {
+			s, server, _ := fileLogScope(t)
+			// After the judge, the service user widens its directory's mode.
+			setSeam(t, &rmBeforeTree, func() {
+				if err := os.Chmod(scopeDir(server, "1001"), 0o750); err != nil {
+					t.Fatal(err)
+				}
+			})
+			setSeam(t, &rmTakeStep, func(at int) error {
+				if at == step {
+					return unix.EIO
+				}
+				return nil
+			})
+			if _, err := s.RemoveScope(t.Context(), 1001); !errors.Is(err, unix.EIO) {
+				t.Fatalf("run 1, the take stopped at step %d: %v, want EIO", step, err)
+			}
+			rmTakeStep, rmBeforeTree = nil, nil
+			if step >= 1 {
+				dir := scopeDir(server, "1001")
+				err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+					if err != nil || !d.IsDir() || p == dir {
+						return err
+					}
+					return os.Chmod(p, 0o700)
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				setSeam(t, &rmServiceUID, func(*FileStore) uint32 { return s.uid + 1 })
+			}
+			if res, err := s.RemoveScope(t.Context(), 1001); err != nil || !res.Recorded {
+				t.Fatalf("the rerun: %v, recorded %v; want removed and listed", err, res.Recorded)
+			}
+			if _, err := os.Lstat(scopeDir(server, "1001")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the scope directory is still there: %v", err)
+			}
+		})
 	}
 }
