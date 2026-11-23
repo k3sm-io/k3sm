@@ -42,6 +42,10 @@ const (
 	// while it stands, to start again once it is gone. A client that
 	// connects meanwhile waits in the socket's backlog.
 	MaintenancePoll = 2 * time.Second
+	// ReopenRetries is how many times in a row a failed log reopen is
+	// retried at MaintenancePoll, so the listener is back within a poll of
+	// a maintenance verb's end, before the doubling backoff takes over.
+	ReopenRetries = 15
 )
 
 // OffReason says why the user scope's listener is not serving. The set is
@@ -221,18 +225,33 @@ func (s *Supervisor) Run(ctx context.Context) {
 		}
 		s.set(State{Phase: PhaseStopped})
 	}()
-	backoff := MinBackoff
+	// checkBackoff spaces failed start checks and starts again from
+	// MinBackoff whenever every check passes; runBackoff spaces listener
+	// failures and starts again only after a run served HealthyPeriod (or
+	// stopped for the marker), so a listener that fails at once after
+	// every passing check still backs off.
+	checkBackoff, runBackoff := MinBackoff, MinBackoff
+	reopenTries := 0
 	var last OffReason
 	for ctx.Err() == nil {
 		reason, detail := s.check(ctx)
+		if reason != OffLogsUnavailable {
+			reopenTries = 0
+		}
 		if reason != "" {
-			wait := backoff
-			if reason == OffMaintenance {
+			wait := checkBackoff
+			switch {
+			case reason == OffMaintenance:
 				// The marker is waited out, not backed off from, so the
 				// listener is back within a poll of the verb's end.
 				wait = MaintenancePoll
-			} else {
-				backoff = nextBackoff(backoff)
+			case reason == OffLogsUnavailable && reopenTries < ReopenRetries:
+				// A reopen right after the marker clears can meet the verb's
+				// last step; it is retried at the marker's pace for a while.
+				reopenTries++
+				wait = MaintenancePoll
+			default:
+				checkBackoff = nextBackoff(checkBackoff)
 			}
 			s.off(reason, detail, last, wait)
 			last = reason
@@ -241,6 +260,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 			}
 			continue
 		}
+		checkBackoff = MinBackoff
 		last = ""
 		ln, err := guard(func() (net.Listener, error) { return s.cfg.Listen(ctx) })
 		if err == nil && ln == nil {
@@ -250,7 +270,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			if !s.backOff(ctx, OffListenerUnavailable, err, &backoff) {
+			if !s.backOff(ctx, OffListenerUnavailable, err, &runBackoff) {
 				return
 			}
 			continue
@@ -269,12 +289,12 @@ func (s *Supervisor) Run(ctx context.Context) {
 		case endDone:
 			return
 		case endMarker:
-			backoff = MinBackoff
+			runBackoff = MinBackoff
 		case endFailed:
 			if s.cfg.Clock.Now().Sub(started) >= HealthyPeriod {
-				backoff = MinBackoff
+				runBackoff = MinBackoff
 			}
-			if !s.backOff(ctx, OffListenerFailed, err, &backoff) {
+			if !s.backOff(ctx, OffListenerFailed, err, &runBackoff) {
 				return
 			}
 		}

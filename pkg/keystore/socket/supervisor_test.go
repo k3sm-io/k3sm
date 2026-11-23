@@ -652,3 +652,63 @@ func TestSupervisorClosesReplacedAndLastSocket(t *testing.T) {
 		}
 	})
 }
+
+// TestFailedReopenRetriedAtMarkerPoll checks a log reopen that keeps
+// failing is retried every MaintenancePoll for ReopenRetries tries, its
+// reason and error visible in State, before the doubling backoff, and that
+// the listener serves at the first poll after it succeeds.
+func TestFailedReopenRetriedAtMarkerPoll(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, func(c *startChecks) { c.logsErr = errors.New("fake: store lock busy") })
+		for try := 1; try <= ReopenRetries; try++ {
+			st := r.wantState(t, PhaseOff, OffLogsUnavailable, MaintenancePoll)
+			if !strings.Contains(st.Detail, "store lock busy") {
+				t.Fatalf("try %d: detail %q does not carry the reopen's error", try, st.Detail)
+			}
+			advance(MaintenancePoll)
+		}
+		if got := r.ck.get().reopens; got != ReopenRetries+1 {
+			t.Fatalf("%d reopens, want %d", got, ReopenRetries+1)
+		}
+		r.wantState(t, PhaseOff, OffLogsUnavailable, MinBackoff)
+		advance(MinBackoff)
+		r.wantState(t, PhaseOff, OffLogsUnavailable, 2*MinBackoff)
+		if r.ck.get().listens != 0 {
+			t.Fatal("the listener source ran while the reopen failed")
+		}
+
+		// A marker in between gives the reopen its fast retries again.
+		r.ck.set(func(c *startChecks) { c.marked = true })
+		advance(2 * MinBackoff)
+		r.wantState(t, PhaseOff, OffMaintenance, MaintenancePoll)
+		r.ck.set(func(c *startChecks) { c.marked = false })
+		advance(MaintenancePoll)
+		r.wantState(t, PhaseOff, OffLogsUnavailable, MaintenancePoll)
+		r.ck.set(func(c *startChecks) { c.logsErr = nil })
+		advance(MaintenancePoll)
+		r.wantState(t, PhaseServing, "", 0)
+	})
+}
+
+// TestCheckBackoffResetsOnPassingChecks checks a full pass of the start
+// checks starts the start-check backoff again from MinBackoff, while a
+// listener failure keeps its own backoff.
+func TestCheckBackoffResetsOnPassingChecks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, func(c *startChecks) { c.install = errors.New("fake: unflagged") })
+		wait := MinBackoff
+		for range 3 {
+			r.wantState(t, PhaseOff, OffInstall, wait)
+			advance(wait)
+			wait *= 2
+		}
+		r.wantState(t, PhaseOff, OffInstall, wait)
+		// Every check passes, but the source has no socket.
+		r.ck.set(func(c *startChecks) { c.install, c.ln = nil, nil })
+		advance(wait)
+		r.wantState(t, PhaseBackingOff, OffListenerUnavailable, MinBackoff)
+		r.ck.set(func(c *startChecks) { c.install = errors.New("fake: unflagged") })
+		advance(MinBackoff)
+		r.wantState(t, PhaseOff, OffInstall, MinBackoff)
+	})
+}
