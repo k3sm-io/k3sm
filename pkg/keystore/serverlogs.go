@@ -202,8 +202,18 @@ type ServerLogs struct {
 	usedByClass map[preFrameClass]int64
 	usedByUID   map[preFrameKey]int64
 	// pending is each uid's dropped count, by class, not yet in a summary
-	// line.
+	// line; others is the count, by class, read back from the persisted
+	// file's others lines, which name no uid and wait for root's rotate.
 	pending map[preFrameKey]uint64
+	others  map[preFrameClass]uint64
+	// written is the counts last written to (or read from)
+	// PreFrameDroppedName; droppedDirty is set when pending or others
+	// changed since, droppedAt is when it was last written, and droppedErr
+	// is why the file did not read, which turns its writes off.
+	written      preFrameDropped
+	droppedDirty bool
+	droppedAt    time.Time
+	droppedErr   error
 	// sync fsyncs the held audit file after an append; a test replaces it.
 	sync func(*os.File) error
 }
@@ -223,26 +233,38 @@ type heldLog struct {
 	off int64
 }
 
-// ServerLogs returns the store's server append surface. It opens nothing:
-// the first Reopen or append opens both logs and counts the budget.
+// ServerLogs returns the store's server append surface. It opens neither
+// log: the first Reopen or append opens both and counts the budget. It
+// reads the persisted pre-frame refusal counts (PreFrameDroppedName) and
+// starts from them; a file that does not read is logged and kept
+// (DroppedPersistError).
 func (s *FileStore) ServerLogs() *ServerLogs {
-	return &ServerLogs{
+	l := &ServerLogs{
 		s:           s,
 		audit:       heldLog{log: &appendLog{s: s, name: auditLogName}},
 		floor:       heldLog{log: &appendLog{s: s, name: userFloorLogName}},
 		pending:     map[preFrameKey]uint64{},
+		others:      map[preFrameClass]uint64{},
+		written:     newPreFrameDropped(),
 		usedByClass: map[preFrameClass]int64{},
 		usedByUID:   map[preFrameKey]int64{},
 		sync:        (*os.File).Sync,
 	}
+	if s.checkConfig() == nil {
+		l.loadDroppedLocked() // l is not shared yet
+	}
+	return l
 }
 
 // Reopen takes the store lock exclusively, reopens both append descriptors
 // through the data root, judges them, recounts the pre-frame budget from the
 // new audit file and only then releases the lock. The server calls it at
-// start and after maintenance, before the listener starts again.
+// start and after maintenance, before the listener starts again. It reads
+// the persisted pre-frame refusal counts again first, so what a rotate
+// wrote to the audit log and took out of the file is not written twice.
 func (l *ServerLogs) Reopen(ctx context.Context) error {
 	return l.locked(ctx, func() error {
+		l.loadDroppedLocked()
 		l.closeLocked()
 		return l.ensureLocked()
 	})
@@ -309,9 +331,12 @@ func (l *ServerLogs) Refused(ctx context.Context, uid uint32, reason string) err
 	})
 	if err != nil {
 		l.mu.Lock()
-		l.pending[preFrameKey{refusalClass(uid, reason), uid}]++
+		k := preFrameKey{refusalClass(uid, reason), uid}
+		l.pending[k] = satAdd(l.pending[k], 1)
+		l.droppedDirty = true
 		l.mu.Unlock()
 	}
+	l.persistDropped(false)
 	return err
 }
 
@@ -343,6 +368,7 @@ func (l *ServerLogs) writePendingLocked(max int) error {
 			continue
 		}
 		delete(l.pending, k)
+		l.droppedDirty = true
 	}
 	return first
 }
@@ -357,12 +383,16 @@ func (l *ServerLogs) writePendingLocked(max int) error {
 func (l *ServerLogs) Dropped(ctx context.Context, uid uint32, n uint64) error {
 	l.mu.Lock()
 	if n > 0 {
-		l.pending[preFrameKey{l.uidClass(uid), uid}] += n
+		k := preFrameKey{l.uidClass(uid), uid}
+		l.pending[k] = satAdd(l.pending[k], n)
+		l.droppedDirty = true
 	}
 	l.mu.Unlock()
-	return l.locked(ctx, func() error {
+	err := l.locked(ctx, func() error {
 		return l.writePendingLocked(len(l.pending))
 	})
+	l.persistDropped(false)
+	return err
 }
 
 // MaintenanceMarked is the store's FileStore.MaintenanceMarked, so the
@@ -400,8 +430,12 @@ func (l *ServerLogs) Files() (audit, floor LogFileID) {
 	return l.audit.id, l.floor.id
 }
 
-// Close closes both descriptors. A later Reopen or append opens them again.
+// Close writes the pending pre-frame refusal counts to
+// PreFrameDroppedName if a change is still unwritten, whatever the time
+// since the last write, then closes both descriptors. A later Reopen or
+// append opens them again.
 func (l *ServerLogs) Close() error {
+	l.persistDropped(true)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.closeLocked()

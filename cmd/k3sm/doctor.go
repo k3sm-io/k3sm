@@ -142,6 +142,11 @@ type doctorEnv struct {
 	// (keystore.FileStore.FloorDamage), and the damage of a floor past the
 	// reader's bounds as its error. A nil seam leaves the row unprobed.
 	keystoreFloorDamage func(context.Context) (int, error)
+	// keystorePreFrameDropped reads the persisted pre-frame refusal counts
+	// not yet in the audit log (keystore.FileStore.PreFrameDropped),
+	// read-only. A nil seam leaves that part of the keystore-logs row
+	// unprobed.
+	keystorePreFrameDropped func(context.Context) (keystore.PreFrameDroppedCounts, error)
 	// keystoreMaintenance reads a standing maintenance marker
 	// (keystore.FileStore.StandingMaintenance): whether one stands and the
 	// command of the run that wrote it. A nil seam leaves the row unprobed.
@@ -209,10 +214,11 @@ func checkKeystoreLogs(env doctorEnv) checkResult {
 	err := env.keystoreLogs(context.Background())
 	switch {
 	case err == nil:
-		if r, past := keystoreSoftCapHint(env); past {
-			return r
+		r, past := keystoreSoftCapHint(env)
+		if !past {
+			r = checkResult{name: name, status: statusPass, detail: "both append-only logs are the service user's, mode 0600, flagged SF_APPEND"}
 		}
-		return checkResult{name: name, status: statusPass, detail: "both append-only logs are the service user's, mode 0600, flagged SF_APPEND"}
+		return keystorePreFrameDroppedHint(env, r)
 	case errors.Is(err, fs.ErrNotExist):
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("the keystore user scope is off: %v", err), remedy: "sudo k3sm install"}
 	case errors.Is(err, fs.ErrPermission):
@@ -378,6 +384,41 @@ func checkKeystoreLossyRuns(env doctorEnv) checkResult {
 	}
 	latest := runs[len(runs)-1]
 	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore maintenance: %d lossy run(s), latest %s dropped %d line(s)", len(runs), latest.Time.UTC().Format(time.RFC3339), latest.Dropped()), remedy: "as root, read " + keystore.MaintenanceRunsName + " in the data root: each lossy run's drop counts by reason, the newest 64 kept"}
+}
+
+// keystorePreFrameDroppedHint adds to r, the keystore-logs row as the flag
+// and size checks left it, the pre-frame refusals the server counted as
+// dropped and has not yet written to the audit log, read-only from the
+// file it persists them in: a WARN with the count and the uids named, or a
+// WARN that the persisted count is unreadable. A file this user may not
+// read adds nothing: the logs row already passed, and doctor as root
+// reads it.
+func keystorePreFrameDroppedHint(env doctorEnv, r checkResult) checkResult {
+	if env.keystorePreFrameDropped == nil {
+		return r
+	}
+	c, err := env.keystorePreFrameDropped(context.Background())
+	var detail string
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return r
+	case err != nil:
+		detail = fmt.Sprintf("the persisted pre-frame refusal count is unreadable, so refusals the server dropped are not shown: %v", err)
+	case c.Refusals == 0:
+		return r
+	default:
+		detail = fmt.Sprintf("%d pre-frame refusal(s) not recorded for %d uid(s)", c.Refusals, c.UIDs)
+		if c.Others > 0 {
+			detail += fmt.Sprintf(", %d of them for further uids not named", c.Others)
+		}
+	}
+	remedy := "sudo k3sm keys audit --rotate   # writes the counts to the new audit log"
+	if r.status == statusWarn {
+		r.detail += "; " + detail
+		r.remedy += "; " + remedy
+		return r
+	}
+	return checkResult{name: r.name, status: statusWarn, detail: detail, remedy: remedy}
 }
 
 // keystoreSoftCapHint is the keystore-logs row's WARN when either log is
@@ -1067,6 +1108,15 @@ func realDoctorEnv(workDir string) doctorEnv {
 			cfg := keystoreLayout(workDir)
 			cfg.UID = uid
 			return keystore.New(cfg).LogSizes(ctx)
+		},
+		keystorePreFrameDropped: func(ctx context.Context) (keystore.PreFrameDroppedCounts, error) {
+			uid, _, err := lookupServiceIDs()
+			if err != nil {
+				return keystore.PreFrameDroppedCounts{}, err
+			}
+			cfg := keystoreLayout(workDir)
+			cfg.UID = uid
+			return keystore.New(cfg).PreFrameDropped(ctx)
 		},
 		keystoreFloorDamage: func(ctx context.Context) (int, error) {
 			uid, _, err := lookupServiceIDs()

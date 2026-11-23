@@ -314,7 +314,9 @@ func (s *FileStore) moveTargetAside(st *mergeStaging, name string) error {
 
 // stagedKind is what a node of the staged tree is, by where it sits: the
 // tree itself, an entry's directory, the user scopes' directory, one user
-// scope, a user scope's entries' directory, or a file.
+// scope, a user scope's entries' directory, a file, or the persisted
+// pre-frame refusal counts (PreFrameDroppedName) or their temporary file,
+// a file judged more strictly and parsed.
 type stagedKind int
 
 const (
@@ -324,7 +326,17 @@ const (
 	stagedScope
 	stagedScopeEntries
 	stagedFile
+	stagedDropped
 )
+
+// file reports whether a node of kind k is a file.
+func (k stagedKind) file() bool { return k == stagedFile || k == stagedDropped }
+
+// droppedFileName reports whether n is PreFrameDroppedName or the
+// temporary file writeFile makes for it.
+func droppedFileName(n string) bool {
+	return n == PreFrameDroppedName || isTempName(n, PreFrameDroppedName)
+}
 
 // stagedChild is what name may be inside a node of kind parent, and, for a
 // file, its size cap: only what the store itself writes there (the entry-file
@@ -339,6 +351,8 @@ func stagedChild(parent stagedKind, name string) (kind stagedKind, maxSize int64
 			return stagedFile, 0, true
 		case name == userScopesName:
 			return stagedUsers, 0, true
+		case droppedFileName(name):
+			return stagedDropped, maxPreFrameDroppedSize, true
 		case checkName(name) == nil:
 			return stagedEntry, 0, true
 		}
@@ -573,7 +587,12 @@ func (s *FileStore) stagedNode(w *stagedWalk, dirfd int, name, rel string, k sta
 		}
 		return nil
 	}
-	if k == stagedFile {
+	if k == stagedDropped {
+		if err := judgeStagedDropped(f, rel, maxSize); err != nil {
+			return err
+		}
+	}
+	if k.file() {
 		return syncNode()
 	}
 	names, err := f.Readdirnames(stagedNameLimit + 1)
@@ -605,10 +624,10 @@ func (s *FileStore) stagedNode(w *stagedWalk, dirfd int, name, rel string, k sta
 // neither.
 func judgeStagedType(rel string, st *unix.Stat_t, k stagedKind) error {
 	typ := st.Mode & unix.S_IFMT
-	if k == stagedFile && typ != unix.S_IFREG {
+	if k.file() && typ != unix.S_IFREG {
 		return errStagedShape(rel, "is not a regular file (type %#o)", typ)
 	}
-	if k != stagedFile && typ != unix.S_IFDIR {
+	if !k.file() && typ != unix.S_IFDIR {
 		return errStagedShape(rel, "is not a directory (type %#o)", typ)
 	}
 	return nil
@@ -627,14 +646,18 @@ func (s *FileStore) judgeStaged(fd int, rel string, st *unix.Stat_t, k stagedKin
 		return err
 	}
 	switch {
-	case k == stagedFile && st.Nlink != 1:
+	case k.file() && st.Nlink != 1:
 		return errStagedShape(rel, "has %d links", st.Nlink)
 	case st.Mode&(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) != 0:
 		return errStagedShape(rel, "has the setuid, setgid or sticky bit (mode %#o)", st.Mode&0o7777)
 	case statFlags(st) != 0:
 		return errStagedShape(rel, "has file flags %#x", statFlags(st))
-	case k == stagedFile && st.Size > maxSize:
+	case k.file() && st.Size > maxSize:
 		return errStagedShape(rel, "is %d bytes, over the %d its name allows", st.Size, maxSize)
+	case k == stagedDropped && st.Uid != s.uid:
+		return errStagedShape(rel, "is owned by uid %d, not the service user (%d), who alone writes it", st.Uid, s.uid)
+	case k == stagedDropped && uint32(st.Mode)&0o777 != uint32(fileMode):
+		return errStagedShape(rel, "is mode %#o, not the %#o the server writes it at", st.Mode&0o777, fileMode)
 	case st.Uid != s.uid && st.Uid != unknownUID:
 		return errStagedShape(rel, "is owned by uid %d, neither the service user (%d) nor the unknown owner (%d)", st.Uid, s.uid, unknownUID)
 	}
@@ -648,13 +671,31 @@ func (s *FileStore) judgeStaged(fd int, rel string, st *unix.Stat_t, k stagedKin
 	return nil
 }
 
+// judgeStagedDropped reads the persisted pre-frame refusal counts, or
+// their temporary file, through f, at most maxSize bytes, and refuses a
+// copy that does not parse strictly (parsePreFrameDropped), as any other
+// malformed staged content is refused.
+func judgeStagedDropped(f *os.File, rel string, maxSize int64) error {
+	b, err := io.ReadAll(io.LimitReader(io.NewSectionReader(f, 0, maxSize+1), maxSize+1))
+	if err != nil {
+		return fmt.Errorf("read %s/%s/%s: %w", preRestoreDirName, stagedTreeName, rel, err)
+	}
+	if int64(len(b)) > maxSize {
+		return errStagedShape(rel, "is over the %d bytes its name allows", maxSize)
+	}
+	if _, err := parsePreFrameDropped(b); err != nil {
+		return errStagedShape(rel, "does not parse: %v", err)
+	}
+	return nil
+}
+
 // handStaged sets the node fd holds to the mode Put writes and hands it to
 // the service user, through the descriptor, then confirms a file still has
 // one link: a link made between the checks and the fchown would share the
 // handover, so its owner and mode are put back and the tree refused.
 func (s *FileStore) handStaged(fd int, rel string, before *unix.Stat_t, k stagedKind) error {
 	mode := uint32(fileMode)
-	if k != stagedFile {
+	if !k.file() {
 		mode = uint32(dirMode)
 	}
 	if err := unix.Fchmod(fd, mode); err != nil {
@@ -667,7 +708,7 @@ func (s *FileStore) handStaged(fd int, rel string, before *unix.Stat_t, k staged
 	if err := unix.Fstat(fd, &after); err != nil {
 		return fmt.Errorf("stat %s/%s/%s: %w", preRestoreDirName, stagedTreeName, rel, err)
 	}
-	if k == stagedFile && after.Nlink != 1 {
+	if k.file() && after.Nlink != 1 {
 		// Put back what the other name had; a failure leaves the refusal.
 		_ = unix.Fchown(fd, int(before.Uid), int(before.Gid))
 		_ = unix.Fchmod(fd, uint32(before.Mode&0o7777))

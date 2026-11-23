@@ -471,3 +471,93 @@ func TestOpenStagingRefusesACL(t *testing.T) {
 		t.Fatal("live floor changed by the refused merge")
 	}
 }
+
+// wellFormedDropped is a persisted pre-frame refusal count in its format.
+func wellFormedDropped() []byte {
+	d := newPreFrameDropped()
+	d.uids[preFrameKey{preFrameClassLogin, 501}] = 3
+	d.others[preFrameClassSystemHigh] = 2
+	return encodePreFrameDropped(d)
+}
+
+// droppedTempName is a temporary-file name writeFile gives
+// PreFrameDroppedName.
+var droppedTempName = tempName(PreFrameDroppedName, [tempSuffixSize]byte{1, 2, 3, 4, 5, 6, 7, 8})
+
+// TestStagedPreFrameDroppedAccepted: the persisted pre-frame refusal
+// count, and its temporary file, at the top of a staged keystore/ are in
+// the keystore's shape when well formed, so a backup taken while the
+// server keeps one restores.
+func TestStagedPreFrameDroppedAccepted(t *testing.T) {
+	for _, name := range []string{PreFrameDroppedName, droppedTempName} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			stageRecipe(t, s, server, 0)
+			writeStaged(t, s, name, wellFormedDropped())
+			st := openTestStaging(t, s)
+			if err := s.checkStaged(context.Background(), st); err != nil {
+				t.Fatalf("checkStaged: %v", err)
+			}
+			if err := s.chownStaged(context.Background(), st); err != nil {
+				t.Fatalf("chownStaged: %v", err)
+			}
+		})
+	}
+}
+
+// TestStagedPreFrameDroppedRefused: a staged persisted count, or its
+// temporary file, is refused by the read-only walk and the handover when
+// it is over its size cap, a symlink, a FIFO, hard-linked, at another
+// mode, or does not parse.
+func TestStagedPreFrameDroppedRefused(t *testing.T) {
+	for _, name := range []string{PreFrameDroppedName, droppedTempName} {
+		for _, tc := range []struct {
+			name  string
+			plant func(t *testing.T, s *FileStore, p string)
+		}{
+			{"over the cap", func(t *testing.T, s *FileStore, p string) {
+				b := append(wellFormedDropped(), bytes.Repeat([]byte("1 login 1\n"), maxPreFrameDroppedSize/10+1)...)
+				writeStaged(t, s, name, b)
+			}},
+			{"a symlink", func(t *testing.T, s *FileStore, p string) {
+				if err := os.Symlink("/etc/passwd", p); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"a FIFO", func(t *testing.T, s *FileStore, p string) {
+				if err := syscall.Mkfifo(p, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"hard-linked", func(t *testing.T, s *FileStore, p string) {
+				outside := filepath.Join(t.TempDir(), "outside")
+				if err := os.WriteFile(outside, wellFormedDropped(), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				giveToService(t, outside)
+				if err := os.Link(outside, p); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"another mode", func(t *testing.T, s *FileStore, p string) {
+				writeStaged(t, s, name, wellFormedDropped())
+				if err := os.Chmod(p, 0o400); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{"malformed", func(t *testing.T, s *FileStore, p string) {
+				writeStaged(t, s, name, []byte(preFrameDroppedHeader+"501 login 0\n"))
+			}},
+			{"no header", func(t *testing.T, s *FileStore, p string) {
+				writeStaged(t, s, name, []byte("501 login 1\n"))
+			}},
+		} {
+			t.Run(name+"/"+tc.name, func(t *testing.T) {
+				s, server := newTestStore(t)
+				stageRecipe(t, s, server, 0)
+				tc.plant(t, s, stagePath(s, stagedTreeName, name))
+				wantShapeRefused(t, s, name)
+			})
+		}
+	}
+}

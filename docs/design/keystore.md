@@ -3582,6 +3582,19 @@ service user can only add to.
     with the count, and the count is persisted, not kept only in memory: the next summary line
     written for that source carries it, and root's next `audit --rotate` writes any count still
     unwritten as one line charged to no uid (U85, U126).
+    For the pre-frame part the server persists its dropped counts in `.preframe-dropped` in the
+    store directory it owns (`server/keystore/`, 0700; the audit log's directory is root's): one
+    header line, then at most 256 lines `<uid> <class> <count>`, each at most 64 bytes, with the
+    uids past 256 folded into one `others <class> <count>` line per class. It is written temp,
+    fsync, rename and directory fsync through a descriptor of the store directory, `O_NOFOLLOW`,
+    0600, when the pending counts change, at most once a second on the server's clock, and
+    emptied to its header once every count has reached the audit log; it is read, owner and mode
+    checked and strictly parsed, and merged when the server opens its logs and again on each
+    reopen. It is written under the server's in-process mutex **without** the store lock, which
+    may be what the dropped line timed out on. A file that does not parse is reported, never
+    reset: the counts stay in memory, the server stops writing the file, and `doctor`'s
+    `keystore-logs` row says the persisted count is unreadable. The `others` lines name no uid,
+    so no summary line can carry them; they wait for root's next `audit --rotate`.
   - *The pre-frame part is split so a login user cannot spend it for everyone.* A login user
     can be refused at will (a self-sandboxed process is refused as `sandboxed` under its own
     uid), so the 256 KiB pre-frame part is not one pool. A **login line** is a pre-frame line
