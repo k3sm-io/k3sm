@@ -281,8 +281,12 @@ func writeMaintenanceRuns(dfd int, runs []MaintenanceRun) error {
 // keeping the newest maxMaintenanceRuns. A record that already holds r's
 // run id is left as it is, so a rerun that reports a saved run appends it
 // once. A record that does not read is not replaced: its error is
-// returned.
+// returned, and so is a record r that would not parse (a marker's run id
+// that is not 16 lowercase hex digits), which is never written.
 func appendMaintenanceRun(dfd int, owner int64, dataRoot string, r MaintenanceRun) error {
+	if _, err := parseMaintenanceRun(r.encode()); err != nil {
+		return fmt.Errorf("the run's record would not parse: %w", err)
+	}
 	runs, err := readMaintenanceRuns(dfd, owner, dataRoot)
 	if err != nil {
 		return err
@@ -304,11 +308,18 @@ func appendMaintenanceRun(dfd int, owner int64, dataRoot string, r MaintenanceRu
 // that drops nothing appends nothing. The maintenance verb calls it
 // holding its locks and before the marker goes.
 func (s *FileStore) recordLossyRun(dfd int, run, verb string, ino uint64, report map[string]int64) error {
-	r, lossy := lossyRunOf(run, verb, ino, report, s.now())
+	return recordLossyRunAt(dfd, int64(s.floorUID), s.dataRoot, run, verb, ino, report, s.now())
+}
+
+// recordLossyRunAt is recordLossyRun through the data root dfd, whose
+// root-written files are owner's, at time now: the maintenance verbs and
+// install (EarlierRunAtInstall) both record through it.
+func recordLossyRunAt(dfd int, owner int64, dataRoot, run, verb string, ino uint64, report map[string]int64, now time.Time) error {
+	r, lossy := lossyRunOf(run, verb, ino, report, now)
 	if !lossy {
 		return nil
 	}
-	if err := appendMaintenanceRun(dfd, int64(s.floorUID), s.dataRoot, r); err != nil {
+	if err := appendMaintenanceRun(dfd, owner, dataRoot, r); err != nil {
 		return fmt.Errorf("record the run's drop counts (%s) in %s: %w", r.dropText(), maintenanceRunsName, err)
 	}
 	return nil

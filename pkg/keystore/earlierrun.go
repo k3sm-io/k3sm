@@ -51,7 +51,7 @@ type EarlierRun struct {
 	AuditErr error
 	// RecordErr is why its drop counts were not recorded in the lossy-run
 	// record (keystore-maintenance-runs); nil when they were, or when it
-	// dropped nothing. Install records none, so it is nil there.
+	// dropped nothing.
 	RecordErr error
 }
 
@@ -180,10 +180,15 @@ func (s *FileStore) reportEarlierRun(ctx context.Context, dfd int, prior *marker
 // as root's file (rootUID), records a run whose swap committed (its log's
 // live inode under the logs directory lfd is the one it recorded), it
 // appends that run's audit line (op the verb, via root, result committed)
-// to the audit log and returns the run; install prints it. Anything else,
-// no marker, one not judged, one that never committed, returns nil: install
+// to the audit log, appends its record to the lossy-run record in the data
+// root when its report drops anything (RecordErr says why it could not),
+// and returns the run; install prints it. A record already holding the run
+// id is left as it is, so an install that dies after recording and before
+// removing the marker records the run once when it runs again. dataRoot is
+// the data root's path, for the record's repair text. Anything else, no
+// marker, one not judged, one that never committed, returns nil: install
 // removes it, and it held no committed report.
-func EarlierRunAtInstall(dfd, lfd, rootUID int, now time.Time) *EarlierRun {
+func EarlierRunAtInstall(dfd, lfd, rootUID int, dataRoot string, now time.Time) *EarlierRun {
 	fd, err := unix.Openat(dfd, maintenanceMarkerName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil
@@ -218,6 +223,7 @@ func EarlierRunAtInstall(dfd, lfd, rootUID int, now time.Time) *EarlierRun {
 		}
 	}
 	r.AuditErr = appendInstallAudit(lfd, auditLine{op: prior.verb, via: auditViaRoot, scope: scopeSystem, name: auditPlaceholder, result: auditResultCommitted}, now)
+	r.RecordErr = recordLossyRunAt(dfd, int64(rootUID), dataRoot, prior.run, prior.verb, prior.ino, prior.report, now)
 	return r
 }
 

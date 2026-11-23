@@ -54,9 +54,11 @@ func liveFloorIno(t *testing.T, s *FileStore) uint64 {
 // TestMaintenanceReportDurable: a lossy rebuild's drop counts outlive the
 // marker in keystore-maintenance-runs (run id, verb, UTC time, the counts by
 // reason, the new floor's inode), a clean run appends nothing, a saved
-// report a rerun prints is recorded once, the record keeps the newest 64,
-// and a record that does not parse is an error, never an empty list, and is
-// left as found.
+// report a rerun prints is recorded once, install records an earlier lossy
+// run once even when it dies before removing the marker, the record keeps
+// the newest 64, a record that would not parse is never written, and a
+// record that does not parse is an error, never an empty list, and is left
+// as found.
 func TestMaintenanceReportDurable(t *testing.T) {
 	at := time.Date(2026, 11, 23, 9, 30, 15, 500, time.UTC)
 
@@ -149,6 +151,82 @@ func TestMaintenanceReportDurable(t *testing.T) {
 		}
 		if runs := lossyRuns(t, s); len(runs) != 1 || runs[0].Verb != verbRebuild || runs[0].Drops["dropped"] != 1 {
 			t.Fatalf("records after rotate replaced a lossy rebuild's marker: %+v, want its one record", runs)
+		}
+	})
+
+	t.Run("install records an earlier lossy run once", func(t *testing.T) {
+		s, _, _ := fileLogScope(t)
+		appendLogBytes(t, s, userFloorLogName, []byte("not a floor line\n"))
+		if _, err := s.RebuildFloor(context.Background(), &stepCrash{at: swapStepEnd}); !Committed(err) {
+			t.Fatalf("rebuild failing at end: %v, want Committed", err)
+		}
+		ino := liveFloorIno(t, s)
+		dfd, err := s.openLogDataRoot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = unix.Close(dfd) }()
+		lfd, err := s.openLogsDir(dfd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = unix.Close(lfd) }()
+		// Twice over one marker: the second is install run again after it
+		// died between the record and the marker's removal.
+		for i := range 2 {
+			r := EarlierRunAtInstall(dfd, lfd, s.floorUID, s.dataRoot, at)
+			if r == nil || r.Dropped() != 1 || r.RecordErr != nil {
+				t.Fatalf("install %d reported %+v, want the committed run, dropped 1, recorded", i+1, r)
+			}
+		}
+		runs := lossyRuns(t, s)
+		if len(runs) != 1 || runs[0].Verb != verbRebuild || runs[0].Ino != ino || runs[0].Drops["dropped"] != 1 || !runs[0].Time.Equal(at.Truncate(time.Second)) {
+			t.Fatalf("records after install twice over a lossy rebuild's marker: %+v, want its one record", runs)
+		}
+	})
+
+	t.Run("install over a record that does not read", func(t *testing.T) {
+		s, _, _ := fileLogScope(t)
+		appendLogBytes(t, s, userFloorLogName, []byte("not a floor line\n"))
+		if _, err := s.RebuildFloor(context.Background(), &stepCrash{at: swapStepEnd}); !Committed(err) {
+			t.Fatalf("rebuild failing at end: %v, want Committed", err)
+		}
+		p := filepath.Join(s.dataRoot, maintenanceRunsName)
+		if err := os.WriteFile(p, []byte("not a record\n"), maintenanceRunsMode); err != nil {
+			t.Fatal(err)
+		}
+		dfd, err := s.openLogDataRoot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = unix.Close(dfd) }()
+		lfd, err := s.openLogsDir(dfd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = unix.Close(lfd) }()
+		r := EarlierRunAtInstall(dfd, lfd, s.floorUID, s.dataRoot, at)
+		if r == nil || !errors.Is(r.RecordErr, errMaintenanceRunsBad) {
+			t.Fatalf("install over a damaged record reported %+v, want RecordErr naming the record", r)
+		}
+		if got, _ := os.ReadFile(p); string(got) != "not a record\n" {
+			t.Fatalf("the damaged record was rewritten: %q", got)
+		}
+	})
+
+	t.Run("a run id that would not parse is not written", func(t *testing.T) {
+		s, _, _ := fileLogScope(t)
+		dfd, err := s.openLogDataRoot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = unix.Close(dfd) }()
+		r, _ := lossyRunOf("00", verbRebuild, 7, map[string]int64{"dropped": 1}, at)
+		if err := appendMaintenanceRun(dfd, int64(s.floorUID), s.dataRoot, r); err == nil {
+			t.Fatal("a record with a short run id was appended")
+		}
+		if _, err := os.Lstat(filepath.Join(s.dataRoot, maintenanceRunsName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a record that would not parse created the file: %v", err)
 		}
 	})
 
