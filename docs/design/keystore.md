@@ -1851,6 +1851,7 @@ service user can only add to.
      same way, as root and the installed binary; and (d) its own U and E rows. The pending
      rows U70, U71 and E25 hold their places; they apply only in the helper variant, and the
      amendment names their tests or drops them if K0 picks the flag.
+     2026-11-22: K0 picked the flag variant, so `keystore.sh` prints U70 and U71 as N/A, counted neither pending nor passed.
 - **The flag is checked, not assumed** (flag variant). The server reads `st_flags &
   SF_APPEND` on both logs at start and at every `doctor` run, through the chflags flag source,
   and refuses to start the listener if either flag is clear or either file is not the
