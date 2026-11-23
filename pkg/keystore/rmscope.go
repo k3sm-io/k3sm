@@ -374,6 +374,10 @@ var rmRootUID, rmRootGID = 0, 0
 // removes them and reads again from the start; tests lower it.
 var rmDirBatch = dirBatch
 
+// rmReadBatch is rm-scope's listing of a directory (readBatch); tests
+// wrap it to see every listing the walk makes.
+var rmReadBatch = readBatch
+
 // rmTakeDir takes the directory held at fd from the service user: fchown to
 // root, fchmod 0700 and its extended ACL removed, all on the descriptor, so
 // no service-user process can then create, rename into, rename out of or
@@ -717,7 +721,7 @@ func (w *rmWalk) emptyScopeDir(dfd int) error {
 	}
 	// The directory is root's: no name can appear, and this one re-list is
 	// a check.
-	names, err := readBatch(dfd, 2, nil)
+	names, err := rmReadBatch(dfd, 2, nil)
 	if err != nil {
 		return err
 	}
@@ -745,7 +749,7 @@ func (w *rmWalk) emptyDir(dfd int, rel string, depth int, keep string) error {
 		skip[keep] = true
 	}
 	for {
-		names, err := readBatch(dfd, rmDirBatch, skip)
+		names, err := rmReadBatch(dfd, rmDirBatch, skip)
 		if err != nil {
 			return err
 		}

@@ -546,3 +546,53 @@ func TestRemoveScopeSharedDirFlags(t *testing.T) {
 		}
 	})
 }
+
+// A scope tree with more flagged entries than one run clears (the budget,
+// lowered to 2 through the seam) stops rm-scope with errScopeFlagBudget,
+// committed since the run listed the scope and changed the tree first, and
+// the error says to run rm-scope again; the entries past the budget keep
+// their flag, and a rerun with a fresh budget finishes the removal.
+func TestRemoveScopeFlagBudget(t *testing.T) {
+	setSeam(t, &flagOpenLimit, 2)
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	t.Cleanup(func() { unflagScopeTree(dir) })
+	var flagged []string
+	for i := range 5 {
+		p := filepath.Join(dir, fmt.Sprintf("locked%d", i))
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		giveToService(t, p)
+		setScopeFlags(t, p, unix.UF_IMMUTABLE, false)
+		flagged = append(flagged, p)
+	}
+	_, err := s.RemoveScope(t.Context(), 1001)
+	if !errors.Is(err, errScopeFlagBudget) || !Committed(err) {
+		t.Fatalf("rm-scope past its flag budget: %v, want committed errScopeFlagBudget", err)
+	}
+	if !strings.Contains(err.Error(), "run rm-scope for this scope again") {
+		t.Errorf("the error %q does not say to run rm-scope again", err)
+	}
+	var left int
+	for _, p := range flagged {
+		var st unix.Stat_t
+		if err := unix.Lstat(p, &st); err == nil && st.Flags&unix.UF_IMMUTABLE != 0 {
+			left++
+		}
+	}
+	if left != len(flagged)-2 {
+		t.Errorf("%d flagged entries are left, want %d past the budget of 2", left, len(flagged)-2)
+	}
+	for range 2 {
+		if _, err = s.RemoveScope(t.Context(), 1001); !errors.Is(err, errScopeFlagBudget) {
+			break
+		}
+	}
+	if err != nil {
+		t.Fatalf("the reruns: %v, want the removal finished", err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there: %v", err)
+	}
+}
