@@ -3636,7 +3636,7 @@ text points here.
    `keystore-lock` in the data root, root-owned 0600, created by the first root verb through
    the data-root descriptor rules ("Root never acts by path where the service user can write"),
    which only root can open. Every root verb that writes the system floor or a keystore file in
-   the data root takes it, after the store `.lock` and with the same bounded wait: `put`,
+   the data root takes it, before the store `.lock` (§ "Concurrency") and with the same bounded wait: `put`,
    `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise at the start of `list` and
    `show`, `rm-scope`, `floor --rebuild` and `audit --rotate`. The server never takes it. This
    changes Phase A code already merged and Phase A's "Concurrency" text, so it is also filed as
