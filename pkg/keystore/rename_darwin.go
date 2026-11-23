@@ -25,3 +25,9 @@ import "golang.org/x/sys/unix"
 func renameExcl(fromDir int, from string, toDir int, to string) error {
 	return unix.RenameatxNp(fromDir, from, toDir, to, unix.RENAME_EXCL)
 }
+
+// renameSwap exchanges from in fromDir with to in toDir atomically
+// (renameatx_np RENAME_SWAP): both must exist.
+func renameSwap(fromDir int, from string, toDir int, to string) error {
+	return unix.RenameatxNp(fromDir, from, toDir, to, unix.RENAME_SWAP)
+}

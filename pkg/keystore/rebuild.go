@@ -24,14 +24,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log/slog"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // The root maintenance verb floor --rebuild (docs/design/keystore.md §
@@ -43,13 +40,11 @@ const (
 	// maintenanceMarkerName is present in the data root only while a
 	// maintenance verb runs; the listener stays down while it is.
 	maintenanceMarkerName = "keystore-maintenance"
-	// floorStagingName is floor --rebuild's staging file, in the staging
-	// directory.
-	floorStagingName = userFloorLogName + ".new"
 	// stagingDirName is the maintenance verbs' staging directory in the data
-	// root: root's 0700, so no other user can reach, and so hard-link, a
-	// staging file while it is written. It is on the data root's volume, so
-	// the staging file is renamed out of it into the logs directory.
+	// root: root's 0700, so no other user can reach a replacement directory
+	// while it is built, or a retired one. It is on the data root's volume,
+	// so a replacement directory is swapped out of it into the logs
+	// directory.
 	stagingDirName = "keystore-staging"
 	// stagingDirMode is the staging directory's mode.
 	stagingDirMode = 0o700
@@ -79,22 +74,6 @@ type SwapStepper interface {
 	BeforeSwapStep(step string) error
 }
 
-// The steps a SwapStepper is called before, in the order the swap runs
-// them (docs/design/keystore.md § "The swap"). The attribute calls between
-// them (the new log's fchown and fchmod, the gate's close and open, the old
-// log's flag clear, the new log's flag) reach the writer itself.
-const (
-	swapStepReadOld       = "read-old"
-	swapStepStageArchive  = "stage-archive"
-	swapStepStage         = "stage"
-	swapStepReadTail      = "read-tail"
-	swapStepUnlinkOld     = "unlink-old"
-	swapStepShiftArchives = "shift-archives"
-	swapStepPlaceArchive  = "place-archive"
-	swapStepRename        = "rename"
-	swapStepEnd           = "end"
-)
-
 // RebuildReport is what floor --rebuild did: the scopes it read, the keys
 // the new floor holds, and what it dropped, by class: the old floor's lines
 // that did not parse (a torn last line among them), its lines over the
@@ -115,100 +94,85 @@ func (r RebuildReport) Lost() bool {
 var errRebuildRefused = errors.New("floor --rebuild refused and changed nothing")
 
 // RebuildFloor rebuilds the user-scope floor (floor --rebuild). Run as
-// root: it writes the maintenance marker, takes the floor lock, then the
-// exclusive store lock, waiting at most 30 s, reads the old floor on its own
-// descriptor (unflagged and root's after a restore, or flagged and the
-// service user's; an old floor with more than one link is read, with a
-// Warn, since the rebuild replaces its inode), carries forward every line
-// that parses, opens every
-// scope under .user/ without the GeneratedUID check, and writes one line
-// per key: every carried tombstone, which no entry line overrides, and per
-// live key the higher of the carried sequence and the one on disk. A key of
-// a scope whose directory is gone is dropped. Any scope that does not open
-// refuses the rebuild, naming the scope, before the old floor is touched.
+// root: it takes the floor lock, then the exclusive store lock, waiting at
+// most 30 s, then writes the maintenance marker (beginMaintenance). It
+// opens the old floor and judges it on its descriptor (openOldLog: flagged,
+// or unflagged and root's after a restore; an old floor with more than one
+// link is read, with a Warn, since the rebuild replaces its inode), and
+// reads it once, streamed and bounded by its size at open: lines appended
+// after that are dropped, and only a hostile process appends then, since
+// every legitimate writer holds the store lock. It carries forward every
+// line that parses, opens every scope under .user/ without the
+// GeneratedUID check, and writes one line per key: every carried tombstone,
+// which no entry line overrides, and per live key the higher of the carried
+// sequence and the one on disk. A key of a scope whose directory is gone is
+// dropped. Any scope that does not open refuses the rebuild, naming the
+// scope, before anything changes.
 //
-// The old floor is read while still flagged, and the new one swapped in by
-// the gated swap (swapLog): lines the old floor gained after the first read
-// are re-read under the closed gate and merged (mergeTail). A rerun after a
-// crash finishes from whatever state the crash left (resumeSwap). The
-// marker is removed last.
+// The new floor is swapped in as a whole directory (swapLogDir). A rerun
+// after a crash past the swap prints the crashed run's report and does not
+// run again; after a crash before it, it runs again from the start.
 func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (RebuildReport, error) {
 	var rep RebuildReport
 	if err := s.checkConfig(); err != nil {
 		return rep, err
 	}
-	m, err := s.beginMaintenance(ctx, errRebuildRefused)
+	m, err := s.beginMaintenance(ctx, verbRebuild, userFloorLogName, errRebuildRefused, attrs)
 	if err != nil {
 		return rep, err
 	}
 	defer m.end()
-	m.hook, _ = attrs.(SwapStepper)
-	done, err := s.resumeSwap(m, userFloorLogName, floorStagingName, nil, attrs)
-	if done || err != nil {
-		return rep, err
+	if m.saved != nil {
+		return rebuildReportOf(m.saved), nil
 	}
 	if err := m.step(swapStepReadOld); err != nil {
-		m.refused()
 		return rep, fmt.Errorf("%w: %w", errRebuildRefused, err)
 	}
 	removed, err := s.readRemovedScopes(m.dfd)
 	if err != nil {
-		m.refused()
 		return rep, fmt.Errorf("%w: %w", errRebuildRefused, err)
 	}
 	in, err := s.rebuildScopes(ctx, m.root)
 	if err != nil {
-		m.refused()
 		return rep, fmt.Errorf("%w: %w", errRebuildRefused, err)
 	}
 	in.removed = removed.scopes()
 	rep.Scopes = len(in.present)
 	old, err := s.readOldFloor(m.lfd, in)
 	if err != nil {
-		m.refused()
 		return rep, fmt.Errorf("%w: the old floor %s cannot be read: %w", errRebuildRefused, userFloorLogName, err)
 	}
-	defer func() { _ = old.f.Close() }() // read-only
 	rep.Dropped, rep.OverLong, rep.ForgedLive, rep.RemovedKeys = old.dropped, old.overLong, old.forged, old.removed
 	lines, keys := mergeFloor(old, in.disk)
 	rep.Keys = keys
-	sw := logSwap{
-		canonical: userFloorLogName,
-		staging:   floorStagingName,
-		old:       old.f,
-		off:       old.off,
-		content:   bytes.Join(lines, nil),
-		tail:      func(b []byte) ([]byte, error) { return mergeTail(b, in), nil },
+	content := func(w io.Writer) error {
+		for _, l := range lines {
+			if _, err := w.Write(l); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	if err := s.swapLog(m, sw, attrs); err != nil {
+	if err := s.swapLogDir(m, userFloorLogName, content, nil, rep.fields(), attrs); err != nil {
 		return rep, err
 	}
 	return rep, nil
 }
 
-// mergeTail is the lines the old floor gained after rebuild read it (step
-// 5), to append to the new floor: every whole line that parses, but of a
-// scope root removed and recorded. The floor's reader takes a key's highest sequence and its
-// tombstone over all its lines, so appending them merges them.
-func mergeTail(b []byte, in rebuildInput) []byte {
-	var out []byte
-	for len(b) > 0 {
-		i := bytes.IndexByte(b, '\n')
-		if i < 0 {
-			break // a torn last line
-		}
-		line := b[:i]
-		b = b[i+1:]
-		if len(line) == 0 {
-			continue
-		}
-		r, err := parseFloorLine(line)
-		if err != nil || (!in.present[r.key.scope] && in.removed[r.key.scope]) {
-			continue
-		}
-		out = append(append(out, line...), '\n')
+// fields is r as the marker records it.
+func (r RebuildReport) fields() map[string]int64 {
+	return map[string]int64{
+		"scopes": int64(r.Scopes), "keys": int64(r.Keys), "dropped": int64(r.Dropped),
+		"overlong": int64(r.OverLong), "forged": int64(r.ForgedLive), "removed": int64(r.RemovedKeys),
 	}
-	return out
+}
+
+// rebuildReportOf is the report a marker recorded (fields).
+func rebuildReportOf(f map[string]int64) RebuildReport {
+	return RebuildReport{
+		Scopes: int(f["scopes"]), Keys: int(f["keys"]), Dropped: int(f["dropped"]),
+		OverLong: int(f["overlong"]), ForgedLive: int(f["forged"]), RemovedKeys: int(f["removed"]),
+	}
 }
 
 // floorLog is the file-backed floor's appendLog, for its key bound.
@@ -219,228 +183,10 @@ func (s *FileStore) floorLog() *appendLog {
 	return newFileFloorLog(s).log
 }
 
-// maintenance is a maintenance verb's hold: the floor lock, the store lock,
-// the keystore root, the judged data-root descriptor and the staging
-// directory's.
-type maintenance struct {
-	s      *FileStore
-	root   *os.Root
-	done   func()
-	fl     *floorLock
-	dfd    int
-	sfd    int
-	lfd    int
-	marker bool
-	// crashed is a marker an earlier run left: it stood before this run
-	// wrote one and still stood once this run held both locks, so no verb
-	// that ran in between removed it.
-	crashed bool
-	// refusal is the verb's refused-and-changed-nothing error, which a
-	// refusal before the old file's flag clear wraps.
-	refusal error
-	// keep leaves the marker in place: a step past the old file's flag
-	// clear failed, so the listener must stay down until a rerun.
-	keep bool
-	// hook is the attribute writer's step seam, or nil.
-	hook SwapStepper
-}
-
-// step calls the step seam, when there is one, before the step name.
-func (m *maintenance) step(name string) error {
-	if m.hook == nil {
-		return nil
-	}
-	if err := m.hook.BeforeSwapStep(name); err != nil {
-		return fmt.Errorf("before the step %s: %w; rerun the verb", name, err)
-	}
-	return nil
-}
-
-// errStoreLockHeld is the maintenance verbs' refusal when the store lock
-// is not had within maintenanceLockWait. The verb already holds
-// keystore-lock, which every root verb takes first, so the holder is a
-// process running as the service user: the server or one of its processes.
-var errStoreLockHeld = errors.New("a process running as the service user held the store lock (keystore/.lock) for 30 s: stop the server (sudo k3sm stop) or that process, then rerun; nothing was changed")
-
-// lockMaintenance takes a maintenance verb's two locks in the order every
-// verb that takes both keeps (docs/design/keystore.md § "Concurrency"):
-// keystore-lock first, then the exclusive store lock, waiting at most
-// maintenanceLockWait for it (errStoreLockHeld past it). A failure
-// releases what it took.
-func (s *FileStore) lockMaintenance(ctx context.Context, root *os.Root) (*floorLock, func(), error) {
-	fl, _, err := s.lockFloor(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	saved := s.lockWait
-	s.lockWait = maintenanceLockWait
-	unlock, err := s.lock(ctx, root, true)
-	s.lockWait = saved
-	if err != nil {
-		fl.unlock()
-		if errors.Is(err, errLockTimeout) {
-			return nil, nil, errStoreLockHeld
-		}
-		return nil, nil, err
-	}
-	return fl, unlock, nil
-}
-
-// beginMaintenance opens and judges the data root, writes the marker, then
-// takes keystore-lock and the exclusive store lock (at most
-// maintenanceLockWait; lockMaintenance), as the design orders it: the marker
-// first, so the listener stops while the verb waits. The marker is no lock,
-// so the lock order is untouched. Holding both locks it writes the marker
-// again when a verb that ran in the meantime removed it, and opens and
-// judges the staging directory. refusal is the verb's
-// refused-and-changed-nothing error. A failure before the locks are held
-// removes only a marker this run created.
-func (s *FileStore) beginMaintenance(ctx context.Context, refusal error) (*maintenance, error) {
-	root, err := s.openDir(s.dir, false)
-	if err != nil {
-		return nil, err
-	}
-	m := &maintenance{s: s, root: root, done: func() { _ = root.Close() }, dfd: -1, sfd: -1, lfd: -1, refusal: refusal}
-	if m.dfd, err = s.openLogDataRoot(); err != nil {
-		m.end()
-		return nil, err
-	}
-	pre, err := m.writeMarker()
-	if err != nil {
-		m.end()
-		return nil, err
-	}
-	fl, unlock, err := s.lockMaintenance(ctx, root)
-	if err != nil {
-		m.marker = pre // a marker another run wrote stays
-		m.end()
-		return nil, err
-	}
-	m.fl = fl
-	m.done = func() { unlock(); _ = root.Close() }
-	post, err := m.writeMarker()
-	if err != nil {
-		m.end()
-		return nil, err
-	}
-	m.marker = true
-	m.crashed = !pre && !post
-	if m.sfd, err = m.openStagingDir(); err != nil {
-		m.end()
-		return nil, fmt.Errorf("%w: %w", refusal, err)
-	}
-	// A rerun after a crash finds the gate closed, and opens it once done.
-	if m.lfd, err = s.openLogsDir(m.dfd, true); err != nil {
-		m.end()
-		return nil, fmt.Errorf("%w: %w", refusal, err)
-	}
-	for _, name := range []string{userFloorLogName, auditLogName} {
-		var st unix.Stat_t
-		if unix.Fstatat(m.dfd, name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil {
-			m.end()
-			return nil, fmt.Errorf("%w: %w", refusal, errLogOldLocation(name))
-		}
-	}
-	return m, nil
-}
-
-// writeMarker creates the marker O_CREAT|O_EXCL|O_NOFOLLOW and reports
-// whether it did. A marker already there is kept when it is a regular file
-// with one link, of the data root's owner (root); anything else at the name
-// refuses.
-func (m *maintenance) writeMarker() (bool, error) {
-	fd, err := unix.Openat(m.dfd, maintenanceMarkerName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, markerMode)
-	if errors.Is(err, unix.EEXIST) {
-		var st unix.Stat_t
-		if err := unix.Fstatat(m.dfd, maintenanceMarkerName, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			return false, fmt.Errorf("stat %s: %w", maintenanceMarkerName, err)
-		}
-		if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || int64(st.Uid) != int64(m.s.floorUID) {
-			return false, fmt.Errorf("%w: %s is not a regular file with one link, of the data root's owner", errLogUntrusted, maintenanceMarkerName)
-		}
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("create %s: %w", maintenanceMarkerName, err)
-	}
-	m.marker = true
-	err = unix.Fsync(fd)
-	if cerr := unix.Close(fd); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = unix.Fsync(m.dfd)
-	}
-	return true, err
-}
-
-// openStagingDir creates the staging directory in the data root, root's
-// 0700, or keeps the one a crashed run left, and opens it
-// O_DIRECTORY|O_NOFOLLOW and judges it on its descriptor: a directory of
-// the data root's owner (root), mode 0700, with no file flag beside
-// SF_APPEND and no extended ACL. Only root can reach a name in it, so no
-// other user can hard-link a staging file while it is written.
-func (m *maintenance) openStagingDir() (int, error) {
-	if err := unix.Mkdirat(m.dfd, stagingDirName, stagingDirMode); err != nil && !errors.Is(err, unix.EEXIST) {
-		return -1, fmt.Errorf("create %s: %w", stagingDirName, err)
-	}
-	fd, err := unix.Openat(m.dfd, stagingDirName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return -1, fmt.Errorf("%w: %s: %w", errLogUntrusted, stagingDirName, err)
-	}
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		_ = unix.Close(fd) // read-only
-		return -1, fmt.Errorf("stat %s: %w", stagingDirName, err)
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFDIR || int64(st.Uid) != int64(m.s.floorUID) || st.Mode&0o7777 != stagingDirMode {
-		_ = unix.Close(fd) // read-only
-		return -1, fmt.Errorf("%w: %s is not a directory of the data root's owner at mode 0700", errLogUntrusted, stagingDirName)
-	}
-	if err := judgeFlagsACL(fd, fdFlags); err != nil {
-		_ = unix.Close(fd) // read-only
-		return -1, fmt.Errorf("%s: %w", stagingDirName, err)
-	}
-	return fd, nil
-}
-
-// refused marks a refusal before the old file was touched: the marker
-// goes.
-func (m *maintenance) refused() { m.keep = false }
-
-// end removes the staging directory, when empty, and the marker unless
-// keep, then releases the locks.
-func (m *maintenance) end() {
-	if m.lfd >= 0 {
-		_ = unix.Close(m.lfd) // read-only directory descriptor
-	}
-	if m.sfd >= 0 {
-		_ = unix.Close(m.sfd) // read-only directory descriptor
-		if !m.keep {
-			_ = unix.Unlinkat(m.dfd, stagingDirName, unix.AT_REMOVEDIR) // a staging directory left is reused by the rerun
-		}
-	}
-	if m.marker && !m.keep {
-		_ = unix.Unlinkat(m.dfd, maintenanceMarkerName, 0) // a marker left only keeps the listener down
-		_ = unix.Fsync(m.dfd)
-	}
-	if m.dfd >= 0 {
-		_ = unix.Close(m.dfd) // read-only directory descriptor
-	}
-	if m.fl != nil {
-		m.fl.unlock()
-	}
-	m.done()
-}
-
 // oldFloor is the old floor as rebuild read it: the descriptor it read,
 // the keys admitted to the new floor with their highest carried sequence,
 // the carried tombstones, and the counts of what was dropped, by class.
 type oldFloor struct {
-	f *os.File
-	// off is the offset just past the last whole line read: the tail
-	// re-read (step 5) starts there.
-	off    int64
 	maxSeq map[floorKey]uint64
 	buried map[floorKey]bool
 	// dropped counts the lines that did not parse and a torn last line;
@@ -501,26 +247,21 @@ func floorLines(r io.Reader, lineBound int, fn func(line []byte, err error) erro
 	}
 }
 
-// readOldFloor opens the canonical floor through the logs directory lfd
-// O_NOFOLLOW (step 2 of the swap: read under the flag), refuses anything
-// but a regular file, and streams it with no size bound and memory bounded
-// by the key bound and one line (readOldFloorFrom). Its owner and flag are
-// not judged: after a restore it is root's and unflagged.
+// readOldFloor opens the canonical floor in its judged directory under
+// lfd and judges it (openOldLog, step 2), and streams it once, bounded by
+// its size at open, with memory bounded by the key bound and one line
+// (readOldFloorFrom).
 func (s *FileStore) readOldFloor(lfd int, in rebuildInput) (*oldFloor, error) {
-	f, err := openOldLog(lfd, userFloorLogName)
+	o, err := s.openOldLog(lfd, userFloorLogName)
 	if err != nil {
 		return nil, err
 	}
-	o, err := readOldFloorFrom(f, in, s.floorLog().keyBound(), maxLogLine)
-	if err != nil {
-		_ = f.Close() // read-only
-		return nil, err
-	}
-	o.f = f
-	return o, nil
+	defer o.close()
+	return readOldFloorFrom(o.f, o.size, in, s.floorLog().keyBound(), maxLogLine)
 }
 
-// readOldFloorFrom reads the old floor f in two streamed passes and admits
+// readOldFloorFrom reads the first size bytes of the old floor f in two
+// streamed passes and admits
 // its keys against keyBound, counting the keys on disk first, in this
 // order (docs/design/keystore.md § "Rebuild reads a flooded floor"):
 //
@@ -540,12 +281,12 @@ func (s *FileStore) readOldFloor(lfd int, in rebuildInput) (*oldFloor, error) {
 // the keys on disk alone pass the bound, it refuses, naming the scopes with
 // the most keys: the one refusal left. Memory is the admitted keys, at most
 // keyBound, and one line's buffer, whatever the file's size.
-func readOldFloorFrom(f io.ReaderAt, in rebuildInput, keyBound, lineBound int) (*oldFloor, error) {
+func readOldFloorFrom(f io.ReaderAt, size int64, in rebuildInput, keyBound, lineBound int) (*oldFloor, error) {
 	o := &oldFloor{maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}}
 	total := len(in.disk)
 	removedSeen := map[floorKey]bool{}
 	gone := func(k floorKey) bool { return !in.present[k.scope] && in.removed[k.scope] }
-	off, torn, err := floorLines(io.NewSectionReader(f, 0, 1<<62), lineBound, func(line []byte, lerr error) error {
+	off, torn, err := floorLines(io.NewSectionReader(f, 0, size), lineBound, func(line []byte, lerr error) error {
 		if lerr != nil {
 			o.overLong++
 			return nil
@@ -585,7 +326,6 @@ func readOldFloorFrom(f io.ReaderAt, in rebuildInput, keyBound, lineBound int) (
 	if err != nil {
 		return nil, err
 	}
-	o.off = off
 	if torn {
 		o.dropped++
 	}
@@ -649,35 +389,6 @@ func topScopes(buried map[floorKey]bool, disk map[floorKey]uint64, n int) string
 		parts = append(parts, fmt.Sprintf("%s (%d keys)", sc, count[sc]))
 	}
 	return strings.Join(parts, ", ")
-}
-
-// openOldLog opens name, a canonical log in the logs directory, read-only
-// through lfd with O_NOFOLLOW, and refuses anything but a regular file: a
-// planted symlink or FIFO refuses the verb. Its owner and flag are not
-// judged: after a restore it is root's and unflagged. A log with more than
-// one link is read as input, with a Warn naming it: the verb retires the
-// canonical inode and swaps in a fresh one, so the other link keeps only
-// the old file. The steady-state check (judgeLog) still refuses it until
-// the verb has run.
-func openOldLog(lfd int, name string) (*os.File, error) {
-	fd, err := unix.Openat(lfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	f := os.NewFile(uintptr(fd), name)
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		_ = f.Close() // read-only
-		return nil, err
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		_ = f.Close() // read-only
-		return nil, fmt.Errorf("%w: %s is not a regular file", errLogUntrusted, name)
-	}
-	if st.Nlink > 1 {
-		slog.Warn("a keystore append-only log has more than one link; the maintenance verb replaces it with a fresh file, and the other link keeps only the old one", "log", name, "links", st.Nlink)
-	}
-	return f, nil
 }
 
 // rebuildScopes opens every scope under .user/ without the GeneratedUID

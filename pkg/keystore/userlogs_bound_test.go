@@ -113,7 +113,7 @@ func TestAuditStraddlingLineCharged(t *testing.T) {
 func TestLogOpenFIFORefused(t *testing.T) {
 	ctx := context.Background()
 	s, _, u := fileLogScope(t)
-	p := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
+	p := filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName)
 	if err := os.Remove(p); err != nil {
 		t.Fatal(err)
 	}

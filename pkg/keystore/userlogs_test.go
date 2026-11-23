@@ -40,7 +40,7 @@ func flagged(*os.File) (uint32, error) { return sfAppend, nil }
 func withFileLogs(t *testing.T, s *FileStore) {
 	t.Helper()
 	for _, n := range []string{userFloorLogName, auditLogName} {
-		p := filepath.Join(s.dataRoot, logsDirName, n)
+		p := filepath.Join(s.dataRoot, logsDirName, logDirOf(n), n)
 		if err := os.WriteFile(p, nil, logMode); err != nil {
 			t.Fatal(err)
 		}
@@ -64,7 +64,7 @@ func fileLogScope(t *testing.T) (*FileStore, string, *UserScope) {
 
 func readLog(t *testing.T, s *FileStore, name string) []byte {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(s.dataRoot, logsDirName, name))
+	b, err := os.ReadFile(filepath.Join(s.dataRoot, logsDirName, logDirOf(name), name))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func readLog(t *testing.T, s *FileStore, name string) []byte {
 
 func appendLogBytes(t *testing.T, s *FileStore, name string, b []byte) {
 	t.Helper()
-	f, err := os.OpenFile(filepath.Join(s.dataRoot, logsDirName, name), os.O_WRONLY|os.O_APPEND, 0)
+	f, err := os.OpenFile(filepath.Join(s.dataRoot, logsDirName, logDirOf(name), name), os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestWithdrawAbsentFloorProceeds(t *testing.T) {
 	if err := u.addDelivery(ctx, testDelivery(1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(s.dataRoot, logsDirName, userFloorLogName)); err != nil {
+	if err := os.Remove(filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName)); err != nil {
 		t.Fatal(err)
 	}
 	before := readDeliveriesBytes(t, server)
@@ -267,7 +267,7 @@ func TestFlagCheckRefusesUnflagged(t *testing.T) {
 	}
 	s.logFlags = flagged
 
-	floorPath := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
+	floorPath := filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName)
 	t.Run("mode", func(t *testing.T) {
 		chmod(t, floorPath, 0o640)
 		defer chmod(t, floorPath, logMode)
@@ -289,7 +289,7 @@ func TestFlagCheckRefusesUnflagged(t *testing.T) {
 		}
 	})
 	t.Run("hard link", func(t *testing.T) {
-		link := filepath.Join(s.dataRoot, logsDirName, "floor-link")
+		link := filepath.Join(s.dataRoot, logsDirName, floorDirName, "floor-link")
 		if err := os.Link(floorPath, link); err != nil {
 			t.Fatal(err)
 		}
@@ -299,7 +299,7 @@ func TestFlagCheckRefusesUnflagged(t *testing.T) {
 		}
 	})
 	t.Run("symlink", func(t *testing.T) {
-		auditPath := filepath.Join(s.dataRoot, logsDirName, auditLogName)
+		auditPath := filepath.Join(s.dataRoot, logsDirName, auditDirName, auditLogName)
 		moved := auditPath + ".real"
 		if err := os.Rename(auditPath, moved); err != nil {
 			t.Fatal(err)

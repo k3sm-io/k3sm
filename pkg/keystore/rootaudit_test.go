@@ -35,7 +35,7 @@ func TestAuditRootViaRootOnceLogExists(t *testing.T) {
 	if err := s.AuditRoot(ctx, "put", "api-token", "ok"); err != nil {
 		t.Fatalf("AuditRoot before install made the log: %v, want nil", err)
 	}
-	if _, err := os.Lstat(filepath.Join(s.dataRoot, logsDirName, auditLogName)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(filepath.Join(s.dataRoot, logsDirName, auditDirName, auditLogName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("AuditRoot created the audit log: %v", err)
 	}
 	withFileLogs(t, s)

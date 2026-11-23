@@ -73,7 +73,7 @@ func TestPutRefusedFirstAtCapStraddle(t *testing.T) {
 		}
 		appendLogBytes(t, s, userFloorLogName, line)
 	}
-	if err := os.Truncate(filepath.Join(s.dataRoot, logsDirName, auditLogName), 0); err != nil {
+	if err := os.Truncate(filepath.Join(s.dataRoot, logsDirName, auditDirName, auditLogName), 0); err != nil {
 		t.Fatal(err)
 	}
 	size := int64(len(readLog(t, s, userFloorLogName)))
@@ -106,7 +106,7 @@ func TestDeliverRefusedFirstBelowFloorMargin(t *testing.T) {
 // its one ok line and no refusal.
 func TestPutMintJudgesFloorRoomOnce(t *testing.T) {
 	s, _, _ := fileLogScope(t)
-	floorPath := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
+	floorPath := filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName)
 	before := int64(len(readLog(t, s, userFloorLogName)))
 	s.userFloor.(*fileFloorLog).log.freeSpace = func(int) (uint64, error) {
 		fi, err := os.Stat(floorPath)

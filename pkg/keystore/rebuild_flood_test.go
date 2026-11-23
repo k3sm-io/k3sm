@@ -144,7 +144,7 @@ func TestOldFloorReaderMemoryBounded(t *testing.T) {
 		var before, after runtime.MemStats
 		runtime.GC()
 		runtime.ReadMemStats(&before)
-		o, err := readOldFloorFrom(bytes.NewReader(b), in, keyBound, maxLogLine)
+		o, err := readOldFloorFrom(bytes.NewReader(b), int64(len(b)), in, keyBound, maxLogLine)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -187,7 +187,7 @@ func TestOldFloorReaderRefusesTombstonesPastBound(t *testing.T) {
 		b.Write(line)
 	}
 	in := rebuildInput{disk: map[floorKey]uint64{}, present: map[string]bool{"user/1001": true}, names: map[nameKey]bool{}, removed: map[string]bool{}}
-	_, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), in, 4, maxLogLine)
+	_, err := readOldFloorFrom(bytes.NewReader(b.Bytes()), int64(b.Len()), in, 4, maxLogLine)
 	if err == nil || !strings.Contains(err.Error(), "user/1001 (5 keys)") {
 		t.Fatalf("readOldFloorFrom: %v, want a refusal naming user/1001 (5 keys)", err)
 	}

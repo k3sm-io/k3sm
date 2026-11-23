@@ -86,10 +86,10 @@ func TestKeysMaintenanceVerbs(t *testing.T) {
 
 	h.euid = 0
 	h.logFlags = keysFlagged
-	if err := os.Mkdir(filepath.Join(h.cfg.DataRoot, keystore.LogsDirName), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(h.cfg.DataRoot, keystore.LogsDirName, keystore.FloorDirName), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	floor := filepath.Join(h.cfg.DataRoot, keystore.LogsDirName, "keystore-user-floor.log")
+	floor := filepath.Join(h.cfg.DataRoot, keystore.LogsDirName, keystore.FloorDirName, "keystore-user-floor.log")
 	if err := os.WriteFile(floor, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -216,14 +216,15 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	h.logFlags = keysFlagged
 	root := h.cfg.DataRoot
 	logs := filepath.Join(root, keystore.LogsDirName)
-	if err := os.Mkdir(logs, 0o755); err != nil {
+	adir := filepath.Join(logs, keystore.AuditDirName)
+	if err := os.MkdirAll(adir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	name := func(n int) string {
 		if n == 0 {
-			return filepath.Join(logs, keystore.AuditLogName)
+			return filepath.Join(adir, keystore.AuditLogName)
 		}
-		return filepath.Join(logs, fmt.Sprintf("%s.%d", keystore.AuditLogName, n))
+		return filepath.Join(adir, fmt.Sprintf("%s.%d", keystore.AuditLogName, n))
 	}
 	write := func(n int, s string) {
 		t.Helper()
@@ -232,7 +233,7 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 		}
 	}
 	// read drops the verb's own audit-rotate line, which AuditRoot appends
-	// to the new log once the verb is done (step 9), and the newline each
+	// to the new log once the verb is done (step 7), and the newline each
 	// append leads with.
 	read := func(n int) string {
 		t.Helper()
@@ -264,8 +265,8 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	write(1, "a1\n")
 	write(2, "a2\n")
 
-	// Two archives: both shift, the old log becomes .1, the new log is
-	// empty, and each file it shifted was handled on its own descriptor.
+	// Two archives: both are linked one number up, the old log's bytes
+	// become .1, and the new log is empty.
 	rec := &keysInoRecorder{t: t, calls: map[uint64][]string{}}
 	h.attrs = rec
 	lines = nil
@@ -286,14 +287,16 @@ func TestAuditRotateKeepsFourArchives(t *testing.T) {
 			t.Errorf("the archive shifted to .%d saw %q on its descriptor, want none: archives are root's and unflagged", n, got)
 		}
 	}
-	if got := rec.calls[keysIno(t, name(1))]; !slices.Equal(got, []string{"fchmod 600"}) {
-		t.Errorf("the new archive .1 saw %q on its descriptor, want root's 0600 only", got)
+	if got := rec.calls[keysIno(t, name(1))]; len(got) != 0 {
+		t.Errorf("the new archive .1 saw %q through the attribute writer, want none: it is root's 0600", got)
 	}
 	if got := rec.calls[keysIno(t, name(0))]; !slices.Equal(got, []string{"fchown", "fchmod 600", flagged}) {
 		t.Errorf("the new log saw %q, want the service user, 0600, then the flag", got)
 	}
-	if got := rec.calls[keysIno(t, logs)]; !slices.Equal(got, []string{"fchmod 700", "fchmod 755"}) {
-		t.Errorf("%s saw %q, want the gate closed, then opened", keystore.LogsDirName, got)
+	for _, d := range []string{logs, adir} {
+		if got := rec.calls[keysIno(t, d)]; len(got) != 0 {
+			t.Errorf("%s saw %q, want no attribute call: there is no gate", d, got)
+		}
 	}
 	for _, n := range []string{"keystore-maintenance", "keystore-staging"} {
 		if _, err := os.Lstat(filepath.Join(root, n)); !errors.Is(err, os.ErrNotExist) {

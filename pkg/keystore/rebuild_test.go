@@ -178,7 +178,7 @@ func TestRebuildCarriesTombstonesForward(t *testing.T) {
 	}
 
 	// A floor that cannot be read refuses, changing nothing.
-	p := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
+	p := filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName)
 	before := readLog(t, s, userFloorLogName)
 	aside := p + ".aside"
 	if err := os.Rename(p, aside); err != nil {
@@ -345,7 +345,7 @@ func TestBackupRestoreRoundTripRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	copyTree(t, filepath.Join(backup, "keystore"), ks)
-	p := filepath.Join(s.dataRoot, logsDirName, userFloorLogName)
+	p := filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName)
 	if err := os.Remove(p); err != nil {
 		t.Fatal(err)
 	}
@@ -369,9 +369,10 @@ func TestBackupRestoreRoundTripRebuild(t *testing.T) {
 	}
 	assertNoMaintenanceLeft(t, s)
 	svc := fmt.Sprintf("fchown %d", s.uid)
-	root := fmt.Sprintf("fchown %d", s.floorUID)
-	_ = root
-	want := []string{svc, "fchmod 600", "fchmod 700", "fchflags 0x0", fmt.Sprintf("fchflags %#x", sfAppend), "fchmod 755"}
+	// The new log is handed over, set to 0600 and flagged before it is
+	// reachable; the restored log is unflagged and, in this non-root test,
+	// the floor owner's, so it is taken as a restore; no other call is made.
+	want := []string{svc, "fchmod 600", fmt.Sprintf("fchflags %#x", sfAppend)}
 	if strings.Join(rec.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("attribute calls %q, want %q", rec.calls, want)
 	}
@@ -393,7 +394,7 @@ func TestRebuildKeepsDamagedEntryCorrupt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The restored floor lost the entry's line.
-	if err := os.WriteFile(filepath.Join(s.dataRoot, logsDirName, userFloorLogName), nil, logMode); err != nil {
+	if err := os.WriteFile(filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName), nil, logMode); err != nil {
 		t.Fatal(err)
 	}
 	rebuild(t, s)

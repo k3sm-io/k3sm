@@ -56,7 +56,7 @@ func TestUserRmChargesEveryTombstone(t *testing.T) {
 		b = append(b, line...)
 	}
 	appendLogBytes(t, s, userFloorLogName, b)
-	if err := os.Truncate(filepath.Join(s.dataRoot, logsDirName, auditLogName), 0); err != nil {
+	if err := os.Truncate(filepath.Join(s.dataRoot, logsDirName, auditDirName, auditLogName), 0); err != nil {
 		t.Fatal(err)
 	}
 	before := readLog(t, s, userFloorLogName)

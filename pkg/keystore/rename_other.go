@@ -26,3 +26,8 @@ import "errors"
 func renameExcl(int, string, int, string) error {
 	return errors.ErrUnsupported
 }
+
+// renameSwap is renameatx_np's RENAME_SWAP, which only Darwin has.
+func renameSwap(int, string, int, string) error {
+	return errors.ErrUnsupported
+}

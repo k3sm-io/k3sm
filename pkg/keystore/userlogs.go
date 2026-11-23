@@ -67,15 +67,16 @@ const (
 	userFloorLogName = "keystore-user-floor.log"
 	auditLogName     = "keystore-audit.log"
 	// logsDirName is the logs directory in the data root: root's 0755, with
-	// no flag and no ACL. It holds the two logs and the audit archives.
-	// Closing it to 0700 (logsGateMode) is the maintenance gate: no other
-	// user can then look a name up in it, so none can open, truncate or
-	// hard-link a log while a swap renames, flags or retires one.
-	logsDirName = "keystore-logs"
-	// logsDirMode is the logs directory's mode with the gate open, and
-	// logsGateMode its mode with the gate closed.
-	logsDirMode  = 0o755
-	logsGateMode = 0o700
+	// no flag and no ACL. It holds one root-owned directory per log
+	// (floorDirName, auditDirName), each root's 0755 with no flag and no
+	// ACL, so a maintenance verb replaces a log and its archives as one
+	// directory, swapped in whole (docs/design/keystore.md § "The swap").
+	logsDirName  = "keystore-logs"
+	floorDirName = "floor"
+	auditDirName = "audit"
+	// logsDirMode is the mode of keystore-logs/ and of each log's
+	// directory.
+	logsDirMode = 0o755
 	// maxLogLine bounds one line of either log, its newline included.
 	maxLogLine = 1024
 	// maxAppendLine is the most one append of one line writes: the newline
@@ -408,7 +409,7 @@ func (s *FileStore) LogSizes(ctx context.Context) (LogSizes, error) {
 		size *int64
 	}{{userFloorLogName, &out.UserFloor}, {auditLogName, &out.Audit}} {
 		var st unix.Stat_t
-		if err := unix.Fstatat(lfd, l.name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if err := s.statLog(lfd, l.name, &st); err != nil {
 			return LogSizes{}, fmt.Errorf("%s: %w", l.name, err)
 		}
 		*l.size = st.Size
@@ -656,60 +657,92 @@ func (s *FileStore) openLogDataRoot() (int, error) {
 	return dfd, nil
 }
 
-// errLogsGateClosed is the logs directory found at the gate's mode, 0700:
-// a maintenance verb or install closed it for a swap and has not opened it
-// again, so it is running or stopped part-way.
-var errLogsGateClosed = fmt.Errorf("%w: %s is closed (mode 0700): a keystore maintenance verb or install is running or stopped part-way; rerun the one that stopped (sudo k3sm keys floor --rebuild, sudo k3sm keys audit --rotate, or sudo k3sm install), which opens it again", errLogUntrusted, logsDirName)
+// logDirOf is the directory in keystore-logs/ that holds the log name.
+func logDirOf(name string) string {
+	if name == userFloorLogName {
+		return floorDirName
+	}
+	return auditDirName
+}
 
 // openLogsDir opens the logs directory through the judged data root dfd,
-// O_DIRECTORY|O_NOFOLLOW, and judges it on its descriptor (judgeLogsDir).
-// gateOK accepts the gate's mode, 0700, beside 0755: a maintenance verb
-// rerun after a crash finds it closed.
-func (s *FileStore) openLogsDir(dfd int, gateOK bool) (int, error) {
-	fd, err := unix.Openat(dfd, logsDirName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+// O_DIRECTORY|O_NOFOLLOW, and judges it on its descriptor (judgeLogDir).
+func (s *FileStore) openLogsDir(dfd int) (int, error) {
+	return s.openJudgedDir(dfd, logsDirName)
+}
+
+// openLogDir opens the directory of the log name through the judged logs
+// directory lfd, O_DIRECTORY|O_NOFOLLOW, and judges it on its descriptor
+// (judgeLogDir). A missing directory is an error matching unix.ENOENT.
+func (s *FileStore) openLogDir(lfd int, name string) (int, error) {
+	return s.openJudgedDir(lfd, logDirOf(name))
+}
+
+// openJudgedDir opens dir under pfd and judges it (judgeLogDir).
+func (s *FileStore) openJudgedDir(pfd int, dir string) (int, error) {
+	fd, err := unix.Openat(pfd, dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return -1, fmt.Errorf("%w: open %s: %w; sudo k3sm install creates it", errLogUntrusted, logsDirName, err)
+		return -1, fmt.Errorf("%w: open %s: %w; sudo k3sm install creates it", errLogUntrusted, dir, err)
 	}
-	if err := s.judgeLogsDir(fd, gateOK); err != nil {
+	if err := s.judgeLogDir(fd, dir); err != nil {
 		_ = unix.Close(fd) // read-only directory descriptor
 		return -1, err
 	}
 	return fd, nil
 }
 
-// judgeLogsDir refuses the logs directory open at fd unless it is a
-// directory of the data root's owner (root) at mode 0755 (or the gate's
-// 0700 when gateOK), with no file flag and no extended ACL.
-func (s *FileStore) judgeLogsDir(fd int, gateOK bool) error {
+// judgeLogDir refuses the directory dir open at fd unless it is a
+// directory of the data root's owner (root) at mode 0755, with no file flag
+// and no extended ACL: keystore-logs/ and each log's directory.
+func (s *FileStore) judgeLogDir(fd int, dir string) error {
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
-		return fmt.Errorf("stat %s: %w", logsDirName, err)
+		return fmt.Errorf("stat %s: %w", dir, err)
 	}
-	mode := st.Mode & 0o7777
 	if st.Mode&unix.S_IFMT != unix.S_IFDIR || int64(st.Uid) != int64(s.floorUID) {
-		return fmt.Errorf("%w: %s is not a directory of the data root's owner", errLogUntrusted, logsDirName)
+		return fmt.Errorf("%w: %s is not a directory of the data root's owner", errLogUntrusted, dir)
 	}
-	if mode == logsGateMode && !gateOK {
-		return errLogsGateClosed
-	}
-	if mode != logsDirMode && mode != logsGateMode {
-		slog.Debug("the keystore logs directory is not at its mode", "mode", fmt.Sprintf("%04o", mode))
-		return fmt.Errorf("%w: %s is not at mode 0755", errLogUntrusted, logsDirName)
+	if mode := st.Mode & 0o7777; mode != logsDirMode {
+		slog.Debug("a keystore logs directory is not at its mode", "dir", dir, "mode", fmt.Sprintf("%04o", mode))
+		return fmt.Errorf("%w: %s is not at mode 0755", errLogUntrusted, dir)
 	}
 	fl, err := fdFlags(fd)
 	if err != nil {
-		return fmt.Errorf("%w: read the flags of %s: %w", errLogUntrusted, logsDirName, err)
+		return fmt.Errorf("%w: read the flags of %s: %w", errLogUntrusted, dir, err)
 	}
 	if fl != 0 {
-		return fmt.Errorf("%w: %s carries a file flag", errLogUntrusted, logsDirName)
+		return fmt.Errorf("%w: %s carries a file flag", errLogUntrusted, dir)
 	}
 	return judgeFlagsACL(fd, func(int) (uint32, error) { return fl, nil })
 }
 
-// errLogOldLocation is a log found at the top of the data root, where no
-// release keeps one: the logs live in keystore-logs/.
+// errLogOldLocation is a log found where no release keeps one: at the top
+// of the data root, or directly in keystore-logs/. The logs live in their
+// own directories in keystore-logs/.
 func errLogOldLocation(name string) error {
-	return fmt.Errorf("%w: %s is at the top of the data root, where this build keeps no log (the logs live in %s/); clear its flag and remove it (sudo chflags nosappnd and sudo rm), then run sudo k3sm install", errLogUntrusted, name, logsDirName)
+	return fmt.Errorf("%w: %s is at a location this build keeps no log at (the log lives in %s/%s/); clear its flag and remove it (sudo chflags nosappnd and sudo rm), then run sudo k3sm install", errLogUntrusted, name, logsDirName, logDirOf(name))
+}
+
+// oldLogLocation reports whether the log name stands at an earlier
+// location: the top of the data root dfd, or directly in the logs
+// directory lfd (when lfd >= 0).
+func oldLogLocation(dfd, lfd int, name string) bool {
+	var st unix.Stat_t
+	if unix.Fstatat(dfd, name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil {
+		return true
+	}
+	return lfd >= 0 && unix.Fstatat(lfd, name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil
+}
+
+// statLog stats the log name in its directory under lfd, without
+// following a symlink, the directory judged.
+func (s *FileStore) statLog(lfd int, name string, st *unix.Stat_t) error {
+	ld, err := s.openLogDir(lfd, name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(ld) }() // read-only directory descriptor
+	return unix.Fstatat(ld, name, st, unix.AT_SYMLINK_NOFOLLOW)
 }
 
 // openLogDirs opens and judges the data root and, through it, the logs
@@ -719,7 +752,7 @@ func (s *FileStore) openLogDirs() (dfd, lfd int, err error) {
 	if err != nil {
 		return -1, -1, err
 	}
-	lfd, err = s.openLogsDir(dfd, false)
+	lfd, err = s.openLogsDir(dfd)
 	if err != nil {
 		_ = unix.Close(dfd) // read-only directory descriptor
 		return -1, -1, err
@@ -737,22 +770,28 @@ func (l *appendLog) open(flag int) (*os.File, unix.Stat_t, error) {
 		return nil, st, err
 	}
 	defer func() { _ = unix.Close(dfd) }() // the file is opened; the directory is done with
-	// A missing logs directory is a missing log, as before install.
-	lfd, err := l.s.openLogsDir(dfd, false)
+	// A missing logs directory, or log directory, is a missing log, as
+	// before install.
+	lfd, err := l.s.openLogsDir(dfd)
 	fd := -1
-	switch {
-	case errors.Is(err, unix.ENOENT):
-	case err != nil:
-		return nil, st, err
-	default:
+	if err == nil {
 		defer func() { _ = unix.Close(lfd) }() // as dfd
-		// O_NONBLOCK, so a FIFO planted at the name is opened, and refused on
-		// its descriptor, rather than blocking the open.
-		fd, err = unix.Openat(lfd, l.name, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+		var ld int
+		ld, err = l.s.openLogDir(lfd, l.name)
+		if err == nil {
+			// O_NONBLOCK, so a FIFO planted at the name is opened, and refused
+			// on its descriptor, rather than blocking the open.
+			fd, err = unix.Openat(ld, l.name, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+			_ = unix.Close(ld) // read-only directory descriptor
+		}
+	} else {
+		lfd = -1
+	}
+	if err != nil && fd < 0 && !errors.Is(err, unix.ENOENT) && errors.Is(err, errLogUntrusted) {
+		return nil, st, err // a judged directory refused
 	}
 	if errors.Is(err, unix.ENOENT) {
-		var old unix.Stat_t
-		if unix.Fstatat(dfd, l.name, &old, unix.AT_SYMLINK_NOFOLLOW) == nil {
+		if oldLogLocation(dfd, lfd, l.name) {
 			return nil, st, errLogOldLocation(l.name)
 		}
 		missing := errLogMissing

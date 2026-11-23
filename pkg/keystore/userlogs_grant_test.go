@@ -37,7 +37,7 @@ func TestGrantRefusesUntrustedFloorFirst(t *testing.T) {
 		want  error
 	}{
 		{"absent", func(t *testing.T, s *FileStore) {
-			if err := os.Remove(filepath.Join(s.dataRoot, logsDirName, userFloorLogName)); err != nil {
+			if err := os.Remove(filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName)); err != nil {
 				t.Fatal(err)
 			}
 		}, errLogMissing},

@@ -47,7 +47,9 @@ type fileAttrWriter interface {
 // swapStepper is the optional step seam of the file-attribute writer: when
 // fileAttrSeam also implements it, the keystore step calls BeforeSwapStep
 // with the step's name before each step of a log's creation that makes no
-// attribute call of its own ("create", "rename", "fsync"), so a root-run
+// attribute call of its own ("create": the build of the log's directory in
+// keystore-staging/, "rename": its RENAME_EXCL into keystore-logs/,
+// "fsync"), so a root-run
 // test can probe, or stop install at, every step. An error fails the step
 // as a crash there would leave it.
 type swapStepper interface {

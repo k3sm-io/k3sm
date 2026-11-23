@@ -25,7 +25,8 @@ import (
 )
 
 // UserFloorLogName, AuditLogName and RunDirName are the names install
-// creates: the two append-only logs, in LogsDirName, and the keystore's
+// creates: the two append-only logs, each in its own directory in
+// LogsDirName (FloorDirName, AuditDirName), and the keystore's
 // run directory in the data root (docs/design/keystore.md § "The user-scope floor").
 // UserScopesDirName is the user scopes' directory in the entries'
 // directory, whose presence makes a missing floor a restore, not an
@@ -35,16 +36,26 @@ const (
 	AuditLogName      = auditLogName
 	RunDirName        = "keystore-run"
 	UserScopesDirName = userScopesName
-	// LogsDirName is the logs' directory in the data root, root's 0755
-	// (0700 while a swap holds its gate closed), and StagingDirName the
-	// root-only staging directory a new log is written in.
+	// LogsDirName is the logs' directory in the data root, root's 0755;
+	// FloorDirName and AuditDirName the logs' own directories in it, root's
+	// 0755; StagingDirName the root-only staging directory a replacement
+	// log directory is built in.
 	LogsDirName    = logsDirName
+	FloorDirName   = floorDirName
+	AuditDirName   = auditDirName
 	StagingDirName = stagingDirName
+	// FloorLockName is keystore-lock in the data root, which every
+	// maintenance verb holds while it runs.
+	FloorLockName = floorLockName
 )
+
+// LogDirOf is the directory in LogsDirName that holds the log name.
+func LogDirOf(name string) string { return logDirOf(name) }
 
 // MaintenanceMarkerName is the maintenance marker in the data root:
 // present only while floor --rebuild or audit --rotate runs, or after one
-// stopped part-way, until a rerun of that verb finishes.
+// stopped part-way, until the next maintenance verb or install, run with
+// no maintenance lock held, removes it.
 const MaintenanceMarkerName = maintenanceMarkerName
 
 // LinkedLogRepair reports, when err is a log refused for more than one link

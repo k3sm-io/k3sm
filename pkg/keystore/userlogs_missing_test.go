@@ -31,7 +31,7 @@ import (
 func TestLogMissingWithScopesNamesRestore(t *testing.T) {
 	ctx := context.Background()
 	s, _, u := fileLogScope(t)
-	if err := os.Remove(filepath.Join(s.dataRoot, logsDirName, userFloorLogName)); err != nil {
+	if err := os.Remove(filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName)); err != nil {
 		t.Fatal(err)
 	}
 	_, err := u.Put(ctx, "user/1001/other", KindOpaque, []byte("v"))

@@ -51,7 +51,7 @@ func cachedFloor(t *testing.T, s *FileStore, u *UserScope) (first, last int64, l
 // only its own key, and the file keeps its inode and size.
 func spoilLineAt(t *testing.T, s *FileStore, end int64) {
 	t.Helper()
-	f, err := os.OpenFile(filepath.Join(s.dataRoot, logsDirName, userFloorLogName), os.O_RDWR, 0)
+	f, err := os.OpenFile(filepath.Join(s.dataRoot, logsDirName, floorDirName, userFloorLogName), os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
