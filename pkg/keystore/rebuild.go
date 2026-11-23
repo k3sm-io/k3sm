@@ -531,7 +531,7 @@ func (s *FileStore) rebuildScopes(ctx context.Context, root *os.Root, keyBound i
 			return fmt.Errorf("the entries of the scopes on disk pass the new floor's key bound of %d, so the rebuild would lower a real scope's floor; remove a scope (sudo k3sm keys rm-scope); the scopes with the most entries: %s", keyBound, topScopes(count, 3))
 		}
 		if err != nil {
-			return fmt.Errorf("the scope %s does not open, so the rebuild would lower its floor: %w", u.scope, err)
+			return fmt.Errorf("the scope %s does not open, so the rebuild would lower its floor: %w; repair it, or remove it (sudo k3sm keys rm-scope %s --yes)", u.scope, err, u.scope)
 		}
 		return nil
 	})

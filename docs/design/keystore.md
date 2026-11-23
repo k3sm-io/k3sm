@@ -2944,7 +2944,12 @@ service user can only add to.
   - *The service user can block `floor --rebuild`.* It can flood the floor with tombstones past
     the key bound, or make one of its scopes unopenable; rebuild then refuses, naming the scope
     ("Rebuild never lowers"). The repair is `sudo k3sm keys rm-scope user/<uid> --yes` for that
-    scope, then `floor --rebuild`.
+    scope, then `floor --rebuild`. It needs only the scope's `scope.key` to open: a delivery
+    record that names a delivery still refuses (withdraw first), but one that does not read,
+    corrupt or missing beside `entries/`, which the service user can cause in its own tree, does
+    not. `rm-scope` then lists the scope key, removes the tree and exits 4, saying the delivery
+    record could not be read, so deliveries from this scope were not checked, and any Secret it
+    delivered stays until it is withdrawn or removed by hand.
   - *Root's audit line comes after the verb.* The CLI writes the verb's audit line once the
     verb has returned, so a crash between the commit and that line leaves the change without
     its line; the rerun writes one.

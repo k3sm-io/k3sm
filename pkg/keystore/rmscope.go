@@ -24,6 +24,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"unicode"
 
 	"golang.org/x/sys/unix"
 )
@@ -38,7 +40,10 @@ var errScopeHasDeliveries = errors.New("the scope's delivery record names delive
 // floor lock and then the exclusive store lock (at most 30 s;
 // lockMaintenance) it opens the scope's key under W without the
 // GeneratedUID check and reads its delivery record, refusing while the
-// record names any delivery, then lists the scope key's identity in the
+// record names any delivery. A record that does not read (the service user
+// can damage its own) does not stop it, since listing needs only
+// scope.key: the scope is removed and the result is errCommitted, saying
+// its deliveries were not checked. It then lists the scope key's identity in the
 // removed-scopes record (keystore-removed-scopes.json, through the judged
 // data-root descriptor) with the user-scope floor's byte size at that
 // moment, then removes .user/<uid>/ by descriptor (removeScopeTree),
@@ -109,6 +114,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 	_, ds, derr := u.readDeliveriesUnfloored(o)
 	_, eerr := o.dir.Lstat(scopeEntriesName)
 	o.close()
+	var unread error
 	switch {
 	case recorded:
 		// An earlier rm-scope listed the key, then stopped part-way.
@@ -119,7 +125,10 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		// An earlier rm-scope, unlisted (a full record), removed entries/
 		// and the record, then stopped.
 	default:
-		return false, fmt.Errorf("read the delivery record of %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", u.scope, derr)
+		// The service user can damage its own record; listing needs only
+		// scope.key, so the scope is removed, and the result says what
+		// went unchecked.
+		unread = derr
 	}
 	if !recorded {
 		ino, size, err := s.floorSize(dfd)
@@ -140,7 +149,16 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		}
 		return recorded, fmt.Errorf("%w; the scope %s %s, and its directory keystore/%s/%s is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, u.scope, state, userScopesName, name, u.scope)
 	}
+	if unread != nil {
+		return recorded, fmt.Errorf("%w: %s", errCommitted, scopeRemovedUnread(u.scope, unread))
+	}
 	return recorded, nil
+}
+
+// scopeRemovedUnread is rm-scope's committed report for a scope removed
+// although its delivery record did not read (err).
+func scopeRemovedUnread(scope string, err error) string {
+	return "removed " + scope + ", but its delivery record could not be read (" + safeText(err.Error()) + "), so deliveries from this scope were not checked: any Secret it delivered stays until it is withdrawn or removed by hand"
 }
 
 // floorSize is the user-scope floor's inode and byte size, through the
@@ -501,3 +519,21 @@ func listDir(dfd int) ([]string, error) {
 		}
 	}
 }
+
+// safeText is s, a text that may hold a name from the service user's
+// tree, with its control characters and invalid bytes removed, so an error
+// or hint that prints it cannot move the cursor, start a new line or
+// carry an escape sequence.
+func safeText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == unicode.ReplacementChar || unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(s, ""))
+}
+
+// quoteName renders a name or path from the service user's tree for an
+// error or hint: control characters removed, then Go-quoted, so a shell
+// metacharacter in it is plainly part of a quoted name.
+func quoteName(s string) string { return strconv.Quote(safeText(s)) }
