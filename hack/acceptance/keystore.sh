@@ -578,7 +578,7 @@ check U25 "backup and restore round trip: a restored tree with cleared flags is 
 	TestBackupRestoreRoundTripRebuild TestRebuildKeepsDamagedEntryCorrupt TestSwapCallOrder TestSwapRerunFromEachStep TestMaintenanceRepairsHardLinkedLog TestMaintenanceStagingDirIsRootOnly TestMaintenanceLocksBeforeMarker TestOldLogUnflaggedServiceOwnedRefused
 pend U26 "peers uid 0, the service uid and uid < 501 are refused before any frame is read (socket listener)" \
 	k3sm/pkg/keystore/socket::TestPeerEligibility
-pend U27 "framing: an oversize frame, unknown type or missing HELLO closes; an unknown header field is ignored; HELLO picks the highest common version (socket listener)" \
+check U27 "framing: an oversize frame, unknown type or missing HELLO closes; an unknown header field is ignored; HELLO picks the highest common version (socket listener)" \
 	k3sm/pkg/keystore/socket::FuzzFrameReader TestFramingBounds TestSubLengthsWithinFrame TestHelloReadDeadline TestUnknownHeaderFieldsIgnored TestHelloVersionRange TestHelloReplyCarriesVersionAndMaxFrame TestHelloNoOverlapSendsUnsupportedVersion TestUnknownOpKeepsConnection TestFrameCapCoversMaxValue
 pend U28 "64 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after HELLO or between requests is closed (socket listener)" \
 	k3sm/pkg/keystore/socket::TestConnectionCapsPerUID TestRequestTimeout TestIdleTimeoutAfterHelloAndBetweenRequests
