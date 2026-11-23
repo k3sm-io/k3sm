@@ -1,0 +1,5 @@
+go test fuzz v1
+[]byte("{\"version\":1,\"scope\":\"system\",\"entries\":{\"m\":{\"generation\":\"00000000000000000000000000000003\",\"seq\":1}}}")
+[]byte("{\"version\":1,\"scope\":\"system\",\"entries\":{\"m\":{\"generation\":\"00000000000000000000000000000004\",\"seq\":1}}}")
+string("m")
+string("")

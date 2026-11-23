@@ -82,16 +82,21 @@ func TestFloorWriteRereads(t *testing.T) {
 		}
 	})
 
-	t.Run("a stale Delete cannot erase a newer Put's floor entry", func(t *testing.T) {
+	// The floor records k live at a generation the Delete never read: the
+	// Delete buries the floor's own live generation, root's record, so
+	// whatever stands under the name at that generation is refused, never
+	// accepted; the directory's generation is buried too, after it, because
+	// its pointer authenticates under it with the master.
+	t.Run("a Delete buries the floor's live generation, then the authenticated directory's", func(t *testing.T) {
 		s, server := newTestStore(t)
 		mustPut(t, s, "k", KindOpaque, []byte("one"))
 		mustPut(t, s, "other", KindOpaque, []byte("one"))
 		start := floorOf(t, server)
 		newer := floorEntry{Generation: strings.Repeat("11", generationSize), Seq: 1}
-		// After the Delete removed the pointer, a Put of a new generation of
-		// k records its floor.
+		// After the Delete read the floor, before its burial, a Put of a new
+		// generation of k records its floor.
 		s.step = func(name string) error {
-			if name == "delete k" {
+			if name == "bury k" {
 				putFloorFile(t, server, floor{"k": newer, "other": start["other"]})
 			}
 			return nil
@@ -100,10 +105,12 @@ func TestFloorWriteRereads(t *testing.T) {
 			t.Fatalf("Delete: %v", err)
 		}
 		got := floorOf(t, server)
-		if got["k"] != newer {
-			t.Fatalf("floor k after the Delete = %+v, want the newer Put's %+v kept", got["k"], newer)
+		// The directory's own generation authenticated under the master, so
+		// it is buried too, after the floor's live one.
+		if bs := got["k"].burials(); got["k"].live() || len(bs) != 2 || bs[0].Generation != newer.Generation || bs[1].Generation != start["k"].Generation {
+			t.Fatalf("floor k after the Delete = %+v, want the floor's live %s buried, then the directory's %s", got["k"], newer.Generation, start["k"].Generation)
 		}
-		if got["other"] != start["other"] {
+		if !entriesEqual(got["other"], start["other"]) {
 			t.Fatalf("floor other after the Delete = %+v, want %+v", got["other"], start["other"])
 		}
 
@@ -112,8 +119,8 @@ func TestFloorWriteRereads(t *testing.T) {
 		if err := s.Delete(t.Context(), "gone"); err != nil {
 			t.Fatalf("Delete gone: %v", err)
 		}
-		if _, ok := floorOf(t, server)["gone"]; ok {
-			t.Fatal("the Delete left its own generation's floor entry")
+		if f := floorOf(t, server)["gone"]; len(f.burials()) == 0 {
+			t.Fatalf("the Delete left its own generation's floor entry live: %+v, want a tombstone", f)
 		}
 	})
 }
@@ -186,7 +193,7 @@ func TestFloorLockBoundedWait(t *testing.T) {
 			if _, err := os.Lstat(filepath.Join(server, "keystore", "b")); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("the timed-out Put left b: %v", err)
 			}
-			if after := floorOf(t, server); after["a"] != before["a"] || len(after) != len(before) {
+			if after := floorOf(t, server); !entriesEqual(after["a"], before["a"]) || len(after) != len(before) {
 				t.Fatalf("floor after the timed-out verbs = %+v, was %+v", after, before)
 			}
 		})
@@ -227,8 +234,8 @@ func TestDataRootFlockBlocksNoFloorWrite(t *testing.T) {
 			}
 		}
 		fl := floorOf(t, server)
-		if _, ok := fl["a"]; ok {
-			t.Fatalf("floor after the Delete still records a: %+v", fl)
+		if len(fl["a"].burials()) == 0 {
+			t.Fatalf("floor after the Delete still records a live: %+v, want a tombstone", fl)
 		}
 		if fl["b"].Seq != 1 {
 			t.Fatalf("floor b after the Put = %+v, want sequence 1", fl["b"])
@@ -290,7 +297,7 @@ func TestFloorLockFileUntrustedRefused(t *testing.T) {
 					t.Fatalf("%s over a %s %s: %v, want errFloorUntrusted naming it", op, tc.name, floorLockName, err)
 				}
 			}
-			if after := floorOf(t, server); !maps.Equal(after, before) {
+			if after := floorOf(t, server); !floorsEqual(after, before) {
 				t.Fatalf("floor after the refused verbs = %+v, was %+v", after, before)
 			}
 			if _, err := os.Lstat(filepath.Join(server, "keystore", "b")); !errors.Is(err, os.ErrNotExist) {
@@ -350,7 +357,7 @@ func TestFloorLockFileRecheckedAfterFlock(t *testing.T) {
 		if replaced != 1 {
 			t.Fatalf("the lock file was replaced %d times, want 1", replaced)
 		}
-		if after := floorOf(t, server); !maps.Equal(after, before) {
+		if after := floorOf(t, server); !floorsEqual(after, before) {
 			t.Fatalf("floor after the refused Rotate = %+v, was %+v", after, before)
 		}
 		mustCurrent(t, s, "a", "a")
@@ -450,7 +457,7 @@ func TestDataRootSwapRefused(t *testing.T) {
 				t.Errorf("%s through a symlinked data root: %v, want errFloorUntrusted", op, err)
 			}
 		}
-		if after := floorOf(t, server); !maps.Equal(after, before) {
+		if after := floorOf(t, server); !floorsEqual(after, before) {
 			t.Fatalf("floor after the refused verbs = %+v, was %+v", after, before)
 		}
 	})
@@ -528,7 +535,7 @@ func TestLoopsStopOnContext(t *testing.T) {
 	if _, err := s.syncFloor(cancelled, root, l, read, k); !errors.Is(err, context.Canceled) {
 		t.Fatalf("syncFloor under a cancelled context: %v, want context.Canceled", err)
 	}
-	if got := floorOf(t, server)["k0"]; got != lagging {
+	if got := floorOf(t, server)["k0"]; !entriesEqual(got, lagging) {
 		t.Fatalf("the stopped syncFloor wrote k0's floor %+v, want %+v left", got, lagging)
 	}
 	e, err := openEntry(root, "k0", read)

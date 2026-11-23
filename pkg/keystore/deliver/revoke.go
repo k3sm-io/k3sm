@@ -49,9 +49,10 @@ import (
 //     identity must match the sweep's too, so a swap in the middle of a sweep
 //     deletes nothing;
 //   - the floor (keystore-floor.json) is the durable witness of a delete:
-//     Delete removes the name from it, so Absent answers
-//     ErrFloorRecordsEntry, not absent, for a name the floor records whose
-//     directory is missing. That is a restored or rolled-back keystore/, and
+//     Delete buries the name's live record (a tombstone), so Absent answers
+//     ErrFloorRecordsEntry, not absent, for a name the floor records live
+//     whose directory is missing, and absent for one it holds only burials
+//     for. That is a restored or rolled-back keystore/, and
 //     it holds that name's revocation for as long as it lasts, not for one
 //     sweep. Where the floor proves nothing (removed and rebuilt by the
 //     restore procedure, or full), the restore hold is what stands;
@@ -180,7 +181,7 @@ const (
 )
 
 // floorHolds reports whether err is Absent's ErrFloorRecordsEntry: the
-// floor still records name and its directory is missing, a restored or
+// floor still records name live and its directory is missing, a restored or
 // rolled-back keystore/ rather than an rm, so its Secrets are kept (held by
 // entry, so one entry delivered into many namespaces is one name).
 func (r *Reconciler) floorHolds(sw *sweep, name string, err error) bool {

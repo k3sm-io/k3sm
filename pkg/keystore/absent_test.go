@@ -94,7 +94,9 @@ func TestAbsent(t *testing.T) {
 // An older keystore/ restored the documented way (moved aside, a backup put
 // in its place) lacks a name the live floor still records: Absent refuses
 // to call that an absence. An interrupted Put is not an absence either. A
-// real Delete removes the name from the floor, and then it is absent.
+// real Delete buries the name's generation and keeps the name in the floor
+// with no live record, and then it is absent. A name put back after a
+// Delete is live again, and a restore without it is held again.
 func TestAbsentHoldsWhatTheFloorRecords(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
@@ -122,11 +124,37 @@ func TestAbsentHoldsWhatTheFloorRecords(t *testing.T) {
 		t.Fatalf("Absent(half) for an interrupted Put = %v %v, want false and the interrupted-put error", got, err)
 	}
 
-	// A real rm takes the name out of the floor.
+	// A real rm buries a: the floor keeps the name, with no live record.
 	if err := s.Delete(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
+	fdir, fl, err := s.openFloor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = fdir.Close()
+	if f, ok := fl["a"]; !ok || f.live() || len(f.burials()) == 0 {
+		t.Fatalf("floor record of a after Delete = %+v (recorded %v), want burials and no live record", f, ok)
+	}
 	if got, _, err := s.Absent(ctx, "a"); !got || err != nil {
 		t.Fatalf("Absent(a) after Delete = %v %v, want true", got, err)
+	}
+
+	// Put back, a is live again; a tree restored without it is held, even
+	// though the floor also holds a burial for the name.
+	mustPut(t, s, "a", KindOpaque, []byte("a2"))
+	if err := os.RemoveAll(ks + ".backup"); err != nil {
+		t.Fatal(err)
+	}
+	copyTree(t, ks, ks+".backup")
+	if err := os.RemoveAll(filepath.Join(ks+".backup", "a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(ks, ks+".pre-restore-2"); err != nil {
+		t.Fatal(err)
+	}
+	copyTree(t, ks+".backup", ks)
+	if got, _, err := s.Absent(ctx, "a"); got || !errors.Is(err, ErrFloorRecordsEntry) {
+		t.Fatalf("Absent(a) after a restore without its live generation = %v %v, want false and ErrFloorRecordsEntry", got, err)
 	}
 }

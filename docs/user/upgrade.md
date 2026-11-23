@@ -650,6 +650,10 @@ anything, and prints the verification step you must then run; see
 [Backup & restore](backup-restore.md). Rolling the binary back without restoring the backup leaves an
 older k3sm pointed at a database a newer engine has migrated.
 
+An older release refuses a keystore floor (`/var/lib/k3sm/keystore-floor.json`) that records deleted
+entries, and its only way past that, removing the floor, discards those records, so a copy of a
+deleted entry put back is accepted again.
+
 ### Rolling Back Past the Aggregation Layer
 
 A release without the aggregation layer ignores the new request-header CA files, but the apiserver

@@ -30,6 +30,9 @@
   (subpath "/etc/ssl")
   (subpath "/private/etc/ssl")
   )
+;; metadata: the host /home link node, so a shimless binary's lookup of a
+;; mount-path HOME answers ENOENT, not EPERM. The link only, no subpath.
+(allow file-read-metadata (literal "/home"))
 ;; write: validated extra write paths (+ /dev/null); the pod's own
 ;; data volume is re-allowed below, after the protected denies.
 (allow file-write*

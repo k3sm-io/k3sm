@@ -637,8 +637,8 @@ func TestRevokeHeldAcrossKeystoreRestore(t *testing.T) {
 // documented way: stop, move the live one aside, ditto the backup in,
 // start. The floor still records the two the backup lacks, so neither the
 // first sweep after the start nor the second deletes their Secrets, and one
-// Warn per name says why. A real rm afterwards takes its name out of the
-// floor, and its Secret is deleted.
+// Warn per name says why. A real rm afterwards buries its name in the
+// floor (a tombstone, no live record), and its Secret is deleted.
 func TestRevokeHeldByFloorAfterRestore(t *testing.T) {
 	h, s, dir := newRealStoreHarness(t)
 	ctx := context.Background()
@@ -681,7 +681,8 @@ func TestRevokeHeldByFloorAfterRestore(t *testing.T) {
 			t.Fatalf("the floor-hold Warn does not name system/%s\n%s", n, logs)
 		}
 	}
-	// A real rm takes a out of the floor, and its Secret goes.
+	// A real rm buries a in the floor, and its Secret goes; b, c and d,
+	// still live in the floor, stay held.
 	if err := s.Delete(ctx, "a"); err != nil {
 		t.Fatal(err)
 	}
@@ -690,6 +691,39 @@ func TestRevokeHeldByFloorAfterRestore(t *testing.T) {
 	for _, n := range []string{"b", "c", "d"} {
 		h.secret(t, "payments", n)
 	}
+}
+
+// TestRevokeHeldWhileMergePending: an entry delivered, then rm'd while a
+// keystore restore is unfinished (MergePending set). The restored tree may
+// lack entries made since the backup, so the sweep revokes nothing: no
+// apiserver call, the Secret and its record kept. Once the merge has run,
+// the next sweep deletes the Secret.
+func TestRevokeHeldWhileMergePending(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("tok"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	h.secret(t, "payments", "api-token")
+	h.store.rm("api-token")
+	h.store.mu.Lock()
+	h.store.pending = errors.New("a restore is unfinished")
+	h.store.mu.Unlock()
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	h.r.Sweep(ctx)
+	if got := h.client.Actions(); len(got) != 0 {
+		t.Fatalf("merge pending: the apiserver saw %v, want no call", h.verbs())
+	}
+	h.secret(t, "payments", "api-token")
+	if _, ok := h.state(t).owned[stateKey("payments", "api-token")]; !ok {
+		t.Fatal("merge pending: the ownership record was dropped")
+	}
+	h.store.mu.Lock()
+	h.store.pending = nil
+	h.store.mu.Unlock()
+	h.r.Sweep(ctx)
+	h.gone(t, "payments", "api-token")
 }
 
 // TestRmDeletesWithRealStore: a real store whose keystore/ stays the same;

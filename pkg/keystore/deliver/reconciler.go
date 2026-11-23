@@ -77,11 +77,14 @@ const changeDebounce = 500 * time.Millisecond
 // missing entries' directory answers it too), and returns the identity of
 // the entries' directory it read; Identity names that directory, so a
 // restored or recreated one is told from the one the last sweep saw (see
-// revoke.go).
+// revoke.go). MergePending is non-nil while a keystore restore is unfinished
+// (its floor merge has not run): the restored floor then lacks the deletions
+// since the backup, so a sweep delivers and revokes nothing until it is nil.
 type ValueSource interface {
 	Current(ctx context.Context, name string) (keystore.Version, []byte, error)
 	Absent(ctx context.Context, name string) (absent bool, identity string, err error)
 	Identity(ctx context.Context) (string, error)
+	MergePending() error
 }
 
 // Config is what New needs.
@@ -325,6 +328,16 @@ func forwardEvents(events <-chan fsnotify.Event, errs <-chan error, name string,
 func (r *Reconciler) Sweep(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if err := r.store.MergePending(); err != nil {
+		// A restored keystore whose floor merge has not run may hold a key
+		// deleted since the backup to revoke it: nothing is published until
+		// the merge has run. Nothing is revoked either: the restored tree
+		// lacks the entries made since the backup, which are not removed.
+		// The next sweep tries again.
+		r.logger.Error("keystore delivery: a keystore restore is unfinished; nothing delivered until sudo k3sm keys floor merge has run, retried on the next sweep", "reason", err.Error())
+		return
+	}
 
 	d, fi, exists, err := Read(r.path, r.open, r.check)
 	if err != nil {
