@@ -178,3 +178,46 @@ func TestPendingSinceReadFloorNotCommitted(t *testing.T) {
 		t.Fatalf("pendingSince on the read floor changed = %v, want notWrittenError", err)
 	}
 }
+
+// TestFloorMergeCrashBetweenRenames (U192): a merge that renames its
+// retired record and stops before renaming its input leaves no pending
+// record. The rerun finds the renamed record of this input and this floor,
+// only renames the input, and writes no second, empty record, so the
+// record an undo reads still holds what the merge retired.
+func TestFloorMergeCrashBetweenRenames(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	putFloorFile(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}})
+	writeAsideFloor(t, server, floor{"keep": {Generation: mgen(2), Seq: 1}, "ret": {Generation: mgen(3), Seq: 1}})
+	input, err := os.ReadFile(floorPath(server) + ".pre-restore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageTree(t, s)
+	failStepOnce(s, "merge rename input")
+	if _, err := s.MergeFloor(ctx, MergeOptions{}); !Committed(err) {
+		t.Fatalf("first run with the input's rename failing: %v, want committed", err)
+	}
+	if s.MergePending() == nil {
+		t.Fatal("the first run cleared the guard, want the input left in place")
+	}
+	r, err := s.MergeFloor(ctx, MergeOptions{})
+	if err != nil || !r.AlreadyMerged || len(r.Retired) != 1 || r.Retired[0] != "ret" {
+		t.Fatalf("rerun = %+v, %v; want already merged, retiring ret", r, err)
+	}
+	if err := s.MergePending(); err != nil {
+		t.Fatalf("MergePending after the rerun: %v, want the guard cleared", err)
+	}
+	if recs := mergedRecords(t, s); len(recs) != 1 {
+		t.Fatalf("retired records after the rerun: %v, want only the first run's", recs)
+	}
+	fdir, _, err := s.lockFloor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fdir.unlock()
+	rec, err := s.readRetired(fdir, sha256Hex(input))
+	if err != nil || len(rec.Retired) != 1 || rec.Retired[0] != "ret" {
+		t.Fatalf("the record an undo reads = %+v, %v; want it to retire ret", rec, err)
+	}
+}

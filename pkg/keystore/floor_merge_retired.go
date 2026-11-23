@@ -270,32 +270,30 @@ func errNoMatchingRetired(n int) error {
 	return fmt.Errorf("--undo uses only the retired record of the merge it undoes, the one whose input is the live floor (an undo puts the first merge's input, keystore-floor.json.merged-<unix>, back as keystore-floor.json), and none of the %d keystore-floor.json.merged-<unix>.retired records in the data root has that input: each is from another merge. Nothing is written. Put back as keystore-floor.json the keystore-floor.json.merged-<unix> of the merge to undo, as docs/user/keys.md describes, and run the undo again", n)
 }
 
-// readRetired reads the retired record of the merge an undo reverses: of
-// the data root's keystore-floor.json.merged-<unix>.retired records, each
-// judged as the floor is (readRetiredFile), the one whose input sha256 is
-// liveSum, the sha256 of the live floor's bytes, which an undo makes the
-// first merge's input. The <unix> in a name never chooses a record, so a
-// clock stepped back between merges cannot pick another merge's; of two
-// with the same input, the higher <unix> is read. It refuses when there is
-// no record (errNoRetiredRecord) or none matches (errNoMatchingRetired).
-func (s *FileStore) readRetired(l *floorLock, liveSum string) (retiredRecord, error) {
+// retiredCand is one keystore-floor.json.merged-<unix>.retired name in the
+// data root, and its <unix>.
+type retiredCand struct {
+	name string
+	at   uint64
+}
+
+// retiredNames lists the data root's keystore-floor.json.merged-<unix>.retired
+// names, the highest <unix> first, refusing a data root with more than
+// maxDirNames names.
+func retiredNames(l *floorLock) ([]retiredCand, error) {
 	d, err := l.root.Open(".")
 	if err != nil {
-		return retiredRecord{}, err
+		return nil, err
 	}
 	names, err := d.Readdirnames(maxDirNames + 1)
 	_ = d.Close() // read-only
 	if err != nil && !errors.Is(err, io.EOF) {
-		return retiredRecord{}, err
+		return nil, err
 	}
 	if len(names) > maxDirNames {
-		return retiredRecord{}, fmt.Errorf("%w: the data root holds more than %d names", errFloorUntrusted, maxDirNames)
+		return nil, fmt.Errorf("%w: the data root holds more than %d names", errFloorUntrusted, maxDirNames)
 	}
-	type cand struct {
-		name string
-		at   uint64
-	}
-	var cands []cand
+	var cands []retiredCand
 	for _, n := range names {
 		ts, ok := strings.CutPrefix(n, mergedPrefix)
 		if !ok {
@@ -309,12 +307,28 @@ func (s *FileStore) readRetired(l *floorLock, liveSum string) (retiredRecord, er
 		if err != nil || strconv.FormatUint(u, 10) != ts {
 			continue
 		}
-		cands = append(cands, cand{n, u})
+		cands = append(cands, retiredCand{n, u})
+	}
+	slices.SortFunc(cands, func(a, b retiredCand) int { return cmp.Compare(b.at, a.at) })
+	return cands, nil
+}
+
+// readRetired reads the retired record of the merge an undo reverses: of
+// the data root's keystore-floor.json.merged-<unix>.retired records, each
+// judged as the floor is (readRetiredFile), the one whose input sha256 is
+// liveSum, the sha256 of the live floor's bytes, which an undo makes the
+// first merge's input. The <unix> in a name never chooses a record, so a
+// clock stepped back between merges cannot pick another merge's; of two
+// with the same input, the higher <unix> is read. It refuses when there is
+// no record (errNoRetiredRecord) or none matches (errNoMatchingRetired).
+func (s *FileStore) readRetired(l *floorLock, liveSum string) (retiredRecord, error) {
+	cands, err := retiredNames(l)
+	if err != nil {
+		return retiredRecord{}, err
 	}
 	if len(cands) == 0 {
 		return retiredRecord{}, errNoRetiredRecord
 	}
-	slices.SortFunc(cands, func(a, b cand) int { return cmp.Compare(b.at, a.at) })
 	for _, c := range cands {
 		rec, err := s.readRetiredFile(l, c.name)
 		if err != nil {
@@ -325,6 +339,27 @@ func (s *FileStore) readRetired(l *floorLock, liveSum string) (retiredRecord, er
 		}
 	}
 	return retiredRecord{}, errNoMatchingRetired(len(cands))
+}
+
+// finishedRetired is the renamed retired record of a merge of input whose
+// floor is the live one (floorSum), and its name, or nil when there is
+// none: a merge that renamed its record and stopped before renaming its
+// input (renameMerged), which a rerun only finishes.
+func (s *FileStore) finishedRetired(l *floorLock, input, floorSum string) (*retiredRecord, string, error) {
+	cands, err := retiredNames(l)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, c := range cands {
+		rec, err := s.readRetiredFile(l, c.name)
+		if err != nil {
+			return nil, "", err
+		}
+		if rec.Input == input && rec.Floor == floorSum {
+			return &rec, c.name, nil
+		}
+	}
+	return nil, "", nil
 }
 
 // classifyUndo splits r's buried-live names, in the reverse merge of an

@@ -298,6 +298,20 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 			}
 		}
 	}
+	// A merge that renamed its record and stopped before renaming its
+	// input left no pending record: its renamed record, of this input and
+	// this floor, says it is finished, and only the input's rename is left.
+	// Planning again would write a second, empty record, which an undo
+	// would read in place of this one.
+	if pending == nil {
+		done, name, err := s.finishedRetired(fdir, in.sum, liveSum)
+		if err != nil {
+			return r, err
+		}
+		if done != nil {
+			return s.finishRenamed(in, *done, strings.TrimSuffix(name, retiredSuffix), opts.DryRun)
+		}
+	}
 	var undo retiredRecord
 	if opts.Undo && !rerun {
 		// In an undo the live floor is the first merge's input: only the
@@ -543,6 +557,43 @@ func (s *FileStore) finishRerun(st *mergeStaging, in *mergeInput, live floor, re
 		return r, fmt.Errorf("%w: the merge is written, but its input was not renamed, so the verbs that change the keystore still refuse; run the same merge again, which writes nothing more and renames it: %w", errCommitted, err)
 	}
 	return r, nil
+}
+
+// finishRenamed finishes a merge whose retired record, rec, is already
+// renamed and whose input is not: it renames the input to to, the record's
+// name without .retired, or to the first free name when that one is taken,
+// and reports from rec, already merged. A dry run renames nothing. A
+// failed rename is committed.
+func (s *FileStore) finishRenamed(in *mergeInput, rec retiredRecord, to string, dryRun bool) (MergeReport, error) {
+	r := MergeReport{AlreadyMerged: true, Retired: rec.Retired, BuriedLive: rec.BuriedLive, Kept: rec.Kept, Recorded: rec.Recorded, Dropped: rec.Dropped}
+	if dryRun {
+		return r, nil
+	}
+	err := in.same()
+	if err == nil {
+		err = renameExclIn(in.dir, in.base, to)
+		if errors.Is(err, fs.ErrExist) {
+			err = s.renameMerged(in)
+		} else if err == nil {
+			err = syncDir(in.dir)
+		}
+	}
+	if err != nil {
+		return r, fmt.Errorf("%w: the merge is written and its record renamed, but its input was not renamed, so the verbs that change the keystore still refuse; run the same merge again, which writes nothing more and renames it: %w", errCommitted, err)
+	}
+	return r, nil
+}
+
+// renameExclIn renames from to to in root, refusing (EEXIST) when anything
+// is at to (renameExcl).
+func renameExclIn(root *os.Root, from, to string) error {
+	d, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }() // read-only
+	fd := int(d.Fd())
+	return renameExcl(fd, from, fd, to)
 }
 
 // pendingSince judges a live floor that is neither of rec's floors byte for
@@ -934,7 +985,12 @@ func (s *FileStore) renameMerged(in *mergeInput) error {
 	// would leave it pending with no guard left to rerun the merge on.
 	switch _, err := in.dir.Lstat(retiredPendingName); {
 	case err == nil:
-		if err := in.dir.Rename(retiredPendingName, to+retiredSuffix); err != nil {
+		if err := renameExclIn(in.dir, retiredPendingName, to+retiredSuffix); err != nil {
+			return err
+		}
+		// A crash here leaves the record renamed and the input not: a
+		// rerun finds the renamed record (finishedRetired).
+		if err := s.step("merge rename input"); err != nil {
 			return err
 		}
 	case !errors.Is(err, fs.ErrNotExist):
@@ -945,7 +1001,7 @@ func (s *FileStore) renameMerged(in *mergeInput) error {
 	if err := in.dir.Remove(rmDroppedName); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	if err := in.dir.Rename(in.base, to); err != nil {
+	if err := renameExclIn(in.dir, in.base, to); err != nil {
 		return err
 	}
 	return syncDir(in.dir)
