@@ -367,7 +367,7 @@ func (u *UserScope) buryThen(name string, cause error) error {
 // name, and neither the generation file nor a record header reads.
 // Removing the tree then would leave nothing to refuse a copy of it put
 // back.
-var errRmNoGeneration = fmt.Errorf("%w: rm refused, nothing removed: no generation to bury: the user-scope floor holds none live for the name and neither the generation file nor a record header reads; root can remove the entry's directory by hand (the rebuild verb, which would record the entry's generation for rm to bury, is not yet available)", ErrCorrupt)
+var errRmNoGeneration = fmt.Errorf("%w: rm refused, nothing removed: no generation to bury: the user-scope floor holds none live for the name and neither the generation file nor a record header reads; root can remove the entry's directory by hand, or run sudo k3sm keys floor --rebuild, which records the entry's generation, so rm can bury it", ErrCorrupt)
 
 // openEntryForRm opens name's directory for an rm, through the entryOpen
 // seam when it is set.

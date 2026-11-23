@@ -202,10 +202,11 @@ func TestRewrapRefusesStrayScopeDirs(t *testing.T) {
 // checkDamagedScopeRecovery asserts a damaged-scope refusal names the
 // recovery that works: removing the scope by hand recovers only a user who
 // never delivered (mint refuses over a floor past 1); otherwise it is
-// rm-scope, and until that lands floor --rebuild, whose cost is said.
+// removing it by hand then floor --rebuild, whose cost is said, since
+// rm-scope refuses a scope with deliveries.
 func checkDamagedScopeRecovery(t *testing.T, err error) {
 	t.Helper()
-	for _, want := range []string{"never delivered", "rm-scope", "sudo k3sm doctor", "not yet available", "lower every record's floor"} {
+	for _, want := range []string{"never delivered", "rm-scope", "sudo k3sm doctor", "floor --rebuild", "lowers every record's floor"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal %q does not say %q", err, want)
 		}

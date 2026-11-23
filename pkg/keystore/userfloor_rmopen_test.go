@@ -95,7 +95,7 @@ func TestUserRmNoGenerationRefusesFirst(t *testing.T) {
 	if !errors.Is(err, errRmNoGeneration) || errors.Is(err, errCommitted) {
 		t.Fatalf("rm with no generation to bury: %v, want errRmNoGeneration before any removal", err)
 	}
-	if !strings.Contains(err.Error(), "not yet available") || !strings.Contains(err.Error(), "by hand") {
+	if !strings.Contains(err.Error(), "floor --rebuild") || !strings.Contains(err.Error(), "by hand") {
 		t.Fatalf("the refusal %q names no remedy", err)
 	}
 	if _, err := os.Lstat(dir); err != nil {

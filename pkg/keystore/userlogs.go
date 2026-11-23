@@ -234,22 +234,22 @@ func (s *FileStore) logReadBound() int64 {
 type logMissingScopesError struct{}
 
 func (logMissingScopesError) Error() string {
-	return "the keystore append-only log is missing while user scopes exist, so a new one would lower their floor: restore the matched set (keystore/, keystore/.user/ and both logs) from one backup and run sudo k3sm doctor (the rebuild verb is not yet available)"
+	return "the keystore append-only log is missing while user scopes exist, so a new one would lower their floor: restore the matched set (keystore/, keystore/.user/ and both logs) from one backup, then run sudo k3sm keys floor --rebuild and sudo k3sm keys audit --rotate, which flag the restored logs append-only, and sudo k3sm doctor"
 }
 
 func (logMissingScopesError) Is(target error) bool { return target == errLogMissing }
 
-// restoreRemedy is the remedy a user-scope floor error names, while the
-// rebuild verb is not built, for damage a skipped line cannot absorb: the
-// matched-set restore, then doctor, and what the restore costs. A torn or
-// garbage line is never such damage: the reader skips it. No error names a
-// verb that does not exist yet (TestErrorsNameNoUnbuiltVerb).
-const restoreRemedy = "restore the matched set (keystore/, keystore/.user/ and both logs) from one backup, which brings back every entry deleted since the backup, and run sudo k3sm doctor (the rebuild verb is not yet available)"
+// restoreRemedy is the remedy a user-scope floor error names for damage a
+// skipped line cannot absorb, a floor past the reader's bounds that the
+// rebuild cannot read: the matched-set restore and what it costs, then
+// floor --rebuild, which flags the restored floor append-only, and doctor.
+// A torn or garbage line is never such damage: the reader skips it.
+const restoreRemedy = "restore the matched set (keystore/, keystore/.user/ and both logs) from one backup, which brings back every entry deleted since the backup, then run sudo k3sm keys floor --rebuild and sudo k3sm doctor"
 
 // ErrLogFull refuses an operation because an append-only log is past its
 // hard cap, or, for a revocation past the hard cap, because the uid's
 // revocation budget in that log is spent. Nothing was changed.
-var ErrLogFull = errors.New("the keystore log is full: the user-scope floor or audit log is past its hard cap or the floor's key bound, so no user-scope change can be recorded; root must run sudo k3sm doctor (the audit rotation and floor rebuild verbs are not yet available); nothing was changed")
+var ErrLogFull = errors.New("the keystore log is full: the user-scope floor or audit log is past its hard cap or the floor's key bound, so no user-scope change can be recorded; root must run sudo k3sm doctor, then sudo k3sm keys audit --rotate for the audit log or sudo k3sm keys floor --rebuild for the floor; nothing was changed")
 
 var (
 	// errLogMissing is a log that does not exist: the data root has not been
@@ -2017,7 +2017,7 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 // errLogRevokeBudgetSpent is a configuration under which a uid's lines past
 // the hard cap already exceed its revocation budget, which the writer never
 // produces, so the caps were lowered: root-only, refused at store open.
-var errLogRevokeBudgetSpent = errors.New("the configured log caps leave a uid's revocation budget already spent past the hard cap, so its revocations would be refused; configure the caps the log was written under, or restore the caps and rotate the audit log (the audit rotation verb is not yet available: until it is, restore the log from a backup and run sudo k3sm doctor)")
+var errLogRevokeBudgetSpent = errors.New("the configured log caps leave a uid's revocation budget already spent past the hard cap, so its revocations would be refused; configure the caps the log was written under, or restore the caps and rotate the audit log with sudo k3sm keys audit --rotate, then run sudo k3sm doctor")
 
 var errLogBoundsBelowLog = errors.New("the configured log caps put the reader's bounds below what an existing append-only log already holds, so it would read as damage; configure the caps the log was written under, or " + restoreRemedy)
 

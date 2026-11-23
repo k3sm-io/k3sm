@@ -28,8 +28,15 @@ import (
 )
 
 // unbuiltVerbs are verbs the store's remedies would name but that are not
-// built yet: no string the package returns may name one.
-var unbuiltVerbs = []string{"audit --rotate"}
+// built yet: no string the package returns may name one. floor --rebuild,
+// rm-scope and audit --rotate are built, and the remedies name them; none
+// is left, and a verb a later slice names in a remedy before it lands is
+// added here.
+var unbuiltVerbs []string
+
+// staleWording is what a remedy said of a verb while it was not built: no
+// string may still say it, now that every verb a remedy names exists.
+var staleWording = []string{"not yet available", "not built yet"}
 
 // unbuiltVerbAllow lists "file: verb" pairs allowed to name an unbuilt
 // verb. It stays empty: a remedy names the matched-set restore or doctor
@@ -37,7 +44,8 @@ var unbuiltVerbs = []string{"audit --rotate"}
 var unbuiltVerbAllow = map[string]bool{}
 
 // No string literal in the package's code names a verb that does not exist
-// yet; comments may, since they describe the design.
+// yet, or says a verb is not yet available; comments may, since they
+// describe the design.
 func TestErrorsNameNoUnbuiltVerb(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -66,6 +74,11 @@ func TestErrorsNameNoUnbuiltVerb(t *testing.T) {
 			s, err := strconv.Unquote(lit.Value)
 			if err != nil {
 				t.Fatalf("%s: %v", fset.Position(lit.Pos()), err)
+			}
+			for _, w := range staleWording {
+				if strings.Contains(s, w) {
+					t.Errorf("%s: a string says %q of a verb, but every verb a remedy names is built: name it", fset.Position(lit.Pos()), w)
+				}
 			}
 			for _, v := range unbuiltVerbs {
 				if strings.Contains(s, v) && !unbuiltVerbAllow[f+": "+v] {
