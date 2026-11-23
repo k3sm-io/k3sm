@@ -630,7 +630,10 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// no other entry's floor then, as RaiseFloor does not.
 	// Revocation always succeeds: a merge that has written its commit
 	// marker accepts on its rerun the floor it recorded plus the burials
-	// written now (pendingSince).
+	// written now, less the burials the rm-dropped record lists
+	// (pendingSince); when that record cannot list them it is marked
+	// unusable, the burial still lands, and the rerun stops, committed,
+	// for the operator (recordRmDropped).
 	pending := fdir.mergePending() != nil
 	if pending && fl == nil {
 		// The saved floor is not put back yet: a floor this Delete created
@@ -662,8 +665,11 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 			slog.Warn("keystore: the pending merge's record does not read, so the burials this delete drops are not recorded for it", "name", name, "err", err)
 		}
 		if rec != nil {
+			// Never refused: a record that cannot list them is marked
+			// unusable, and the burial lands regardless.
 			fdir.beforeWrite = func(pruned []pruned) error {
-				return s.recordRmDropped(fdir, *rec, append(slices.Clone(dropped), pruned...))
+				s.recordRmDropped(fdir, *rec, append(slices.Clone(dropped), pruned...))
+				return nil
 			}
 		}
 	}

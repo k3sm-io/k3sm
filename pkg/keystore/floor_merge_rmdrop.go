@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"slices"
 )
 
@@ -35,14 +36,24 @@ import (
 // is root-owned, written durably before the floor write that drops what it
 // lists, and bound to the pending retired record by that record's input
 // and base sha256: a record of another one is not of this merge and is
-// ignored. renameMerged removes it with the guard.
+// ignored. renameMerged and finishRenamed remove it with the guard.
+//
+// rm is never refused for it either: when the record would list more than
+// maxRmDropped burials, does not read, or cannot be written, the Delete
+// replaces it with a mark (Unusable), root-owned and bound to the pending
+// record, and buries regardless. A rerun that finds the mark cannot tell
+// the floor rm left from one changed by anything else, so it accepts no
+// drops and stops, committed, for the operator to inspect. Fail-closed
+// even when the mark cannot be written: the floor then lacks a burial the
+// record does not list, or the record does not read, and the rerun refuses
+// either.
 
 const (
 	// rmDroppedName is the record's name in the data root.
 	rmDroppedName = floorPreRestoreName + ".rm-dropped"
 	// maxRmDropped bounds how many burials the record lists. A Delete
-	// that would list more is refused before its floor write: run the
-	// merge first.
+	// that would list more marks the record unusable and buries
+	// regardless (markRmDropped).
 	maxRmDropped = 4096
 )
 
@@ -52,11 +63,13 @@ func rmDroppedSizeLimit() int { return 256 + maxRmDropped*(maxNameLen+2*generati
 
 // rmDropRecord is the rm-dropped record's content: the pending retired
 // record's Input and Base, and each burial dropped, in the order dropped,
-// without repeats.
+// without repeats. Unusable is the mark: the burials an rm under this
+// record dropped are not all listed, and Dropped is empty.
 type rmDropRecord struct {
-	Input   string   `json:"input"`
-	Base    string   `json:"base"`
-	Dropped []rmDrop `json:"dropped"`
+	Input    string   `json:"input"`
+	Base     string   `json:"base"`
+	Unusable bool     `json:"unusable,omitempty"`
+	Dropped  []rmDrop `json:"dropped"`
 }
 
 // rmDrop is one burial an rm under the guard dropped.
@@ -81,7 +94,8 @@ func marshalRmDropped(rec rmDropRecord) ([]byte, error) {
 // parseRmDropped decodes an rm-dropped record, refusing anything rm would
 // not have written: an unknown field, a sum that is not a lowercase hex
 // sha256, a burial whose name or generation is not valid, a repeat, more
-// than maxRmDropped burials, or any encoding but marshalRmDropped's.
+// than maxRmDropped burials, a mark that lists any, or any encoding but
+// marshalRmDropped's.
 func parseRmDropped(b []byte) (rmDropRecord, error) {
 	var rec rmDropRecord
 	d := json.NewDecoder(bytes.NewReader(b))
@@ -97,6 +111,9 @@ func parseRmDropped(b []byte) (rmDropRecord, error) {
 	}
 	if len(rec.Dropped) > maxRmDropped {
 		return rmDropRecord{}, fmt.Errorf("%w: the rm-dropped record lists more than %d burials", ErrCorrupt, maxRmDropped)
+	}
+	if rec.Unusable && len(rec.Dropped) > 0 {
+		return rmDropRecord{}, fmt.Errorf("%w: the rm-dropped record is marked unusable and lists burials", ErrCorrupt)
 	}
 	seen := map[floorBurial]bool{}
 	for _, x := range rec.Dropped {
@@ -151,7 +168,9 @@ func (s *FileStore) readRmDroppedFile(l *floorLock) (*rmDropRecord, error) {
 // pending retired record rec: empty when there is no record, or when the
 // record is of another input or base (another merge, or a first run that
 // planned again from the floor rm left, which already lacks them). A record
-// that is not trusted or does not parse refuses.
+// that is not trusted or does not parse refuses, and one of rec marked
+// unusable (markRmDropped) refuses committed: the merge cannot tell what
+// rm dropped, and never accepts a drop it cannot account for.
 func (s *FileStore) rmDroppedOf(l *floorLock, rec retiredRecord) (map[floorBurial]bool, error) {
 	got, err := s.readRmDroppedFile(l)
 	if err != nil {
@@ -160,6 +179,9 @@ func (s *FileStore) rmDroppedOf(l *floorLock, rec retiredRecord) (map[floorBuria
 	out := map[floorBurial]bool{}
 	if got == nil || got.Input != rec.Input || got.Base != rec.Base {
 		return out, nil
+	}
+	if got.Unusable {
+		return nil, fmt.Errorf("%w: %s is marked unusable: an rm under this merge dropped burials it could not list (it would have listed more than %d, or it did not read or could not be written then), so the merge cannot tell the floor rm left from one changed by anything else, and it accepts no drops. Nothing more is done; inspect keystore-floor.json against %s", errCommitted, rmDroppedName, maxRmDropped, retiredPendingName)
 	}
 	for _, x := range got.Dropped {
 		out[floorBurial{x.Name, x.Generation}] = true
@@ -170,19 +192,25 @@ func (s *FileStore) rmDroppedOf(l *floorLock, rec retiredRecord) (map[floorBuria
 // recordRmDropped appends each burial in dropped to the rm-dropped record
 // of the pending retired record rec, writing it durably, root-owned at the
 // floor's mode, before the floor write that drops them. A record of another
-// input or base is replaced by one of rec's; a record that is not trusted
-// or does not parse refuses, as does one that would list more than
-// maxRmDropped burials.
-func (s *FileStore) recordRmDropped(l *floorLock, rec retiredRecord, dropped []pruned) error {
+// input or base is replaced by one of rec's. It never refuses the write: a
+// record that is not trusted or does not parse, one that would list more
+// than maxRmDropped burials, and a write that fails are each replaced by
+// the mark (markRmDropped), and a record of rec already marked stays so.
+func (s *FileStore) recordRmDropped(l *floorLock, rec retiredRecord, dropped []pruned) {
 	if len(dropped) == 0 {
-		return nil
+		return
 	}
 	got, err := s.readRmDroppedFile(l)
 	if err != nil {
-		return fmt.Errorf("record the burials this delete drops while a merge is pending: %w", err)
+		s.markRmDropped(l, rec, fmt.Sprintf("it does not read: %v", err))
+		return
 	}
 	out := rmDropRecord{Input: rec.Input, Base: rec.Base}
 	if got != nil && got.Input == rec.Input && got.Base == rec.Base {
+		if got.Unusable {
+			// Already marked: the rerun refuses whatever rm drops now.
+			return
+		}
 		out.Dropped = slices.Clone(got.Dropped)
 	}
 	for _, p := range dropped {
@@ -192,11 +220,32 @@ func (s *FileStore) recordRmDropped(l *floorLock, rec retiredRecord, dropped []p
 		}
 	}
 	if len(out.Dropped) > maxRmDropped {
-		return fmt.Errorf("%w: this delete would drop recorded deletions while a merge is pending, and %s already lists %d, the most it holds; nothing is deleted. Run sudo k3sm keys floor merge first", errFloorFull, rmDroppedName, maxRmDropped)
+		s.markRmDropped(l, rec, fmt.Sprintf("it would list more than %d burials, the most it holds", maxRmDropped))
+		return
 	}
 	b, err := marshalRmDropped(out)
-	if err != nil {
-		return err
+	if err == nil {
+		err = s.writeFileAs(l.root, rmDroppedName, b, uint32(s.floorUID), uint32(s.floorGID), floorFileMode)
 	}
-	return s.writeFileAs(l.root, rmDroppedName, b, uint32(s.floorUID), uint32(s.floorGID), floorFileMode)
+	if err != nil {
+		s.markRmDropped(l, rec, fmt.Sprintf("it could not be written: %v", err))
+	}
+}
+
+// markRmDropped replaces the rm-dropped record with the mark of rec, why
+// being the reason the burials could not be listed, root-owned at the
+// floor's mode, and logs it. A mark that cannot be written is logged too:
+// the burial lands regardless, and the rerun still refuses, since the
+// floor then lacks a burial the record does not list, or the record does
+// not read.
+func (s *FileStore) markRmDropped(l *floorLock, rec retiredRecord, why string) {
+	b, err := marshalRmDropped(rmDropRecord{Input: rec.Input, Base: rec.Base, Unusable: true})
+	if err == nil {
+		err = s.writeFileAs(l.root, rmDroppedName, b, uint32(s.floorUID), uint32(s.floorGID), floorFileMode)
+	}
+	if err != nil {
+		slog.Warn("keystore: the burials this delete drops while a merge is pending cannot be recorded, and "+rmDroppedName+" cannot be marked unusable either; the delete goes on, and the merge's rerun refuses, since the floor lacks a burial the record does not list", "why", why, "err", err)
+		return
+	}
+	slog.Warn("keystore: the burials this delete drops while a merge is pending cannot be recorded, so "+rmDroppedName+" is marked unusable; the delete goes on, and the merge's rerun stops, committed, until the operator inspects the floor", "why", why)
 }

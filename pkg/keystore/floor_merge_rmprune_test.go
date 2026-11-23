@@ -19,6 +19,7 @@ package keystore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -266,5 +267,98 @@ func TestFloorMergeFirstRunRemovesRmDroppedStaged(t *testing.T) {
 	}
 	if err := s.MergePending(); err != nil {
 		t.Fatalf("MergePending after the merge: %v, want the guard cleared", err)
+	}
+}
+
+// TestDeleteUnderGuardNeverRefusedBySidecar (U192): rm is never refused
+// under the guard for the rm-dropped record. With the record already
+// listing maxRmDropped burials, the next guarded rm that drops one more,
+// and with the record corrupt, an rm that drops one, each buries its
+// generation, marks the record unusable, root-owned and bound to the
+// pending record, and the merge's rerun, dry run included, stops,
+// committed, naming the record, accepting no drops and leaving the guard.
+func TestDeleteUnderGuardNeverRefusedBySidecar(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		plant func(t *testing.T, s *FileStore, rec retiredRecord) []byte
+	}{
+		{"full", func(t *testing.T, _ *FileStore, rec retiredRecord) []byte {
+			full := rmDropRecord{Input: rec.Input, Base: rec.Base}
+			for i := range maxRmDropped {
+				full.Dropped = append(full.Dropped, rmDrop{Name: fmt.Sprintf("n-%04d", i), Generation: mgen(1000 + i)})
+			}
+			b, err := marshalRmDropped(full)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return b
+		}},
+		{"corrupt", func(*testing.T, *FileStore, retiredRecord) []byte { return []byte("{\n") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			capSetup(t, s, server)
+			stageTree(t, s)
+			failStepOnce(s, "merge tree rename")
+			if _, err := s.MergeFloor(ctx, MergeOptions{}); !Committed(err) {
+				t.Fatalf("first run: %v, want committed with the tree move failing", err)
+			}
+			rec := readRecordFile(t, s, retiredPendingName)
+			p := filepath.Join(s.dataRoot, rmDroppedName)
+			if err := os.WriteFile(p, tc.plant(t, s, rec), floorFileMode); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Delete(ctx, "k"); !errors.Is(err, ErrTombstoneEvicted) || !DeleteDone(err) {
+				t.Fatalf("Delete k under the guard with the record %s: %v, want it done with ErrTombstoneEvicted", tc.name, err)
+			}
+			if fl := floorOf(t, server); fl["k"].live() || !fl["k"].buries(mgen(50)) {
+				t.Fatalf("k after the rm = %+v, want %s buried", fl["k"], mgen(50))
+			}
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := parseRmDropped(b)
+			if err != nil || !got.Unusable || got.Input != rec.Input || got.Base != rec.Base || len(got.Dropped) != 0 {
+				t.Fatalf("the rm-dropped record after the rm = %+v, %v; want the mark of the pending record", got, err)
+			}
+			for _, dry := range []bool{true, false} {
+				r, err := s.MergeFloor(ctx, MergeOptions{DryRun: dry, AcceptDrops: true})
+				if !Committed(err) || !strings.Contains(err.Error(), rmDroppedName) || !strings.Contains(err.Error(), "unusable") {
+					t.Fatalf("rerun (dry run %v) with the record marked: %+v, %v; want a committed refusal naming %s", dry, r, err, rmDroppedName)
+				}
+			}
+			if s.MergePending() == nil {
+				t.Fatal("the refused rerun cleared the guard")
+			}
+		})
+	}
+}
+
+// TestParseRmDroppedMark (U192): the mark parses in its one encoding, and
+// a mark that lists burials does not.
+func TestParseRmDroppedMark(t *testing.T) {
+	sum := sha256Hex([]byte("x"))
+	b, err := marshalRmDropped(rmDropRecord{Input: sum, Base: sum, Unusable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := parseRmDropped(b); err != nil || !got.Unusable {
+		t.Fatalf("parseRmDropped(the mark) = %+v, %v; want it marked", got, err)
+	}
+	bad, err := marshalRmDropped(rmDropRecord{Input: sum, Base: sum, Unusable: true, Dropped: []rmDrop{{Name: "k", Generation: mgen(1)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseRmDropped(bad); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("parseRmDropped(a mark listing a burial) = %v, want ErrCorrupt", err)
+	}
+	plain, err := marshalRmDropped(rmDropRecord{Input: sum, Base: sum})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "unusable") {
+		t.Fatalf("an unmarked record encodes %q, want no unusable field", plain)
 	}
 }

@@ -896,7 +896,7 @@ type floorLock struct {
 	// write's prune dropped, after the prune and before the floor is
 	// written; its error refuses the write. Delete under a pending merge
 	// records there each burial the write drops (recordRmDropped), durably,
-	// before the floor that drops it.
+	// before the floor that drops it, and never refuses the write.
 	beforeWrite func(pruned []pruned) error
 }
 
