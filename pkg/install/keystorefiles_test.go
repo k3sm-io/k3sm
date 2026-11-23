@@ -94,22 +94,48 @@ func fdName(fd int) string {
 	return filepath.Base(unix.ByteSliceToString(buf))
 }
 
-// U21 (install's half): the keystore step creates keystore-run/ and both
-// logs, each log created root-owned 0600 with nothing written, flagged
-// SF_APPEND on the held descriptor and only then handed to the service
-// user; a rerun finishes a root-owned log the same way; it refuses without
-// root, over a symlink, over a log at another mode, and over a missing
-// floor while user scopes exist, changing nothing.
+// fakeStat is keystoreFstatSeam for a test whose recorder changes nothing
+// on disk: a file the recorder chowned reads as the service user's, and
+// one it flagged reads with SF_APPEND.
+func (r *attrRecorder) fakeStat(svcUID int) func(int, *unix.Stat_t) error {
+	return func(fd int, st *unix.Stat_t) error {
+		if err := unix.Fstat(fd, st); err != nil {
+			return err
+		}
+		n := fdName(fd)
+		for _, c := range r.calls {
+			if strings.HasPrefix(c, "chown:"+n+":") {
+				st.Uid = uint32(svcUID)
+			}
+			if c == "chflags:"+n+":0x40000" {
+				st.Flags = unix.SF_APPEND
+			}
+		}
+		return nil
+	}
+}
+
+// U21 (install's half): the keystore step creates keystore-run/,
+// keystore-logs/ and both logs, each log created root's 0600 in
+// keystore-staging/ with nothing written, handed to the service user
+// there, then, behind the closed gate (keystore-logs/ at 0700), renamed in,
+// flagged SF_APPEND on the held descriptor, judged, and the gate opened; a
+// rerun leaves judged logs alone, and finishes a log an install left
+// unflagged behind a closed gate; it refuses without root, over a symlink,
+// over a log at another mode, over a log at the old location and over a
+// missing floor while user scopes exist, changing nothing.
 func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 	const svcUID, svcGID = 271, 20
 	me := os.Getuid()
 	floor, audit := keystore.UserFloorLogName, keystore.AuditLogName
-	run := keystore.RunDirName
-	want := []string{
-		"chmod:" + run + ":0700", "chown:" + run + ":271:20",
-		"chmod:" + floor + ":0600", "chflags:" + floor + ":0x40000", "chown:" + floor + ":271:20",
-		"chmod:" + audit + ":0600", "chflags:" + audit + ":0x40000", "chown:" + audit + ":271:20",
+	run, logs := keystore.RunDirName, keystore.LogsDirName
+	swap := func(n string) []string {
+		return []string{
+			"chmod:" + n + ":0600", "chown:" + n + ":271:20",
+			"chmod:" + logs + ":0700", "chflags:" + n + ":0x40000", "chmod:" + logs + ":0755",
+		}
 	}
+	want := append(append([]string{"chmod:" + run + ":0700", "chown:" + run + ":271:20"}, swap(floor)...), swap(audit)...)
 	setup := func(t *testing.T) (string, *attrRecorder) {
 		t.Helper()
 		root := t.TempDir()
@@ -119,6 +145,7 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 		rec := &attrRecorder{}
 		setSeam(t, &euidSeam, func() int { return 0 })
 		setSeam[fileAttrWriter](t, &fileAttrSeam, rec)
+		setSeam(t, &keystoreFstatSeam, rec.fakeStat(svcUID))
 		return root, rec
 	}
 	t.Run("fresh", func(t *testing.T) {
@@ -130,7 +157,7 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 			t.Fatalf("file-attribute calls:\n got %q\nwant %q", rec.calls, want)
 		}
 		for _, n := range []string{floor, audit} {
-			fi, err := os.Lstat(filepath.Join(root, n))
+			fi, err := os.Lstat(filepath.Join(root, logs, n))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -138,33 +165,78 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 				t.Fatalf("%s: %v size %d, want an empty 0600 regular file", n, fi.Mode(), fi.Size())
 			}
 		}
-		if fi, err := os.Lstat(filepath.Join(root, run)); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
-			t.Fatalf("%s: %v, %v, want a 0700 directory", run, fi, err)
+		if fi, err := os.Lstat(filepath.Join(root, logs)); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755 {
+			t.Fatalf("%s: %v, %v, want a 0755 directory", logs, fi, err)
 		}
-		// A rerun finds both logs still root's (the recorder changed no
-		// owner): an install that stopped before its chown, finished in the
-		// same order, flag first.
-		rec.calls = nil
+		if _, err := os.Lstat(filepath.Join(root, keystore.StagingDirName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s left behind: %v", keystore.StagingDirName, err)
+		}
+		// A rerun finds both logs judged and leaves them alone.
+		rec.calls = rec.calls[:len(rec.calls):len(rec.calls)]
+		before := len(rec.calls)
 		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); err != nil {
 			t.Fatal(err)
 		}
-		rerun := []string{
-			"chmod:" + run + ":0700", "chown:" + run + ":271:20",
-			"chflags:" + floor + ":0x40000", "chown:" + floor + ":271:20",
-			"chflags:" + audit + ":0x40000", "chown:" + audit + ":271:20",
-		}
-		if !slices.Equal(rec.calls, rerun) {
-			t.Fatalf("rerun calls:\n got %q\nwant %q", rec.calls, rerun)
+		rerun := []string{"chmod:" + run + ":0700", "chown:" + run + ":271:20"}
+		if got := rec.calls[before:]; !slices.Equal(got, rerun) {
+			t.Fatalf("rerun calls:\n got %q\nwant %q", got, rerun)
 		}
 	})
-	t.Run("flag fails, no chown", func(t *testing.T) {
+	t.Run("flag fails, rerun finishes behind the closed gate", func(t *testing.T) {
 		root, rec := setup(t)
 		rec.failOn = "chflags:" + floor
 		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); err == nil {
 			t.Fatal("a failed chflags was not an error")
 		}
-		if slices.Contains(rec.calls, "chown:"+floor+":271:20") {
-			t.Fatalf("the floor was handed over without its flag: %q", rec.calls)
+		if i := slices.Index(rec.calls, "chown:"+floor+":271:20"); i < 0 || i > slices.Index(rec.calls, "chmod:"+logs+":0700") {
+			t.Fatalf("the floor was not handed over before the gate closed: %q", rec.calls)
+		}
+		if slices.Contains(rec.calls, "chmod:"+logs+":0755") {
+			t.Fatalf("the gate was opened after a failed flag: %q", rec.calls)
+		}
+		// The failed chflags set nothing; the recorder kept its record.
+		rec.calls = slices.DeleteFunc(rec.calls, func(c string) bool { return c == "chflags:"+floor+":0x40000" })
+		// The recorder changed no mode: close the gate as root's call would.
+		if err := os.Chmod(filepath.Join(root, logs), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		before := len(rec.calls)
+		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); err != nil {
+			t.Fatal(err)
+		}
+		got := rec.calls[before:]
+		wantRerun := append([]string{"chmod:" + run + ":0700", "chown:" + run + ":271:20", "chflags:" + floor + ":0x40000"}, swap(audit)...)
+		if !slices.Equal(got, wantRerun) {
+			t.Fatalf("rerun calls:\n got %q\nwant %q", got, wantRerun)
+		}
+	})
+	t.Run("unflagged with the gate open", func(t *testing.T) {
+		root, _ := setup(t)
+		if err := os.Mkdir(filepath.Join(root, logs), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, logs, floor), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		setSeam(t, &keystoreFstatSeam, func(fd int, st *unix.Stat_t) error {
+			err := unix.Fstat(fd, st)
+			st.Uid = svcUID
+			return err
+		})
+		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); !errors.Is(err, errKeystoreFileUntrusted) {
+			t.Fatalf("got %v, want errKeystoreFileUntrusted", err)
+		}
+	})
+	t.Run("old location", func(t *testing.T) {
+		root, rec := setup(t)
+		if err := os.WriteFile(filepath.Join(root, audit), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); !errors.Is(err, errKeystoreFileUntrusted) || !strings.Contains(err.Error(), "sudo k3sm install") {
+			t.Fatalf("got %v, want errKeystoreFileUntrusted naming install", err)
+		}
+		if len(rec.calls) != 0 {
+			t.Fatalf("calls over a log at the old location: %q", rec.calls)
 		}
 	})
 	t.Run("not root", func(t *testing.T) {
@@ -180,8 +252,11 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 	})
 	t.Run("symlink", func(t *testing.T) {
 		root, rec := setup(t)
+		if err := os.Mkdir(filepath.Join(root, logs), 0o755); err != nil {
+			t.Fatal(err)
+		}
 		target := filepath.Join(t.TempDir(), "elsewhere")
-		if err := os.Symlink(target, filepath.Join(root, audit)); err != nil {
+		if err := os.Symlink(target, filepath.Join(root, logs, audit)); err != nil {
 			t.Fatal(err)
 		}
 		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); !errors.Is(err, errKeystoreFileUntrusted) {
@@ -196,7 +271,10 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 	})
 	t.Run("wrong mode", func(t *testing.T) {
 		root, _ := setup(t)
-		if err := os.WriteFile(filepath.Join(root, floor), []byte("x\n"), 0o644); err != nil {
+		if err := os.Mkdir(filepath.Join(root, logs), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, logs, floor), []byte("x\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); !errors.Is(err, errKeystoreFileUntrusted) {
@@ -211,7 +289,7 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); !errors.Is(err, errKeystoreFloorWithScopes) {
 			t.Fatalf("got %v, want errKeystoreFloorWithScopes", err)
 		}
-		if _, err := os.Lstat(filepath.Join(root, floor)); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(filepath.Join(root, logs, floor)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatal("a floor was created while user scopes exist")
 		}
 		if slices.ContainsFunc(rec.calls, func(c string) bool { return strings.Contains(c, floor) }) {
@@ -256,9 +334,9 @@ func TestKeystoreFilesRefuseDuringMaintenance(t *testing.T) {
 	rec := &attrRecorder{}
 	setSeam(t, &euidSeam, func() int { return 0 })
 	setSeam[fileAttrWriter](t, &fileAttrSeam, rec)
-	// A stopped rotate's state: the root-owned new log, unflagged.
-	log := filepath.Join(root, keystore.AuditLogName)
-	if err := os.WriteFile(log, nil, 0o600); err != nil {
+	setSeam(t, &keystoreFstatSeam, rec.fakeStat(271))
+	// A stopped rotate's state: keystore-logs/ behind a closed gate.
+	if err := os.Mkdir(filepath.Join(root, keystore.LogsDirName), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(root, keystore.MaintenanceMarkerName)
