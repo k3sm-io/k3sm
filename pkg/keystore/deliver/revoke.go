@@ -62,6 +62,7 @@ import (
 // The guarantee is the delete from the API only: a copy a Pod already read,
 // the datastore's history and its backups keep the value, so revoking a
 // credential still means rotating it where it is accepted. Absent and the
+// identity are read again just before each delete, but that read and the
 // delete are not atomic: an entry put back between them loses its Secret, and
 // the next sweep creates it again.
 
@@ -401,8 +402,26 @@ func (r *Reconciler) revokeOne(ctx context.Context, sw *sweep, rv revocation) {
 		r.logger.Debug("keystore delivery: the Secret of a deleted entry is being deleted; waiting", attrs...)
 		return
 	}
+	// Gather and delete are a whole sweep apart: the entry may be back, or
+	// the keystore swapped, since. So both are asked again just before the
+	// delete; the window left is this read to the delete.
+	name := Target{Entry: rv.entry}.Name()
+	absent, id, err := r.store.Absent(ctx, name)
+	switch {
+	case r.floorHolds(sw, name, err):
+		return
+	case err != nil:
+		r.logger.Warn("keystore delivery: the entry's absence cannot be confirmed again before the delete, so the Secret is kept; will retry", append(attrs, "err", err)...)
+		return
+	case !absent:
+		r.logger.Info("keystore delivery: the entry was put back before its Secret was deleted, so the Secret is kept", attrs...)
+		return
+	case id != sw.keystore:
+		r.logger.Warn("keystore delivery: the keystore directory changed before the delete, so the Secret is kept; will retry", attrs...)
+		return
+	}
 	uid := types.UID(rv.uid)
-	err := r.client.CoreV1().Secrets(rv.namespace).Delete(ctx, rv.secret, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+	err = r.client.CoreV1().Secrets(rv.namespace).Delete(ctx, rv.secret, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
 	done := true
 	switch {
 	case apierrors.IsNotFound(err):

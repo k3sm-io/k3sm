@@ -98,6 +98,37 @@ func TestRmDeletesDeliveredSecret(t *testing.T) {
 	}
 }
 
+// TestRePutBetweenGatherAndDeleteKeepsSecret: the entry is put back after
+// the sweep gathered its Secret and before the delete; the re-check just
+// before the delete finds it, and the Secret is kept.
+func TestRePutBetweenGatherAndDeleteKeepsSecret(t *testing.T) {
+	h := newHarness(t, true, false)
+	h.store.set("api-token", 1, []byte("one"))
+	h.declare(t, Target{Entry: "system/api-token", Namespace: "payments"})
+	ctx := context.Background()
+	h.r.Sweep(ctx)
+	h.store.rm("api-token")
+	h.store.beforeAbsent = func(name string, call int) {
+		if name == "api-token" && call == 2 {
+			h.store.set("api-token", 1, []byte("two"))
+		}
+	}
+	h.client.ClearActions()
+	h.r.Sweep(ctx)
+	if n := h.deletes(); n != 0 {
+		t.Fatalf("a re-put before the delete drew %d deletes: %v", n, h.verbs())
+	}
+	h.secret(t, "payments", "api-token")
+	if !strings.Contains(h.logs.String(), "the entry was put back before its Secret was deleted") {
+		t.Fatalf("the kept Secret is not logged\n%s", h.logs.String())
+	}
+	h.store.beforeAbsent = nil
+	h.r.Sweep(ctx)
+	if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "two" {
+		t.Fatalf("the next sweep left %q, want the re-put value", got)
+	}
+}
+
 // TestRmKeepsSecretWhenAbsenceUnconfirmed: Current's ErrNotFound alone
 // deletes nothing; a store that cannot confirm the entry is gone (a missing
 // entries' directory) keeps the Secret, and once it confirms, the next sweep

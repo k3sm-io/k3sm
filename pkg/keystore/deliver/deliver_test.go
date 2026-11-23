@@ -77,6 +77,10 @@ type fakeStore struct {
 	reads     int
 	absentErr error
 	identity  string
+	// beforeAbsent, when set, runs before Absent answers, with the name and
+	// how many times Absent was asked for it (1 for the first).
+	beforeAbsent func(name string, call int)
+	absentCalls  map[string]int
 }
 
 type fakeEntry struct {
@@ -100,6 +104,16 @@ func (s *fakeStore) Current(_ context.Context, name string) (keystore.Version, [
 }
 
 func (s *fakeStore) Absent(_ context.Context, name string) (bool, string, error) {
+	s.mu.Lock()
+	if s.absentCalls == nil {
+		s.absentCalls = map[string]int{}
+	}
+	s.absentCalls[name]++
+	call, hook := s.absentCalls[name], s.beforeAbsent
+	s.mu.Unlock()
+	if hook != nil {
+		hook(name, call)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.absentErr != nil {
