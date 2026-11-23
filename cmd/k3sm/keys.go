@@ -157,7 +157,7 @@ const (
 	// rewrap under a key the operator did not supply, so it must run again.
 	keysResumed = 3
 	// keysCommitted is a change that was made, but not cleanly: a write's
-	// keystore.ErrCommitted (put, rotate or adopt made its change, and a
+	// committed error, keystore.Committed (put, rotate or adopt made its change, and a
 	// step after the commit point failed); a change whose floor write
 	// dropped a recorded deletion to stay within the floor's limits: a
 	// committed keystore.ErrTombstoneEvicted from put, rotate, adopt or rm
@@ -626,7 +626,7 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 // keysAuditResult is the audit line's result for a verb's exit code: ok,
 // resumed (rewrap finished an earlier rewrap), committed (keysCommitted and
 // keysNotRenamed: the change was made, and its report says what to read or
-// rerun; a put, rotate or adopt whose store returned keystore.ErrCommitted
+// rerun; a put, rotate or adopt whose store returned a keystore.Committed error
 // exits keysCommitted), or refused.
 func keysAuditResult(code int) string {
 	switch code {
@@ -797,7 +797,7 @@ func keysPut(ctx context.Context, args []string, env keysEnv) int {
 	defer clear(value)
 	ver, err := s.Put(ctx, name, kind, value)
 	code = keysOK
-	if errors.Is(err, keystore.ErrCommitted) {
+	if keystore.Committed(err) {
 		// The change stands: it is reported as made, and the exit says a
 		// later step failed.
 		code = v.failf(keysCommitted, "%v", err)
@@ -854,7 +854,7 @@ func keysRotate(ctx context.Context, args []string, env keysEnv) int {
 	}
 	ver, err := s.Rotate(ctx, name, value)
 	code = keysOK
-	if errors.Is(err, keystore.ErrCommitted) {
+	if keystore.Committed(err) {
 		// The change stands: it is reported as made, and the exit says a
 		// later step failed.
 		code = v.failf(keysCommitted, "%v", err)
@@ -1331,7 +1331,7 @@ func keysAdopt(ctx context.Context, args []string, env keysEnv) int {
 	}
 	ver, err := s.Adopt(ctx, name, info.Orphan)
 	code = keysOK
-	if errors.Is(err, keystore.ErrCommitted) {
+	if keystore.Committed(err) {
 		code = v.failf(keysCommitted, "%v", err)
 		err = nil
 	}
