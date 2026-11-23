@@ -81,6 +81,7 @@ func TestRootFileServiceLinkReadsAsRoot(t *testing.T) {
 	if err := ackReviewed(t, s); err != nil {
 		t.Fatalf("ackFloorDamage: %v", err)
 	}
+	userPut(t, userScope(t, s, 1002), "user/1002/x", "removed")
 	if _, err := s.RemoveScope(ctx, 1002); err != nil {
 		t.Fatalf("RemoveScope: %v", err)
 	}
