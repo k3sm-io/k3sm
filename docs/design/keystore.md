@@ -2746,8 +2746,10 @@ service user can only add to.
   `scope.key` goes last. Each directory, the scope directory first, is taken before any of its
   entries is listed or touched: its user locking flags cleared if it carries any, then `fchown`
   to root, `fchmod` 0700 and its extended ACL removed, all on the held descriptor, so while
-  rm-scope handles its entries the directory is root's and no service-user process can create,
-  rename into, rename out of or unlink in it. A subdirectory is descended into only when its
+  rm-scope handles its entries the directory is root's and no service-user process can create
+  a name in it or rename one into it (on macOS an entry carrying an ACL entry that allows its
+  deletion can still be renamed out of it or unlinked; the walk takes each name as it finds it).
+  A subdirectory is descended into only when its
   `fstatat` and `fstat` show the service user as owner, or root at 0700 (rm-scope's own earlier
   work), on the scope directory's device. Any other, such as a directory another user owns
   renamed into the tree from a shared parent, is left in place with everything in it, and the

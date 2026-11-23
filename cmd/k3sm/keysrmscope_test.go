@@ -74,7 +74,9 @@ func TestKeysRmScopeUnlistedExitsCommitted(t *testing.T) {
 // An rm-scope that stopped part-way after it changed something (the
 // committed class) exits 4, audited committed, and prints what remains and
 // that a rerun continues; one that stopped before changing anything is a
-// refusal, exit 1, audited refused.
+// refusal, exit 1, audited refused. The stub's errors are the shape
+// rmStopped gives a stop a rerun can finish (a failed take, a failed
+// stat), which is the only kind it pairs with the rerun line.
 func TestKeysRmScopePartialExitsFour(t *testing.T) {
 	const remains = "its directory \"keystore/.user/1001\" is partly or wholly present: rerun sudo k3sm keys rm-scope user/1001 --yes to finish removing it"
 	for _, tc := range []struct {
@@ -83,8 +85,8 @@ func TestKeysRmScopePartialExitsFour(t *testing.T) {
 		code  int
 		audit string
 	}{
-		{"changed, then stopped", fmt.Errorf("%w: rm-scope began removing the scope, then stopped: a directory in the scope tree is not the scope's; %s", keystore.ErrCommitted, remains), keysCommitted, "rm-scope  committed"},
-		{"stopped before any change", fmt.Errorf("a directory in the scope tree is not the scope's; %s", remains), keysRefused, "rm-scope  refused"},
+		{"changed, then stopped", fmt.Errorf("%w: rm-scope began removing the scope, then stopped: take the directory \"/srv/keystore/.user/1001/entries\" (named for reading, not for pasting) from the service user: input/output error; the scope user/1001 is listed as removed in keystore-removed-scopes.json, so no open serves it, and %s", keystore.ErrCommitted, remains), keysCommitted, "rm-scope  committed"},
+		{"stopped before any change", fmt.Errorf("stat \"c0\": input/output error; the scope user/1001 is listed as removed in keystore-removed-scopes.json, so no open serves it, and %s", remains), keysRefused, "rm-scope  refused"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newKeysHarness(t)
