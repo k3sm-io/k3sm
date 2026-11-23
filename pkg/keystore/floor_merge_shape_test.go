@@ -27,6 +27,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // openTestStaging opens s's pre-restore.d as openStaging does, without the
@@ -559,5 +561,61 @@ func TestStagedPreFrameDroppedRefused(t *testing.T) {
 				wantShapeRefused(t, s, name)
 			})
 		}
+	}
+}
+
+// TestStagedPreFrameDroppedUnknownOwner: the persisted pre-frame refusal
+// count, and its temporary file, take the owner rule of every other staged
+// file: the service user or the unknown owner (uid 99) a volume that
+// ignores ownership reports, so a backup copied off such a volume restores.
+// Any other owner is still refused. Non-root the file cannot be given to
+// uid 99, so the owner judge (judgeStaged) reads the file's real stat with
+// its owner set; root also walks a tree with the file at uid 99.
+func TestStagedPreFrameDroppedUnknownOwner(t *testing.T) {
+	for _, name := range []string{PreFrameDroppedName, droppedTempName} {
+		t.Run(name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			stageRecipe(t, s, server, 0)
+			p := writeStaged(t, s, name, wellFormedDropped())
+			kind, maxSize, ok := stagedChild(stagedTree, name)
+			if !ok {
+				t.Fatalf("stagedChild(%q) refuses the name", name)
+			}
+			f, err := os.Open(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = f.Close() }()
+			var st unix.Stat_t
+			if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+				t.Fatal(err)
+			}
+			for _, tc := range []struct {
+				uid  uint32
+				want bool
+			}{{s.uid, true}, {unknownUID, true}, {otherUID(t), false}} {
+				st.Uid = tc.uid
+				err := s.judgeStaged(int(f.Fd()), name, &st, kind, maxSize)
+				if tc.want && err != nil {
+					t.Errorf("judgeStaged owned by uid %d: %v, want it accepted", tc.uid, err)
+				}
+				if !tc.want && (!errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "owned by uid")) {
+					t.Errorf("judgeStaged owned by uid %d: %v, want ErrCorrupt naming the owner", tc.uid, err)
+				}
+			}
+			if !asRoot() {
+				return
+			}
+			if err := os.Lchown(p, unknownUID, unknownUID); err != nil {
+				t.Fatal(err)
+			}
+			st2 := openTestStaging(t, s)
+			if err := s.checkStaged(context.Background(), st2); err != nil {
+				t.Fatalf("checkStaged with %s at uid %d: %v", name, unknownUID, err)
+			}
+			if err := s.chownStaged(context.Background(), st2); err != nil {
+				t.Fatalf("chownStaged with %s at uid %d: %v", name, unknownUID, err)
+			}
+		})
 	}
 }

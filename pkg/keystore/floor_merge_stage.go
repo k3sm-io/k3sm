@@ -638,9 +638,11 @@ func judgeStagedType(rel string, st *unix.Stat_t, k stagedKind) error {
 // file (a second is the same inode as a file elsewhere, and handing it over
 // would hand that file over), no setuid, setgid or sticky bit, no file flag,
 // no extended ACL, a file at most maxSize bytes, and owned by the service
-// user or by the unknown owner an ownership-ignoring volume reports. A
-// root-owned node is refused: a ditto of the backup keeps the service
-// user's owner, so a root file there is a copied link to one of root's.
+// user or by the unknown owner an ownership-ignoring volume reports, the
+// persisted pre-frame refusal counts included (a backup copied off such a
+// volume carries them at uid 99 like every other file). A root-owned node
+// is refused: a ditto of the backup keeps the service user's owner, so a
+// root file there is a copied link to one of root's.
 func (s *FileStore) judgeStaged(fd int, rel string, st *unix.Stat_t, k stagedKind, maxSize int64) error {
 	if err := judgeStagedType(rel, st, k); err != nil {
 		return err
@@ -654,8 +656,6 @@ func (s *FileStore) judgeStaged(fd int, rel string, st *unix.Stat_t, k stagedKin
 		return errStagedShape(rel, "has file flags %#x", statFlags(st))
 	case k.file() && st.Size > maxSize:
 		return errStagedShape(rel, "is %d bytes, over the %d its name allows", st.Size, maxSize)
-	case k == stagedDropped && st.Uid != s.uid:
-		return errStagedShape(rel, "is owned by uid %d, not the service user (%d), who alone writes it", st.Uid, s.uid)
 	case k == stagedDropped && uint32(st.Mode)&0o777 != uint32(fileMode):
 		return errStagedShape(rel, "is mode %#o, not the %#o the server writes it at", st.Mode&0o777, fileMode)
 	case st.Uid != s.uid && st.Uid != unknownUID:
