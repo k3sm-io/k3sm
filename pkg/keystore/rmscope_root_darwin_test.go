@@ -571,6 +571,7 @@ func TestRemoveScopeLeavesForeignOwnedDirAsRoot(t *testing.T) {
 	if !asRoot() {
 		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
 	}
+	// No service-user process reaches the tree here, so rootRmScopeBase's reachable base is not needed.
 	s, server, _ := fileLogScope(t)
 	dir := scopeDir(server, "1001")
 	other := otherUID(t)
