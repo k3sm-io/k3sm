@@ -24,8 +24,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -121,7 +123,7 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = root.Close() }()
-			err = removeScopeTree(root, s.dir, "1001", s.uid)
+			err = removeScopeTree(root, s.dir, "1001", s.uid, true)
 			if plant == sfAppend {
 				var st unix.Stat_t
 				if !errors.Is(err, unix.EPERM) {
@@ -212,7 +214,7 @@ func TestRemoveScopeClearsServiceUserFIFOAndSocketAsRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	if err := removeScopeTree(root, s.dir, "1001", s.uid); err != nil {
+	if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
 		t.Fatalf("removeScopeTree over the service user's flagged FIFO and socket, as root: %v", err)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
@@ -298,13 +300,13 @@ func TestRemoveScopeNameSwapAsRoot(t *testing.T) {
 			t.Fatal(err)
 		}
 		for range 5 {
-			_ = removeScopeTree(root, ks, "1001", svcUID) // the race may leave it busy
+			_ = removeScopeTree(root, ks, "1001", svcUID, true) // the race may leave it busy
 		}
 		close(stop)
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
-		_ = removeScopeTree(root, ks, "1001", svcUID)
+		_ = removeScopeTree(root, ks, "1001", svcUID, true)
 		_ = root.Close()
 		var st unix.Stat_t
 		if err := unix.Lstat(victim, &st); err != nil || st.Flags != 0 {
@@ -312,4 +314,260 @@ func TestRemoveScopeNameSwapAsRoot(t *testing.T) {
 		}
 	}
 	t.Logf("%d iterations, %d writes by name", iterations, calls)
+}
+
+// rootRmScopeBase makes the scope tree reachable for the service user, as
+// TestRemoveScopeClearsServiceUserFlagsAsRoot does: the store is built under
+// a root-made 0755 directory in /private/tmp, and the data root and its
+// parent are 0755.
+func rootRmScopeBase(t *testing.T) (*FileStore, string) {
+	t.Helper()
+	base, err := os.MkdirTemp("/private/tmp", "k3sm-rmtake-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(base) })
+	if err := os.Chmod(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", base)
+	s, server, _ := fileLogScope(t)
+	data := filepath.Dir(server)
+	for _, d := range []string{filepath.Dir(data), data} {
+		if err := os.Chmod(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return s, server
+}
+
+// TestRemoveScopeTakesDirsFromServiceUserAsRoot is rm-scope's take,
+// root-run: while it removes a scope, a service-user process tries, in a
+// loop, to create a file in, rename a file into and rename a file out of
+// the scope directory and a subdirectory. Once root has taken a directory
+// (the seam marks it, and holds each take a little so the loop meets it),
+// every attempt there fails with EACCES, or with ENOENT once the directory
+// is gone; none succeeds. The removal completes.
+func TestRemoveScopeTakesDirsFromServiceUserAsRoot(t *testing.T) {
+	if !asRoot() {
+		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
+	}
+	svcUID, svcGID := serviceIDs(t)
+	s, server := rootRmScopeBase(t)
+	dir := scopeDir(server, "1001")
+	sub := filepath.Join(dir, "sub")
+	outside := filepath.Join(filepath.Dir(server), "svc-outside")
+	for _, d := range []string{sub, outside} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		giveToService(t, d)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(outside) })
+	targets := []string{dir, sub}
+	var inos [2]uint64
+	for i, d := range targets {
+		var st unix.Stat_t
+		if err := unix.Lstat(d, &st); err != nil {
+			t.Fatal(err)
+		}
+		inos[i] = st.Ino
+	}
+	var taken [2]atomic.Bool
+	saved := rmTakeDir
+	setSeam(t, &rmTakeDir, func(fd int) error {
+		err := saved(fd)
+		var st unix.Stat_t
+		if err == nil && unix.Fstat(fd, &st) == nil {
+			for i, ino := range inos {
+				if st.Ino == ino {
+					taken[i].Store(true)
+					time.Sleep(50 * time.Millisecond) // let the loop meet the taken directory
+				}
+			}
+		}
+		return err
+	})
+	stop := make(chan struct{})
+	type tally struct{ eacces, enoent, before int }
+	done := make(chan error, 1)
+	var got tally
+	go func() {
+		runtime.LockOSThread() // never unlocked: the thread dies with the goroutine
+		if _, _, errno := syscall.Syscall(syscall.SYS_SETTID, uintptr(svcUID), uintptr(svcGID), 0); errno != 0 {
+			done <- fmt.Errorf("settid: %w", errno)
+			return
+		}
+		check := func(i int, was bool, what string, err error) error {
+			if !was {
+				got.before++
+				return nil
+			}
+			switch {
+			case err == nil:
+				return fmt.Errorf("the service user's %s in %s succeeded after root took it", what, targets[i])
+			case errors.Is(err, unix.EACCES):
+				got.eacces++
+			case errors.Is(err, unix.ENOENT):
+				if _, serr := os.Lstat(targets[i]); !errors.Is(serr, os.ErrNotExist) {
+					return fmt.Errorf("the service user's %s in %s: ENOENT while the directory is there (%v)", what, targets[i], serr)
+				}
+				got.enoent++
+			default:
+				return fmt.Errorf("the service user's %s in %s: %v, want EACCES", what, targets[i], err)
+			}
+			return nil
+		}
+		for n := 0; ; n++ {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			default:
+			}
+			for i, d := range targets {
+				was := taken[i].Load()
+				fd, err := unix.Open(filepath.Join(d, fmt.Sprintf("c%d", n)), unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW, 0o600)
+				if err == nil {
+					_ = unix.Close(fd)
+				}
+				if cerr := check(i, was, "create", err); cerr != nil {
+					done <- cerr
+					return
+				}
+				src := filepath.Join(outside, fmt.Sprintf("r%d-%d", i, n))
+				if err := os.WriteFile(src, nil, 0o600); err != nil {
+					done <- err
+					return
+				}
+				was = taken[i].Load()
+				err = unix.Rename(src, filepath.Join(d, fmt.Sprintf("in%d", n)))
+				if cerr := check(i, was, "rename into", err); cerr != nil {
+					done <- cerr
+					return
+				}
+				_ = os.Remove(src)
+				was = taken[i].Load()
+				err = unix.Rename(filepath.Join(d, fmt.Sprintf("c%d", n)), filepath.Join(outside, fmt.Sprintf("o%d-%d", i, n)))
+				if cerr := check(i, was, "rename out of", err); cerr != nil {
+					done <- cerr
+					return
+				}
+			}
+		}
+	}()
+	time.Sleep(20 * time.Millisecond) // the loop runs before the take
+	root, err := s.openDir(s.dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	rerr := removeScopeTree(root, s.dir, "1001", s.uid, true)
+	time.Sleep(20 * time.Millisecond) // and after the removal
+	close(stop)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if rerr != nil {
+		t.Fatalf("removeScopeTree while the service user writes: %v", rerr)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there: %v", err)
+	}
+	if got.eacces == 0 {
+		t.Fatalf("no attempt met a taken directory (%+v): the test proved nothing", got)
+	}
+	t.Logf("attempts: %d before the take, %d EACCES after it, %d ENOENT once gone", got.before, got.eacces, got.enoent)
+}
+
+// TestRemoveScopeRerunAfterTakeAsRoot is rm-scope's crash case, root-run:
+// an rm-scope that stopped after it took the scope directory and entries/
+// (the seam fails the take of the entry directory) leaves them root's at
+// 0700, which no open of the scope accepts. The rerun finds the scope
+// directory root's at 0700, its own earlier work, descends the taken
+// directories and removes the scope, listed, with no error.
+func TestRemoveScopeRerunAfterTakeAsRoot(t *testing.T) {
+	if !asRoot() {
+		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
+	}
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	entry := filepath.Join(dir, scopeEntriesName, "token")
+	var est unix.Stat_t
+	if err := unix.Lstat(entry, &est); err != nil {
+		t.Fatal(err)
+	}
+	saved := rmTakeDir
+	setSeam(t, &rmTakeDir, func(fd int) error {
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			return err
+		}
+		if st.Ino == est.Ino && st.Dev == est.Dev {
+			return unix.EIO
+		}
+		return saved(fd)
+	})
+	ctx := t.Context()
+	if _, err := s.RemoveScope(ctx, 1001); err == nil || !strings.Contains(err.Error(), "is listed as removed") {
+		t.Fatalf("the stopped rm-scope: %v, want the listed, partly present state", err)
+	}
+	for _, d := range []string{dir, filepath.Join(dir, scopeEntriesName)} {
+		var st unix.Stat_t
+		if err := unix.Lstat(d, &st); err != nil || st.Uid != 0 || st.Mode&0o7777 != 0o700 {
+			t.Fatalf("%s after the stop: uid %d mode %#o (%v), want root's at 0700", d, st.Uid, st.Mode&0o7777, err)
+		}
+	}
+	rmTakeDir = saved
+	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
+		t.Fatalf("the rerun over root-owned directories: %v, recorded %v", err, recorded)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there after the rerun: %v", err)
+	}
+}
+
+// TestRemoveScopeLeavesForeignOwnedDirAsRoot is the foreign-directory
+// case, root-run: a directory another user owns, with a file inside, in
+// the scope's entries/ (as if renamed in from a shared parent), is left
+// untouched with its file, and rm-scope fails naming it for reading only,
+// saying who owns it, with no command; the scope stays listed.
+func TestRemoveScopeLeavesForeignOwnedDirAsRoot(t *testing.T) {
+	if !asRoot() {
+		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
+	}
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	other := otherUID(t)
+	foreign := filepath.Join(dir, scopeEntriesName, "theirs")
+	if err := os.Mkdir(foreign, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	kept := filepath.Join(foreign, "file")
+	if err := os.WriteFile(kept, []byte("another user's"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{kept, foreign} {
+		if err := os.Lchown(p, int(other), int(other)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recorded, err := s.RemoveScope(t.Context(), 1001)
+	if !recorded || !errors.Is(err, errScopeForeignDir) {
+		t.Fatalf("rm-scope over another user's directory: %v, recorded %v; want errScopeForeignDir, listed", err, recorded)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "(named for reading, not for pasting)") || !strings.Contains(msg, fmt.Sprintf("uid %d owns it", other)) || !strings.Contains(msg, "is listed as removed") {
+		t.Errorf("the error %q does not name the directory for reading, its owner and the listed state", msg)
+	}
+	if strings.Contains(msg, "rm -") || strings.Contains(msg, "chown") {
+		t.Errorf("the error %q offers a command on the directory", msg)
+	}
+	if b, err := os.ReadFile(kept); err != nil || string(b) != "another user's" {
+		t.Fatalf("the file in the foreign directory: %q, %v; want it untouched", b, err)
+	}
+	var st unix.Stat_t
+	if err := unix.Lstat(foreign, &st); err != nil || st.Uid != other || st.Mode&0o7777 != 0o700 {
+		t.Fatalf("the foreign directory: uid %d mode %#o (%v), want it untouched", st.Uid, st.Mode&0o7777, err)
+	}
 }

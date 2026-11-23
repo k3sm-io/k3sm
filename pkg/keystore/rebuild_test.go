@@ -26,6 +26,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // attrRecorder is a file-attribute writer that records each call and, for
@@ -483,19 +485,32 @@ func TestRootWalksRefusePlantedNames(t *testing.T) {
 }
 
 // rm-scope that stops part-way says what state it left, and a rerun
-// finishes the removal.
+// finishes the removal. The stop is a failed take of the entry directory
+// (the seam), after rm-scope took the scope directory and entries/ (for the
+// test's own uid, non-root; TestRemoveScopeRerunAfterTakeAsRoot is the
+// root-owned case).
 func TestRemoveScopeRerunFinishesPartialRemoval(t *testing.T) {
-	if asRoot() {
-		t.Skip("root removes in a read-only directory; the partial removal needs a non-root run")
-	}
 	ctx := context.Background()
 	s, server, _ := fileLogScope(t)
 	dir := scopeDir(server, "1001")
 	entry := filepath.Join(dir, scopeEntriesName, "token")
-	if err := os.Chmod(entry, 0o500); err != nil {
+	var est unix.Stat_t
+	if err := unix.Lstat(entry, &est); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(entry, 0o700) })
+	taken := 0
+	saved := rmTakeDir
+	setSeam(t, &rmTakeDir, func(fd int) error {
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			return err
+		}
+		if st.Ino == est.Ino && st.Dev == est.Dev {
+			return unix.EIO
+		}
+		taken++
+		return saved(fd)
+	})
 	_, err := s.RemoveScope(ctx, 1001)
 	if err == nil || !strings.Contains(err.Error(), "is listed as removed") || !strings.Contains(err.Error(), "partly or wholly present") || !strings.Contains(err.Error(), "rerun sudo k3sm keys rm-scope user/1001 --yes") || strings.Contains(err.Error(), "nothing was changed") {
 		t.Fatalf("a stopped rm-scope: %v; want the recorded, partly present state and the rerun", err)
@@ -503,9 +518,16 @@ func TestRemoveScopeRerunFinishesPartialRemoval(t *testing.T) {
 	if r := readRecord(t, s); r.keys() != 1 {
 		t.Fatalf("the record lists %d keys, want 1", r.keys())
 	}
-	if err := os.Chmod(entry, 0o700); err != nil {
-		t.Fatal(err)
+	for _, d := range []string{dir, filepath.Join(dir, scopeEntriesName)} {
+		var st unix.Stat_t
+		if err := unix.Lstat(d, &st); err != nil || int(st.Uid) != rmRootUID || st.Mode&0o7777 != 0o700 {
+			t.Fatalf("%s after the stop: uid %d mode %#o (%v), want taken: uid %d at 0700", d, st.Uid, st.Mode&0o7777, err, rmRootUID)
+		}
 	}
+	if taken < 2 {
+		t.Fatalf("the stopped run took %d directories, want the scope directory and entries/", taken)
+	}
+	rmTakeDir = saved
 	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
 		t.Fatalf("the rerun: %v, recorded %v", err, recorded)
 	}

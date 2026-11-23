@@ -79,8 +79,8 @@ func TestRemoveScopeUnreadableDeliveryRecord(t *testing.T) {
 // wrong: a copy of the directory put back (taken before the damage) is
 // refused at every open. A scope.key whose content does not parse is
 // removed unlisted, committed, saying the key file could not be trusted,
-// that a copy put back would open only if it carries a key the master
-// accepts, and that its floor lines are kept. Floor --rebuild, which
+// that a copy the service user puts back opens again, held only to the
+// scope's floor lines, which are kept. Floor --rebuild, which
 // refused the scope naming rm-scope, runs after either.
 func TestRemoveScopeUntrustedKeyUnlisted(t *testing.T) {
 	for name, tc := range map[string]struct {
@@ -102,7 +102,7 @@ func TestRemoveScopeUntrustedKeyUnlisted(t *testing.T) {
 			if err := os.WriteFile(p, []byte("not a key record"), fileMode); err != nil {
 				t.Fatal(err)
 			}
-		}, false, []string{"removed user/1002 without listing it", "its scope.key could not be trusted", "would open only if it carries a key the master accepts", "its floor lines are kept"}},
+		}, false, []string{"removed user/1002 without listing it", "its scope.key could not be trusted", "put back by the service user opens again", "held only to the scope's floor lines, which are kept"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()

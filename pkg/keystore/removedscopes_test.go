@@ -182,8 +182,8 @@ func TestRemovedScopesMalformedFailsClosed(t *testing.T) {
 // A scope directory with no scope.key, for a uid the record does not
 // list, is removed, but the removal is committed, not clean: the error
 // says it was removed without being listed, because its key file was
-// absent, so a copy put back would open, and that its floor lines are
-// kept. It never says the record is full.
+// absent, so a copy the service user puts back opens again, held only to
+// the scope's floor lines, which are kept. It never says the record is full.
 func TestRemoveScopeMissingKeyUnlistedCommitted(t *testing.T) {
 	ctx := context.Background()
 	s, server, _ := fileLogScope(t)
@@ -195,7 +195,7 @@ func TestRemoveScopeMissingKeyUnlistedCommitted(t *testing.T) {
 	if recorded || !Committed(err) {
 		t.Fatalf("rm-scope of an unlisted keyless scope: %v, recorded %v; want committed, unlisted", err, recorded)
 	}
-	for _, want := range []string{"without listing it", "scope.key was absent", "would open", "floor lines are kept"} {
+	for _, want := range []string{"without listing it", "scope.key was absent", "put back by the service user opens again", "held only to the scope's floor lines, which are kept"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error %q does not say %q", err, want)
 		}

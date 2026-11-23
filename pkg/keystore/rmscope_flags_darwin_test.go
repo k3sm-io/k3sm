@@ -177,7 +177,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if err := removeScopeTree(root, s.dir, "1001", s.uid); err != nil {
+		if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
 			t.Fatalf("removeScopeTree over user flags: %v", err)
 		}
 		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
@@ -215,7 +215,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if err := removeScopeTree(root, s.dir, "1001", s.uid); err != nil {
+		if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
 			t.Fatalf("removeScopeTree over a uchg FIFO: %v", err)
 		}
 		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
@@ -352,7 +352,7 @@ func TestRemoveScopeClearsForeignFlags(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = root.Close() }()
-			err = removeScopeTree(root, s.dir, "1001", s.uid+1)
+			err = removeScopeTree(root, s.dir, "1001", s.uid+1, true)
 			if linked {
 				var st unix.Stat_t
 				if !errors.Is(err, unix.EPERM) || !strings.Contains(err.Error(), "has 2 links") || strings.Contains(err.Error(), "sudo") || strings.Contains(err.Error(), "chflags") {
@@ -418,7 +418,7 @@ func TestRemoveScopeSwappedNameGetsZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	if err := removeScopeTree(root, s.dir, "1001", s.uid); err != nil {
+	if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
 		t.Fatalf("removeScopeTree over a swapped name: %v", err)
 	}
 	if !swapped {
