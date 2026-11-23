@@ -341,7 +341,7 @@ file owned by root is refused too. The message names the path inside the copy. L
 `/var/lib/k3sm/server/keystore` absent. If anything is there when the merge runs, such as a
 directory or link the service user made, the merge moves it into `pre-restore.d` as
 `planted-<time>`, where only root can reach it, without reading it or following a link. It says
-so on stderr and in a `moved aside` line of its report, then goes on. With `--dry-run` it prints
+so on stderr and in a `moved aside` line of its report, then goes on, and exits 4 so you read it. With `--dry-run` it prints
 where it would move it and moves nothing. Every line ends in
 `|| exit 1`, so the first one that fails stops the steps (and closes the shell), and no later
 line moves a copy into or over one that is set aside. Before anything moves, the first two
@@ -384,8 +384,11 @@ Once the merge is written, it moves `pre-restore.d/restored` to `/var/lib/k3sm/s
 then renames the file to `keystore-floor.json.merged-<time>`, the time in
 seconds since 1970, and the other verbs work again. If it prints its report and exits 5, the merge is
 written, but the restored copy was not moved into place or the file was not renamed: run the same
-command again. The second run writes nothing more, prints `already merged`, moves the restored copy
-if it is still staged and renames the file. The merge takes no file name: it reads only `/var/lib/k3sm/keystore-floor.json.pre-restore`,
+command again. The second run never works the merge out again: it checks that the floor is the one
+the first run recorded writing in `keystore-floor.json.pre-restore.retired`, writes nothing more,
+prints `already merged` with the first run's report, moves the restored copy if it is still staged
+and renames the file. If the floor changed since, it refuses and says so. Until that second run,
+`k3sm keys rm` refuses: run the merge again first. The merge takes no file name: it reads only `/var/lib/k3sm/keystore-floor.json.pre-restore`,
 the floor the steps above moved aside, so it never reads the floor saved with the backup or any
 other copy. It refuses, and changes nothing, if that file is missing, if the restored
 `keystore-floor.json` is not in place yet (put it back with `install` first), if the file is
@@ -450,9 +453,11 @@ it fences the entry only past the version the moved-aside floor records, and a c
 the restore numbered above that may still be accepted.
 
 The merge exits 0 when it is written and there is nothing to read in the report. It exits 4 when
-it is written but dropped a deletion, kept an entry because `--keep` named it, or left an entry
-`unverified`, so read the report. It exits 5 when it is written but the restored copy was not
-moved into place or the file was not renamed (run it again), and 1 when it refuses and changes
+it is written but dropped a deletion, kept an entry because `--keep` named it, left an entry
+`unverified` (with no `pre-restore.d/keystore`, each entry the moved-aside floor holds live), or
+moved aside what it found at `server/keystore`, so read the report. It exits 5 when it is written
+but the restored copy was not moved into place, the move may not survive a crash, or the file was
+not renamed (run it again), and 1 when it refuses and changes
 nothing. A run after an exit 5 finds the merge already written, so if it then refuses the
 restored copy, or cannot move aside what is at `server/keystore`, it says the merge is written
 and exits 5 again, with `--dry-run` too: fix what it names and run it once more. With `--dry-run` it exits with the code the merge itself would return. Then start the server and check the entries:
@@ -500,8 +505,10 @@ merge runs in reverse and keeps every deletion you made after the restore. If yo
 the merge, the floor you moved aside is now `keystore-floor.json.merged-<time>`: use that name
 in the first floor `mv` instead. `--undo` tells the reverse merge to read the record the first
 merge left beside that file, `keystore-floor.json.merged-<time>.retired`, which lists what the
-first merge retired; leave that record in place. If you never ran the first merge there is no
-record and `--undo` refuses: run the two merge lines without `--undo`. The `pgrep` line stops
+first merge retired; leave that record in place. `--undo` uses only the record whose merge read
+the floor you put back, so it refuses when that floor is not the first merge's input, or when no
+record matches it, and says so. If you never ran the first merge there is no record and `--undo`
+refuses: run the two merge lines without `--undo`. The `pgrep` line stops
 the steps while anything still runs as the service user, as in the restore.
 
 ```
