@@ -18,8 +18,11 @@ package keystore
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"time"
+
+	"k3sm.io/k3sm/pkg/keystore/typed"
 )
 
 // This file is the keystore's contract: the Store interface, its types and its
@@ -38,6 +41,14 @@ const (
 	// KindOpaque is an opaque byte string the keystore stores but does not
 	// interpret.
 	KindOpaque
+	// KindToken is a bearer token that always carries an expiry. Its value
+	// is a typed envelope (pkg/keystore/typed), read as a typed.Credential.
+	KindToken
+	// KindSSH is an ed25519 SSH key, a typed envelope holding its seed.
+	KindSSH
+	// KindOAuth is an OAuth access and refresh pair, a typed envelope whose
+	// refresh token no read returns.
+	KindOAuth
 )
 
 // String returns the lowercase name of k, as the CLI prints it.
@@ -47,6 +58,12 @@ func (k Kind) String() string {
 		return "ed25519"
 	case KindOpaque:
 		return "opaque"
+	case KindToken:
+		return "token"
+	case KindSSH:
+		return "ssh"
+	case KindOAuth:
+		return "oauth"
 	default:
 		return "unknown"
 	}
@@ -71,6 +88,34 @@ type Version struct {
 	// truncated one, never a plain hash of the value, because List output
 	// would otherwise be a guessing oracle for a low-entropy value.
 	Fingerprint string
+
+	// identity names this version of this entry's life, and no other: a
+	// digest of the entry's generation, name, version number and record
+	// digest (see versionIdentity). An entry
+	// deleted and put again restarts at version 1 under a fresh generation,
+	// so its versions never share an identity with the old entry's. It is
+	// opaque and unexported: RotateIf compares the identity of the Version
+	// a writer read with the current one, and pkg/keystore exposes no
+	// generation.
+	identity [identitySize]byte
+	// digest is the record digest of the sealed file the version was read
+	// from (RecordDigest).
+	digest [digestSize]byte
+}
+
+// identitySize is the length of a Version's identity.
+const identitySize = 16
+
+// RecordDigest is the hex digest of the exact sealed record the version was
+// read from: the first 16 bytes of the SHA-256 of its nonce and ciphertext.
+// It reveals nothing about the value. Two records of one version number
+// (a failed rotation's file and its retry's) have different digests, and a
+// Rewrap changes it. It is empty for a Version not read from the store.
+func (v Version) RecordDigest() string {
+	if v.digest == ([digestSize]byte{}) {
+		return ""
+	}
+	return hex.EncodeToString(v.digest[:])
 }
 
 // Entry is the metadata of a named entry: its current version and every
@@ -155,8 +200,72 @@ var (
 	ErrCorrupt = errors.New("keystore record is corrupt: it failed authentication or does not parse, so it was tampered with, moved or truncated; restore it from backup")
 	// ErrNotFound reports that no entry has the requested name.
 	ErrNotFound = errors.New("keystore entry not found")
+	// ErrKindUnsupported is returned for a record this build cannot read: a
+	// kind byte from 6 to 0xFC, or a typed envelope version it does not
+	// know. It was written by a newer k3sm, or altered to read as one, so
+	// it is not wrapped in ErrCorrupt; its text names an upgrade first and
+	// a restore when this k3sm is current. It is typed.ErrKindUnsupported,
+	// so the envelope decoder's refusal matches it unmapped.
+	ErrKindUnsupported = typed.ErrKindUnsupported
+	// ErrKindMismatch reports a rotate, or a put over an existing name, of
+	// a kind other than the entry's: an entry's kind is fixed when it is
+	// created, and changing kind means a new entry name.
+	ErrKindMismatch = errors.New("the keystore entry holds another kind: an entry's kind is fixed when it is created; store the new kind under a new name")
+	// ErrTypedCredential reports a raw-value read (Current, Get) of a
+	// typed entry, token, ssh or oauth, whose value is read only as a
+	// typed.Credential (CurrentCredential, GetCredential), so no raw read
+	// can carry an oauth refresh token.
+	ErrTypedCredential = errors.New("the keystore entry is a typed credential: read it as a typed credential, not as raw bytes")
+	// ErrVersionStale reports a RotateIf whose expected current version is
+	// not the entry's current version: another write came first, or the
+	// entry was deleted and put again since the expected version was read,
+	// or the expected Version was not read from the store.
+	ErrVersionStale = errors.New("the keystore entry's current version is not the one expected: another write came first; read it again")
+	// ErrCommitted marks an error returned after a write committed: the
+	// change stands, and a step after its commit point (the floor line, the
+	// oauth prune, an audit line) failed. A rotation that returns it also
+	// returns the Version it made current. A refresher that gets it must
+	// read the entry again and work from what it reads, and never retry
+	// from the pair it held: that pair is no longer current, and its refresh
+	// token may already be rotated at the provider. The next write records
+	// the floor and prunes what was left.
+	//
+	// ErrCommitted takes precedence: an error that matches it matches no
+	// other sentinel of this package, ErrCorrupt included, whatever its
+	// cause was (a floor refusal reads as ErrCorrupt). The cause is in the
+	// message only.
+	//
+	// The refresher's contract on a failure that does not match it: nothing
+	// was made current, and the provider may already have rotated the
+	// stored pair's refresh token, so the refresher retries RotateIf with
+	// the new pair it holds in memory, and never refreshes again from the
+	// stored pair. When the failure matches ErrOrphanVersion, the new pair
+	// is already sealed above the pointer: a retry is refused with
+	// ErrOrphanVersion too, and the refresher stops and leaves the entry to
+	// an operator's Adopt.
+	ErrCommitted = errors.New("the change was made")
+	// ErrRefreshOwnerFixed reports a rotation of an oauth entry whose new
+	// pair names another refresh owner: the owner is fixed when the entry
+	// is put, so the server never starts or stops refreshing a pair because
+	// a rotation said so. Changing owner means rm and put again. The socket
+	// answers it as invalid-value.
+	ErrRefreshOwnerFixed = errors.New("the oauth entry's refresh owner is fixed when it is put: a rotation must name the same owner; to change it, rm the entry and put it again")
+	// ErrFromVersionOAuth reports a rotate from an earlier version of an
+	// oauth entry: resurrecting a rotated refresh token can trip the
+	// provider's reuse detection and revoke the whole grant.
+	ErrFromVersionOAuth = errors.New("an oauth entry cannot be rotated from an earlier version: reusing a rotated refresh token can make the provider revoke the whole grant")
+	// ErrOrphanVersion reports a version of an entry, above the one its
+	// current pointer names, that authenticates as this entry's: a rotation
+	// crashed between writing it and flipping the pointer, or an older
+	// pointer was copied back over a newer one. For oauth it may hold the
+	// provider's newest refresh token, so it is never unlinked, and an oauth
+	// read refuses with it rather than hand out a pair that may already be
+	// spent. An oauth rotation that fails after its version file is in
+	// place and before its pointer flip keeps that file and returns an
+	// error matching it, never ErrCommitted.
+	ErrOrphanVersion = errors.New("a sealed version of the keystore entry lies above its current pointer, left by a crashed rotation or a copied-back pointer")
 	// ErrTombstoneEvicted reports a verb that made its change (a Delete, a
-	// Put, a Rotate, a RaiseFloor) but whose floor writes dropped burials,
+	// Put, a Rotate, an Adopt, a RaiseFloor) but whose floor writes dropped burials,
 	// its own or other names', to stay within the floor's tombstone budget
 	// or a name's cap of buried generations: a copy of each of those deleted
 	// entries put back is accepted again. It comes with errCommitted

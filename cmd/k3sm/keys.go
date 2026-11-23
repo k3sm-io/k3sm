@@ -63,6 +63,11 @@ const keysUsage = `Usage:
         k3sm so the value is never printed
   sudo k3sm keys rm system/<name> --yes
         delete the entry and every version; irreversible
+  sudo k3sm keys adopt system/<name> [--yes]
+        show the sealed version a crashed rotation left above the current
+        one, beside the current one, and make it current: with --yes, or
+        once confirmed at a terminal. For oauth it may hold the only valid
+        refresh token: adopt it, never delete it
   sudo k3sm keys rewrap --key-out FILE | --key-in FILE
         re-seal every entry under a new master key. --key-out writes the new
         key k3sm mints to FILE (a new file, mode 0600, in a directory only
@@ -79,7 +84,7 @@ const keysUsage = `Usage:
         backup stay refused (user-scope deletions are not carried over yet). A restored entry deleted since the backup is deleted again
         (buried live); --keep, repeatable, keeps that entry's restored
         version live instead, for an entry you are restoring on purpose.
-        Until it runs, put, rotate and rewrap refuse; once written, the
+        Until it runs, put, rotate, adopt and rewrap refuse; once written, the
         file is renamed to keystore-floor.json.merged-<unix>. A merge that
         would drop a deletion since the backup to fit the floor refuses;
         --accept-drops writes it anyway, dropping the oldest deletions,
@@ -129,16 +134,17 @@ Flags:
                     data root is its parent
 
 Exit codes: 0 done; 1 refused or failed; 2 usage; 3 rewrap completed an
-earlier interrupted rewrap instead (run it again with a new key); 4 the verb
-(put, rotate, rm or floor merge) is done, but the floor dropped a recorded
-deletion to stay within its limits, so a copy of that deleted entry put back
-is accepted, or floor merge kept an entry with --keep, left one
-unverified, moved a target aside, or carried over user-scope entries
-without a floor check (read its report), or floor --rebuild dropped lines
-or keys of the old floor (it lists the counts by class: unparseable,
-over-long, forged live keys, removed-scope keys); 5 floor merge written, input not
-renamed: rerun to clear the guard (it wins over 4, and the report lists any
-drops).
+earlier interrupted rewrap instead (run it again with a new key);
+4 the change was made (put, rotate, rm, adopt or floor merge is done), but:
+a step after it failed (put, rotate or adopt: the new version is current,
+and the next keys verb finishes what was left); or the floor dropped a
+recorded deletion to stay within its limits, so a copy of that deleted
+entry put back is accepted; or floor merge kept an entry with --keep, left one unverified,
+moved a target aside, or carried over user-scope entries without a floor
+check (read its report); or floor --rebuild dropped lines or keys of the
+old floor (it lists the counts by class: unparseable, over-long, forged
+live keys, removed-scope keys); 5 floor merge written, input not renamed:
+rerun to clear the guard (it wins over 4, and the report lists any drops).
 floor merge --dry-run exits as the merge itself would.
 `
 
@@ -150,10 +156,12 @@ const (
 	// keysResumed is rewrap's ErrRewrapResumed: it finished an earlier
 	// rewrap under a key the operator did not supply, so it must run again.
 	keysResumed = 3
-	// keysCommitted is a change that was made, but whose floor write
+	// keysCommitted is a change that was made, but not cleanly: a write's
+	// keystore.ErrCommitted (put, rotate or adopt made its change, and a
+	// step after the commit point failed); a change whose floor write
 	// dropped a recorded deletion to stay within the floor's limits: a
-	// committed keystore.ErrTombstoneEvicted from put, rotate or rm (its
-	// tree left behind, or nothing found after a raise that pruned,
+	// committed keystore.ErrTombstoneEvicted from put, rotate, adopt or rm
+	// (its tree left behind, or nothing found after a raise that pruned,
 	// included), or a floor merge that reports a drop; and a floor merge
 	// (or its dry run) that keeps an entry with --keep or leaves one
 	// unverified; and a floor --rebuild that dropped lines or keys of the
@@ -197,6 +205,8 @@ type keysStore interface {
 	RemoveScope(ctx context.Context, uid uint32) (bool, error)
 	// RotateAudit is the root maintenance verb audit --rotate.
 	RotateAudit(ctx context.Context, attrs keystore.FileAttrWriter, discardOldest bool) (keystore.RotateReport, error)
+	Orphan(ctx context.Context, name string) (keystore.OrphanInfo, error)
+	Adopt(ctx context.Context, name string, orphan keystore.Version) (keystore.Version, error)
 	MergeFloor(ctx context.Context, opts keystore.MergeOptions) (keystore.MergeReport, error)
 	MergePending() error
 }
@@ -646,6 +656,8 @@ func runKeysVerb(ctx context.Context, verb string, rest []string, env keysEnv) i
 		return keysRotate(ctx, rest, env)
 	case "rm":
 		return keysRm(ctx, rest, env)
+	case "adopt":
+		return keysAdopt(ctx, rest, env)
 	case "rewrap":
 		return keysRewrap(ctx, rest, env)
 	case "floor":
@@ -784,6 +796,12 @@ func keysPut(ctx context.Context, args []string, env keysEnv) int {
 	defer clear(value)
 	ver, err := s.Put(ctx, name, kind, value)
 	code = keysOK
+	if errors.Is(err, keystore.ErrCommitted) {
+		// The change stands: it is reported as made, and the exit says a
+		// later step failed.
+		code = v.failf(keysCommitted, "%v", err)
+		err = nil
+	}
 	if err != nil {
 		if code = v.evictedCode(err); code == keysRefused {
 			return code
@@ -835,6 +853,12 @@ func keysRotate(ctx context.Context, args []string, env keysEnv) int {
 	}
 	ver, err := s.Rotate(ctx, name, value)
 	code = keysOK
+	if errors.Is(err, keystore.ErrCommitted) {
+		// The change stands: it is reported as made, and the exit says a
+		// later step failed.
+		code = v.failf(keysCommitted, "%v", err)
+		err = nil
+	}
 	if err != nil {
 		if code = v.evictedCode(err); code == keysRefused {
 			return code
@@ -1259,6 +1283,104 @@ func keysFloorMerge(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysCommitted, "%s %s; read the report above", lead, strings.Join(why, "; "))
 	}
 	return keysOK
+}
+
+// keysAdopt is `keys adopt`: it prints the entry's current version and the
+// sealed version above it (Orphan), each with its kind, fingerprint, record
+// digest, sealed issuedAt and created time, never a value, then makes that version
+// current (Adopt) with --yes, or once a terminal on stdin confirms.
+func keysAdopt(ctx context.Context, args []string, env keysEnv) int {
+	v := newKeysVerb("adopt", env)
+	yes := v.fs.Bool("yes", false, "confirm: make the orphaned version current")
+	pos, err := v.parse(args)
+	if err != nil {
+		return keysBadUsage
+	}
+	name, code := v.nameArg(pos)
+	if code != keysOK {
+		return code
+	}
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	info, err := s.Orphan(ctx, name)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	fmt.Fprintf(env.stdout, "name:     %s\n", qualify(name))
+	fmt.Fprintf(env.stdout, "current:  version %d, %s, pointer sequence %d\n", info.Current.Version, info.Current.Kind, info.Seq)
+	printAdoptSide(env.stdout, info.Current, info.CurrentIssuedAt)
+	fmt.Fprintf(env.stdout, "orphan:   version %d, %s\n", info.Orphan.Version, info.Orphan.Kind)
+	printAdoptSide(env.stdout, info.Orphan, info.OrphanIssuedAt)
+	if len(info.Others) > 0 {
+		fmt.Fprintf(env.stdout, "beyond:   versions %v (a copied-back pointer: adopt refuses)\n", info.Others)
+	}
+	if !*yes {
+		if !env.stdinTTY() {
+			return v.failf(keysBadUsage, "adopting makes version %d of %s current: pass --yes, or run it at a terminal to confirm", info.Orphan.Version, qualify(name))
+		}
+		fmt.Fprintf(env.stdout, "make version %d current? [y/N] ", info.Orphan.Version)
+		if !confirmed(env.stdin) {
+			return v.failf(keysRefused, "not confirmed; nothing was changed")
+		}
+	}
+	ver, err := s.Adopt(ctx, name, info.Orphan)
+	code = keysOK
+	if errors.Is(err, keystore.ErrCommitted) {
+		code = v.failf(keysCommitted, "%v", err)
+		err = nil
+	}
+	if err != nil {
+		if code = v.evictedCode(err); code == keysRefused {
+			return code
+		}
+	}
+	fmt.Fprintf(env.stdout, "adopted %s version %d: it is current\n", qualify(name), ver.Version)
+	return code
+}
+
+// printAdoptSide prints the metadata `keys adopt` shows under one side's
+// heading, never a value: the fingerprint, the record digest, for a token or
+// an oauth pair the issuedAt sealed in its envelope (issued, the zero time
+// when it did not decode), and the record's created header, which is not
+// authenticated.
+func printAdoptSide(w io.Writer, v keystore.Version, issued time.Time) {
+	fmt.Fprintf(w, "  fingerprint:    %s\n", v.Fingerprint)
+	fmt.Fprintf(w, "  record digest:  %s\n", v.RecordDigest())
+	if v.Kind == keystore.KindToken || v.Kind == keystore.KindOAuth {
+		if issued.IsZero() {
+			fmt.Fprintf(w, "  issuedAt:       unreadable (the sealed envelope does not decode)\n")
+		} else {
+			fmt.Fprintf(w, "  issuedAt:       %s (sealed)\n", issued.UTC().Format(time.RFC3339))
+		}
+	}
+	fmt.Fprintf(w, "  created:        %s (unauthenticated)\n", v.Created.UTC().Format(time.RFC3339))
+}
+
+// confirmed reads one short answer line from r and reports whether it is
+// y or yes, in any case. It reads at most a few bytes, so a stream that
+// never ends a line is not read whole.
+func confirmed(r io.Reader) bool {
+	var b [8]byte
+	var line []byte
+	for len(line) < len(b) {
+		n, err := r.Read(b[len(line) : len(line)+1])
+		if n == 1 {
+			if b[len(line)] == '\n' {
+				break
+			}
+			line = b[:len(line)+1]
+		}
+		if err != nil {
+			break
+		}
+	}
+	answer := strings.ToLower(strings.TrimSpace(string(line)))
+	return answer == "y" || answer == "yes"
 }
 
 // unionStrings is the strings in a or b, without repeats.

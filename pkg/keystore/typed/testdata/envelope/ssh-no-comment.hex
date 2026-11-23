@@ -1,0 +1,6 @@
+# The ssh envelope, assembled by hand from docs/design/keystore.md
+# ("The envelope"): version, then tag (1 B), length (2 B BE), value.
+# Hex digits only count; '#' starts a comment.
+01  # envelope version 1
+20 0001 01  # tag 0x20 algorithm, 1 bytes: 1 = ed25519
+21 0020 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f  # tag 0x21 seed, 32 bytes: 00 01 .. 1f

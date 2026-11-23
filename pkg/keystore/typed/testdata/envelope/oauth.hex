@@ -1,0 +1,11 @@
+# The oauth envelope, assembled by hand from docs/design/keystore.md
+# ("The envelope"): version, then tag (1 B), length (2 B BE), value.
+# Hex digits only count; '#' starts a comment.
+01  # envelope version 1
+30 000a 67686f5f616363657373  # tag 0x30 accessToken, 10 bytes: "gho_access"
+31 0008 000000006ab14990  # tag 0x31 accessExpiresAt, 8 bytes: 1790003600 (2026-09-21T15:13:20Z)
+32 0008 000000006ab13b80  # tag 0x32 accessIssuedAt, 8 bytes: 1790000000 (2026-09-21T14:13:20Z)
+33 000b 6768725f72656672657368  # tag 0x33 refreshToken, 11 bytes: "ghr_refresh"
+34 0008 000000006b9e8980  # tag 0x34 refreshExpiresAt, 8 bytes: 1805552000 (2027-03-20T14:13:20Z)
+35 0006 426561726572  # tag 0x35 tokenType, 6 bytes: "Bearer"
+36 000d 7365727665722f676974687562  # tag 0x36 refreshOwner, 13 bytes: "server/github"

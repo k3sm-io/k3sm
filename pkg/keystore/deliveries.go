@@ -607,7 +607,7 @@ func (u *UserScope) writeDeliveries(dir *os.Root, key []byte, gen [generationSiz
 	}
 	deliveriesSeen.note(u.s.dir, u.scope, gen, seq)
 	if err := u.s.userFloor.append(u.scope, deliveriesFloorName, gen, seq, revoke); err != nil {
-		return fmt.Errorf("%w, and its floor line was not written: %w", errCommitted, err)
+		return committedf(err, "the deliveries record is written, but its floor line was not")
 	}
 	return nil
 }
@@ -627,13 +627,15 @@ var errWithdrawUnsealed = errors.New("the user-scope floor cannot be verified, s
 
 // errCommitted marks an error after a change was committed: the change
 // stands, and what follows it (a floor line, an audit line) was not
-// written.
+// written. Unlike ErrCommitted it is joined to other sentinels: a committed
+// ErrTombstoneEvicted, or a floor merge's refusal to go on.
 var errCommitted = errors.New("the change was made")
 
 // Committed reports whether err followed a change that was committed and
-// stands, such as a Delete whose entry was deleted though its floor write
-// evicted tombstones (ErrTombstoneEvicted).
-func Committed(err error) bool { return errors.Is(err, errCommitted) }
+// stands: an error matching ErrCommitted, or one marked errCommitted, such
+// as a Delete whose entry was deleted though its floor write evicted
+// tombstones (ErrTombstoneEvicted).
+func Committed(err error) bool { return errors.Is(err, errCommitted) || errors.Is(err, ErrCommitted) }
 
 // deliveriesKey derives the delivery-record key from K_u.
 func deliveriesKey(ku []byte, scope string) []byte {
@@ -807,7 +809,7 @@ func (u *UserScope) lookupDelivery(ctx context.Context, uid string) (delivery, e
 // has read or written, and with the floor unverifiable it seals nothing
 // (errWithdrawUnsealed) (docs/design/keystore.md § "Quotas", the residuals of
 // "Revocation always succeeds"). An already withdrawn UID is no change; an absent one is ErrNotFound. As a revocation it
-// commits first and audits after: a failed append is reported (errCommitted)
+// commits first and audits after: a failed append is reported (ErrCommitted)
 // and the tombstone stands.
 //
 // Its audit line names the delivery UID (auditPlaceholder for one outside
@@ -1479,14 +1481,14 @@ func (u *UserScope) auditBriefly(ctx context.Context, l auditLine, err error) {
 var errAuditRefused = errors.New("the audit line could not be written, so nothing was changed")
 
 // appendAudit appends l to the audit sink, setting its scope and its
-// result, "ok" or the refusal's name; its name and namespace must already
-// be validated (or auditPlaceholder), and never a value. It is the
-// revocations' order: commit, then audit. Its error, after a change was
-// made, matches errCommitted.
+// result, "ok", "committed" or the refusal's name; its name and namespace
+// must already be validated (or auditPlaceholder), and never a value. It is
+// the revocations' order: commit, then audit. Its error, after a change was
+// made, matches ErrCommitted.
 func (u *UserScope) appendAudit(l auditLine, err error) error {
 	l.scope, l.result = u.scope, auditResult(err)
 	if aerr := u.s.auditSink.append(l); aerr != nil {
-		return fmt.Errorf("%w, and its audit line was not written: %w", errCommitted, aerr)
+		return committedf(aerr, "the change stands, but its audit line was not written")
 	}
 	return nil
 }
@@ -1526,7 +1528,7 @@ func auditResult(err error) string {
 	switch {
 	case err == nil:
 		return auditResultOK
-	case errors.Is(err, errCommitted):
+	case Committed(err):
 		return auditResultCommitted
 	case errors.Is(err, ErrQuota):
 		return "quota"

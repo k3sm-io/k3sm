@@ -57,6 +57,7 @@ name.
 | `sudo k3sm keys rotate system/NAME --in FILE` | Stores a new version and makes it current. Earlier versions are kept. |
 | `sudo k3sm keys rotate system/NAME --from-version N` | Stores a copy of version N as a new version. The copy is made inside k3sm and the value is never printed. This is the rollback. |
 | `sudo k3sm keys rm system/NAME --yes` | Deletes the entry and every version. This cannot be undone, so it needs `--yes`. It also removes an entry `list` reports as corrupt. |
+| `sudo k3sm keys adopt system/NAME` | Finishes a rotation that was interrupted: shows the current version beside the newer one a crash left behind, and makes the newer one current once you confirm (see [Finishing an interrupted rotation](#finishing-an-interrupted-rotation)). |
 | `sudo k3sm keys rewrap --key-out FILE` | Re-seals every entry under a new master key (see [Changing the master key](#changing-the-master-key)). |
 | `sudo k3sm keys deliver system/NAME --namespace NS` | Declares that the server delivers the entry's current version into the cluster as a Secret (see [Delivering an entry as a Secret](#delivering-an-entry-as-a-secret)). |
 | `sudo k3sm keys undeliver system/NAME --namespace NS [--secret S]` | Withdraws that declaration. The Secret stays. |
@@ -97,6 +98,10 @@ lines or keys of the old floor; it lists the counts. 5 `floor merge` wrote the m
 rename `keystore-floor.json.pre-restore`: run it again to finish the restore. Exit 5 wins over 4,
 and the report still lists every dropped deletion.
 
+Exit 4 also means a `put`, `rotate` or `adopt` made its change and a step after it failed. The
+new version is current, so do not run the command again without checking: `keys show` tells you
+which version is current, and the next `keys` verb finishes what was left.
+
 ## Giving a Value
 
 A value never comes from the command line. Anything there is visible to every local user through
@@ -134,6 +139,35 @@ sudo k3sm keys show system/signer-key --version 3 --reveal | sudo k3sm keys rota
 
 Use a pipe here, not `<( ... )`: `sudo` closes inherited file descriptors, so that path would not
 open.
+
+## Finishing an Interrupted Rotation
+
+If a rotation stops after it wrote the new version but before it made that version current,
+`keys show` and the other reads of the entry report a newer version than the current one and say
+to inspect it with `k3sm keys adopt`. Until you deal with it, a retried
+`rotate` is refused, so it cannot overwrite what the crash left.
+
+```
+sudo k3sm keys adopt system/signer-key
+```
+
+The command prints the name, then the current version and the newer one (the orphan), one after
+the other. For each it shows the version number and kind, the fingerprint, the record digest, the
+time sealed inside a token or OAuth pair (`issuedAt`) and the created time, which is not
+authenticated. It never prints a value. If versions exist beyond the orphan, it lists them and
+refuses to adopt.
+
+Compare the two sides, then confirm. At a terminal it asks `make version N current? [y/N]`;
+answer `y` or `yes`. Anywhere else, such as a script, pass `--yes`, or it changes nothing and
+exits 2. Any other answer changes nothing and exits 1.
+
+On confirmation the orphan becomes the current version. The version that was current stays in
+the history, so you can still roll back to it (see [Rolling back](#rolling-back)). The exception
+is an OAuth pair, which keeps only the previous current version beside the new one. Older ones
+are removed.
+
+For an OAuth pair, the orphan may hold the only valid refresh token, because the old one may
+already be spent at the provider. Inspect it and adopt it. Do not delete its file.
 
 ## Changing the Master Key
 

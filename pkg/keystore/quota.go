@@ -144,7 +144,7 @@ func entryBytes(entries *os.Root, name string) (int64, error) {
 // the user scope reads as damage, is removed too.
 //
 // As a revocation it commits first and audits after: a failed append is
-// reported (errCommitted) and the removal stands.
+// reported (ErrCommitted) and the removal stands.
 func (u *UserScope) Delete(ctx context.Context, input string) error {
 	name, err := u.own("rm", input)
 	if err != nil {

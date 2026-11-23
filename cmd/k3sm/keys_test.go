@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/keystore"
+	"k3sm.io/k3sm/pkg/keystore/typed"
 )
 
 // keysRecorder passes every call to the store it wraps, the real
@@ -2539,6 +2540,247 @@ func TestRewrapWarnsWhenUserScopesExist(t *testing.T) {
 			t.Fatalf("rewrap printed the user-scope warning %d times, want the closing one:\n%s", got, h.stderr.String())
 		}
 	})
+}
+
+// TestKeysAdopt is G9's CLI half: keys adopt is root-only, prints the
+// current version and the orphan above it, and adopts only with --yes or a
+// confirmation typed at a terminal. The orphan here is a newer version
+// behind a copied-back pointer with the floor lagging, which leaves the
+// same files a crashed rotation does.
+func TestKeysAdopt(t *testing.T) {
+	h := newKeysHarness(t)
+	h.put("system/alpha", []byte("one"))
+	cur := filepath.Join(h.keystoreDir(), "alpha", "current")
+	saved, err := os.ReadFile(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.stdin = strings.NewReader("two")
+	h.mustRun(0, "rotate", "system/alpha", "--in", "-")
+	if err := os.WriteFile(cur, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	floorPath := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+	b, err := os.ReadFile(floorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lagged := strings.Replace(string(b), `"seq":2`, `"seq":1`, 1)
+	if lagged == string(b) {
+		t.Fatalf("the floor does not record sequence 2: %s", b)
+	}
+	if err := os.WriteFile(floorPath, []byte(lagged), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h.euid = 501
+	h.mustRun(1, "adopt", "system/alpha", "--yes")
+	if !strings.Contains(h.stderr.String(), "run as root") {
+		t.Fatalf("adopt as non-root: %s", h.stderr.String())
+	}
+	h.euid = 0
+
+	// Neither --yes nor a terminal: both sides printed, nothing changed.
+	info, err := keystore.New(h.storeCfg).Orphan(context.Background(), "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun(2, "adopt", "system/alpha")
+	for _, want := range []string{
+		"current:  version 1, opaque",
+		adoptSide(info.Current, time.Time{}),
+		"orphan:   version 2, opaque",
+		adoptSide(info.Orphan, time.Time{}),
+		"pass --yes",
+	} {
+		if !strings.Contains(h.stdout.String()+h.stderr.String(), want) {
+			t.Fatalf("adopt without --yes does not print %q:\nstdout:\n%s\nstderr:\n%s", want, h.stdout.String(), h.stderr.String())
+		}
+	}
+	if strings.Contains(h.stdout.String(), "issuedAt") {
+		t.Fatalf("adopt printed an issuedAt for an opaque entry:\n%s", h.stdout.String())
+	}
+	// A terminal answering no changes nothing either.
+	h.stdinTTY = true
+	h.stdin = strings.NewReader("n\n")
+	h.mustRun(1, "adopt", "system/alpha")
+	// A read refuses the orphan (ErrOrphanVersion), so the pointer file is
+	// what shows nothing changed.
+	if got, err := os.ReadFile(cur); err != nil || !bytes.Equal(got, saved) {
+		t.Fatalf("the declined adopt changed the current pointer (%v)", err)
+	}
+	h.stdin = strings.NewReader("yes\n")
+	h.mustRun(0, "adopt", "system/alpha")
+	if !strings.Contains(h.stdout.String(), "adopted system/alpha version 2") {
+		t.Fatalf("adopt output:\n%s", h.stdout.String())
+	}
+	h.stdinTTY = false
+	h.mustRun(0, "show", "system/alpha", "--reveal", "--yes")
+	if h.stdout.String() != "two" {
+		t.Fatalf("current after adopt = %q, want two", h.stdout.String())
+	}
+	h.mustRun(1, "adopt", "system/alpha", "--yes")
+	if !strings.Contains(h.stderr.String(), "no sealed version lies above") {
+		t.Fatalf("adopt with nothing to adopt: %s", h.stderr.String())
+	}
+	if strings.Contains(h.stdout.String()+h.stderr.String(), "two") {
+		t.Fatal("adopt printed a value")
+	}
+
+	t.Run("typed", func(t *testing.T) { keysAdoptTyped(t) })
+}
+
+// adoptSide is the block `keys adopt` prints under one side's heading: the
+// fingerprint, the record digest, the sealed issuedAt when issued is set,
+// and the unauthenticated created time.
+func adoptSide(v keystore.Version, issued time.Time) string {
+	b := fmt.Sprintf("  fingerprint:    %s\n  record digest:  %s\n", v.Fingerprint, v.RecordDigest())
+	if !issued.IsZero() {
+		b += fmt.Sprintf("  issuedAt:       %s (sealed)\n", issued.UTC().Format(time.RFC3339))
+	}
+	return b + fmt.Sprintf("  created:        %s (unauthenticated)\n", v.Created.UTC().Format(time.RFC3339))
+}
+
+// keysAdoptTyped is TestKeysAdopt for a token entry: each side also shows
+// the issuedAt sealed in its envelope, and no output carries the token.
+func keysAdoptTyped(t *testing.T) {
+	ctx := context.Background()
+	h := newKeysHarness(t)
+	h.put("system/seed", []byte("s")) // opens the store config
+	st := keystore.New(h.storeCfg)
+	marker1, marker2 := "MARKER-adopt-first-9c41e7", "MARKER-adopt-orphan-5d2b08"
+	token := func(v string) typed.Envelope {
+		return typed.Envelope{Credential: typed.Credential{Value: []byte(v), ExpiresAt: time.Now().Add(time.Hour)}}
+	}
+	if _, err := st.PutCredential(ctx, "tok", keystore.KindToken, token(marker1)); err != nil {
+		t.Fatal(err)
+	}
+	_, c1, err := st.CurrentCredential(ctx, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := filepath.Join(h.keystoreDir(), "tok", "current")
+	saved, err := os.ReadFile(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RotateCredential(ctx, "tok", keystore.KindToken, token(marker2)); err != nil {
+		t.Fatal(err)
+	}
+	_, c2, err := st.CurrentCredential(ctx, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cur, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	floorPath := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+	b, err := os.ReadFile(floorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lagged := strings.Replace(string(b), `"seq":2`, `"seq":1`, 1)
+	if lagged == string(b) {
+		t.Fatalf("the floor does not record sequence 2: %s", b)
+	}
+	if err := os.WriteFile(floorPath, []byte(lagged), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := st.Orphan(ctx, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h.mustRun(2, "adopt", "system/tok")
+	out := h.stdout.String() + h.stderr.String()
+	for _, want := range []string{
+		"current:  version 1, token",
+		adoptSide(info.Current, c1.IssuedAt),
+		"orphan:   version 2, token",
+		adoptSide(info.Orphan, c2.IssuedAt),
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("adopt does not print %q:\n%s", want, out)
+		}
+	}
+	h.mustRun(0, "adopt", "system/tok", "--yes")
+	out += h.stdout.String() + h.stderr.String()
+	for _, m := range []string{marker1, marker2} {
+		if strings.Contains(out, m) {
+			t.Fatalf("adopt printed the token value %q:\n%s", m, out)
+		}
+	}
+}
+
+// committedStore reports every write it makes as committed with a failed
+// step after the commit point, which the real store reaches only through a
+// failing fsync or floor write a test cannot cause from outside.
+type committedStore struct{ keysStore }
+
+func (c committedStore) Put(ctx context.Context, name string, kind keystore.Kind, value []byte) (keystore.Version, error) {
+	v, err := c.keysStore.Put(ctx, name, kind, value)
+	if err != nil {
+		return v, err
+	}
+	return v, fmt.Errorf("%w: injected failure after the commit point", keystore.ErrCommitted)
+}
+
+func (c committedStore) Rotate(ctx context.Context, name string, value []byte) (keystore.Version, error) {
+	v, err := c.keysStore.Rotate(ctx, name, value)
+	if err != nil {
+		return v, err
+	}
+	return v, fmt.Errorf("%w: injected failure after the commit point", keystore.ErrCommitted)
+}
+
+func (c committedStore) Adopt(ctx context.Context, name string, orphan keystore.Version) (keystore.Version, error) {
+	v, err := c.keysStore.Adopt(ctx, name, orphan)
+	if err != nil {
+		return v, err
+	}
+	return v, fmt.Errorf("%w: injected failure after the commit point", keystore.ErrCommitted)
+}
+
+// TestKeysCommittedExitCode is review round 4, item 6: put, rotate and adopt
+// exit keysCommitted, not keysRefused, when the write committed and a step
+// after it failed, and the usage text names the code.
+func TestKeysCommittedExitCode(t *testing.T) {
+	h := newKeysHarness(t)
+	h.wrap = func(s keysStore) keysStore { return committedStore{s} }
+	h.stdin = strings.NewReader("one")
+	h.mustRun(keysCommitted, "put", "system/alpha", "--in", "-")
+	cur := filepath.Join(h.keystoreDir(), "alpha", "current")
+	saved, err := os.ReadFile(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.stdin = strings.NewReader("two")
+	h.mustRun(keysCommitted, "rotate", "system/alpha", "--in", "-")
+	if got := h.value("alpha", 2); string(got) != "two" {
+		t.Fatalf("alpha v2 = %q after the committed rotate", got)
+	}
+	// A copied-back pointer behind a lagging floor leaves version 2 to adopt.
+	if err := os.WriteFile(cur, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	floorPath := filepath.Join(filepath.Dir(h.work), "keystore-floor.json")
+	b, err := os.ReadFile(floorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(floorPath, []byte(strings.Replace(string(b), `"seq":2`, `"seq":1`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun(keysCommitted, "adopt", "system/alpha", "--yes")
+	if !strings.Contains(h.stdout.String(), "adopted system/alpha version 2") {
+		t.Fatalf("committed adopt output:\n%s", h.stdout.String())
+	}
+	if keysCommitted == keysRefused || keysCommitted == keysBadUsage || keysCommitted == keysResumed {
+		t.Fatalf("keysCommitted %d is not distinct", keysCommitted)
+	}
+	if !strings.Contains(keysUsage, fmt.Sprintf("%d the change was made", keysCommitted)) {
+		t.Fatalf("usage does not name exit code %d:\n%s", keysCommitted, keysUsage)
+	}
 }
 
 // plantBurials sets name's tombstones in the floor file at p to n

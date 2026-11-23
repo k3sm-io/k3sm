@@ -292,6 +292,18 @@ func (s *FileStore) writeFile(root *os.Root, name string, data []byte) error {
 // writeFileAs is writeFile with the owner and mode given, for the one file
 // the store keeps outside the service user's tree: the root-owned floor.
 func (s *FileStore) writeFileAs(root *os.Root, name string, data []byte, uid, gid uint32, mode fs.FileMode) error {
+	if err := s.renameInto(root, name, data, uid, gid, mode); err != nil {
+		return err
+	}
+	return syncDir(root)
+}
+
+// renameInto is writeFileAs up to and including the rename, without the
+// directory fsync: a nil return means name now holds data. A writer whose
+// rename is its commit point (a current pointer) calls it so that it can
+// tell a failed rename, which committed nothing, from a failed fsync after
+// it, which did.
+func (s *FileStore) renameInto(root *os.Root, name string, data []byte, uid, gid uint32, mode fs.FileMode) error {
 	var suffix [tempSuffixSize]byte
 	if err := s.readRandom(suffix[:]); err != nil {
 		return fmt.Errorf("name a temporary file: %w", err)
@@ -327,7 +339,7 @@ func (s *FileStore) writeFileAs(root *os.Root, name string, data []byte, uid, gi
 		return fmt.Errorf("rename %s to %s: %w", tmp, name, err)
 	}
 	renamed = true
-	return syncDir(root)
+	return nil
 }
 
 // tempSuffixSize is the size of the random part of a temporary file's name.

@@ -408,7 +408,12 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 			return err
 		}
 		v, val, err = e.version(uk, cur)
-		return err
+		if err := rawOnly(v, err); err != nil {
+			clear(val) // a refused typed envelope never lingers
+			val = nil
+			return err
+		}
+		return nil
 	})
 	if err != nil {
 		return Version{}, nil, fail("current", err)

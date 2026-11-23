@@ -1,0 +1,7 @@
+# The token envelope, assembled by hand from docs/design/keystore.md
+# ("The envelope"): version, then tag (1 B), length (2 B BE), value.
+# Hex digits only count; '#' starts a comment.
+01  # envelope version 1
+10 0011 6768705f6b33736d54657374546f6b656e  # tag 0x10 value, 17 bytes: "ghp_k3smTestToken"
+11 0008 000000006b49d200  # tag 0x11 expiresAt, 8 bytes: 1800000000 (2027-01-15T08:00:00Z)
+12 0008 000000006ab13b80  # tag 0x12 issuedAt, 8 bytes: 1790000000 (2026-09-21T14:13:20Z)
