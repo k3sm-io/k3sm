@@ -124,8 +124,10 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 				var st unix.Stat_t
 				if !errors.Is(err, unix.EPERM) {
 					t.Errorf("removeScopeTree over a root-owned uchg file: %v, want EPERM", err)
-				} else if want := "sudo chflags -h nouchg,nouappnd " + quoteName(planted); !strings.Contains(err.Error(), want) {
-					t.Errorf("the error %q does not name the repair %q", err, want)
+				} else if want := "to clear it, run sudo k3sm stop, then " + repairCommands(dir, "user/1001")[1] + ", then rerun sudo k3sm keys rm-scope user/1001 --yes"; !strings.HasSuffix(err.Error(), want) {
+					t.Errorf("the error %q does not end with the repair %q", err, want)
+				} else if !strings.Contains(err.Error(), quoteName(planted)+" (named for reading, not for pasting)") {
+					t.Errorf("the error %q does not name the plant for reading", err)
 				}
 				if serr := unix.Lstat(planted, &st); serr != nil || st.Flags&unix.UF_IMMUTABLE == 0 {
 					t.Errorf("the root-owned plant has flags %#x (%v); want uchg kept", st.Flags, serr)
@@ -139,5 +141,81 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 				t.Fatalf("the scope directory is still there: %v", err)
 			}
 		})
+	}
+}
+
+// TestRemoveScopeClearsServiceUserFIFOAndSocketAsRoot is rm-scope's
+// unopened case, root-run: the service user sets uchg on a FIFO and
+// uchg,uappnd on a socket in its own scope tree, by path, which makes
+// root's unlinkat fail with EPERM; rm-scope, as root, clears both by
+// directory descriptor and name (setattrlistat, never opening them) and
+// removes the scope with no error and so no hint.
+func TestRemoveScopeClearsServiceUserFIFOAndSocketAsRoot(t *testing.T) {
+	if !asRoot() {
+		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
+	}
+	svcUID, svcGID := serviceIDs(t)
+	asService := func(f func() error) error {
+		errc := make(chan error, 1)
+		go func() {
+			runtime.LockOSThread() // never unlocked: the thread dies with the goroutine
+			if _, _, errno := syscall.Syscall(syscall.SYS_SETTID, uintptr(svcUID), uintptr(svcGID), 0); errno != 0 {
+				errc <- fmt.Errorf("settid: %w", errno)
+				return
+			}
+			errc <- f()
+		}()
+		return <-errc
+	}
+	// As in TestRemoveScopeClearsServiceUserFlagsAsRoot: the service user
+	// must search every parent of the scope directory.
+	base, err := os.MkdirTemp("/private/tmp", "k3sm-rmscope-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(base) })
+	if err := os.Chmod(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", base)
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	t.Cleanup(func() { unflagScopeTree(dir) })
+	data := filepath.Dir(server)
+	for _, d := range []string{filepath.Dir(data), data} {
+		if err := os.Chmod(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fifo := filepath.Join(dir, "planted-fifo")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, scopeEntriesName, "planted-socket")
+	plantSocket(t, sock)
+	_ = filepath.WalkDir(dir, func(p string, _ fs.DirEntry, err error) error {
+		if err == nil {
+			_ = os.Lchown(p, int(svcUID), int(svcGID))
+		}
+		return nil
+	})
+	for _, f := range []struct {
+		p     string
+		flags int
+	}{{fifo, unix.UF_IMMUTABLE}, {sock, unix.UF_IMMUTABLE | unix.UF_APPEND}} {
+		if err := asService(func() error { return unix.Chflags(f.p, f.flags) }); err != nil {
+			t.Fatalf("the service user's chflags %#x of %s: %v", f.flags, f.p, err)
+		}
+	}
+	root, err := s.openDir(s.dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := removeScopeTree(root, s.dir, "1001", s.uid); err != nil {
+		t.Fatalf("removeScopeTree over the service user's flagged FIFO and socket, as root: %v", err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there: %v", err)
 	}
 }

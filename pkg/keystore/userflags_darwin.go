@@ -180,3 +180,7 @@ func (w *flagWalk) clear(root *os.Root, name, path string, depth int) error {
 	}
 	return nil
 }
+
+// sfFlagsMask is the system (SF_*) half of st_flags, which only root sets
+// and rm-scope never writes.
+const sfFlagsMask = 0xffff0000

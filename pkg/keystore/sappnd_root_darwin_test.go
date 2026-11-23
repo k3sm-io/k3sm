@@ -37,8 +37,11 @@ import (
 // EPERM; a descriptor opened without O_APPEND before the flag can neither
 // pwrite nor ftruncate once it is set, and the bytes stay; the service
 // user's link(2) of a root-owned 0600 unflagged file into its own
-// directory succeeds, and of a flagged file fails. Only root can set the
-// flag, so it skips unless root.
+// directory succeeds, and of a flagged file fails; root's setattrlistat
+// of ATTR_CMN_FLAGS with FSOPT_NOFOLLOW, by directory descriptor and name,
+// clears UF_IMMUTABLE on the service user's FIFO and socket, and at a
+// symlink changes the link, not its target. Only root can set the flag,
+// so it skips unless root.
 func TestSappndMeasuredFacts(t *testing.T) {
 	if !asRoot() {
 		t.Skip("root-run (U195): run as root through hack/acceptance/keystore.sh --root")
@@ -228,6 +231,56 @@ func TestSappndMeasuredFacts(t *testing.T) {
 	wantErrno("the service user's link of a flagged file (the flag, not the path, must refuse it)", err, unix.EPERM)
 	if err := unix.Lstat(p, &st); err != nil || st.Nlink != 1 {
 		t.Errorf("after the service user's link the flagged file has nlink %d (%v), want 1", st.Nlink, err)
+	}
+
+	// rm-scope's unopened flag clear (setFlagsAt): root's setattrlistat
+	// with ATTR_CMN_FLAGS and FSOPT_NOFOLLOW, by directory descriptor and
+	// name, clears UF_IMMUTABLE on the service user's FIFO and socket, and
+	// at a symlink changes the link, never its flagged target.
+	ufd, err := unix.Open(own, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(ufd) }()
+	if err := unix.Mkfifo(filepath.Join(own, "fifo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sk, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(sk) }()
+	if err := unix.Bind(sk, &unix.SockaddrUnix{Name: filepath.Join(own, "sock")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"fifo", "sock"} {
+		q := filepath.Join(own, name)
+		if err := os.Lchown(q, int(svcUID), int(svcGID)); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Chflags(q, unix.UF_IMMUTABLE); err != nil {
+			t.Fatalf("chflags uchg on the %s: %v", name, err)
+		}
+		if err := setFlagsAt(ufd, name, 0); err != nil {
+			t.Errorf("root setattrlistat clearing uchg on the service user's %s: %v", name, err)
+		}
+		if err := unix.Lstat(q, &st); err != nil || st.Flags != 0 || st.Uid != svcUID {
+			t.Errorf("after setattrlistat the %s is uid %d flags %#x (%v); want the service user's, no flag", name, st.Uid, st.Flags, err)
+		}
+		wantErrno("root unlink of the "+name+" once unflagged", unix.Unlink(q), nil)
+	}
+	target, _ := file(true)
+	if err := os.Symlink(target, filepath.Join(own, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := setFlagsAt(ufd, "link", unix.UF_NODUMP); err != nil {
+		t.Errorf("root setattrlistat at a symlink: %v", err)
+	}
+	if err := unix.Lstat(target, &st); err != nil || st.Flags != sfAppend {
+		t.Errorf("setattrlistat at a symlink left its target flags %#x (%v); want SF_APPEND alone, unchanged", st.Flags, err)
+	}
+	if err := unix.Lstat(filepath.Join(own, "link"), &st); err != nil || st.Flags != unix.UF_NODUMP {
+		t.Errorf("setattrlistat at a symlink left the link flags %#x (%v); want UF_NODUMP, the link itself changed", st.Flags, err)
 	}
 }
 

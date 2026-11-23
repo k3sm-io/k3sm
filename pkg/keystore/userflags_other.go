@@ -31,6 +31,7 @@ const (
 	userLockingFlags = 0
 	maxFlagOpens     = 4096
 	oSymlink         = 0
+	sfFlagsMask      = 0
 )
 
 // flagOpenLimit is maxFlagOpens.
@@ -38,3 +39,6 @@ var flagOpenLimit = maxFlagOpens
 
 // scopeFchflags is never called off Darwin: no file carries a user flag.
 var scopeFchflags = func(int, int) error { return nil }
+
+// setFlagsAt is never called off Darwin: no file carries a user flag.
+var setFlagsAt = func(int, string, uint32) error { return nil }

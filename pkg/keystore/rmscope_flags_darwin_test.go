@@ -21,7 +21,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -119,9 +118,10 @@ func setScopeFlags(t *testing.T, p string, flags int, link bool) uint64 {
 // directory and version file, a uappnd delivery record, a uchg symlink, a
 // uchg regular file with two links in the tree, and a uchg file whose
 // other link is outside the tree (the owner could clear that flag itself,
-// so leaving it would only stall the removal). A uchg FIFO is not opened,
-// since an open has side effects: the removal fails with EPERM, naming the
-// FIFO and the chflags that clears it, and the FIFO keeps its flag.
+// so leaving it would only stall the removal). A uchg FIFO and a uchg
+// socket are not opened, since an open has side effects or is refused:
+// their flags are cleared by directory descriptor and name
+// (setattrlistat), and the tree is removed.
 // Non-root, the test user is the service user and sets the flags itself;
 // as root, the tree and the outside file are handed to the service user
 // first, and root sets the flags.
@@ -194,7 +194,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 			}
 		}
 	})
-	t.Run("a flagged FIFO", func(t *testing.T) {
+	t.Run("a flagged FIFO and socket", func(t *testing.T) {
 		s, server, _ := fileLogScope(t)
 		dir := scopeDir(server, "1001")
 		t.Cleanup(func() { unflagScopeTree(dir) })
@@ -202,31 +202,99 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 		if err := unix.Mkfifo(fifo, 0o600); err != nil {
 			t.Fatal(err)
 		}
+		sock := filepath.Join(dir, scopeEntriesName, "planted-socket")
+		plantSocket(t, sock)
 		giveScopeTree(t, dir)
-		ino := setScopeFlags(t, fifo, unix.UF_IMMUTABLE, false)
+		inos := map[uint64]string{
+			setScopeFlagsByPath(t, fifo, unix.UF_IMMUTABLE):                "the FIFO",
+			setScopeFlagsByPath(t, sock, unix.UF_IMMUTABLE|unix.UF_APPEND): "the socket",
+		}
 		calls := recordScopeFlags(t)
+		named := recordSetFlagsAt(t)
 		root, err := s.openDir(s.dir, false)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		err = removeScopeTree(root, s.dir, "1001", s.uid)
-		if !errors.Is(err, unix.EPERM) {
-			t.Fatalf("removeScopeTree over a uchg FIFO: %v, want EPERM", err)
+		if err := removeScopeTree(root, s.dir, "1001", s.uid); err != nil {
+			t.Fatalf("removeScopeTree over a uchg FIFO and socket: %v", err)
 		}
-		for _, want := range []string{quoteName(fifo), "sudo chflags -h nouchg,nouappnd " + quoteName(fifo)} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the error %q does not name %q", err, want)
-			}
+		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the scope directory is still there: %v", err)
 		}
 		for _, c := range *calls {
-			if c.ino == ino {
-				t.Errorf("rm-scope opened the FIFO to clear its flag: %+v", c)
+			if what, ok := inos[c.ino]; ok {
+				t.Errorf("rm-scope opened %s to clear its flag: %+v", what, c)
 			}
 		}
-		var st unix.Stat_t
-		if err := unix.Lstat(fifo, &st); err != nil || st.Flags&unix.UF_IMMUTABLE == 0 {
-			t.Errorf("the FIFO's flags are %#x (%v); want uchg kept", st.Flags, err)
+		got := map[uint64]bool{}
+		for _, c := range *named {
+			got[c.ino] = true
+			if c.flags&userLockingFlags != 0 {
+				t.Errorf("a flag write left a user locking flag: %#x", c.flags)
+			}
+		}
+		for ino, what := range inos {
+			if !got[ino] {
+				t.Errorf("%s's flag was not cleared by name (calls %+v)", what, *named)
+			}
 		}
 	})
+}
+
+// plantSocket binds a unix socket at p: it is bound in a short directory
+// under /private/tmp (a socket path is at most 104 bytes) and renamed to
+// p, on the same volume.
+func plantSocket(t *testing.T, p string) {
+	t.Helper()
+	d, err := os.MkdirTemp("/private/tmp", "k3s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	tmp := filepath.Join(d, "s")
+	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: tmp}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// setScopeFlagsByPath sets flags on p by path (chflags never opens it), as
+// the service user would on its own FIFO or socket, and returns its inode.
+func setScopeFlagsByPath(t *testing.T, p string, flags int) uint64 {
+	t.Helper()
+	if err := unix.Chflags(p, flags); err != nil {
+		t.Fatalf("set flags %#x on %s: %v", flags, p, err)
+	}
+	var st unix.Stat_t
+	if err := unix.Lstat(p, &st); err != nil {
+		t.Fatal(err)
+	}
+	return st.Ino
+}
+
+// recordSetFlagsAt replaces setFlagsAt with the real call that records
+// each call's inode (by fstatat of the name, not followed), for the
+// test's life.
+func recordSetFlagsAt(t *testing.T) *[]rmFlagCall {
+	t.Helper()
+	var calls []rmFlagCall
+	saved := setFlagsAt
+	setFlagsAt = func(dirfd int, name string, flags uint32) error {
+		var st unix.Stat_t
+		if err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			t.Errorf("fstatat the name rm-scope flags: %v", err)
+		}
+		calls = append(calls, rmFlagCall{ino: st.Ino, flags: int(flags)})
+		return saved(dirfd, name, flags)
+	}
+	t.Cleanup(func() { setFlagsAt = saved })
+	return &calls
 }

@@ -206,16 +206,18 @@ const (
 var errScopeTreeBusy = fmt.Errorf("new names kept appearing in the scope directory over %d removal passes: a process running as the service user is still writing there; stop the server (sudo k3sm stop) and any such process", maxRemovePasses)
 
 // errScopeFlagBudget is a scope tree whose user flags would take more
-// opens than rm-scope makes.
-var errScopeFlagBudget = fmt.Errorf("the scope directory holds more flagged files than rm-scope opens to clear their user flags (%d): clear them as root (sudo chflags -R nouchg,nouappnd on the scope directory), then rerun", maxFlagOpens)
+// flag clears than rm-scope makes.
+var errScopeFlagBudget = fmt.Errorf("the scope directory holds more flagged files than rm-scope clears the user flags of (%d)", maxFlagOpens)
 
 // rmWalk is one removeScopeTree: the service user's uid, whose own
-// entries' user flags it clears, how many entries it has opened to do so,
-// and the scope directory's path, which its errors name.
+// entries' user flags it clears, how many entries it has cleared or opened
+// to do so, the scope directory's path, which its repair command names,
+// and the scope, which its rerun names.
 type rmWalk struct {
 	svc   uint32
 	opens int
 	base  string
+	scope string
 }
 
 // removeScopeTree removes keystore/.user/<uid>/ by descriptor, starting
@@ -236,11 +238,13 @@ type rmWalk struct {
 // service user owns it, whatever its link count (the owner could clear the
 // flag itself, so leaving it would only let it stall the removal): on a
 // descriptor opened O_NOFOLLOW (O_SYMLINK for a symlink), never by path,
-// and re-checked as the name. A FIFO, device or socket is not opened (an
-// open has side effects, or macOS refuses it), and an entry another user
-// owns is left alone: its unlinkat fails with EPERM, and the error names
-// the entry and the chflags that clears it (flagKept). dir is the
-// keystore's path, which errors name.
+// and re-checked as the name; a FIFO, device or socket is not opened (an
+// open has side effects, or macOS refuses it) but changed by directory
+// descriptor and name with setattrlistat, which never follows a symlink.
+// An entry another user owns is left alone: its unlinkat fails with EPERM,
+// and the error names the entry for reading only and offers one repair
+// whose only path is the scope directory's (flagKept). dir is the
+// keystore's path, which the repair names.
 func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32) error {
 	kd, err := keystore.Open(".")
 	if err != nil {
@@ -252,7 +256,7 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32) error {
 		return err
 	}
 	defer func() { _ = unix.Close(ufd) }() // fsynced below
-	w := &rmWalk{svc: svc, base: filepath.Join(dir, userScopesName, uid)}
+	w := &rmWalk{svc: svc, base: filepath.Join(dir, userScopesName, uid), scope: userScopePrefix + uid}
 	if err := w.clearHeld(ufd, &ust); err != nil {
 		return err
 	}
@@ -375,9 +379,9 @@ func (w *rmWalk) removeName(pfd int, rel, name string, depth int) error {
 
 // flagKept is the error for the entry rel below the scope directory,
 // which st describes, whose removal failed with err. When it carries a
-// user flag rm-scope left (another user owns it, or it is a FIFO, device
-// or socket, which rm-scope does not open), the error names the entry and
-// the chflags that clears it.
+// user flag rm-scope left because another user owns it, the error names the entry for reading only, quoted with its
+// control bytes removed (quoteName), and offers the repair, whose one
+// command names only the scope directory (repairHint), never the entry.
 func (w *rmWalk) flagKept(rel string, st *unix.Stat_t, err error) error {
 	p := quoteName(filepath.Join(w.base, rel))
 	if statFlags(st)&userLockingFlags == 0 {
@@ -385,14 +389,40 @@ func (w *rmWalk) flagKept(rel string, st *unix.Stat_t, err error) error {
 	}
 	why := "the service user does not own it (uid " + strconv.FormatUint(uint64(st.Uid), 10) + ")"
 	if st.Uid == w.svc {
-		switch st.Mode & unix.S_IFMT {
-		case unix.S_IFREG, unix.S_IFLNK, unix.S_IFDIR:
-			// Its flag was cleared: the failure is not the flag's.
-			return fmt.Errorf("remove %s: %w", p, err)
-		}
-		why = "it is a FIFO, device or socket, which rm-scope does not open"
+		// Its user flag was cleared (clearScopeFlags, clearHeld): the
+		// failure is not the flag's.
+		return fmt.Errorf("remove %s: %w", p, err)
 	}
-	return fmt.Errorf("remove %s: %w: it carries a user flag (uchg or uappnd) that rm-scope does not clear, because %s; %s", p, err, why, chflagsHint(p))
+	return fmt.Errorf("remove the entry %s (named for reading, not for pasting): %w: it carries a user flag (uchg or uappnd) that rm-scope does not clear, because %s; %s", p, err, why, w.repairHint())
+}
+
+// repairHint is the one repair rm-scope offers for a flag it leaves
+// (repairCommands, in order).
+func (w *rmWalk) repairHint() string {
+	c := repairCommands(w.base, w.scope)
+	return "to clear it, run " + c[0] + ", then " + c[1] + ", then rerun " + c[2]
+}
+
+// repairCommands are the commands of rm-scope's repair: stop the server,
+// clear the user locking flags of everything under the scope directory
+// base as root, never following a symlink, and rerun. The one path in them
+// is base, which the caller builds from the keystore's path and the
+// numeric uid, never from a name in the service user's tree, and it is
+// single-quoted (shellQuote) so a shell expands nothing in it. scope is
+// the scope's name, the prefix and the numeric uid.
+func repairCommands(base, scope string) [3]string {
+	return [3]string{
+		"sudo k3sm stop",
+		"sudo chflags -R -P nouchg,nouappnd " + shellQuote(base),
+		"sudo k3sm keys rm-scope " + scope + " --yes",
+	}
+}
+
+// shellQuote is s single-quoted for a POSIX shell: inside single quotes a
+// shell expands nothing, and a single quote in s is closed, escaped and
+// reopened ('\”).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // clearHeld clears the user flags of the directory held at fd, which st
@@ -409,18 +439,19 @@ func (w *rmWalk) clearHeld(fd int, st *unix.Stat_t) error {
 }
 
 // clearScopeFlags clears the user flags of the non-directory name in pfd,
-// rel below the scope directory, which st describes (fstatat, not followed), before its removal. Nothing
-// is done unless it carries one and the service user owns it (an entry of
-// another owner is left for unlinkat to refuse, flagKept naming it), at
-// any link count: a link outside the tree shares the flag, but its owner
-// could clear the flag itself. A regular file is opened O_NOFOLLOW and a
-// symlink O_SYMLINK (the link itself), never by path; both opens are free
-// of side effects. A FIFO or device is not opened (an open can unblock a
-// writer or start a driver), nor a socket (macOS refuses its open with
-// EOPNOTSUPP), so a flag on one stays and unlinkat fails with EPERM. The
+// rel below the scope directory, which st describes (fstatat, not
+// followed), before its removal. Nothing is done unless it carries one and
+// the service user owns it (an entry of another owner is left for unlinkat
+// to refuse, flagKept naming it), at any link count: a link outside the
+// tree shares the flag, but its owner could clear the flag itself. A
+// regular file is opened O_NOFOLLOW and a symlink O_SYMLINK (the link
+// itself), never by path; both opens are free of side effects. The
 // descriptor is re-checked as the name (device, inode, link count, owner;
 // leave is true and the name left for the next pass when it changed) and
-// changed with fchflags. At most flagOpenLimit entries are opened in all.
+// changed with fchflags. A FIFO or device is not opened (an open can
+// unblock a writer or start a driver), nor a socket (macOS refuses its open
+// with EOPNOTSUPP): clearUnopened changes it by name. At most flagOpenLimit
+// entries are cleared in all.
 func (w *rmWalk) clearScopeFlags(pfd int, name, rel string, st *unix.Stat_t) (leave bool, err error) {
 	fl := statFlags(st)
 	if fl&userLockingFlags == 0 || st.Uid != w.svc {
@@ -433,11 +464,10 @@ func (w *rmWalk) clearScopeFlags(pfd int, name, rel string, st *unix.Stat_t) (le
 	case unix.S_IFLNK:
 		flags = unix.O_RDONLY | oSymlink | unix.O_NONBLOCK | unix.O_CLOEXEC
 	default:
-		// A FIFO, device or socket is not opened; flagKept names it.
-		return false, nil
+		return w.clearUnopened(pfd, name, rel, st)
 	}
 	if w.opens >= flagOpenLimit {
-		return false, errScopeFlagBudget
+		return false, w.budgetErr()
 	}
 	w.opens++
 	fd, err := unix.Openat(pfd, name, flags, 0)
@@ -445,7 +475,7 @@ func (w *rmWalk) clearScopeFlags(pfd int, name, rel string, st *unix.Stat_t) (le
 		return true, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("open %s to clear its user flags: %w; %s", quoteName(name), err, chflagsHint(quoteName(filepath.Join(w.base, rel))))
+		return false, fmt.Errorf("open the entry %s (named for reading, not for pasting) to clear its user flags: %w; %s", quoteName(filepath.Join(w.base, rel)), err, w.repairHint())
 	}
 	defer func() { _ = unix.Close(fd) }() // only its flags change
 	var got unix.Stat_t
@@ -457,9 +487,58 @@ func (w *rmWalk) clearScopeFlags(pfd int, name, rel string, st *unix.Stat_t) (le
 		return true, nil
 	}
 	if err := scopeFchflags(fd, int(statFlags(&got)&^userLockingFlags)); err != nil {
-		return false, fmt.Errorf("clear the user flags of %s: %w; %s", quoteName(name), err, chflagsHint(quoteName(filepath.Join(w.base, rel))))
+		return false, fmt.Errorf("clear the user flags of the entry %s (named for reading, not for pasting): %w; %s", quoteName(filepath.Join(w.base, rel)), err, w.repairHint())
 	}
 	return false, nil
+}
+
+// clearUnopened clears the user flags of the FIFO, socket or device name
+// in pfd, which st describes (fstatat, not followed, owned by the service
+// user and carrying a user flag), without opening it: setattrlistat by
+// directory descriptor and name, FSOPT_NOFOLLOW (setFlagsAt). An entry
+// that also carries a system flag is left, so the write sets user flags
+// only. The name is then stat'ed again: when it is
+// no longer the file st describes, or no longer the service user's, leave
+// is true and the next pass sees it anew; when it still carries a user
+// locking flag the error says so and offers the repair. A name replaced
+// between the stat and the write by another file the service user could
+// link in has at most its user flags set to st's less the locking ones.
+// An entry carrying a system flag is left as it is (the write would set
+// it), and its unlinkat fails.
+func (w *rmWalk) clearUnopened(pfd int, name, rel string, st *unix.Stat_t) (leave bool, err error) {
+	fl := statFlags(st)
+	if fl&sfFlagsMask != 0 {
+		return false, nil
+	}
+	if w.opens >= flagOpenLimit {
+		return false, w.budgetErr()
+	}
+	w.opens++
+	err = setFlagsAt(pfd, name, fl&^userLockingFlags)
+	if errors.Is(err, unix.ENOENT) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("clear the user flags of the entry %s (named for reading, not for pasting): %w; %s", quoteName(filepath.Join(w.base, rel)), err, w.repairHint())
+	}
+	var got unix.Stat_t
+	if err := unix.Fstatat(pfd, name, &got, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
+		return true, nil
+	} else if err != nil {
+		return false, fmt.Errorf("stat %s: %w", quoteName(name), err)
+	}
+	if got.Dev != st.Dev || got.Ino != st.Ino || got.Uid != w.svc {
+		return true, nil
+	}
+	if statFlags(&got)&userLockingFlags != 0 {
+		return false, fmt.Errorf("setattrlistat left a user flag (flags %#x) on the entry %s (named for reading, not for pasting); %s", statFlags(&got), quoteName(filepath.Join(w.base, rel)), w.repairHint())
+	}
+	return false, nil
+}
+
+// budgetErr is errScopeFlagBudget with the repair.
+func (w *rmWalk) budgetErr() error {
+	return fmt.Errorf("%w; %s", errScopeFlagBudget, w.repairHint())
 }
 
 // errPlanted is a name in a service-user tree that the layout does not put
@@ -533,15 +612,8 @@ func safeText(s string) string {
 	}, strings.ToValidUTF8(s, ""))
 }
 
-// chflagsHint is the hint that clears the user flags of the entry at
-// quoted, a path quoteName rendered: chflags -h acts on a symlink itself,
-// never its target, and the operator checks the path first, since it
-// names a file in the service user's tree.
-func chflagsHint(quoted string) string {
-	return "check that the path is the one meant, then clear it with sudo chflags -h nouchg,nouappnd " + quoted
-}
-
 // quoteName renders a name or path from the service user's tree for an
-// error or hint: control characters removed, then Go-quoted, so a shell
-// metacharacter in it is plainly part of a quoted name.
+// error to read: control characters removed, then Go-quoted (%q). A shell
+// still expands $(...), backticks and $VAR inside double quotes, so no
+// command rm-scope offers ever holds it.
 func quoteName(s string) string { return strconv.Quote(safeText(s)) }
