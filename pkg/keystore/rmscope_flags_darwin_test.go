@@ -18,9 +18,11 @@ package keystore
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -206,7 +208,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 		plantSocket(t, sock)
 		giveScopeTree(t, dir)
 		inos := map[uint64]string{
-			setScopeFlagsByPath(t, fifo, unix.UF_IMMUTABLE):                "the FIFO",
+			setScopeFlagsByPath(t, fifo, unix.UF_IMMUTABLE|unix.UF_NODUMP): "the FIFO",
 			setScopeFlagsByPath(t, sock, unix.UF_IMMUTABLE|unix.UF_APPEND): "the socket",
 		}
 		calls := recordScopeFlags(t)
@@ -230,8 +232,8 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 		got := map[uint64]bool{}
 		for _, c := range *named {
 			got[c.ino] = true
-			if c.flags&userLockingFlags != 0 {
-				t.Errorf("a flag write left a user locking flag: %#x", c.flags)
+			if c.flags != 0 {
+				t.Errorf("a flag write by name wrote %#x, want exactly 0", c.flags)
 			}
 		}
 		for ino, what := range inos {
@@ -297,4 +299,120 @@ func recordSetFlagsAt(t *testing.T) *[]rmFlagCall {
 	}
 	t.Cleanup(func() { setFlagsAt = saved })
 	return &calls
+}
+
+// rm-scope clears a locking flag whoever owns the entry, when it has one
+// link and no system flag: a flagged file cannot be hard-linked, so it is
+// debris of the tree being removed. Through the seam, the service user is
+// another uid than the files' owner: a uchg file with one link and a
+// uchg,nodump FIFO are cleared and the scope removed. A uchg file another
+// user owns with two links (linked before it was flagged) is left: the
+// removal fails with EPERM, the error says it has 2 links and offers no
+// command, and its flag is kept.
+func TestRemoveScopeClearsForeignFlags(t *testing.T) {
+	for _, linked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("second link %v", linked), func(t *testing.T) {
+			s, server, _ := fileLogScope(t)
+			dir := scopeDir(server, "1001")
+			t.Cleanup(func() { unflagScopeTree(dir) })
+			plant := filepath.Join(dir, scopeEntriesName, "foreign")
+			if err := os.WriteFile(plant, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if linked {
+				if err := os.Link(plant, filepath.Join(dir, "foreign-alias")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fifo := filepath.Join(dir, "foreign-fifo")
+			if err := unix.Mkfifo(fifo, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			giveScopeTree(t, dir)
+			setScopeFlags(t, plant, unix.UF_IMMUTABLE, false)
+			setScopeFlagsByPath(t, fifo, unix.UF_IMMUTABLE|unix.UF_NODUMP)
+			root, err := s.openDir(s.dir, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			err = removeScopeTree(root, s.dir, "1001", s.uid+1)
+			if linked {
+				var st unix.Stat_t
+				if !errors.Is(err, unix.EPERM) || !strings.Contains(err.Error(), "has 2 links") || strings.Contains(err.Error(), "sudo") || strings.Contains(err.Error(), "chflags") {
+					t.Fatalf("removeScopeTree over another user's twice-linked uchg file: %v, want EPERM saying it has 2 links, with no command", err)
+				}
+				if serr := unix.Lstat(plant, &st); serr != nil || st.Flags&unix.UF_IMMUTABLE == 0 {
+					t.Errorf("the twice-linked file has flags %#x (%v); want uchg kept", st.Flags, serr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("removeScopeTree over another user's one-link uchg file and FIFO: %v", err)
+			}
+			if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the scope directory is still there: %v", err)
+			}
+		})
+	}
+}
+
+// rm-scope's write by name never sets a flag: when the FIFO it stat'ed is
+// swapped, between that fstatat and the setattrlistat, for a hard link to
+// an unflagged file outside the tree (the seam does the swap), the write
+// is exactly 0, so the outside file's flags stay 0 (a write of the FIFO's
+// flags less the locking ones would set nodump on it). The re-stat sees
+// another file, so the name counts as not cleared and the next pass
+// unlinks the link; the outside file survives.
+func TestRemoveScopeSwappedNameGetsZero(t *testing.T) {
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	t.Cleanup(func() { unflagScopeTree(dir) })
+	fifo := filepath.Join(dir, "planted-fifo")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(filepath.Dir(server), "outside")
+	if err := os.WriteFile(outside, []byte("kept"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	giveScopeTree(t, dir)
+	giveToService(t, outside)
+	setScopeFlagsByPath(t, fifo, unix.UF_APPEND|unix.UF_NODUMP)
+	saved := setFlagsAt
+	swapped := false
+	setFlagsAt = func(dirfd int, name string, flags uint32) error {
+		if !swapped && name == "planted-fifo" {
+			swapped = true
+			if err := unix.Chflags(fifo, 0); err != nil {
+				t.Errorf("clear the FIFO's flags: %v", err)
+			}
+			if err := unix.Unlinkat(dirfd, name, 0); err != nil {
+				t.Errorf("unlink the FIFO: %v", err)
+			}
+			if err := os.Link(outside, fifo); err != nil {
+				t.Errorf("link the outside file in: %v", err)
+			}
+		}
+		return saved(dirfd, name, flags)
+	}
+	t.Cleanup(func() { setFlagsAt = saved })
+	root, err := s.openDir(s.dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := removeScopeTree(root, s.dir, "1001", s.uid); err != nil {
+		t.Fatalf("removeScopeTree over a swapped name: %v", err)
+	}
+	if !swapped {
+		t.Fatal("the FIFO was never written by name")
+	}
+	var st unix.Stat_t
+	if err := unix.Lstat(outside, &st); err != nil || st.Flags != 0 || st.Nlink != 1 {
+		t.Fatalf("the outside file has flags %#x nlink %d (%v), want 0 and its one link", st.Flags, st.Nlink, err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there: %v", err)
+	}
 }

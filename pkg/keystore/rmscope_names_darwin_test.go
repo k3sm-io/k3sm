@@ -19,9 +19,7 @@ package keystore
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -46,33 +44,14 @@ func assertInert(t *testing.T, msg, want string) {
 	}
 }
 
-// hostileSpecials are the bytes of hostileName a shell or a terminal acts
-// on; a command rm-scope offers holds none of them.
-const hostileSpecials = ";$()\n\x1b[]\x07"
-
 // Every rm-scope error that prints a name from the service user's tree
 // renders it quoted with its control bytes removed and labelled as not for
-// pasting, so the terminal does not act on it, and the one command it
-// offers names only the scope directory, never the entry: no byte of the
-// hostile name a shell acts on is in it.
+// pasting, so the terminal does not act on it.
 func TestRmScopeHostileNameInert(t *testing.T) {
 	w := &rmWalk{svc: 501, base: "/data/keystore/.user/1001", scope: "user/1001"}
-	st := unix.Stat_t{Mode: unix.S_IFIFO, Uid: 0, Flags: unix.UF_IMMUTABLE}
+	st := unix.Stat_t{Mode: unix.S_IFIFO, Uid: 0, Nlink: 1, Flags: sfAppend}
 	msg := w.flagKept(filepath.Join("entries", hostileName), &st, unix.EPERM).Error()
 	assertInert(t, msg, `"/data/keystore/.user/1001/entries/a; touch pwned $(id)[2J]0;titleb" (named for reading, not for pasting)`)
-	_, hint, ok := strings.Cut(msg, "to clear it, run ")
-	if !ok {
-		t.Fatalf("the message %q offers no repair", msg)
-	}
-	if want := "sudo k3sm stop, then sudo chflags -R -P nouchg,nouappnd '/data/keystore/.user/1001', then rerun sudo k3sm keys rm-scope user/1001 --yes"; hint != want {
-		t.Fatalf("the repair is %q, want %q", hint, want)
-	}
-	if i := strings.IndexAny(hint, hostileSpecials); i >= 0 {
-		t.Fatalf("the repair %q holds the hostile name's byte %q", hint, hint[i])
-	}
-	if strings.Contains(hint, "entries") || strings.Contains(hint, "pwned") {
-		t.Fatalf("the repair %q names the entry", hint)
-	}
 	d := t.TempDir()
 	if err := os.Symlink("x", filepath.Join(d, hostileName)); err != nil {
 		t.Fatal(err)
@@ -89,41 +68,43 @@ func TestRmScopeHostileNameInert(t *testing.T) {
 	assertInert(t, err.Error(), `"a; touch pwned $(id)[2J]0;titleb"`)
 }
 
-// Every command rm-scope offers parses (sh -n), and a shell expands
-// nothing in it: run through sh -c with printf in place of the command,
-// each word comes back as written, and nothing runs, even when the scope
-// directory's path itself holds a command substitution, a backtick, a
-// variable and a single quote.
-func TestRmScopeRepairCommandsDoNotExpand(t *testing.T) {
-	for _, base := range []string{
-		"/data/keystore/.user/1001",
-		"/data/a$(touch pwned)b/keystore/.user/1001",
-		"/data/a`touch pwned`b/$HOME/it's/keystore/.user/1001",
+// rm-scope prints no command at all: not for a system flag it leaves (only
+// the administrator who set it should clear it), not for a twice-linked
+// flagged entry another user owns, and not for a run that meets its flag
+// budget (which says to run rm-scope again). No message holds sudo,
+// chflags or a stop, and the scope directory's path appears only inside
+// the one quoted name labelled as not for pasting.
+func TestRmScopeOffersNoCommand(t *testing.T) {
+	base := "/data/a$(touch pwned)b/keystore/.user/1001"
+	w := &rmWalk{svc: 501, base: base, scope: "user/1001"}
+	label := quoteName(filepath.Join(base, "entries", "x")) + " (named for reading, not for pasting)"
+	for name, tc := range map[string]struct {
+		msg  string
+		want []string
+	}{
+		"system flag": {
+			w.flagKept(filepath.Join("entries", "x"), &unix.Stat_t{Mode: unix.S_IFREG, Uid: 0, Nlink: 1, Flags: sfAppend | unix.UF_IMMUTABLE}, unix.EPERM).Error(),
+			[]string{label, "a system flag is set", "only the administrator who set it should clear it"},
+		},
+		"linked user flag": {
+			w.flagKept(filepath.Join("entries", "x"), &unix.Stat_t{Mode: unix.S_IFREG, Uid: 0, Nlink: 2, Flags: unix.UF_IMMUTABLE}, unix.EPERM).Error(),
+			[]string{label, "has 2 links"},
+		},
+		"budget": {errScopeFlagBudget.Error(), []string{"run rm-scope for this scope again", "each run unlocks up to"}},
 	} {
-		t.Run(base, func(t *testing.T) {
-			cwd := t.TempDir()
-			for _, c := range repairCommands(base, "user/1001") {
-				if out, err := exec.Command("sh", "-n", "-c", c).CombinedOutput(); err != nil {
-					t.Fatalf("sh -n %q: %v: %s", c, err, out)
-				}
-				cmd := exec.Command("sh", "-c", "printf '%s\\n' "+c)
-				cmd.Dir = cwd
-				cmd.Env = []string{"HOME=/expanded", "PATH=/usr/bin:/bin"}
-				out, err := cmd.Output()
-				if err != nil {
-					t.Fatalf("sh -c printf %q: %v", c, err)
-				}
-				got := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
-				want := strings.Fields(c)
-				if strings.Contains(c, "chflags") {
-					want = append(strings.Fields("sudo chflags -R -P nouchg,nouappnd"), base)
-				}
-				if !slices.Equal(got, want) {
-					t.Fatalf("the shell expanded %q to %q, want %q", c, got, want)
+		t.Run(name, func(t *testing.T) {
+			for _, bad := range []string{"sudo", "chflags", "k3sm stop", "'"} {
+				if strings.Contains(tc.msg, bad) {
+					t.Errorf("the message %q offers a command (%q)", tc.msg, bad)
 				}
 			}
-			if names, _ := os.ReadDir(cwd); len(names) != 0 {
-				t.Fatalf("a repair command ran something: %v", names)
+			for _, want := range tc.want {
+				if !strings.Contains(tc.msg, want) {
+					t.Errorf("the message %q does not say %q", tc.msg, want)
+				}
+			}
+			if rest := strings.Replace(tc.msg, label, "", 1); strings.Contains(rest, "/data") || strings.Contains(rest, "pwned") {
+				t.Errorf("the message %q holds a path outside the one name labelled not for pasting", tc.msg)
 			}
 		})
 	}

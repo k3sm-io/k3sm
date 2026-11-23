@@ -38,7 +38,9 @@ import (
 // EPERM; a descriptor opened without O_APPEND before the flag can neither
 // pwrite nor ftruncate once it is set, and the bytes stay; the service
 // user's link(2) of a root-owned 0600 unflagged file into its own
-// directory succeeds, and of a flagged file fails; root's setattrlistat
+// directory succeeds, and of a flagged file fails, for UF_IMMUTABLE,
+// UF_APPEND and SF_APPEND alike and whether root or the service user owns
+// it; root's setattrlistat
 // of ATTR_CMN_FLAGS with FSOPT_NOFOLLOW, by directory descriptor and name,
 // clears UF_IMMUTABLE on the service user's FIFO and socket, and at a
 // symlink changes the link, not its target; root's fclonefileat of the
@@ -293,6 +295,30 @@ func TestSappndMeasuredFacts(t *testing.T) {
 	wantErrno("the service user's link of a flagged file (the flag, not the path, must refuse it)", err, unix.EPERM)
 	if err := unix.Lstat(p, &st); err != nil || st.Nlink != 1 {
 		t.Errorf("after the service user's link the flagged file has nlink %d (%v), want 1", st.Nlink, err)
+	}
+	// rm-scope's write of 0 by name (clearUnopened) rests on this: a file
+	// carrying any locking flag, user or system, cannot be hard-linked by
+	// the service user, whoever owns it, so a name it swaps in after
+	// rm-scope's fstatat is a file with no flags, which 0 leaves as it was.
+	for _, fl := range []uint32{unix.UF_IMMUTABLE, unix.UF_APPEND, sfAppend} {
+		for _, svcOwned := range []bool{false, true} {
+			p, f := file(false)
+			if svcOwned {
+				if err := unix.Fchown(int(f.Fd()), int(svcUID), int(svcGID)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := unix.Chflags(p, int(fl)); err != nil {
+				t.Fatalf("chflags %#x: %v", fl, err)
+			}
+			alias := filepath.Join(own, fmt.Sprintf("alias-%#x-%v", fl, svcOwned))
+			err := asService(func() error { return unix.Link(p, alias) })
+			t.Logf("the service user's link of a file flagged %#x (service-owned %v): %v", fl, svcOwned, err)
+			wantErrno(fmt.Sprintf("the service user's link of a file flagged %#x (service-owned %v)", fl, svcOwned), err, unix.EPERM)
+			if err := unix.Lstat(p, &st); err != nil || st.Nlink != 1 {
+				t.Errorf("after the service user's link the file flagged %#x has nlink %d (%v), want 1", fl, st.Nlink, err)
+			}
+		}
 	}
 
 	// rm-scope's unopened flag clear (setFlagsAt): root's setattrlistat

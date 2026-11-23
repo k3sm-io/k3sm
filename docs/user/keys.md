@@ -125,16 +125,14 @@ sudo k3sm keys floor --rebuild
 while the scope's delivery record names a delivery; withdraw those deliveries first. A scope
 whose delivery record is damaged or missing is still removed, and `rm-scope` exits 4: it could
 not check that scope's deliveries, so any Secret it delivered stays until it is withdrawn or
-removed by hand. A file in the scope
-that its user locked with a user flag (`chflags uchg`, `uappnd` or `uunlnk`) is unlocked and
-removed when the service user owns it, even when the file also has a name outside the scope,
-and even when it is a FIFO, socket or device, which `rm-scope` unlocks without opening.
-`rm-scope` stops, and says so, only at a flagged entry it does not unlock, one another user owns.
-The message names the entry for you to read, not to paste, and gives the repair, which names
-only the scope directory: run `sudo k3sm stop`, then
-`sudo chflags -R -P nouchg,nouappnd '/var/lib/k3sm/server/keystore/.user/<uid>'` (the path the
-message prints), then run `rm-scope` again. It gives the same repair if the scope holds more
-flagged files than `rm-scope` unlocks in one run.
+removed by hand. A file in the scope locked with a user flag (`chflags uchg`, `uappnd` or
+`uunlnk`) is unlocked and removed, whoever owns it, when it has one link, and even when it is a
+FIFO, socket or device, which `rm-scope` unlocks without opening; the service user's own file is
+unlocked even when it also has a name outside the scope. `rm-scope` unlocks up to 4096 entries
+per run: if the scope holds more, it says so, and running it again unlocks up to 4096 more.
+It stops, and says so, at an entry with a system flag (only root sets one; only the administrator
+who set it should clear it) and at another user's flagged file with more than one link. The
+message names the entry for you to read, not to paste, and offers no command.
 
 `--work-dir DIR` points every verb at a server work dir other than the default
 `/var/lib/k3sm/server`. The data root is its parent.
