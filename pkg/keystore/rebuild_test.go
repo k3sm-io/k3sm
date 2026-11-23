@@ -513,7 +513,8 @@ func TestRemoveScopeRerunFinishesPartialRemoval(t *testing.T) {
 		t.Fatalf("the scope directory is still there after the rerun: %v", err)
 	}
 
-	// A directory left without scope.key is finished as it stands.
+	// A directory left without scope.key, for a uid the record lists, is
+	// finished as it stands.
 	if err := os.MkdirAll(filepath.Join(dir, scopeEntriesName, "left"), 0o700); err != nil {
 		t.Fatal(err)
 	}

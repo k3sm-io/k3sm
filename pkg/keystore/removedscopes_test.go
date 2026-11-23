@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -175,4 +176,36 @@ func TestRemovedScopesMalformedFailsClosed(t *testing.T) {
 		}
 		assertScopeRemovedEverywhere(t, s, 1001, errRemovedScopesBad)
 	})
+}
+
+// A scope directory with no scope.key, for a uid the record does not
+// list, is removed, but the removal is committed, not clean: the error
+// says it was removed without being listed, because its key file was
+// absent, so a copy put back would open, and that its floor lines are
+// kept. It never says the record is full.
+func TestRemoveScopeMissingKeyUnlistedCommitted(t *testing.T) {
+	ctx := context.Background()
+	s, server, _ := fileLogScope(t)
+	userPut(t, userScope(t, s, 1002), "user/1002/x", "x")
+	if err := os.Remove(filepath.Join(scopeDir(server, "1002"), scopeKeyName)); err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := s.RemoveScope(ctx, 1002)
+	if recorded || !Committed(err) {
+		t.Fatalf("rm-scope of an unlisted keyless scope: %v, recorded %v; want committed, unlisted", err, recorded)
+	}
+	for _, want := range []string{"without listing it", "scope.key was absent", "would open", "floor lines are kept"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error %q does not say %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "full") {
+		t.Errorf("the error %q speaks of a full record", err)
+	}
+	if _, err := os.Lstat(scopeDir(server, "1002")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there: %v", err)
+	}
+	if readRecord(t, s).listed(1002) {
+		t.Fatal("the keyless scope was listed")
+	}
 }

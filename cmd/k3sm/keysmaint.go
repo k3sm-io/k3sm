@@ -164,12 +164,15 @@ func keysRmScope(ctx context.Context, args []string, env keysEnv) int {
 		return v.failf(keysRefused, "%v", err)
 	}
 	recorded, err := s.RemoveScope(ctx, uid)
+	if keystore.Committed(err) {
+		return v.failf(keysCommitted, "%v (exit 4)", err)
+	}
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
 	if !recorded {
-		fmt.Fprintf(env.stdout, "removed user/%d, but the removed-scopes record is full, so it is not listed: a copy of its directory put back would open, and floor --rebuild keeps its floor keys\n", uid)
-		return keysOK
+		fmt.Fprintf(env.stdout, "removed user/%d, but the removed-scopes record is full, so it is not listed: a copy of its directory put back would open, and floor --rebuild keeps its floor keys (exit 4)\n", uid)
+		return keysCommitted
 	}
 	fmt.Fprintf(env.stdout, "removed user/%d; run sudo k3sm keys floor --rebuild to free its floor keys\n", uid)
 	return keysOK

@@ -93,7 +93,12 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		if err := removeScopeTree(root, name, s.uid); err != nil {
 			return false, fmt.Errorf("%w; the directory keystore/%s/%s has no scope.key and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, userScopesName, name, u.scope)
 		}
-		return removed.listed(uid), nil
+		if removed.listed(uid) {
+			return true, nil
+		}
+		// Not listed: an interrupted run that never listed it, or
+		// tampering. The tree is gone, but there was no key to list.
+		return false, fmt.Errorf("%w: %s", errCommitted, scopeRemovedUnlisted(u.scope))
 	}
 	if err != nil {
 		return false, fmt.Errorf("open the scope %s: %w; nothing was changed", u.scope, err)
@@ -154,6 +159,12 @@ func (s *FileStore) floorSize(dfd int) (uint64, int64, error) {
 		return 0, 0, err
 	}
 	return st.Ino, st.Size, nil
+}
+
+// scopeRemovedUnlisted is rm-scope's committed report for a scope
+// directory with no scope.key whose uid the record does not list.
+func scopeRemovedUnlisted(scope string) string {
+	return "removed " + scope + " without listing it in " + removedScopesName + ", because its scope.key was absent (an interrupted earlier rm-scope, or tampering): a copy of its directory put back would open; its floor lines are kept, so the floor still refuses rolled-back or deleted entries"
 }
 
 // scopeDirPresent reports whether keystore/.user/<name> names anything.
