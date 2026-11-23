@@ -375,8 +375,10 @@ and `rewrap` refuse with a message that names `keys floor merge`, and `list` and
 warning on stderr but find no entries, since the restored ones are not in place yet. `rm` still deletes, with
 the same warning, and the merge keeps each deletion it records. An `rm` at this point records
 the deletion, but the restored entry's files are still in `pre-restore.d/restored`, out of its
-reach, so its cluster Secret stays in place until the merge. The merge removes those files
-before it moves the restored copy into place, so you do not need to run `rm` again. A server started
+reach. The merge removes those files before it moves the restored copy into place, so you do not
+need to run `rm` again. Neither `rm` nor the merge deletes a Secret delivered from the entry: as
+after any `rm`, it keeps the last value delivered until you run `k3sm keys undeliver` and delete
+it. A server started
 before the merge delivers no keys to the cluster: it logs an error and tries again until the
 merge has run. Merge those deletions into the restored floor:
 
