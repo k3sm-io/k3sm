@@ -62,6 +62,13 @@ const (
 	PreFrameReserved = PreFrameBudget - PreFrameLoginBudget
 )
 
+// PendingSummariesPerAppend is how many uids' pending dropped counts a
+// refused line that lands carries after it as summary lines, in uid order;
+// the rest wait for the next line or the minute's summary pass
+// (docs/design/keystore.md Open requirement 9: a dropped count reaches the
+// log with the next line written).
+const PendingSummariesPerAppend = 8
+
 // ServerAppendLockWait is the longest a server append waits for the store
 // lock (docs/design/keystore.md § "The audit log": every append takes the
 // store lock); past it the line is not written and is counted as dropped.
@@ -154,13 +161,20 @@ func (l *ServerLogs) Reopen(ctx context.Context) error {
 // refused before its first frame for reason (a word of lowercase letters
 // and '-', otherwise written as the placeholder): no scope, no name, no
 // value. It draws on PreFrameBudget. A line not written is counted as
-// dropped for uid and the error says why.
+// dropped for uid and the error says why. A line that lands is followed,
+// under the same lock, by the summary lines of up to
+// PendingSummariesPerAppend uids' pending dropped counts; a summary that
+// does not land keeps its count pending and does not fail the call.
 func (l *ServerLogs) Refused(ctx context.Context, uid uint32, reason string) error {
 	if !auditWord(reason) {
 		reason = auditPlaceholder
 	}
 	err := l.locked(ctx, func() error {
-		return l.appendLocked(preFrameRecord(uid, reason, 0, l.s.now()))
+		if err := l.appendLocked(preFrameRecord(uid, reason, 0, l.s.now())); err != nil {
+			return err
+		}
+		l.writePendingLocked(PendingSummariesPerAppend)
+		return nil
 	})
 	if err != nil {
 		l.mu.Lock()
@@ -170,11 +184,40 @@ func (l *ServerLogs) Refused(ctx context.Context, uid uint32, reason string) err
 	return err
 }
 
+// writePendingLocked writes the summary lines of up to max uids' pending
+// dropped counts, in uid order, forgetting each count written; a count not
+// written stays pending. It returns the first error.
+func (l *ServerLogs) writePendingLocked(max int) error {
+	uids := make([]uint32, 0, len(l.pending))
+	for u, c := range l.pending {
+		if c > 0 {
+			uids = append(uids, u)
+		}
+	}
+	slices.Sort(uids)
+	var first error
+	for i, u := range uids {
+		if i == max {
+			break
+		}
+		if err := l.appendLocked(preFrameRecord(u, auditResultDropped, l.pending[u], l.s.now())); err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		delete(l.pending, u)
+	}
+	return first
+}
+
 // Dropped adds n to uid's dropped count and writes one summary line for
 // each uid whose count is not 0, in uid order, each carrying its count
 // since its last summary line, and forgets each count written. A summary
 // line draws on PreFrameBudget too; a count not written is kept for the
-// next call.
+// next call, and one uid's count not written does not hold back another's.
+// With n 0 it only writes what is pending, which the listener's minute
+// pass does whether or not its rate limit dropped anything.
 func (l *ServerLogs) Dropped(ctx context.Context, uid uint32, n uint64) error {
 	l.mu.Lock()
 	if n > 0 {
@@ -182,20 +225,7 @@ func (l *ServerLogs) Dropped(ctx context.Context, uid uint32, n uint64) error {
 	}
 	l.mu.Unlock()
 	return l.locked(ctx, func() error {
-		uids := make([]uint32, 0, len(l.pending))
-		for u, c := range l.pending {
-			if c > 0 {
-				uids = append(uids, u)
-			}
-		}
-		slices.Sort(uids)
-		for _, u := range uids {
-			if err := l.appendLocked(preFrameRecord(u, auditResultDropped, l.pending[u], l.s.now())); err != nil {
-				return err
-			}
-			delete(l.pending, u)
-		}
-		return nil
+		return l.writePendingLocked(len(l.pending))
 	})
 }
 

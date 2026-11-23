@@ -158,6 +158,7 @@ func (l *Listener) Serve(ctx context.Context) error {
 		cut()
 		wg.Wait()
 		l.refusals.summarize()
+		l.queue.flush()
 	}()
 	wg.Go(func() {
 		defer l.recovered("refusal summary")
@@ -251,6 +252,7 @@ func (l *Listener) summarizeEvery(ctx context.Context) {
 		case <-tick:
 		}
 		l.refusals.summarize()
+		l.queue.flush()
 	}
 }
 

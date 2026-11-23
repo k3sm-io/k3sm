@@ -632,8 +632,8 @@ func TestPreFrameRefusalLinesRateLimited(t *testing.T) {
 	t.Run("past the budget", func(t *testing.T) {
 		// Pre-frame lines another writer appended have spent the budget:
 		// a refusal that passes the limit is still refused at accept,
-		// writes nothing and is counted, and the count reaches the log in
-		// the uid's first summary line written after root rotates.
+		// writes nothing and is counted, and the count reaches the log
+		// with the first line written after root rotates.
 		synctest.Test(t, func(t *testing.T) {
 			store := newStoreRig(t)
 			store.writeLog(t, store.auditPath(), fullBudget())
@@ -658,7 +658,7 @@ func TestPreFrameRefusalLinesRateLimited(t *testing.T) {
 				t.Fatalf("Serve = %v", err)
 			}
 			want := slices.Repeat([]refusal{{0, ReasonRoot}}, RefusalLinesPerMinute)
-			checkLogged(t, store, want, []drop{{0, 2 + 3}})
+			checkLogged(t, store, want, []drop{{0, 3}, {0, 2}})
 		})
 	})
 }

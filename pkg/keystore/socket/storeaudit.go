@@ -78,6 +78,14 @@ func (a *StoreAuditor) droppedContext(ctx context.Context, uid uint32, n uint64)
 	}
 }
 
+// flushPending writes the dropped counts the log keeps for lines it could
+// not write, under ctx.
+func (a *StoreAuditor) flushPending(ctx context.Context) {
+	if err := a.log.Dropped(ctx, NoUID, 0); err != nil {
+		a.logger.Warn("keystore socket: a dropped-count summary line was not written; the count is kept for the next", "err", err)
+	}
+}
+
 // LogReopener is the store side of the reopen after maintenance:
 // *keystore.ServerLogs's Reopen and *keystore.FileStore's
 // MaintenanceMarked in production.

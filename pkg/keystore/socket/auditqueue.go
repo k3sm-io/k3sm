@@ -48,12 +48,22 @@ type contextAuditor interface {
 	droppedContext(ctx context.Context, uid uint32, n uint64)
 }
 
-// auditItem is one queued call: a refusal when reason is set, otherwise a
-// summary of dropped.
+// pendingFlusher is an auditor that keeps dropped counts of its own (lines
+// it could not write) and can be asked to write them: StoreAuditor is one.
+// The listener's minute pass asks it every minute, whether or not the rate
+// limit dropped anything.
+type pendingFlusher interface {
+	flushPending(ctx context.Context)
+}
+
+// auditItem is one queued call: a refusal when reason is set, a request to
+// write the auditor's pending counts when flush is, otherwise a summary of
+// dropped.
 type auditItem struct {
 	uid     uint32
 	reason  string
 	dropped uint64
+	flush   bool
 }
 
 // auditQueue is the RefusalAuditor the rate limiter writes to: it queues
@@ -78,6 +88,18 @@ func (q *auditQueue) Refused(uid uint32, reason string) {
 // Dropped implements RefusalAuditor.
 func (q *auditQueue) Dropped(uid uint32, n uint64) {
 	q.put(auditItem{uid: uid, dropped: n}, n)
+}
+
+// flush queues a request to write the auditor's pending counts, when it
+// keeps any; a full queue skips it until the next minute.
+func (q *auditQueue) flush() {
+	if _, ok := q.audit.(pendingFlusher); !ok {
+		return
+	}
+	select {
+	case q.items <- auditItem{flush: true}:
+	default:
+	}
 }
 
 // put queues it, or counts n dropped for its uid when the queue is full.
@@ -109,6 +131,10 @@ func (q *auditQueue) write(ctx context.Context, it auditItem) {
 			q.log.Error("keystore socket: recovered a panic", "goroutine", "refusal audit", "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
 		}
 	}()
+	if it.flush {
+		q.audit.(pendingFlusher).flushPending(ctx) // only queued for a pendingFlusher
+		return
+	}
 	ca, isCtx := q.audit.(contextAuditor)
 	switch {
 	case it.reason != "" && isCtx:
@@ -133,6 +159,9 @@ func (q *auditQueue) discard(first auditItem) {
 }
 
 func lostOf(it auditItem) uint64 {
+	if it.flush {
+		return 0
+	}
 	if it.reason != "" {
 		return 1
 	}

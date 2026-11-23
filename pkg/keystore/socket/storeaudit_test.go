@@ -18,6 +18,7 @@ package socket
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -217,6 +218,16 @@ func (t teeAuditor) Refused(uid uint32, reason string) {
 }
 func (t teeAuditor) Dropped(uid uint32, n uint64) { t.a.Dropped(uid, n); t.b.Dropped(uid, n) }
 
+// flushPending passes the minute pass's flush to whichever auditor keeps
+// pending counts.
+func (t teeAuditor) flushPending(ctx context.Context) {
+	for _, a := range []RefusalAuditor{t.a, t.b} {
+		if f, ok := a.(pendingFlusher); ok {
+			f.flushPending(ctx)
+		}
+	}
+}
+
 func size(t *testing.T, p string) int64 {
 	t.Helper()
 	fi, err := os.Stat(p)
@@ -374,12 +385,12 @@ func TestMaintenanceReopensLogsAndResetsShares(t *testing.T) {
 			t.Fatalf("budget used after audit --rotate = %d, want 0", got)
 		}
 		retired := size(t, oldAudit)
-		a.Refused(0, ReasonRoot)
-		a.Dropped(0, 2) // carries the one dropped before
+		a.Refused(0, ReasonRoot) // lands, and carries the one dropped before
+		a.Dropped(0, 2)
 		lines, _ := readAudit(t, r.auditPath())
 		rs, ds := refusedOf(t, lines)
-		if !slices.Equal(rs, []refusal{{0, ReasonRoot}}) || !slices.Equal(ds, []drop{{0, 3}}) {
-			t.Fatalf("new audit log = %v, summaries %v; want one refusal and uid 0 dropped 3", rs, ds)
+		if !slices.Equal(rs, []refusal{{0, ReasonRoot}}) || !slices.Equal(ds, []drop{{0, 1}, {0, 2}}) {
+			t.Fatalf("new audit log = %v, summaries %v; want one refusal and uid 0 dropped 1, then 2", rs, ds)
 		}
 		if n := size(t, oldAudit); n != retired {
 			t.Fatalf("the retired audit log grew from %d to %d bytes", retired, n)
