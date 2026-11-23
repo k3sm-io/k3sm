@@ -29,7 +29,7 @@ import (
 
 // unbuiltVerbs are verbs the store's remedies would name but that are not
 // built yet: no string the package returns may name one.
-var unbuiltVerbs = []string{"floor --rebuild", "audit --rotate"}
+var unbuiltVerbs = []string{"audit --rotate"}
 
 // unbuiltVerbAllow lists "file: verb" pairs allowed to name an unbuilt
 // verb. It stays empty: a remedy names the matched-set restore or doctor
