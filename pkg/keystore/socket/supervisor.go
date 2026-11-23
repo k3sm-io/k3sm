@@ -270,26 +270,60 @@ func (s *Supervisor) Run(ctx context.Context) {
 	}
 }
 
-// check runs the start checks in order and returns the first reason the
-// listener may not start, with its error's text, or "".
+// check runs the start checks over the supervisor's config.
 func (s *Supervisor) check(ctx context.Context) (OffReason, string) {
-	if euid := s.cfg.EUID(); euid < 0 || uint64(euid) != uint64(s.cfg.ServiceUID) {
-		return OffNotInstalledServer, fmt.Sprintf("effective uid %d is not the service uid %d", euid, s.cfg.ServiceUID)
+	return Preconditions{
+		EUID:              s.cfg.EUID,
+		ServiceUID:        s.cfg.ServiceUID,
+		MaintenanceMarked: s.cfg.MaintenanceMarked,
+		IgnoresOwnership:  s.cfg.IgnoresOwnership,
+		CheckInstall:      s.cfg.CheckInstall,
+		ServerCount:       s.cfg.ServerCount,
+	}.Check(ctx)
+}
+
+// Preconditions are the user scope's start checks, the ones the Supervisor
+// runs before each start and doctor re-runs in its own process, so the two
+// cannot disagree about why the listener is off. Every func is required.
+type Preconditions struct {
+	// EUID returns the effective uid of the process that would listen.
+	EUID func() int
+	// ServiceUID is the service user's uid.
+	ServiceUID uint32
+	// MaintenanceMarked reports whether the maintenance marker stands.
+	MaintenanceMarked func() (bool, error)
+	// IgnoresOwnership reports whether the data root is mounted with
+	// MNT_IGNORE_OWNERSHIP.
+	IgnoresOwnership func() (bool, error)
+	// CheckInstall returns an error when the socket directory or either
+	// append-only log is absent, wrong or unflagged.
+	CheckInstall func(ctx context.Context) error
+	// ServerCount returns how many servers the cluster has registered.
+	ServerCount func(ctx context.Context) (int, error)
+}
+
+// Check runs the start checks in the design's order (the effective uid, the
+// maintenance marker, the mount flags, the installed files, a server count
+// of exactly one) and returns the first reason the listener may not start,
+// with its error's text, or "" when every check passes.
+func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
+	if euid := p.EUID(); euid < 0 || uint64(euid) != uint64(p.ServiceUID) {
+		return OffNotInstalledServer, fmt.Sprintf("effective uid %d is not the service uid %d", euid, p.ServiceUID)
 	}
-	if marked, err := s.cfg.MaintenanceMarked(); err != nil {
+	if marked, err := p.MaintenanceMarked(); err != nil {
 		return OffMaintenanceUnknown, err.Error()
 	} else if marked {
 		return OffMaintenance, ""
 	}
-	if ignores, err := s.cfg.IgnoresOwnership(); err != nil {
+	if ignores, err := p.IgnoresOwnership(); err != nil {
 		return OffMountUnknown, err.Error()
 	} else if ignores {
 		return OffIgnoresOwnership, "MNT_IGNORE_OWNERSHIP is set"
 	}
-	if err := s.cfg.CheckInstall(ctx); err != nil {
+	if err := p.CheckInstall(ctx); err != nil {
 		return OffInstall, err.Error()
 	}
-	n, err := s.cfg.ServerCount(ctx)
+	n, err := p.ServerCount(ctx)
 	switch {
 	case err != nil:
 		return OffServersUnknown, err.Error()
@@ -299,6 +333,16 @@ func (s *Supervisor) check(ctx context.Context) (OffReason, string) {
 		return OffServersUnknown, fmt.Sprintf("%d servers registered", n)
 	}
 	return "", ""
+}
+
+// Remedy is the command the server log and doctor name for r, or "" when
+// no command puts it right: only a missing, wrong or unflagged installed
+// file names `sudo k3sm install`.
+func (r OffReason) Remedy() string {
+	if r == OffInstall {
+		return installRemedy
+	}
+	return ""
 }
 
 // off records a failed start check and logs it: the install Warn on every
@@ -311,7 +355,7 @@ func (s *Supervisor) off(reason OffReason, detail string, last OffReason, wait t
 			s.cfg.Log.Info(offMsg+": the listener is down while the maintenance marker stands", "reason", string(reason))
 		}
 	case OffInstall:
-		s.cfg.Log.Warn(offMsg+"; "+installRemedy, "reason", string(reason), "err", detail, "retry", wait)
+		s.cfg.Log.Warn(offMsg+"; "+reason.Remedy(), "reason", string(reason), "err", detail, "retry", wait)
 	default:
 		s.cfg.Log.Warn(offMsg, "reason", string(reason), "err", detail, "retry", wait)
 	}
