@@ -17,6 +17,7 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -431,9 +432,16 @@ func TestFloorMergeKeepRecordsAsideLive(t *testing.T) {
 	if _, err := parseFloor(b); err != nil {
 		t.Fatalf("the merged floor does not parse: %v", err)
 	}
+	// A rerun keeps spare again and leaves the floor's bytes as they are;
+	// a keep counts as a change (changes), so a kept-only first run writes
+	// its retired record.
 	again, _ := restored.merge(aside, keep, nil)
-	if !slices.Equal(again.Kept, []string{"spare"}) || again.changes() {
-		t.Errorf("rerun keeping spare = %+v, want spare kept and nothing changed", again)
+	b2, err := marshalFloor(restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(again.Kept, []string{"spare"}) || !again.changes() || !bytes.Equal(b, b2) {
+		t.Errorf("rerun keeping spare = %+v, want spare kept, counted as a change, and the floor bytes unchanged", again)
 	}
 }
 

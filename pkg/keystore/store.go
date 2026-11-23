@@ -628,6 +628,17 @@ func (s *FileStore) delete(ctx context.Context, name string) error {
 	// only adds burials, so a burial written now is kept by it. It raises
 	// no other entry's floor then, as RaiseFloor does not.
 	pending := fdir.mergePending() != nil
+	if pending {
+		// Once a merge has written its commit marker, a rerun finishes it
+		// from that record and never plans the floor again, so a burial
+		// written now would change the floor the record names.
+		switch _, err := fdir.root.Lstat(retiredPendingName); {
+		case err == nil:
+			return errMergeCommitted
+		case !errors.Is(err, fs.ErrNotExist):
+			return err
+		}
+	}
 	if pending && fl == nil {
 		// The saved floor is not put back yet: a floor this Delete created
 		// would hold its burial alone, which the merge would take for the

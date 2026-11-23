@@ -402,12 +402,27 @@ func TestFloorMergeRemovesBuriedLiveStaged(t *testing.T) {
 // TestParseRetired (U192): the retired record parses only in the one
 // encoding a merge writes.
 func TestParseRetired(t *testing.T) {
-	good, err := marshalRetired(retiredRecord{Retired: []string{"a", "b"}})
+	sum := sha256Hex(nil)
+	good, err := marshalRetired(retiredRecord{Input: sum, Base: sum, Floor: sum, Retired: []string{"a", "b"}, Dropped: []string{"d", "d"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec, err := parseRetired(good); err != nil || len(rec.Retired) != 2 || len(rec.BuriedLive) != 0 {
-		t.Fatalf("parseRetired(%s) = %+v, %v; want a and b retired", good, rec, err)
+	if rec, err := parseRetired(good); err != nil || len(rec.Retired) != 2 || len(rec.BuriedLive) != 0 || len(rec.Dropped) != 2 {
+		t.Fatalf("parseRetired(%s) = %+v, %v; want a and b retired and d dropped twice", good, rec, err)
+	}
+	for _, bad := range []retiredRecord{
+		{Input: "", Base: sum, Floor: sum},
+		{Input: strings.ToUpper(sum), Base: sum, Floor: sum},
+		{Input: sum, Base: sum, Floor: sum, Kept: []string{"a", "a"}},
+		{Input: sum, Base: sum, Floor: sum, Dropped: []string{"b", "a"}},
+	} {
+		b, err := marshalRetired(bad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := parseRetired(b); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("parseRetired(%s): %v, want ErrCorrupt", b, err)
+		}
 	}
 	for _, bad := range []string{
 		`{"retired":["b","a"],"buriedLive":[]}` + "\n",

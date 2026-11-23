@@ -248,12 +248,6 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if named, err := fdir.root.Lstat(floorName); err == nil && os.SameFile(named, in.info) {
 		return r, errMergeLiveFloor
 	}
-	var undo retiredRecord
-	if opts.Undo {
-		if undo, err = s.readRetired(fdir); err != nil {
-			return r, err
-		}
-	}
 	if err := s.step("merge read"); err != nil {
 		return r, err
 	}
@@ -261,14 +255,47 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if live == nil {
 		return r, checkMergeInput(live, from, kept)
 	}
-	// written is set when the live floor already holds every burial and
-	// fence the input records, judged without the trees' pointers: a rerun
-	// after a committed merge (exit 5). A refusal of what is staged then
-	// leaves a written floor, and is worded so (committedShape), never as
-	// nothing written.
-	written := !planMerge(live, from, kept, nil, nil).r.changes()
+	liveBytes, err := marshalFloor(live)
+	if err != nil {
+		return r, err
+	}
+	liveSum := sha256Hex(liveBytes)
+	// The pending retired record is the merge's commit marker: every first
+	// run writes it, with the input's sha256 and the floor it writes, before
+	// the floor. A record of this input whose floor is the live one is a
+	// rerun: the floor is written, and is never planned again (a prune an
+	// --accept-drops run made would be undone and another made); a record
+	// whose base is the live floor is a first run that stopped before the
+	// floor's write. No record is a first run: nothing is written.
+	pending, err := s.readPendingRetired(fdir)
+	if err != nil {
+		return r, err
+	}
+	rerun := false
+	if pending != nil {
+		switch {
+		case pending.Input != in.sum:
+			return r, fmt.Errorf("%s, the record a merge writes before the floor, is of another input than keystore-floor.json.pre-restore (input sha256 %s, the file's %s): the file was replaced after a merge of another one began. Nothing is written; put back the floor that merge read, or inspect both files", retiredPendingName, pending.Input, in.sum)
+		case pending.Floor == liveSum:
+			rerun = true
+		case pending.Base != liveSum:
+			return r, fmt.Errorf("%w: keystore-floor.json (sha256 %s) is neither the floor this merge recorded writing (%s) nor the one it read (%s), in %s: it changed after the merge wrote it, and the merge never plans a written merge again, so nothing more is done. Inspect keystore-floor.json against the record", errCommitted, liveSum, pending.Floor, pending.Base, retiredPendingName)
+		}
+	}
+	var undo retiredRecord
+	if opts.Undo && !rerun {
+		// In an undo the live floor is the first merge's input: only the
+		// record of that merge is read.
+		raw, _, err := readFile(fdir.root, floorName, int64(floorSizeLimit))
+		if err != nil {
+			return r, err
+		}
+		if undo, err = s.readRetired(fdir, sha256Hex(raw)); err != nil {
+			return r, err
+		}
+	}
 	finish := func(err error) error {
-		if err == nil || !written || Committed(err) {
+		if err == nil || !rerun || Committed(err) {
 			return err
 		}
 		return committedShape(err)
@@ -305,13 +332,15 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 			return r, finish(err)
 		}
 	}
+	if rerun {
+		return s.finishRerun(st, in, live, *pending, opts.DryRun, moveAside)
+	}
 	ptrs, unverified, aside, asideUnverified, err := s.stagedPointers(ctx, st, live, from)
 	if err != nil {
-		return r, finish(err)
+		return r, err
 	}
 	// A dry run on a copy (planMerge): an input whose every burial and fence
-	// the live floor already holds (a rerun after a failed rename) writes
-	// nothing and is only renamed, whatever its newest deletion.
+	// the live floor already holds writes nothing to the floor.
 	plan := planMerge(live, from, kept, ptrs, aside)
 	pr := plan.r
 	if unmatched := unmatchedKeep(kept, pr.Kept); len(unmatched) > 0 {
@@ -322,50 +351,40 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 			return MergeReport{}, err
 		}
 	}
-	if !pr.changes() {
-		pr.AlreadyMerged, pr.Unverified, pr.Dropped = true, unionNames(unverified, pr.Unverified), nil
-		pr.AsideUnverified = asideUnverified
-		if opts.DryRun {
-			_ = moveAside(&pr) // a dry run moves nothing
-			return pr, nil
+	changes := pr.changes()
+	mergedBytes := liveBytes
+	if changes {
+		if mergedBytes, err = marshalFloor(plan.merged); err != nil {
+			return r, err
 		}
-		if st.staged {
-			// A rerun after the tree's move failed: the floor is written,
-			// so finish the move.
-			if err := moveAside(&pr); err != nil {
-				return pr, committedShape(err)
-			}
-			if err := s.chownStaged(st); err != nil {
-				return pr, committedShape(err)
-			}
-			if err := s.moveStaged(st); err != nil {
-				return pr, committedShape(err)
-			}
+		if !st.staged {
+			return r, errNotStaged
 		}
-		if err := s.renameMerged(in); err != nil {
-			return pr, fmt.Errorf("%w: the merge is written, but its input was not renamed, so the verbs that change the keystore still refuse; run the same merge again, which writes nothing more and renames it: %w", errCommitted, err)
+		if err := checkMergeInput(live, from, kept); err != nil {
+			return r, err
 		}
-		return pr, nil
+	} else {
+		pr.AlreadyMerged, pr.Dropped, plan.dropped = true, nil, nil
 	}
-	if !st.staged {
-		return r, errNotStaged
-	}
-	if err := checkMergeInput(live, from, kept); err != nil {
-		return r, err
-	}
+	pr.Unverified, pr.AsideUnverified = unionNames(unverified, pr.Unverified), asideUnverified
 	// As Put and Rotate ask room before they write: a merge whose write
 	// would drop any burial is refused, with nothing written and the input
 	// left where it is, so the guard stays, unless opts.AcceptDrops says
 	// so; and a write that would drop the burial of a generation it buries
 	// live is refused whatever opts says (planMerge, mergeLoss.refusal).
-	refused := plan.loss.refusal(opts.AcceptDrops)
+	var refused error
+	if changes {
+		refused = plan.loss.refusal(opts.AcceptDrops)
+	}
 	if opts.DryRun {
-		pr.Unverified, pr.AsideUnverified = unionNames(unverified, pr.Unverified), asideUnverified
 		_ = moveAside(&pr) // a dry run moves nothing
 		return pr, refused
 	}
 	if refused != nil {
 		return r, refused
+	}
+	if changes && len(mergedBytes) > floorSizeLimit {
+		return r, fmt.Errorf("%w (%d bytes)", errFloorFull, len(mergedBytes))
 	}
 	// The guard file must still be the file read: one replaced since is
 	// not merged.
@@ -378,62 +397,124 @@ func (s *FileStore) mergeFloor(ctx context.Context, opts MergeOptions) (MergeRep
 	if err := moveAside(&moved); err != nil {
 		return r, fmt.Errorf("%w; nothing is merged, run the merge again", err)
 	}
-	// What the merge retires and buries live is recorded before the floor
-	// is written, under the pending name renameMerged renames with the
-	// input, so an undo can tell them apart from later deletions.
-	if err := s.writeRetiredPending(fdir, pr); err != nil {
+	// The commit marker, written before the floor: what the merge retires,
+	// buries live, keeps and drops, so an undo can tell them apart from
+	// later deletions, and the floor it writes, so a rerun finishes this
+	// merge instead of planning another. A first run that stopped before
+	// the floor's write keeps the sets the record holds (unionRecord).
+	rec := retiredRecord{Input: in.sum, Base: liveSum, Floor: sha256Hex(mergedBytes), Retired: pr.Retired, BuriedLive: pr.BuriedLive, Kept: pr.Kept, Recorded: pr.Recorded, Dropped: pr.Dropped}
+	if pending != nil {
+		rec = unionRecord(*pending, rec)
+		rec.Floor = sha256Hex(mergedBytes)
+	}
+	if err := s.writeRetiredPending(fdir, rec); err != nil {
 		return r, fmt.Errorf("write %s: %w; nothing is merged, run the merge again", retiredPendingName, err)
 	}
-	// The staged tree is handed to the service user before the floor is
-	// written: a failure here leaves nothing written.
-	if err := s.chownStaged(st); err != nil {
-		return r, err
-	}
-	// rm under the guard buried some entries while their files were
-	// staged, out of its reach, and the merge buries others live: it
-	// removes the staged directory of each before the tree moves into
-	// place, so none is left for a later prune of its burial to bring
-	// back. A name --keep keeps is not buried live. A failure here leaves
-	// the floor unwritten.
-	if err := s.removeStaged(st, unionNames(guardBuried(live, plan.merged), pr.BuriedLive)); err != nil {
-		return r, err
+	var removed []string
+	if st.staged {
+		// The staged tree is handed to the service user before the floor
+		// is written: a failure here leaves the floor unwritten.
+		if err := s.chownStaged(st); err != nil {
+			return r, err
+		}
+		// Each staged entry whose generation the merged floor refuses (rm
+		// under the guard buried it while its files were staged, out of
+		// its reach, the merge buries it live or from the moved-aside
+		// floor, or the write drops its burial) has its staged directory
+		// removed before the tree moves into place, so none is left for a
+		// later prune of its burial to bring back. A name --keep keeps is
+		// live. A failure here leaves the floor unwritten.
+		names, err := s.refusedStaged(st, plan.merged, plan.dropped)
+		if err != nil {
+			return r, err
+		}
+		if removed, err = s.removeStaged(st, names); err != nil {
+			return r, err
+		}
 	}
 	// Only keystore-lock: the merge writes the root-owned floor and nothing
 	// under keystore/, so it takes no keystore/.lock, which the service user
 	// can hold or replace to stop it. Readers need no .lock against it
-	// either: the floor is replaced by an atomic rename.
-	var capDropped []pruned
-	_, dropped, err := fdir.updatePruned(func(fl floor) bool {
-		r, capDropped = fl.mergeFenced(from, kept, ptrs, aside)
-		return r.changes()
-	})
-	if err != nil {
-		return MergeReport{}, err
+	// either: the floor is replaced by an atomic rename. The bytes written
+	// are the plan's, the floor the record names.
+	if changes {
+		if err := s.writeFileAs(fdir.root, floorName, mergedBytes, uint32(s.floorUID), uint32(s.floorGID), floorFileMode); err != nil {
+			if len(removed) > 0 {
+				return MergeReport{}, fmt.Errorf("%w; the floor is not written, but the staged directories of %s, which the merged floor refuses, were removed from %s/%s; run the merge again", err, strings.Join(removed, ", "), preRestoreDirName, stagedTreeName)
+			}
+			return MergeReport{}, err
+		}
+		logPruned(plan.dropped)
 	}
-	for _, p := range append(capDropped, dropped...) {
-		r.Dropped = append(r.Dropped, p.name)
-	}
-	sort.Strings(r.Dropped)
-	logPruned(capDropped)
+	r = pr
 	for _, name := range unverified {
 		slog.Warn("keystore floor: the restored pointer of this entry did not authenticate under the master, so the merge left its recorded sequence as the restored floor holds it: a pointer below it is refused, one at it is accepted, and one above it is accepted unless the merge fenced the entry, when one above it and at or below the fence is refused until a Rotate seals above the fence", "name", name)
 	}
 	for _, name := range r.overRaise {
 		slog.Warn("keystore floor: the restored pointer of this entry is more than one sequence above the restored floor's record, more than a crash leaves, so the merge did not raise the record to it: that pointer is refused while it is at or below the fence the merge set, until a Rotate seals above the fence, and accepted above it; the record's own sequence stays accepted", "name", name)
 	}
-	r.Unverified, r.AsideUnverified = unionNames(unverified, r.Unverified), asideUnverified
 	for _, name := range asideUnverified {
 		slog.Warn("keystore floor: the moved-aside tree's pointer of this entry did not authenticate under the master, so the merge fenced it one past the moved-aside floor's record, not past that pointer", "name", name)
 	}
 	r.MovedAside, r.MovedAsideType = moved.MovedAside, moved.MovedAsideType
-	if opts.Undo {
-		_ = classifyUndo(&r, undo) // its refusal was decided on the plan
-	}
 	for _, name := range r.BuriedLive {
 		slog.Warn("keystore floor: the moved-aside floor records the restored generation of this entry as deleted, so the merge buried it and removed its restored directory; in an undo --keep brings back a version the first merge retired", "name", name)
 	}
-	if err := s.moveStaged(st); err != nil {
-		return r, fmt.Errorf("%w: the merge is written, but the restored keystore/ is still staged in pre-restore.d/restored: %w; run the same merge again, which writes nothing more and moves it into place", errCommitted, err)
+	if st.staged {
+		if err := s.moveStaged(st); err != nil {
+			return r, movedErr(err)
+		}
+	}
+	if err := s.renameMerged(in); err != nil {
+		return r, fmt.Errorf("%w: the merge is written, but its input was not renamed, so the verbs that change the keystore still refuse; run the same merge again, which writes nothing more and renames it: %w", errCommitted, err)
+	}
+	return r, nil
+}
+
+// movedErr is the committed error of a failed moveStaged, on a merge whose
+// floor is written.
+func movedErr(err error) error {
+	if errors.Is(err, errMovedNotSynced) {
+		return fmt.Errorf("%w: the merge is written and the restored keystore/ is moved into place, but %w, so the move may not survive a crash and the input is not renamed; run the same merge again, which writes nothing more and renames it", errCommitted, err)
+	}
+	return fmt.Errorf("%w: the merge is written, but the restored keystore/ is still staged in pre-restore.d/restored: %w; run the same merge again, which writes nothing more and moves it into place", errCommitted, err)
+}
+
+// finishRerun is a rerun of a merge whose floor is written (rec, the
+// pending retired record, names the live floor): it never plans the floor
+// again, only finishes the steps after it, the staged tree's handover and
+// move and the input's rename, and reports from rec, already merged. Every
+// failure is committed.
+func (s *FileStore) finishRerun(st *mergeStaging, in *mergeInput, live floor, rec retiredRecord, dryRun bool, moveAside func(*MergeReport) error) (MergeReport, error) {
+	r := MergeReport{AlreadyMerged: true, Retired: rec.Retired, BuriedLive: rec.BuriedLive, Kept: rec.Kept, Recorded: rec.Recorded, Dropped: rec.Dropped}
+	for name, e := range in.fl {
+		for _, b := range e.burials() {
+			if live[name].buries(b.Generation) {
+				r.AlreadyPresent++
+			}
+		}
+	}
+	if dryRun {
+		_ = moveAside(&r) // a dry run moves nothing
+		return r, nil
+	}
+	if st.staged {
+		if err := moveAside(&r); err != nil {
+			return r, committedShape(err)
+		}
+		if err := s.chownStaged(st); err != nil {
+			return r, committedShape(err)
+		}
+		names, err := s.refusedStaged(st, live, nil)
+		if err != nil {
+			return r, committedShape(err)
+		}
+		if _, err := s.removeStaged(st, names); err != nil {
+			return r, committedShape(err)
+		}
+		if err := s.moveStaged(st); err != nil {
+			return r, movedErr(err)
+		}
 	}
 	if err := s.renameMerged(in); err != nil {
 		return r, fmt.Errorf("%w: the merge is written, but its input was not renamed, so the verbs that change the keystore still refuse; run the same merge again, which writes nothing more and renames it: %w", errCommitted, err)
@@ -456,19 +537,6 @@ func (fl floor) guardEra() map[floorBurial]bool {
 		}
 	}
 	return out
-}
-
-// guardBuried is each name, sorted, with a guard-era burial in live (rm
-// run under the guard) that merged does not hold live: the entries whose
-// staged directory the merge removes (removeStaged).
-func guardBuried(live, merged floor) []string {
-	set := map[string]bool{}
-	for b := range live.guardEra() {
-		if !merged[b.name].live() {
-			set[b.name] = true
-		}
-	}
-	return sortedNames(set)
 }
 
 // renumberGuard renumbers fl's burials, order kept: those in guarded from
@@ -639,12 +707,16 @@ func (e *mergeFullError) Is(target error) bool { return target == errFloorFull }
 
 // changes reports whether the merge r reports changed the floor.
 func (r MergeReport) changes() bool {
-	return r.Merged > 0 || len(r.Retired) > 0 || len(r.Fenced) > 0 || r.raised > 0 || r.recorded > 0 || r.renumbered
+	return r.Merged > 0 || len(r.Retired) > 0 || len(r.Fenced) > 0 || len(r.Kept) > 0 || r.raised > 0 || r.recorded > 0 || r.renumbered
 }
 
 // errMergeLiveFloor refuses a merge whose input is the data root's live
 // floor itself, the same inode under the guard file's name.
 var errMergeLiveFloor = errors.New("keystore-floor.json.pre-restore is the live floor itself: merging it changes nothing. It must be the floor moved aside before the restore")
+
+// errMergeCommitted refuses a Delete while a merge is written but not
+// finished: its pending retired record is in the data root.
+var errMergeCommitted = errors.New("a floor merge is written but not finished (keystore-floor.json.pre-restore.retired, its record, is in the data root): run sudo k3sm keys floor merge again first, which finishes it without planning it again; nothing is deleted until then")
 
 // errGuardNoFloor refuses a Delete while a restore is unfinished and the
 // live floor is absent.
@@ -755,7 +827,10 @@ func floorsSame(a, b floor) bool {
 // info, its base name, and the data root it was read through, which the
 // floor lock owns and closes.
 type mergeInput struct {
-	fl   floor
+	fl floor
+	// sum is the sha256 of the file's bytes, which the retired record
+	// carries as its input.
+	sum  string
 	info fs.FileInfo
 	dir  *os.Root
 	base string
@@ -805,7 +880,7 @@ func (s *FileStore) readGuard(l *floorLock) (*mergeInput, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &mergeInput{fl: fl, info: fi, dir: l.root, base: floorPreRestoreName}, nil
+	return &mergeInput{fl: fl, sum: sha256Hex(b), info: fi, dir: l.root, base: floorPreRestoreName}, nil
 }
 
 // mergeFenced adds to fl every burial in from that fl lacks, oldest (lowest
@@ -863,7 +938,11 @@ func (fl floor) mergeFenced(from floor, keep map[string]bool, ptrs, aside map[st
 	// between, and every burial is renumbered from 1 at the end, order kept.
 	guarded := fl.guardEra()
 	last := fl.lastDeleted()
-	if len(guarded) > 0 {
+	// A floor numbered into the guard band with no guard-era burial left (a
+	// band an earlier merge or Delete left) is renumbered too, so what the
+	// merge adds stays below guardEraSeq.
+	band := len(guarded) > 0 || last >= guardEraSeq
+	if band {
 		last = fl.renumberGuard(guarded)
 	}
 	add := func(name, g string) {
@@ -957,7 +1036,7 @@ func (fl floor) mergeFenced(from floor, keep map[string]bool, ptrs, aside map[st
 	}
 	r.BuriedLive, r.Kept, r.Fenced, r.Recorded = sortedNames(buriedLive), sortedNames(kept), sortedNames(fenced), sortedNames(recorded)
 	r.Unverified, r.overRaise = sortedNames(overRaise), sortedNames(overRaise)
-	if len(guarded) > 0 {
+	if band {
 		fl.renumber()
 		r.renumbered = true
 	}
@@ -1001,8 +1080,9 @@ func unmatchedKeep(keep map[string]bool, kept []string) []string {
 // generation: the fence goes above it (mergeFenced); with that tree present,
 // each of those names whose pointer did not authenticate (no master, no
 // entry, another generation, or a refused record) is returned, sorted, in
-// asideUnverified. An absent moved-aside tree holds no pointer to fence
-// above, and is no failure. It takes no
+// asideUnverified. With pre-restore.d present but the moved-aside tree
+// absent, each of those names is in asideUnverified too: no pointer of it
+// authenticated, so its fence is one past the moved-aside floor's record. It takes no
 // keystore/.lock (see mergeFloor) and writes nothing; it stops with ctx's
 // error.
 func (s *FileStore) stagedPointers(ctx context.Context, st *mergeStaging, live, from floor) (ptrs map[string]uint64, unverified []string, aside map[string]uint64, asideUnverified []string, err error) {
@@ -1046,7 +1126,14 @@ func (s *FileStore) stagedPointers(ctx context.Context, st *mergeStaging, live, 
 			return nil, nil, nil, nil, terr
 		}
 		switch {
+		case tree == nil && st.dir == nil:
+			// No pre-restore.d at all: nothing is staged, and a merge that
+			// would change the floor is refused (errNotStaged).
 		case tree == nil:
+			// pre-restore.d holds no moved-aside tree, so no pointer of
+			// these live entries authenticates: their fence is one past
+			// the moved-aside floor's record, not past a pointer.
+			asideUnverified = asideNames
 		case kerr != nil:
 			_ = tree.Close() // read-only
 			asideUnverified = asideNames

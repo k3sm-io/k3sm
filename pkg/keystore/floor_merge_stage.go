@@ -17,6 +17,7 @@ limitations under the License.
 package keystore
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -58,6 +59,16 @@ const (
 // over, before the tree's rename. It is a variable so a test can observe
 // each fsync.
 var syncStaged = func(f *os.File) error { return f.Sync() }
+
+// statDev is the device of the directory f holds (fstat). It is a
+// variable so a test can report two devices.
+var statDev = func(f *os.File) (uint64, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		return 0, fmt.Errorf("stat %s: %w", f.Name(), err)
+	}
+	return uint64(st.Dev), nil
+}
 
 // stagedNameLimit bounds how many names the staged-tree walk accepts in one
 // directory: maxDirNames, which tests lower.
@@ -159,6 +170,21 @@ func (s *FileStore) openStaging(l *floorLock) (st *mergeStaging, err error) {
 		return st, fmt.Errorf("%s: %w", preRestoreDirName, err)
 	case acl:
 		return st, fmt.Errorf("%w: %s has an extended ACL, which can grant past its mode: it must grant nothing to anyone but root (sudo chmod -N %s removes it)", errFloorUntrusted, preRestoreDirName, preRestoreDirName)
+	}
+	// The staged tree moves to the store's Dir by rename, and what is
+	// planted there moves into pre-restore.d the same way: both
+	// directories must be on one device, judged on the descriptors before
+	// anything is written.
+	pd, err := statDev(st.parent)
+	if err != nil {
+		return st, err
+	}
+	sd, err := statDev(st.dirF)
+	if err != nil {
+		return st, err
+	}
+	if pd != sd {
+		return st, fmt.Errorf("%s (device %d) and %s, the directory the keystore is in (device %d), are on different devices: the merge moves the restored keystore/ between them by rename, which cannot cross devices. Nothing is written; make pre-restore.d in the data root on the keystore's volume, as docs/user/keys.md describes", preRestoreDirName, sd, filepath.Dir(s.dir), pd)
 	}
 	switch fi, err := st.dir.Lstat(stagedTreeName); {
 	case errors.Is(err, fs.ErrNotExist):
@@ -588,38 +614,117 @@ func (s *FileStore) handStaged(fd int, rel string, before *unix.Stat_t, k staged
 	return nil
 }
 
+// refusedStaged is each entry name, sorted, in pre-restore.d/restored
+// whose staged generation the floor fl refuses: one fl buries and does not
+// hold live, or one of dropped, the burials the write drops (a copy of
+// which would otherwise be accepted again). An entry directory without a
+// readable generation file is left.
+func (s *FileStore) refusedStaged(st *mergeStaging, fl floor, dropped []pruned) ([]string, error) {
+	tree, err := st.tree(stagedTreeName)
+	if err != nil || tree == nil {
+		return nil, err
+	}
+	defer func() { _ = tree.Close() }() // read-only
+	d, err := tree.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	names, err := d.Readdirnames(stagedNameLimit + 1)
+	_ = d.Close() // read-only
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	var out []string
+	for _, name := range names {
+		if checkName(name) != nil {
+			continue
+		}
+		fi, err := tree.Lstat(name)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+		dir, err := tree.OpenRoot(name)
+		if err != nil {
+			return nil, err
+		}
+		gen, gerr := readGeneration(dir)
+		_ = dir.Close() // read-only
+		if gerr != nil {
+			continue
+		}
+		g := hex.EncodeToString(gen[:])
+		e := fl[name]
+		refused := e.buries(g) && !(e.live() && e.Generation == g)
+		for _, p := range dropped {
+			if p.name == name && p.generation == g && !(e.live() && e.Generation == g) {
+				refused = true
+			}
+		}
+		if refused {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // removeStaged removes the directory of each of names from
 // pre-restore.d/restored, through the tree opened by descriptor inside the
 // root-only pre-restore.d (st.tree): os.Root's RemoveAll never follows a
 // symlink, removing one itself, and never leaves the tree. A name already
-// absent is no error.
-func (s *FileStore) removeStaged(st *mergeStaging, names []string) error {
+// absent is no error. It returns the names it removed, those removed
+// before a failure included.
+func (s *FileStore) removeStaged(st *mergeStaging, names []string) ([]string, error) {
 	if len(names) == 0 {
-		return nil
+		return nil, nil
 	}
 	tree, err := st.tree(stagedTreeName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if tree == nil {
-		return errNotStaged
+		return nil, errNotStaged
 	}
 	defer func() { _ = tree.Close() }() // removals are synced below
+	var removed []string
 	for _, name := range names {
 		if err := checkName(name); err != nil {
-			return err
+			return removed, err
+		}
+		if err := s.step("merge remove staged " + name); err != nil {
+			return removed, removedErr(removed, err)
 		}
 		if err := tree.RemoveAll(name); err != nil {
-			return fmt.Errorf("remove the staged directory of %s, which the merge buries, from %s/%s: %w; nothing is written, run the merge again", name, preRestoreDirName, stagedTreeName, err)
+			return removed, removedErr(removed, fmt.Errorf("remove the staged directory of %s, which the merged floor refuses, from %s/%s: %w", name, preRestoreDirName, stagedTreeName, err))
 		}
+		removed = append(removed, name)
 	}
-	return syncDir(tree)
+	if err := syncDir(tree); err != nil {
+		return removed, removedErr(removed, err)
+	}
+	return removed, nil
 }
+
+// removedErr is err, a failure of removeStaged once it removed the staged
+// directories of removed: the floor is not written, and, when any was
+// removed, it names them rather than saying nothing is written.
+func removedErr(removed []string, err error) error {
+	if len(removed) == 0 {
+		return fmt.Errorf("%w; nothing is written, run the merge again", err)
+	}
+	return fmt.Errorf("%w; the floor is not written, but the staged directories of %s, which the merged floor refuses, were removed from %s/%s; run the merge again", err, strings.Join(removed, ", "), preRestoreDirName, stagedTreeName)
+}
+
+// errMovedNotSynced is a directory fsync that failed after the staged
+// tree's rename: the tree is in place, but the rename may not survive a
+// crash.
+var errMovedNotSynced = errors.New("a directory fsync after the restored keystore/'s rename failed")
 
 // moveStaged renames pre-restore.d/restored to the store's Dir, through the
 // two directory descriptors, refusing when anything, a symlink included, is
-// at Dir (renameExcl). Once the rename is made it stands: a failed fsync of
-// either directory after it is logged at Warn, not returned.
+// at Dir (renameExcl). A failed fsync of either directory after the rename
+// is returned (errMovedNotSynced): the rename stands, and the merge is
+// committed.
 func (s *FileStore) moveStaged(st *mergeStaging) error {
 	if err := s.step("merge tree rename"); err != nil {
 		return err
@@ -631,9 +736,13 @@ func (s *FileStore) moveStaged(st *mergeStaging) error {
 		return fmt.Errorf("move %s/%s to %s: %w", preRestoreDirName, stagedTreeName, s.dir, err)
 	}
 	for _, d := range []*os.File{st.parent, st.dirF} {
-		if err := d.Sync(); err != nil {
-			slog.Warn("keystore floor: the restored keystore/ is moved into place, but a directory fsync after the rename failed; the rename stands", "dir", d.Name(), "err", err)
+		if err := syncMovedDir(d); err != nil {
+			return fmt.Errorf("%w: fsync %s: %w", errMovedNotSynced, d.Name(), err)
 		}
 	}
 	return nil
 }
+
+// syncMovedDir fsyncs a directory after the staged tree's rename. It is a
+// variable so a test can fail it.
+var syncMovedDir = func(d *os.File) error { return d.Sync() }

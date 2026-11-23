@@ -18,10 +18,14 @@ package keystore
 
 import (
 	"bytes"
+	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"slices"
 	"strconv"
 	"strings"
@@ -45,11 +49,72 @@ const (
 	mergedPrefix = floorName + ".merged-"
 )
 
-// retiredRecord is the retired record's content: each set sorted, without
-// repeats, every name a valid entry name.
+// retiredRecord is the retired record's content, the merge's commit
+// marker: the sha256 of the merge input (the guard file's bytes), of the
+// live floor's bytes the merge read (Base), and of the floor bytes it writes
+// (Floor, Base again when it changes nothing), and what it committed. Each set is
+// sorted, without repeats (Dropped, one name per burial dropped, may
+// repeat), every name a valid entry name.
 type retiredRecord struct {
+	Input      string   `json:"input"`
+	Base       string   `json:"base"`
+	Floor      string   `json:"floor"`
 	Retired    []string `json:"retired"`
 	BuriedLive []string `json:"buriedLive"`
+	Kept       []string `json:"kept"`
+	Recorded   []string `json:"recorded"`
+	Dropped    []string `json:"dropped"`
+}
+
+// sha256Hex is the lowercase hex sha256 of b.
+func sha256Hex(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// isSHA256Hex reports whether s is a lowercase hex sha256.
+func isSHA256Hex(s string) bool {
+	if len(s) != 2*sha256.Size {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// unionRecord is rec with add's sets unioned in: the record a rerun writes
+// when it has to write one, so it never loses what the first run recorded.
+// Input and Floor stay rec's.
+func unionRecord(rec, add retiredRecord) retiredRecord {
+	out := rec
+	out.Retired = unionNames(rec.Retired, add.Retired)
+	out.BuriedLive = unionNames(rec.BuriedLive, add.BuriedLive)
+	out.Kept = unionNames(rec.Kept, add.Kept)
+	out.Recorded = unionNames(rec.Recorded, add.Recorded)
+	// Dropped repeats a name once per burial: the union keeps each name's
+	// larger count.
+	count := map[string]int{}
+	for _, n := range rec.Dropped {
+		count[n]++
+	}
+	more := map[string]int{}
+	for _, n := range add.Dropped {
+		more[n]++
+	}
+	for n, c := range more {
+		count[n] = max(count[n], c)
+	}
+	out.Dropped = nil
+	for n, c := range count {
+		for range c {
+			out.Dropped = append(out.Dropped, n)
+		}
+	}
+	slices.Sort(out.Dropped)
+	return out
 }
 
 // marshalRetired is the record's one encoding, a trailing newline included.
@@ -59,6 +124,15 @@ func marshalRetired(rec retiredRecord) ([]byte, error) {
 	}
 	if rec.BuriedLive == nil {
 		rec.BuriedLive = []string{}
+	}
+	if rec.Kept == nil {
+		rec.Kept = []string{}
+	}
+	if rec.Recorded == nil {
+		rec.Recorded = []string{}
+	}
+	if rec.Dropped == nil {
+		rec.Dropped = []string{}
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
@@ -80,12 +154,16 @@ func parseRetired(b []byte) (retiredRecord, error) {
 	if _, err := d.Token(); !errors.Is(err, io.EOF) {
 		return retiredRecord{}, fmt.Errorf("%w: the retired record holds more than one value", ErrCorrupt)
 	}
-	for _, set := range [][]string{rec.Retired, rec.BuriedLive} {
+	if !isSHA256Hex(rec.Input) || !isSHA256Hex(rec.Base) || !isSHA256Hex(rec.Floor) {
+		return retiredRecord{}, fmt.Errorf("%w: the retired record's input, base and floor are not lowercase hex sha256 digests", ErrCorrupt)
+	}
+	for k, set := range [][]string{rec.Retired, rec.BuriedLive, rec.Kept, rec.Recorded, rec.Dropped} {
+		repeats := k == 4
 		for i, n := range set {
 			if err := checkName(n); err != nil {
 				return retiredRecord{}, fmt.Errorf("%w: the retired record: %w", ErrCorrupt, err)
 			}
-			if i > 0 && set[i-1] >= n {
+			if i > 0 && (set[i-1] > n || !repeats && set[i-1] == n) {
 				return retiredRecord{}, fmt.Errorf("%w: the retired record's names are not sorted without repeats", ErrCorrupt)
 			}
 		}
@@ -98,23 +176,75 @@ func parseRetired(b []byte) (retiredRecord, error) {
 
 // writeRetiredPending writes rec under its pending name through l.root,
 // root-owned at the floor's mode, durably.
-func (s *FileStore) writeRetiredPending(l *floorLock, r MergeReport) error {
-	b, err := marshalRetired(retiredRecord{Retired: r.Retired, BuriedLive: r.BuriedLive})
+func (s *FileStore) writeRetiredPending(l *floorLock, rec retiredRecord) error {
+	b, err := marshalRetired(rec)
 	if err != nil {
 		return err
 	}
 	return s.writeFileAs(l.root, retiredPendingName, b, uint32(s.floorUID), uint32(s.floorGID), floorFileMode)
 }
 
+// readRetiredFile reads the retired record name through l.root, judged as
+// the floor is: a regular file, never followed, owned by root (floorUID),
+// not group- or other-writable, at most floorSizeLimit, and in its one
+// encoding.
+func (s *FileStore) readRetiredFile(l *floorLock, name string) (retiredRecord, error) {
+	named, err := l.root.Lstat(name)
+	if err != nil {
+		return retiredRecord{}, err
+	}
+	if !named.Mode().IsRegular() {
+		return retiredRecord{}, fmt.Errorf("%w: %s has mode %s", errFloorUntrusted, name, named.Mode())
+	}
+	b, fi, err := readFile(l.root, name, int64(floorSizeLimit))
+	if errors.Is(err, errBadFile) {
+		return retiredRecord{}, fmt.Errorf("%w: %s: %w", errFloorUntrusted, name, err)
+	}
+	if err != nil {
+		return retiredRecord{}, err
+	}
+	if err := s.floorOwned(fi); err != nil {
+		return retiredRecord{}, fmt.Errorf("%w: %s: %w", errFloorUntrusted, name, err)
+	}
+	rec, err := parseRetired(b)
+	if err != nil {
+		return retiredRecord{}, fmt.Errorf("%s: %w", name, err)
+	}
+	return rec, nil
+}
+
+// readPendingRetired reads the pending retired record, the commit marker a
+// first run writes before the floor: nil when there is none.
+func (s *FileStore) readPendingRetired(l *floorLock) (*retiredRecord, error) {
+	rec, err := s.readRetiredFile(l, retiredPendingName)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
 // errNoRetiredRecord refuses an undo with no retired record in the data
 // root.
 var errNoRetiredRecord = errors.New("--undo reads what the restore's merge retired from the record it left in the data root, keystore-floor.json.merged-<unix>.retired, and there is none: a merge from before that record cannot be undone by --undo. Nothing is written")
 
-// readRetired reads the newest retired record in the data root (the one
-// with the highest <unix>), through l.root, judged as the floor is: a
-// regular file, never followed, owned by root (floorUID), not group- or
-// other-writable, at most floorSizeLimit, and in its one encoding.
-func (s *FileStore) readRetired(l *floorLock) (retiredRecord, error) {
+// errNoMatchingRetired refuses an undo whose live floor is no retired
+// record's input.
+func errNoMatchingRetired(n int) error {
+	return fmt.Errorf("--undo uses only the retired record of the merge it undoes, the one whose input is the live floor (an undo puts the first merge's input, keystore-floor.json.merged-<unix>, back as keystore-floor.json), and none of the %d keystore-floor.json.merged-<unix>.retired records in the data root has that input: each is from another merge. Nothing is written. Put back as keystore-floor.json the keystore-floor.json.merged-<unix> of the merge to undo, as docs/user/keys.md describes, and run the undo again", n)
+}
+
+// readRetired reads the retired record of the merge an undo reverses: of
+// the data root's keystore-floor.json.merged-<unix>.retired records, each
+// judged as the floor is (readRetiredFile), the one whose input sha256 is
+// liveSum, the sha256 of the live floor's bytes, which an undo makes the
+// first merge's input. The <unix> in a name never chooses a record, so a
+// clock stepped back between merges cannot pick another merge's; of two
+// with the same input, the higher <unix> is read. It refuses when there is
+// no record (errNoRetiredRecord) or none matches (errNoMatchingRetired).
+func (s *FileStore) readRetired(l *floorLock, liveSum string) (retiredRecord, error) {
 	d, err := l.root.Open(".")
 	if err != nil {
 		return retiredRecord{}, err
@@ -127,8 +257,11 @@ func (s *FileStore) readRetired(l *floorLock) (retiredRecord, error) {
 	if len(names) > maxDirNames {
 		return retiredRecord{}, fmt.Errorf("%w: the data root holds more than %d names", errFloorUntrusted, maxDirNames)
 	}
-	var newest string
-	var at uint64
+	type cand struct {
+		name string
+		at   uint64
+	}
+	var cands []cand
 	for _, n := range names {
 		ts, ok := strings.CutPrefix(n, mergedPrefix)
 		if !ok {
@@ -142,31 +275,22 @@ func (s *FileStore) readRetired(l *floorLock) (retiredRecord, error) {
 		if err != nil || strconv.FormatUint(u, 10) != ts {
 			continue
 		}
-		if newest == "" || u > at {
-			newest, at = n, u
-		}
+		cands = append(cands, cand{n, u})
 	}
-	if newest == "" {
+	if len(cands) == 0 {
 		return retiredRecord{}, errNoRetiredRecord
 	}
-	named, err := l.root.Lstat(newest)
-	if err != nil {
-		return retiredRecord{}, err
+	slices.SortFunc(cands, func(a, b cand) int { return cmp.Compare(b.at, a.at) })
+	for _, c := range cands {
+		rec, err := s.readRetiredFile(l, c.name)
+		if err != nil {
+			return retiredRecord{}, err
+		}
+		if rec.Input == liveSum {
+			return rec, nil
+		}
 	}
-	if !named.Mode().IsRegular() {
-		return retiredRecord{}, fmt.Errorf("%w: %s has mode %s", errFloorUntrusted, newest, named.Mode())
-	}
-	b, fi, err := readFile(l.root, newest, int64(floorSizeLimit))
-	if errors.Is(err, errBadFile) {
-		return retiredRecord{}, fmt.Errorf("%w: %s: %w", errFloorUntrusted, newest, err)
-	}
-	if err != nil {
-		return retiredRecord{}, err
-	}
-	if err := s.floorOwned(fi); err != nil {
-		return retiredRecord{}, fmt.Errorf("%w: %s: %w", errFloorUntrusted, newest, err)
-	}
-	return parseRetired(b)
+	return retiredRecord{}, errNoMatchingRetired(len(cands))
 }
 
 // classifyUndo splits r's buried-live names, in the reverse merge of an
