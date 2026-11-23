@@ -183,10 +183,10 @@ func keysIno(t *testing.T, path string) uint64 {
 
 // U91: audit --rotate keeps four archives, .1 the newest; with .4 present
 // it refuses, changing nothing, unless --discard-oldest, which deletes .4
-// first; each archive it shifts is unflagged, made root's 0600 and flagged
-// again on its own descriptor, the old log becomes .1 and is flagged on
-// its descriptor, and the new log is empty, so every uid's share of it
-// starts at 0. Usage and a non-root caller are refused before the store
+// first; the swapped-in directory holds a fresh .1 with the old log's
+// bytes, the older archives carried by hard link as .2 to .4, root's 0600
+// and unflagged, and an empty new log, so every uid's share of it starts
+// at 0. Usage and a non-root caller are refused before the store
 // opens; the verb's audit line is audit-rotate, via root (AuditRoot).
 func TestAuditRotateKeepsFourArchives(t *testing.T) {
 	h := newKeysHarness(t)
