@@ -3280,6 +3280,21 @@ service user can only add to.
     with the count, and the count is persisted, not kept only in memory: the next summary line
     written for that source carries it, and root's next `audit --rotate` writes any count still
     unwritten as one line charged to no uid (U85, U126).
+  - *The pre-frame part is split so a login user cannot spend it for everyone.* A login user
+    can be refused at will (a self-sandboxed process is refused as `sandboxed` under its own
+    uid), so the 256 KiB pre-frame part is not one pool. A **login line** is a pre-frame line
+    whose uid is from 501 to 2147483647 and whose `result` is not a uid-range reason (`root`,
+    `service-uid`, `system-uid`, `high-uid`): the `sandboxed`, `sandbox-unknown` and
+    `token-mismatch` refusals, `cred-unreadable` when a uid was read, and the summaries of such
+    a uid. Login lines draw on at most 8 KiB per uid (`keystore.PreFrameLoginUIDShare`) and at
+    most 128 KiB for all login uids together (`keystore.PreFrameLoginBudget`), for the life of
+    the log; every other pre-frame line (root, the service uid, a system or high uid, uid
+    4294967295 when none was read) draws on the remaining 128 KiB
+    (`keystore.PreFrameReserved`), which no login line can consume. A line past its part is
+    dropped and counted as any other. The class is read off each line's uid and `result` when
+    the server recounts, never from memory. *Residual:* the reserved part is still one pool, so
+    a process running as root, or as the service user (which can append forged pre-frame lines
+    too), can spend it and silence the other ineligible peers' lines until the log is rotated.
   - *Past the share, reads are refused too.* A uid past its share has its own mutations and
     its own reads refused with `ErrLogFull` (code `log-full`) before any line is written, so
     no read is a way around the share. Its `refused` lines and their summaries are not written

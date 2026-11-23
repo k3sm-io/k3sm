@@ -40,6 +40,28 @@ import (
 // from the audit log, never from memory.
 const PreFrameBudget = 256 << 10
 
+// The pre-frame part's split (docs/design/keystore.md § "Per-uid fairness",
+// the reconciler budget). A refusal of a peer whose uid is in the login
+// range (501 to 2147483647) and whose reason is not a uid-range reason (it
+// was refused as sandboxed, as sandbox-unknown, as token-mismatch, or as
+// cred-unreadable with its uid read), and a summary line of such a uid, is a
+// login line: it is charged to its uid's sub-share and to the login part.
+// Every other pre-frame line (root, the service uid, a system or high uid,
+// no uid read) is charged to the reserved part, which no login line draws
+// on. Each part is recounted from the log, the class read off the line's
+// uid and result, never from memory.
+const (
+	// PreFrameLoginUIDShare is the most one login uid's pre-frame lines may
+	// take of an audit log, for the life of that log.
+	PreFrameLoginUIDShare = 8 << 10
+	// PreFrameLoginBudget is the most all login uids' pre-frame lines may
+	// take of an audit log together.
+	PreFrameLoginBudget = 128 << 10
+	// PreFrameReserved is the part kept for the pre-frame lines of
+	// ineligible peers.
+	PreFrameReserved = PreFrameBudget - PreFrameLoginBudget
+)
+
 // ServerAppendLockWait is the longest a server append waits for the store
 // lock (docs/design/keystore.md § "The audit log": every append takes the
 // store lock); past it the line is not written and is counted as dropped.
@@ -87,8 +109,11 @@ type ServerLogs struct {
 	audit heldLog
 	floor heldLog
 	// used is the pre-frame bytes counted in the held audit file up to
-	// audit.off.
-	used int64
+	// audit.off; usedLogin the login lines' part of it, and usedByUID each
+	// login uid's.
+	used      int64
+	usedLogin int64
+	usedByUID map[uint32]int64
 	// pending is each uid's dropped count not yet in a summary line.
 	pending map[uint32]uint64
 }
@@ -106,10 +131,11 @@ type heldLog struct {
 // the first Reopen or append opens both logs and counts the budget.
 func (s *FileStore) ServerLogs() *ServerLogs {
 	return &ServerLogs{
-		s:       s,
-		audit:   heldLog{log: &appendLog{s: s, name: auditLogName}},
-		floor:   heldLog{log: &appendLog{s: s, name: userFloorLogName}},
-		pending: map[uint32]uint64{},
+		s:         s,
+		audit:     heldLog{log: &appendLog{s: s, name: auditLogName}},
+		floor:     heldLog{log: &appendLog{s: s, name: userFloorLogName}},
+		pending:   map[uint32]uint64{},
+		usedByUID: map[uint32]int64{},
 	}
 }
 
@@ -234,7 +260,13 @@ func (l *ServerLogs) closeLocked() {
 		}
 		h.f, h.id, h.off = nil, LogFileID{}, 0
 	}
-	l.used = 0
+	l.resetCountLocked()
+}
+
+// resetCountLocked forgets the pre-frame count.
+func (l *ServerLogs) resetCountLocked() {
+	l.used, l.usedLogin = 0, 0
+	clear(l.usedByUID)
 }
 
 // ensureLocked makes each held descriptor the canonical file's, judged:
@@ -259,13 +291,13 @@ func (l *ServerLogs) ensureLocked() error {
 		if err != nil {
 			h.id, h.off = LogFileID{}, 0
 			if h == &l.audit {
-				l.used = 0
+				l.resetCountLocked()
 			}
 			return err
 		}
 		h.f, h.id, h.off = f, LogFileID{Dev: uint64(st.Dev), Ino: st.Ino}, 0
 		if h == &l.audit {
-			l.used = 0
+			l.resetCountLocked()
 		}
 	}
 	var st unix.Stat_t
@@ -309,7 +341,8 @@ func (l *ServerLogs) canonical(h *heldLog) (bool, error) {
 func (l *ServerLogs) countLocked(size int64) error {
 	h := &l.audit
 	if size < h.off {
-		h.off, l.used = 0, 0
+		h.off = 0
+		l.resetCountLocked()
 	}
 	if size == h.off {
 		return nil
@@ -341,8 +374,10 @@ func (l *ServerLogs) countLocked(size int64) error {
 		if err != nil {
 			return h.log.unreadable(off, err)
 		}
-		if len(line) > 1 && isPreFrameLine(line[:len(line)-1]) {
-			l.used += int64(len(line)) + 1
+		if len(line) > 1 {
+			if rec, ok := preFrameLineOf(line[:len(line)-1]); ok {
+				l.chargeLocked(rec, int64(len(line))+1)
+			}
 		}
 		off += int64(len(line))
 	}
@@ -368,7 +403,7 @@ func (l *ServerLogs) appendLocked(rec preFrameRec) error {
 	}
 	out := make([]byte, 0, len(line)+2)
 	out = append(append(append(out, '\n'), line...), '\n')
-	if l.used+int64(len(out)) > PreFrameBudget {
+	if !l.roomLocked(rec, int64(len(out))) {
 		return errPreFrameBudgetSpent
 	}
 	h := &l.audit
@@ -396,6 +431,40 @@ func (l *ServerLogs) appendLocked(rec preFrameRec) error {
 		return fmt.Errorf("append to %s: %w", auditLogName, err)
 	}
 	return nil
+}
+
+// chargeLocked adds n bytes of rec's to the count of its part.
+func (l *ServerLogs) chargeLocked(rec preFrameRec, n int64) {
+	l.used += n
+	if preFrameLoginLine(rec) {
+		l.usedLogin += n
+		l.usedByUID[rec.Caller.UID] += n
+	}
+}
+
+// roomLocked reports whether n more bytes of rec's fit its part: a login
+// line its uid's sub-share and the login part, any other line the reserved
+// part, and every line the whole pre-frame part.
+func (l *ServerLogs) roomLocked(rec preFrameRec, n int64) bool {
+	if l.used+n > PreFrameBudget {
+		return false
+	}
+	if preFrameLoginLine(rec) {
+		return l.usedByUID[rec.Caller.UID]+n <= PreFrameLoginUIDShare && l.usedLogin+n <= PreFrameLoginBudget
+	}
+	return l.used-l.usedLogin+n <= PreFrameReserved
+}
+
+// The pre-frame reasons that say the peer's uid is not a login uid: these
+// lines are charged to the reserved part whatever uid they name.
+var preFrameUIDRangeReasons = []string{"root", "service-uid", "system-uid", "high-uid"}
+
+// preFrameLoginLine reports whether rec is a login line: its uid in the
+// login range and its result not a uid-range reason. A summary line is
+// classed by its uid; the service uid is a system uid, below the range.
+func preFrameLoginLine(rec preFrameRec) bool {
+	uid := rec.Caller.UID
+	return uid >= minScopeUID && uid <= maxScopeUID && !slices.Contains(preFrameUIDRangeReasons, rec.Result)
 }
 
 // preFrameRec is a pre-frame refused line, or its summary: the audit
@@ -439,18 +508,18 @@ func preFrameRecord(uid uint32, result string, dropped uint64, now time.Time) pr
 	}
 }
 
-// isPreFrameLine reports whether line, without its newline, reads strictly
-// as a pre-frame line: format 1, op refused, via socket, no scope, charged
-// to the reconciler's pre-frame part. Only such lines are counted against
-// PreFrameBudget.
-func isPreFrameLine(line []byte) bool {
+// preFrameLineOf decodes line, without its newline, and reports whether it
+// reads strictly as a pre-frame line: format 1, op refused, via socket, no
+// scope, charged to the reconciler's pre-frame part. Only such lines are
+// counted against PreFrameBudget.
+func preFrameLineOf(line []byte) (preFrameRec, bool) {
 	if err := auditKeysStrictOf(line, preFrameKeys); err != nil {
-		return false
+		return preFrameRec{}, false
 	}
 	var r preFrameRec
 	if err := json.Unmarshal(line, &r); err != nil {
-		return false
+		return preFrameRec{}, false
 	}
-	return r.V == auditFormat && r.Op == auditOpRefused && r.Via == auditViaSocket && r.Scope == "" &&
+	return r, r.V == auditFormat && r.Op == auditOpRefused && r.Via == auditViaSocket && r.Scope == "" &&
 		r.Charge == auditChargeReconcil && r.Source == auditSourcePreFrame
 }
