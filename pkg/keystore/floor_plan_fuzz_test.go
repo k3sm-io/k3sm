@@ -157,7 +157,18 @@ func FuzzPlanMerge(f *testing.F) {
 			}
 		}
 		if len(p.dropped) == 0 {
-			again := planMerge(p.merged, from, keep, ptrs, nil)
+			// A --keep name the merge keeps nothing for refuses it
+			// (unmatchedKeep), so the merge an operator runs twice names
+			// only what the first kept; a name that kept nothing changes
+			// nothing in the first merge.
+			matched := map[string]bool{}
+			for _, name := range p.r.Kept {
+				matched[name] = true
+			}
+			if m := planMerge(before, from, matched, ptrs, nil); !floorsEqual(m.merged, p.merged) || !slices.Equal(m.r.Kept, p.r.Kept) {
+				t.Fatalf("the merge keeping only %v = %+v, want the merge keeping %v, %+v", p.r.Kept, m.r, keep, p.r)
+			}
+			again := planMerge(p.merged, from, matched, ptrs, nil)
 			// A rerun keeps each kept name again and writes nothing
 			// (docs/design/keystore.md): the same Kept, no floor change.
 			if again.r.floorChanges() || !slices.Equal(again.r.Kept, p.r.Kept) || len(again.dropped) != 0 || !floorsEqual(again.merged, p.merged) {

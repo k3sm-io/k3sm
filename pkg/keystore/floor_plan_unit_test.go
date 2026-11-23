@@ -107,3 +107,30 @@ func TestFuzzRmReportsCapEviction(t *testing.T) {
 		t.Errorf("the reverse merge lost the rm's burial of b %s", gen)
 	}
 }
+
+// TestPlanMergeUnmatchedKeepRefusedFirst (U192): --keep of a name the
+// merge only fences keeps nothing, so the merge refuses it (unmatchedKeep)
+// and an operator's second merge never names it; the merge keeping only
+// what it kept is the same merge, and merged again it writes nothing. The
+// second merge with the unmatched name would read the fence as a recorded
+// keep, which FuzzPlanMerge's merge-twice oracle took for a change.
+func TestPlanMergeUnmatchedKeepRefusedFirst(t *testing.T) {
+	live := floor{"a": {Generation: mgen(0), Seq: 4}}
+	aside := floor{"a": {Generation: mgen(0), Seq: 4}}
+	keep := map[string]bool{"a": true}
+	once := planMerge(live, aside, keep, nil, nil)
+	if !slices.Equal(once.r.Fenced, []string{"a"}) || len(once.r.Kept) != 0 {
+		t.Fatalf("the merge keeping a = %+v, want a fenced and nothing kept", once.r)
+	}
+	if u := unmatchedKeep(keep, once.r.Kept); !slices.Equal(u, []string{"a"}) {
+		t.Fatalf("unmatchedKeep = %v, want a, so the merge is refused", u)
+	}
+	none := planMerge(live, aside, nil, nil, nil)
+	if !floorsEqual(none.merged, once.merged) {
+		t.Fatalf("the merge keeping nothing = %+v, want %+v", none.merged, once.merged)
+	}
+	again := planMerge(none.merged, aside, nil, nil, nil)
+	if again.r.changes() || !floorsEqual(again.merged, none.merged) {
+		t.Errorf("the merge run again = %+v, want no change", again.r)
+	}
+}
