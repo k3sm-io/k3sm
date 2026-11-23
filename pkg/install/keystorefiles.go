@@ -312,6 +312,9 @@ func (g *keystoreGate) ensureLog(name string, svcUID, svcGID int) error {
 	if err := removeStaged(sfd, name, g.rootUID, svcUID); err != nil {
 		return err
 	}
+	if err := beforeLogStep("create"); err != nil {
+		return fmt.Errorf("before creating %s: %w", name, err)
+	}
 	fd, err := unix.Openat(sfd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, keystoreLogMode)
 	if err != nil {
 		return fmt.Errorf("create %s in %s: %w", name, keystore.StagingDirName, err)
@@ -327,11 +330,17 @@ func (g *keystoreGate) ensureLog(name string, svcUID, svcGID int) error {
 	if err := g.setGate(keystoreGateMode); err != nil {
 		return err
 	}
+	if err := beforeLogStep("rename"); err != nil {
+		return fmt.Errorf("before renaming %s: %w", name, err)
+	}
 	if err := unix.RenameatxNp(sfd, name, g.lfd, name, unix.RENAME_EXCL); err != nil {
 		return fmt.Errorf("rename %s into %s: %w", name, keystore.LogsDirName, err)
 	}
 	if err := flagAndJudge(fd, name, svcUID); err != nil {
 		return err
+	}
+	if err := beforeLogStep("fsync"); err != nil {
+		return fmt.Errorf("before fsyncing %s: %w", keystore.LogsDirName, err)
 	}
 	if err := unix.Fsync(g.lfd); err != nil {
 		return fmt.Errorf("fsync %s: %w", keystore.LogsDirName, err)

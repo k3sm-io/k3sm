@@ -44,6 +44,25 @@ type fileAttrWriter interface {
 	Fchflags(fd, flags int) error
 }
 
+// swapStepper is the optional step seam of the file-attribute writer: when
+// fileAttrSeam also implements it, the keystore step calls BeforeSwapStep
+// with the step's name before each step of a log's creation that makes no
+// attribute call of its own ("create", "rename", "fsync"), so a root-run
+// test can probe, or stop install at, every step. An error fails the step
+// as a crash there would leave it.
+type swapStepper interface {
+	BeforeSwapStep(step string) error
+}
+
+// beforeLogStep calls the step seam, when fileAttrSeam has one.
+func beforeLogStep(step string) error {
+	h, ok := fileAttrSeam.(swapStepper)
+	if !ok {
+		return nil
+	}
+	return h.BeforeSwapStep(step)
+}
+
 // realFileAttrWriter is the file-attribute writer over the syscalls.
 type realFileAttrWriter struct{}
 
