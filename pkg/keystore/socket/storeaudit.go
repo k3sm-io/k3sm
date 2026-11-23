@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sync"
 )
 
 // RefusalLog is the store side of the refusal audit: the server's append
@@ -83,45 +82,5 @@ func (a *StoreAuditor) droppedContext(ctx context.Context, uid uint32, n uint64)
 func (a *StoreAuditor) flushPending(ctx context.Context) {
 	if err := a.log.Dropped(ctx, NoUID, 0); err != nil {
 		a.logger.Warn("keystore socket: a dropped-count summary line was not written; the count is kept for the next", "err", err)
-	}
-}
-
-// LogReopener is the store side of the reopen after maintenance:
-// *keystore.ServerLogs's Reopen and *keystore.FileStore's
-// MaintenanceMarked in production.
-type LogReopener interface {
-	// MaintenanceMarked reports whether the maintenance marker stands.
-	MaintenanceMarked() (bool, error)
-	// Reopen takes the store lock exclusively, reopens the audit and floor
-	// append descriptors and recounts what is charged from the new files
-	// before releasing it.
-	Reopen(ctx context.Context) error
-}
-
-// ReopenAfterMaintenance returns the Supervisor's MaintenanceMarked check
-// over r: it reports the marker as r reads it, and when the marker is
-// clear for the first time, and the first time after it stood, it reopens
-// the append descriptors (Reopen) before reporting it clear, so the
-// listener starts, and every later append is charged, against the new
-// files. A Reopen that fails is the check's error, so the listener stays
-// down (fail closed) and the next poll tries again.
-func ReopenAfterMaintenance(r LogReopener) func() (bool, error) {
-	var mu sync.Mutex
-	stale := true // nothing reopened yet
-	return func() (bool, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		marked, err := r.MaintenanceMarked()
-		if err != nil || marked {
-			stale = true
-			return marked, err
-		}
-		if stale {
-			if err := r.Reopen(context.Background()); err != nil {
-				return false, err
-			}
-			stale = false
-		}
-		return false, nil
 	}
 }

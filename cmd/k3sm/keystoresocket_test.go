@@ -215,7 +215,7 @@ func TestKeystoreSocketWiring(t *testing.T) {
 		if err := cfg.CheckInstall(ctx); err == nil || !strings.Contains(err.Error(), "keystore-sock") {
 			t.Errorf("CheckInstall = %v, want the store's refusal naming the socket directory", err)
 		}
-		// The store's marker, through the reopen wrapper.
+		// The store's marker, read only.
 		marker := filepath.Join(f.dataRoot, keystore.MaintenanceMarkerName)
 		if err := os.WriteFile(marker, nil, 0o644); err != nil {
 			t.Fatal(err)
@@ -226,10 +226,13 @@ func TestKeystoreSocketWiring(t *testing.T) {
 		if err := os.Remove(marker); err != nil {
 			t.Fatal(err)
 		}
-		// With the marker gone the wrapper reopens the logs, which a temp
-		// data root does not have, so the check fails closed.
-		if marked, err := cfg.MaintenanceMarked(); marked || err == nil {
-			t.Errorf("MaintenanceMarked = %v, %v with no logs to reopen; want the reopen's error", marked, err)
+		if marked, err := cfg.MaintenanceMarked(); marked || err != nil {
+			t.Errorf("MaintenanceMarked = %v, %v with the marker gone; want false: the read reopens nothing", marked, err)
+		}
+		// The log reopen is its own step: a temp data root has no logs, so
+		// it fails closed.
+		if err := cfg.OpenLogs(ctx); err == nil {
+			t.Error("OpenLogs succeeded with no logs to reopen; want the reopen's error")
 		}
 		if _, ok := cfg.Creds.(fakePeerCreds); !ok {
 			t.Errorf("Creds = %T, want the given source", cfg.Creds)
@@ -290,6 +293,7 @@ func TestKeystoreSocketWiring(t *testing.T) {
 				IgnoresOwnership:  func() (bool, error) { return false, nil },
 				CheckInstall:      func(context.Context) error { return nil },
 				MaintenanceMarked: func() (bool, error) { return false, nil },
+				OpenLogs:          func(context.Context) error { return nil },
 				ServerCount: func(ctx context.Context) (int, error) {
 					close(entered)
 					<-ctx.Done()

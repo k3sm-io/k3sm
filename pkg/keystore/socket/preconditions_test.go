@@ -28,6 +28,7 @@ func passing() Preconditions {
 		EUID:              func() int { return 260 },
 		ServiceUID:        260,
 		MaintenanceMarked: func() (bool, error) { return false, nil },
+		OpenLogs:          func(context.Context) error { return nil },
 		IgnoresOwnership:  func() (bool, error) { return false, nil },
 		CheckInstall:      func(context.Context) error { return nil },
 		ServerCount:       func(context.Context) (int, error) { return 1, nil },
@@ -52,16 +53,38 @@ func TestPreconditionsCheck(t *testing.T) {
 		{"ignore ownership", func(p *Preconditions) { p.IgnoresOwnership = func() (bool, error) { return true, nil } }, OffIgnoresOwnership},
 		{"mount unreadable", func(p *Preconditions) { p.IgnoresOwnership = func() (bool, error) { return false, boom } }, OffMountUnknown},
 		{"install", func(p *Preconditions) { p.CheckInstall = func(context.Context) error { return boom } }, OffInstall},
+		{"logs unavailable", func(p *Preconditions) { p.OpenLogs = func(context.Context) error { return boom } }, OffLogsUnavailable},
+		{"logs panic", func(p *Preconditions) { p.OpenLogs = func(context.Context) error { panic("fake") } }, OffLogsUnavailable},
 		{"two servers", func(p *Preconditions) { p.ServerCount = func(context.Context) (int, error) { return 2, nil } }, OffServers},
 		{"no server", func(p *Preconditions) { p.ServerCount = func(context.Context) (int, error) { return 0, nil } }, OffServersUnknown},
 		{"count error", func(p *Preconditions) { p.ServerCount = func(context.Context) (int, error) { return 0, boom } }, OffServersUnknown},
 		{"sandbox check unusable", func(p *Preconditions) { p.SandboxCheck = func() error { return boom } }, OffSandboxCheckUnusable},
 		{"sandbox check panics", func(p *Preconditions) { p.SandboxCheck = func() error { panic("fake") } }, OffSandboxCheckUnusable},
 		{"sandbox check usable", func(p *Preconditions) { p.SandboxCheck = func() error { return nil } }, ""},
-		{"euid before marker", func(p *Preconditions) {
+		{"euid before mount", func(p *Preconditions) {
 			p.EUID = func() int { return 0 }
-			p.MaintenanceMarked = func() (bool, error) { return true, nil }
+			p.IgnoresOwnership = func() (bool, error) { return true, nil }
 		}, OffNotInstalledServer},
+		{"mount before install", func(p *Preconditions) {
+			p.IgnoresOwnership = func() (bool, error) { return true, nil }
+			p.CheckInstall = func(context.Context) error { return boom }
+		}, OffIgnoresOwnership},
+		{"install before marker", func(p *Preconditions) {
+			p.CheckInstall = func(context.Context) error { return boom }
+			p.MaintenanceMarked = func() (bool, error) { return false, boom }
+		}, OffInstall},
+		{"marker before logs", func(p *Preconditions) {
+			p.MaintenanceMarked = func() (bool, error) { return true, nil }
+			p.OpenLogs = func(context.Context) error { return boom }
+		}, OffMaintenance},
+		{"logs before sandbox check", func(p *Preconditions) {
+			p.OpenLogs = func(context.Context) error { return boom }
+			p.SandboxCheck = func() error { return boom }
+		}, OffLogsUnavailable},
+		{"sandbox check before servers", func(p *Preconditions) {
+			p.SandboxCheck = func() error { return boom }
+			p.ServerCount = func(context.Context) (int, error) { return 2, nil }
+		}, OffSandboxCheckUnusable},
 		{"install before servers", func(p *Preconditions) {
 			p.CheckInstall = func(context.Context) error { return boom }
 			p.ServerCount = func(context.Context) (int, error) { return 2, nil }
@@ -75,7 +98,7 @@ func TestPreconditionsCheck(t *testing.T) {
 			}
 		})
 	}
-	for _, r := range []OffReason{OffNotInstalledServer, OffMaintenance, OffMaintenanceUnknown, OffIgnoresOwnership, OffMountUnknown, OffServers, OffServersUnknown, OffListenerUnavailable, OffListenerFailed, OffSandboxCheckUnusable} {
+	for _, r := range []OffReason{OffNotInstalledServer, OffMaintenance, OffMaintenanceUnknown, OffIgnoresOwnership, OffMountUnknown, OffLogsUnavailable, OffServers, OffServersUnknown, OffListenerUnavailable, OffListenerFailed, OffSandboxCheckUnusable} {
 		if got := r.Remedy(); got != "" {
 			t.Errorf("%q names the remedy %q, want none", r, got)
 		}

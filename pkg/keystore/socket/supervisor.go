@@ -56,6 +56,7 @@ const (
 	OffIgnoresOwnership     OffReason = "the data root is mounted ignoring ownership"
 	OffMountUnknown         OffReason = "the data root's mount flags cannot be read"
 	OffInstall              OffReason = "the socket directory or an append-only log is missing, wrong or unflagged"
+	OffLogsUnavailable      OffReason = "the append-only logs cannot be opened (logs-unavailable)"
 	OffServers              OffReason = "more than one server registered"
 	OffServersUnknown       OffReason = "the server count is unknown"
 	OffListenerUnavailable  OffReason = "the listening socket is unavailable"
@@ -125,8 +126,13 @@ type SupervisorConfig struct {
 	CheckInstall func(ctx context.Context) error
 	// ServerCount returns how many servers the cluster has registered.
 	ServerCount func(ctx context.Context) (int, error)
-	// MaintenanceMarked reports whether the maintenance marker stands.
+	// MaintenanceMarked reports whether the maintenance marker stands. It
+	// only reads: the supervisor polls it while serving.
 	MaintenanceMarked func() (bool, error)
+	// OpenLogs reopens the server's audit and floor append descriptors and
+	// recounts what is charged from the new files (Preconditions.OpenLogs);
+	// production passes (*keystore.ServerLogs).Reopen.
+	OpenLogs func(ctx context.Context) error
 	// SandboxCheck is Preconditions.SandboxCheck; nil skips it.
 	SandboxCheck func() error
 	// Creds, Sandbox, Audit and Handler are given to each run's Listener.
@@ -170,6 +176,8 @@ func NewSupervisor(cfg SupervisorConfig) (*Supervisor, error) {
 		missing = "server count"
 	case cfg.MaintenanceMarked == nil:
 		missing = "maintenance marker check"
+	case cfg.OpenLogs == nil:
+		missing = "log reopen"
 	case cfg.Creds == nil:
 		missing = "peer-credential source"
 	case cfg.Sandbox == nil:
@@ -279,6 +287,7 @@ func (s *Supervisor) check(ctx context.Context) (OffReason, string) {
 		EUID:              s.cfg.EUID,
 		ServiceUID:        s.cfg.ServiceUID,
 		MaintenanceMarked: s.cfg.MaintenanceMarked,
+		OpenLogs:          s.cfg.OpenLogs,
 		IgnoresOwnership:  s.cfg.IgnoresOwnership,
 		CheckInstall:      s.cfg.CheckInstall,
 		ServerCount:       s.cfg.ServerCount,
@@ -294,8 +303,15 @@ type Preconditions struct {
 	EUID func() int
 	// ServiceUID is the service user's uid.
 	ServiceUID uint32
-	// MaintenanceMarked reports whether the maintenance marker stands.
+	// MaintenanceMarked reports whether the maintenance marker stands,
+	// reading it only.
 	MaintenanceMarked func() (bool, error)
+	// OpenLogs is the step after the marker: the supervisor reopens both
+	// append-only logs on it, so the listener starts against the files as
+	// they are now (after maintenance swapped them, too); doctor judges
+	// both logs read-only, holding and writing nothing. An error keeps the
+	// listener off with OffLogsUnavailable.
+	OpenLogs func(ctx context.Context) error
 	// IgnoresOwnership reports whether the data root is mounted with
 	// MNT_IGNORE_OWNERSHIP.
 	IgnoresOwnership func() (bool, error)
@@ -306,14 +322,18 @@ type Preconditions struct {
 	ServerCount func(ctx context.Context) (int, error)
 	// SandboxCheck is the start-time control on the peer-sandbox check;
 	// production passes SandboxSelfCheck. An error keeps the listener off
-	// with OffSandboxCheckUnusable. It is run last; nil skips it.
+	// with OffSandboxCheckUnusable. It runs before the server count; nil
+	// skips it.
 	SandboxCheck func() error
 }
 
 // Check runs the start checks in the design's order (the effective uid, the
-// maintenance marker, the mount flags, the installed files, a server count
-// of exactly one) and returns the first reason the listener may not start,
-// with its error's text, or "" when every check passes.
+// mount flags, the installed files, the maintenance marker, the log reopen,
+// the sandbox self-check, a server count of exactly one) and returns the
+// first reason the listener may not start, with its error's text, or ""
+// when every check passes. Nothing is opened on the data root before its
+// mount flags and the installed files are vetted, so an install that
+// predates the logs is reported as the install reason, naming its remedy.
 //
 // A check that panics is recovered and fails as that check: its reason,
 // with the panic as its detail.
@@ -325,11 +345,6 @@ func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
 	if euid < 0 || uint64(euid) != uint64(p.ServiceUID) {
 		return OffNotInstalledServer, fmt.Sprintf("effective uid %d is not the service uid %d", euid, p.ServiceUID)
 	}
-	if marked, err := guard(p.MaintenanceMarked); err != nil {
-		return OffMaintenanceUnknown, err.Error()
-	} else if marked {
-		return OffMaintenance, ""
-	}
 	if ignores, err := guard(p.IgnoresOwnership); err != nil {
 		return OffMountUnknown, err.Error()
 	} else if ignores {
@@ -337,6 +352,19 @@ func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
 	}
 	if _, err := guard(func() (struct{}, error) { return struct{}{}, p.CheckInstall(ctx) }); err != nil {
 		return OffInstall, err.Error()
+	}
+	if marked, err := guard(p.MaintenanceMarked); err != nil {
+		return OffMaintenanceUnknown, err.Error()
+	} else if marked {
+		return OffMaintenance, ""
+	}
+	if _, err := guard(func() (struct{}, error) { return struct{}{}, p.OpenLogs(ctx) }); err != nil {
+		return OffLogsUnavailable, err.Error()
+	}
+	if p.SandboxCheck != nil {
+		if _, err := guard(func() (struct{}, error) { return struct{}{}, p.SandboxCheck() }); err != nil {
+			return OffSandboxCheckUnusable, err.Error()
+		}
 	}
 	n, err := guard(func() (int, error) { return p.ServerCount(ctx) })
 	switch {
@@ -346,11 +374,6 @@ func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
 		return OffServers, fmt.Sprintf("%d servers registered", n)
 	case n < 1:
 		return OffServersUnknown, fmt.Sprintf("%d servers registered", n)
-	}
-	if p.SandboxCheck != nil {
-		if _, err := guard(func() (struct{}, error) { return struct{}{}, p.SandboxCheck() }); err != nil {
-			return OffSandboxCheckUnusable, err.Error()
-		}
 	}
 	return "", ""
 }

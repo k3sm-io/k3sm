@@ -137,8 +137,8 @@ func newKeystoreSocket(deps keystoreSocketDeps) (*keystoreSocket, error) {
 // store's server log surface and its refusal auditor, the peer sources, the
 // handler and the start checks (the effective uid, the service uid, the
 // mount flags of a data-root descriptor it opens and keeps open, the store's
-// install check, the maintenance marker check that reopens the logs after
-// maintenance, and the server count). The returned func closes the
+// install check, the maintenance marker read, the log reopen and the server
+// count). The returned func closes the
 // descriptors the config holds.
 func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, func(), error) {
 	if deps.listen == nil {
@@ -183,7 +183,8 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 		IgnoresOwnership:  func() (bool, error) { return deps.ignoresOwnership(dir) },
 		CheckInstall:      store.CheckSocketInstall,
 		ServerCount:       func(ctx context.Context) (int, error) { return countKeystoreServers(ctx, cs) },
-		MaintenanceMarked: socket.ReopenAfterMaintenance(logs),
+		MaintenanceMarked: logs.MaintenanceMarked,
+		OpenLogs:          logs.Reopen,
 		Creds:             deps.creds,
 		Sandbox:           deps.sandbox,
 		Audit:             audit,
@@ -298,6 +299,7 @@ func doctorKeystoreUserScope(workDir string) (socket.Preconditions, func(), erro
 		EUID:              euid,
 		ServiceUID:        uid,
 		MaintenanceMarked: store.MaintenanceMarked,
+		OpenLogs:          store.CheckLogFlags,
 		IgnoresOwnership:  ignores,
 		CheckInstall:      store.CheckSocketInstall,
 		ServerCount:       count,

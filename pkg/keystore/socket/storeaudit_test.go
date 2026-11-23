@@ -321,7 +321,14 @@ func TestMaintenanceReopensLogsAndResetsShares(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := newStoreRig(t)
 		r.writeLog(t, r.auditPath(), fullBudget())
-		gate := ReopenAfterMaintenance(r.logs)
+		// gate is the supervisor's marker read then its log reopen, as
+		// Preconditions runs them.
+		gate := func() (bool, error) {
+			if marked, err := r.logs.MaintenanceMarked(); err != nil || marked {
+				return marked, err
+			}
+			return false, r.logs.Reopen(context.Background())
+		}
 		a := newStoreAuditor(t, r.logs)
 		if marked, err := gate(); err != nil || marked {
 			t.Fatalf("gate at start = %v, %v", marked, err)
@@ -398,12 +405,12 @@ func TestMaintenanceReopensLogsAndResetsShares(t *testing.T) {
 		if got := r.logs.PendingDropped(0); got != 0 {
 			t.Fatalf("dropped count after its summary = %d", got)
 		}
-		// The next check reads the marker only: no second reopen.
+		// A reopen with nothing swapped holds the same files.
 		if marked, err := gate(); err != nil || marked {
 			t.Fatalf("gate again = %v, %v", marked, err)
 		}
-		if a2, _ := r.logs.Files(); a2 != audit1 {
-			t.Fatalf("reopened with no maintenance: %v", a2)
+		if a2, f2 := r.logs.Files(); a2 != audit1 || f2 != floor1 {
+			t.Fatalf("a reopen with no maintenance moved to %v, %v", a2, f2)
 		}
 	})
 }
@@ -491,5 +498,45 @@ func TestMaintenanceMarkedReadsTheMarker(t *testing.T) {
 	}
 	if marked, err := r.fs.MaintenanceMarked(); err != nil || !marked {
 		t.Fatalf("marker: %v, %v", marked, err)
+	}
+}
+
+// TestInstallMissingLogNamesInstall holds the check order to the upgrade
+// path: on a data root whose install predates the append-only logs, the
+// production start checks (the real store's install check, marker read and
+// log reopen) report the install reason, which names `sudo k3sm install`,
+// and open no log.
+func TestInstallMissingLogNamesInstall(t *testing.T) {
+	for _, name := range []string{"audit", "floor"} {
+		t.Run(name, func(t *testing.T) {
+			r := newStoreRig(t)
+			p := r.auditPath()
+			if name == "floor" {
+				p = r.floorPath()
+			}
+			if err := os.Remove(p); err != nil {
+				t.Fatal(err)
+			}
+			pre := Preconditions{
+				EUID:              func() int { return 260 },
+				ServiceUID:        260,
+				IgnoresOwnership:  func() (bool, error) { return false, nil },
+				CheckInstall:      r.fs.CheckSocketInstall,
+				MaintenanceMarked: r.logs.MaintenanceMarked,
+				OpenLogs:          r.logs.Reopen,
+				SandboxCheck:      func() error { return nil },
+				ServerCount:       func(context.Context) (int, error) { return 1, nil },
+			}
+			reason, detail := pre.Check(t.Context())
+			if reason != OffInstall || reason.Remedy() != "run `sudo k3sm install`" {
+				t.Fatalf("Check = %q (%s); want the install reason naming sudo k3sm install", reason, detail)
+			}
+			if !bytes.Contains([]byte(detail), []byte("is missing")) {
+				t.Fatalf("detail %q does not say the log is missing", detail)
+			}
+			if a, f := r.logs.Files(); a != (keystore.LogFileID{}) || f != (keystore.LogFileID{}) {
+				t.Fatalf("a log was opened before the install was vetted: %v, %v", a, f)
+			}
+		})
 	}
 }

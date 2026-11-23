@@ -3635,9 +3635,13 @@ directory is root's"). A worker node runs no listener (E18).
   "keystore user scope: off (<reason>); run `sudo k3sm install`"; and the CLI's connect error
   names `sudo k3sm install` (U31, U38, E15).
 - **Supervision details.** The start checks run at start and before every retry, in this order:
-  the effective uid, the maintenance marker, the data root's mount flags, the installed files,
-  and a server count of exactly one (a count that cannot be read, or of none, keeps the
-  listener off too). A failed check retries on the same backoff as a failure, except the
+  the effective uid, the data root's mount flags, the installed files, the maintenance marker
+  (read only), the reopen of both append-only logs (its own step: a reopen that fails keeps the
+  listener off as `logs-unavailable`, with the error), the peer-sandbox self-check, and a server
+  count of exactly one (a count that cannot be read, or of none, keeps the listener off too).
+  Nothing is opened on the data root before its mount flags and the installed files are
+  vetted, so an install that predates the logs is reported as the install reason, naming
+  `sudo k3sm install`. A failed check retries on the same backoff as a failure, except the
   marker, which is polled every 2 seconds, both while it stands and while the listener serves;
   a marker that appears, or that cannot be read, stops the listener and cuts its connections.
   Between runs the activated descriptor stays open and bound: accept is stopped by expiring

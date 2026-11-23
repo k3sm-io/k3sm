@@ -494,6 +494,7 @@ func userScopeChecks(mut func(*socket.Preconditions)) func() (socket.Preconditio
 			EUID:              func() int { return 260 },
 			ServiceUID:        260,
 			MaintenanceMarked: func() (bool, error) { return false, nil },
+			OpenLogs:          func(context.Context) error { return nil },
 			IgnoresOwnership:  func() (bool, error) { return false, nil },
 			CheckInstall:      func(context.Context) error { return nil },
 			ServerCount:       func(context.Context) (int, error) { return 1, nil },
@@ -536,6 +537,17 @@ func TestDoctorKeystoreUserScopeRow(t *testing.T) {
 		{name: "install check failed", seam: userScopeChecks(func(p *socket.Preconditions) {
 			p.CheckInstall = func(context.Context) error { return errors.New("the socket directory keystore-sock is missing") }
 		}), status: statusWarn, detail: "keystore user scope: off (the socket directory or an append-only log is missing, wrong or unflagged); run `sudo k3sm install`", remedy: "sudo k3sm install", detailHas: "keystore-sock is missing"},
+		{name: "install predates the logs", seam: userScopeChecks(func(p *socket.Preconditions) {
+			// An install with no audit log: the marker and the log judgement
+			// fail too, but the install check runs first and names install.
+			missing := errors.New("the append-only log keystore-audit.log is missing")
+			p.CheckInstall = func(context.Context) error { return missing }
+			p.MaintenanceMarked = func() (bool, error) { return false, missing }
+			p.OpenLogs = func(context.Context) error { return missing }
+		}), status: statusWarn, detail: "keystore user scope: off (the socket directory or an append-only log is missing, wrong or unflagged); run `sudo k3sm install`", remedy: "sudo k3sm install", detailHas: "keystore-audit.log is missing"},
+		{name: "logs unavailable", seam: userScopeChecks(func(p *socket.Preconditions) {
+			p.OpenLogs = func(context.Context) error { return boom }
+		}), status: statusWarn, detail: "keystore user scope: off (the append-only logs cannot be opened (logs-unavailable))", detailHas: "boom"},
 		{name: "maintenance", seam: userScopeChecks(func(p *socket.Preconditions) {
 			p.MaintenanceMarked = func() (bool, error) { return true, nil }
 		}), status: statusWarn, detail: "keystore user scope: off (a maintenance verb is running)"},

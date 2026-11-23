@@ -117,12 +117,14 @@ type startChecks struct {
 	ignores    bool
 	mountErr   error
 	install    error
+	logsErr    error
+	reopens    int
 	servers    int
 	serversErr error
 	listens    int
 	counted    int
 	ln         net.Listener // what the listener source returns
-	panics     string       // the step that panics: euid, marker, mount, install, count or listen
+	panics     string       // the step that panics: euid, marker, mount, install, logs, count or listen
 }
 
 // boom panics when step is the one set to.
@@ -141,7 +143,7 @@ func (c *startChecks) set(f func(c *startChecks)) {
 func (c *startChecks) get() startChecks {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return startChecks{listens: c.listens, counted: c.counted}
+	return startChecks{listens: c.listens, counted: c.counted, reopens: c.reopens}
 }
 
 // logBuf collects the supervisor's log lines.
@@ -268,6 +270,13 @@ func (r *supRig) config() SupervisorConfig {
 			ck.boom("marker")
 			return ck.marked, ck.markerErr
 		},
+		OpenLogs: func(context.Context) error {
+			ck.mu.Lock()
+			defer ck.mu.Unlock()
+			ck.reopens++
+			ck.boom("logs")
+			return ck.logsErr
+		},
 		Creds:   r.creds,
 		Sandbox: r.box,
 		Audit:   &fakeAuditor{},
@@ -334,6 +343,7 @@ func TestSupervisorRequiresDependencies(t *testing.T) {
 			{"install check", func(c *SupervisorConfig) { c.CheckInstall = nil }},
 			{"server count", func(c *SupervisorConfig) { c.ServerCount = nil }},
 			{"maintenance marker check", func(c *SupervisorConfig) { c.MaintenanceMarked = nil }},
+			{"log reopen", func(c *SupervisorConfig) { c.OpenLogs = nil }},
 			{"peer-credential source", func(c *SupervisorConfig) { c.Creds = nil }},
 			{"peer-sandbox source", func(c *SupervisorConfig) { c.Sandbox = nil }},
 			{"refusal auditor", func(c *SupervisorConfig) { c.Audit = nil }},
