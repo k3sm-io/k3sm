@@ -40,10 +40,11 @@ var errScopeHasDeliveries = errors.New("the scope's delivery record names delive
 // floor lock and then the exclusive store lock (at most 30 s;
 // lockMaintenance) it opens the scope's key under W without the
 // GeneratedUID check and reads its delivery record, refusing while the
-// record names any delivery. A record that does not read (the service user
-// can damage its own) does not stop it, since listing needs only
-// scope.key: the scope is removed and the result is errCommitted, saying
-// its deliveries were not checked. It then lists the scope key's identity in the
+// record names any delivery. A damaged record (deliveriesDamaged: the
+// service user can damage its own) does not stop it, since listing needs
+// only scope.key: the scope is removed and the result is errCommitted,
+// saying its deliveries were not checked. Any other failure to read it
+// refuses, changing nothing. It then lists the scope key's identity in the
 // removed-scopes record (keystore-removed-scopes.json, through the judged
 // data-root descriptor) with the user-scope floor's byte size at that
 // moment, then removes .user/<uid>/ by descriptor (removeScopeTree),
@@ -125,7 +126,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 	}
 	id := o.id
 	recorded = removed.has(uid, id)
-	_, ds, derr := u.readDeliveriesUnfloored(o)
+	_, ds, derr := rmReadDeliveries(u, o)
 	_, eerr := o.dir.Lstat(scopeEntriesName)
 	o.close()
 	var unread error
@@ -138,11 +139,16 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 	case errors.Is(derr, ErrScopeAbsent) && errors.Is(eerr, os.ErrNotExist):
 		// An earlier rm-scope, unlisted (a full record), removed entries/
 		// and the record, then stopped.
-	default:
+	case deliveriesDamaged(derr):
 		// The service user can damage its own record; listing needs only
 		// scope.key, so the scope is removed, and the result says what
 		// went unchecked.
 		unread = derr
+	default:
+		// A transient failure (a cancelled context, EINTR, EMFILE, EIO)
+		// says nothing of the record: proceeding would leave its
+		// deliveries unchecked for no cause.
+		return false, fmt.Errorf("read the delivery record of %s: %s; nothing was changed; run it again", u.scope, safeText(derr.Error()))
 	}
 	if !recorded {
 		fid, size, err := s.floorSize(dfd)
@@ -167,6 +173,20 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		return recorded, fmt.Errorf("%w: %s", errCommitted, scopeRemovedUnread(u.scope, unread))
 	}
 	return recorded, nil
+}
+
+// rmReadDeliveries is rm-scope's read of the delivery record; tests
+// replace it to inject a failure.
+var rmReadDeliveries = (*UserScope).readDeliveriesUnfloored
+
+// deliveriesDamaged reports whether err, from readDeliveriesUnfloored, is
+// a damaged record rather than a failure to read it: ErrCorrupt (a record
+// that does not parse, authenticate or bind, or the judge's refusal of its
+// type, owner, mode, flags or links, errBadFile), a planted name
+// (errPlanted), or a record missing beside scope.key (ErrScopeAbsent), all
+// of which the service user can cause and a rerun would meet again.
+func deliveriesDamaged(err error) bool {
+	return errors.Is(err, ErrCorrupt) || errors.Is(err, errBadFile) || errors.Is(err, errPlanted) || errors.Is(err, ErrScopeAbsent)
 }
 
 // scopeRemovedUnread is rm-scope's committed report for a scope removed

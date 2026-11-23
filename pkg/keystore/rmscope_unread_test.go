@@ -19,10 +19,13 @@ package keystore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // rm-scope removes a scope whose delivery record does not read, corrupt
@@ -117,6 +120,57 @@ func TestRemoveScopeUntrustedKeyUnlisted(t *testing.T) {
 				t.Fatal("a scope with an untrusted scope.key was listed")
 			}
 			rebuild(t, s)
+		})
+	}
+}
+
+// rm-scope proceeds past a delivery record that does not read only when
+// the record is damaged (ErrCorrupt, the judge's refusal, a planted name,
+// a missing record): then it removes the scope, committed. A transient
+// failure to read it (a cancelled context, EINTR, EMFILE, EIO) refuses,
+// saying nothing was changed and to run it again, and the scope stays
+// unlisted and in place.
+func TestRemoveScopeTransientDeliveryReadRefuses(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err     error
+		damaged bool
+	}{
+		"corrupt":   {fmt.Errorf("%w: deliveries does not authenticate", ErrCorrupt), true},
+		"judged":    {fmt.Errorf("%w: deliveries: %w", ErrCorrupt, errBadFile), true},
+		"planted":   {fmt.Errorf("%w: deliveries", errPlanted), true},
+		"missing":   {fmt.Errorf("%w: no record", ErrScopeAbsent), true},
+		"cancelled": {fmt.Errorf("read deliveries: %w", context.Canceled), false},
+		"EINTR":     {fmt.Errorf("read deliveries: %w", unix.EINTR), false},
+		"EMFILE":    {fmt.Errorf("read deliveries: %w", unix.EMFILE), false},
+		"EIO":       {fmt.Errorf("read deliveries: %w", unix.EIO), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := deliveriesDamaged(tc.err); got != tc.damaged {
+				t.Fatalf("deliveriesDamaged(%v) = %v, want %v", tc.err, got, tc.damaged)
+			}
+			ctx := context.Background()
+			s, server, _ := fileLogScope(t)
+			userPut(t, userScope(t, s, 1002), "user/1002/x", "x")
+			saved := rmReadDeliveries
+			rmReadDeliveries = func(*UserScope, *openedScope) (uint64, []delivery, error) { return 0, nil, tc.err }
+			t.Cleanup(func() { rmReadDeliveries = saved })
+			recorded, err := s.RemoveScope(ctx, 1002)
+			_, serr := os.Lstat(scopeDir(server, "1002"))
+			if tc.damaged {
+				if !recorded || !Committed(err) || !errors.Is(serr, os.ErrNotExist) {
+					t.Fatalf("rm-scope over a damaged record: recorded %v, %v, directory %v; want listed, committed and removed", recorded, err, serr)
+				}
+				return
+			}
+			if recorded || err == nil || Committed(err) || !strings.Contains(err.Error(), "nothing was changed; run it again") {
+				t.Fatalf("rm-scope over a transient read failure: recorded %v, %v; want a refusal saying nothing was changed; run it again", recorded, err)
+			}
+			if serr != nil {
+				t.Fatalf("the scope directory is gone after a refusal: %v", serr)
+			}
+			if readRecord(t, s).listed(1002) {
+				t.Fatal("a refused rm-scope listed the scope")
+			}
 		})
 	}
 }
