@@ -99,6 +99,37 @@ func (s *FileStore) openDir(path string, create bool) (*os.Root, error) {
 	return root, nil
 }
 
+// openDirForRm is openDir for rm-scope only, never for a serving path,
+// and never creating: the keystore directory at path must be the service
+// user's, but its mode is not judged. The service user can set it, and a
+// mode check would let the principal being revoked veto its revocation,
+// as with .user and the scope directory (openScopeDirForRm).
+func (s *FileStore) openDirForRm(path string) (*os.Root, error) {
+	named, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !named.IsDir() {
+		return nil, fmt.Errorf("%s is not a directory (mode %s)", path, named.Mode())
+	}
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := root.Stat(".")
+	if err == nil && !os.SameFile(named, opened) {
+		err = errors.New("changed while it was opened")
+	}
+	if err == nil {
+		err = s.checkOwned(opened, fs.ModePerm)
+	}
+	if err != nil {
+		_ = root.Close() // the open is abandoned; its close has nothing to report
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return root, nil
+}
+
 // openSubdir is openDir for the directory name inside parent, created with
 // mkdirAt, so the open never leaves parent.
 func (s *FileStore) openSubdir(parent *os.Root, name string, create bool) (*os.Root, error) {
@@ -178,8 +209,11 @@ func (s *FileStore) mkdirOwned(path string) error {
 // directory, and the identity check refuses only a swap between the Lstat and
 // the open. A directory that fails any check may be another entry or one the
 // service user prepared, so it is refused as ErrCorrupt and nothing is chowned
-// or chmodded. An existing name is an error matching fs.ErrExist. Once handed
-// over, parent is fsynced, so the new name is durable.
+// or chmodded. Once checked, any extended ACL it inherited from parent is
+// removed on the descriptor (removeExtendedACL; a no-op where the build reads
+// no ACL), before the handover. An existing name is an error matching
+// fs.ErrExist. Once handed over, parent is fsynced, so the new name is
+// durable.
 func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	if err := parent.Mkdir(name, dirMode); err != nil {
 		return nil, err
@@ -205,6 +239,13 @@ func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	defer func() { _ = f.Close() }() // read-only; nothing to flush
 	if err := s.checkNewDir(f, made, opened); err != nil {
 		return nil, fmt.Errorf("%w: the new directory %s %w", ErrCorrupt, name, err)
+	}
+	// An inheritable ACL entry on parent is copied onto the new directory,
+	// and while root owns it one granting add_subdirectory lets its grantee
+	// move it to another parent: it is removed on the descriptor before
+	// anything else is done with the directory.
+	if err := removeExtendedACL(int(f.Fd())); err != nil {
+		return nil, fmt.Errorf("the new directory %s: %w", name, err)
 	}
 	if err := s.own(f, dirMode); err != nil {
 		return nil, err

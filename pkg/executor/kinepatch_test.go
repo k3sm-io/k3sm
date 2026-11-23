@@ -107,6 +107,7 @@ var kinePatchSetHistory = map[string]string{
 	"nocgo+p4": "b116e0d06b6453fcd929a4bc62da794ad957ea3895b51f192c652e7f01115cc9",
 	"nocgo+p5": "14db0c216afa353618c5548f54f1df1161e7559ba6748b44af811bdbe17e7f56",
 	"nocgo+p6": "121ae7c6e733c7c140effda0fe5980037102274184aba16ffc088d6522ed5d4d",
+	"nocgo+p7": "b89f590848a142b94d67d204cf415162b46d981833f3f13c10283138c81aa7c8",
 }
 
 // TestKinePatchSetIsMarked pins the link between the carried patches and the staging

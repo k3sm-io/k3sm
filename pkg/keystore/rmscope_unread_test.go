@@ -52,11 +52,12 @@ func TestRemoveScopeUnreadableDeliveryRecord(t *testing.T) {
 			if _, err := s.RebuildFloor(ctx, &attrRecorder{}); !errors.Is(err, errRebuildRefused) || !strings.Contains(err.Error(), "rm-scope user/1002") {
 				t.Fatalf("rebuild with the record damaged: %v, want a refusal naming rm-scope user/1002", err)
 			}
-			recorded, err := s.RemoveScope(ctx, 1002)
+			res, err := s.RemoveScope(ctx, 1002)
+			recorded := res.Recorded
 			if !recorded || !Committed(err) {
 				t.Fatalf("rm-scope: recorded %v, %v; want listed and committed", recorded, err)
 			}
-			for _, want := range []string{"removed user/1002", "delivery record could not be read", "deliveries from this scope were not checked", "stays until it is withdrawn or removed by hand"} {
+			for _, want := range []string{"removed user/1002", "delivery record could not be read", "deliveries from this scope were not checked", "stays until it is withdrawn"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("the error %q does not say %q", err, want)
 				}
@@ -114,7 +115,8 @@ func TestRemoveScopeUntrustedKeyUnlisted(t *testing.T) {
 			if _, err := s.RebuildFloor(ctx, &attrRecorder{}); !errors.Is(err, errRebuildRefused) || !strings.Contains(err.Error(), "rm-scope user/1002") {
 				t.Fatalf("rebuild with scope.key damaged: %v, want a refusal naming rm-scope user/1002", err)
 			}
-			recorded, err := s.RemoveScope(ctx, 1002)
+			res, err := s.RemoveScope(ctx, 1002)
+			recorded := res.Recorded
 			if recorded != tc.listed || !Committed(err) {
 				t.Fatalf("rm-scope: recorded %v, %v; want recorded %v and committed", recorded, err, tc.listed)
 			}
@@ -166,9 +168,10 @@ func TestRemoveScopeTransientDeliveryReadRefuses(t *testing.T) {
 			s, server, _ := fileLogScope(t)
 			userPut(t, userScope(t, s, 1002), "user/1002/x", "x")
 			saved := rmReadDeliveries
-			rmReadDeliveries = func(*UserScope, *openedScope) (uint64, []delivery, error) { return 0, nil, tc.err }
+			rmReadDeliveries = func(*UserScope, *openedScope) (deliveriesRead, error) { return deliveriesRead{}, tc.err }
 			t.Cleanup(func() { rmReadDeliveries = saved })
-			recorded, err := s.RemoveScope(ctx, 1002)
+			res, err := s.RemoveScope(ctx, 1002)
+			recorded := res.Recorded
 			_, serr := os.Lstat(scopeDir(server, "1002"))
 			if tc.damaged {
 				if !recorded || !Committed(err) || !errors.Is(serr, os.ErrNotExist) {

@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -39,8 +40,8 @@ import (
 // one link, is debris of the tree being removed: its flag is cleared too
 // and the scope removed. A file root planted with a system flag (sappnd)
 // is left: the removal fails with EPERM, the error names it for reading
-// only, says a system flag is set and offers no command, and the file
-// keeps its flag.
+// only, says it carries a system flag that rm-scope clears none of,
+// offers no command and no rerun, and the file keeps its flag.
 func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 	if !asRoot() {
 		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
@@ -122,13 +123,13 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = root.Close() }()
-			err = removeScopeTree(root, s.dir, "1001", s.uid, true)
+			_, err = removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true})
 			if plant == sfAppend {
 				var st unix.Stat_t
 				if !errors.Is(err, unix.EPERM) {
 					t.Errorf("removeScopeTree over a root-owned sappnd file: %v, want EPERM", err)
-				} else if msg := err.Error(); !strings.Contains(msg, quoteName(planted)+" (named for reading, not for pasting)") || !strings.Contains(msg, "a system flag is set") || strings.Contains(msg, "sudo") || strings.Contains(msg, "chflags") {
-					t.Errorf("the error %q does not name the plant for reading only, say a system flag is set, and offer no command", msg)
+				} else {
+					checkSystemFlagKept(t, err, planted, plant)
 				}
 				if serr := unix.Lstat(planted, &st); serr != nil || st.Flags&sfAppend == 0 {
 					t.Errorf("the root-owned plant has flags %#x (%v); want sappnd kept", st.Flags, serr)
@@ -142,6 +143,40 @@ func TestRemoveScopeClearsServiceUserFlagsAsRoot(t *testing.T) {
 				t.Fatalf("the scope directory is still there: %v", err)
 			}
 		})
+	}
+}
+
+// checkSystemFlagKept checks flagKept's text for a root-owned entry
+// planted carrying the system flag plant, as removeScopeTree returns it
+// with the scope listed: the entry named for reading only, the flag it
+// carries, its owner, that rm-scope clears no system flag and leaves it
+// (errFlagLeft, which a rerun meets again), the listed state, and no
+// command and no rerun.
+func checkSystemFlagKept(t *testing.T, err error, planted string, plant int) {
+	t.Helper()
+	if !errors.Is(err, errFlagLeft) {
+		t.Errorf("the error %v does not wrap errFlagLeft", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"remove the entry " + quoteName(planted) + " (named for reading, not for pasting)",
+		fmt.Sprintf("it carries a system flag (flags %#x)", plant),
+		"another user (uid 0) owns it",
+		"only root sets a system flag and rm-scope clears none",
+		errFlagLeft.Error(),
+		"The scope is already listed as removed, so no open serves it",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the error %q does not say %q", msg, want)
+		}
+	}
+	for _, bad := range []string{"sudo", "chflags", "rm -"} {
+		if strings.Contains(msg, bad) {
+			t.Errorf("the error %q offers a command (%q)", msg, bad)
+		}
+	}
+	if strings.Contains(strings.ToLower(msg), "rerun") {
+		t.Errorf("the error %q offers a rerun, and a rerun meets the same flag", msg)
 	}
 }
 
@@ -213,7 +248,7 @@ func TestRemoveScopeClearsServiceUserFIFOAndSocketAsRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+	if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 		t.Fatalf("removeScopeTree over the service user's flagged FIFO and socket, as root: %v", err)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
@@ -299,13 +334,13 @@ func TestRemoveScopeNameSwapAsRoot(t *testing.T) {
 			t.Fatal(err)
 		}
 		for range 5 {
-			_ = removeScopeTree(root, ks, "1001", svcUID, true) // the race may leave it busy
+			_, _ = removeScopeTree(root, ks, "1001", svcUID, rmTreeOpts{listed: true}) // the race may leave it busy
 		}
 		close(stop)
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
-		_ = removeScopeTree(root, ks, "1001", svcUID, true)
+		_, _ = removeScopeTree(root, ks, "1001", svcUID, rmTreeOpts{listed: true})
 		_ = root.Close()
 		var st unix.Stat_t
 		if err := unix.Lstat(victim, &st); err != nil || st.Flags != 0 {
@@ -495,7 +530,7 @@ func TestRemoveScopeTakesDirsFromServiceUserAsRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	rerr := removeScopeTree(root, s.dir, "1001", s.uid, true)
+	_, rerr := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true})
 	removed.Store(true)
 	wait(after) // and after the removal
 	close(stop)
@@ -553,8 +588,8 @@ func TestRemoveScopeRerunAfterTakeAsRoot(t *testing.T) {
 		}
 	}
 	rmTakeDir = saved
-	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
-		t.Fatalf("the rerun over root-owned directories: %v, recorded %v", err, recorded)
+	if res, err := s.RemoveScope(ctx, 1001); err != nil || !res.Recorded {
+		t.Fatalf("the rerun over root-owned directories: %v, recorded %v", err, res.Recorded)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the scope directory is still there after the rerun: %v", err)
@@ -570,6 +605,7 @@ func TestRemoveScopeLeavesForeignOwnedDirAsRoot(t *testing.T) {
 	if !asRoot() {
 		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
 	}
+	// No service-user process reaches the tree here, so rootRmScopeBase's reachable base is not needed.
 	s, server, _ := fileLogScope(t)
 	dir := scopeDir(server, "1001")
 	other := otherUID(t)
@@ -586,7 +622,8 @@ func TestRemoveScopeLeavesForeignOwnedDirAsRoot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	recorded, err := s.RemoveScope(t.Context(), 1001)
+	res, err := s.RemoveScope(t.Context(), 1001)
+	recorded := res.Recorded
 	if !recorded || !errors.Is(err, errScopeForeignDir) {
 		t.Fatalf("rm-scope over another user's directory: %v, recorded %v; want errScopeForeignDir, listed", err, recorded)
 	}
@@ -603,5 +640,125 @@ func TestRemoveScopeLeavesForeignOwnedDirAsRoot(t *testing.T) {
 	var st unix.Stat_t
 	if err := unix.Lstat(foreign, &st); err != nil || st.Uid != other || st.Mode&0o7777 != 0o700 {
 		t.Fatalf("the foreign directory: uid %d mode %#o (%v), want it untouched", st.Uid, st.Mode&0o7777, err)
+	}
+}
+
+// TestRemoveScopeRefusesForeignScopeDirAsRoot is the foreign scope
+// directory, root-run: .user/<uid> is a directory another user owns at
+// 0700, as if renamed in at the name after the by-path judgement. Its tree
+// removal takes nothing: the directory keeps its owner and mode and every
+// name in it, and the error names it for reading only and offers no
+// command.
+func TestRemoveScopeRefusesForeignScopeDirAsRoot(t *testing.T) {
+	if !asRoot() {
+		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
+	}
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	other := otherUID(t)
+	if err := os.Lchown(dir, int(other), int(other)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before := treeNames(t, dir)
+	takes := countTakes(t)
+	root, err := s.openDir(s.dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	_, err = removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true})
+	checkScopeDirRefused(t, err, s, fmt.Sprintf("uid %d owns it", other))
+	if *takes != 0 {
+		t.Errorf("rmTakeDir ran %d times, want none", *takes)
+	}
+	var st unix.Stat_t
+	if err := unix.Lstat(dir, &st); err != nil || st.Uid != other || st.Mode&0o7777 != 0o700 {
+		t.Fatalf("the scope directory: uid %d mode %#o (%v), want it untouched", st.Uid, st.Mode&0o7777, err)
+	}
+	if after := treeNames(t, dir); !slices.Equal(before, after) {
+		t.Fatalf("the scope directory holds %v, want %v untouched", after, before)
+	}
+}
+
+// TestRmScopeMeasuredPremiseAsRoot pins the measured premise of the
+// rerun rule (docs/design/keystore.md § "A removed scope stays removed",
+// "The measured premise"), root-run, with a service-user thread (settid,
+// as the neighbouring root tests run code as the service user) acting on
+// two directories it owns: (a) it cannot rename a root-owned 0700
+// directory into another parent it owns; (b) it can rename it within the
+// same parent; (c) with an inheritable ACL entry granting add_subdirectory
+// on the parent when root creates a directory there, it can move that
+// root-created directory out to the other parent, and the directory
+// mkdirAt makes under the same parent carries no ACL.
+func TestRmScopeMeasuredPremiseAsRoot(t *testing.T) {
+	if !asRoot() {
+		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
+	}
+	svcUID, svcGID := serviceIDs(t)
+	asService := func(f func() error) error {
+		errc := make(chan error, 1)
+		go func() {
+			runtime.LockOSThread() // never unlocked: the thread dies with the goroutine
+			if _, _, errno := syscall.Syscall(syscall.SYS_SETTID, uintptr(svcUID), uintptr(svcGID), 0); errno != 0 {
+				errc <- fmt.Errorf("settid: %w", errno)
+				return
+			}
+			errc <- f()
+		}()
+		return <-errc
+	}
+	s, _ := rootRmScopeBase(t)
+	base := t.TempDir() // under the root-made 0755 base rootRmScopeBase set as TMPDIR
+	if err := os.Chmod(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent, other := filepath.Join(base, "parent"), filepath.Join(base, "other")
+	for _, d := range []string{parent, other} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(d, int(svcUID), int(svcGID)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rootDir := filepath.Join(parent, "rootdir")
+	if err := os.Mkdir(rootDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// (a) Into another parent: refused (the moved directory's ".." would
+	// change, which needs write on it).
+	if err := asService(func() error { return os.Rename(rootDir, filepath.Join(other, "moved")) }); err == nil {
+		t.Fatal("(a) the service user moved a root-owned 0700 directory into another parent it owns")
+	}
+	// (b) Within the same parent: allowed.
+	renamed := filepath.Join(parent, "renamed")
+	if err := asService(func() error { return os.Rename(rootDir, renamed) }); err != nil {
+		t.Fatalf("(b) the service user's rename of a root-owned directory within its own parent: %v, want it to succeed", err)
+	}
+	// (c) An inheritable add_subdirectory entry on the parent at creation.
+	addInheritableACL(t, parent)
+	inh := filepath.Join(parent, "inherited")
+	if err := os.Mkdir(inh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if !pathHasACL(t, inh) {
+		t.Fatal("(c) root's mkdir under the parent inherited no ACL entry: the setup does not test anything")
+	}
+	if err := asService(func() error { return os.Rename(inh, filepath.Join(other, "inherited")) }); err != nil {
+		t.Fatalf("(c) the service user's move of a root-created directory carrying the inherited entry: %v, want it to succeed", err)
+	}
+	pr, err := os.OpenRoot(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pr.Close() }()
+	if _, err := s.mkdirAt(pr, "made"); err != nil {
+		t.Fatalf("(c) mkdirAt: %v", err)
+	}
+	if pathHasACL(t, filepath.Join(parent, "made")) {
+		t.Fatal("(c) the directory mkdirAt made under the parent carries the inherited ACL entry")
 	}
 }

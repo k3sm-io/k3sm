@@ -49,6 +49,10 @@ type EarlierRun struct {
 	Report map[string]int64
 	// AuditErr is why its audit line was not written; nil when it was.
 	AuditErr error
+	// RecordErr is why its drop counts were not recorded in the lossy-run
+	// record (keystore-maintenance-runs); nil when they were, or when it
+	// dropped nothing.
+	RecordErr error
 }
 
 // String is the stderr line for r.
@@ -67,6 +71,9 @@ func (r EarlierRun) String() string {
 	}
 	if r.AuditErr != nil {
 		s += fmt.Sprintf("; its audit line was not written: %v", r.AuditErr)
+	}
+	if r.RecordErr != nil {
+		s += fmt.Sprintf("; its drop counts were not recorded: %v", r.RecordErr)
 	}
 	return s
 }
@@ -147,9 +154,11 @@ func WithEarlierRun(ctx context.Context, report func(EarlierRun)) context.Contex
 
 // reportEarlierRun reports prior, a committed run of a verb other than the
 // running one: its audit line, written under the store lock the
-// maintenance holds, then the report through ctx. beginMaintenance calls
-// it only for a known verb whose recorded log is live.
-func (s *FileStore) reportEarlierRun(ctx context.Context, prior *marker) {
+// maintenance holds, and its drop counts recorded in the lossy-run record
+// through the data root dfd (recordLossyRun), then the report through ctx.
+// beginMaintenance calls it only for a known verb whose recorded log is
+// live.
+func (s *FileStore) reportEarlierRun(ctx context.Context, dfd int, prior *marker) {
 	op := prior.verb
 	r := EarlierRun{Verb: op, Report: map[string]int64{}}
 	for k, v := range prior.report {
@@ -158,6 +167,7 @@ func (s *FileStore) reportEarlierRun(ctx context.Context, prior *marker) {
 		}
 	}
 	r.AuditErr = s.auditSink.append(auditLine{op: op, via: auditViaRoot, scope: scopeSystem, name: auditPlaceholder, result: auditResultCommitted})
+	r.RecordErr = s.recordLossyRun(dfd, prior.run, prior.verb, prior.ino, prior.report)
 	if f, ok := ctx.Value(earlierRunKey{}).(func(EarlierRun)); ok && f != nil {
 		f(r)
 		return
@@ -170,10 +180,15 @@ func (s *FileStore) reportEarlierRun(ctx context.Context, prior *marker) {
 // as root's file (rootUID), records a run whose swap committed (its log's
 // live inode under the logs directory lfd is the one it recorded), it
 // appends that run's audit line (op the verb, via root, result committed)
-// to the audit log and returns the run; install prints it. Anything else,
-// no marker, one not judged, one that never committed, returns nil: install
+// to the audit log, appends its record to the lossy-run record in the data
+// root when its report drops anything (RecordErr says why it could not),
+// and returns the run; install prints it. A record already holding the run
+// id is left as it is, so an install that dies after recording and before
+// removing the marker records the run once when it runs again. dataRoot is
+// the data root's path, for the record's repair text. Anything else, no
+// marker, one not judged, one that never committed, returns nil: install
 // removes it, and it held no committed report.
-func EarlierRunAtInstall(dfd, lfd, rootUID int, now time.Time) *EarlierRun {
+func EarlierRunAtInstall(dfd, lfd, rootUID int, dataRoot string, now time.Time) *EarlierRun {
 	fd, err := unix.Openat(dfd, maintenanceMarkerName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil
@@ -208,6 +223,7 @@ func EarlierRunAtInstall(dfd, lfd, rootUID int, now time.Time) *EarlierRun {
 		}
 	}
 	r.AuditErr = appendInstallAudit(lfd, auditLine{op: prior.verb, via: auditViaRoot, scope: scopeSystem, name: auditPlaceholder, result: auditResultCommitted}, now)
+	r.RecordErr = recordLossyRunAt(dfd, int64(rootUID), dataRoot, prior.run, prior.verb, prior.ino, prior.report, now)
 	return r
 }
 

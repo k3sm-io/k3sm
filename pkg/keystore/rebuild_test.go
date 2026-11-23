@@ -528,20 +528,21 @@ func TestRemoveScopeRerunFinishesPartialRemoval(t *testing.T) {
 		t.Fatalf("the stopped run took %d directories, want the scope directory and entries/", taken)
 	}
 	rmTakeDir = saved
-	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
-		t.Fatalf("the rerun: %v, recorded %v", err, recorded)
+	if res, err := s.RemoveScope(ctx, 1001); err != nil || !res.Recorded {
+		t.Fatalf("the rerun: %v, recorded %v", err, res.Recorded)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the scope directory is still there after the rerun: %v", err)
 	}
 
 	// A directory left without scope.key, for a uid the record lists, is
-	// finished as it stands.
+	// finished as it stands, but with no key to prove it listed the result
+	// is committed, not clean.
 	if err := os.MkdirAll(filepath.Join(dir, scopeEntriesName, "left"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
-		t.Fatalf("rm-scope of a directory without scope.key: %v, recorded %v", err, recorded)
+	if res, err := s.RemoveScope(ctx, 1001); !Committed(err) || res.Recorded || !strings.Contains(err.Error(), "could not confirm") {
+		t.Fatalf("rm-scope of a directory without scope.key: %v, recorded %v; want committed, unconfirmed", err, res.Recorded)
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the keyless scope directory is still there: %v", err)

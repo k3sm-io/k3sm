@@ -81,7 +81,7 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 	}
 	defer m.end()
 	if m.saved != nil {
-		return RotateReport{Archives: int(m.saved["archives"]), Discarded: m.saved["discarded"] != 0, Earlier: true}, nil
+		return RotateReport{Archives: int(m.saved["archives"]), Discarded: m.saved["discarded"] != 0, Earlier: true}, m.savedErr
 	}
 	if err := m.step(swapStepReadOld); err != nil {
 		return rep, fmt.Errorf("%w: %w", errRotateRefused, err)
@@ -128,7 +128,8 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 // and judged; in it .1, the old log's first old.size bytes, root's 0600
 // and unflagged: a clone of the old log (cloneArchive), so rotate needs no
 // free space the size of a log the service user can grow, or, when the
-// volume refuses the clone, a copy after a free-space check
+// volume refuses the clone or an extended attribute on it cannot be
+// removed, a copy after a free-space check
 // (copyArchive); then each
 // present archive .n of .1 to .3 hard-linked from the live archives/
 // (adir) as .n+1; archives/ is fsynced.
@@ -148,11 +149,7 @@ func (s *FileStore) placeArchives(old *oldLog, adir, dir int, present [auditArch
 	if err := s.judgeArchivesDir(nad); err != nil {
 		return fmt.Errorf("the new %s: %w", archivesDirName, err)
 	}
-	if err := cloneArchive(old, nad, auditArchiveName(1)); errors.Is(err, errCloneRefused) {
-		if err := copyArchive(old, nad, auditArchiveName(1), err); err != nil {
-			return err
-		}
-	} else if err != nil {
+	if err := archiveLog(old, nad, auditArchiveName(1)); err != nil {
 		return err
 	}
 	for n := auditArchives - 1; n >= 1; n-- {
@@ -167,6 +164,17 @@ func (s *FileStore) placeArchives(old *oldLog, adir, dir int, present [auditArch
 		return fmt.Errorf("fsync the new %s: %w", archivesDirName, err)
 	}
 	return nil
+}
+
+// archiveLog makes name in the root-only archives directory nad the
+// archive of the old log: a clone (cloneArchive) or, when the clone is
+// refused or discarded (errCloneRefused), a copy (copyArchive).
+func archiveLog(old *oldLog, nad int, name string) error {
+	err := cloneArchive(old, nad, name)
+	if errors.Is(err, errCloneRefused) {
+		return copyArchive(old, nad, name, err)
+	}
+	return err
 }
 
 // openArchivesDir opens archives/ in the live audit/ directory dir
@@ -271,15 +279,18 @@ func (s *FileStore) judgeArchive(dir int, name string, st *unix.Stat_t) error {
 	return nil
 }
 
-// errCloneRefused is a clone of the old log the volume refused: nothing
-// was created, and rotate copies instead.
+// errCloneRefused is a clone of the old log the volume refused, or one
+// discarded because an extended attribute on it could not be removed:
+// nothing is left, and rotate copies instead.
 var errCloneRefused = errors.New("the audit log could not be cloned")
 
 // cloneArchive makes name in the root-only archives directory nad a clone
 // of the old log (cloneFileAt), then makes it the archive: the clone holds
 // the whole file, its flag and its extended attributes (measured as root,
 // U195), so on its own descriptor its flag is cleared, every extended
-// attribute is removed (stripXattrs), any extended ACL is removed
+// attribute is removed (stripXattrs; when one cannot be, as a protected
+// system attribute cannot, the clone is unlinked and the error is
+// errCloneRefused, so rotate copies), any extended ACL is removed
 // (removeACL), it is made the caller's (root's) at mode 0600, and,
 // reopened for writing and checked as the same inode, it is truncated to
 // the size the old log had at open (the snapshot rule), fsynced and
@@ -305,12 +316,17 @@ func cloneArchive(old *oldLog, nad int, name string) error {
 		return fmt.Errorf("the cloned %s is not a regular file with one link", name)
 	}
 	if statFlags(&st) != 0 {
-		if err := unix.Fchflags(rfd, 0); err != nil {
+		if err := clearFdFlags(rfd); err != nil {
 			return fmt.Errorf("clear the flags of the cloned %s: %w", name, err)
 		}
 	}
 	if err := stripXattrs(rfd); err != nil {
-		return fmt.Errorf("the cloned %s: %w", name, err)
+		// A protected attribute would refuse every rotate: the clone is
+		// discarded and rotate copies, and a copy carries no attribute.
+		if uerr := unix.Unlinkat(nad, name, 0); uerr != nil {
+			return fmt.Errorf("remove the cloned %s after its extended attributes could not be removed (%v): %w", name, err, uerr)
+		}
+		return fmt.Errorf("%w: the cloned %s, discarded: %w", errCloneRefused, name, err)
 	}
 	if err := removeACL(rfd); err != nil {
 		return fmt.Errorf("the cloned %s: %w", name, err)
@@ -450,7 +466,7 @@ func defaultVolumeSpace(fd int) (free, size int64, err error) {
 }
 
 // copyArchive makes name in nad a copy of the old log's first old.size
-// bytes, root's 0600, when the clone was refused (why). It first checks
+// bytes, root's 0600, when the clone was refused or discarded (why). It first checks
 // that the volume has room for the copy (copyRoom: the log's size plus the
 // larger of 1 GiB and 2% of the volume's size, from one fstatfs) and
 // refuses up front, before any byte is written, when it does not: the service user can grow the log,

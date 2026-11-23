@@ -170,7 +170,7 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 	if stale {
 		// A committed run the marker records was not reported: report it
 		// and audit it before the marker goes.
-		if r := keystore.EarlierRunAtInstall(dfd, g.lfd, rootUID, time.Now()); r != nil {
+		if r := keystore.EarlierRunAtInstall(dfd, g.lfd, rootUID, dataRoot, time.Now()); r != nil {
 			fmt.Fprintf(keystoreStderr, "install: %s%s\n", r, earlierRunDropHint(r))
 		}
 		if err := unix.Unlinkat(dfd, keystore.MaintenanceMarkerName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
@@ -185,15 +185,21 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 
 // earlierRunDropHint is what install adds to an earlier run's line when
 // that run dropped lines: a verb that reports such a run exits 4, but
-// install keeps its own exit codes, and the drop counts are in this line
-// and in no other record (the audit log holds only a committed line for
-// that run), so the line tells the operator to copy it down. Only floor
-// --rebuild drops lines.
+// install keeps its own exit codes, so the line says where the drop counts
+// are kept: in the lossy-run record doctor reads, which
+// EarlierRunAtInstall appended to before install removes the marker. When
+// that record could not be read or written (the line already says why),
+// the counts are in this line only (the audit log holds only a committed
+// line for that run), so the line tells the operator to copy it down. Only
+// floor --rebuild drops lines.
 func earlierRunDropHint(r *keystore.EarlierRun) string {
 	if r.Dropped() == 0 {
 		return ""
 	}
-	return "; install does not exit 4 for it: the earlier run's drop counts are in this line and in no other record (the audit log holds a committed line for that run, without them), so copy this line down"
+	if r.RecordErr != nil {
+		return "; install does not exit 4 for it: the earlier run's drop counts could not be recorded, so they are in this line only (the audit log holds a committed line for that run, without them): copy this line down"
+	}
+	return "; install does not exit 4 for it: the earlier run's drop counts are kept in " + keystore.MaintenanceRunsName + " in the data root, which k3sm doctor reads"
 }
 
 // errLogOldLocation is a log at a location no release keeps one at: the

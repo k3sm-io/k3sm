@@ -138,7 +138,7 @@ func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (Reb
 	if m.saved != nil {
 		rep = rebuildReportOf(m.saved)
 		rep.Earlier = true
-		return rep, nil
+		return rep, m.savedErr
 	}
 	if err := m.step(swapStepReadOld); err != nil {
 		return rep, fmt.Errorf("%w: %w", errRebuildRefused, err)

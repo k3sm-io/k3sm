@@ -156,11 +156,6 @@ func TestChownStagedRefusesShape(t *testing.T) {
 	}
 }
 
-// setFlags sets path's file flags (chflags) without following it.
-func setFlags(path string, flags int) error {
-	return syscall.Chflags(path, flags)
-}
-
 // TestChownStagedRefusesACL (U192): a file with an extended ACL is refused,
 // so no grant set on the backup reaches the live keystore.
 func TestChownStagedRefusesACL(t *testing.T) {

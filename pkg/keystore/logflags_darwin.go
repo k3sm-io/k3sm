@@ -109,3 +109,6 @@ func fdHasACL(fd int) (bool, error) {
 
 // statFlags is st's st_flags.
 func statFlags(st *unix.Stat_t) uint32 { return st.Flags }
+
+// clearFdFlags sets the flags of the file held at fd to 0.
+func clearFdFlags(fd int) error { return unix.Fchflags(fd, 0) }

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -63,7 +64,8 @@ func TestRemovedScopeCopiedBackRefused(t *testing.T) {
 	s, server, _ := fileLogScope(t)
 	saved := filepath.Join(t.TempDir(), "1001")
 	copyTree(t, scopeDir(server, "1001"), saved)
-	recorded, err := s.RemoveScope(ctx, 1001)
+	res, err := s.RemoveScope(ctx, 1001)
+	recorded := res.Recorded
 	if err != nil || !recorded {
 		t.Fatalf("RemoveScope: %v, recorded %v", err, recorded)
 	}
@@ -73,11 +75,17 @@ func TestRemovedScopeCopiedBackRefused(t *testing.T) {
 	}
 	copyTree(t, saved, scopeDir(server, "1001"))
 	assertScopeRemovedEverywhere(t, s, 1001, errScopeRemoved)
+	// The refusal names rm-scope's own rerun, built from the integer uid,
+	// and no delete by hand.
+	_, _, rerr := (&UserScope{s: s, uid: 1001, scope: userScopeOf(1001)}).Current(ctx, "user/1001/token")
+	if msg := rerr.Error(); !strings.Contains(msg, "sudo k3sm keys rm-scope user/1001 --yes") || strings.Contains(msg, "delete") || strings.Contains(msg, "rm -") || strings.Contains(msg, userScopesName) {
+		t.Errorf("the refusal %q does not name sudo k3sm keys rm-scope user/1001 --yes, or names a delete by hand", msg)
+	}
 
 	// A rerun of rm-scope on the copied-back directory finishes, and the
 	// record lists the key once.
-	if recorded, err := s.RemoveScope(ctx, 1001); err != nil || !recorded {
-		t.Fatalf("rm-scope of the copied-back directory: %v, recorded %v", err, recorded)
+	if res, err := s.RemoveScope(ctx, 1001); err != nil || !res.Recorded {
+		t.Fatalf("rm-scope of the copied-back directory: %v, recorded %v", err, res.Recorded)
 	}
 	r := readRecord(t, s)
 	if r.keys() != 1 {
@@ -124,11 +132,12 @@ func TestRemovedScopesFullKeepsFloorKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeRemovedScopes(dfd, full); err != nil {
+	if _, err := writeRemovedScopes(dfd, full); err != nil {
 		t.Fatal(err)
 	}
 	_ = unix.Close(dfd)
-	recorded, err := s.RemoveScope(ctx, 1002)
+	res, err := s.RemoveScope(ctx, 1002)
+	recorded := res.Recorded
 	if err != nil || recorded {
 		t.Fatalf("RemoveScope with a full record: %v, recorded %v; want removed, unrecorded", err, recorded)
 	}
@@ -191,7 +200,8 @@ func TestRemoveScopeMissingKeyUnlistedCommitted(t *testing.T) {
 	if err := os.Remove(filepath.Join(scopeDir(server, "1002"), scopeKeyName)); err != nil {
 		t.Fatal(err)
 	}
-	recorded, err := s.RemoveScope(ctx, 1002)
+	res, err := s.RemoveScope(ctx, 1002)
+	recorded := res.Recorded
 	if recorded || !Committed(err) {
 		t.Fatalf("rm-scope of an unlisted keyless scope: %v, recorded %v; want committed, unlisted", err, recorded)
 	}
@@ -253,4 +263,53 @@ func TestLogOldLocationTextNamesRestore(t *testing.T) {
 			t.Errorf("the text %q names %q", msg, bad)
 		}
 	}
+}
+
+// The data root's fsync after the record's rename fails (through the
+// seam): the record already lists the scope, so rm-scope stops committed
+// (exit 4, audited committed), saying the record lists it but its
+// durability is unknown, and leaves the scope directory untouched.
+func TestRmScopeRecordFsyncFailureIsCommitted(t *testing.T) {
+	s, server, _ := fileLogScope(t)
+	setSeam(t, &removedScopesFsync, func(int) error { return unix.EIO })
+	res, err := s.RemoveScope(t.Context(), 1001)
+	if !Committed(err) || !errors.Is(err, unix.EIO) {
+		t.Fatalf("rm-scope with the record's fsync failing: %v, want committed wrapping EIO", err)
+	}
+	if !res.Recorded {
+		t.Error("the result says the scope is not listed")
+	}
+	if !strings.Contains(err.Error(), "the record lists the scope but its durability is unknown") {
+		t.Errorf("the error %q does not say the record lists the scope of unknown durability", err)
+	}
+	if !readRecord(t, s).listed(1001) {
+		t.Fatal("the record does not list the scope after its rename")
+	}
+	if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeKeyName)); err != nil {
+		t.Fatalf("scope.key after a stop at the record: %v, want the directory untouched", err)
+	}
+	// The rerun finds the key listed and makes the record durable again
+	// before anything is removed: with the fsync still failing it stops,
+	// committed, durability unknown, the directory untouched; once it
+	// works, the rerun removes the scope, listed (exit 0).
+	res, err = s.RemoveScope(t.Context(), 1001)
+	if !Committed(err) || !errors.Is(err, unix.EIO) || !strings.Contains(err.Error(), "durability is unknown") {
+		t.Fatalf("the rerun with the fsync still failing: %v, want committed, durability unknown", err)
+	}
+	if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeKeyName)); err != nil {
+		t.Fatalf("scope.key after the rerun stopped at the record: %v, want the directory untouched", err)
+	}
+	removedScopesFsync = unix.Fsync
+	if res, err = s.RemoveScope(t.Context(), 1001); err != nil || !res.Recorded {
+		t.Fatalf("the rerun with the fsync working: %v, recorded %v; want removed and listed", err, res.Recorded)
+	}
+	if _, err := os.Lstat(scopeDir(server, "1001")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there: %v", err)
+	}
+}
+
+// listed reports whether any scope key of uid is listed. Only the tests ask by
+// uid alone: rm-scope proves a removal by the key it read.
+func (r *removedScopes) listed(uid uint32) bool {
+	return slices.ContainsFunc(r.Scopes, func(sc removedScope) bool { return sc.UID == uid })
 }

@@ -41,3 +41,7 @@ func fdHasACL(int) (bool, error) { return false, nil }
 
 // statFlags is st's st_flags. Off darwin there are no file flags.
 func statFlags(*unix.Stat_t) uint32 { return 0 }
+
+// clearFdFlags is never called off darwin: no file carries a flag
+// (statFlags is 0).
+func clearFdFlags(int) error { return nil }

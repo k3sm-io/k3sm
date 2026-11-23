@@ -177,7 +177,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+		if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 			t.Fatalf("removeScopeTree over user flags: %v", err)
 		}
 		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
@@ -215,7 +215,7 @@ func TestRemoveScopeClearsUserFlags(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+		if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 			t.Fatalf("removeScopeTree over a uchg FIFO: %v", err)
 		}
 		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
@@ -365,7 +365,7 @@ func TestRemoveScopeClearsForeignFlags(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = root.Close() }()
-			err = removeScopeTree(root, s.dir, "1001", s.uid+1, true)
+			_, err = removeScopeTree(root, s.dir, "1001", s.uid+1, rmTreeOpts{listed: true})
 			if linked {
 				var st unix.Stat_t
 				if !errors.Is(err, unix.EPERM) || !strings.Contains(err.Error(), "has 2 links") || strings.Contains(err.Error(), "sudo") || strings.Contains(err.Error(), "chflags") {
@@ -431,7 +431,7 @@ func TestRemoveScopeSwappedNameGetsZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	if err := removeScopeTree(root, s.dir, "1001", s.uid, true); err != nil {
+	if _, err := removeScopeTree(root, s.dir, "1001", s.uid, rmTreeOpts{listed: true}); err != nil {
 		t.Fatalf("removeScopeTree over a swapped name: %v", err)
 	}
 	if !swapped {
@@ -443,5 +443,253 @@ func TestRemoveScopeSwappedNameGetsZero(t *testing.T) {
 	}
 	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the scope directory is still there: %v", err)
+	}
+}
+
+// TestRemoveScopeSharedDirFlags: .user is shared by every scope, so rm-scope
+// leaves its flags alone unless removing the scope directory from it fails
+// with EPERM. With uchg on .user, which the service user owns, the tree is
+// emptied first, then the flag is cleared on .user's descriptor (no
+// scope.key is left when the seam sees it), the scope directory removed,
+// and the result reports the clear, naming .user for reading only. With
+// uchg on a .user another user owns (through the seam the service user is
+// another uid), nothing is cleared on it: the removal fails with EPERM
+// naming it and its owner, with no command, and .user keeps its flag.
+func TestRemoveScopeSharedDirFlags(t *testing.T) {
+	if asRoot() {
+		t.Skip("the unit case sets the test user's own flag on .user; as root .user is root's")
+	}
+	setup := func(t *testing.T) (*FileStore, string, string, uint64) {
+		s, server, _ := fileLogScope(t)
+		shared := filepath.Join(server, "keystore", userScopesName)
+		t.Cleanup(func() { _ = unix.Chflags(shared, 0) })
+		return s, shared, scopeDir(server, "1001"), setScopeFlags(t, shared, unix.UF_IMMUTABLE, false)
+	}
+	run := func(t *testing.T, s *FileStore, svc uint32) (string, error) {
+		root, err := s.openDir(s.dir, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = root.Close() }()
+		tree, err := removeScopeTree(root, s.dir, "1001", svc, rmTreeOpts{listed: true})
+		return tree.cleared, err
+	}
+	t.Run("the service user's", func(t *testing.T) {
+		s, shared, dir, ino := setup(t)
+		var sharedCalls int
+		saved := scopeFchflags
+		setSeam(t, &scopeFchflags, func(fd, flags int) error {
+			var st unix.Stat_t
+			if err := unix.Fstat(fd, &st); err != nil {
+				t.Errorf("fstat the descriptor rm-scope flags: %v", err)
+			}
+			if st.Ino == ino {
+				sharedCalls++
+				if _, err := os.Lstat(filepath.Join(dir, scopeKeyName)); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf(".user's flag was cleared before the scope directory was emptied (scope.key: %v)", err)
+				}
+				if flags&userLockingFlags != 0 {
+					t.Errorf("the flag write on .user left a user locking flag: %#x", flags)
+				}
+			}
+			return saved(fd, flags)
+		})
+		// Through RemoveScope, whose service user is s.uid: the clear is
+		// a note of the clean result, never an error or a log warning.
+		res, err := s.RemoveScope(t.Context(), 1001)
+		if err != nil || !res.Recorded {
+			t.Fatalf("rm-scope under a flagged .user the service user owns: %v, recorded %v", err, res.Recorded)
+		}
+		cleared := res.Cleared
+		if sharedCalls != 1 {
+			t.Errorf(".user's flags were written %d times, want once", sharedCalls)
+		}
+		for _, want := range []string{"cleared a user flag", "the shared directory " + quoteName(shared) + " (named for reading, not for pasting)"} {
+			if !strings.Contains(cleared, want) {
+				t.Errorf("the report %q does not say %q", cleared, want)
+			}
+		}
+		if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the scope directory is still there: %v", err)
+		}
+	})
+	// Through RemoveScope: the flag is cleared, then the retried removal
+	// stops (the seam moves the emptied directory away before it): the
+	// stop's error, committed, still carries the note of the clear.
+	t.Run("the service user's, then the removal stops", func(t *testing.T) {
+		s, shared, dir, _ := setup(t)
+		calls := 0
+		setSeam(t, &rmBeforeScopeRmdir, func(step rmdirStep) {
+			if step != rmdirBeforeStat {
+				return
+			}
+			calls++
+			if calls == 2 {
+				if err := os.Rename(dir, filepath.Join(shared, "away")); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+		_, err := s.RemoveScope(t.Context(), 1001)
+		if calls != 2 {
+			t.Fatalf("the scope directory's removal was tried %d times, want twice", calls)
+		}
+		if !Committed(err) || !errors.Is(err, errScopeDirMoved) {
+			t.Fatalf("rm-scope stopped after clearing .user's flag: %v, want committed wrapping errScopeDirMoved", err)
+		}
+		for _, want := range []string{"cleared a user flag", "the shared directory " + quoteName(shared) + " (named for reading, not for pasting)"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the error %q does not say %q", err, want)
+			}
+		}
+	})
+	t.Run("another user's", func(t *testing.T) {
+		s, shared, dir, ino := setup(t)
+		calls := recordScopeFlags(t)
+		cleared, err := run(t, s, s.uid+1)
+		if !errors.Is(err, unix.EPERM) {
+			t.Fatalf("removeScopeTree under another user's flagged .user: %v, want EPERM", err)
+		}
+		msg := err.Error()
+		for _, want := range []string{"the shared directory " + quoteName(shared) + " (named for reading, not for pasting)", fmt.Sprintf("uid %d owns it", s.uid), "clears nothing on it"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("the error %q does not say %q", msg, want)
+			}
+		}
+		if strings.Contains(msg, "sudo") || strings.Contains(msg, "chflags") {
+			t.Errorf("the error %q offers a command", msg)
+		}
+		if cleared != "" {
+			t.Errorf("a refused removal reports a clear: %q", cleared)
+		}
+		for _, c := range *calls {
+			if c.ino == ino {
+				t.Errorf("rm-scope wrote .user's flags: %+v", c)
+			}
+		}
+		var st unix.Stat_t
+		if err := unix.Lstat(shared, &st); err != nil || st.Flags&unix.UF_IMMUTABLE == 0 {
+			t.Fatalf(".user's flags: %#x (%v), want uchg kept", st.Flags, err)
+		}
+		if names, err := os.ReadDir(dir); err != nil || len(names) != 0 {
+			t.Fatalf("the scope directory holds %v (%v), want it present and emptied", names, err)
+		}
+	})
+}
+
+// A scope tree with more flagged entries than one run clears (the budget,
+// lowered to 2 through the seam) stops rm-scope with errScopeFlagBudget,
+// committed since the run listed the scope and changed the tree first, and
+// the error says to run rm-scope again; the entries past the budget keep
+// their flag, and a rerun with a fresh budget finishes the removal.
+func TestRemoveScopeFlagBudget(t *testing.T) {
+	setSeam(t, &flagOpenLimit, 2)
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	t.Cleanup(func() { unflagScopeTree(dir) })
+	var flagged []string
+	for i := range 5 {
+		p := filepath.Join(dir, fmt.Sprintf("locked%d", i))
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		giveToService(t, p)
+		setScopeFlags(t, p, unix.UF_IMMUTABLE, false)
+		flagged = append(flagged, p)
+	}
+	_, err := s.RemoveScope(t.Context(), 1001)
+	if !errors.Is(err, errScopeFlagBudget) || !Committed(err) {
+		t.Fatalf("rm-scope past its flag budget: %v, want committed errScopeFlagBudget", err)
+	}
+	if !strings.Contains(err.Error(), "run rm-scope for this scope again") {
+		t.Errorf("the error %q does not say to run rm-scope again", err)
+	}
+	var left int
+	for _, p := range flagged {
+		var st unix.Stat_t
+		if err := unix.Lstat(p, &st); err == nil && st.Flags&unix.UF_IMMUTABLE != 0 {
+			left++
+		}
+	}
+	if left != len(flagged)-2 {
+		t.Errorf("%d flagged entries are left, want %d past the budget of 2", left, len(flagged)-2)
+	}
+	for range 2 {
+		if _, err = s.RemoveScope(t.Context(), 1001); !errors.Is(err, errScopeFlagBudget) {
+			break
+		}
+	}
+	if err != nil {
+		t.Fatalf("the reruns: %v, want the removal finished", err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there: %v", err)
+	}
+}
+
+// The service user can set a user flag again on its own scope.key after
+// rm-scope cleared it, before the unlink (through the seam on the flag
+// write: the clear lands, then uchg is set again on the same descriptor).
+// The unlink fails with EPERM and the run stops committed (it took the
+// directory and cleared flags), saying the flag was set again while it ran
+// and to rerun once nothing sets the flag, with the rerun line. The rerun,
+// with nothing setting the flag, finds root's taken leftover (the seam's
+// other service uid makes the test's own 0700 directories root's) holding
+// the key the first run listed: it makes the record durable again, clears
+// the flag, removes the directory and reports it removed and listed.
+func TestRemoveScopeFlagResetThenRerunFinishes(t *testing.T) {
+	if asRoot() {
+		t.Skip("the seam's other service uid makes the store's own directories foreign as root")
+	}
+	s, server, _ := fileLogScope(t)
+	dir := scopeDir(server, "1001")
+	t.Cleanup(func() { unflagScopeTree(dir) })
+	key := filepath.Join(dir, scopeKeyName)
+	keyIno := setScopeFlags(t, key, unix.UF_IMMUTABLE, false)
+	saved := scopeFchflags
+	resets := 0
+	setSeam(t, &scopeFchflags, func(fd, flags int) error {
+		if err := saved(fd, flags); err != nil {
+			return err
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			return err
+		}
+		if st.Ino == keyIno {
+			resets++
+			return unix.Fchflags(fd, flags|unix.UF_IMMUTABLE)
+		}
+		return nil
+	})
+	_, err := s.RemoveScope(t.Context(), 1001)
+	if !Committed(err) || !errors.Is(err, unix.EPERM) || resets != 1 {
+		t.Fatalf("run 1 with the flag set again: %v (resets %d), want committed with EPERM", err, resets)
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		quoteName(key) + " (named for reading, not for pasting)",
+		"rm-scope cleared the flag, and it was set again while rm-scope ran",
+		"Rerun once nothing sets the flag",
+		"rerun sudo k3sm keys rm-scope user/1001 --yes",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("run 1's error %q does not say %q", msg, want)
+		}
+	}
+	if _, err := os.Lstat(key); err != nil {
+		t.Fatalf("scope.key after run 1: %v, want it left for the rerun", err)
+	}
+	scopeFchflags = saved
+	asTakenRerun(t, s, dir)
+	res, err := s.RemoveScope(t.Context(), 1001)
+	if err != nil || !res.Recorded {
+		t.Fatalf("the rerun: %v, recorded %v; want removed and listed", err, res.Recorded)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there: %v", err)
+	}
+	if !readRecord(t, s).listed(1001) {
+		t.Error("the record does not list the scope")
 	}
 }

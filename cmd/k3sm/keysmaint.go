@@ -188,18 +188,26 @@ func keysRmScope(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	recorded, err := s.RemoveScope(ctx, uid)
+	res, err := s.RemoveScope(ctx, uid)
 	if keystore.Committed(err) {
 		return v.failf(keysCommitted, "%v (exit 4)", err)
 	}
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	if !recorded {
+	if !res.Recorded {
 		fmt.Fprintf(env.stdout, "removed user/%d, but the removed-scopes record is full, so it is not listed: a copy of its directory put back would open, and floor --rebuild keeps its floor keys (exit 4)\n", uid)
+	} else {
+		fmt.Fprintf(env.stdout, "removed user/%d; run sudo k3sm keys floor --rebuild to free its floor keys\n", uid)
+	}
+	if res.Cleared != "" {
+		// A flag rm-scope cleared on the shared .user directory, which the
+		// service user owns: part of what it did, not a failure.
+		fmt.Fprintln(env.stdout, res.Cleared)
+	}
+	if !res.Recorded {
 		return keysCommitted
 	}
-	fmt.Fprintf(env.stdout, "removed user/%d; run sudo k3sm keys floor --rebuild to free its floor keys\n", uid)
 	return keysOK
 }
 

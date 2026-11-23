@@ -161,8 +161,13 @@ func TestRebuildForgedTombstoneFloodPresentUIDRefusesThenRmScope(t *testing.T) {
 	if !bytes.Equal(before, readLog(t, s, userFloorLogName)) {
 		t.Fatal("the refused rebuild changed the floor")
 	}
-	if recorded, err := s.RemoveScope(ctx, 1002); err != nil || !recorded {
-		t.Fatalf("rm-scope user/1002: %v, %v", recorded, err)
+	// The flooded floor is past the steady-state reader's bound, so the
+	// delivery record cannot be checked against it: removed and listed,
+	// committed, deliveries not confirmed.
+	if res, err := s.RemoveScope(ctx, 1002); !Committed(err) || !res.Recorded || !strings.Contains(err.Error(), "deliveries are not confirmed") {
+		t.Fatalf("rm-scope user/1002: %v, %v; want listed, committed, deliveries not confirmed", res.Recorded, err)
+	} else {
+		checkRmScopeCommands(t, strings.ReplaceAll(err.Error(), "user/1002", "user/1001"))
 	}
 	rep, _ := rebuild(t, s)
 	if rep.RemovedKeys == 0 {
