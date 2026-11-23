@@ -622,8 +622,8 @@ rootcheck U50 "root-run: the defeat list run as the service user against both fl
 	k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser
 pend U51 "per-uid log fairness: the share is a fixed byte count, at most 1/16 of the hard cap; every line, reads included, is charged to its uid; a uid past its share has its mutations and reads refused with ErrLogFull while another uid's succeed, never as the global append failure; it cannot get another uid's mutations, reads or revocations refused, though it can delay them through the store lock; list and deliveries are rate-limited per uid (socket operations)" \
 	k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID TestLogShareAtMostOneSixteenthOfHardCap TestShareRefusalIsNotGlobalAppendFailure TestReadRateLimitPerUID TestReadsChargedToShare TestShareExhaustionIsolatedPerUID
-check U52 "every root verb writes one audit line with via root once the log exists, and none before it (append-only files)" \
-	k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine
+check U52 "every root verb writes one audit line with via root once the log exists, and none before it; floor merge and its dry run included, a change made with exit 4 or 5 audited committed (append-only files)" \
+	k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine TestFloorMergeWritesAuditLine TestKeysAuditResult
 pend U53 "every reconciler Secret write and delete, and every record withdrawal, writes one audit line with via reconciler, except drift repairs, coalesced to one line per delivery per 10 minutes (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited
 pend U54 "a pre-frame refusal writes a refused line with the peer uid, rate-limited per uid, drawing on the reconciler budget with its once-a-minute dropped-count summary (socket listener)" \

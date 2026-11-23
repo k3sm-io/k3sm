@@ -206,6 +206,9 @@ type keysAudit struct {
 	// roots are the verb's scrubbed roots (keysVerb.roots), which the
 	// warning of a line not written is scrubbed of.
 	roots []string
+	// op, when set, is the line's op in place of the one runKeysWith
+	// derives from the verb: the floor verb's two forms set theirs.
+	op string
 }
 
 // keysEnv is what the keys verbs touch, so a test can fake it.
@@ -592,23 +595,34 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 	switch op {
 	case "ls":
 		op = "list"
-	case "floor":
-		op = "floor-rebuild"
 	case "audit":
 		op = "audit-rotate"
 	}
-	result := "refused"
-	switch code {
-	case keysOK:
-		result = "ok"
-	case keysResumed:
-		result = "resumed"
+	if audit.op != "" {
+		op = audit.op
 	}
-	if err := audit.store.AuditRoot(ctx, op, audit.name, result); err != nil {
+	if err := audit.store.AuditRoot(ctx, op, audit.name, keysAuditResult(code)); err != nil {
 		// The verb has run; what it did stands, and its exit code says so.
 		fmt.Fprintf(env.stderr, "k3sm keys %s: warning: its audit line was not written: %v\n", op, scrubPaths(err, audit.roots...))
 	}
 	return code
+}
+
+// keysAuditResult is the audit line's result for a verb's exit code: ok,
+// resumed (rewrap finished an earlier rewrap), committed (keysCommitted and
+// keysNotRenamed: the change was made, and its report says what to read or
+// rerun), or refused.
+func keysAuditResult(code int) string {
+	switch code {
+	case keysOK:
+		return "ok"
+	case keysResumed:
+		return "resumed"
+	case keysCommitted, keysNotRenamed:
+		return "committed"
+	default:
+		return "refused"
+	}
 }
 
 // runKeysVerb dispatches one verb.
@@ -1125,6 +1139,14 @@ func keysFloorMerge(ctx context.Context, args []string, env keysEnv) int {
 	pos, err := v.parse(args)
 	if err != nil {
 		return keysBadUsage
+	}
+	if v.env.audit != nil {
+		// A dry run writes nothing, so its line says so: an auditor reading
+		// floor-merge ok knows the floor was merged.
+		v.env.audit.op = "floor-merge"
+		if *dryRun {
+			v.env.audit.op = "floor-merge-dry-run"
+		}
 	}
 	if len(pos) != 0 {
 		return v.failf(keysBadUsage, "takes no file: it reads only keystore-floor.json.pre-restore in the data root, the floor the restore recipe moves aside")

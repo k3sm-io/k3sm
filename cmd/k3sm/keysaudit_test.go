@@ -43,7 +43,7 @@ func (r keysAuditRecorder) AuditRoot(ctx context.Context, op, name, result strin
 }
 
 // U52: every root verb that exists (put, list, show, rotate, rm, rewrap,
-// deliver, undeliver) asks for exactly one audit line, via root, naming its
+// deliver, undeliver; floor merge in TestFloorMergeWritesAuditLine) asks for exactly one audit line, via root, naming its
 // op, its entry and its result, and a refusal is audited as refused. A verb
 // refused before it opens the store (usage, not root) asks for none. With
 // no audit log (before install made it) no line is written, nothing creates
@@ -132,4 +132,59 @@ func (panickingFileAttrs) Fchmod(int, uint32) error {
 
 func (panickingFileAttrs) Fchflags(int, int) error {
 	panic("a unit test reached fchflags: inject a fake file-attribute writer")
+}
+
+// U52 for the floor verb's merge form: floor merge and its dry run each ask
+// for one audit line, the dry run under its own op since it writes nothing,
+// and a usage refusal, before the store opens, asks for none.
+func TestFloorMergeWritesAuditLine(t *testing.T) {
+	h := newKeysHarness(t)
+	var lines []string
+	h.wrap = func(s keysStore) keysStore { return keysAuditRecorder{keysStore: s, lines: &lines} }
+	h.put("system/k", []byte("v"))
+	b := saveRecipeBackup(t, h, filepath.Join(t.TempDir(), "keystore-floor-backup"), "2026-11-22")
+	h.mustRun(keysOK, "rm", "system/k", "--yes")
+	if _, err := restoreRecipeBackup(t, h, b, true); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	for _, tc := range []struct {
+		args []string
+		op   string
+	}{
+		{[]string{"floor", "merge", "--dry-run"}, "floor-merge-dry-run"},
+		{[]string{"floor", "merge"}, "floor-merge"},
+	} {
+		lines = nil
+		code := h.run(tc.args...)
+		want := tc.op + "  " + keysAuditResult(code)
+		if code != keysOK && code != keysCommitted {
+			t.Fatalf("keys %v exited %d: %s", tc.args, code, h.stderr.String())
+		}
+		if !slices.Equal(lines, []string{want}) {
+			t.Errorf("keys %v: audit lines %q, want exactly [%q]", tc.args, lines, want)
+		}
+	}
+	lines = nil
+	h.mustRun(keysBadUsage, "floor", "merge", "extra")
+	h.mustRun(keysBadUsage, "floor")
+	if len(lines) != 0 {
+		t.Errorf("floor refused for usage asked for audit lines: %q", lines)
+	}
+}
+
+// keysAuditResult: an exit that made the change (4, and 5 for a floor merge
+// written but not finished) is audited as committed, never as refused.
+func TestKeysAuditResult(t *testing.T) {
+	for code, want := range map[int]string{
+		keysOK:         "ok",
+		keysRefused:    "refused",
+		keysBadUsage:   "refused",
+		keysResumed:    "resumed",
+		keysCommitted:  "committed",
+		keysNotRenamed: "committed",
+	} {
+		if got := keysAuditResult(code); got != want {
+			t.Errorf("keysAuditResult(%d) = %q, want %q", code, got, want)
+		}
+	}
 }

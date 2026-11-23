@@ -31,6 +31,9 @@ import (
 // floor merge, so its usage line names both forms.
 func keysFloorRebuild(ctx context.Context, args []string, env keysEnv) int {
 	v := newKeysVerb("floor", env)
+	if v.env.audit != nil {
+		v.env.audit.op = "floor-rebuild"
+	}
 	rebuild := v.fs.Bool("rebuild", false, "rebuild the user-scope floor log")
 	pos, err := v.parse(args)
 	if err != nil {
