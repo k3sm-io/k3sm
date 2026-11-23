@@ -32,6 +32,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -373,53 +374,99 @@ func (s *FileStore) Current(ctx context.Context, name string) (Version, []byte, 
 
 // Absent reports whether name is definitively not an entry, for a caller
 // that must act on a deletion (the delivery reconciler deletes the Secret it
-// delivered for a deleted entry). Current answers ErrNotFound both for a
-// name with no entry and for an entries' directory that is not there; only
-// the first is an answer about name, since a data root restored without its
-// keystore, or not yet mounted, is not every entry deleted. So Absent is true
-// only when the entries' directory opens and is trusted under the shared
-// lock, the recorded floor reads, and name has no directory there or holds
-// only what an interrupted Put leaves (not an entry, as for Current). A
-// missing entries' directory, an entry Current reports as corrupt (a lost
-// pointer included) and any other failure is false with the error. It reads
-// no record and does not load the master key, so it names no value.
-func (s *FileStore) Absent(ctx context.Context, name string) (bool, error) {
-	absent, err := s.absent(ctx, name)
+// delivered for a deleted entry), with the Identity of the entries'
+// directory it read, so the caller can tell that directory from one restored
+// or recreated since. Current answers ErrNotFound both for a name with no
+// entry and for an entries' directory that is not there; only the first is an
+// answer about name, since a data root restored without its keystore, or not
+// yet mounted, is not every entry deleted. So Absent is true only when the
+// entries' directory opens and is trusted under the shared lock, the recorded
+// floor reads, and name has no directory there or holds only what an
+// interrupted Put leaves (not an entry, as for Current). A missing entries'
+// directory, an entry Current reports as corrupt (a lost pointer included)
+// and any other failure is false with the error. It reads no record and does
+// not load the master key, so it names no value.
+func (s *FileStore) Absent(ctx context.Context, name string) (absent bool, identity string, err error) {
+	absent, identity, err = s.absent(ctx, name)
 	if err != nil {
-		return false, fmt.Errorf("%s: %w", name, err)
+		return false, "", fmt.Errorf("%s: %w", name, err)
 	}
-	return absent, nil
+	return absent, identity, nil
 }
 
-func (s *FileStore) absent(ctx context.Context, name string) (bool, error) {
+func (s *FileStore) absent(ctx context.Context, name string) (bool, string, error) {
 	if err := s.checkConfig(); err != nil {
-		return false, err
+		return false, "", err
 	}
 	if err := checkName(name); err != nil {
-		return false, err
+		return false, "", err
 	}
 	// Unlike read, a missing entries' directory stays fs.ErrNotExist: it is
 	// not an answer about name.
 	root, done, err := s.openLocked(ctx, false, false)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	defer done()
+	id, err := rootIdentity(root)
+	if err != nil {
+		return false, "", err
+	}
 	fdir, fl, err := s.openFloor()
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	_ = fdir.Close() // read-only; nothing to flush
 	e, err := openEntry(root, name, fl)
 	switch {
 	case err == nil:
 		e.close()
-		return false, nil
+		return false, id, nil
 	case errors.Is(err, ErrNotFound):
-		return true, nil
+		return true, id, nil
 	default:
-		return false, err
+		return false, "", err
 	}
+}
+
+// Identity names the entries' directory as it stands: its device and inode,
+// as "<dev>:<ino>". A restore that moves keystore/ aside and puts a copy in
+// its place, or a keystore deleted and created again by the next Put, gets a
+// new one; a Put, Rotate or Delete inside it does not change it. It is what
+// the delivery reconciler compares across sweeps before it deletes a Secret
+// on Absent's word. It reads only the directory's metadata, after the
+// directory checks every open makes, and takes no lock. A missing entries'
+// directory is an error matching fs.ErrNotExist.
+func (s *FileStore) Identity(ctx context.Context) (string, error) {
+	if err := s.checkConfig(); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	root, err := s.openDir(s.dir, false)
+	if err != nil {
+		return "", fmt.Errorf("the keystore identity: %w", err)
+	}
+	defer func() { _ = root.Close() }() // read-only
+	id, err := rootIdentity(root)
+	if err != nil {
+		return "", fmt.Errorf("the keystore identity: %w", err)
+	}
+	return id, nil
+}
+
+// rootIdentity is the device and inode of the directory root is open on.
+func rootIdentity(root *os.Root) (string, error) {
+	fi, err := root.Stat(".")
+	if err != nil {
+		return "", err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return "", errors.New("the entries' directory has no device and inode")
+	}
+	return strconv.FormatUint(uint64(st.Dev), 10) + ":" + strconv.FormatUint(st.Ino, 10), nil
 }
 
 // Get returns version of name with its value. A version above the one the

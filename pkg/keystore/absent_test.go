@@ -28,14 +28,22 @@ import (
 // TestAbsent: Absent is true for a deleted or never-put name, false for a
 // live one, and false with an error where Current's ErrNotFound is not an
 // answer about the name (no entries' directory) or the entry is damaged (a
-// lost pointer).
+// lost pointer). The identity it returns is Identity's, which a Put or a
+// Delete leaves alone and a directory swapped in for the entries' changes.
 func TestAbsent(t *testing.T) {
 	ctx := context.Background()
 	s, server := newTestStore(t)
-	if got, err := s.Absent(ctx, "a"); got || !errors.Is(err, fs.ErrNotExist) {
+	if got, _, err := s.Absent(ctx, "a"); got || !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Absent with no entries' directory = %v %v, want false and fs.ErrNotExist", got, err)
 	}
+	if id, err := s.Identity(ctx); id != "" || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Identity with no entries' directory = %q %v, want fs.ErrNotExist", id, err)
+	}
 	mustPut(t, s, "live", KindOpaque, []byte("live"))
+	before, err := s.Identity(ctx)
+	if err != nil || before == "" {
+		t.Fatalf("Identity = %q %v", before, err)
+	}
 	mustPut(t, s, "gone", KindOpaque, []byte("gone"))
 	mustPut(t, s, "lost", KindOpaque, []byte("lost"))
 	if err := s.Delete(ctx, "gone"); err != nil {
@@ -54,9 +62,12 @@ func TestAbsent(t *testing.T) {
 		{"never", true, nil},
 		{"lost", false, ErrCorrupt},
 	} {
-		got, err := s.Absent(ctx, c.name)
+		got, id, err := s.Absent(ctx, c.name)
 		if got != c.absent || (c.err == nil) != (err == nil) || (c.err != nil && !errors.Is(err, c.err)) {
 			t.Errorf("Absent(%s) = %v %v, want %v %v", c.name, got, err, c.absent, c.err)
+		}
+		if err == nil && id != before {
+			t.Errorf("Absent(%s) read identity %q, want %q: a Put or Delete changed it", c.name, id, before)
 		}
 	}
 	// The entries' directory moved aside: Current reads every name as not
@@ -68,7 +79,12 @@ func TestAbsent(t *testing.T) {
 	if _, _, err := s.Current(ctx, "live"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Current with the entries' directory moved aside = %v, want ErrNotFound", err)
 	}
-	if got, err := s.Absent(ctx, "live"); got || !errors.Is(err, fs.ErrNotExist) {
+	if got, _, err := s.Absent(ctx, "live"); got || !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Absent with the entries' directory moved aside = %v %v, want false and fs.ErrNotExist", got, err)
+	}
+	// A directory put in its place is another keystore.
+	mustPut(t, s, "fresh", KindOpaque, []byte("fresh"))
+	if after, err := s.Identity(ctx); err != nil || after == before {
+		t.Fatalf("Identity of a recreated entries' directory = %q %v, want other than %q", after, err, before)
 	}
 }
