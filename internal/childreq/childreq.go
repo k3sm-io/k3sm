@@ -23,7 +23,8 @@ limitations under the License.
 // together with each requirement the raised version itself needs above the tag's,
 // and nothing else moves. kine is built from a patched copy of its own
 // module, so Apply raises the requirement in that copy's go.mod and adds the hashes
-// to its go.sum.
+// to its go.sum. A module the raised versions newly import, which the tag does not
+// require at all, is added as a requirement the same way (Requirement.Added).
 //
 // A raise is a build-time requirement only. The go.sum hashes are the checksum
 // database's, recorded here so the build runs -mod=readonly: every module is
@@ -71,6 +72,17 @@ const (
 // module of its own, so raising it moves no other module.
 const CompressVersion = "v1.20.2"
 
+// OTelVersion is the go.opentelemetry.io/otel family version kine is built
+// against. v1.47.0 fixes GO-2026-6974 in go.opentelemetry.io/otel/sdk (an attribute
+// length limit bypassed by U+FFFD runes) and in otel/trace, and GO-2026-6975 in
+// go.opentelemetry.io/otel (memory amplification parsing W3C baggage); kine's tag
+// selects v1.46.0. The sdk at this version requires otel, otel/metric and otel/trace
+// at the same version, and otel imports the new go.opentelemetry.io/otel/log module,
+// which kine's tag does not require, so all five move together: four raised, otel/log
+// added. These are the versions the control-plane binaries and the etcd wrapper are
+// built against.
+const OTelVersion = "v1.47.0"
+
 // Requirement is one raised module requirement and its go.sum hashes.
 type Requirement struct {
 	// Path is the module path.
@@ -79,6 +91,10 @@ type Requirement struct {
 	Version string
 	// Sum is the module zip's go.sum hash and GoModSum its go.mod's.
 	Sum, GoModSum string
+	// Added marks a module the tree does not require at all, which the raised
+	// versions newly import: Apply adds its requirement instead of raising one, and
+	// refuses if the tree already requires it.
+	Added bool
 }
 
 // Raises is the set of raised requirements kine is built with. Changing it changes
@@ -119,6 +135,32 @@ var Raises = []Requirement{{
 	Version:  CompressVersion,
 	Sum:      "h1:v5tiZvm1KGLyg5d5oXdXe3lsSPrbEUiKoXGia//I7Qo=",
 	GoModSum: "h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=",
+}, {
+	Path:     "go.opentelemetry.io/otel/sdk",
+	Version:  OTelVersion,
+	Sum:      "h1:zWXEr4j2lFefG87TU6Yg8a7ngfohIKFZHKp0Hf5hC6I=",
+	GoModSum: "h1:VUc24kiOeoGsxG8G9ULx3fWKvB7jMhnGE8Oi607lgR0=",
+}, {
+	Path:     "go.opentelemetry.io/otel",
+	Version:  OTelVersion,
+	Sum:      "h1:j7ALJ/zgkS7Z6aeJW09p8VC9804bC+PpeTfCD4XPnOM=",
+	GoModSum: "h1:8wS9O2qfXrYrzp6hIF/HOYJJf/wIhFPhR2xLuP+iXQU=",
+}, {
+	Path:     "go.opentelemetry.io/otel/metric",
+	Version:  OTelVersion,
+	Sum:      "h1:4PptaldXx3Eat1XjMZ68pPJEs5wrhlemctZE9a3UdWY=",
+	GoModSum: "h1:ADGSXxRrXM6bjbvLo535EstVFlPpPYZm4LBKixjDHwU=",
+}, {
+	Path:     "go.opentelemetry.io/otel/trace",
+	Version:  OTelVersion,
+	Sum:      "h1:JOjX/Oci8K94QHddo+bbfya/Ai/nf6/dt9ZfrFNWSrM=",
+	GoModSum: "h1:jNaSLa2PZEYFG6fRjJABAu+bw4FS08uDmPg28lTghu0=",
+}, {
+	Path:     "go.opentelemetry.io/otel/log",
+	Version:  OTelVersion,
+	Sum:      "h1:cOTS1CcLbSQeZKanGJ+0JpF/+t4PELi3O3bbl2lqCcI=",
+	GoModSum: "h1:9byitSQ5pLC6PpqwGXjqdMKya6ZTswHRZh2vvXT33nw=",
+	Added:    true,
 }}
 
 // ErrNotARaise marks a requirement the tree already meets or exceeds: the pin
@@ -130,7 +172,9 @@ var ErrNotARaise = errors.New("the module already requires this version or newer
 // go.sum there. The module must already be required on exactly one go.mod line at
 // a version strictly below the raise; anything else is an error naming the module,
 // never a silent skip, so a pin bump that already carries the fix stops the build
-// and makes someone drop the raise.
+// and makes someone drop the raise. An Added requirement must not be required at
+// all, and gets its own "// indirect" require line; a pin bump that starts
+// requiring it stops the build the same way.
 func Apply(root string, reqs []Requirement) error {
 	modPath := filepath.Join(root, "go.mod")
 	mod, err := os.ReadFile(modPath)
@@ -140,7 +184,13 @@ func Apply(root string, reqs []Requirement) error {
 	lines := strings.Split(string(mod), "\n")
 	var sums strings.Builder
 	for _, r := range reqs {
-		if err := raiseLine(lines, r); err != nil {
+		if r.Added {
+			l, err := addLine(lines, r)
+			if err != nil {
+				return err
+			}
+			lines = l
+		} else if err := raiseLine(lines, r); err != nil {
 			return err
 		}
 		fmt.Fprintf(&sums, "%s %s %s\n%s %s/go.mod %s\n", r.Path, r.Version, r.Sum, r.Path, r.Version, r.GoModSum)
@@ -162,34 +212,32 @@ func Apply(root string, reqs []Requirement) error {
 	return nil
 }
 
+// addLine returns lines with a "require <path> <version> // indirect" line for r
+// appended, after the last non-empty line. It refuses if any line already requires
+// r.Path.
+func addLine(lines []string, r Requirement) ([]string, error) {
+	if at, err := requireLine(lines, r.Path); err != nil {
+		return nil, err
+	} else if at >= 0 {
+		return nil, fmt.Errorf("add %s %s: go.mod already requires it: %w", r.Path, r.Version, ErrNotARaise)
+	}
+	if _, err := parseRelease(r.Version); err != nil {
+		return nil, fmt.Errorf("add %s: %w", r.Path, err)
+	}
+	end := len(lines)
+	for end > 0 && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	out := append(append([]string{}, lines[:end]...), "", "require "+r.Path+" "+r.Version+" // indirect")
+	return append(out, lines[end:]...), nil
+}
+
 // raiseLine rewrites, in place, the one go.mod line requiring r.Path, either a
 // "require <path> <version>" line or a "<path> <version>" line in a require block.
 func raiseLine(lines []string, r Requirement) error {
-	at, block := -1, false
-	for i, l := range lines {
-		t := strings.TrimSpace(l)
-		switch {
-		case strings.HasPrefix(t, "require ("):
-			block = true
-			continue
-		case block && t == ")":
-			block = false
-			continue
-		}
-		f := strings.Fields(t)
-		if !block {
-			if len(f) < 3 || f[0] != "require" {
-				continue
-			}
-			f = f[1:]
-		}
-		if len(f) < 2 || f[0] != r.Path {
-			continue
-		}
-		if at >= 0 {
-			return fmt.Errorf("raise %s: go.mod requires it on more than one line", r.Path)
-		}
-		at = i
+	at, err := requireLine(lines, r.Path)
+	if err != nil {
+		return err
 	}
 	if at < 0 {
 		return fmt.Errorf("raise %s: go.mod does not require it", r.Path)
@@ -208,6 +256,39 @@ func raiseLine(lines []string, r Requirement) error {
 	}
 	lines[at] = strings.Replace(lines[at], r.Path+" "+old, r.Path+" "+r.Version, 1)
 	return nil
+}
+
+// requireLine is the index of the one go.mod line requiring path, either a
+// "require <path> <version>" line or a "<path> <version>" line in a require block,
+// or -1 when no line requires it. More than one such line is an error.
+func requireLine(lines []string, path string) (int, error) {
+	at, block := -1, false
+	for i, l := range lines {
+		t := strings.TrimSpace(l)
+		switch {
+		case strings.HasPrefix(t, "require ("):
+			block = true
+			continue
+		case block && t == ")":
+			block = false
+			continue
+		}
+		f := strings.Fields(t)
+		if !block {
+			if len(f) < 3 || f[0] != "require" {
+				continue
+			}
+			f = f[1:]
+		}
+		if len(f) < 2 || f[0] != path {
+			continue
+		}
+		if at >= 0 {
+			return -1, fmt.Errorf("raise %s: go.mod requires it on more than one line", path)
+		}
+		at = i
+	}
+	return at, nil
 }
 
 // versionLess reports whether release version a sorts before b. Both must be plain

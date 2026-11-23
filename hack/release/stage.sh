@@ -454,8 +454,9 @@ GV_ALLOW="$HERE/govulncheck.allow"
 # path@version), HELM_COMMIT (the tag's commit the build stamps) and HELM_BINARY,
 # XNET_FLOOR (the golang.org/x/net kine is built against),
 # COMPRESS_RAISED (the github.com/klauspost/compress it is built against) and
-# KINE_RAISED (every module kine is built with raised, "path version" pairs
-# space-separated: x/net, the golang.org/x modules it requires, compress), read from
+# KINE_RAISED (every module kine is built with raised or added, "path version"
+# pairs space-separated: x/net, the golang.org/x modules it requires, compress, the
+# OpenTelemetry family), read from
 # the source the staged k3sm is built from, so the checks below compare against
 # that build's own pins.
 read_pins() {
@@ -492,6 +493,11 @@ read_pins() {
 		KINE_RAISED="$KINE_RAISED golang.org/x/${m%%:*} $v"
 	done
 	KINE_RAISED="$KINE_RAISED github.com/klauspost/compress $COMPRESS_RAISED"
+	v="$(sed -n 's/^[[:space:]]*const OTelVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cr")"
+	[ -n "$v" ] || die "cannot read the raised go.opentelemetry.io/otel family (OTelVersion) from $cr"
+	for m in sdk "" metric trace log; do
+		KINE_RAISED="$KINE_RAISED go.opentelemetry.io/otel${m:+/$m} $v"
+	done
 }
 
 # helm_buildinfo_problems <want-version> <go-pin> <raised>  (stdin: `go version -m`)
