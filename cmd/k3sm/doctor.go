@@ -148,10 +148,11 @@ type doctorEnv struct {
 	keystoreMaintenance func(context.Context) (verb string, present bool, err error)
 	// keystoreUserScope builds the user scope's start checks as doctor
 	// re-runs them in its own process (doctorKeystoreUserScope): the same
-	// socket.Preconditions the server's supervisor runs, and a func that
-	// releases what they hold. An error is a service user that cannot be
-	// resolved. A nil seam leaves the row unprobed.
-	keystoreUserScope func() (socket.Preconditions, func(), error)
+	// socket.Preconditions the server's supervisor runs, what releases what
+	// they hold, the servers the count saw and an lstat of the socket path.
+	// An error is a service user that cannot be resolved. A nil seam leaves
+	// the row unprobed.
+	keystoreUserScope func() (doctorUserScope, error)
 	// interconnect is the interconnect section's seams (doctorinterconnect.go).
 	// Nil leaves the section out of the report.
 	interconnect *interconnectEnv
@@ -271,13 +272,23 @@ func checkKeystoreMaintenance(env doctorEnv) checkResult {
 	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, left by keys %s, which stopped or did not report; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName, verb), remedy: "sudo k3sm keys " + verb + "   # finishes the run, or prints its committed report"}
 }
 
-// checkKeystoreUserScope is the user scope's row: "keystore user scope: on"
-// when every start check the server's supervisor runs passes, else "off
-// (<reason>)" with the supervisor's reason, naming `sudo k3sm install` where
-// that puts it right. Doctor cannot read the server's supervisor, so it
-// re-runs the same checks through the same evaluator
-// (socket.Preconditions.Check); off is a WARN, since the system scope is
-// unaffected. A worker runs no listener.
+// doctorServersShown bounds how many server names the user-scope row
+// lists when more than one is registered.
+const doctorServersShown = 8
+
+// checkKeystoreUserScope is the user scope's row. Doctor is its own process
+// and cannot read the server's supervisor, so it re-runs the same start
+// checks through the same evaluator (socket.Preconditions.Check), judging
+// the logs read-only where the server reopens them. When every check passes
+// it says "start checks pass" and not "on": all it can add is what an
+// lstat of the socket path shows (it never connects; root and the service
+// user would be refused and write a refusal line), and no socket of the
+// service user's there is a WARN. A failed check is "off (<reason>)" with
+// the supervisor's reason, naming `sudo k3sm install` where that puts it
+// right, and the servers by name when more than one is registered; off is a
+// WARN, since the system scope is unaffected. A server count this user may
+// not read is a WARN naming sudo that does not call the scope off. A worker
+// runs no listener.
 func checkKeystoreUserScope(env doctorEnv) checkResult {
 	const name = "keystore-user-scope"
 	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
@@ -288,15 +299,28 @@ func checkKeystoreUserScope(env doctorEnv) checkResult {
 	}
 	var reason socket.OffReason
 	var why string
-	pre, release, err := env.keystoreUserScope()
+	scope, err := env.keystoreUserScope()
 	if err != nil {
 		reason, why = socket.OffNotInstalledServer, err.Error()
 	} else {
-		reason, why = pre.Check(context.Background())
-		release()
+		reason, why = scope.pre.Check(context.Background())
+		if scope.release != nil {
+			scope.release()
+		}
 	}
-	if reason == "" {
-		return checkResult{name: name, status: statusPass, detail: "keystore user scope: on"}
+	var servers []string
+	var countErr error
+	if err == nil && scope.servers != nil {
+		servers, countErr = scope.servers()
+	}
+	switch {
+	case reason == "":
+		if serr := scope.sockState(); serr != nil {
+			return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: start checks pass, but no listening socket at %s [%v]", scope.sockPath, serr)}
+		}
+		return checkResult{name: name, status: statusPass, detail: "keystore user scope: start checks pass; a socket owned by the service user is at " + scope.sockPath}
+	case reason == socket.OffServersUnknown && errors.Is(countErr, fs.ErrPermission):
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: the server count cannot be read as this user, so the start checks are not all known [%v]", countErr), remedy: "sudo k3sm doctor   # the admin kubeconfig is root's"}
 	}
 	detail := "keystore user scope: off (" + string(reason) + ")"
 	r := checkResult{name: name, status: statusWarn}
@@ -307,8 +331,20 @@ func checkKeystoreUserScope(env doctorEnv) checkResult {
 	if why != "" {
 		detail += " [" + why + "]"
 	}
+	if reason == socket.OffServers && len(servers) > 1 {
+		detail += " servers: " + boundedNames(servers, doctorServersShown)
+	}
 	r.detail = detail
 	return r
+}
+
+// boundedNames joins the first max of names with ", ", adding how many
+// more there are.
+func boundedNames(names []string, max int) string {
+	if len(names) <= max {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(names[:max], ", "), len(names)-max)
 }
 
 // keystoreSoftCapHint is the keystore-logs row's WARN when either log is
@@ -1011,7 +1047,7 @@ func realDoctorEnv(workDir string) doctorEnv {
 		keystoreMaintenance: func(ctx context.Context) (string, bool, error) {
 			return keystore.New(keystoreLayout(workDir)).StandingMaintenance(ctx)
 		},
-		keystoreUserScope: func() (socket.Preconditions, func(), error) {
+		keystoreUserScope: func() (doctorUserScope, error) {
 			return doctorKeystoreUserScope(workDir)
 		},
 		interconnect: realInterconnectEnv(),

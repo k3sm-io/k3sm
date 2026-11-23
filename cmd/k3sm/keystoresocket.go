@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -34,6 +35,7 @@ import (
 	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/k3sm/pkg/keystore/socket"
 	"k3sm.io/k3sm/pkg/kubeclient"
+	"k3sm.io/runtimed/pkg/keystorepaths"
 )
 
 // keystoreServerCountTimeout bounds one count of the cluster's servers, so a
@@ -48,22 +50,30 @@ const keystoreServerCountTimeout = 10 * time.Second
 // keystoreServerCountTimeout, and any error, a nil client included, is the
 // count's error, which keeps the listener off.
 func countKeystoreServers(ctx context.Context, cs kubernetes.Interface) (int, error) {
+	names, err := listKeystoreServers(ctx, cs)
+	return len(names), err
+}
+
+// listKeystoreServers is countKeystoreServers' list: the servers' node
+// names, sorted.
+func listKeystoreServers(ctx context.Context, cs kubernetes.Interface) ([]string, error) {
 	if cs == nil {
-		return 0, errors.New("no admin client to count the servers with")
+		return nil, errors.New("no admin client to count the servers with")
 	}
 	ctx, cancel := context.WithTimeout(ctx, keystoreServerCountTimeout)
 	defer cancel()
 	list, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: controlPlaneNodeLabel})
 	if err != nil {
-		return 0, fmt.Errorf("list the nodes labelled %s: %w", controlPlaneNodeLabel, err)
+		return nil, fmt.Errorf("list the nodes labelled %s: %w", controlPlaneNodeLabel, err)
 	}
-	n := 0
+	var names []string
 	for i := range list.Items {
 		if _, cp := list.Items[i].Labels[controlPlaneNodeLabel]; cp {
-			n++
+			names = append(names, list.Items[i].Name)
 		}
 	}
-	return n, nil
+	slices.Sort(names)
+	return names, nil
 }
 
 // openKeystoreDataRoot opens the data root as a directory, refusing a
@@ -259,21 +269,87 @@ func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Inte
 	return runKeystoreSocket(ctx, ks)
 }
 
+// doctorUserScope is what doctor's user-scope row reads: the start checks
+// as doctor re-runs them, the release of what they hold, the servers the
+// count saw and its error, and the one fact doctor can establish about the
+// listener without connecting to it (a connection from root or the service
+// user would be refused and write a refusal line): what is at the socket's
+// path.
+type doctorUserScope struct {
+	pre     socket.Preconditions
+	release func()
+	// servers is the last count's sorted node names, and countErr its
+	// error.
+	servers  func() ([]string, error)
+	sockPath string
+	// sockState lstats sockPath, never following or connecting: nil when a
+	// socket owned by the service user is there.
+	sockState func() error
+}
+
+// errNoListeningSocket is a socket path that holds no socket of the
+// service user's.
+var errNoListeningSocket = errors.New("no listening socket")
+
+// lstatKeystoreSocket judges what is at path by lstat alone: nil for a
+// socket owned by uid, else an error wrapping errNoListeningSocket (or the
+// lstat's error) that says what is there.
+func lstatKeystoreSocket(path string, uid uint32) error {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("%w: nothing is at the path", errNoListeningSocket)
+		}
+		return fmt.Errorf("lstat the socket path: %w", err)
+	}
+	return judgeKeystoreSocket(uint32(st.Mode), st.Uid, uid)
+}
+
+// judgeKeystoreSocket is lstatKeystoreSocket's rule over an lstat's mode
+// and owner.
+func judgeKeystoreSocket(mode, owner, uid uint32) error {
+	switch {
+	case mode&unix.S_IFMT != unix.S_IFSOCK:
+		return fmt.Errorf("%w: the path is not a socket", errNoListeningSocket)
+	case owner != uid:
+		return fmt.Errorf("%w: the socket is owned by uid %d, not the service user's %d", errNoListeningSocket, owner, uid)
+	}
+	return nil
+}
+
+// readAdminKubeconfig loads the admin kubeconfig at path, opening it first
+// so that a file this user may not read is an error wrapping
+// fs.ErrPermission.
+func readAdminKubeconfig(path string) (kubernetes.Interface, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read the admin kubeconfig: %w", err)
+	}
+	_ = f.Close() // opened only to learn whether this user may read it
+	_, cs, err := kubeclient.FromPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("load the admin kubeconfig: %w", err)
+	}
+	return cs, nil
+}
+
 // doctorKeystoreUserScope is doctor's view of the user scope's start checks
 // for the server whose work dir is workDir. Doctor runs as its own process,
 // so where the server's supervisor reads its own state doctor reads the
 // installed one: the server's effective uid is the service uid when this
 // Mac is installed as a server (its LaunchDaemon runs as the service user),
 // and doctor's own otherwise, the uid a rootless server started from the
-// same account runs as; the marker is read without reopening anything; the
-// data root's descriptor is opened here and released by the returned func;
-// and the servers are counted through the work dir's admin kubeconfig. A
-// failure to open the data root or to load the kubeconfig is that check's
-// error, so it is reported in its place in the order.
-func doctorKeystoreUserScope(workDir string) (socket.Preconditions, func(), error) {
+// same account runs as; the marker is read without reopening anything, and
+// the logs are judged read-only (CheckLogFlags) where the server reopens
+// them; the data root's descriptor is opened here and released by the
+// returned release; the servers are listed through the work dir's admin
+// kubeconfig; and the socket path is only lstat'd. A failure to open the
+// data root or to load the kubeconfig is that check's error, so it is
+// reported in its place in the order.
+func doctorKeystoreUserScope(workDir string) (doctorUserScope, error) {
 	uid, gid, err := lookupServiceIDs()
 	if err != nil {
-		return socket.Preconditions{}, nil, err
+		return doctorUserScope{}, err
 	}
 	storeCfg := keystoreLayout(workDir)
 	storeCfg.UID, storeCfg.GID = uid, gid
@@ -292,21 +368,31 @@ func doctorKeystoreUserScope(workDir string) (socket.Preconditions, func(), erro
 		}
 		return euidSeam()
 	}
+	var names []string
+	var countErr error
 	count := func(ctx context.Context) (int, error) {
-		_, cs, err := kubeclient.FromPath(executor.KubeconfigPath(workDir))
-		if err != nil {
-			return 0, fmt.Errorf("load the admin kubeconfig: %w", err)
+		cs, err := readAdminKubeconfig(executor.KubeconfigPath(workDir))
+		if err == nil {
+			names, err = listKeystoreServers(ctx, cs)
 		}
-		return countKeystoreServers(ctx, cs)
+		countErr = err
+		return len(names), err
 	}
-	return socket.Preconditions{
-		EUID:              euid,
-		ServiceUID:        uid,
-		MaintenanceMarked: store.MaintenanceMarked,
-		OpenLogs:          store.CheckLogFlags,
-		SandboxCheck:      socket.SandboxSelfCheck,
-		IgnoresOwnership:  ignores,
-		CheckInstall:      store.CheckSocketInstall,
-		ServerCount:       count,
-	}, release, nil
+	sock := keystorepaths.SocketPath(storeCfg.DataRoot)
+	return doctorUserScope{
+		pre: socket.Preconditions{
+			EUID:              euid,
+			ServiceUID:        uid,
+			MaintenanceMarked: store.MaintenanceMarked,
+			OpenLogs:          store.CheckLogFlags,
+			SandboxCheck:      socket.SandboxSelfCheck,
+			IgnoresOwnership:  ignores,
+			CheckInstall:      store.CheckSocketInstall,
+			ServerCount:       count,
+		},
+		release:   release,
+		servers:   func() ([]string, error) { return names, countErr },
+		sockPath:  sock,
+		sockState: func() error { return lstatKeystoreSocket(sock, uid) },
+	}, nil
 }

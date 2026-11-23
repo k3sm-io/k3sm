@@ -487,9 +487,15 @@ func TestDoctorKeystoreMaintenanceNamesVerb(t *testing.T) {
 }
 
 // userScopeChecks is a doctor seam over socket.Preconditions under which
-// every start check passes; mut changes the one under test.
-func userScopeChecks(mut func(*socket.Preconditions)) func() (socket.Preconditions, func(), error) {
-	return func() (socket.Preconditions, func(), error) {
+// every start check passes and a socket of the service user's is at the
+// path; mut changes the one under test.
+func userScopeChecks(mut func(*socket.Preconditions)) func() (doctorUserScope, error) {
+	return userScope(func(u *doctorUserScope) { mut(&u.pre) })
+}
+
+// userScope is userScopeChecks over the whole seam.
+func userScope(mut func(*doctorUserScope)) func() (doctorUserScope, error) {
+	return func() (doctorUserScope, error) {
 		p := socket.Preconditions{
 			EUID:              func() int { return 260 },
 			ServiceUID:        260,
@@ -500,8 +506,14 @@ func userScopeChecks(mut func(*socket.Preconditions)) func() (socket.Preconditio
 			CheckInstall:      func(context.Context) error { return nil },
 			ServerCount:       func(context.Context) (int, error) { return 1, nil },
 		}
-		mut(&p)
-		return p, func() {}, nil
+		u := doctorUserScope{
+			pre:       p,
+			release:   func() {},
+			sockPath:  "/var/lib/k3sm/keystore-sock/keys.sock",
+			sockState: func() error { return nil },
+		}
+		mut(&u)
+		return u, nil
 	}
 }
 
@@ -516,21 +528,36 @@ func TestDoctorKeystoreUserScopeRow(t *testing.T) {
 	boom := errors.New("boom")
 	for _, tt := range []struct {
 		name      string
-		seam      func() (socket.Preconditions, func(), error)
+		seam      func() (doctorUserScope, error)
 		status    doctorStatus
 		detail    string
 		remedy    string
 		detailHas string
 	}{
-		{name: "on", seam: userScopeChecks(func(*socket.Preconditions) {}), status: statusPass, detail: "keystore user scope: on"},
-		{name: "two servers", seam: userScopeChecks(func(p *socket.Preconditions) {
-			p.ServerCount = func(context.Context) (int, error) { return 2, nil }
-		}), status: statusWarn, detail: "keystore user scope: off (more than one server registered)", detailHas: "2 servers registered"},
+		{name: "start checks pass", seam: userScopeChecks(func(*socket.Preconditions) {}), status: statusPass, detail: "keystore user scope: start checks pass; a socket owned by the service user is at /var/lib/k3sm/keystore-sock/keys.sock"},
+		{name: "start checks pass, no socket", seam: userScope(func(u *doctorUserScope) {
+			u.sockState = func() error { return fmt.Errorf("%w: nothing is at the path", errNoListeningSocket) }
+		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path"},
+		{name: "two servers", seam: userScope(func(u *doctorUserScope) {
+			u.pre.ServerCount = func(context.Context) (int, error) { return 2, nil }
+			u.servers = func() ([]string, error) { return []string{"mac-a", "mac-b"}, nil }
+		}), status: statusWarn, detail: "keystore user scope: off (more than one server registered)", detailHas: "2 servers registered] servers: mac-a, mac-b"},
+		{name: "ten servers", seam: userScope(func(u *doctorUserScope) {
+			u.pre.ServerCount = func(context.Context) (int, error) { return 10, nil }
+			u.servers = func() ([]string, error) {
+				return []string{"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"}, nil
+			}
+		}), status: statusWarn, detail: "keystore user scope: off (more than one server registered)", detailHas: "servers: s0, s1, s2, s3, s4, s5, s6, s7 and 2 more"},
+		{name: "count unreadable as this user", seam: userScope(func(u *doctorUserScope) {
+			denied := fmt.Errorf("read the admin kubeconfig: %w", fs.ErrPermission)
+			u.pre.ServerCount = func(context.Context) (int, error) { return 0, denied }
+			u.servers = func() ([]string, error) { return nil, denied }
+		}), status: statusWarn, detail: "keystore user scope: the server count cannot be read as this user", remedy: "sudo k3sm doctor   # the admin kubeconfig is root's"},
 		{name: "rootless server", seam: userScopeChecks(func(p *socket.Preconditions) {
 			p.EUID = func() int { return 501 }
 		}), status: statusWarn, detail: "keystore user scope: off (user scope needs the installed server)"},
-		{name: "service user unknown", seam: func() (socket.Preconditions, func(), error) {
-			return socket.Preconditions{}, nil, boom
+		{name: "service user unknown", seam: func() (doctorUserScope, error) {
+			return doctorUserScope{}, boom
 		}, status: statusWarn, detail: "keystore user scope: off (user scope needs the installed server)", detailHas: "boom"},
 		{name: "ignore-ownership mount", seam: userScopeChecks(func(p *socket.Preconditions) {
 			p.IgnoresOwnership = func() (bool, error) { return true, nil }
@@ -573,6 +600,9 @@ func TestDoctorKeystoreUserScopeRow(t *testing.T) {
 			if r.remedy != tt.remedy {
 				t.Errorf("remedy = %q, want %q", r.remedy, tt.remedy)
 			}
+			if strings.Contains(r.detail, "scope: on") || (tt.name == "count unreadable as this user" && strings.Contains(r.detail, "off")) {
+				t.Errorf("detail = %q claims a state doctor cannot establish", r.detail)
+			}
 			if tt.remedy == "" && strings.Contains(r.detail, "sudo k3sm install") {
 				t.Errorf("detail = %q names install for a reason install does not fix", r.detail)
 			}
@@ -582,9 +612,9 @@ func TestDoctorKeystoreUserScopeRow(t *testing.T) {
 	t.Run("a worker is skipped", func(t *testing.T) {
 		t.Parallel()
 		e := agentEnv()
-		e.keystoreUserScope = func() (socket.Preconditions, func(), error) {
+		e.keystoreUserScope = func() (doctorUserScope, error) {
 			t.Error("a worker ran the user scope's checks")
-			return socket.Preconditions{}, nil, nil
+			return doctorUserScope{}, nil
 		}
 		if r := checkKeystoreUserScope(e); r.status != statusSkip {
 			t.Fatalf("row = %+v, want SKIP", r)

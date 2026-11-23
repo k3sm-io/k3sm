@@ -20,16 +20,19 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -354,4 +357,59 @@ func mustHandler(t *testing.T) *socket.Handler {
 		t.Fatal(err)
 	}
 	return h
+}
+
+// TestDoctorKeystoreSocketLstat holds the doctor row's socket fact to an
+// lstat: a socket of the service user's passes; nothing there, a file, a
+// symlink, or another owner's socket is no listening socket. The socket
+// cases are judged from the mode and owner an lstat returns, so no socket
+// is bound.
+func TestDoctorKeystoreSocketLstat(t *testing.T) {
+	const svc = 260
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, svc, svc); err != nil {
+		t.Fatalf("the service user's socket: %v", err)
+	}
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, 0, svc); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "owned by uid 0") {
+		t.Fatalf("root's socket: %v", err)
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(file, link); err != nil {
+		t.Fatal(err)
+	}
+	me := uint32(os.Getuid())
+	for _, p := range []string{filepath.Join(dir, "absent"), file, link, dir} {
+		if err := lstatKeystoreSocket(p, me); !errors.Is(err, errNoListeningSocket) {
+			t.Errorf("%s: %v, want no listening socket", filepath.Base(p), err)
+		}
+	}
+}
+
+// TestKeystoreServerCountNames checks the doctor's list names the servers,
+// sorted, and only them.
+func TestKeystoreServerCountNames(t *testing.T) {
+	cs := fake.NewClientset(serverNode("s2"), serverNode("s1"), node("w1", nil))
+	names, err := listKeystoreServers(context.Background(), cs)
+	if err != nil || !slices.Equal(names, []string{"s1", "s2"}) {
+		t.Fatalf("names = %v, %v; want [s1 s2]", names, err)
+	}
+}
+
+// TestDoctorKeystoreKubeconfigPermission checks a kubeconfig this user may
+// not read is an error wrapping fs.ErrPermission.
+func TestDoctorKeystoreKubeconfigPermission(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 0000 file")
+	}
+	p := filepath.Join(t.TempDir(), "admin.kubeconfig")
+	if err := os.WriteFile(p, nil, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAdminKubeconfig(p); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("readAdminKubeconfig = %v, want a permission error", err)
+	}
 }
