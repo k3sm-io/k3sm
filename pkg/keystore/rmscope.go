@@ -366,10 +366,16 @@ func (r *rmRun) serviceUserRule(hk heldKey) string {
 // rewritten through the same writer, so the listing a rerun relies on is
 // durable again. A full record lists nothing (full). Its errors are
 // complete (stopErr): a failure before the rename is a refusal, nothing
-// changed; one after it, or any failure of a rewrite, is errCommitted,
-// saying the record lists the scope but its durability is unknown.
+// changed, unless this run already wrote or rewrote the record (then it is
+// errCommitted); one after it, or any failure of a rewrite, is
+// errCommitted, saying the record lists the scope but its durability is
+// unknown.
 func (r *rmRun) list(id string) error {
 	uid, scope := r.u.uid, r.u.scope
+	// A second list (check's, of a key found at the name other than the
+	// judged one) after this run wrote or rewrote the record is never a
+	// refusal: the record already changed.
+	prior := r.wrote || r.renewed
 	if r.removed.has(uid, id) {
 		if r.wrote || r.renewed {
 			return nil
@@ -382,6 +388,10 @@ func (r *rmRun) list(id string) error {
 		return nil
 	}
 	fid, size, err := r.s.floorSize(r.dfd)
+	if err != nil && prior {
+		r.stopErr = fmt.Errorf("%w: rm-scope listed %s in %s earlier in this run, then could not list the scope.key found at the scope's name: read the size of the user-scope floor %s: %w; the scope directory is untouched", errCommitted, scope, removedScopesName, userFloorLogName, err)
+		return r.stopErr
+	}
 	if err != nil {
 		r.stopErr = fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", userFloorLogName, err)
 		return r.stopErr
@@ -401,6 +411,10 @@ func (r *rmRun) list(id string) error {
 	if err != nil {
 		// Nothing landed: the key add listed is dropped again.
 		r.removed.drop(uid, id)
+		if prior {
+			r.stopErr = fmt.Errorf("%w: rm-scope listed %s in %s earlier in this run, then could not list the scope.key found at the scope's name: record it in %s: %w; the record does not list that key, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", errCommitted, scope, removedScopesName, removedScopesName, err, scope)
+			return r.stopErr
+		}
 		r.stopErr = fmt.Errorf("record the removed scope %s in %s: %w; the record does not list it, and nothing was changed: rerun sudo k3sm keys rm-scope %s --yes", scope, removedScopesName, err, scope)
 		return r.stopErr
 	}
@@ -458,7 +472,7 @@ func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScope
 		if errors.Is(err, errNotJudgedScope) && r.wrote {
 			err = fmt.Errorf("%w; %s now lists the key of %s that rm-scope judged, so no open serves that key", err, removedScopesName, scope)
 		}
-		return RemoveScopeResult{Recorded: r.proven()}, rmStopped(err, r.wrote || r.aclStripped || tree.changed, state, scope, tree.cleared)
+		return RemoveScopeResult{Recorded: r.proven()}, rmStopped(err, r.wrote || r.renewed || r.aclStripped || tree.changed, state, scope, tree.cleared)
 	}
 	if tree.absent {
 		switch {
@@ -504,8 +518,8 @@ func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScope
 // (rmRerunCannotHelp): then its own text says what was left. A directory at the name that is not the scope judged
 // (errNotJudgedScope) is not what remains of the scope, so neither state
 // nor a rerun is said. cleared, removeScopeTree's note of a flag it
-// cleared on .user before it stopped, is carried at the end. When this run changed something first (changed: it wrote the
-// removed-scopes record, or the walk unlinked an entry, took a directory or
+// cleared on .user before it stopped, is carried at the end. When this run changed something first (changed: it wrote or
+// rewrote the removed-scopes record, removed an ACL, or the walk unlinked an entry, took a directory or
 // cleared a flag), the removal was made in part and the error is committed
 // (exit 4, audited committed); otherwise it is a refusal.
 func rmStopped(err error, changed bool, state, scope, cleared string) error {
