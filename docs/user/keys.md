@@ -280,7 +280,8 @@ name, here `2026-11-22`, and save its floor under that name:
 
 ```
 B=2026-11-22
-sudo install -d -o root -g wheel -m 0755 /path/to/backup /path/to/backup/$B
+sudo install -d -o root -g wheel -m 0755 /path/to/backup
+sudo install -d -o root -g wheel -m 0700 /path/to/backup/$B
 sudo ditto /var/lib/k3sm/server/keystore /path/to/backup/$B/keystore
 sudo ditto /var/lib/k3sm/server/cred/keystore-master /other/place/keystore-master
 sudo install -d -o root -g wheel -m 0700 /var/root/keystore-floor-backup/$B
@@ -288,9 +289,9 @@ sudo install -o root -g wheel -m 0644 /var/lib/k3sm/keystore-floor.json /var/roo
 sudo shasum -a 256 /var/root/keystore-floor-backup/$B/keystore-floor.json | sudo tee /var/root/keystore-floor-backup/$B/keystore-floor.json.sha256
 ```
 
-Keep `/path/to/backup` and each backup's directory in it owned by root, with no write access for
-group or others, as the `install -d` line makes them: the restore copies from there as root, and
-checks it first. Save `keystore/` and the floor file in the same run, and keep them as a pair. A floor file saved
+Keep `/path/to/backup` owned by root with no write access for group or others, and each backup's
+directory in it owned by root with mode 0700, as the `install -d` lines make them: the restore
+copies from there as root, and checks both first. Save `keystore/` and the floor file in the same run, and keep them as a pair. A floor file saved
 at another moment does not describe the saved entries: some of them are refused, or deletions
 recorded after it are lost. Each backup keeps its own floor, in the directory named after it, so
 an older backup still has the floor that matches it. Never save every backup's floor to one
@@ -344,20 +345,23 @@ directory or link the service user made, the merge moves it into `pre-restore.d`
 so on stderr and in a `moved aside` line of its report, then goes on, and exits 4 so you read it. With `--dry-run` it prints
 where it would move it and moves nothing. Every line ends in
 `|| exit 1`, so the first one that fails stops the steps (and closes the shell), and no later
-line moves a copy into or over one that is set aside. Before anything moves, the first two
-lines check that nothing runs as the service user and that the backup's directories are owned by
-root with no write access for group or others.
+line moves a copy into or over one that is set aside. Before anything moves, the first three
+lines check that nothing runs as the service user, that `/path/to/backup` is owned by root with
+no write access for group or others, and that `/path/to/backup/$B` is owned by root with mode
+0700.
 If `pgrep` prints process IDs, the server has not stopped yet: wait for it and start the steps
-again. If the second check fails, fix the owner or mode of `/path/to/backup` and
-`/path/to/backup/$B` (`sudo chown root:wheel` and `sudo chmod go-w` on each) and start again. The
+again. If the second or third check fails, fix the owner or mode it names (`sudo chown root:wheel`
+on either directory, `sudo chmod go-w /path/to/backup`, `sudo chmod 0700 /path/to/backup/$B`)
+and start again. The
 `test ! -L` before `ditto` stops if the backup's `keystore` is a link, which `ditto` would follow:
 
 ```
 ! pgrep -u _k3sm || exit 1
-test "$(sudo find /path/to/backup /path/to/backup/$B -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 2 || exit 1
+test "$(sudo find /path/to/backup -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 1 || exit 1
+test "$(sudo find /path/to/backup/$B -maxdepth 0 -user root -perm 0700 | grep -c .)" -eq 1 || exit 1
 sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
-test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
 sudo test ! -L /path/to/backup/$B/keystore || exit 1
@@ -395,7 +399,10 @@ the floor the steps above moved aside, so it never reads the floor saved with th
 other copy. It refuses, and changes nothing, if that file is missing, if the restored
 `keystore-floor.json` is not in place yet (put it back with `install` first), if the file is
 the live floor itself, or if the restored floor holds none of the entries the moved-aside floor
-holds, which means it is not the floor saved with this backup. `rm` also refuses until the
+holds, which means it is not the floor saved with this backup. It also refuses, and changes
+nothing, if `/var/lib/k3sm/pre-restore.d` is on another volume than `/var/lib/k3sm/server`: it
+moves the restored copy into place with a rename, which cannot cross volumes, so make
+`pre-restore.d` in `/var/lib/k3sm` as the steps above do. `rm` also refuses until the
 restored `keystore-floor.json` is in place.
 
 The merge keeps every key revoked since the backup refused: a key created after the backup, every
