@@ -648,3 +648,83 @@ func TestRemoveScopeRefusesForeignScopeDirAsRoot(t *testing.T) {
 		t.Fatalf("the scope directory holds %v, want %v untouched", after, before)
 	}
 }
+
+// TestRmScopeMeasuredPremiseAsRoot pins the measured premise of the
+// rerun rule (docs/design/keystore.md § "A removed scope stays removed",
+// "The measured premise"), root-run, with a service-user thread (settid,
+// as the neighbouring root tests run code as the service user) acting on
+// two directories it owns: (a) it cannot rename a root-owned 0700
+// directory into another parent it owns; (b) it can rename it within the
+// same parent; (c) with an inheritable ACL entry granting add_subdirectory
+// on the parent when root creates a directory there, it can move that
+// root-created directory out to the other parent, and the directory
+// mkdirAt makes under the same parent carries no ACL.
+func TestRmScopeMeasuredPremiseAsRoot(t *testing.T) {
+	if !asRoot() {
+		t.Skip("root-run: run as root through hack/acceptance/keystore.sh --root")
+	}
+	svcUID, svcGID := serviceIDs(t)
+	asService := func(f func() error) error {
+		errc := make(chan error, 1)
+		go func() {
+			runtime.LockOSThread() // never unlocked: the thread dies with the goroutine
+			if _, _, errno := syscall.Syscall(syscall.SYS_SETTID, uintptr(svcUID), uintptr(svcGID), 0); errno != 0 {
+				errc <- fmt.Errorf("settid: %w", errno)
+				return
+			}
+			errc <- f()
+		}()
+		return <-errc
+	}
+	s, _ := rootRmScopeBase(t)
+	base := t.TempDir() // under the root-made 0755 base rootRmScopeBase set as TMPDIR
+	if err := os.Chmod(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent, other := filepath.Join(base, "parent"), filepath.Join(base, "other")
+	for _, d := range []string{parent, other} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(d, int(svcUID), int(svcGID)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rootDir := filepath.Join(parent, "rootdir")
+	if err := os.Mkdir(rootDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// (a) Into another parent: refused (the moved directory's ".." would
+	// change, which needs write on it).
+	if err := asService(func() error { return os.Rename(rootDir, filepath.Join(other, "moved")) }); err == nil {
+		t.Fatal("(a) the service user moved a root-owned 0700 directory into another parent it owns")
+	}
+	// (b) Within the same parent: allowed.
+	renamed := filepath.Join(parent, "renamed")
+	if err := asService(func() error { return os.Rename(rootDir, renamed) }); err != nil {
+		t.Fatalf("(b) the service user's rename of a root-owned directory within its own parent: %v, want it to succeed", err)
+	}
+	// (c) An inheritable add_subdirectory entry on the parent at creation.
+	addInheritableACL(t, parent)
+	inh := filepath.Join(parent, "inherited")
+	if err := os.Mkdir(inh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if !pathHasACL(t, inh) {
+		t.Fatal("(c) root's mkdir under the parent inherited no ACL entry: the setup does not test anything")
+	}
+	if err := asService(func() error { return os.Rename(inh, filepath.Join(other, "inherited")) }); err != nil {
+		t.Fatalf("(c) the service user's move of a root-created directory carrying the inherited entry: %v, want it to succeed", err)
+	}
+	pr, err := os.OpenRoot(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pr.Close() }()
+	if _, err := s.mkdirAt(pr, "made"); err != nil {
+		t.Fatalf("(c) mkdirAt: %v", err)
+	}
+	if pathHasACL(t, filepath.Join(parent, "made")) {
+		t.Fatal("(c) the directory mkdirAt made under the parent carries the inherited ACL entry")
+	}
+}
