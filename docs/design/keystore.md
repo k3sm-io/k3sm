@@ -898,43 +898,79 @@ object is the one this server created; a failed precondition deletes and creates
 **Revocation on delete:** a `keys rm` must not leave the deleted value readable in the
 cluster, so a sweep deletes the Secret of a target whose entry is gone, declared or withdrawn
 (an `undeliver` after the `rm` does not stop it: the withdrawn record is kept until the
-revocation is done, and the entry is read from the label on the Secret that carries the
-recorded UID). The recorded UID decides, as for an update: the Secret must carry it, and the
+revocation is done). The recorded UID decides, as for an update: the Secret must carry it, and the
 delete carries it as `DeleteOptions{Preconditions: {UID: <recorded UID>}}`, so a Secret replaced
 after the Get is not the one deleted. A Secret missing the label or an annotation is still
-deleted and the missing mark logged at Warn; one of another UID is left alone and logged. The
-entry must be gone by two reads: `Store.Current` answers `ErrNotFound`, and `Store.Absent`
-confirms it. `Absent` (`keystore.FileStore.Absent`) is a read added for this: `Current` answers
-`ErrNotFound` both for a name with no entry and for an entries' directory that is not there, and
-only the first is an answer about the name, so `Absent` is true only when the entries' directory
-opens and is trusted under the shared lock, the floor reads, and the name has no directory (or
-only what an interrupted Put leaves); any other state is false with its error, and the Secret is
-kept. It reads no record and loads no master key. Revocation writes no value, so it runs while
-plaintext delivery is refused too (a refused target is only read for it: one Get, one `Absent`).
+deleted and the missing mark logged at Warn; one of another UID is left alone and logged.
 
-Because a delete cannot be undone, two guards stand between an absent entry and a delete:
+*Which entry.* The state record stores the entry a Secret delivers (`entry`, an optional
+field: a record written before it has none), set on create and brought up to date when a
+declared target's owned Secret is seen (root re-pointing a target updates it). A withdrawn
+target is checked against the record's entry, never the label: the label is on an object any
+namespace writer can edit, and relabelled to a live entry it would keep a deleted entry's value
+readable, or relabelled to another deleted entry get the Secret deleted early. A record without
+the field falls back to the label, with a Warn. A label that disagrees with the record is logged
+at Warn and keeps the record, whatever the entry's state, so the target is never silently
+dropped. The field is additive for this build, which reads an older file; an older build reads
+the state file strictly and refuses one carrying it, so a rollback past this change delivers
+nothing until the state file is removed, which fails closed.
 
+*Gone.* The entry must be gone by two reads: `Store.Current` answers `ErrNotFound`, and
+`Store.Absent` confirms it. `Absent` (`keystore.FileStore.Absent`) is a read added for this:
+`Current` answers `ErrNotFound` both for a name with no entry and for an entries' directory that
+is not there, and only the first is an answer about the name. `Absent` is true only when the
+entries' directory opens and is trusted under the shared lock, the floor reads, the name has no
+directory, **and the floor does not record the name**. Any other state is false with its error,
+and the Secret is kept. It reads no record and loads no master key. Revocation writes no value,
+so it runs while plaintext delivery is refused too (a refused target is only read for it: one
+Get, one `Absent`).
+
+Because a delete cannot be undone, these stand between an absent entry and a delete:
+
+- *The floor as the durable witness.* `Delete` removes the name from `keystore-floor.json`
+  (`fl.remove(name, gen)`) in the same verb that removes its directory. A floor that still
+  records a name whose directory is missing is therefore not an `rm`: it is a restored or
+  rolled-back `keystore/` (the documented restore moves `keystore/` aside and puts a backup in
+  its place, and the floor beside it stays). `Absent` answers `ErrFloorRecordsEntry`, the
+  reconciler keeps that name's Secrets for as long as it lasts, not for one sweep, and logs a
+  Warn once per name. An interrupted Put (a directory with no pointer, in the shape a crashed
+  Put leaves) is not an entry for `Current`, and not a proven deletion either: `Absent` answers
+  false with its error. Where the floor proves nothing, the identity hold below is what
+  stands: a floor that is absent and rebuilt (the "Restoring an older keystore/" procedure
+  removes it, and the next root verb writes it from the restored pointers), full (it records
+  only the entries it has room for), or unreadable (`Absent` fails, and the Secret is kept).
+  The residual: an interrupted `Delete` that removed the directory but not the floor entry
+  holds that name's revocation until the name is put again and removed, or the Secret is
+  deleted by hand; it fails closed, and the Warn names the entry.
 - *Keystore identity.* `keystore.FileStore.Identity` names the entries' directory by device and
   inode; a Put, Rotate or Delete inside it leaves that alone, and a restore that moves
   `keystore/` aside, or a keystore deleted and created again, changes it. Each sweep reads it.
   The first sweep after start, and a sweep that sees it changed (logged at Error, naming both),
-  delete nothing; revocation resumes on the next sweep that sees it unchanged, so a restore
-  holds revocation for one sweep. `Absent` returns the identity it read under the lock, and a
-  delete needs it to be the sweep's, so a swap in the middle of a sweep deletes nothing. The
-  identity is held in memory, not in the state file: every start holds one sweep, which is
-  stricter than comparing with a recorded value, and the state file's strict schema (an older
-  build refuses an unknown field) stays as it is.
-- *Breaker.* When more than `max(3, 25%)` of the recorded Secrets would be revoked in one sweep,
-  none is; one Error carries the count, and it holds until the absent set is back within the
-  limit (entries put back, or the Secrets deleted by hand with kubectl). The limit is a seam of
+  delete nothing; revocation resumes on the next sweep that sees it unchanged. `Absent` returns
+  the identity it read under the lock, and a delete needs it to be the sweep's, so a swap in the
+  middle of a sweep deletes nothing. The identity is held in memory, not in the state file:
+  every start holds one sweep, which is stricter than comparing with a recorded value.
+- *Breaker.* When the revocations one sweep would make are above 3 **and** above a quarter of
+  the recorded Secrets (`max(3, recorded/4)`), none is made; an Error carries the count, and
+  repeats at most hourly while it holds, until the absent set is back within the limit (entries
+  put back, or the Secrets deleted by hand with kubectl). The base counts live deliveries only:
+  a revoked target's record is dropped with its Secret (a record a failed write left is dropped
+  on a later sweep), so old records do not widen the limit. A stuck revocation does not count
+  toward the breaker: a Secret already terminating, or one whose Delete failed on an earlier
+  sweep and is retrying, so a few that never finish cannot hold every later `rm` back. A Warn
+  marks each when it first gets stuck and each time its state changes, and a summary Warn naming
+  namespace/name and how long repeats at most hourly while any is stuck. The limit is a seam of
   the reconciler; there is no override verb.
+- *Re-check before the delete.* Gathering and deleting are a sweep apart, so `revokeOne` asks
+  `Absent` again, and compares the identity it read with the sweep's, immediately before each
+  Delete; an entry put back in between keeps its Secret.
 
-The guarantee is the delete from the API only. A copy a Pod already read, the datastore's
-history and its backups keep the value, so revoking a credential still means rotating it where
-it is accepted. `Absent` and the delete are not atomic: an entry put back between them loses its
-Secret, and the next sweep creates it again; that race is accepted. A revoked target whose entry
-stays gone logs nothing on later sweeps. The state record of a revoked declared target is kept
-(its UID matches nothing, and a later create replaces it); a withdrawn one's is dropped.
+The guarantee is the delete from the API only. A tenant that can read a Secret already has its
+value, and a copy a Pod already read, the datastore's history and its backups keep it, so
+revoking a credential still means rotating it where it is accepted. The re-check and the delete
+are not atomic: an entry put back between them loses its Secret, and the next sweep creates it
+again; that race is accepted. A revoked target whose entry stays gone logs nothing on later
+sweeps (after a restart, its first sweep logs once that the entry cannot be read).
 
 **Refusal while secrets encryption is off.** Delivery is refused by default; the override
 is explicit, as the maintainer answered on the issue. Two facts the first revision got
