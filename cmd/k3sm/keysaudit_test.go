@@ -102,6 +102,9 @@ func TestRealPrimitivesUnreachable(t *testing.T) {
 		{"geteuid", func() { _ = euidSeam() }},
 		{"getpwnam", func() { _, _ = uidResolverSeam("_k3sm") }},
 		{"exec", func() { _ = kubectlExec("/bin/false", nil, nil) }},
+		{"fchown", func() { _ = fileAttrSeam.Fchown(-1, 0, 0) }},
+		{"fchmod", func() { _ = fileAttrSeam.Fchmod(-1, 0) }},
+		{"fchflags", func() { _ = fileAttrSeam.Fchflags(-1, 0) }},
 	} {
 		t.Run(tt.primitive, func(t *testing.T) {
 			defer func() {
@@ -113,4 +116,20 @@ func TestRealPrimitivesUnreachable(t *testing.T) {
 			tt.call()
 		})
 	}
+}
+
+// panickingFileAttrs is the file-attribute writer TestMain installs: a
+// unit test that forgets to inject a fake panics, naming the call.
+type panickingFileAttrs struct{}
+
+func (panickingFileAttrs) Fchown(int, int, int) error {
+	panic("a unit test reached fchown: inject a fake file-attribute writer")
+}
+
+func (panickingFileAttrs) Fchmod(int, uint32) error {
+	panic("a unit test reached fchmod: inject a fake file-attribute writer")
+}
+
+func (panickingFileAttrs) Fchflags(int, int) error {
+	panic("a unit test reached fchflags: inject a fake file-attribute writer")
 }

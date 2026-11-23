@@ -112,8 +112,11 @@ type keysHarness struct {
 	keyOutStep func(string) error
 	// encryptionOff is what the verbs' encryptionOn seam answers, negated.
 	encryptionOff bool
-	stdout        bytes.Buffer
-	stderr        bytes.Buffer
+	// attrs is the maintenance verbs' file-attribute writer; nil leaves
+	// fileAttrSeam, which panics in a unit test.
+	attrs  keystore.FileAttrWriter
+	stdout bytes.Buffer
+	stderr bytes.Buffer
 }
 
 func newKeysHarness(t *testing.T) *keysHarness {
@@ -165,6 +168,7 @@ func (h *keysHarness) run(args ...string) int {
 		deliveryCheck: keysTestDeliveryCheck,
 		deliveryChown: func(*os.File) error { return nil },
 		encryptionOn:  func(string) bool { return !h.encryptionOff },
+		attrs:         h.attrs,
 		stdout:        &h.stdout,
 		stderr:        &h.stderr,
 	}

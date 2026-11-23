@@ -82,6 +82,15 @@ const keysUsage = `Usage:
         withdraw the entry's delivery into NS (only into Secret S, with
         --secret). The Secret stays; delete it with kubectl, and rotate the
         entry to revoke
+  sudo k3sm keys floor --rebuild
+        rebuild the user-scope floor log after a restore: carry every line
+        of the old floor that parses forward, add each user scope's
+        entries, and flag the new log append-only. It refuses, changing
+        nothing, when any user scope does not open
+  sudo k3sm keys rm-scope user/<uid> --yes
+        remove a user scope and every entry in it; irreversible. It refuses
+        while the scope's delivery record names a delivery. Run floor
+        --rebuild after it to free the scope's floor keys
 
 Names are scope-qualified: system/<name>, where <name> is 1 to 253 bytes of
 dot-separated labels of lowercase letters, digits and '-'. This build
@@ -137,6 +146,10 @@ type keysStore interface {
 	// AuditRoot appends the verb's one audit line, via root, once the
 	// audit log exists.
 	AuditRoot(ctx context.Context, op, name, result string) error
+	// RebuildFloor and RemoveScope are the root maintenance verbs floor
+	// --rebuild and rm-scope.
+	RebuildFloor(ctx context.Context, attrs keystore.FileAttrWriter) (keystore.RebuildReport, error)
+	RemoveScope(ctx context.Context, uid uint32) error
 }
 
 // keysAudit is what a root verb's audit line is made from (U52): the store
@@ -184,6 +197,9 @@ type keysEnv struct {
 	stderr       io.Writer
 	// audit collects the running verb's audit line; runKeysWith sets it.
 	audit *keysAudit
+	// attrs is the file-attribute writer the maintenance verbs act
+	// through; nil is fileAttrSeam.
+	attrs keystore.FileAttrWriter
 }
 
 func defaultKeysEnv(stdout, stderr io.Writer) keysEnv {
@@ -493,8 +509,11 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 		return code
 	}
 	op := args[0]
-	if op == "ls" {
+	switch op {
+	case "ls":
 		op = "list"
+	case "floor":
+		op = "floor-rebuild"
 	}
 	result := "refused"
 	switch code {
@@ -532,6 +551,10 @@ func runKeysVerb(ctx context.Context, verb string, rest []string, env keysEnv) i
 		return keysDeliver(ctx, rest, env)
 	case "undeliver":
 		return keysUndeliver(ctx, rest, env)
+	case "floor":
+		return keysFloor(ctx, rest, env)
+	case "rm-scope":
+		return keysRmScope(ctx, rest, env)
 	default:
 		// The argument is not echoed: it may be a value typed in the wrong place.
 		fmt.Fprintln(env.stderr, "k3sm keys: unknown subcommand (not echoed); see k3sm keys --help")

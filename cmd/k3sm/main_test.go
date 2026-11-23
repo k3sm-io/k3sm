@@ -100,6 +100,7 @@ func TestMain(m *testing.M) {
 	kubectlExec = func(string, []string, []string) error {
 		panic("a unit test reached exec: inject a fake exec")
 	}
+	fileAttrSeam = panickingFileAttrs{}
 	os.Exit(m.Run())
 }
 

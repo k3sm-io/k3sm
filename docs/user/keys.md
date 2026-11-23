@@ -60,6 +60,8 @@ name.
 | `sudo k3sm keys rewrap --key-out FILE` | Re-seals every entry under a new master key (see [Changing the master key](#changing-the-master-key)). |
 | `sudo k3sm keys deliver system/NAME --namespace NS` | Declares that the server delivers the entry's current version into the cluster as a Secret (see [Delivering an entry as a Secret](#delivering-an-entry-as-a-secret)). |
 | `sudo k3sm keys undeliver system/NAME --namespace NS [--secret S]` | Withdraws that declaration. The Secret stays. |
+| `sudo k3sm keys floor --rebuild` | Rebuilds the user-scope floor log, `/var/lib/k3sm/keystore-user-floor.log`, after a restore. It keeps every line of the old log that still reads and adds each user scope's entries. It prints how many old lines it dropped because they did not read. If any user scope does not open, it refuses and changes nothing. |
+| `sudo k3sm keys rm-scope user/UID --yes` | Removes a user scope and every entry in it. This cannot be undone. It refuses while the scope still delivers anything, so withdraw those deliveries first. Run `floor --rebuild` afterwards to free the scope's lines in the floor log. |
 
 `--work-dir DIR` points every verb at a server work dir other than the default
 `/var/lib/k3sm/server`. The data root is its parent.
