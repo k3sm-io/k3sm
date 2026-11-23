@@ -156,6 +156,22 @@ func TestDoctorChecksTable(t *testing.T) {
 			e.nodeRole = func() (install.Role, bool) { return install.RoleAgent, true }
 		}, statusSkip},
 
+		// keystore-maintenance: no marker → PASS; a standing marker → WARN
+		// naming its verb; a worker or no seam → SKIP.
+		{"keystore-maintenance/pass", checkKeystoreMaintenance, func(e *doctorEnv) {
+			e.keystoreMaintenance = func(context.Context) (string, bool, error) { return "", false, nil }
+		}, statusPass},
+		{"keystore-maintenance/warn-standing", checkKeystoreMaintenance, func(e *doctorEnv) {
+			e.keystoreMaintenance = func(context.Context) (string, bool, error) { return "floor --rebuild", true, nil }
+		}, statusWarn},
+		{"keystore-maintenance/warn-unknown", checkKeystoreMaintenance, func(e *doctorEnv) {
+			e.keystoreMaintenance = func(context.Context) (string, bool, error) { return "", true, nil }
+		}, statusWarn},
+		{"keystore-maintenance/skip-unprobed", checkKeystoreMaintenance, func(e *doctorEnv) { e.keystoreMaintenance = nil }, statusSkip},
+		{"keystore-maintenance/skip-worker", checkKeystoreMaintenance, func(e *doctorEnv) {
+			e.nodeRole = func() (install.Role, bool) { return install.RoleAgent, true }
+		}, statusSkip},
+
 		// netd-helper: installed+running → PASS, installed-only → WARN, absent → WARN.
 		{"helper/pass-running", checkHelper, func(e *doctorEnv) {
 			e.helperState = func() (bool, bool) { return true, true }
@@ -435,7 +451,7 @@ func TestDoctorChecksTable(t *testing.T) {
 				t.Errorf("registry entry %q returns checkResult.name %q — must match", dc.name, r.name)
 			}
 		}
-		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon", "keystore-logs", "keystore-floor"} {
+		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "datastore", "toolchain", "agent-daemon", "keystore-logs", "keystore-floor", "keystore-maintenance"} {
 			if !seen[want] {
 				t.Errorf("registry missing check %q", want)
 			}
@@ -456,4 +472,15 @@ func TestDoctorChecksTable(t *testing.T) {
 			t.Fatalf("status tags collide: %v", tags)
 		}
 	})
+}
+
+// A standing maintenance marker's WARN names the verb that left it and the
+// command to run.
+func TestDoctorKeystoreMaintenanceNamesVerb(t *testing.T) {
+	e := healthyDoctorEnv()
+	e.keystoreMaintenance = func(context.Context) (string, bool, error) { return "audit --rotate", true, nil }
+	r := checkKeystoreMaintenance(e)
+	if r.status != statusWarn || !strings.Contains(r.detail, "left by keys audit --rotate") || !strings.HasPrefix(r.remedy, "sudo k3sm keys audit --rotate") {
+		t.Fatalf("the row is %+v, want WARN naming audit --rotate and its rerun", r)
+	}
 }

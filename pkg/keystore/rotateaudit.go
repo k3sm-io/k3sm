@@ -50,6 +50,9 @@ var errRotateRefused = errors.New("audit --rotate refused and changed nothing")
 type RotateReport struct {
 	Archives  int
 	Discarded bool
+	// Earlier is set when the report is an earlier run's, which committed
+	// and was not reported: this run printed it and did not rotate.
+	Earlier bool
 }
 
 // RotateAudit rotates the audit log (audit --rotate). Run as root: it
@@ -77,7 +80,7 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 	}
 	defer m.end()
 	if m.saved != nil {
-		return RotateReport{Archives: int(m.saved["archives"]), Discarded: m.saved["discarded"] != 0}, nil
+		return RotateReport{Archives: int(m.saved["archives"]), Discarded: m.saved["discarded"] != 0, Earlier: true}, nil
 	}
 	if err := m.step(swapStepReadOld); err != nil {
 		return rep, fmt.Errorf("%w: %w", errRotateRefused, err)

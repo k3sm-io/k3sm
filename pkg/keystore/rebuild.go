@@ -82,6 +82,9 @@ type SwapStepper interface {
 // scopes root removed and recorded, which it did not carry forward.
 type RebuildReport struct {
 	Scopes, Keys, Dropped, OverLong, PastShare, AbsentScopes, RemovedKeys int
+	// Earlier is set when the report is an earlier run's, which committed
+	// and was not reported: this run printed it and did not rebuild.
+	Earlier bool
 }
 
 // Lost reports whether the rebuild dropped any line or key.
@@ -132,7 +135,9 @@ func (s *FileStore) RebuildFloor(ctx context.Context, attrs FileAttrWriter) (Reb
 	}
 	defer m.end()
 	if m.saved != nil {
-		return rebuildReportOf(m.saved), nil
+		rep = rebuildReportOf(m.saved)
+		rep.Earlier = true
+		return rep, nil
 	}
 	if err := m.step(swapStepReadOld); err != nil {
 		return rep, fmt.Errorf("%w: %w", errRebuildRefused, err)

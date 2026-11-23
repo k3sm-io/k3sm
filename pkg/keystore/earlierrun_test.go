@@ -79,7 +79,11 @@ func TestEarlierCommittedRunReported(t *testing.T) {
 				t.Fatalf("the earlier rebuild's report: %v, want dropped=1", got[0].Report)
 			}
 			msg := got[0].String()
-			if !strings.HasPrefix(msg, "an earlier "+verbDisplay(op)+" committed and was not reported: ") {
+			want := "an earlier " + verbDisplay(op) + " committed and was not reported: "
+			if op == verbRebuild {
+				want = "an earlier floor --rebuild committed and dropped 1 lines, and was not reported: "
+			}
+			if !strings.HasPrefix(msg, want) || got[0].Dropped() != map[bool]int64{true: 1}[op == verbRebuild] {
 				t.Fatalf("the stderr line: %q", msg)
 			}
 			// The audit line was written before the marker was replaced: a
@@ -98,5 +102,21 @@ func TestEarlierCommittedRunReported(t *testing.T) {
 				t.Fatalf("no %s committed audit line in %q", op, logs)
 			}
 		})
+	}
+}
+
+// A marker a run left stands for doctor, naming the run's verb; none
+// stands once a run finished.
+func TestStandingMaintenanceNamesVerb(t *testing.T) {
+	ctx := context.Background()
+	s, _, _ := fileLogScope(t)
+	if _, present, err := s.StandingMaintenance(ctx); present || err != nil {
+		t.Fatalf("before any run: present %v, %v", present, err)
+	}
+	if _, err := s.RebuildFloor(ctx, &stepCrash{at: swapStepEnd}); !Committed(err) {
+		t.Fatalf("a rebuild failing at end: %v, want Committed", err)
+	}
+	if verb, present, err := s.StandingMaintenance(ctx); verb != "floor --rebuild" || !present || err != nil {
+		t.Fatalf("after a crashed rebuild: %q, %v, %v; want floor --rebuild standing", verb, present, err)
 	}
 }

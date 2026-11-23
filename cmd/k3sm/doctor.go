@@ -141,6 +141,10 @@ type doctorEnv struct {
 	// (keystore.FileStore.FloorDamage), and the damage of a floor past the
 	// reader's bounds as its error. A nil seam leaves the row unprobed.
 	keystoreFloorDamage func(context.Context) (int, error)
+	// keystoreMaintenance reads a standing maintenance marker
+	// (keystore.FileStore.StandingMaintenance): whether one stands and the
+	// command of the run that wrote it. A nil seam leaves the row unprobed.
+	keystoreMaintenance func(context.Context) (verb string, present bool, err error)
 	// interconnect is the interconnect section's seams (doctorinterconnect.go).
 	// Nil leaves the section out of the report.
 	interconnect *interconnectEnv
@@ -166,6 +170,7 @@ func doctorChecks() []doctorCheck {
 		{"agent-daemon", checkAgentDaemon},
 		{"keystore-logs", checkKeystoreLogs},
 		{"keystore-floor", checkKeystoreFloor},
+		{"keystore-maintenance", checkKeystoreMaintenance},
 	}
 }
 
@@ -231,6 +236,31 @@ func checkKeystoreFloor(env doctorEnv) checkResult {
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("the user-scope floor holds %d damaged lines, which the reader skips; grants and reads of every key they could name are refused", n), remedy: remedy}
 	}
 	return checkResult{name: name, status: statusPass, detail: "the user-scope floor holds no damaged line"}
+}
+
+// checkKeystoreMaintenance is the standing maintenance marker's row: none
+// is PASS; one is WARN, since the server keeps the user scope's listener
+// down while it stands, naming the verb that left it and the one to run:
+// a rerun of that verb finishes it, or prints the committed run's report,
+// and install removes a marker that names no verb this build knows.
+func checkKeystoreMaintenance(env doctorEnv) checkResult {
+	const name = "keystore-maintenance"
+	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+		return checkResult{name: name, status: statusSkip, detail: "a worker keeps no keystore"}
+	}
+	if env.keystoreMaintenance == nil {
+		return checkResult{name: name, status: statusSkip, detail: "not probed"}
+	}
+	verb, present, err := env.keystoreMaintenance(context.Background())
+	switch {
+	case !present:
+		return checkResult{name: name, status: statusPass, detail: "no " + keystore.MaintenanceMarkerName + " marker stands"}
+	case err != nil:
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands and could not be read: %v", keystore.MaintenanceMarkerName, err), remedy: "sudo k3sm doctor   # the marker is root's"}
+	case verb == "":
+		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, naming no maintenance verb this build knows; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName), remedy: "sudo k3sm install   # removes a stale marker"}
+	}
+	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, left by keys %s, which stopped or did not report; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName, verb), remedy: "sudo k3sm keys " + verb + "   # finishes the run, or prints its committed report"}
 }
 
 // keystoreSoftCapHint is the keystore-logs row's WARN when either log is
@@ -929,6 +959,9 @@ func realDoctorEnv(workDir string) doctorEnv {
 			cfg := keystoreLayout(workDir)
 			cfg.UID = uid
 			return keystore.New(cfg).FloorDamage(ctx)
+		},
+		keystoreMaintenance: func(ctx context.Context) (string, bool, error) {
+			return keystore.New(keystoreLayout(workDir)).StandingMaintenance(ctx)
 		},
 		interconnect: realInterconnectEnv(),
 	}

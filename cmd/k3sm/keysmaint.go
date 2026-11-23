@@ -49,17 +49,22 @@ func keysFloorRebuild(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	rep, err := s.RebuildFloor(env.earlierRuns(ctx), env.attrWriter())
+	var lossy earlierLoss
+	rep, err := s.RebuildFloor(env.earlierRuns(ctx, &lossy), env.attrWriter())
 	if err != nil && !keystore.Committed(err) {
 		return v.failf(keysRefused, "%v", err)
 	}
-	fmt.Fprintf(env.stdout, "rebuilt the user-scope floor: %d scopes, %d keys\n", rep.Scopes, rep.Keys)
+	if rep.Earlier {
+		fmt.Fprintf(env.stdout, "an earlier run committed; this run did not rebuild: the user-scope floor has %d scopes, %d keys\n", rep.Scopes, rep.Keys)
+	} else {
+		fmt.Fprintf(env.stdout, "rebuilt the user-scope floor: %d scopes, %d keys\n", rep.Scopes, rep.Keys)
+	}
 	if err != nil {
 		printRebuildDrops(env, rep)
 		return v.failf(keysCommitted, "%v", err)
 	}
 	if !rep.Lost() {
-		return keysOK
+		return lossy.exit(env)
 	}
 	printRebuildDrops(env, rep)
 	fmt.Fprintln(env.stdout, "the rebuild dropped what is listed above; the new floor is in place (exit 4)")
@@ -84,12 +89,28 @@ func printRebuildDrops(env keysEnv, rep keystore.RebuildReport) {
 	}
 }
 
+// earlierLoss is the lines an earlier committed run, reported by this
+// verb, dropped.
+type earlierLoss struct{ dropped int64 }
+
+// exit is a clean verb's exit: 4 when the earlier run it reported dropped
+// lines, which its own clean work does not undo, and 0 otherwise.
+func (l *earlierLoss) exit(env keysEnv) int {
+	if l.dropped == 0 {
+		return keysOK
+	}
+	fmt.Fprintf(env.stderr, "k3sm keys: an earlier run committed and dropped %d lines, reported above (exit 4)\n", l.dropped)
+	return keysCommitted
+}
+
 // earlierRuns returns ctx carrying the report of a committed maintenance
 // run of the other verb that a verb finds in the marker: printed to
-// stderr before the marker is replaced (keystore.WithEarlierRun).
-func (env keysEnv) earlierRuns(ctx context.Context) context.Context {
+// stderr before the marker is replaced (keystore.WithEarlierRun), and its
+// drops counted in loss.
+func (env keysEnv) earlierRuns(ctx context.Context, loss *earlierLoss) context.Context {
 	return keystore.WithEarlierRun(ctx, func(r keystore.EarlierRun) {
 		fmt.Fprintf(env.stderr, "k3sm keys: %s\n", r)
+		loss.dropped += r.Dropped()
 	})
 }
 
@@ -114,9 +135,13 @@ func keysAuditVerb(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	rep, err := s.RotateAudit(env.earlierRuns(ctx), env.attrWriter(), *discard)
+	var lossy earlierLoss
+	rep, err := s.RotateAudit(env.earlierRuns(ctx, &lossy), env.attrWriter(), *discard)
 	if err != nil && !keystore.Committed(err) {
 		return v.failf(keysRefused, "%v", err)
+	}
+	if rep.Earlier {
+		fmt.Fprintln(env.stdout, "an earlier run committed; this run did not rotate:")
 	}
 	if rep.Discarded {
 		fmt.Fprintln(env.stdout, "discarded the oldest audit archive")
@@ -125,7 +150,7 @@ func keysAuditVerb(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysCommitted, "%v", err)
 	}
-	return keysOK
+	return lossy.exit(env)
 }
 
 // attrWriter is the file-attribute writer the maintenance verbs act

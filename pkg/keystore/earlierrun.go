@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -61,10 +62,55 @@ func (r EarlierRun) String() string {
 		rep = "no counts recorded"
 	}
 	s := fmt.Sprintf("an earlier %s committed and was not reported: %s", verbDisplay(r.Verb), rep)
+	if n := r.Dropped(); n > 0 {
+		s = fmt.Sprintf("an earlier %s committed and dropped %d lines, and was not reported: %s", verbDisplay(r.Verb), n, rep)
+	}
 	if r.AuditErr != nil {
 		s += fmt.Sprintf("; its audit line was not written: %v", r.AuditErr)
 	}
 	return s
+}
+
+// dropFields are the saved report's fields that count dropped lines or
+// keys (RebuildReport.fields).
+var dropFields = []string{"dropped", "overlong", "past-share", "absent", "removed"}
+
+// Dropped is how many lines or keys r's saved report shows dropped: more
+// than 0 makes the verb that reports it exit at least 4.
+func (r EarlierRun) Dropped() int64 {
+	var n int64
+	for _, k := range dropFields {
+		n += max(r.Report[k], 0)
+	}
+	return n
+}
+
+// StandingMaintenance reads the maintenance marker in the data root, for
+// doctor: present reports whether one stands, and verb is the command of
+// the run that wrote it ("" when it names none this build knows). The
+// marker is root's 0644, so any account reads it.
+func (s *FileStore) StandingMaintenance(ctx context.Context) (verb string, present bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	fd, err := unix.Open(filepath.Join(s.dataRoot, maintenanceMarkerName), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", true, err
+	}
+	f := os.NewFile(uintptr(fd), maintenanceMarkerName)
+	defer func() { _ = f.Close() }() // read-only
+	b, err := io.ReadAll(io.LimitReader(f, maxMarkerSize))
+	if err != nil {
+		return "", true, err
+	}
+	switch v := parseMarker(b).verb; v {
+	case verbRebuild, verbRotate:
+		return verbDisplay(v), true, nil
+	}
+	return "", true, nil
 }
 
 // verbDisplay is the command a marker's verb names.

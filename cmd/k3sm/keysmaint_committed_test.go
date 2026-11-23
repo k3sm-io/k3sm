@@ -39,9 +39,10 @@ func (*keysEndCrash) BeforeSwapStep(step string) error {
 
 // A rebuild that fails after its swap committed exits 4, prints its drop
 // counts and audits committed, never refused. A rotate run next finds its
-// marker, prints its saved report to stderr as an earlier committed run,
-// and writes its audit line (op floor-rebuild, result committed) before it
-// replaces the marker.
+// marker, prints its saved report to stderr as an earlier committed run
+// that dropped lines, writes its audit line (op floor-rebuild, result
+// committed) before it replaces the marker, and exits 4 though its own
+// rotation was clean.
 func TestKeysMaintenanceCommittedAfterSwap(t *testing.T) {
 	h := newKeysHarness(t)
 	var lines []string
@@ -79,8 +80,8 @@ func TestKeysMaintenanceCommittedAfterSwap(t *testing.T) {
 	h.stdout.Reset()
 	h.stderr.Reset()
 	lines = nil
-	h.mustRun(keysOK, "audit", "--rotate")
-	if !strings.Contains(h.stderr.String(), "an earlier floor --rebuild committed and was not reported: ") || !strings.Contains(h.stderr.String(), "dropped=1") {
+	h.mustRun(keysCommitted, "audit", "--rotate")
+	if !strings.Contains(h.stderr.String(), "an earlier floor --rebuild committed and dropped 1 lines, and was not reported: ") || !strings.Contains(h.stderr.String(), "dropped=1") || !strings.Contains(h.stderr.String(), "(exit 4)") {
 		t.Errorf("rotate after a committed rebuild printed %q to stderr, want the earlier report", h.stderr.String())
 	}
 	if strings.Contains(h.stderr.String(), "not written") {
@@ -89,5 +90,48 @@ func TestKeysMaintenanceCommittedAfterSwap(t *testing.T) {
 	one, err := os.ReadFile(filepath.Join(h.cfg.DataRoot, keystore.LogsDirName, keystore.AuditDirName, keystore.ArchivesDirName, "keystore-audit.log.1"))
 	if err != nil || !strings.Contains(string(one), `"op":"floor-rebuild","via":"root","scope":"system","name":"-","namespace":"","result":"committed"`) {
 		t.Errorf("the rotated log %q (%v) holds no committed floor-rebuild line", one, err)
+	}
+}
+
+// keysMaintHarness is a keys harness with both logs placed, the floor
+// holding one line that does not parse, as root with the logs flagged.
+func keysMaintHarness(t *testing.T) *keysHarness {
+	t.Helper()
+	h := newKeysHarness(t)
+	h.stdin = strings.NewReader("tok")
+	h.mustRun(keysOK, "put", "system/api-token", "--in", "-")
+	h.euid = 0
+	h.logFlags = keysFlagged
+	for dir, name := range map[string]string{
+		keystore.FloorDirName: "keystore-user-floor.log",
+		keystore.AuditDirName: "keystore-audit.log",
+	} {
+		if err := os.MkdirAll(filepath.Join(h.cfg.DataRoot, keystore.LogsDirName, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body := ""
+		if dir == keystore.FloorDirName {
+			body = "not a floor line\n"
+		}
+		if err := os.WriteFile(filepath.Join(h.cfg.DataRoot, keystore.LogsDirName, dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return h
+}
+
+// A rerun of the same verb after a committed, unreported rebuild prints
+// the saved report as an earlier run's, never as a rebuild of its own, and
+// exits 4 for its drops.
+func TestKeysRebuildRerunSaysEarlierRun(t *testing.T) {
+	h := keysMaintHarness(t)
+	h.attrs = &keysEndCrash{}
+	h.mustRun(keysCommitted, "floor", "--rebuild")
+	h.attrs = &keysAttrRecorder{}
+	h.stdout.Reset()
+	h.mustRun(keysCommitted, "floor", "--rebuild")
+	out := h.stdout.String()
+	if !strings.HasPrefix(out, "an earlier run committed; this run did not rebuild") || strings.Contains(out, "rebuilt") {
+		t.Errorf("the rerun printed %q, want the earlier run's report, not a rebuild", out)
 	}
 }
