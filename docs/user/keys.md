@@ -109,6 +109,25 @@ an extra flag or access list, or linked under a second name. What to run:
 
 When the message names a verb, run that verb. Each of them replaces the log with a fresh file.
 
+### The keystore user scope row in `k3sm doctor`
+
+`doctor` runs in its own process and cannot ask the server whether the listener is serving, so
+its `keystore-user-scope` row says only what it can check:
+
+- `keystore user scope: start checks pass; a socket owned by the service user is at <path>`
+  (PASS): every check the server makes before it starts the listener passes, and a socket is at
+  the path. `doctor` looks at the path; it never connects, since the server refuses root and
+  the service user.
+- `keystore user scope: start checks pass, but no listening socket at <path>` (WARN): the
+  checks pass but nothing, something other than a socket, or another user's socket is at the
+  path.
+- `keystore user scope: off (<reason>)` (WARN): a check fails, with the server's own reason.
+  For a missing, wrong or unflagged log or socket directory it adds `run sudo k3sm install`;
+  for `more than one server registered` it names the servers (up to 8, then how many more);
+  for `the append-only logs cannot be opened (logs-unavailable)` it shows the error.
+- `keystore user scope: the server count cannot be read as this user` (WARN): run
+  `sudo k3sm doctor`; this does not mean the user scope is off.
+
 ### When a user scope blocks the rebuild
 
 `floor --rebuild` refuses, changing nothing, when a user scope does not open, or when a scope has
