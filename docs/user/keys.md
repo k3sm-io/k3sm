@@ -207,16 +207,49 @@ delivered as the stored 32-byte seed or 64-byte key, with no PEM wrapping. The e
   label alone does not count: a Secret of that name that someone else created first, or that was deleted and created
   again, is "not created by this server". The server leaves it alone and logs why: delete it, or
   pick another `--secret`. The server never lists Secrets, and deletes one only to re-create an
-  immutable Secret it created after a rotation or a change to its data.
+  immutable Secret it created after a rotation or a change to its data, or after an `rm`.
+  After an `rm`, the next sweep deletes the Secret the server delivered for that entry, if it
+  still has the recorded UID, and logs the names.
 - **A namespace that does not exist yet.** Delivering into it goes to whoever later creates that
   namespace.
 - **Withdrawing.** `undeliver` removes every delivery of the entry into that namespace from the
   declaration (with `--secret S`, only the one into Secret `S`), and prints: the Secret stays; delete it with kubectl, and rotate the entry to
   revoke. A Pod that read the value still has it, which is why revoking it means rotating.
 - **Deleting a delivered entry.** `rm` does not withdraw its deliveries. For each one still
-  declared, it warns: still declared for delivery to `<namespace>/<secret>`; the Secret keeps its
-  value: run `k3sm keys undeliver` and delete the Secret. Until you do, the server logs that it
-  cannot read the entry, and the Secret holds the last value it delivered.
+  declared, it warns: still declared for delivery to `<namespace>/<secret>`; the server deletes
+  that Secret on its next sweep, unless the delivery breaker or a restore hold stops it; the
+  server log says so. `k3sm keys undeliver` does not change that. The delete is made only on
+  the Secret with the UID the server recorded when it created it, for the entry it recorded
+  then (a label someone changed on the Secret does not count), and it runs while plaintext
+  delivery is refused too. It removes the Secret from the Kubernetes API and nothing more: a
+  Pod that already read the value still has it, and the datastore's history and its backups
+  keep it, so revoking a credential still means rotating or disabling it where it is
+  accepted. Anyone who can read the Secret already has the value. Since the delete cannot be
+  undone, these hold it back:
+  - `rm` records the entry as deleted in root's record, `/var/lib/k3sm/keystore-floor.json`,
+    and it is no longer current there. An entry that record still lists as current but whose
+    files are missing was not removed with `rm`: it is a restored or rolled-back `keystore/`,
+    and its Secret is kept, with a warning naming the entry in the server log (see
+    [Restoring an older keystore/](#restoring-an-older-keystore)). If an earlier `rm` was
+    interrupted after removing the files, run `rm` again: it records the deletion even with
+    the files gone.
+  - The restore hold: after the server starts, and after `keystore/` is replaced, nothing is
+    deleted until the first sweep has passed **and** 10 minutes have. The server warns when
+    the hold starts, naming the time it ends. There is no flag to shorten it.
+  - The breaker counts entries, not Secrets: an `rm` of one entry delivered into many
+    namespaces is one. When the number of delivered entries gone at once is above 3 **and**
+    above a quarter of the live delivered entries, none of their Secrets is deleted and the
+    server logs an error with the count, again every hour while it holds. It keeps holding
+    until enough entries are back, or until you delete those Secrets yourself with kubectl.
+  - A delete counts as done only once the Secret is gone. A Secret already being deleted (a
+    finalizer holds it), still there after its delete, or whose delete keeps failing is
+    stuck: it is retried every sweep and does not count toward the breaker.
+  - The entry is checked again just before each delete, so one put back meanwhile keeps its
+    Secret.
+  - Every Secret kept back for a reason that names it (root's record still lists the entry,
+    the entry's absence cannot be confirmed, the Secret cannot be read) and every stuck
+    delete gets one warning when it starts, and a summary every hour while any lasts,
+    naming each, why, and for how long.
 
 The declaration is `/var/lib/k3sm/keystore-delivery.json`, owned by root, mode 0644, and only
 `k3sm keys deliver` and `undeliver` write it. It decides which namespace the server writes a
@@ -254,7 +287,8 @@ on:
 
 To turn it off, remove the flag from the plist, restart the server daemon, and run
 `sudo k3sm install`. If the record still carries the flag, remove it there too. A Secret delivered
-while the override was on stays as it is: the server does not delete it, and stops updating it.
+while the override was on stays as it is: the server stops updating it, and deletes it only
+after an `rm` of its entry.
 
 ## Backing Up and Restoring
 
@@ -376,11 +410,11 @@ warning on stderr but find no entries, since the restored ones are not in place 
 the same warning, and the merge keeps each deletion it records. An `rm` at this point records
 the deletion, but the restored entry's files are still in `pre-restore.d/restored`, out of its
 reach. The merge removes those files before it moves the restored copy into place, so you do not
-need to run `rm` again. Neither `rm` nor the merge deletes a Secret delivered from the entry: as
-after any `rm`, it keeps the last value delivered until you run `k3sm keys undeliver` and delete
-it. A server started
-before the merge delivers no keys to the cluster: it logs an error and tries again until the
-merge has run. Merge those deletions into the restored floor:
+need to run `rm` again. A server started before the merge delivers no keys to the cluster and
+deletes no delivered Secret: it logs an error and tries again until the merge has run. Once it
+has, the server deletes the Secret delivered from each entry the merge or an `rm` deleted, as
+after any `rm`: once the restore hold has passed and unless the breaker holds (see [Delivering
+an Entry as a Secret](#delivering-an-entry-as-a-secret)). Merge those deletions into the restored floor:
 
 ```
 sudo k3sm keys floor merge
@@ -573,3 +607,24 @@ is deliberate:
 Only remove the record when you know the restored entries are the ones you want current, since
 the next keys verb accepts them as the newest. Removing it also discards every deletion it
 recorded: a copy of a deleted entry put back later is no longer refused.
+
+A restore also changes which entries exist, and the server does not delete a delivered Secret
+because a restore lost its entry:
+
+- After a restore of a backup with its saved floor and `keys floor merge` (the steps under
+  "Backing Up and Restoring"), the merge records as deleted each entry the backup lacks and the
+  moved-aside floor holds, unless `--keep` names it, so the server deletes their Secrets as after
+  an `rm`, once the restore hold has passed and unless the breaker holds. Root's record still
+  lists as current an entry whose files are missing only when the restored `keystore/` lacks
+  what the record names, such as an entry `--keep` kept that the backup does not hold, or a
+  `keystore/` put back without its floor. The server keeps those Secrets for as long as that
+  lasts and warns once per entry in its log. To revoke one, `rm` it, or delete the Secret with
+  kubectl.
+- After the steps above, which remove root's record and write it again from the restored
+  entries, the record no longer lists the entries the restored copy lacks, so it cannot tell
+  them from an `rm`. The server holds back for 10 minutes after `start` (and after
+  `keystore/` is replaced while it runs), and for every sweep while the breaker holds (above
+  3 and above a quarter of the delivered entries gone at once). You have those 10 minutes
+  after `start` to put back any entry that is still delivered. After that, an entry the
+  restored copy does not hold has its Secret deleted, as after an `rm`, so restore every entry
+  you still deliver.

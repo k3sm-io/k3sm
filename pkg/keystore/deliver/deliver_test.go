@@ -67,11 +67,20 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-// fakeStore is a ValueSource over a map; it counts Current calls.
+// fakeStore is a ValueSource over a map; it counts Current calls. absentErr,
+// when set, is Absent's answer, standing in for a store that cannot confirm
+// an absence (a missing entries' directory); identity is the entries'
+// directory's identity Identity and Absent answer.
 type fakeStore struct {
-	mu      sync.Mutex
-	entries map[string]fakeEntry
-	reads   int
+	mu        sync.Mutex
+	entries   map[string]fakeEntry
+	reads     int
+	absentErr error
+	identity  string
+	// beforeAbsent, when set, runs before Absent answers, with the name and
+	// how many times Absent was asked for it (1 for the first).
+	beforeAbsent func(name string, call int)
+	absentCalls  map[string]int
 	// pending is what MergePending returns: set, a restore is unfinished.
 	pending error
 }
@@ -102,6 +111,39 @@ func (s *fakeStore) Current(_ context.Context, name string) (keystore.Version, [
 	return keystore.Version{Name: name, Version: e.version, Kind: keystore.KindOpaque, Fingerprint: hex.EncodeToString(sum[:8])}, bytes.Clone(e.value), nil
 }
 
+func (s *fakeStore) Absent(_ context.Context, name string) (bool, string, error) {
+	s.mu.Lock()
+	if s.absentCalls == nil {
+		s.absentCalls = map[string]int{}
+	}
+	s.absentCalls[name]++
+	call, hook := s.absentCalls[name], s.beforeAbsent
+	s.mu.Unlock()
+	if hook != nil {
+		hook(name, call)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.absentErr != nil {
+		return false, "", s.absentErr
+	}
+	_, ok := s.entries[name]
+	return !ok, s.identity, nil
+}
+
+func (s *fakeStore) Identity(context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.identity, nil
+}
+
+// rm deletes name, as keys rm does.
+func (s *fakeStore) rm(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.entries, name)
+}
+
 func (s *fakeStore) set(name string, version uint64, value []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -126,7 +168,7 @@ func newHarness(t *testing.T, encryptionOn, allowPlaintext bool, objs ...runtime
 	h := &harness{
 		dir:    t.TempDir(),
 		client: fake.NewClientset(objs...),
-		store:  &fakeStore{entries: map[string]fakeEntry{}},
+		store:  &fakeStore{entries: map[string]fakeEntry{}, identity: "1:1"},
 		logs:   &syncBuffer{},
 	}
 	h.path = filepath.Join(h.dir, FileName)
@@ -160,6 +202,9 @@ func (h *harness) reconciler(encryptionOn, allowPlaintext bool) *Reconciler {
 	// The declaration stands the test user in for root; the state file's
 	// checks are production's, since the server's euid owns it.
 	r.check = testCheck
+	// The restore hold's duration is tested on its own
+	// (TestRestoreHoldLastsTenMinutes); elsewhere only its first sweep holds.
+	r.revokeHold = 0
 	return r
 }
 
@@ -233,8 +278,8 @@ func (h *harness) verbs() []string {
 
 // assertOnlyGetCreateUpdateSecrets fails on any recorded call that is not a
 // get, create or update of a Secret, or a delete under a UID precondition
-// (an owned immutable Secret's): no list, no watch, no other delete, no other
-// kind.
+// (an owned immutable Secret's, or one whose entry is gone): no list, no
+// watch, no other delete, no other kind.
 func (h *harness) assertOnlyGetCreateUpdateSecrets(t *testing.T) {
 	t.Helper()
 	for _, a := range h.client.Actions() {
@@ -242,7 +287,7 @@ func (h *harness) assertOnlyGetCreateUpdateSecrets(t *testing.T) {
 		case a.GetResource().Resource != "secrets":
 			t.Errorf("touched another kind: %s %s", a.GetVerb(), a.GetResource().Resource)
 		case a.GetVerb() == "delete":
-			// The one delete allowed: an owned immutable Secret, under a
+			// The one delete shape allowed: an owned Secret, under a
 			// precondition on its UID.
 			d, ok := a.(k8stesting.DeleteAction)
 			if !ok || d.GetDeleteOptions().Preconditions == nil || d.GetDeleteOptions().Preconditions.UID == nil || *d.GetDeleteOptions().Preconditions.UID == "" {
@@ -263,8 +308,9 @@ func secretObj(ns, name string, labels map[string]string, data map[string][]byte
 }
 
 // TestDeliveryRefusedWhileEncryptionOff: with encryption off and no override,
-// every target is refused before any apiserver call or store read, and the
-// refusal is logged at Warn once per target however many sweeps run (G18).
+// every target is refused: no create, no update and no read of a value; the
+// only calls are the Gets a revocation needs. The refusal is logged at Warn
+// once per target however many sweeps run (G18).
 func TestDeliveryRefusedWhileEncryptionOff(t *testing.T) {
 	h := newHarness(t, false, false)
 	h.store.set("api-token", 1, []byte("tok"))
@@ -274,8 +320,10 @@ func TestDeliveryRefusedWhileEncryptionOff(t *testing.T) {
 	for range 3 {
 		h.r.Sweep(ctx)
 	}
-	if got := h.client.Actions(); len(got) != 0 {
-		t.Fatalf("encryption off: the apiserver saw %v, want no call", h.verbs())
+	for _, v := range h.verbs() {
+		if v != "get/secrets" {
+			t.Fatalf("encryption off: the apiserver saw %v, want Gets only", h.verbs())
+		}
 	}
 	if h.store.reads != 0 {
 		t.Fatalf("encryption off: the store was read %d times, want 0", h.store.reads)
@@ -335,8 +383,8 @@ func TestDeliveryOverrideAllowsPlaintext(t *testing.T) {
 }
 
 // TestDeliveredTargetStaysWhenOverrideRemoved: a target delivered under the
-// override is left as it is by a server restarted without it: no update, no
-// delete, the Secret still there (G18).
+// override, whose entry is live, is left as it is by a server restarted
+// without it: no update, no delete, the Secret still there (G18).
 func TestDeliveredTargetStaysWhenOverrideRemoved(t *testing.T) {
 	h := newHarness(t, false, true)
 	h.store.set("api-token", 1, []byte("tok"))
@@ -348,8 +396,11 @@ func TestDeliveredTargetStaysWhenOverrideRemoved(t *testing.T) {
 	h.store.set("api-token", 2, []byte("tok2"))
 	restarted := h.reconciler(false, false)
 	restarted.Sweep(ctx)
-	if got := h.client.Actions(); len(got) != 0 {
-		t.Fatalf("after the override was removed the apiserver saw %v, want no call", h.verbs())
+	restarted.Sweep(ctx)
+	for _, v := range h.verbs() {
+		if v != "get/secrets" {
+			t.Fatalf("after the override was removed the apiserver saw %v, want Gets only", h.verbs())
+		}
 	}
 	if got := string(h.secret(t, "payments", "api-token").Data[DefaultDataKey]); got != "tok" {
 		t.Fatalf("the delivered Secret changed to %q", got)
