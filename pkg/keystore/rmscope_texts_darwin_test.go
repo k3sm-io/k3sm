@@ -118,7 +118,8 @@ func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 		})
 	}
 	// A scope directory that is gone when the walk comes to open it was not
-	// removed by this run: the unlisted report says it was found absent.
+	// removed by this run, and nothing was written: a refusal saying it was
+	// found absent, never that it was removed.
 	t.Run("absent at the open", func(t *testing.T) {
 		s, server, _ := fileLogScope(t)
 		dir := scopeDir(server, "1001")
@@ -131,11 +132,11 @@ func TestRmScopeErrorTextsOfferNoCommand(t *testing.T) {
 			}
 		})
 		_, err := s.RemoveScope(t.Context(), 1001)
-		if !Committed(err) {
-			t.Fatalf("rm-scope of a keyless scope found absent: %v, want the unlisted report", err)
+		if err == nil || Committed(err) {
+			t.Fatalf("rm-scope of a keyless scope found absent: %v, want a refusal", err)
 		}
 		msg := err.Error()
-		if !strings.Contains(msg, "found user/1001 absent") || strings.Contains(msg, "removed user/1001") {
+		if !strings.Contains(msg, "absent at its name") || strings.Contains(msg, "removed user/1001") || strings.Contains(msg, "removed the directory") {
 			t.Errorf("the report %q does not say the scope was found absent, or says it was removed", msg)
 		}
 	})

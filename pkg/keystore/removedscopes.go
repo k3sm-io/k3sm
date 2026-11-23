@@ -147,6 +147,31 @@ func (r *removedScopes) listed(uid uint32) bool {
 	return slices.ContainsFunc(r.Scopes, func(sc removedScope) bool { return sc.UID == uid })
 }
 
+// count is how many scope keys of uid are listed.
+func (r *removedScopes) count(uid uint32) int {
+	for _, sc := range r.Scopes {
+		if sc.UID == uid {
+			return len(sc.Keys)
+		}
+	}
+	return 0
+}
+
+// drop takes uid's key id out of the record in memory again, after a
+// write that listed it did not land; a uid left with no key goes too.
+func (r *removedScopes) drop(uid uint32, id string) {
+	for i := range r.Scopes {
+		if r.Scopes[i].UID != uid {
+			continue
+		}
+		r.Scopes[i].Keys = slices.DeleteFunc(r.Scopes[i].Keys, func(k string) bool { return k == id })
+		if len(r.Scopes[i].Keys) == 0 {
+			r.Scopes = slices.Delete(r.Scopes, i, i+1)
+		}
+		return
+	}
+}
+
 // dropBefore maps each user scope recorded against the floor id (device,
 // inode and birth time all matching), with a nonzero offset, to its
 // offset: the rebuild reading that floor drops that scope's lines starting

@@ -71,25 +71,35 @@ type RemoveScopeResult struct {
 // unlisted, and floor --rebuild keeps its floor keys (fail closed for a
 // copy-back). A record that does not read refuses, changing nothing.
 //
-// A rerun finishes an rm-scope that stopped part-way: a scope whose key is
-// already listed is removed without reading its delivery record again, and
-// a scope directory left without its scope.key is removed as it stands,
-// and so is one an earlier run took from the service user (root's at
-// 0700, scopeDirTaken), which no open accepts. A scope.key the judge refuses only for its link count or mode, which any
+// A scope.key the judge refuses only for its link count or mode, which any
 // local user can cause, is read again without those two checks
 // (openScopeForRmLoose): when it authenticates under the master it is
 // listed and the tree removed, and the result is errCommitted, noting the
 // link count or mode. A scope.key that is present but does not parse or
-// authenticate (errScopeKeyUntrusted) is treated as a missing one: the
-// tree is removed unlisted, its floor lines are kept, and the result is
-// errCommitted, saying so.
+// authenticate (errScopeKeyUntrusted) is treated as a missing one.
 //
-// The tree is removed only while the directory held at the name is the one
-// judged (removeScopeTree's check, before anything in it is taken): with a
-// judged key identity its scope.key, read by descriptor, must open to that
-// identity (judgedScope); on the paths without one, rerunScope's rule
-// applies. Otherwise the result is errNotJudgedScope and nothing in the
-// directory is changed.
+// The directory held at the name is checked before anything in it is
+// taken (rmRun.check, the rerun rule). The service user cannot create a
+// root-owned directory, and cannot move one into .user from another
+// parent: the only root-owned 0700 directory it can put at .user/<uid> is
+// another uid's leftover that an earlier rm-scope took, renamed within
+// .user, and no open ever serves a taken directory. So a root-owned 0700
+// directory held at the name (the owner and device rule already passed) is
+// always removed, whatever scope.key it holds, and a stop anywhere after a
+// take leaves a directory a rerun accepts. A service user's directory is
+// removed only on what was judged: on the judged path its scope.key must
+// open to the judged identity; on the paths without one it must hold what
+// the path found (no scope.key, or one that cannot be trusted), or a key
+// already listed for the uid. Before the removal, a scope.key in the held
+// directory that opens as this scope's is listed when the record does not
+// list it yet, and the record is made durable again when it already did.
+//
+// The result says the scope is removed and listed (a nil error, Recorded)
+// only when the identity of the scope.key read in the held directory is in
+// the record (has); a directory that held no key, or an untrusted one, is
+// removed with errCommitted, saying its key could not be confirmed as
+// listed. A directory gone from its name when the walk opens it is never
+// reported removed.
 func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeResult, error) {
 	if err := s.checkConfig(); err != nil {
 		return RemoveScopeResult{}, err
@@ -122,21 +132,15 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		return RemoveScopeResult{}, fmt.Errorf("%w; nothing was changed", err)
 	}
 	name := strconv.FormatUint(uint64(uid), 10)
+	svc := rmServiceUID(s)
 	u := &UserScope{s: s, uid: uid, scope: userScopeOf(uid), allowRemoved: true}
-	if scopeDirTaken(root, name, s.uid) {
+	r := &rmRun{s: s, u: u, k: k, removed: removed, dfd: dfd, svc: svc, name: name}
+	if scopeDirTaken(root, name, svc) {
 		// An earlier rm-scope took the directory from the service user, then
 		// stopped: no open serves a root-owned scope directory, and the
-		// removal needs none, since that run listed the scope first when it
-		// could.
-		listed := removed.listed(uid)
-		tree, err := removeScopeTree(root, s.dir, name, s.uid, rmTreeOpts{listed: listed, check: u.rerunScope(k, removed, s.uid, rerunTaken)})
-		if err != nil {
-			return RemoveScopeResult{Recorded: listed}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope, tree.cleared)
-		}
-		if listed {
-			return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
-		}
-		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedTaken(u.scope, tree.absent), tree.cleared))
+		// rerun rule removes it whatever it holds.
+		r.path = rmPathTaken
+		return r.finish(root, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), nil)
 	}
 	o, err := u.openScopeForRevoke(root, k)
 	var judged string
@@ -151,28 +155,17 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 	if errors.Is(err, errScopeKeyUntrusted) {
 		// scope.key is present but cannot be trusted, which the service
 		// user can cause: there is no key identity to list, so the scope
-		// is removed unlisted, as with no scope.key, and its floor lines
+		// is removed unconfirmed, as with no scope.key, and its floor lines
 		// are kept. Refusing would leave a scope rebuild refuses and names
 		// rm-scope for.
-		tree, rerr := removeScopeTree(root, s.dir, name, s.uid, rmTreeOpts{listed: removed.listed(uid), keyFirst: true, check: u.rerunScope(k, removed, s.uid, rerunUntrusted)})
-		if rerr != nil {
-			return RemoveScopeResult{}, rmStopped(rerr, tree.changed, fmt.Sprintf("the directory %s has a scope.key that cannot be trusted and is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope, tree.cleared)
-		}
-		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUntrusted(u.scope, err, tree.absent), tree.cleared))
+		r.path, r.untrusted = rmPathUntrusted, err
+		return r.finish(root, fmt.Sprintf("the directory %s has a scope.key that cannot be trusted and is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), nil)
 	}
 	if errors.Is(err, errNoScopeKey) && scopeDirPresent(root, name) {
-		// An earlier rm-scope removed scope.key, then stopped: no open
-		// serves the directory, and there is no key to list.
-		tree, err := removeScopeTree(root, s.dir, name, s.uid, rmTreeOpts{listed: removed.listed(uid), keyFirst: true, check: u.rerunScope(k, removed, s.uid, rerunNoKey)})
-		if err != nil {
-			return RemoveScopeResult{}, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s has no scope.key and is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), u.scope, tree.cleared)
-		}
-		if removed.listed(uid) {
-			return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
-		}
-		// Not listed: an interrupted run that never listed it, or
-		// tampering. The tree is gone, but there was no key to list.
-		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUnlisted(u.scope, tree.absent), tree.cleared))
+		// An earlier rm-scope removed scope.key, then stopped, or the
+		// service user did: no open serves the directory.
+		r.path = rmPathNoKey
+		return r.finish(root, fmt.Sprintf("the directory %s has no scope.key and is partly or wholly present", quoteName("keystore/"+userScopesName+"/"+name)), nil)
 	}
 	if err != nil {
 		return RemoveScopeResult{}, fmt.Errorf("open the scope %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", u.scope, err)
@@ -203,53 +196,226 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 		// deliveries unchecked for no cause.
 		return RemoveScopeResult{}, fmt.Errorf("read the delivery record of %s: %s; nothing was changed; run it again", u.scope, safeText(derr.Error()))
 	}
-	// wrote reports whether this run wrote the removed-scopes record: a
-	// change, so a later failure is a removal made in part.
-	wrote := false
-	if !recorded {
-		fid, size, err := s.floorSize(dfd)
-		if err != nil {
-			return RemoveScopeResult{}, fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", userFloorLogName, err)
-		}
-		if removed.add(uid, id, fid, size) {
-			renamed, err := writeRemovedScopes(dfd, removed)
-			if err != nil && renamed {
-				// The rename landed: the record lists the scope, as far as
-				// any later read sees, though a crash may yet lose it.
-				return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: record the removed scope %s in %s: %w; the record lists the scope but its durability is unknown, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", errCommitted, u.scope, removedScopesName, err, u.scope)
-			}
-			if err != nil {
-				return RemoveScopeResult{}, fmt.Errorf("record the removed scope %s in %s: %w; the record does not list it, and nothing was changed: rerun sudo k3sm keys rm-scope %s --yes", u.scope, removedScopesName, err, u.scope)
-			}
-			recorded, wrote = true, true
-		}
+	// The judged key is listed, or the record made durable again, before
+	// the walk: the tree is then removed only while the directory at the
+	// name holds that scope.key (or is a taken leftover, rmRun.check).
+	r.path, r.judged = rmPathJudged, id
+	if err := r.list(id); err != nil {
+		return RemoveScopeResult{Recorded: r.wrote || r.renewed}, err
 	}
-	// The tree is removed only while the directory at the name holds the
-	// scope.key judged and listed above (judgedScope): .user is the service
-	// user's, and another of its scope directories can be renamed onto the
-	// name in between. An unlisted removal (a full record) takes scope.key
-	// first, so a run that stops after its take leaves no key a rerun must
-	// find listed.
-	tree, err := removeScopeTree(root, s.dir, name, s.uid, rmTreeOpts{listed: recorded, keyFirst: !recorded, check: u.judgedScope(k, id)})
-	if err != nil {
-		state := "is listed as removed in " + removedScopesName + ", so no open serves it"
-		if !recorded {
-			state = "is not listed in " + removedScopesName + ", which is full"
-		}
-		return RemoveScopeResult{Recorded: recorded}, rmStopped(err, wrote || tree.changed, fmt.Sprintf("the scope %s %s, and its directory %s is partly or wholly present", u.scope, state, quoteName("keystore/"+userScopesName+"/"+name)), u.scope, tree.cleared)
-	}
-	cleared := tree.cleared
 	var notes []string
 	if judged != "" {
-		notes = append(notes, scopeRemovedJudged(u.scope, judged, recorded))
+		notes = append(notes, scopeRemovedJudged(u.scope, judged, r.removed.has(uid, id)))
 	}
 	if unread != nil {
 		notes = append(notes, scopeRemovedUnread(u.scope, unread))
 	}
-	if len(notes) > 0 {
-		return RemoveScopeResult{Recorded: recorded}, fmt.Errorf("%w: %s", errCommitted, withCleared(strings.Join(notes, "; "), cleared))
+	state := "is listed as removed in " + removedScopesName + ", so no open serves it"
+	if !r.removed.has(uid, id) {
+		state = "is not listed in " + removedScopesName + ", which is full"
 	}
-	return RemoveScopeResult{Recorded: recorded, Cleared: cleared}, nil
+	return r.finish(root, fmt.Sprintf("the scope %s %s, and its directory %s is partly or wholly present", u.scope, state, quoteName("keystore/"+userScopesName+"/"+name)), notes)
+}
+
+// rmServiceUID is the service user RemoveScope judges owners by; tests
+// replace it to stand for another uid, so their own 0700 directories are
+// root's, as an earlier run's take leaves them.
+var rmServiceUID = func(s *FileStore) uint32 { return s.uid }
+
+// rmPath is which of RemoveScope's paths removes the tree: the judged
+// path, with a judged key identity, or a path without one: a directory an
+// earlier run took (rmPathTaken), one with no scope.key (rmPathNoKey), or
+// one whose scope.key cannot be trusted (rmPathUntrusted).
+type rmPath int
+
+const (
+	rmPathJudged rmPath = iota
+	rmPathTaken
+	rmPathNoKey
+	rmPathUntrusted
+)
+
+// rmRun is one RemoveScope's state around its walk: the path, the judged
+// identity (rmPathJudged only), what the check read in the held directory
+// (held, once read), and what it did to the record: wrote it (wrote),
+// rewrote a record already listing the key to make it durable again
+// (renewed), or found it full (full). stopErr is a record failure's own
+// complete error, returned as it stands.
+type rmRun struct {
+	s         *FileStore
+	u         *UserScope
+	k         keys
+	removed   *removedScopes
+	dfd       int
+	svc       uint32
+	name      string
+	path      rmPath
+	judged    string
+	untrusted error
+	held      heldKey
+	heldRead  bool
+	wrote     bool
+	renewed   bool
+	full      bool
+	stopErr   error
+}
+
+// check is the rerun rule, run on the scope directory held at the name
+// before anything in it is taken. A directory root owns (at 0700 on .user's
+// device: removeScopeTree's owner rule passed, and st.Uid is not the
+// service user's) is always accepted: the service user can place no
+// root-owned directory at the name but another uid's taken leftover, and a
+// taken directory is never served, so finishing its removal is safe. A
+// service user's directory is accepted on the judged path only while its
+// scope.key opens to the judged identity; on the other paths when its
+// scope.key is already listed for the uid, or when it holds what the path
+// found: no scope.key on the no-key path, one that does not open as this
+// scope's on the untrusted path; the taken path accepts none (root's
+// directory was judged). A scope.key that opens as this scope's and is not
+// listed is a valid, unlisted scope, never removed without its judge.
+// Once accepted, a scope.key that opens as this scope's is listed, or the
+// record made durable again (list), before anything is taken.
+func (r *rmRun) check(dfd int, st *unix.Stat_t) (string, error) {
+	hk, err := r.u.scopeKeyAt(dfd, r.k)
+	if err != nil {
+		return "", err
+	}
+	if st.Uid == r.svc {
+		if why := r.serviceUserRule(hk); why != "" {
+			return why, nil
+		}
+	}
+	r.held, r.heldRead = hk, true
+	if hk.id == "" {
+		return "", nil
+	}
+	return "", r.list(hk.id)
+}
+
+// serviceUserRule is check's rule for a directory the service user owns:
+// a non-empty why refuses it.
+func (r *rmRun) serviceUserRule(hk heldKey) string {
+	if r.path == rmPathJudged {
+		switch {
+		case !hk.present:
+			return "it holds no scope.key, and the scope rm-scope judged had one"
+		case hk.id != r.judged:
+			return "its scope.key is not the one rm-scope judged and listed"
+		}
+		return ""
+	}
+	switch {
+	case hk.id != "" && r.removed.has(r.u.uid, hk.id):
+		return ""
+	case r.path == rmPathTaken:
+		return "rm-scope found root's directory at the name, which an earlier rm-scope took, and the service user's is there now"
+	case hk.id != "":
+		return "it holds a scope.key that opens as this scope's and is not listed as removed"
+	case r.path == rmPathNoKey && hk.present:
+		return "rm-scope found no scope.key there, and one is there now"
+	case r.path == rmPathUntrusted && !hk.present:
+		return "rm-scope found a scope.key it could not trust there, and none is there now"
+	}
+	return ""
+}
+
+// list lists uid's scope key id in the record before the removal, through
+// the normal writer (writeRemovedScopes: temporary file, fsync, rename,
+// fsync of the data root), with the floor's size at this moment. When the
+// record lists id already and this run has not written it, it is
+// rewritten through the same writer, so the listing a rerun relies on is
+// durable again. A full record lists nothing (full). Its errors are
+// complete (stopErr): a failure before the rename is a refusal, nothing
+// changed; one after it, or any failure of a rewrite, is errCommitted,
+// saying the record lists the scope but its durability is unknown.
+func (r *rmRun) list(id string) error {
+	uid, scope := r.u.uid, r.u.scope
+	if r.removed.has(uid, id) {
+		if r.wrote || r.renewed {
+			return nil
+		}
+		r.renewed = true
+		if _, err := writeRemovedScopes(r.dfd, r.removed); err != nil {
+			r.stopErr = fmt.Errorf("%w: make %s durable again: %w; the record lists the scope %s but its durability is unknown, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", errCommitted, removedScopesName, err, scope, scope)
+			return r.stopErr
+		}
+		return nil
+	}
+	fid, size, err := r.s.floorSize(r.dfd)
+	if err != nil {
+		r.stopErr = fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", userFloorLogName, err)
+		return r.stopErr
+	}
+	if !r.removed.add(uid, id, fid, size) {
+		r.full = true
+		return nil
+	}
+	renamed, err := writeRemovedScopes(r.dfd, r.removed)
+	if err != nil && renamed {
+		// The rename landed: the record lists the scope, as far as any
+		// later read sees, though a crash may yet lose it.
+		r.wrote = true
+		r.stopErr = fmt.Errorf("%w: record the removed scope %s in %s: %w; the record lists the scope but its durability is unknown, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", errCommitted, scope, removedScopesName, err, scope)
+		return r.stopErr
+	}
+	if err != nil {
+		// Nothing landed: the key add listed is dropped again.
+		r.removed.drop(uid, id)
+		r.stopErr = fmt.Errorf("record the removed scope %s in %s: %w; the record does not list it, and nothing was changed: rerun sudo k3sm keys rm-scope %s --yes", scope, removedScopesName, err, scope)
+		return r.stopErr
+	}
+	r.wrote = true
+	return nil
+}
+
+// proven reports whether the scope.key read in the held directory opened
+// as this scope's and its identity is in the record: the only ground for
+// saying the removal is listed.
+func (r *rmRun) proven() bool {
+	return r.heldRead && r.held.id != "" && r.removed.has(r.u.uid, r.held.id)
+}
+
+// finish removes the tree under check and reports it: state says what
+// remains when the walk stops, notes are the judged path's committed notes.
+func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScopeResult, error) {
+	uid, scope := r.u.uid, r.u.scope
+	tree, err := removeScopeTree(root, r.s.dir, r.name, r.svc, rmTreeOpts{listedNow: r.proven, check: r.check})
+	if r.stopErr != nil {
+		return RemoveScopeResult{Recorded: r.wrote || r.renewed}, r.stopErr
+	}
+	if err != nil {
+		if errors.Is(err, errNotJudgedScope) && r.wrote {
+			err = fmt.Errorf("%w; %s now lists the key of %s that rm-scope judged, so no open serves that key", err, removedScopesName, scope)
+		}
+		return RemoveScopeResult{Recorded: r.proven()}, rmStopped(err, r.wrote || tree.changed, state, scope, tree.cleared)
+	}
+	if tree.absent {
+		switch {
+		case r.wrote:
+			return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: rm-scope listed %s in %s, but the directory was not at its name: found absent when it came to remove it, so it removed nothing", errCommitted, scope, removedScopesName)
+		case r.renewed:
+			return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: %s is listed in %s, but the directory was not at its name: found absent when rm-scope came to remove it, so it removed nothing", errCommitted, scope, removedScopesName)
+		}
+		return RemoveScopeResult{}, fmt.Errorf("rm-scope found the directory of %s absent at its name when it came to remove it: nothing was changed and nothing removed", scope)
+	}
+	switch {
+	case r.proven():
+		if len(notes) > 0 {
+			return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: %s", errCommitted, withCleared(strings.Join(notes, "; "), tree.cleared))
+		}
+		return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
+	case r.full && r.held.id != "":
+		// The key opened as this scope's, and the record is full.
+		if len(notes) > 0 {
+			return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(strings.Join(notes, "; "), tree.cleared))
+		}
+		return RemoveScopeResult{Cleared: tree.cleared}, nil
+	}
+	note := scopeRemovedUnconfirmed(scope, r.held, r.untrusted, r.removed.count(uid))
+	if len(notes) > 0 {
+		note = strings.Join(append(notes, note), "; ")
+	}
+	return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(note, tree.cleared))
 }
 
 // rmStopped is RemoveScope's error for a removeScopeTree of scope that
@@ -357,39 +523,30 @@ func (s *FileStore) floorSize(dfd int) (floorIdentity, int64, error) {
 	return floorIdentityOf(&st), st.Size, nil
 }
 
-// scopeRemovedUnlisted is rm-scope's committed report for a scope
-// directory with no scope.key whose uid the record does not list; absent
-// says the directory was gone when the walk came to open it.
-func scopeRemovedUnlisted(scope string, absent bool) string {
-	return unlistedLead(scope, absent) + " without listing it in " + removedScopesName + ", because its scope.key was absent (an interrupted earlier rm-scope, or tampering); " + unlistedCopyBack
-}
-
-// unlistedLead opens an unlisted report: what rm-scope did to scope's
-// directory, which was removed, or found absent, so nothing was removed.
-func unlistedLead(scope string, absent bool) string {
-	if absent {
-		return "found " + scope + " absent when it came to remove its directory, so it removed nothing, and left it"
+// scopeRemovedUnconfirmed is rm-scope's committed report for a scope
+// directory removed whose held scope.key gave no listed identity: none
+// (held.present false), or one that does not open as this scope's
+// (untrusted, the judge's error, when that path found it). n is how many
+// keys the record lists for the uid: whether the removed directory's key
+// was among them cannot be told, so a copy put back may open.
+func scopeRemovedUnconfirmed(scope string, held heldKey, untrusted error, n int) string {
+	why := "its scope.key was absent (an interrupted earlier rm-scope, or tampering)"
+	if held.present {
+		why = "its scope.key could not be trusted"
+		if untrusted != nil {
+			why += " (" + safeText(untrusted.Error()) + ")"
+		}
 	}
-	return "removed " + scope
-}
-
-// scopeRemovedUntrusted is rm-scope's committed report for a scope
-// directory whose scope.key was present but could not be trusted (err).
-func scopeRemovedUntrusted(scope string, err error, absent bool) string {
-	return unlistedLead(scope, absent) + " without listing it in " + removedScopesName + ", because its scope.key could not be trusted (" + safeText(err.Error()) + "); " + unlistedCopyBack
+	if n == 0 {
+		return "removed " + scope + " without listing it in " + removedScopesName + ", because " + why + "; the record lists no key for this uid, so " + unlistedCopyBack
+	}
+	return fmt.Sprintf("removed the directory of %s, but %s, so rm-scope could not confirm that its key is listed in %s, which lists %d keys for this uid; if it is not among them, %s", scope, why, removedScopesName, n, unlistedCopyBack)
 }
 
 // unlistedCopyBack is what an unlisted removal leaves open: the service
 // user can put back a copy of the directory, key file and all, and it
 // opens again, held only to the scope's floor lines, which are kept.
 const unlistedCopyBack = "a copy of its directory put back by the service user opens again, held only to the scope's floor lines, which are kept, so the floor still refuses an entry rolled back or deleted against them"
-
-// scopeRemovedTaken is rm-scope's committed report for a scope directory
-// an earlier rm-scope took from the service user and stopped, whose uid
-// the record does not list.
-func scopeRemovedTaken(scope string, absent bool) string {
-	return unlistedLead(scope, absent) + " without listing it in " + removedScopesName + ": an earlier rm-scope took its directory from the service user and stopped before it could list it (a full record, or a scope.key that was absent or could not be trusted); " + unlistedCopyBack
-}
 
 // scopeDirTaken reports whether keystore/.user/<name> is a directory root
 // owns at mode 0700 and the service user (svc) does not: an earlier
@@ -481,10 +638,6 @@ type rmWalk struct {
 	listed  bool
 	dev     uint64
 	foreign []error
-	// keyFirst removes scope.key before the rest of the scope directory:
-	// a removal that lists no key of this scope then never leaves a taken
-	// directory holding one (rerunScope).
-	keyFirst bool
 	// changed is set once the walk unlinks an entry, takes a directory that
 	// was not already root's at 0700, or clears a flag: a failure after it
 	// is a removal made in part.
@@ -580,7 +733,7 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, opts rmTree
 		return rmTree{}, err
 	}
 	defer func() { _ = unix.Close(ufd) }() // fsynced below
-	w := &rmWalk{svc: svc, base: filepath.Join(dir, userScopesName, uid), scope: userScopePrefix + uid, listed: opts.listed, keyFirst: opts.keyFirst}
+	w := &rmWalk{svc: svc, base: filepath.Join(dir, userScopesName, uid), scope: userScopePrefix + uid, listed: opts.listed}
 	defer func() { tree.changed = w.changed }()
 	dfd, dst, err := openDirAt(ufd, uid)
 	if errors.Is(err, unix.ENOENT) {
@@ -643,15 +796,15 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, opts rmTree
 	return tree, fmt.Errorf("remove the scope directory: %w", err)
 }
 
-// rmTreeOpts is how removeScopeTree treats one scope: listed says whether
-// the scope is already listed as removed, which its errors report;
-// keyFirst removes scope.key before the rest (rmWalk.keyFirst); check, when
-// set, judges the scope directory held at the name before anything in it is
-// taken: a non-empty why refuses it (errNotJudgedScope).
+// rmTreeOpts is how removeScopeTree treats one scope: check, when set,
+// judges the scope directory held at the name before anything in it is
+// taken: a non-empty why refuses it (errNotJudgedScope); listed says
+// whether the scope is listed as removed, which its errors report, unless
+// listedNow is set: then it is asked after the check, which may list it.
 type rmTreeOpts struct {
-	listed   bool
-	keyFirst bool
-	check    func(dfd int, st *unix.Stat_t) (why string, err error)
+	listed    bool
+	listedNow func() bool
+	check     func(dfd int, st *unix.Stat_t) (why string, err error)
 }
 
 // rmBeforeTree, when set, runs as removeScopeTree starts, after
@@ -724,86 +877,6 @@ func (u *UserScope) scopeKeyAt(dfd int, k keys) (heldKey, error) {
 	id := scopeKeyID(u.scope, ku)
 	clear(ku)
 	return heldKey{present: true, id: id}, nil
-}
-
-// judgedScope is the check of the scope directory at the name when
-// RemoveScope judged its scope.key and has its identity, id: the held
-// directory's scope.key must open to that identity; one missing, untrusted
-// or of another identity is not the judged scope.
-func (u *UserScope) judgedScope(k keys, id string) func(int, *unix.Stat_t) (string, error) {
-	return func(dfd int, _ *unix.Stat_t) (string, error) {
-		hk, err := u.scopeKeyAt(dfd, k)
-		switch {
-		case err != nil:
-			return "", err
-		case !hk.present:
-			return "it holds no scope.key, and the scope rm-scope judged had one", nil
-		case hk.id != id:
-			return "its scope.key is not the one rm-scope judged and listed", nil
-		}
-		return "", nil
-	}
-}
-
-// rerunPath is which of RemoveScope's paths without a judged key identity
-// removes the tree: a directory an earlier run took (rerunTaken), one with
-// no scope.key (rerunNoKey), or one whose scope.key cannot be trusted
-// (rerunUntrusted).
-type rerunPath int
-
-const (
-	rerunTaken rerunPath = iota
-	rerunNoKey
-	rerunUntrusted
-)
-
-// rerunScope is the check of the scope directory at the name on a path
-// with no judged key identity, the paths a rerun finishes an interrupted
-// rm-scope on. Its rule, on the scope.key read in the held directory
-// (scopeKeyAt):
-//
-//   - a scope.key that opens as this scope's and whose identity the
-//     removed-scopes record lists for the uid is accepted on every path:
-//     no open serves it, and an earlier run listed it;
-//   - otherwise a directory root owns (at 0700, as the owner rule requires)
-//     is accepted only when it holds no scope.key: an earlier run that
-//     listed no key took scope.key first (keyFirst), so its leftover holds
-//     none;
-//   - otherwise the directory is the service user's, which the taken path
-//     never accepts (root's directory was judged; the service user cannot
-//     make one root's), the no-key path accepts only while it holds no
-//     scope.key, and the untrusted path only while it holds a scope.key that
-//     still does not open as this scope's; a scope.key that opens as this
-//     scope's and is not listed is a valid, unlisted scope, never removed
-//     without its judge.
-//
-// A scope.key of another uid's scope does not open as this scope's (the
-// scope is bound into its record), so on the untrusted path it reads as
-// untrusted.
-func (u *UserScope) rerunScope(k keys, removed *removedScopes, svc uint32, path rerunPath) func(int, *unix.Stat_t) (string, error) {
-	return func(dfd int, st *unix.Stat_t) (string, error) {
-		hk, err := u.scopeKeyAt(dfd, k)
-		switch {
-		case err != nil:
-			return "", err
-		case hk.id != "" && removed.has(u.uid, hk.id):
-			return "", nil
-		case st.Uid != svc:
-			if hk.present {
-				return "root owns it at 0700, as an earlier rm-scope leaves it, but it holds a scope.key that is not listed as this scope's removed key", nil
-			}
-			return "", nil
-		case path == rerunTaken:
-			return "rm-scope found root's directory at the name, which an earlier rm-scope took, and the service user's is there now", nil
-		case hk.id != "":
-			return "it holds a scope.key that opens as this scope's and is not listed as removed", nil
-		case path == rerunNoKey && hk.present:
-			return "rm-scope found no scope.key there, and one is there now", nil
-		case path == rerunUntrusted && !hk.present:
-			return "rm-scope found a scope.key it could not trust there, and none is there now", nil
-		}
-		return "", nil
-	}
 }
 
 // errScopeDirMoved is a scope directory rm-scope emptied that was no longer
@@ -1014,17 +1087,10 @@ func (w *rmWalk) foreignErr() error {
 }
 
 // emptyScopeDir removes every name in the scope directory dfd, scope.key
-// last and only when nothing else is left beside it, or first when the
-// walk is keyFirst.
+// last and only when nothing else is left beside it, on every path: a stop
+// part-way leaves the key a rerun reads to list the removal.
 func (w *rmWalk) emptyScopeDir(dfd int) error {
-	keep := scopeKeyName
-	if w.keyFirst {
-		if _, err := w.removeName(dfd, "", scopeKeyName, 0); err != nil {
-			return err
-		}
-		keep = ""
-	}
-	if err := w.emptyDir(dfd, "", 0, keep); err != nil {
+	if err := w.emptyDir(dfd, "", 0, scopeKeyName); err != nil {
 		return err
 	}
 	if len(w.foreign) > 0 {

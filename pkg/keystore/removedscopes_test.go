@@ -281,4 +281,22 @@ func TestRmScopeRecordFsyncFailureIsCommitted(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeKeyName)); err != nil {
 		t.Fatalf("scope.key after a stop at the record: %v, want the directory untouched", err)
 	}
+	// The rerun finds the key listed and makes the record durable again
+	// before anything is removed: with the fsync still failing it stops,
+	// committed, durability unknown, the directory untouched; once it
+	// works, the rerun removes the scope, listed (exit 0).
+	res, err = s.RemoveScope(t.Context(), 1001)
+	if !Committed(err) || !errors.Is(err, unix.EIO) || !strings.Contains(err.Error(), "durability is unknown") {
+		t.Fatalf("the rerun with the fsync still failing: %v, want committed, durability unknown", err)
+	}
+	if _, err := os.Lstat(filepath.Join(scopeDir(server, "1001"), scopeKeyName)); err != nil {
+		t.Fatalf("scope.key after the rerun stopped at the record: %v, want the directory untouched", err)
+	}
+	removedScopesFsync = unix.Fsync
+	if res, err = s.RemoveScope(t.Context(), 1001); err != nil || !res.Recorded {
+		t.Fatalf("the rerun with the fsync working: %v, recorded %v; want removed and listed", err, res.Recorded)
+	}
+	if _, err := os.Lstat(scopeDir(server, "1001")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the scope directory is still there: %v", err)
+	}
 }
