@@ -232,13 +232,24 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 			t.Fatalf("got %v, want errKeystoreFileUntrusted", err)
 		}
 	})
+	// oldLocationRefusal reports whether err refuses a log at a location
+	// no release keeps one at: not a supported layout, where the logs
+	// belong, a restore from backup, and no unflag or delete.
+	oldLocationRefusal := func(err error) bool {
+		if !errors.Is(err, errKeystoreFileUntrusted) {
+			return false
+		}
+		m := err.Error()
+		return strings.Contains(m, "not a supported layout") && strings.Contains(m, "keystore-logs/floor/ and keystore-logs/audit/") &&
+			strings.Contains(m, "restore the data root from a backup") && !strings.Contains(m, "chflags") && !strings.Contains(m, "sudo rm")
+	}
 	t.Run("old location", func(t *testing.T) {
 		root, rec := setup(t)
 		if err := os.WriteFile(filepath.Join(root, audit), nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); !errors.Is(err, errKeystoreFileUntrusted) || !strings.Contains(err.Error(), "sudo k3sm install") {
-			t.Fatalf("got %v, want errKeystoreFileUntrusted naming install", err)
+		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); !oldLocationRefusal(err) {
+			t.Fatalf("got %v, want errKeystoreFileUntrusted saying the layout is not supported and naming a restore", err)
 		}
 		if len(rec.calls) != 0 {
 			t.Fatalf("calls over a log at the old location: %q", rec.calls)
@@ -252,8 +263,8 @@ func TestKeystoreAppendOnlyFilesAtInstall(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(root, logs, floor), nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); !errors.Is(err, errKeystoreFileUntrusted) || !strings.Contains(err.Error(), "sudo k3sm install") {
-			t.Fatalf("got %v, want errKeystoreFileUntrusted naming install", err)
+		if err := ensureKeystoreFiles(root, svcUID, svcGID, me); !oldLocationRefusal(err) {
+			t.Fatalf("got %v, want errKeystoreFileUntrusted saying the layout is not supported and naming a restore", err)
 		}
 		if slices.ContainsFunc(rec.calls, func(c string) bool { return strings.Contains(c, ".log") }) {
 			t.Fatalf("log calls over a log at the old location: %q", rec.calls)

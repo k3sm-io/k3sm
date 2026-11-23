@@ -75,7 +75,7 @@ func TestKeystoreFilesReportsCommittedMarker(t *testing.T) {
 				t.Fatal(err)
 			}
 			line := `"op":"floor-rebuild","via":"root","scope":"system","name":"-","namespace":"","result":"committed"`
-			want := "install: an earlier floor --rebuild committed and was not reported: dropped=2, keys=5\n"
+			want := "install: an earlier floor --rebuild committed and dropped 2 lines, and was not reported: dropped=2, keys=5\n"
 			if !committed {
 				if stderr.Len() != 0 || strings.Contains(string(audit), line) {
 					t.Fatalf("a marker that never committed was reported: %q / %q", stderr.String(), audit)
