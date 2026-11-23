@@ -110,15 +110,15 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		// removal needs none, since that run listed the scope first when it
 		// could.
 		listed := removed.listed(uid)
-		cleared, err := removeScopeTree(root, s.dir, name, s.uid, listed)
+		tree, err := removeScopeTree(root, s.dir, name, s.uid, listed)
 		if err != nil {
-			return listed, fmt.Errorf("%w; the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, quoteName("keystore/"+userScopesName+"/"+name), u.scope)
+			return listed, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s, which an earlier rm-scope took from the service user, is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
 		}
 		if listed {
-			warnCleared(u.scope, cleared)
+			warnCleared(u.scope, tree.cleared)
 			return true, nil
 		}
-		return false, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedTaken(u.scope), cleared))
+		return false, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedTaken(u.scope), tree.cleared))
 	}
 	o, err := u.openScopeForRevoke(root, k)
 	var judged string
@@ -136,26 +136,26 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		// is removed unlisted, as with no scope.key, and its floor lines
 		// are kept. Refusing would leave a scope rebuild refuses and names
 		// rm-scope for.
-		cleared, rerr := removeScopeTree(root, s.dir, name, s.uid, removed.listed(uid))
+		tree, rerr := removeScopeTree(root, s.dir, name, s.uid, removed.listed(uid))
 		if rerr != nil {
-			return false, fmt.Errorf("%w; the directory %s has a scope.key that cannot be trusted and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", rerr, quoteName("keystore/"+userScopesName+"/"+name), u.scope)
+			return false, rmStopped(rerr, tree.changed, fmt.Sprintf("the directory %s has a scope.key that cannot be trusted and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
 		}
-		return false, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUntrusted(u.scope, err), cleared))
+		return false, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUntrusted(u.scope, err), tree.cleared))
 	}
 	if errors.Is(err, errNoScopeKey) && scopeDirPresent(root, name) {
 		// An earlier rm-scope removed scope.key, then stopped: no open
 		// serves the directory, and there is no key to list.
-		cleared, err := removeScopeTree(root, s.dir, name, s.uid, removed.listed(uid))
+		tree, err := removeScopeTree(root, s.dir, name, s.uid, removed.listed(uid))
 		if err != nil {
-			return false, fmt.Errorf("%w; the directory %s has no scope.key and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, quoteName("keystore/"+userScopesName+"/"+name), u.scope)
+			return false, rmStopped(err, tree.changed, fmt.Sprintf("the directory %s has no scope.key and is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", quoteName("keystore/"+userScopesName+"/"+name), u.scope))
 		}
 		if removed.listed(uid) {
-			warnCleared(u.scope, cleared)
+			warnCleared(u.scope, tree.cleared)
 			return true, nil
 		}
 		// Not listed: an interrupted run that never listed it, or
 		// tampering. The tree is gone, but there was no key to list.
-		return false, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUnlisted(u.scope), cleared))
+		return false, fmt.Errorf("%w: %s", errCommitted, withCleared(scopeRemovedUnlisted(u.scope), tree.cleared))
 	}
 	if err != nil {
 		return false, fmt.Errorf("open the scope %s: %w; nothing was changed: repair what the error names (sudo k3sm doctor lists it), then rerun", u.scope, err)
@@ -186,6 +186,9 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 		// deliveries unchecked for no cause.
 		return false, fmt.Errorf("read the delivery record of %s: %s; nothing was changed; run it again", u.scope, safeText(derr.Error()))
 	}
+	// wrote reports whether this run wrote the removed-scopes record: a
+	// change, so a later failure is a removal made in part.
+	wrote := false
 	if !recorded {
 		fid, size, err := s.floorSize(dfd)
 		if err != nil {
@@ -195,17 +198,18 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 			if err := writeRemovedScopes(dfd, removed); err != nil {
 				return false, fmt.Errorf("record the removed scope %s in %s: %w; the record may or may not list it, and the scope directory is untouched: rerun sudo k3sm keys rm-scope %s --yes", u.scope, removedScopesName, err, u.scope)
 			}
-			recorded = true
+			recorded, wrote = true, true
 		}
 	}
-	cleared, err := removeScopeTree(root, s.dir, name, s.uid, recorded)
+	tree, err := removeScopeTree(root, s.dir, name, s.uid, recorded)
 	if err != nil {
 		state := "is listed as removed in " + removedScopesName + ", so no open serves it"
 		if !recorded {
 			state = "is not listed in " + removedScopesName + ", which is full"
 		}
-		return recorded, fmt.Errorf("%w; the scope %s %s, and its directory %s is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", err, u.scope, state, quoteName("keystore/"+userScopesName+"/"+name), u.scope)
+		return recorded, rmStopped(err, wrote || tree.changed, fmt.Sprintf("the scope %s %s, and its directory %s is partly or wholly present: rerun sudo k3sm keys rm-scope %s --yes to finish removing it", u.scope, state, quoteName("keystore/"+userScopesName+"/"+name), u.scope))
 	}
+	cleared := tree.cleared
 	var notes []string
 	if judged != "" {
 		notes = append(notes, scopeRemovedJudged(u.scope, judged, recorded))
@@ -218,6 +222,19 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (recorded bool,
 	}
 	warnCleared(u.scope, cleared)
 	return recorded, nil
+}
+
+// rmStopped is RemoveScope's error for a removeScopeTree that failed
+// (err), followed by state, which says what remains. When this run changed
+// something first (changed: it wrote the removed-scopes record, or the walk
+// unlinked an entry, took a directory or cleared a flag), the removal was
+// made in part and the error is committed (exit 4, audited committed);
+// otherwise it is a refusal.
+func rmStopped(err error, changed bool, state string) error {
+	if changed {
+		return fmt.Errorf("%w: rm-scope began removing the scope, then stopped: %w; %s", errCommitted, err, state)
+	}
+	return fmt.Errorf("%w; %s", err, state)
 }
 
 // withCleared is the committed note with removeScopeTree's report of a
@@ -385,8 +402,8 @@ var errScopeFlagBudget = fmt.Errorf("the scope directory holds more flagged entr
 // it has cleared or opened to clear their flags, the scope directory's
 // path, which its errors name entries under, the scope, which its warnings
 // name, whether the scope is listed as removed, the device of .user, the
-// baseline every directory of the tree must share, and the directories it
-// left in place as not the scope's.
+// baseline every directory of the tree must share, the directories it left
+// in place as not the scope's, and whether it changed anything (changed).
 type rmWalk struct {
 	svc     uint32
 	opens   int
@@ -395,6 +412,18 @@ type rmWalk struct {
 	listed  bool
 	dev     uint64
 	foreign []error
+	// changed is set once the walk unlinks an entry, takes a directory that
+	// was not already root's at 0700, or clears a flag: a failure after it
+	// is a removal made in part.
+	changed bool
+}
+
+// rmTree is what removeScopeTree did: cleared is its note of a flag it
+// cleared on .user, when it cleared one, and changed reports whether it
+// changed anything in the tree or on .user, failed or not.
+type rmTree struct {
+	cleared string
+	changed bool
 }
 
 // rmOutcome is what removeName did with a name.
@@ -458,24 +487,25 @@ const (
 // once more, only when the service user owns it (it could clear the flag
 // itself), and cleared says so for the result; another owner's flag is
 // left and the removal fails naming .user.
-func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, listed bool) (cleared string, err error) {
+func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, listed bool) (tree rmTree, err error) {
 	kd, err := keystore.Open(".")
 	if err != nil {
-		return "", fmt.Errorf("open the keystore directory: %w", err)
+		return rmTree{}, fmt.Errorf("open the keystore directory: %w", err)
 	}
 	defer func() { _ = kd.Close() }() // read-only
 	ufd, ust, err := openDirAt(int(kd.Fd()), userScopesName)
 	if err != nil {
-		return "", err
+		return rmTree{}, err
 	}
 	defer func() { _ = unix.Close(ufd) }() // fsynced below
 	w := &rmWalk{svc: svc, base: filepath.Join(dir, userScopesName, uid), scope: userScopePrefix + uid, listed: listed}
+	defer func() { tree.changed = w.changed }()
 	dfd, dst, err := openDirAt(ufd, uid)
 	if errors.Is(err, unix.ENOENT) {
-		return "", unix.Fsync(ufd)
+		return rmTree{}, unix.Fsync(ufd)
 	}
 	if err != nil {
-		return "", err
+		return rmTree{}, err
 	}
 	// The service user owns .user/ and can rename any directory in at the
 	// name between the by-path judgement and this open: the held directory
@@ -484,7 +514,7 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, listed bool
 	w.dev = rmDev(&ust)
 	if !w.owned(&dst) || rmDev(&dst) != w.dev {
 		_ = unix.Close(dfd) // read-only, untouched
-		return "", fmt.Errorf("%w: the scope directory %s (named for reading, not for pasting): %s; it is not the scope's, so rm-scope took nothing, changed nothing and removed nothing in it; inspect it", errScopeForeignDir, quoteName(w.base), w.foreignWhy(&dst, ".user"))
+		return rmTree{}, fmt.Errorf("%w: the scope directory %s (named for reading, not for pasting): %s; it is not the scope's, so rm-scope took nothing, changed nothing and removed nothing in it; inspect it", errScopeForeignDir, quoteName(w.base), w.foreignWhy(&dst, ".user"))
 	}
 	err = w.take(dfd, &dst, "")
 	if err == nil {
@@ -492,7 +522,7 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, listed bool
 	}
 	_ = unix.Close(dfd) // fsynced in emptyScopeDir
 	if err != nil {
-		return "", err
+		return rmTree{}, err
 	}
 	err = w.rmdirHeld(ufd, uid, &dst)
 	if errors.Is(err, unix.EPERM) {
@@ -500,20 +530,22 @@ func removeScopeTree(keystore *os.Root, dir, uid string, svc uint32, listed bool
 		// cleared only when its removal of this one needs it, and only
 		// when the service user owns it and could clear them itself.
 		var unlocked bool
-		cleared, unlocked, err = w.unlockShared(ufd, err)
+		tree.cleared, unlocked, err = w.unlockShared(ufd, err)
 		if unlocked {
+			w.changed = true
 			err = w.rmdirHeld(ufd, uid, &dst)
 		}
 	}
 	switch {
 	case err == nil:
-		return cleared, unix.Fsync(ufd)
+		w.changed = true
+		return tree, unix.Fsync(ufd)
 	case errors.Is(err, unix.ENOTEMPTY):
-		return cleared, w.busy("")
+		return tree, w.busy("")
 	case errors.Is(err, errScopeTreeBusy), errors.Is(err, errScopeDirMoved):
-		return cleared, err
+		return tree, err
 	}
-	return cleared, fmt.Errorf("remove the scope directory: %w", err)
+	return tree, fmt.Errorf("remove the scope directory: %w", err)
 }
 
 // errScopeDirMoved is a scope directory rm-scope emptied that was no longer
@@ -595,7 +627,16 @@ func (w *rmWalk) take(fd int, st *unix.Stat_t, rel string) error {
 		}
 		err := rmTakeDir(fd)
 		if err == nil {
+			if !w.taken(st) {
+				w.changed = true
+			}
 			return nil
+		}
+		// A take that failed part-way may have changed the owner or mode
+		// already.
+		var now unix.Stat_t
+		if serr := unix.Fstat(fd, &now); serr != nil || now.Uid != st.Uid || now.Mode != st.Mode {
+			w.changed = true
 		}
 		if !errors.Is(err, unix.EPERM) || attempt == maxTakeAttempts {
 			return fmt.Errorf("take the directory %s (named for reading, not for pasting) from the service user: %w", quoteName(filepath.Join(w.base, rel)), err)
@@ -604,6 +645,12 @@ func (w *rmWalk) take(fd int, st *unix.Stat_t, rel string) error {
 			return err
 		}
 	}
+}
+
+// taken reports whether the directory st describes is already root's at
+// 0700, so a take changes nothing of it.
+func (w *rmWalk) taken(st *unix.Stat_t) bool {
+	return int(st.Uid) == rmRootUID && st.Mode&0o7777 == 0o700
 }
 
 // busy is errScopeTreeBusy for the directory rel below the scope
@@ -747,6 +794,8 @@ func (w *rmWalk) removeName(pfd int, rel, name string, depth int) (rmOutcome, er
 		}
 		if err := unix.Unlinkat(pfd, name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			return 0, w.flagKept(rel, &st, err)
+		} else if err == nil {
+			w.changed = true
 		}
 		return rmGone, nil
 	}
@@ -784,7 +833,10 @@ func (w *rmWalk) removeName(pfd int, rel, name string, depth int) (rmOutcome, er
 	}
 	err = unix.Unlinkat(pfd, name, unix.AT_REMOVEDIR)
 	switch {
-	case err == nil, errors.Is(err, unix.ENOENT):
+	case err == nil:
+		w.changed = true
+		return rmGone, nil
+	case errors.Is(err, unix.ENOENT):
 		return rmGone, nil
 	case errors.Is(err, unix.ENOTEMPTY):
 		return 0, w.busy(rel)
@@ -843,6 +895,7 @@ func (w *rmWalk) clearHeld(fd int, st *unix.Stat_t) error {
 	if err := scopeFchflags(fd, int(fl&^userLockingFlags)); err != nil {
 		return fmt.Errorf("clear the user flags of a scope directory: %w", err)
 	}
+	w.changed = true
 	return nil
 }
 
@@ -897,6 +950,7 @@ func (w *rmWalk) clearScopeFlags(pfd int, name, rel string, st *unix.Stat_t) (le
 	if err := scopeFchflags(fd, int(statFlags(&got)&^userLockingFlags)); err != nil {
 		return false, fmt.Errorf("clear the user flags of the entry %s (named for reading, not for pasting): %w", quoteName(filepath.Join(w.base, rel)), err)
 	}
+	w.changed = true
 	return false, nil
 }
 
@@ -928,6 +982,7 @@ func (w *rmWalk) clearUnopened(pfd int, name, rel string, st *unix.Stat_t) (leav
 	if err != nil {
 		return false, fmt.Errorf("clear the user flags of the entry %s (named for reading, not for pasting): %w", quoteName(filepath.Join(w.base, rel)), err)
 	}
+	w.changed = true
 	var got unix.Stat_t
 	if err := unix.Fstatat(pfd, name, &got, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
 		return true, nil

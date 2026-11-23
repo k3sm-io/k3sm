@@ -69,3 +69,43 @@ func TestKeysRmScopeUnlistedExitsCommitted(t *testing.T) {
 		})
 	}
 }
+
+// An rm-scope that stopped part-way after it changed something (the
+// committed class) exits 4, audited committed, and prints what remains and
+// that a rerun continues; one that stopped before changing anything is a
+// refusal, exit 1, audited refused.
+func TestKeysRmScopePartialExitsFour(t *testing.T) {
+	const remains = "its directory \"keystore/.user/1001\" is partly or wholly present: rerun sudo k3sm keys rm-scope user/1001 --yes to finish removing it"
+	for _, tc := range []struct {
+		name  string
+		err   error
+		code  int
+		audit string
+	}{
+		{"changed, then stopped", fmt.Errorf("%w: rm-scope began removing the scope, then stopped: a directory in the scope tree is not the scope's; %s", keystore.ErrCommitted, remains), keysCommitted, "rm-scope  committed"},
+		{"stopped before any change", fmt.Errorf("a directory in the scope tree is not the scope's; %s", remains), keysRefused, "rm-scope  refused"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newKeysHarness(t)
+			var lines []string
+			h.wrap = func(s keysStore) keysStore {
+				return keysAuditRecorder{keysStore: keysRmScopeStub{keysStore: s, recorded: true, err: tc.err}, lines: &lines}
+			}
+			h.euid = 0
+			h.mustRun(tc.code, "rm-scope", "user/1001", "--yes")
+			out := h.stdout.String() + h.stderr.String()
+			if !strings.Contains(out, remains) {
+				t.Errorf("rm-scope printed %q, want what remains and the rerun", out)
+			}
+			if tc.code == keysCommitted && !strings.Contains(out, "(exit 4)") {
+				t.Errorf("rm-scope printed %q, want it to name exit 4", out)
+			}
+			if strings.Contains(out, "removed user/1001;") {
+				t.Errorf("a stopped rm-scope printed the success line: %q", out)
+			}
+			if !slices.Equal(lines, []string{tc.audit}) {
+				t.Errorf("rm-scope audit lines %q, want %q", lines, tc.audit)
+			}
+		})
+	}
+}

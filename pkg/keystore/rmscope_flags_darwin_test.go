@@ -471,7 +471,8 @@ func TestRemoveScopeSharedDirFlags(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		return removeScopeTree(root, s.dir, "1001", svc, true)
+		tree, err := removeScopeTree(root, s.dir, "1001", svc, true)
+		return tree.cleared, err
 	}
 	t.Run("the service user's", func(t *testing.T) {
 		s, shared, dir, ino := setup(t)
