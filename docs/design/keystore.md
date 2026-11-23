@@ -2789,6 +2789,7 @@ service user can only add to.
   | root's, met on the judged path | removes it | exit 4 ("the directory rm-scope judged was not at its name") |
   | the service user's, on the judged path | the held key must be the judged one, read again after the take | exit 0 only if the judged key is in the record; record full: exit 4 |
   | the service user's, on the no-key or untrusted path | removes it | exit 0 only if a listed key was read; else exit 4 |
+  | any row above that gives exit 0, with a line of `user/<uid>` in the floor after the proving key's listing, or a floor that cannot be judged | as that row | exit 4 (the newest-scope rule) |
   | the service user's with a valid unlisted key, or not what its path found | refuses | exit 1 (exit 4 if this run added a key to the record) |
   | absent at the walk's open | removes nothing | exit 4 "found absent" if this run added a key, else exit 1 |
 
@@ -2798,6 +2799,35 @@ service user can only add to.
   exit 1, with no repair advice and no rerun line; a directory the judge refuses (another
   owner, not a directory) is named for reading, exit 1, with no command and no rerun line,
   since a rerun meets the same state.
+
+  *The newest-scope rule.* The record proves that a key is listed, not that it is the uid's
+  newest scope: a tree-writer that kept a copy of a listed `scope.key`, or parked an
+  interrupted run's root-owned leftover, can put it at the name while the uid's live scope is
+  renamed away, and the judge would find the key listed and report exit 0 while the live scope
+  survives unlisted. Only the real server mints a scope, and every mint writes a floor line of
+  the scope (its delivery record's). So every exit 0, on every path, passes one more gate
+  (`newestScope`): the user-scope floor holds no line of `user/<uid>` written after the
+  listing of the key that proves the run. For a key this run listed, the position is the
+  floor's identity and size read under the store lock at the listing; for a key an earlier run
+  listed, the uid's `floor_size` in the record, in the floor file of the recorded identity
+  (device, inode, birth time), which is the uid's latest listing. A floor of another identity
+  (rebuilt since), or a recorded identity that is not whole (no birth time), makes every line
+  of `user/<uid>` in the current floor count as later. The floor is opened and judged as
+  rebuild reads it (root's descriptor, `O_NOFOLLOW`, a regular file flagged `SF_APPEND` or
+  root's) and streamed once, bounded by its size at the open and one line's buffer; a line
+  that does not parse is no mint's and is skipped. A later line, a floor that cannot be
+  opened, judged or read, or a recorded position past the floor's end is not exit 0: exit 4
+  when the run changed something (it always has by then: the removal succeeded), else exit 1,
+  saying the floor shows activity of this uid after the listed key, so rm-scope cannot confirm
+  that the uid's current scope is the one removed, and that the current scope may have been
+  moved away from its name; it names no path and offers no command. rm-scope holds the floor
+  lock and the exclusive store lock while it reads, so no server write runs: a hostile append
+  to the floor can only add a line, which turns exit 0 into exit 4, never the reverse. A first
+  removal never trips it (nothing can be written after a listing made under the lock it still
+  holds) unless the floor cannot be judged; a rerun trips it when the uid had any floor
+  activity after the listing, or, on a floor rebuilt since, when the rebuild kept a line of the
+  uid (a floor without a whole identity, as on a file system with no birth time, keeps the
+  listed scope's own lines and so always trips it).
 
   *Directory mode.* rm-scope's judge, and only it, reads through the mode of `.user` and of
   the scope directory, which the service user can set (a judge that refused it would let the

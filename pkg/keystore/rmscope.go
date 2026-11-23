@@ -108,8 +108,12 @@ type RemoveScopeResult struct {
 // directory is in the record (has), and a root-owned held directory
 // carried no ACL and its key was listed before this run; a directory that held no key, or an untrusted one, is
 // removed with errCommitted, saying its key could not be confirmed as
-// listed. A directory gone from its name when the walk opens it is never
-// reported removed.
+// listed. Every such exit 0 also passes the newest-scope rule
+// (newestScope): the floor holds no line of the uid written after the
+// listing of the key that proves the run; otherwise the result is
+// committed, saying the uid's current scope may have been moved away. A
+// directory gone from its name when the walk opens it is never reported
+// removed.
 func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeResult, error) {
 	if err := s.checkConfig(); err != nil {
 		return RemoveScopeResult{}, err
@@ -147,6 +151,7 @@ func (s *FileStore) RemoveScope(ctx context.Context, uid uint32) (RemoveScopeRes
 	svc := rmServiceUID(s)
 	u := &UserScope{s: s, uid: uid, scope: userScopeOf(uid), allowRemoved: true}
 	r := &rmRun{s: s, u: u, k: k, removed: removed, dfd: dfd, svc: svc, name: name}
+	r.prior, r.priorOK = removed.entry(uid)
 	if scopeDirTaken(root, name, svc) {
 		// An earlier rm-scope took the directory from the service user, then
 		// stopped: no open serves a root-owned scope directory, and the
@@ -320,6 +325,16 @@ type rmRun struct {
 	// rereadBad is set when scope.key, read again from the held directory
 	// after its take, was no longer the key check read (reread).
 	rereadBad bool
+	// prior is the uid's entry in the record as this run read it, before
+	// any write (priorOK: the record listed the uid); listFloor and
+	// listSize are the floor's identity and size list read under the store
+	// lock when this run listed a key (listedNow). The newest-scope rule
+	// (newestScope) measures from them.
+	prior     removedScope
+	priorOK   bool
+	listFloor floorIdentity
+	listSize  int64
+	listedNow bool
 }
 
 // check is the rerun rule, run on the scope directory held at the name
@@ -442,6 +457,7 @@ func (r *rmRun) list(id string) error {
 		r.stopErr = fmt.Errorf("read the size of the user-scope floor %s: %w; nothing was changed", userFloorLogName, err)
 		return r.stopErr
 	}
+	r.listFloor, r.listSize, r.listedNow = fid, size, true
 	if !r.removed.add(uid, id, fid, size) {
 		r.full = true
 		return nil
@@ -564,6 +580,14 @@ func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScope
 	}
 	switch {
 	case r.proven():
+		// The one exit 0: proven, no note, and the newest-scope rule.
+		if why := r.newestScope(); why != nil {
+			note := strings.Join(append(notes, r.newestNote(why)), "; ")
+			if !(r.wrote || r.aclStripped || tree.changed) {
+				return RemoveScopeResult{Recorded: true}, errors.New(withCleared(note, tree.cleared))
+			}
+			return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: %s", errCommitted, withCleared(note, tree.cleared))
+		}
 		if len(notes) > 0 {
 			return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: %s", errCommitted, withCleared(strings.Join(notes, "; "), tree.cleared))
 		}

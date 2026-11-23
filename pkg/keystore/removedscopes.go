@@ -150,6 +150,17 @@ func (r *removedScopes) has(uid uint32, id string) bool {
 	return false
 }
 
+// entry is a copy of uid's record, and whether the record lists uid.
+func (r *removedScopes) entry(uid uint32) (removedScope, bool) {
+	for _, sc := range r.Scopes {
+		if sc.UID == uid {
+			sc.Keys = slices.Clone(sc.Keys)
+			return sc, true
+		}
+	}
+	return removedScope{}, false
+}
+
 // listed reports whether any scope key of uid is listed.
 func (r *removedScopes) listed(uid uint32) bool {
 	return slices.ContainsFunc(r.Scopes, func(sc removedScope) bool { return sc.UID == uid })
