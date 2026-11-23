@@ -40,7 +40,8 @@ var (
 	// getpwnam, through os/user.
 	uidResolverSeam = user.Lookup
 	// fileAttrSeam writes a file's owner, mode and flags on a held
-	// descriptor for the maintenance verbs (floor --rebuild): fchown,
+	// descriptor for the maintenance verbs (floor --rebuild and audit
+	// --rotate): fchown,
 	// fchmod and fchflags.
 	fileAttrSeam keystore.FileAttrWriter = realFileAttrWriter{}
 )
