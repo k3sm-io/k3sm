@@ -1281,11 +1281,12 @@ generation above `seq` and at or below the mark, the raise never raises into it,
 seals its next sequence at one above `max(seq, highwater)`; the raise to it clears the mark,
 and a Put of a new generation or a burial drops it. The verb counts these as `fenced N`.
 Until the merge runs, the restore is unfinished, and the store enforces that: while
-`keystore-floor.json.pre-restore` is in the data root, Put, Rotate, Delete and Rewrap refuse
+`keystore-floor.json.pre-restore` is in the data root, Put, Rotate and Rewrap refuse
 under `keystore-lock`, before they write anything, with a message naming `keys floor merge`
-(`errMergePending`), and RaiseFloor, which the read verbs call first, raises nothing and logs
-that at Warn, so `list` and `show` still read the restored entries and no pointer put back
-before the merge is recorded. A successful merge renames its input to
+(`errMergePending`); Delete runs and writes only its burials (below); and RaiseFloor, which the
+read verbs call first, raises nothing and logs that at Warn, so no pointer put back before the
+merge is recorded. `list` and `show` run with a warning on stderr and, until the merge, find no
+entry, since the restored tree is staged (below). A successful merge renames its input to
 `keystore-floor.json.merged-<unix>` beside it, through the data root descriptor the lock
 judged (never over an existing file, and only if the name is still the file it read), which
 clears the guard. A rename that fails after the write is reported as committed: the verb prints
