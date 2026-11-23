@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"k3sm.io/k3sm/pkg/keystore"
 )
 
 // keysFloor is `k3sm keys floor --rebuild`, the root maintenance verb that
@@ -43,11 +45,7 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
-	attrs := env.attrs
-	if attrs == nil {
-		attrs = fileAttrSeam
-	}
-	rep, err := s.RebuildFloor(ctx, attrs)
+	rep, err := s.RebuildFloor(ctx, env.attrWriter())
 	if err != nil {
 		return v.failf(keysRefused, "%v", err)
 	}
@@ -59,6 +57,47 @@ func keysFloor(ctx context.Context, args []string, env keysEnv) int {
 		fmt.Fprintf(env.stdout, "dropped %d keys of removed user scopes\n", rep.RemovedKeys)
 	}
 	return keysOK
+}
+
+// keysAuditVerb is `k3sm keys audit --rotate [--discard-oldest]`, the root
+// maintenance verb that moves the audit log aside to keystore-audit.log.1,
+// keeping four archives, and flags a new, empty log append-only.
+func keysAuditVerb(ctx context.Context, args []string, env keysEnv) int {
+	v := newKeysVerb("audit", env)
+	rotate := v.fs.Bool("rotate", false, "rotate the audit log, keeping four archives")
+	discard := v.fs.Bool("discard-oldest", false, "delete the oldest archive, keystore-audit.log.4, to make room")
+	pos, err := v.parse(args)
+	if err != nil {
+		return keysBadUsage
+	}
+	if len(pos) != 0 || !*rotate {
+		return v.failf(keysBadUsage, "usage: sudo k3sm keys audit --rotate [--discard-oldest]")
+	}
+	if code := v.requireRoot(); code != keysOK {
+		return code
+	}
+	s, err := v.store()
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	rep, err := s.RotateAudit(ctx, env.attrWriter(), *discard)
+	if err != nil {
+		return v.failf(keysRefused, "%v", err)
+	}
+	if rep.Discarded {
+		fmt.Fprintln(env.stdout, "discarded the oldest audit archive")
+	}
+	fmt.Fprintf(env.stdout, "rotated the audit log: %d archives kept, keystore-audit.log.1 the newest\n", rep.Archives)
+	return keysOK
+}
+
+// attrWriter is the file-attribute writer the maintenance verbs act
+// through: the env's, or the seam.
+func (env keysEnv) attrWriter() keystore.FileAttrWriter {
+	if env.attrs != nil {
+		return env.attrs
+	}
+	return fileAttrSeam
 }
 
 // keysRmScope is `k3sm keys rm-scope user/<uid> --yes`, the root verb that

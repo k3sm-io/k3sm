@@ -91,6 +91,11 @@ const keysUsage = `Usage:
         remove a user scope and every entry in it; irreversible. It refuses
         while the scope's delivery record names a delivery. Run floor
         --rebuild after it to free the scope's floor keys
+  sudo k3sm keys audit --rotate [--discard-oldest]
+        move the audit log aside to keystore-audit.log.1, shifting the
+        older archives up to .4, and flag a new, empty log append-only. It
+        refuses, changing nothing, while keystore-audit.log.4 exists: copy
+        the archives off the Mac first, then pass --discard-oldest
 
 Names are scope-qualified: system/<name>, where <name> is 1 to 253 bytes of
 dot-separated labels of lowercase letters, digits and '-'. This build
@@ -150,6 +155,8 @@ type keysStore interface {
 	// --rebuild and rm-scope.
 	RebuildFloor(ctx context.Context, attrs keystore.FileAttrWriter) (keystore.RebuildReport, error)
 	RemoveScope(ctx context.Context, uid uint32) error
+	// RotateAudit is the root maintenance verb audit --rotate.
+	RotateAudit(ctx context.Context, attrs keystore.FileAttrWriter, discardOldest bool) (keystore.RotateReport, error)
 }
 
 // keysAudit is what a root verb's audit line is made from (U52): the store
@@ -514,6 +521,8 @@ func runKeysWith(ctx context.Context, args []string, env keysEnv) int {
 		op = "list"
 	case "floor":
 		op = "floor-rebuild"
+	case "audit":
+		op = "audit-rotate"
 	}
 	result := "refused"
 	switch code {
@@ -555,6 +564,8 @@ func runKeysVerb(ctx context.Context, verb string, rest []string, env keysEnv) i
 		return keysFloor(ctx, rest, env)
 	case "rm-scope":
 		return keysRmScope(ctx, rest, env)
+	case "audit":
+		return keysAuditVerb(ctx, rest, env)
 	default:
 		// The argument is not echoed: it may be a value typed in the wrong place.
 		fmt.Fprintln(env.stderr, "k3sm keys: unknown subcommand (not echoed); see k3sm keys --help")
