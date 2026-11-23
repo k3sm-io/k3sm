@@ -2751,20 +2751,37 @@ service user can only add to.
   directories onto the name after rm-scope judged it, so before the scope directory held by
   descriptor is taken, its owner is checked (the service user's, or root's at 0700, on `.user`'s
   device) and its `scope.key` is read inside it by descriptor (`fstatat`, then `O_NOFOLLOW`
-  re-checked as that file, bounded, opened under W). The service user cannot create a
-  root-owned directory and cannot move one into `.user` from another parent, so the only
-  root-owned 0700 directory it can put at the name is another uid's leftover that an earlier
-  rm-scope took, renamed within `.user`; and no open ever serves a taken directory. Finishing
-  the removal of any taken leftover is therefore safe, whatever it holds; only the report's
-  claims need proof. The result says the scope was removed and listed (exit 0) only when the
-  `scope.key` read in the held directory opens as this uid's and its identity is in the record.
-  A directory gone from its name when the walk opens it is never reported removed.
+  re-checked as that file, bounded, opened under W). What the service user can put at the
+  name, measured on macOS (APFS, non-root): it cannot create a root-owned directory; moving a
+  directory it cannot write into another parent fails (`EACCES`), while a rename within the
+  same parent needs no rights on the directory moved, so another uid's leftover that an earlier
+  rm-scope took can be renamed within `.user` onto the name; and a root-owned directory that
+  carries an ACL entry granting it `add_subdirectory`, also one inherited from its parent, CAN
+  be moved by it to another parent. A root verb creates directories inside the service user's
+  `keystore/` (`mkdirAt`) root-owned at 0700 before it hands them over, so an inheritable entry
+  the service user put on `keystore/` would be copied onto one and let it move that root-owned
+  directory to `.user/<uid>` and put a freshly minted key in it. Three rules close that: (a)
+  `mkdirAt` removes any inherited extended ACL from the new directory on its descriptor right
+  after it is opened and checked, before anything else is done with it; (b) a root-owned held
+  directory counts as a taken leftover only when it is at 0700 with no extended ACL, and one
+  with an ACL (which a take stopped between its `fchown` and its ACL removal also leaves) is
+  still finished, its ACL removed on the descriptor first, but never proves the removal; (c) a
+  root-owned held directory proves the removal (exit 0) only when its `scope.key` was listed
+  before this run: an interrupted run lists its key before its walk, so it still finishes with
+  exit 0, while a key first listed now is listed and its directory removed, exit 4, saying
+  rm-scope cannot confirm it was the uid's live scope. No open ever serves a root-owned scope
+  directory, so finishing the removal of any root-owned leftover is safe, whatever it holds;
+  only the report's claims need proof. The result says the scope was removed and listed (exit
+  0) only when the `scope.key` read in the held directory opens as this uid's, its identity is
+  in the record, and the root-owned rules above allow it. A directory gone from its name when
+  the walk opens it is never reported removed.
 
   | Held at the name | `scope.key` in it | What rm-scope does | Result |
   |---|---|---|---|
-  | root's, 0700 | none, or one that does not open as this uid's | removes it; record unchanged | exit 4: removed without listing it (the record lists no key for this uid), or could not confirm its key is listed (the record lists N keys for this uid) |
-  | root's, 0700 | opens as this uid's, listed | rewrites the record for durability, removes it | exit 0, listed |
-  | root's, 0700 | opens as this uid's, not listed | lists it, then removes it | exit 0, listed; exit 4 unlisted when the record is full |
+  | root's, 0700, any ACL | none, or one that does not open as this uid's | removes the ACL, removes it; record unchanged | exit 4: removed without listing it (the record lists no key for this uid), or could not confirm its key is listed (the record lists N keys for this uid); an ACL is also said |
+  | root's, 0700, no ACL | opens as this uid's, listed before this run | rewrites the record for durability, removes it | exit 0, listed |
+  | root's, 0700, an ACL | opens as this uid's, listed before this run | removes the ACL, rewrites the record, removes it | exit 4: a root-owned leftover carrying an ACL, not confirmed as the live scope |
+  | root's, 0700, any ACL | opens as this uid's, not listed before this run | removes any ACL, lists the key, removes it | exit 4: a root-owned leftover holding an unlisted key, not confirmed as the live scope (unlisted when the record is full) |
   | the service user's, on the judged path | must open to the judged identity | lists it or rewrites the record, removes it | exit 0, or exit 4 with notes (an unread delivery record, a key file's link count or mode) |
   | the service user's, on the no-key or untrusted path | none (no-key path), one that does not open as this uid's (untrusted path), or one already listed for the uid | removes it | exit 0 only when a listed key was read in it; otherwise exit 4 as in the first row |
   | the service user's | a valid key not listed, or not what its path judged (a key on the no-key path, none on the untrusted path), or any unlisted one on the taken path | refuses: nothing in it taken, no rerun offered | exit 1, or exit 4 when this run already wrote the record |

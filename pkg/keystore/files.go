@@ -178,8 +178,11 @@ func (s *FileStore) mkdirOwned(path string) error {
 // directory, and the identity check refuses only a swap between the Lstat and
 // the open. A directory that fails any check may be another entry or one the
 // service user prepared, so it is refused as ErrCorrupt and nothing is chowned
-// or chmodded. An existing name is an error matching fs.ErrExist. Once handed
-// over, parent is fsynced, so the new name is durable.
+// or chmodded. Once checked, any extended ACL it inherited from parent is
+// removed on the descriptor (removeExtendedACL; a no-op where the build reads
+// no ACL), before the handover. An existing name is an error matching
+// fs.ErrExist. Once handed over, parent is fsynced, so the new name is
+// durable.
 func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	if err := parent.Mkdir(name, dirMode); err != nil {
 		return nil, err
@@ -205,6 +208,13 @@ func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	defer func() { _ = f.Close() }() // read-only; nothing to flush
 	if err := s.checkNewDir(f, made, opened); err != nil {
 		return nil, fmt.Errorf("%w: the new directory %s %w", ErrCorrupt, name, err)
+	}
+	// An inheritable ACL entry on parent is copied onto the new directory,
+	// and while root owns it one granting add_subdirectory lets its grantee
+	// move it to another parent: it is removed on the descriptor before
+	// anything else is done with the directory.
+	if err := removeExtendedACL(int(f.Fd())); err != nil {
+		return nil, fmt.Errorf("the new directory %s: %w", name, err)
 	}
 	if err := s.own(f, dirMode); err != nil {
 		return nil, err

@@ -203,10 +203,11 @@ func asTakenRerun(t *testing.T, s *FileStore, dir string) {
 }
 
 // A root-owned 0700 directory at the name is always finished, whatever
-// scope.key it holds: the service user can place none there but another
-// uid's taken leftover, which no open serves. A key that opens as this
-// scope's is listed first, so the removal is listed (exit 0); one that is
-// absent or cannot be trusted is removed, committed (exit 4). A stop
+// scope.key it holds, since no open serves it. A key the record listed
+// before the run proves the removal (exit 0); one that opens as this
+// scope's and was not listed is listed first, but proves nothing of the
+// uid's live scope, and one that is absent or cannot be trusted proves
+// nothing either: both are removed, committed (exit 4). A stop
 // between the take and the first unlink leaves a directory the rerun
 // finishes.
 func TestRemoveScopeRerunFinishesAnyTakenLeftover(t *testing.T) {
@@ -231,7 +232,7 @@ func TestRemoveScopeRerunFinishesAnyTakenLeftover(t *testing.T) {
 				t.Fatalf("run 1, stopped at the take after listing: %v, want committed", err)
 			}
 		}, true},
-		{"valid unlisted key", func(*testing.T, *FileStore, string) {}, true},
+		{"valid unlisted key", func(*testing.T, *FileStore, string) {}, false},
 		{"untrusted key", func(t *testing.T, _ *FileStore, dir string) {
 			if err := os.WriteFile(filepath.Join(dir, scopeKeyName), []byte("not a key record"), fileMode); err != nil {
 				t.Fatal(err)

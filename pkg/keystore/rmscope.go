@@ -80,13 +80,17 @@ type RemoveScopeResult struct {
 //
 // The directory held at the name is checked before anything in it is
 // taken (rmRun.check, the rerun rule). The service user cannot create a
-// root-owned directory, and cannot move one into .user from another
-// parent: the only root-owned 0700 directory it can put at .user/<uid> is
-// another uid's leftover that an earlier rm-scope took, renamed within
-// .user, and no open ever serves a taken directory. So a root-owned 0700
-// directory held at the name (the owner and device rule already passed) is
-// always removed, whatever scope.key it holds, and a stop anywhere after a
-// take leaves a directory a rerun accepts. A service user's directory is
+// root-owned directory, nor move one it cannot write into .user from
+// another parent, but it can rename another uid's taken leftover within
+// .user onto the name, and move into place a root-owned directory that
+// carries an ACL entry granting it add_subdirectory (measured on macOS),
+// such as one a root verb made under an inheritable entry (mkdirAt now
+// removes it). No open ever serves a root-owned scope directory, so a
+// root-owned 0700 directory held at the name (the owner and device rule
+// already passed) is always removed, whatever scope.key it holds, its ACL
+// removed first, and a stop anywhere after a take leaves a directory a
+// rerun accepts; it proves the removal only without an ACL and with a key
+// listed before this run (proven). A service user's directory is
 // removed only on what was judged: on the judged path its scope.key must
 // open to the judged identity; on the paths without one it must hold what
 // the path found (no scope.key, or one that cannot be trusted), or a key
@@ -95,8 +99,9 @@ type RemoveScopeResult struct {
 // list it yet, and the record is made durable again when it already did.
 //
 // The result says the scope is removed and listed (a nil error, Recorded)
-// only when the identity of the scope.key read in the held directory is in
-// the record (has); a directory that held no key, or an untrusted one, is
+// only when proven: the identity of the scope.key read in the held
+// directory is in the record (has), and a root-owned held directory
+// carried no ACL and its key was listed before this run; a directory that held no key, or an untrusted one, is
 // removed with errCommitted, saying its key could not be confirmed as
 // listed. A directory gone from its name when the walk opens it is never
 // reported removed.
@@ -258,14 +263,23 @@ type rmRun struct {
 	renewed   bool
 	full      bool
 	stopErr   error
+	// rootHeld is set when the held directory is root's (a taken leftover
+	// by the owner rule), aclStripped when it carried an extended ACL that
+	// check removed, and listedBefore when its scope.key opened as this
+	// scope's and the record listed it before this run.
+	rootHeld     bool
+	aclStripped  bool
+	listedBefore bool
 }
 
 // check is the rerun rule, run on the scope directory held at the name
 // before anything in it is taken. A directory root owns (at 0700 on .user's
 // device: removeScopeTree's owner rule passed, and st.Uid is not the
-// service user's) is always accepted: the service user can place no
-// root-owned directory at the name but another uid's taken leftover, and a
-// taken directory is never served, so finishing its removal is safe. A
+// service user's) is always accepted, its extended ACL removed first: no
+// open serves a root-owned scope directory, so finishing its removal is
+// safe, but the service user may have moved it there (another uid's taken
+// leftover renamed within .user, or one an ACL entry let it move from
+// another parent), so it proves the removal only as proven allows. A
 // service user's directory is accepted on the judged path only while its
 // scope.key opens to the judged identity; on the other paths when its
 // scope.key is already listed for the uid, or when it holds what the path
@@ -276,6 +290,24 @@ type rmRun struct {
 // Once accepted, a scope.key that opens as this scope's is listed, or the
 // record made durable again (list), before anything is taken.
 func (r *rmRun) check(dfd int, st *unix.Stat_t) (string, error) {
+	if st.Uid != r.svc {
+		// Root's at 0700 by the owner rule: a taken leftover only while it
+		// carries no extended ACL. One with an ACL (a take stopped between
+		// its fchown and its ACL removal, or a directory a root verb made
+		// under an inheritable entry before mkdirAt removed them) is still
+		// finished, its ACL removed first, but never proves the removal.
+		r.rootHeld = true
+		acl, err := hasExtendedACL(dfd)
+		if err != nil {
+			return "", fmt.Errorf("read the ACL of the root-owned directory at the scope's name: %w", err)
+		}
+		if acl {
+			if err := removeExtendedACL(dfd); err != nil {
+				return "", fmt.Errorf("remove the ACL of the root-owned directory at the scope's name: %w", err)
+			}
+			r.aclStripped = true
+		}
+	}
 	hk, err := r.u.scopeKeyAt(dfd, r.k)
 	if err != nil {
 		return "", err
@@ -289,6 +321,9 @@ func (r *rmRun) check(dfd int, st *unix.Stat_t) (string, error) {
 	if hk.id == "" {
 		return "", nil
 	}
+	// Listed before this run: in the record, and not the judged key this
+	// run wrote into it.
+	r.listedBefore = r.removed.has(r.u.uid, hk.id) && !(r.wrote && hk.id == r.judged)
 	return "", r.list(hk.id)
 }
 
@@ -370,9 +405,40 @@ func (r *rmRun) list(id string) error {
 
 // proven reports whether the scope.key read in the held directory opened
 // as this scope's and its identity is in the record: the only ground for
-// saying the removal is listed.
+// saying the removal is listed. A root-owned held directory proves it only
+// when it carried no extended ACL and its key was listed before this run
+// (an interrupted run lists its key before its walk): a root-owned
+// directory holding a key this run first listed may have been moved to
+// the name from another parent (an inherited ACL entry allows it), with
+// the uid's live scope renamed elsewhere, unlisted and unchecked.
 func (r *rmRun) proven() bool {
-	return r.heldRead && r.held.id != "" && r.removed.has(r.u.uid, r.held.id)
+	if !r.heldRead || r.held.id == "" || !r.removed.has(r.u.uid, r.held.id) {
+		return false
+	}
+	if r.rootHeld && (r.aclStripped || !r.listedBefore) {
+		return false
+	}
+	return true
+}
+
+// rootUnproven is finish's committed note for a root-owned leftover it
+// removed that did not prove the removal (proven): it carried an extended
+// ACL, or held a scope.key that opens as this uid's and was not listed
+// before this run.
+func (r *rmRun) rootUnproven() string {
+	at := quoteName("keystore/" + userScopesName + "/" + r.name)
+	var why []string
+	if r.aclStripped {
+		why = append(why, "it carried an extended ACL, which can let the service user move a root-owned directory to the name from another parent")
+	}
+	if r.held.id != "" && !r.listedBefore {
+		key := "rm-scope listed that key in " + removedScopesName + " now"
+		if !r.removed.has(r.u.uid, r.held.id) {
+			key = removedScopesName + " is full, so that key is not listed"
+		}
+		why = append(why, "it held a scope.key that opens as this uid's and was not listed before this run ("+key+")")
+	}
+	return "removed a root-owned leftover at the name " + at + " (named for reading, not for pasting): " + strings.Join(why, ", and ") + "; no open serves a root-owned directory, but rm-scope cannot confirm it was the live scope of " + r.u.scope + ": if that scope was moved elsewhere, it is not listed and its delivery record was not checked"
 }
 
 // finish removes the tree under check and reports it: state says what
@@ -387,7 +453,7 @@ func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScope
 		if errors.Is(err, errNotJudgedScope) && r.wrote {
 			err = fmt.Errorf("%w; %s now lists the key of %s that rm-scope judged, so no open serves that key", err, removedScopesName, scope)
 		}
-		return RemoveScopeResult{Recorded: r.proven()}, rmStopped(err, r.wrote || tree.changed, state, scope, tree.cleared)
+		return RemoveScopeResult{Recorded: r.proven()}, rmStopped(err, r.wrote || r.aclStripped || tree.changed, state, scope, tree.cleared)
 	}
 	if tree.absent {
 		switch {
@@ -404,6 +470,15 @@ func (r *rmRun) finish(root *os.Root, state string, notes []string) (RemoveScope
 			return RemoveScopeResult{Recorded: true}, fmt.Errorf("%w: %s", errCommitted, withCleared(strings.Join(notes, "; "), tree.cleared))
 		}
 		return RemoveScopeResult{Recorded: true, Cleared: tree.cleared}, nil
+	case r.rootHeld && (r.held.id != "" || r.aclStripped):
+		note := r.rootUnproven()
+		if r.held.id == "" {
+			note += "; " + scopeRemovedUnconfirmed(scope, r.held, r.untrusted, r.removed.count(uid))
+		}
+		if len(notes) > 0 {
+			note = strings.Join(append(notes, note), "; ")
+		}
+		return RemoveScopeResult{}, fmt.Errorf("%w: %s", errCommitted, withCleared(note, tree.cleared))
 	case r.full && r.held.id != "":
 		// The key opened as this scope's, and the record is full.
 		if len(notes) > 0 {
