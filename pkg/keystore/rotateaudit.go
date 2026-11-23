@@ -316,7 +316,7 @@ func cloneArchive(old *oldLog, nad int, name string) error {
 		return fmt.Errorf("the cloned %s is not a regular file with one link", name)
 	}
 	if statFlags(&st) != 0 {
-		if err := unix.Fchflags(rfd, 0); err != nil {
+		if err := clearFdFlags(rfd); err != nil {
 			return fmt.Errorf("clear the flags of the cloned %s: %w", name, err)
 		}
 	}

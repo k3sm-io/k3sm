@@ -631,8 +631,8 @@ func (s *FileStore) judgeStaged(fd int, rel string, st *unix.Stat_t, k stagedKin
 		return errStagedShape(rel, "has %d links", st.Nlink)
 	case st.Mode&(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) != 0:
 		return errStagedShape(rel, "has the setuid, setgid or sticky bit (mode %#o)", st.Mode&0o7777)
-	case st.Flags != 0:
-		return errStagedShape(rel, "has file flags %#x", st.Flags)
+	case statFlags(st) != 0:
+		return errStagedShape(rel, "has file flags %#x", statFlags(st))
 	case k == stagedFile && st.Size > maxSize:
 		return errStagedShape(rel, "is %d bytes, over the %d its name allows", st.Size, maxSize)
 	case st.Uid != s.uid && st.Uid != unknownUID:
