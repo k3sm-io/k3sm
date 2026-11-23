@@ -17,6 +17,7 @@ limitations under the License.
 package keystore
 
 import (
+	"maps"
 	"slices"
 	"testing"
 )
@@ -64,5 +65,45 @@ func TestPlanMergeKeepTwiceWritesNothing(t *testing.T) {
 				t.Errorf("the second merge = %+v (floor changes %v), dropped %v; want the floor the first wrote, nothing more", again.r, again.r.floorChanges(), again.dropped)
 			}
 		})
+	}
+}
+
+// TestFuzzRmReportsCapEviction (U192): the reverse-merge oracle's rm since
+// the restore, at the per-name cap, drops the name's oldest burial, a
+// guard-era one before the merge, and fuzzRm returns it, as Delete reports
+// it evicted; the merge and the reverse merge drop nothing, and the reverse
+// merge keeps every burial the rm left and the rm's own.
+func TestFuzzRmReportsCapEviction(t *testing.T) {
+	setSeam(t, &buriedPerNameLimit, smallBuriedPerName)
+	live := floor{"b": {Generation: mgen(3), Seq: 4, Buried: []burial{
+		{Generation: mgen(1), Deleted: guardEraSeq + 1},
+		{Generation: mgen(2), Deleted: guardEraSeq + 2},
+		{Generation: mgen(7), Deleted: guardEraSeq + 3},
+		{Generation: mgen(0), Deleted: guardEraSeq + 4},
+	}}}
+	from := floor{}
+	p := planMerge(live, from, nil, nil, nil)
+	if len(p.dropped) != 0 || len(p.merged["b"].burials()) != smallBuriedPerName {
+		t.Fatalf("the merge = %+v, dropped %v; want every guard-era burial kept", p.merged, p.dropped)
+	}
+	m := maps.Clone(p.merged)
+	name, gen, lost := fuzzRm(m)
+	if name != "b" || gen != mgen(3) {
+		t.Fatalf("fuzzRm buried %s %s, want b %s", name, gen, mgen(3))
+	}
+	if want := (floorBurial{"b", mgen(1)}); len(lost) != 1 || !lost[want] {
+		t.Fatalf("fuzzRm lost %v, want only %v, the oldest burial at the per-name cap", lost, want)
+	}
+	rev := planMerge(from, m, nil, nil, nil)
+	if len(rev.dropped) != 0 {
+		t.Fatalf("the reverse merge dropped %v, want nothing", rev.dropped)
+	}
+	for _, b := range m["b"].burials() {
+		if !rev.merged["b"].buries(b.Generation) {
+			t.Errorf("the reverse merge lost b's burial of %s", b.Generation)
+		}
+	}
+	if !rev.merged["b"].buries(gen) {
+		t.Errorf("the reverse merge lost the rm's burial of b %s", gen)
 	}
 }

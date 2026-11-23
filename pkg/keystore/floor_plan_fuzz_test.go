@@ -93,7 +93,7 @@ func fuzzFloor(b []byte, guard bool) floor {
 // burial; no raise passes the restored record's sequence plus one; merging
 // the result again changes nothing in the floor and keeps the same names; and a reverse merge (the undo) of the
 // result into the moved-aside floor, after an rm since the restore, keeps
-// every guard-era deletion and that one.
+// every guard-era deletion and that one, each the rm's write did not evict.
 func FuzzPlanMerge(f *testing.F) {
 	f.Add([]byte{0, 1, 1, 8, 2, 1, 9, 3, 1}, []byte{8, 1, 0, 1, 4, 2}, []byte{2, 0}, uint8(0), uint16(4096), false)
 	f.Add([]byte{0, 1, 1, 1, 2, 1, 2, 3, 200, 8, 4, 1, 10, 5, 1}, []byte{8, 1, 0, 9, 2, 0, 3, 6, 1, 4, 7, 2}, []byte{1, 2, 3}, uint8(1), uint16(120), true)
@@ -167,32 +167,44 @@ func FuzzPlanMerge(f *testing.F) {
 		// The undo: an rm since the restore, then the merged floor merged
 		// back into the moved-aside one.
 		m := maps.Clone(p.merged)
-		rmd := ""
-		for _, name := range planNames {
-			if m[name].live() {
-				rmd = name
-				break
-			}
-		}
-		var rmGen string
-		if rmd != "" {
-			rmGen = m[rmd].Generation
-			m.bury(rmd, nil)
-			if len(m.prune()) > 0 {
-				return
-			}
-		}
+		rmd, rmGen, lost := fuzzRm(m)
 		rev := planMerge(from, m, nil, nil, nil)
 		if len(rev.dropped) > 0 {
 			return
 		}
+		// A burial the rm's own write dropped is gone before the reverse
+		// merge, a drop Delete reports (ErrTombstoneEvicted), not the merge's.
 		for b := range guarded {
-			if !rev.merged[b.name].buries(b.generation) {
+			if !lost[b] && !rev.merged[b.name].buries(b.generation) {
 				t.Fatalf("the reverse merge lost the guard-era deletion of %s %s", b.name, b.generation)
 			}
 		}
-		if rmd != "" && !rev.merged[rmd].buries(rmGen) {
+		if rmd != "" && !lost[floorBurial{rmd, rmGen}] && !rev.merged[rmd].buries(rmGen) {
 			t.Fatalf("the reverse merge lost the deletion of %s %s made since the restore", rmd, rmGen)
 		}
 	})
+}
+
+// fuzzRm is the oracle's rm since the restore: it buries the first name m
+// holds live, as Delete does with no guard pending, and returns that name,
+// the generation buried and each burial the write dropped, at the per-name
+// cap or in the prune, which Delete reports as evicted. With no live name it
+// changes nothing and returns "".
+func fuzzRm(m floor) (name, gen string, lost map[floorBurial]bool) {
+	lost = map[floorBurial]bool{}
+	for _, n := range planNames {
+		if m[n].live() {
+			name = n
+			break
+		}
+	}
+	if name == "" {
+		return "", "", lost
+	}
+	gen = m[name].Generation
+	_, capped := m.bury(name, nil)
+	for _, p := range append(capped, m.prune()...) {
+		lost[floorBurial{p.name, p.generation}] = true
+	}
+	return name, gen, lost
 }
