@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -40,8 +41,8 @@ import (
 // runs only as root, through hack/acceptance/keystore.sh --root, with the
 // real file-attribute writer and SF_APPEND set for real; non-root it skips,
 // and the root-run row fails on a SKIP. Every failure names the step, the
-// operation, the errno and the verb's stderr, so a root run's log alone
-// says what went wrong.
+// operation, the route, the errno got and wanted, and the verb's exit code
+// and full stderr, so a root run's log alone says what went wrong.
 
 // keysSFAppend is SF_APPEND, the system append-only file flag.
 const keysSFAppend = 0x00040000
@@ -53,25 +54,50 @@ const (
 	keysLogsDir    = keystore.LogsDirName
 )
 
+// keysAttack is what the service user writes through a descriptor it
+// should not be able to write through; it must never reach a live log.
+const keysAttack = "HELD-DESCRIPTOR-WRITE\n"
+
+// keysFloorGarbage is a line of the old floor that does not parse: the
+// rebuild drops it and exits 4, listing it.
+const keysFloorGarbage = "not a floor line\n"
+
 // keysMaintVerb is one maintenance verb: its arguments, the log it swaps
-// and its staging names in keystore-staging/.
+// and the exit code its uncrashed run gives on the fixture (the fixture's
+// floor holds a line that does not parse, so the rebuild exits 4).
 type keysMaintVerb struct {
-	name    string
-	args    []string
-	log     string
-	staging []string
+	name string
+	args []string
+	log  string
+	code int
 }
 
+// dir is the log's directory in keystore-logs/.
+func (v keysMaintVerb) dir() string { return keystore.LogDirOf(v.log) }
+
+// rel is the canonical log's path from the data root.
+func (v keysMaintVerb) rel() string { return filepath.Join(keysLogsDir, v.dir(), v.log) }
+
 var keysMaintVerbs = []keysMaintVerb{
-	{"floor-rebuild", []string{"floor", "--rebuild"}, keystore.UserFloorLogName, []string{keystore.UserFloorLogName + ".new"}},
-	{"audit-rotate", []string{"audit", "--rotate"}, keystore.AuditLogName, []string{keystore.AuditLogName + ".new", keystore.AuditLogName + ".1.new"}},
+	{"floor-rebuild", []string{"floor", "--rebuild"}, keystore.UserFloorLogName, keysCommitted},
+	{"audit-rotate", []string{"audit", "--rotate"}, keystore.AuditLogName, keysOK},
+}
+
+// other is the other maintenance verb.
+func (v keysMaintVerb) other() keysMaintVerb {
+	if v.log == keystore.UserFloorLogName {
+		return keysMaintVerbs[1]
+	}
+	return keysMaintVerbs[0]
 }
 
 // keysRootMaint is a root-run maintenance fixture: a harness whose store
-// has an entry, its data root root's 0755 as deployed, keystore-logs/
-// root's 0755 holding both logs, the service user's 0600 and flagged, and
-// root's descriptors on the data root and on a directory the service user
-// owns, on the same volume, into which its probes try to link.
+// has an entry, its data root root's 0755 as deployed, keystore-logs/ and
+// its floor/ and audit/ root's 0755, each holding its log, the service
+// user's 0600 and flagged (the floor holding one line that does not
+// parse, the audit log one line), and root's descriptors on the data root
+// and on a directory the service user owns, on the same volume, into which
+// its probes try to link.
 type keysRootMaint struct {
 	t      *testing.T
 	h      *keysHarness
@@ -81,9 +107,6 @@ type keysRootMaint struct {
 	svcUID uint32
 	svcGID uint32
 	links  int
-	// preGate is the service user's descriptor on keystore-logs/, opened
-	// while the gate was open, before any verb ran.
-	preGate int
 }
 
 func keysMaintRoot(t *testing.T, row string) *keysRootMaint {
@@ -102,15 +125,17 @@ func keysMaintRoot(t *testing.T, row string) *keysRootMaint {
 	if err := os.Chmod(m.root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(filepath.Join(m.root, keysLogsDir), 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-		t.Fatal(err)
+	for _, d := range []string{keysLogsDir, filepath.Join(keysLogsDir, keystore.FloorDirName), filepath.Join(keysLogsDir, keystore.AuditDirName)} {
+		p := filepath.Join(m.root, d)
+		if err := os.Mkdir(p, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.Chmod(filepath.Join(m.root, keysLogsDir), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, n := range []string{keystore.UserFloorLogName, keystore.AuditLogName} {
-		m.placeLog(n, "", true, true)
-	}
+	m.placeLog(keystore.UserFloorLogName, keysFloorGarbage, true, true)
+	m.placeLog(keystore.AuditLogName, "", true, true)
 	// An audit line, so the audit log holds bytes the swap must keep.
 	h.mustRun(keysOK, "list")
 	if err := os.Mkdir(own, 0o700); err != nil {
@@ -128,17 +153,18 @@ func keysMaintRoot(t *testing.T, row string) *keysRootMaint {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.own.Close() })
-	m.preGate = m.preGateDir()
 	h.attrs = realFileAttrWriter{}
 	return m
 }
 
-// logPath is name's path in keystore-logs/.
-func (m *keysRootMaint) logPath(name string) string { return filepath.Join(m.root, keysLogsDir, name) }
+// logPath is the log name's canonical path.
+func (m *keysRootMaint) logPath(name string) string {
+	return filepath.Join(m.root, keysLogsDir, keystore.LogDirOf(name), name)
+}
 
-// placeLog creates name in keystore-logs/ holding data, mode 0600, the
-// service user's when service and root's otherwise (owner first), flagged
-// when flag (flag last).
+// placeLog creates the log name in its directory holding data, mode 0600,
+// the service user's when service and root's otherwise (owner first),
+// flagged when flag (flag last).
 func (m *keysRootMaint) placeLog(name, data string, service, flag bool) {
 	m.t.Helper()
 	p := m.logPath(name)
@@ -163,9 +189,8 @@ func (m *keysRootMaint) placeLog(name, data string, service, flag bool) {
 }
 
 // keysUnflagAll clears the flags of every file under root, so the tree
-// can be removed, and opens a closed gate.
+// can be removed.
 func keysUnflagAll(root string) {
-	_ = os.Chmod(filepath.Join(root, keysLogsDir), 0o755)
 	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err == nil && d.Type()&fs.ModeSymlink == 0 {
 			_ = unix.Chflags(p, 0)
@@ -186,28 +211,25 @@ type keysFileState struct {
 	data, symlink string
 }
 
-// snapshot is the state of every name in the data root and in
-// keystore-logs/ (as keystore-logs/<name>) but the marker, keystore-lock
-// and directories.
+// snapshot is the state of every name under keystore-logs/, never
+// following a symlink, and of the marker and keystore-staging/ in the data
+// root, keyed by the path from the data root.
 func (m *keysRootMaint) snapshot() map[string]keysFileState {
 	m.t.Helper()
 	out := map[string]keysFileState{}
-	for _, dir := range []string{"", keysLogsDir} {
-		names, err := os.ReadDir(filepath.Join(m.root, dir))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			m.t.Fatal(err)
-		}
-		for _, d := range names {
-			n := filepath.Join(dir, d.Name())
-			if d.IsDir() || n == keysMarkerName || n == "keystore-lock" {
-				continue
-			}
+	for _, n := range []string{keysMarkerName, keysStagingDir} {
+		if _, err := os.Lstat(filepath.Join(m.root, n)); err == nil {
 			out[n] = keysState(m.t, filepath.Join(m.root, n))
 		}
 	}
+	_ = filepath.WalkDir(filepath.Join(m.root, keysLogsDir), func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(m.root, p)
+		out[rel] = keysState(m.t, p)
+		return nil
+	})
 	return out
 }
 
@@ -252,92 +274,383 @@ func (m *keysRootMaint) asService(probe func() error) error {
 	return <-errc
 }
 
-// preGateDir is the service user's descriptor on keystore-logs/, opened
-// while the gate is open (before the verb runs), which it keeps across
-// the gate's close.
-func (m *keysRootMaint) preGateDir() int {
+// keysHeld is what a process running as the service user holds from
+// before the verb: an O_APPEND descriptor on the old log, a descriptor on
+// the log's live directory, and one on keystore-logs/.
+type keysHeld struct {
+	log, dir, logs int
+}
+
+// hold opens v's held descriptors as the service user.
+func (m *keysRootMaint) hold(v keysMaintVerb) keysHeld {
 	m.t.Helper()
-	fd := -1
+	h := keysHeld{log: -1, dir: -1, logs: -1}
 	err := m.asService(func() error {
 		var err error
-		fd, err = unix.Openat(int(m.dfd.Fd()), keysLogsDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		return err
+		dirFlags := unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+		if h.logs, err = unix.Openat(int(m.dfd.Fd()), keysLogsDir, dirFlags, 0); err != nil {
+			return fmt.Errorf("open %s: %w", keysLogsDir, err)
+		}
+		if h.dir, err = unix.Openat(h.logs, v.dir(), dirFlags, 0); err != nil {
+			return fmt.Errorf("open %s/%s: %w", keysLogsDir, v.dir(), err)
+		}
+		if h.log, err = unix.Openat(h.dir, v.log, unix.O_WRONLY|unix.O_APPEND|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0); err != nil {
+			return fmt.Errorf("open %s O_APPEND: %w", v.rel(), err)
+		}
+		return nil
 	})
 	if err != nil {
-		m.t.Fatalf("the service user cannot open %s while the gate is open: %v", keysLogsDir, err)
+		m.t.Fatalf("the service user cannot take its descriptors before the verb: %v", err)
 	}
-	m.t.Cleanup(func() { _ = unix.Close(fd) })
-	return fd
-}
-
-// keysTarget is a name a probe attacks: dir is keystore-logs/ or
-// keystore-staging/.
-type keysTarget struct{ dir, name string }
-
-func (k keysTarget) String() string { return k.dir + "/" + k.name }
-
-// targets is what the service user attacks during v: the canonical log,
-// which before the retire is the old log and after the rename the new one,
-// and v's staging names.
-func keysTargets(v keysMaintVerb) []keysTarget {
-	out := []keysTarget{{keysLogsDir, v.log}}
-	for _, s := range v.staging {
-		out = append(out, keysTarget{keysStagingDir, s})
-	}
-	return out
-}
-
-// want is the errno the service user's attempt on k must fail with, as
-// root sees the tree now, and the state it read: EACCES when a directory
-// on the way is closed to it (keystore-staging/ always, keystore-logs/
-// while the gate is closed), ENOENT when the name is absent, EPERM when
-// the file is flagged. An unflagged file the service user can reach is
-// itself a defect: want returns 0 and says so.
-func (m *keysRootMaint) want(k keysTarget) (unix.Errno, string) {
-	var dst unix.Stat_t
-	if err := unix.Fstatat(int(m.dfd.Fd()), k.dir, &dst, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return unix.ENOENT, k.dir + " absent"
+	m.t.Cleanup(func() {
+		for _, fd := range []int{h.log, h.dir, h.logs} {
+			if fd >= 0 {
+				_ = unix.Close(fd)
+			}
 		}
-		return 0, fmt.Sprintf("stat %s: %v", k.dir, err)
+	})
+	return h
+}
+
+// keysStepAttrs is the real file-attribute writer and the step seam: it
+// records each attribute call and each step, and runs before before each
+// step; an error from it fails the step, as a crash there would leave it.
+type keysStepAttrs struct {
+	t      *testing.T
+	before func(step string) error
+	events []keysAttrEvent
+}
+
+// keysAttrEvent is one attribute call, with the file's state just before
+// it, or one step (call "step <name>").
+type keysAttrEvent struct {
+	call  string
+	arg   int
+	ino   uint64
+	uid   uint32
+	flags uint32
+}
+
+func (p *keysStepAttrs) do(call string, fd, arg int, f func() error) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		p.t.Errorf("fstat before %s: %v", call, err)
+		return err
 	}
-	if dst.Mode&0o001 == 0 {
-		return unix.EACCES, fmt.Sprintf("%s mode %04o uid %d", k.dir, dst.Mode&0o7777, dst.Uid)
+	p.events = append(p.events, keysAttrEvent{call: call, arg: arg, ino: st.Ino, uid: st.Uid, flags: st.Flags})
+	return f()
+}
+
+func (p *keysStepAttrs) Fchown(fd, uid, gid int) error {
+	return p.do("fchown", fd, uid, func() error { return unix.Fchown(fd, uid, gid) })
+}
+
+func (p *keysStepAttrs) Fchmod(fd int, mode uint32) error {
+	return p.do("fchmod", fd, int(mode), func() error { return unix.Fchmod(fd, mode) })
+}
+
+func (p *keysStepAttrs) Fchflags(fd, flags int) error {
+	return p.do("fchflags", fd, flags, func() error { return unix.Fchflags(fd, flags) })
+}
+
+func (p *keysStepAttrs) BeforeSwapStep(step string) error {
+	p.events = append(p.events, keysAttrEvent{call: "step " + step})
+	if p.before != nil {
+		return p.before(step)
+	}
+	return nil
+}
+
+// index is the position of the event call (on inode ino, when ino is not
+// 0) in the events, or -1.
+func (p *keysStepAttrs) index(call string, ino uint64) int {
+	return slices.IndexFunc(p.events, func(e keysAttrEvent) bool {
+		return e.call == call && (ino == 0 || e.ino == ino)
+	})
+}
+
+// keysSwapRun is one probed run of a verb.
+type keysSwapRun struct {
+	m     *keysRootMaint
+	v     keysMaintVerb
+	held  keysHeld
+	attrs *keysStepAttrs
+	// oldIno and oldData are the canonical log before the verb.
+	oldIno  uint64
+	oldData string
+	// newIno is the new log's inode once the marker names it, wrote its
+	// content as root read it in staging at the swap step, and appended
+	// what the service user appended to it legitimately.
+	newIno   uint64
+	wrote    string
+	haveNew  bool
+	appended []string
+	// appendNew makes the service user append through O_APPEND to the new
+	// canonical log at every hook after the swap.
+	appendNew bool
+	steps     []string
+	crashed   string
+	failures  []string
+	code      int
+	stdout    string
+	stderr    string
+}
+
+func (r *keysSwapRun) failf(format string, args ...any) {
+	r.failures = append(r.failures, fmt.Sprintf(format, args...))
+}
+
+// report fails the test with every failure the run's probes found, each
+// with the verb's exit code and full stderr.
+func (r *keysSwapRun) report(t *testing.T, what string) {
+	t.Helper()
+	for _, f := range r.failures {
+		t.Errorf("%s: %s\nverb exit %d, stderr:\n%s", what, f, r.code, r.stderr)
+	}
+}
+
+// runProbed runs v with the held descriptors and the probes before every
+// step in keystore.SwapSteps and after the verb. crashAt, when not empty,
+// makes that step fail, as a crash there would.
+func (m *keysRootMaint) runProbed(v keysMaintVerb, crashAt string, appendNew bool) *keysSwapRun {
+	m.t.Helper()
+	st := keysState(m.t, m.logPath(v.log))
+	r := &keysSwapRun{m: m, v: v, held: m.hold(v), oldIno: st.ino, oldData: st.data, appendNew: appendNew}
+	r.attrs = &keysStepAttrs{t: m.t}
+	r.attrs.before = func(step string) error {
+		r.steps = append(r.steps, step)
+		r.probe(step)
+		if step == crashAt {
+			r.crashed = step
+			return errors.New("crashed here (the test's hook)")
+		}
+		return nil
+	}
+	m.h.attrs = r.attrs
+	r.code = m.h.run(v.args...)
+	r.stdout, r.stderr = m.h.stdout.String(), m.h.stderr.String()
+	m.h.attrs = realFileAttrWriter{}
+	r.probe("after the verb")
+	if crashAt != "" && r.crashed == "" {
+		r.failf("the step %s was never reached; steps reached: %v", crashAt, r.steps)
+	}
+	return r
+}
+
+// probe is one hook's work: the canonical log judged; at the swap step the
+// staged log read; the service user's attacks, by path and through each
+// held descriptor, each checked against the errno the tree's state wants;
+// the legitimate append, when asked; and the canonical log judged again.
+func (r *keysSwapRun) probe(step string) {
+	at := "step " + step
+	if step == "after the verb" {
+		at = step
+	}
+	r.checkCanonical(at + ", before the attempts")
+	if step == "swap" {
+		r.readStaged(at)
+	}
+	r.byPath(at)
+	r.throughHeld(at)
+	if r.appendNew && step != "after the verb" && r.haveNew && r.liveIno() == r.newIno {
+		line := fmt.Sprintf("appended through O_APPEND at %s\n", at)
+		err := r.m.asService(func() error {
+			fd, err := unix.Openat(int(r.m.dfd.Fd()), r.v.rel(), unix.O_WRONLY|unix.O_APPEND|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = unix.Close(fd) }()
+			_, err = unix.Write(fd, []byte(line))
+			return err
+		})
+		if err != nil {
+			r.failf("%s: open(O_WRONLY|O_APPEND) and write of %s by path: %v, want success", at, r.v.rel(), err)
+		} else {
+			r.appended = append(r.appended, line)
+		}
+	}
+	r.checkCanonical(at + ", after the attempts")
+}
+
+// liveIno is the canonical log's inode now, or 0.
+func (r *keysSwapRun) liveIno() uint64 {
+	var st unix.Stat_t
+	if unix.Lstat(r.m.logPath(r.v.log), &st) != nil {
+		return 0
+	}
+	return st.Ino
+}
+
+// readStaged reads, as root, the new log the verb staged: what it wrote.
+func (r *keysSwapRun) readStaged(at string) {
+	p := filepath.Join(r.m.root, keysStagingDir, r.v.dir()+".new", r.v.log)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		r.failf("%s: read the staged %s as root: %v", at, p, err)
+		return
 	}
 	var st unix.Stat_t
-	err := unix.Fstatat(int(m.dfd.Fd()), k.String(), &st, unix.AT_SYMLINK_NOFOLLOW)
-	if errors.Is(err, unix.ENOENT) {
-		return unix.ENOENT, fmt.Sprintf("%s mode %04o, %s absent", k.dir, dst.Mode&0o7777, k.name)
+	if err := unix.Lstat(p, &st); err != nil {
+		r.failf("%s: stat the staged %s: %v", at, p, err)
+		return
 	}
+	r.newIno, r.wrote, r.haveNew = st.Ino, string(b), true
+	if st.Flags != keysSFAppend || st.Uid != r.m.svcUID || st.Mode&0o7777 != 0o600 || st.Nlink != 1 {
+		r.failf("%s: the staged %s is uid %d mode %04o flags %#x nlink %d before it is reachable; want the service user's 0600, SF_APPEND alone, one link", at, r.v.log, st.Uid, st.Mode&0o7777, st.Flags, st.Nlink)
+	}
+	if r.v.log == keystore.AuditLogName && r.wrote != "" {
+		r.failf("%s: the staged audit log holds %q; want it empty", at, r.wrote)
+	}
+}
+
+// checkCanonical judges the canonical log by path: a regular file, flags
+// exactly SF_APPEND, the service user's, 0600, one link, and either the
+// old log with its whole old content or the new one with what the verb
+// wrote and the legitimate appends.
+func (r *keysSwapRun) checkCanonical(at string) {
+	p := r.m.logPath(r.v.log)
+	var st unix.Stat_t
+	if err := unix.Lstat(p, &st); err != nil {
+		r.failf("%s: lstat the canonical %s: %v", at, r.v.rel(), err)
+		return
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Flags != keysSFAppend || st.Uid != r.m.svcUID || st.Mode&0o7777 != 0o600 || st.Nlink != 1 {
+		r.failf("%s: the canonical %s is type %#o uid %d mode %04o flags %#x nlink %d; want a regular file, the service user's 0600, SF_APPEND alone, one link", at, r.v.rel(), st.Mode&unix.S_IFMT, st.Uid, st.Mode&0o7777, st.Flags, st.Nlink)
+	}
+	b, err := os.ReadFile(p)
 	if err != nil {
-		return 0, fmt.Sprintf("stat %s: %v", k, err)
+		r.failf("%s: read the canonical %s: %v", at, r.v.rel(), err)
+		return
 	}
-	state := fmt.Sprintf("%s mode %04o; %s uid %d mode %04o flags %#x nlink %d", k.dir, dst.Mode&0o7777, k.name, st.Uid, st.Mode&0o7777, st.Flags, st.Nlink)
-	if st.Flags&keysSFAppend != 0 {
-		return unix.EPERM, state
+	got := string(b)
+	// After the verb, the audit log holds the verb's own audit line too,
+	// in whichever log is live.
+	if strings.HasPrefix(at, "after the verb") && r.v.log == keystore.AuditLogName {
+		if i := strings.LastIndex(strings.TrimSuffix(got, "\n"), "\n"); strings.HasSuffix(got, "\n") {
+			got = got[:i+1]
+		}
 	}
-	return 0, state + ": an unflagged log the service user can reach"
+	if strings.Contains(got, keysAttack) {
+		r.failf("%s: the canonical %s holds the held descriptors' write %q: %q", at, r.v.rel(), keysAttack, got)
+	}
+	switch {
+	case st.Ino == r.oldIno:
+		if got != r.oldData {
+			r.failf("%s: the canonical %s is the old log holding %q; want its whole old content %q", at, r.v.rel(), got, r.oldData)
+		}
+	case r.haveNew && st.Ino == r.newIno:
+		want := r.wrote + strings.Join(r.appended, "")
+		if got != want {
+			r.failf("%s: the canonical %s is the new log holding %q; want what the verb wrote %q and the service user's appends %q", at, r.v.rel(), got, r.wrote, r.appended)
+		}
+	default:
+		r.failf("%s: the canonical %s is inode %d, neither the old log (%d) nor the staged new log (%d, seen %v)", at, r.v.rel(), st.Ino, r.oldIno, r.newIno, r.haveNew)
+	}
 }
 
-// keysOps are the service user's attempts: from a directory descriptor
-// and a path under it, each returns nil when it succeeded.
-var keysOps = []struct {
-	name string
-	do   func(m *keysRootMaint, dirfd int, path string) error
-}{
-	{"open(O_WRONLY)", func(_ *keysRootMaint, dirfd int, path string) error {
-		return keysOpenClose(dirfd, path, unix.O_WRONLY)
-	}},
-	{"open(O_WRONLY|O_TRUNC)", func(_ *keysRootMaint, dirfd int, path string) error {
-		return keysOpenClose(dirfd, path, unix.O_WRONLY|unix.O_TRUNC)
-	}},
-	{"link()", func(m *keysRootMaint, dirfd int, path string) error {
-		m.links++
-		return unix.Linkat(dirfd, path, int(m.own.Fd()), fmt.Sprintf("alias-%d", m.links), 0)
-	}},
+// byPath is the service user's attempts on the canonical log by path:
+// open(O_WRONLY), open(O_WRONLY|O_TRUNC), and link() into its own
+// directory. Each must fail EPERM: the log is flagged at every step.
+func (r *keysSwapRun) byPath(at string) {
+	ops := []struct {
+		name string
+		do   func() error
+	}{
+		{"open(O_WRONLY)", func() error { return keysOpenWrite(int(r.m.dfd.Fd()), r.v.rel(), unix.O_WRONLY) }},
+		{"open(O_WRONLY|O_TRUNC)", func() error {
+			return keysOpenWrite(int(r.m.dfd.Fd()), r.v.rel(), unix.O_WRONLY|unix.O_TRUNC)
+		}},
+		{"link()", func() error {
+			r.m.links++
+			return unix.Linkat(int(r.m.dfd.Fd()), r.v.rel(), int(r.m.own.Fd()), fmt.Sprintf("alias-%d", r.m.links), 0)
+		}},
+	}
+	for _, op := range ops {
+		err := r.m.asService(op.do)
+		r.expect(at, op.name, "by path through the data root on "+r.v.rel(), err, unix.EPERM)
+	}
 }
 
-func keysOpenClose(dirfd int, path string, flag int) error {
+// throughHeld is the service user's attempts through the descriptors it
+// held from before the verb: on the old log, F_SETFL clearing O_APPEND,
+// then pwrite at offset 0 and ftruncate to 0 (each EPERM while it is
+// flagged); on the live directory and on
+// keystore-logs/, openat of the log for write. The errno each wants is
+// what root reads of the file now: EPERM while it is flagged, success
+// once the retired log is unflagged (it is no longer reachable by path
+// then), ENOENT once its name is gone.
+func (r *keysSwapRun) throughHeld(at string) {
+	var fst unix.Stat_t
+	if err := unix.Fstat(r.held.log, &fst); err != nil {
+		r.failf("%s: fstat the held log descriptor: %v", at, err)
+		return
+	}
+	flagged := fst.Flags&keysSFAppend != 0
+	route := fmt.Sprintf("through the O_APPEND descriptor held on the old log (inode %d, flags %#x, nlink %d)", fst.Ino, fst.Flags, fst.Nlink)
+	// While the file is flagged every write route is EPERM, the F_SETFL
+	// clearing O_APPEND among them (TestAppendOnlyFlagHoldsAsRoot); once
+	// the retired log is unflagged each succeeds (TestSappndDirectorySwap).
+	want := unix.Errno(0)
+	if flagged {
+		want = unix.EPERM
+	}
+	err := r.m.asService(func() error {
+		fl, err := unix.FcntlInt(uintptr(r.held.log), unix.F_GETFL, 0)
+		if err != nil {
+			return err
+		}
+		_, err = unix.FcntlInt(uintptr(r.held.log), unix.F_SETFL, fl&^unix.O_APPEND)
+		return err
+	})
+	r.expect(at, "fcntl(F_SETFL) clearing O_APPEND", route, err, want)
+	err = r.m.asService(func() error {
+		_, err := unix.Pwrite(r.held.log, []byte(keysAttack), 0)
+		return err
+	})
+	r.expect(at, "pwrite at offset 0", route, err, want)
+	err = r.m.asService(func() error { return unix.Ftruncate(r.held.log, 0) })
+	r.expect(at, "ftruncate to 0", route, err, want)
+
+	for _, d := range []struct {
+		name  string
+		fd    int
+		path  string
+		route string
+	}{
+		{"live directory", r.held.dir, r.v.log, "openat through the descriptor held on the log's live directory " + r.v.dir() + "/"},
+		{keysLogsDir, r.held.logs, filepath.Join(r.v.dir(), r.v.log), "openat through the descriptor held on " + keysLogsDir + "/"},
+	} {
+		want, state := keysWantOpenWrite(d.fd, d.path)
+		err := r.m.asService(func() error {
+			fd, err := unix.Openat(d.fd, d.path, unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = unix.Close(fd) }()
+			_, err = unix.Pwrite(fd, []byte(keysAttack), 0)
+			return err
+		})
+		r.expect(at, "openat(O_WRONLY) and pwrite of "+d.path, d.route+" ("+state+")", err, want)
+	}
+}
+
+// expect records a failure unless err is the errno want (0: success).
+func (r *keysSwapRun) expect(at, op, route string, err error, want unix.Errno) {
+	var got unix.Errno
+	switch {
+	case err == nil && want == 0:
+		return
+	case err == nil:
+		r.failf("%s: the service user's %s %s SUCCEEDED; want errno %d (%v)", at, op, route, int(want), want)
+	case !errors.As(err, &got):
+		r.failf("%s: the service user's %s %s: %v, not an errno; want errno %d (%v)", at, op, route, err, int(want), want)
+	case got != want:
+		r.failf("%s: the service user's %s %s: errno %d (%v), want %d (%v)", at, op, route, int(got), got, int(want), want)
+	}
+}
+
+// keysOpenWrite opens path under dirfd with flag and closes it.
+func keysOpenWrite(dirfd int, path string, flag int) error {
 	fd, err := unix.Openat(dirfd, path, flag|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err == nil {
 		_ = unix.Close(fd)
@@ -345,290 +658,80 @@ func keysOpenClose(dirfd int, path string, flag int) error {
 	return err
 }
 
-// keysProbe is one probing run: the service user's descriptors, the
-// failures it found, and the bytes it holds every log to.
-type keysProbe struct {
-	m       *keysRootMaint
-	v       keysMaintVerb
-	preGate int
-	// old is root's read-only descriptor on the old log, opened before the
-	// verb, so its bytes are checked after it is unlinked too.
-	old      *os.File
-	oldBytes string
-	failures []string
-}
-
-func (m *keysRootMaint) newProbe(v keysMaintVerb) *keysProbe {
-	m.t.Helper()
-	// After a crash past the old log's unlink there is no old log: a nil
-	// old reads as empty.
-	old, err := os.Open(m.logPath(v.log))
+// keysWantOpenWrite is the errno the service user's openat(O_WRONLY) of
+// path under dirfd wants, as root reads it through the same descriptor:
+// ENOENT when the name is gone, EPERM when the file is flagged, success
+// when it is the service user's and unflagged (the retired log after its
+// flag is cleared), EACCES otherwise.
+func keysWantOpenWrite(dirfd int, path string) (unix.Errno, string) {
+	var st unix.Stat_t
+	err := unix.Fstatat(dirfd, path, &st, unix.AT_SYMLINK_NOFOLLOW)
+	var e unix.Errno
+	if errors.As(err, &e) {
+		return e, fmt.Sprintf("root's fstatat: %v", e)
+	}
+	state := fmt.Sprintf("inode %d uid %d mode %04o flags %#x nlink %d", st.Ino, st.Uid, st.Mode&0o7777, st.Flags, st.Nlink)
 	switch {
-	case errors.Is(err, os.ErrNotExist):
-		old = nil
-	case err != nil:
-		m.t.Fatal(err)
-	default:
-		m.t.Cleanup(func() { _ = old.Close() })
+	case st.Flags&keysSFAppend != 0:
+		return unix.EPERM, state
+	case st.Uid != 0:
+		return 0, state
 	}
-	p := &keysProbe{m: m, v: v, preGate: m.preGate, old: old}
-	p.oldBytes = p.readOld()
-	return p
+	return unix.EACCES, state
 }
 
-func (p *keysProbe) readOld() string {
-	if p.old == nil {
-		return ""
-	}
-	b, err := io.ReadAll(io.NewSectionReader(p.old, 0, 1<<40))
+// keysDirEmpty reports whether the directory open at fd lists nothing (a
+// removed directory lists nothing too), reading a duplicate from its
+// start.
+func keysDirEmpty(fd int) (bool, []string) {
+	dup, err := unix.Dup(fd)
 	if err != nil {
-		p.failf("read the old log on root's descriptor: %v", err)
+		return false, []string{err.Error()}
 	}
-	return string(b)
+	f := os.NewFile(uintptr(dup), "dir")
+	defer func() { _ = f.Close() }()
+	if _, err := unix.Seek(dup, 0, io.SeekStart); err != nil {
+		return false, []string{err.Error()}
+	}
+	names, err := f.Readdirnames(-1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, []string{err.Error()}
+	}
+	return len(names) == 0, names
 }
 
-func (p *keysProbe) failf(format string, args ...any) {
-	p.failures = append(p.failures, fmt.Sprintf(format, args...))
-}
-
-// targetBytes is the bytes of each target present, read as root.
-func (p *keysProbe) targetBytes() map[keysTarget]string {
-	out := map[keysTarget]string{}
-	for _, k := range keysTargets(p.v) {
-		if b, err := os.ReadFile(filepath.Join(p.m.root, k.String())); err == nil {
-			out[k] = string(b)
-		}
+// checkDone checks the state a finished swap of v leaves: the canonical
+// log judged (the service user's 0600, SF_APPEND alone, one link, a new
+// inode), no marker and no staging directory, and the retired directory,
+// through the service user's held descriptor on it, empty.
+func (r *keysSwapRun) checkDone(what string) {
+	r.m.t.Helper()
+	fail := func(format string, args ...any) {
+		r.m.t.Errorf("%s: %s\nverb exit %d, stdout:\n%s\nstderr:\n%s", what, fmt.Sprintf(format, args...), r.code, r.stdout, r.stderr)
 	}
-	return out
-}
-
-// probeAll runs every attempt on every target, through the data root and,
-// for keystore-logs/, through the descriptor kept from before the gate
-// closed, and records each that succeeded or failed with another errno,
-// and any byte any of them changed.
-func (p *keysProbe) probeAll(at string) {
-	before := p.targetBytes()
-	oldBefore := p.readOld()
-	for _, k := range keysTargets(p.v) {
-		type route struct {
-			name  string
-			dirfd int
-			path  string
-		}
-		routes := []route{{"through the data root", int(p.m.dfd.Fd()), k.String()}}
-		if k.dir == keysLogsDir {
-			routes = append(routes, route{"through the descriptor on keystore-logs/ opened before the gate closed", p.preGate, k.name})
-		}
-		for _, r := range routes {
-			for _, op := range keysOps {
-				want, state := p.m.want(k)
-				err := p.m.asService(func() error { return op.do(p.m, r.dirfd, r.path) })
-				var got unix.Errno
-				switch {
-				case err == nil:
-					p.failf("%s: the service user's %s of %s %s SUCCEEDED; want %v (state: %s)", at, op.name, k, r.name, want, state)
-					continue
-				case !errors.As(err, &got):
-					p.failf("%s: the service user's %s of %s %s: %v, not an errno (state: %s)", at, op.name, k, r.name, err, state)
-					continue
-				}
-				if want == 0 || got != want {
-					p.failf("%s: the service user's %s of %s %s: errno %d (%v), want %d (%v) (state: %s)", at, op.name, k, r.name, int(got), got, int(want), want, state)
-				}
-			}
-		}
+	r.m.checkLive(r.v, what, r.code, r.stderr)
+	if ino := r.liveIno(); ino == r.oldIno {
+		fail("the canonical %s is still the old inode %d", r.v.rel(), ino)
 	}
-	after := p.targetBytes()
-	for k, b := range before {
-		if a, ok := after[k]; ok && a != b {
-			p.failf("%s: the service user's attempts changed %s: %q, was %q", at, k, a, b)
-		}
-	}
-	if o := p.readOld(); o != oldBefore {
-		p.failf("%s: the service user's attempts changed the old log: %q, was %q", at, o, oldBefore)
+	if ok, names := keysDirEmpty(r.held.dir); !ok {
+		fail("the retired %s/ (the service user's held descriptor on it) lists %v; want it empty", r.v.dir(), names)
 	}
 }
 
-// keysProbeAttrs is the real file-attribute writer and step seam with a
-// hook run before each attribute call and each step, given a label naming
-// it; a hook error fails the call, as a crash at that step would leave it.
-type keysProbeAttrs struct {
-	t      *testing.T
-	before func(label string, e keysAttrEvent) error
-	events []keysAttrEvent
-}
-
-// keysAttrEvent is one hook point: the call or step and, for a call, the
-// file's state just before it.
-type keysAttrEvent struct {
-	label string
-	call  string
-	arg   int
-	ino   uint64
-	uid   uint32
-	mode  uint16
-	flags uint32
-	dir   bool
-}
-
-func (p *keysProbeAttrs) do(call string, fd, arg int, f func() error) error {
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		p.t.Errorf("fstat before %s: %v", call, err)
-		return err
-	}
-	e := keysAttrEvent{call: call, arg: arg, ino: st.Ino, uid: st.Uid, mode: st.Mode & 0o7777, flags: st.Flags, dir: st.Mode&unix.S_IFMT == unix.S_IFDIR}
-	what := "a file"
-	if e.dir {
-		what = "a directory"
-	}
-	e.label = fmt.Sprintf("before %s(%#o) on %s (inode %d, uid %d, mode %04o, flags %#x)", call, arg, what, e.ino, e.uid, e.mode, e.flags)
-	p.events = append(p.events, e)
-	if p.before != nil {
-		if err := p.before(e.label, e); err != nil {
-			return err
-		}
-	}
-	return f()
-}
-
-func (p *keysProbeAttrs) Fchown(fd, uid, gid int) error {
-	return p.do("fchown", fd, uid, func() error { return unix.Fchown(fd, uid, gid) })
-}
-
-func (p *keysProbeAttrs) Fchmod(fd int, mode uint32) error {
-	return p.do("fchmod", fd, int(mode), func() error { return unix.Fchmod(fd, mode) })
-}
-
-func (p *keysProbeAttrs) Fchflags(fd, flags int) error {
-	return p.do("fchflags", fd, flags, func() error { return unix.Fchflags(fd, flags) })
-}
-
-func (p *keysProbeAttrs) BeforeSwapStep(step string) error {
-	e := keysAttrEvent{label: "before the step " + step, call: "step " + step}
-	p.events = append(p.events, e)
-	if p.before != nil {
-		return p.before(e.label, e)
-	}
-	return nil
-}
-
-// eventsOf is the attribute calls on inode ino, in order.
-func (p *keysProbeAttrs) eventsOf(ino uint64) []keysAttrEvent {
-	var out []keysAttrEvent
-	for _, e := range p.events {
-		if e.ino == ino && !strings.HasPrefix(e.call, "step ") {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-// gateOpen reports whether keystore-logs/ is at 0755 now.
-func (m *keysRootMaint) gateOpen() bool {
-	var st unix.Stat_t
-	return unix.Stat(filepath.Join(m.root, keysLogsDir), &st) == nil && st.Mode&0o7777 == 0o755
-}
-
-// isGateClose reports whether e is keystore-logs/'s fchmod to 0700.
-func (m *keysRootMaint) isGateClose(e keysAttrEvent) bool {
-	if e.call != "fchmod" || e.arg != 0o700 || !e.dir {
-		return false
-	}
-	var st unix.Stat_t
-	return unix.Stat(filepath.Join(m.root, keysLogsDir), &st) == nil && st.Ino == e.ino
-}
-
-// keysTail is what the service user appends through O_APPEND before the
-// gate closes: legitimate, and kept (rotate's archive ends with it; a
-// floor's tail keeps only lines that parse, so rebuild drops it).
-const keysTail = "appended before the gate closed\n"
-
-// keysSwapRun is one probed run of a verb.
-type keysSwapRun struct {
-	probe    *keysProbe
-	attrs    *keysProbeAttrs
-	code     int
-	stderr   string
-	appended bool
-	crashed  string
-	labels   []string
-}
-
-// runProbed runs v with probes before every hook point. crashAt >= 0 makes
-// the crashAt-th hook point fail instead, as a crash there would. The
-// service user appends keysTail through O_APPEND just before the gate
-// closes, the first time.
-func (m *keysRootMaint) runProbed(v keysMaintVerb, crashAt int) *keysSwapRun {
-	m.t.Helper()
-	r := &keysSwapRun{probe: m.newProbe(v)}
-	r.probe.probeAll("before the verb")
-	r.attrs = &keysProbeAttrs{t: m.t}
-	r.attrs.before = func(label string, e keysAttrEvent) error {
-		n := len(r.labels)
-		r.labels = append(r.labels, label)
-		if !r.appended && m.isGateClose(e) && m.gateOpen() {
-			r.appended = true
-			err := m.asService(func() error {
-				fd, err := unix.Openat(r.probe.preGate, v.log, unix.O_WRONLY|unix.O_APPEND|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-				if err != nil {
-					return err
-				}
-				defer func() { _ = unix.Close(fd) }()
-				_, err = unix.Write(fd, []byte(keysTail))
-				return err
-			})
-			if err != nil {
-				r.probe.failf("%s: the service user's legitimate O_APPEND write to %s: %v", label, v.log, err)
-			}
-			r.probe.oldBytes = r.probe.readOld()
-		}
-		r.probe.probeAll(fmt.Sprintf("hook %d (%s)", n, label))
-		if n == crashAt {
-			r.crashed = label
-			return errors.New("crashed here (the test's hook)")
-		}
-		return nil
-	}
-	m.h.attrs = r.attrs
-	r.code = m.h.run(v.args...)
-	r.stderr = m.h.stderr.String()
-	r.probe.probeAll("after the verb")
-	m.h.attrs = realFileAttrWriter{}
-	return r
-}
-
-// report fails the test with every failure the run's probes found, each
-// with the verb's exit code and full stderr.
-func (r *keysSwapRun) report(t *testing.T, what string) {
-	t.Helper()
-	for _, f := range r.probe.failures {
-		t.Errorf("%s: %s\nverb exit %d, stderr:\n%s", what, f, r.code, r.stderr)
-	}
-}
-
-// checkSwapped checks the state a finished swap of v leaves: the canonical
-// log the service user's 0600, flagged, one link, passing the flag check;
-// the gate open; no marker and no staging directory.
-func (m *keysRootMaint) checkSwapped(v keysMaintVerb, what, stderr string) {
+// checkLive checks that v's canonical log is judged and that no marker and
+// no staging directory are left.
+func (m *keysRootMaint) checkLive(v keysMaintVerb, what string, code int, stderr string) {
 	m.t.Helper()
 	fail := func(format string, args ...any) {
-		m.t.Errorf("%s: %s\nverb stderr:\n%s", what, fmt.Sprintf(format, args...), stderr)
+		m.t.Errorf("%s: %s\nverb exit %d, stderr:\n%s", what, fmt.Sprintf(format, args...), code, stderr)
 	}
 	var st unix.Stat_t
 	if err := unix.Lstat(m.logPath(v.log), &st); err != nil {
-		fail("stat the canonical %s: %v", v.log, err)
+		fail("stat the canonical %s: %v", v.rel(), err)
 		return
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || st.Uid != m.svcUID || st.Mode&0o7777 != 0o600 || st.Flags != keysSFAppend {
-		fail("the canonical %s is uid %d mode %04o flags %#x nlink %d; want the service user's 0600, SF_APPEND alone, one link", v.log, st.Uid, st.Mode&0o7777, st.Flags, st.Nlink)
-	}
-	if err := keystore.New(m.h.storeCfg).CheckLogFlags(context.Background()); err != nil {
-		fail("the flag check refuses: %v", err)
-	}
-	var dst unix.Stat_t
-	if err := unix.Stat(filepath.Join(m.root, keysLogsDir), &dst); err != nil || dst.Mode&0o7777 != 0o755 {
-		fail("%s mode %04o (%v); want the gate open, 0755", keysLogsDir, dst.Mode&0o7777, err)
+		fail("the canonical %s is uid %d mode %04o flags %#x nlink %d; want the service user's 0600, SF_APPEND alone, one link", v.rel(), st.Uid, st.Mode&0o7777, st.Flags, st.Nlink)
 	}
 	for _, n := range []string{keysMarkerName, keysStagingDir} {
 		if _, err := os.Lstat(filepath.Join(m.root, n)); !errors.Is(err, os.ErrNotExist) {
@@ -637,16 +740,16 @@ func (m *keysRootMaint) checkSwapped(v keysMaintVerb, what, stderr string) {
 	}
 }
 
-// checkArchives checks rotate's archives: .1 (and, when sole, no .2), root's 0600,
-// unflagged, one link, a fresh inode (not the old log's), holding the old
-// log's bytes and, when tail, keysTail once at its end.
-func (m *keysRootMaint) checkArchives(oldIno uint64, oldBytes string, tail, sole bool, what, stderr string) {
+// checkArchives checks rotate's .1: root's 0600, unflagged, one link, a
+// fresh inode, starting with old (the audit log's bytes before the run)
+// and, when sole, no .2.
+func (m *keysRootMaint) checkArchives(oldIno uint64, old string, sole bool, what, stderr string) {
 	m.t.Helper()
 	fail := func(format string, args ...any) {
 		m.t.Errorf("%s: %s\nverb stderr:\n%s", what, fmt.Sprintf(format, args...), stderr)
 	}
+	p := filepath.Join(filepath.Dir(m.logPath(keystore.AuditLogName)), keystore.AuditLogName+".1")
 	var st unix.Stat_t
-	p := m.logPath(keystore.AuditLogName + ".1")
 	if err := unix.Lstat(p, &st); err != nil {
 		fail("stat .1: %v", err)
 		return
@@ -655,236 +758,48 @@ func (m *keysRootMaint) checkArchives(oldIno uint64, oldBytes string, tail, sole
 		fail(".1 is uid %d mode %04o flags %#x nlink %d inode %d (the old log's %d); want a fresh root 0600 unflagged copy with one link", st.Uid, st.Mode&0o7777, st.Flags, st.Nlink, st.Ino, oldIno)
 	}
 	b, _ := os.ReadFile(p)
-	if !strings.HasPrefix(string(b), oldBytes) {
-		fail(".1 holds %q; want it to start with the old log's %q", b, oldBytes)
+	if !strings.HasPrefix(string(b), old) || strings.Contains(string(b), keysAttack) {
+		fail(".1 holds %q; want it to start with the old log's %q, and no held-descriptor write", b, old)
 	}
-	if tail && (!strings.HasSuffix(string(b), keysTail) || strings.Count(string(b), keysTail) != 1 || len(b) != len(oldBytes)+len(keysTail)) {
-		fail(".1 holds %q; want the old log's %q and then %q once", b, oldBytes, keysTail)
-	}
-	if _, err := os.Lstat(m.logPath(keystore.AuditLogName + ".2")); sole && !errors.Is(err, os.ErrNotExist) {
-		fail("rotate made a second archive .2: %v", err)
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(p), keystore.AuditLogName+".2")); sole && !errors.Is(err, os.ErrNotExist) {
+		fail("a second archive .2 exists: %v", err)
 	}
 }
 
-// TestMaintenanceRefusesPlantedSymlinkAndSwap is U68, root-run: floor
-// --rebuild and audit --rotate each refuse a symlink planted at the
-// marker, at keystore-staging/ or at the old log, a FIFO at the old log,
-// and (rotate) a symlink at an archive, before anything changes: no log
-// byte, owner or flag changes (the audit log gains only the verb's own
-// refused line), the planted name and what it points at stand, and no
-// marker or staging directory of the verb's is left. The old log swapped
-// for another file while the verb holds it is refused under the closed
-// gate, with no byte of either file changed, the marker kept and the gate
-// closed, so the listener stays down until the rerun, which finishes.
-func TestMaintenanceRefusesPlantedSymlinkAndSwap(t *testing.T) {
-	if !keysAsRoot() {
-		t.Skip("root-run (U68): run as root through hack/acceptance/keystore.sh --root")
-	}
-	type plant struct {
-		name       string
-		at         func(m *keysRootMaint, v keysMaintVerb, decoy string) string
-		rotateOnly bool
-	}
-	symlinkAt := func(name func(v keysMaintVerb) string) func(*keysRootMaint, keysMaintVerb, string) string {
-		return func(m *keysRootMaint, v keysMaintVerb, decoy string) string {
-			n := name(v)
-			if n == filepath.Join(keysLogsDir, v.log) {
-				m.moveAside(v.log)
-			}
-			if err := os.Symlink(decoy, filepath.Join(m.root, n)); err != nil {
-				m.t.Fatal(err)
-			}
-			return n
-		}
-	}
-	plants := []plant{
-		{name: "marker symlink", at: symlinkAt(func(keysMaintVerb) string { return keysMarkerName })},
-		{name: "staging directory symlink", at: symlinkAt(func(keysMaintVerb) string { return keysStagingDir })},
-		{name: "old log symlink", at: symlinkAt(func(v keysMaintVerb) string { return filepath.Join(keysLogsDir, v.log) })},
-		{name: "old log FIFO", at: func(m *keysRootMaint, v keysMaintVerb, _ string) string {
-			m.moveAside(v.log)
-			if err := unix.Mkfifo(m.logPath(v.log), 0o600); err != nil {
-				m.t.Fatal(err)
-			}
-			return filepath.Join(keysLogsDir, v.log)
-		}},
-		{name: "archive symlink", rotateOnly: true, at: symlinkAt(func(keysMaintVerb) string {
-			return filepath.Join(keysLogsDir, keystore.AuditLogName+".1")
-		})},
-	}
-	for _, v := range keysMaintVerbs {
-		for _, pl := range plants {
-			if pl.rotateOnly && v.log != keystore.AuditLogName {
-				continue
-			}
-			t.Run(v.name+"/"+pl.name, func(t *testing.T) {
-				m := keysMaintRoot(t, "U68")
-				decoy := filepath.Join(t.TempDir(), "decoy")
-				if err := os.WriteFile(decoy, []byte("decoy\n"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				decoyBefore := keysState(t, decoy)
-				planted := pl.at(m, v, decoy)
-				plantedBefore := keysState(t, filepath.Join(m.root, planted))
-				before := m.snapshot()
-				code := m.h.run(v.args...)
-				stderr := m.h.stderr.String()
-				if code != keysRefused {
-					t.Fatalf("%s: exit %d, want %d (refused)\nstderr:\n%s", pl.name, code, keysRefused, stderr)
-				}
-				after := m.snapshot()
-				m.allowRefusedAuditLine(before, after)
-				for n, b := range before {
-					if a, ok := after[n]; !ok || a != b {
-						t.Errorf("%s: %s changed: %+v, was %+v\nstderr:\n%s", pl.name, n, after[n], b, stderr)
-					}
-				}
-				for n := range after {
-					if _, ok := before[n]; !ok {
-						t.Errorf("%s: the refused verb left %s\nstderr:\n%s", pl.name, n, stderr)
-					}
-				}
-				if got := keysState(t, decoy); got != decoyBefore {
-					t.Errorf("%s: the decoy a planted name points at changed: %+v, was %+v", pl.name, got, decoyBefore)
-				}
-				if got := keysState(t, filepath.Join(m.root, planted)); got != plantedBefore {
-					t.Errorf("%s: the planted %s changed: %+v, was %+v", pl.name, planted, got, plantedBefore)
-				}
-				for _, n := range []string{keysMarkerName, keysStagingDir} {
-					if n == planted {
-						continue
-					}
-					if _, err := os.Lstat(filepath.Join(m.root, n)); !errors.Is(err, os.ErrNotExist) {
-						t.Errorf("%s: the refused verb left %s: %v\nstderr:\n%s", pl.name, n, err, stderr)
-					}
-				}
-			})
-		}
-		t.Run(v.name+"/old log swapped mid-run", func(t *testing.T) {
-			m := keysMaintRoot(t, "U68")
-			var swapped map[string]keysFileState
-			m.h.attrs = &keysProbeAttrs{t: t, before: func(label string, _ keysAttrEvent) error {
-				// The stage step comes after the verb opened and read the
-				// old log, and before it checks the name still holds it.
-				if swapped == nil && label == "before the step stage" {
-					m.moveAside(v.log)
-					m.placeLog(v.log, "swapped in\n", true, true)
-					swapped = m.snapshot()
-				}
-				return nil
-			}}
-			code := m.h.run(v.args...)
-			stderr := m.h.stderr.String()
-			if swapped == nil {
-				t.Fatalf("the stage step was never reached: exit %d\nstderr:\n%s", code, stderr)
-			}
-			if code != keysRefused || !strings.Contains(stderr, "replaced") {
-				t.Fatalf("exit %d, want %d naming the replaced log\nstderr:\n%s", code, keysRefused, stderr)
-			}
-			after := m.snapshot()
-			for _, n := range []string{filepath.Join(keysLogsDir, v.log), filepath.Join(keysLogsDir, "keystore-saved-"+v.log)} {
-				if after[n].data != swapped[n].data || after[n].ino != swapped[n].ino || after[n].flags != swapped[n].flags {
-					t.Errorf("%s changed: %+v, was %+v\nstderr:\n%s", n, after[n], swapped[n], stderr)
-				}
-			}
-			if _, err := os.Lstat(filepath.Join(m.root, keysMarkerName)); err != nil {
-				t.Errorf("a refusal under the closed gate removed the marker: %v\nstderr:\n%s", err, stderr)
-			}
-			m.h.attrs = realFileAttrWriter{}
-			code = m.h.run(v.args...)
-			stderr = m.h.stderr.String()
-			if code != keysOK {
-				t.Fatalf("the rerun: exit %d\nstderr:\n%s", code, stderr)
-			}
-			m.checkSwapped(v, "the rerun after the swapped log", stderr)
-		})
-	}
-}
-
-// moveAside renames the log name in keystore-logs/ to
-// keystore-saved-<name> there, flagged as it was, so a plant can take its
-// name.
-func (m *keysRootMaint) moveAside(name string) {
-	m.t.Helper()
-	p := m.logPath(name)
-	saved := m.logPath("keystore-saved-" + name)
-	if err := unix.Chflags(p, 0); err != nil {
-		m.t.Fatal(err)
-	}
-	if err := os.Rename(p, saved); err != nil {
-		m.t.Fatal(err)
-	}
-	if err := unix.Chflags(saved, keysSFAppend); err != nil {
-		m.t.Fatal(err)
-	}
-}
-
-// allowRefusedAuditLine accepts, on the canonical audit log, the one line
-// the refused verb's audit appends: after holds before's bytes and one more
-// line, which names the refusal.
-func (m *keysRootMaint) allowRefusedAuditLine(before, after map[string]keysFileState) {
-	m.t.Helper()
-	n := filepath.Join(keysLogsDir, keystore.AuditLogName)
-	b, okb := before[n]
-	a, oka := after[n]
-	if !okb || !oka || b.typ != unix.S_IFREG || !strings.HasPrefix(a.data, b.data) {
-		return
-	}
-	extra := strings.TrimPrefix(a.data, b.data)
-	extra = strings.TrimPrefix(extra, "\n")
-	if strings.Count(extra, "\n") == 1 && strings.HasSuffix(extra, "\n") && strings.Contains(extra, `"refused"`) {
-		a.data = b.data
-		after[n] = a
-	}
-}
-
-// TestMaintenanceGatedSwapRefusesServiceUser is U90, root-run: before
-// every step of floor --rebuild and audit --rotate (each attribute call
-// and each step the step seam names) and after, the service user's
-// open(O_WRONLY), open(O_WRONLY|O_TRUNC) and link() into a directory it
-// owns, of the old log, the new log's canonical name and each staging
-// name, through the data root and through a descriptor on keystore-logs/
-// it opened before the gate closed, each fail: EACCES behind keystore-
-// staging/ or the closed gate, EPERM on a flagged file, ENOENT on an
-// absent name. No log byte changes. A line it appends through O_APPEND
-// before the gate closes is kept (rotate's .1 ends with it). The final log
-// passes the judge with one link, and the gate is open. The new log is
-// staged root's 0600, written, then handed to the service user and set
-// 0600 before the gate closes, and flagged after its rename; the old log
-// gets one attribute call, its flag clear, and is never chowned.
-func TestMaintenanceGatedSwapRefusesServiceUser(t *testing.T) {
-	if !keysAsRoot() {
-		t.Skip("root-run (U90): run as root through hack/acceptance/keystore.sh --root")
-	}
+// TestMaintenanceSwapRefusesServiceUser is U90, root-run: a process
+// running as the service user holds, from before floor --rebuild or audit
+// --rotate, an O_APPEND descriptor on the old log, a descriptor on the
+// log's live directory and one on keystore-logs/. Before every step in
+// keystore.SwapSteps and after the verb it tries, by path on the canonical
+// log, open(O_WRONLY), open(O_WRONLY|O_TRUNC) and link() into its own
+// directory (each EPERM), and through each held descriptor F_SETFL
+// clearing O_APPEND, pwrite and ftruncate (EPERM while the file is
+// flagged, success on the retired log once it is unflagged), and openat
+// for write (EPERM while flagged, ENOENT once gone).
+// At every hook the canonical log is a complete judged log: the old one
+// with its whole content or the new one with what the verb wrote, flags
+// exactly SF_APPEND, the service user's, 0600, one link. After the swap it
+// appends through O_APPEND by path, which is kept. At the end the new log
+// holds what the verb wrote and those appends and nothing the held
+// descriptors did; staging is gone and the retired directory is empty.
+func TestMaintenanceSwapRefusesServiceUser(t *testing.T) {
 	for _, v := range keysMaintVerbs {
 		t.Run(v.name, func(t *testing.T) {
 			m := keysMaintRoot(t, "U90")
-			oldSt := keysState(t, m.logPath(v.log))
-			r := m.runProbed(v, -1)
+			r := m.runProbed(v, "", true)
 			r.report(t, v.name)
-			if r.code != keysOK {
-				t.Fatalf("exit %d, want %d\nstderr:\n%s", r.code, keysOK, r.stderr)
+			if r.code != v.code {
+				t.Fatalf("exit %d, want %d\nstdout:\n%s\nstderr:\n%s", r.code, v.code, r.stdout, r.stderr)
 			}
-			if !r.appended {
-				t.Errorf("the gate's close (fchmod 0700 of %s) was never seen; hooks: %v", keysLogsDir, r.labels)
+			if !slices.Equal(r.steps, keystore.SwapSteps) {
+				t.Errorf("the steps reached are %v; want %v", r.steps, keystore.SwapSteps)
 			}
-			m.checkSwapped(v, v.name, r.stderr)
-			newSt := keysState(t, m.logPath(v.log))
-			if newSt.ino == oldSt.ino {
-				t.Errorf("the canonical %s is still the old inode", v.log)
+			if len(r.appended) == 0 {
+				t.Errorf("the service user's legitimate append to the new log never ran; steps %v", r.steps)
 			}
-			evs := r.attrs.eventsOf(newSt.ino)
-			calls := make([]string, 0, len(evs))
-			for _, e := range evs {
-				calls = append(calls, fmt.Sprintf("%s(%#o) uid %d flags %#x", e.call, e.arg, e.uid, e.flags))
-			}
-			if len(evs) != 3 || evs[0].call != "fchown" || evs[0].arg != int(m.svcUID) || evs[0].uid != 0 ||
-				evs[1].call != "fchmod" || evs[1].arg != 0o600 ||
-				evs[2].call != "fchflags" || evs[2].arg != keysSFAppend || evs[2].uid != m.svcUID {
-				t.Errorf("the new %s's attribute calls are %v; want fchown to the service user while root's, fchmod 0600, then the flag", v.log, calls)
-			}
+			r.checkDone(v.name)
 			if v.log == keystore.AuditLogName {
-				m.checkArchives(oldSt.ino, oldSt.data, true, true, v.name, r.stderr)
+				m.checkArchives(r.oldIno, r.oldData, true, v.name, r.stderr)
 			}
 		})
 	}
@@ -909,63 +824,86 @@ func TestMaintenanceGatedSwapRefusesServiceUser(t *testing.T) {
 		after := m.snapshot()
 		for n, b := range before {
 			if after[n] != b {
-				t.Errorf("the timed-out rotate changed %s", n)
+				t.Errorf("the timed-out rotate changed %s: %+v, was %+v", n, after[n], b)
 			}
 		}
-		if _, err := os.Lstat(filepath.Join(m.root, keysMarkerName)); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("the timed-out rotate left the marker: %v", err)
+		for _, n := range []string{keysMarkerName, keysStagingDir} {
+			if _, err := os.Lstat(filepath.Join(m.root, n)); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("the timed-out rotate left %s: %v", n, err)
+			}
 		}
 	})
 }
 
 // TestMaintenanceCrashAtEverySwapStepReruns is U90's crash half,
-// root-run: floor --rebuild and audit --rotate stopped at each hook point
-// in turn (each attribute call and each step), probed as in
-// TestMaintenanceGatedSwapRefusesServiceUser throughout, then rerun with
-// the probes still on, end with the canonical log judged with one link,
-// flagged, the gate open and no marker; rotate holds exactly one new
-// archive, the old log's bytes, so a crash after the gate opened does not
-// rotate twice.
+// root-run: floor --rebuild and audit --rotate stopped at each step in
+// keystore.SwapSteps in turn, probed throughout as in
+// TestMaintenanceSwapRefusesServiceUser, leave a valid live log. Rerun,
+// the same verb finishes: the rebuild, whose old floor holds a line that
+// does not parse, exits 4 and prints the uncrashed run's counts, whether
+// the crash came before or past the commit; rotate keeps one new archive.
+// Run instead, the other verb harms nothing of the first verb's log and
+// finishes, and the first verb's rerun then finishes too.
 func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
-	if !keysAsRoot() {
-		t.Skip("root-run (U90): run as root through hack/acceptance/keystore.sh --root")
-	}
 	for _, v := range keysMaintVerbs {
-		var labels []string
-		t.Run(v.name+"/hook points", func(t *testing.T) {
+		var ref string
+		t.Run(v.name+"/uncrashed", func(t *testing.T) {
 			m := keysMaintRoot(t, "U90")
-			r := m.runProbed(v, -1)
-			if r.code != keysOK {
-				t.Fatalf("the uncrashed run: exit %d\nstderr:\n%s", r.code, r.stderr)
+			r := m.runProbed(v, "", false)
+			r.report(t, "uncrashed")
+			if r.code != v.code {
+				t.Fatalf("exit %d, want %d\nstdout:\n%s\nstderr:\n%s", r.code, v.code, r.stdout, r.stderr)
 			}
-			labels = r.labels
+			ref = r.stdout
 		})
-		for i := range labels {
-			t.Run(fmt.Sprintf("%s/crash at hook %d", v.name, i), func(t *testing.T) {
+		for _, step := range keystore.SwapSteps {
+			t.Run(v.name+"/crash before "+step+"/rerun", func(t *testing.T) {
 				m := keysMaintRoot(t, "U90")
-				oldSt := keysState(t, m.logPath(v.log))
-				r := m.runProbed(v, i)
-				r.report(t, fmt.Sprintf("crash at hook %d", i))
-				if r.crashed == "" {
-					t.Fatalf("hook %d (%s in the uncrashed run) was never reached; this run's hooks: %v\nstderr:\n%s", i, labels[i], r.labels, r.stderr)
-				}
+				r := m.runProbed(v, step, false)
+				r.report(t, "the crashed run")
 				if r.code == keysOK {
-					t.Fatalf("the run crashed %s reported success\nstderr:\n%s", r.crashed, r.stderr)
+					t.Fatalf("the run crashed before %s reported success\nstderr:\n%s", step, r.stderr)
 				}
-				if _, err := os.Lstat(filepath.Join(m.root, keysMarkerName)); errors.Is(err, os.ErrNotExist) {
-					// A refusal before the gate closed: the old log stands.
-					if st := keysState(t, m.logPath(v.log)); st.ino != oldSt.ino || st.flags != keysSFAppend || !strings.HasPrefix(st.data, oldSt.data) {
-						t.Errorf("crashed %s, the marker gone: the canonical %s is %+v; want the old log, flagged, its bytes kept\nstderr:\n%s", r.crashed, v.log, st, r.stderr)
-					}
+				m.checkLive(v, "after the crash before "+step, r.code, r.stderr)
+				rerun := m.runProbed(v, "", false)
+				rerun.report(t, "the rerun after a crash before "+step)
+				if rerun.code != v.code || (ref != "" && rerun.stdout != ref) {
+					t.Fatalf("the rerun after a crash before %s: exit %d, want %d; stdout:\n%s\nwant (the uncrashed run's):\n%s\ncrashed run's stderr:\n%s\nrerun's stderr:\n%s", step, rerun.code, v.code, rerun.stdout, ref, r.stderr, rerun.stderr)
 				}
-				rerun := m.runProbed(v, -1)
-				rerun.report(t, fmt.Sprintf("the rerun after a crash at hook %d (%s)", i, r.crashed))
-				if rerun.code != keysOK {
-					t.Fatalf("the rerun after a crash %s: exit %d\ncrashed run's stderr:\n%s\nrerun's stderr:\n%s", r.crashed, rerun.code, r.stderr, rerun.stderr)
-				}
-				m.checkSwapped(v, "the rerun after a crash "+r.crashed, rerun.stderr)
+				m.checkLive(v, "the rerun after a crash before "+step, rerun.code, rerun.stderr)
 				if v.log == keystore.AuditLogName {
-					m.checkArchives(oldSt.ino, oldSt.data, false, true, "the rerun after a crash "+r.crashed, r.stderr+rerun.stderr)
+					m.checkArchives(r.oldIno, r.oldData, true, "the rerun after a crash before "+step, r.stderr+rerun.stderr)
+				}
+			})
+			t.Run(v.name+"/crash before "+step+"/other verb", func(t *testing.T) {
+				m := keysMaintRoot(t, "U90")
+				r := m.runProbed(v, step, false)
+				r.report(t, "the crashed run")
+				if r.code == keysOK {
+					t.Fatalf("the run crashed before %s reported success\nstderr:\n%s", step, r.stderr)
+				}
+				before := keysState(t, m.logPath(v.log))
+				o := v.other()
+				code := m.h.run(o.args...)
+				stdout, stderr := m.h.stdout.String(), m.h.stderr.String()
+				if code != keysOK && code != keysCommitted {
+					t.Fatalf("%s after %s crashed before %s: exit %d\nstdout:\n%s\nstderr:\n%s", o.name, v.name, step, code, stdout, stderr)
+				}
+				m.checkLive(o, o.name+" after the crash before "+step, code, stderr)
+				after := keysState(t, m.logPath(v.log))
+				// The other verb's audit line may follow the audit log's
+				// bytes; nothing else of the first verb's log changes.
+				if after.ino != before.ino || after.flags != before.flags || after.uid != before.uid || after.mode != before.mode || !strings.HasPrefix(after.data, before.data) {
+					t.Errorf("%s changed %s's log: %+v, was %+v\nstderr:\n%s", o.name, v.name, after, before, stderr)
+				}
+				rerun := m.runProbed(v, "", false)
+				rerun.report(t, "the first verb's rerun")
+				if rerun.code != keysOK && rerun.code != keysCommitted {
+					t.Fatalf("%s's rerun after %s: exit %d\nstdout:\n%s\nstderr:\n%s", v.name, o.name, rerun.code, rerun.stdout, rerun.stderr)
+				}
+				m.checkLive(v, v.name+"'s rerun after "+o.name, rerun.code, rerun.stderr)
+				if v.log == keystore.AuditLogName {
+					m.checkArchives(r.oldIno, r.oldData, false, v.name+"'s rerun after "+o.name, r.stderr+rerun.stderr)
 				}
 			})
 		}
@@ -973,66 +911,296 @@ func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
 }
 
 // TestMaintenanceOldLogRetiredNeverReowned is U118, root-run: in floor
-// --rebuild and audit --rotate the old log's one attribute call is its
-// flag clear, under the closed gate; it is never chowned or chmodded, and
-// its name is unlinked before the new log is renamed in. While it is
-// unflagged the service user reaches it by no route (EACCES, the gate),
-// and its bytes never change. Rotate's archives are fresh root-owned
-// unflagged copies, 0600 with one link; existing archives shift up by
-// rename, unchanged.
+// --rebuild and audit --rotate the new log gets, in staging, between the
+// build and report steps, its fchown to the service user while root's,
+// its fchmod 0600 and then its flag; the old log's one attribute call is
+// its flag clear, after the swap step, so it is never chowned or
+// chmodded, and is unflagged only once the swap has made it unreachable
+// by path. It ends unlinked, its owner and mode as they were and its bytes
+// unchanged. Rotate's .1 is a fresh root 0600 unflagged copy with one
+// link; the old .1 and .2 are the new .2 and .3, the same inodes and
+// bytes.
 func TestMaintenanceOldLogRetiredNeverReowned(t *testing.T) {
-	if !keysAsRoot() {
-		t.Skip("root-run (U118): run as root through hack/acceptance/keystore.sh --root")
-	}
 	for _, v := range keysMaintVerbs {
 		t.Run(v.name, func(t *testing.T) {
 			m := keysMaintRoot(t, "U118")
-			oldSt := keysState(t, m.logPath(v.log))
 			var archives []keysFileState
 			if v.log == keystore.AuditLogName {
 				for n := 1; n <= 2; n++ {
-					m.placeLog(fmt.Sprintf("%s.%d", keystore.AuditLogName, n), fmt.Sprintf("archive %d\n", n), false, false)
-					archives = append(archives, keysState(t, m.logPath(fmt.Sprintf("%s.%d", keystore.AuditLogName, n))))
+					p := filepath.Join(filepath.Dir(m.logPath(v.log)), fmt.Sprintf("%s.%d", v.log, n))
+					if err := os.WriteFile(p, fmt.Appendf(nil, "archive %d\n", n), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					archives = append(archives, keysState(t, p))
 				}
 			}
-			r := m.runProbed(v, -1)
-			r.report(t, v.name)
-			if r.code != keysOK {
-				t.Fatalf("exit %d\nstderr:\n%s", r.code, r.stderr)
+			old, err := os.Open(m.logPath(v.log))
+			if err != nil {
+				t.Fatal(err)
 			}
-			evs := r.attrs.eventsOf(oldSt.ino)
-			if len(evs) != 1 || evs[0].call != "fchflags" || evs[0].arg != 0 {
-				t.Errorf("the old %s's attribute calls are %+v; want its flag clear alone\nstderr:\n%s", v.log, evs, r.stderr)
+			defer func() { _ = old.Close() }()
+			oldSt := keysState(t, m.logPath(v.log))
+			attrs := &keysStepAttrs{t: t}
+			m.h.attrs = attrs
+			code := m.h.run(v.args...)
+			stderr := m.h.stderr.String()
+			m.h.attrs = realFileAttrWriter{}
+			if code != v.code {
+				t.Fatalf("exit %d, want %d\nstderr:\n%s", code, v.code, stderr)
 			}
-			// The hooks between the old log's flag clear and its unlink
-			// saw the gate closed: the probes there wanted EACCES and any
-			// other result is in r.probe.failures, reported above.
-			cleared, unlinked := -1, -1
-			for i, e := range r.attrs.events {
-				if e.ino == oldSt.ino && e.call == "fchflags" {
-					cleared = i
+			newSt := keysState(t, m.logPath(v.log))
+			build, report, swap, clean := attrs.index("step build", 0), attrs.index("step report", 0), attrs.index("step swap", 0), attrs.index("step clean", 0)
+			chown, chmod, chflags := attrs.index("fchown", newSt.ino), attrs.index("fchmod", newSt.ino), attrs.index("fchflags", newSt.ino)
+			if build < 0 || !(build < chown && chown < chmod && chmod < chflags && chflags < report && report < swap) {
+				t.Errorf("the new log's calls: build %d, fchown %d, fchmod %d, fchflags %d, report %d, swap %d; want them in that order\nevents %+v", build, chown, chmod, chflags, report, swap, attrs.events)
+			} else if e := attrs.events[chown]; e.uid != 0 || e.arg != int(m.svcUID) {
+				t.Errorf("the new log's fchown was to %d while uid %d; want to the service user %d while root's", e.arg, e.uid, m.svcUID)
+			} else if e := attrs.events[chflags]; e.arg != keysSFAppend || e.uid != m.svcUID {
+				t.Errorf("the new log's fchflags was %#x while uid %d; want SF_APPEND once it is the service user's", e.arg, e.uid)
+			}
+			var oldCalls []keysAttrEvent
+			for i, e := range attrs.events {
+				if e.ino == oldSt.ino && !strings.HasPrefix(e.call, "step ") {
+					oldCalls = append(oldCalls, e)
+					if i < clean {
+						t.Errorf("the old log's %s at event %d comes before the clean step (%d), while it may still be reachable", e.call, i, clean)
+					}
 				}
-				if e.call == "step unlink-old" {
-					unlinked = i
-				}
 			}
-			if cleared < 0 || unlinked != cleared+1 {
-				t.Errorf("the old log's flag clear at hook %d and the unlink step at hook %d; want the unlink next", cleared, unlinked)
+			if len(oldCalls) != 1 || oldCalls[0].call != "fchflags" || oldCalls[0].arg != 0 {
+				t.Errorf("the old %s's attribute calls are %+v; want its flag clear alone\nstderr:\n%s", v.log, oldCalls, stderr)
 			}
 			var held unix.Stat_t
-			if err := unix.Fstat(int(r.probe.old.Fd()), &held); err != nil || held.Nlink != 0 || held.Uid != oldSt.uid || held.Mode&0o7777 != 0o600 {
+			if err := unix.Fstat(int(old.Fd()), &held); err != nil || held.Nlink != 0 || held.Uid != oldSt.uid || held.Mode&0o7777 != 0o600 {
 				t.Errorf("the old log ends nlink %d uid %d mode %04o (%v); want unlinked, its owner and mode as they were", held.Nlink, held.Uid, held.Mode&0o7777, err)
+			}
+			if b, err := io.ReadAll(io.NewSectionReader(old, 0, 1<<30)); err != nil || string(b) != oldSt.data {
+				t.Errorf("the old log's bytes are %q (%v); want them unchanged, %q", b, err, oldSt.data)
 			}
 			if v.log != keystore.AuditLogName {
 				return
 			}
-			m.checkArchives(oldSt.ino, oldSt.data, true, false, v.name, r.stderr)
+			m.checkArchives(oldSt.ino, oldSt.data, false, v.name, stderr)
 			for n, a := range archives {
-				got := keysState(t, m.logPath(fmt.Sprintf("%s.%d", keystore.AuditLogName, n+2)))
-				if got.ino != a.ino || got.data != a.data || got.uid != 0 || got.flags != 0 || got.mode != 0o600 {
-					t.Errorf(".%d ends %+v; want the old .%d %+v, shifted unchanged", n+2, got, n+1, a)
+				got := keysState(t, filepath.Join(filepath.Dir(m.logPath(v.log)), fmt.Sprintf("%s.%d", v.log, n+2)))
+				if got.ino != a.ino || got.data != a.data || got.uid != 0 || got.flags != 0 || got.mode != 0o600 || got.nlink != 1 {
+					t.Errorf(".%d ends %+v; want the old .%d %+v, carried by link, one link once the retired set is cleaned", n+2, got, n+1, a)
 				}
 			}
 		})
 	}
+}
+
+// keysPlant is a name U68 plants before a verb runs: at returns the
+// planted path from the data root; clean is true when the verb cleans it
+// (an entry inside keystore-staging/) and finishes, false when it refuses.
+type keysPlant struct {
+	name  string
+	at    func(m *keysRootMaint, v keysMaintVerb, decoy string) string
+	clean bool
+}
+
+// keysPlants are U68's plants: a symlink, a FIFO and a swapped directory
+// at the marker, at keystore-staging/, inside keystore-staging/ and at
+// the verb's log directory.
+func keysPlants() []keysPlant {
+	symlink := func(rel func(keysMaintVerb) string, aside bool) func(*keysRootMaint, keysMaintVerb, string) string {
+		return func(m *keysRootMaint, v keysMaintVerb, decoy string) string {
+			n := rel(v)
+			if aside {
+				m.moveDirAside(v)
+			}
+			if err := os.Symlink(decoy, filepath.Join(m.root, n)); err != nil {
+				m.t.Fatal(err)
+			}
+			return n
+		}
+	}
+	fifo := func(rel func(keysMaintVerb) string, aside bool) func(*keysRootMaint, keysMaintVerb, string) string {
+		return func(m *keysRootMaint, v keysMaintVerb, _ string) string {
+			n := rel(v)
+			if aside {
+				m.moveDirAside(v)
+			}
+			if err := unix.Mkfifo(filepath.Join(m.root, n), 0o600); err != nil {
+				m.t.Fatal(err)
+			}
+			return n
+		}
+	}
+	// dir plants a directory the service user owns holding a flagged log
+	// of the verb's name: a swapped directory.
+	dir := func(rel func(keysMaintVerb) string, aside bool) func(*keysRootMaint, keysMaintVerb, string) string {
+		return func(m *keysRootMaint, v keysMaintVerb, _ string) string {
+			n := rel(v)
+			if aside {
+				m.moveDirAside(v)
+			}
+			p := filepath.Join(m.root, n)
+			if err := os.Mkdir(p, 0o755); err != nil {
+				m.t.Fatal(err)
+			}
+			lp := filepath.Join(p, v.log)
+			if err := os.WriteFile(lp, []byte("planted\n"), 0o600); err != nil {
+				m.t.Fatal(err)
+			}
+			for _, q := range []string{lp, p} {
+				if err := os.Chown(q, int(m.svcUID), int(m.svcGID)); err != nil {
+					m.t.Fatal(err)
+				}
+			}
+			if err := unix.Chflags(lp, keysSFAppend); err != nil {
+				m.t.Fatal(err)
+			}
+			return n
+		}
+	}
+	inStaging := func(name string, place func(m *keysRootMaint, p, decoy string)) func(*keysRootMaint, keysMaintVerb, string) string {
+		return func(m *keysRootMaint, v keysMaintVerb, decoy string) string {
+			s := filepath.Join(m.root, keysStagingDir)
+			if err := os.Mkdir(s, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+				m.t.Fatal(err)
+			}
+			if name == "" {
+				name = v.dir() + ".new"
+			}
+			place(m, filepath.Join(s, name), decoy)
+			return filepath.Join(keysStagingDir, name)
+		}
+	}
+	marker := func(keysMaintVerb) string { return keysMarkerName }
+	staging := func(keysMaintVerb) string { return keysStagingDir }
+	logDir := func(v keysMaintVerb) string { return filepath.Join(keysLogsDir, v.dir()) }
+	return []keysPlant{
+		{name: "marker symlink", at: symlink(marker, false)},
+		{name: "marker FIFO", at: fifo(marker, false)},
+		{name: "marker directory", at: dir(marker, false)},
+		{name: "staging symlink", at: symlink(staging, false)},
+		{name: "staging FIFO", at: fifo(staging, false)},
+		{name: "staging directory of the service user", at: dir(staging, false)},
+		{name: "log directory symlink", at: symlink(logDir, true)},
+		{name: "log directory FIFO", at: fifo(logDir, true)},
+		{name: "log directory of the service user", at: dir(logDir, true)},
+		{name: "symlink in staging at the replacement's name", clean: true, at: inStaging("", func(m *keysRootMaint, p, decoy string) {
+			if err := os.Symlink(filepath.Dir(decoy), p); err != nil {
+				m.t.Fatal(err)
+			}
+		})},
+		{name: "FIFO in staging", clean: true, at: inStaging("planted-fifo", func(m *keysRootMaint, p, _ string) {
+			if err := unix.Mkfifo(p, 0o600); err != nil {
+				m.t.Fatal(err)
+			}
+		})},
+		{name: "directory in staging holding a symlink", clean: true, at: inStaging("", func(m *keysRootMaint, p, decoy string) {
+			if err := os.Mkdir(p, 0o700); err != nil {
+				m.t.Fatal(err)
+			}
+			if err := os.Symlink(decoy, filepath.Join(p, "link")); err != nil {
+				m.t.Fatal(err)
+			}
+		})},
+	}
+}
+
+// moveDirAside renames v's log directory to <dir>.saved in keystore-logs/,
+// so a plant can take its name.
+func (m *keysRootMaint) moveDirAside(v keysMaintVerb) {
+	m.t.Helper()
+	d := filepath.Join(m.root, keysLogsDir, v.dir())
+	if err := os.Rename(d, d+".saved"); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// allowRefusedAuditLine accepts, on the canonical audit log, the one line
+// the refused verb's audit appends: after holds before's bytes and one more
+// line, which names the refusal.
+func (m *keysRootMaint) allowRefusedAuditLine(before, after map[string]keysFileState) {
+	m.t.Helper()
+	n := filepath.Join(keysLogsDir, keystore.AuditDirName, keystore.AuditLogName)
+	b, okb := before[n]
+	a, oka := after[n]
+	if !okb || !oka || b.typ != unix.S_IFREG || !strings.HasPrefix(a.data, b.data) {
+		return
+	}
+	extra := strings.TrimPrefix(strings.TrimPrefix(a.data, b.data), "\n")
+	if strings.Count(extra, "\n") == 1 && strings.HasSuffix(extra, "\n") && strings.Contains(extra, `"refused"`) {
+		a.data = b.data
+		after[n] = a
+	}
+}
+
+// TestMaintenanceRefusesPlantedNames is U68, root-run: floor --rebuild and
+// audit --rotate each meet a symlink, a FIFO and a swapped directory (the
+// service user's, holding a flagged log) at the marker, at
+// keystore-staging/ and at their log's directory in keystore-logs/, and
+// refuse before anything changes; a symlink, FIFO or directory inside
+// keystore-staging/ is removed unread and the verb finishes. The verb
+// never follows a planted name: the decoy it points at does not change. No
+// log byte changes in a refusal (the audit log gains only the verb's own
+// refused line), the planted name stands, and no marker or staging
+// directory of the verb's is left.
+func TestMaintenanceRefusesPlantedNames(t *testing.T) {
+	for _, v := range keysMaintVerbs {
+		for _, pl := range keysPlants() {
+			t.Run(v.name+"/"+pl.name, func(t *testing.T) {
+				m := keysMaintRoot(t, "U68")
+				decoyDir := t.TempDir()
+				decoy := filepath.Join(decoyDir, v.log)
+				if err := os.WriteFile(decoy, []byte("decoy\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				decoyBefore := keysState(t, decoy)
+				planted := pl.at(m, v, decoy)
+				plantedBefore := keysState(t, filepath.Join(m.root, planted))
+				before := m.snapshot()
+				code := m.h.run(v.args...)
+				stdout, stderr := m.h.stdout.String(), m.h.stderr.String()
+				if got := keysState(t, decoy); got != decoyBefore {
+					t.Errorf("%s: the decoy a planted name points at changed: %+v, was %+v\nstderr:\n%s", pl.name, got, decoyBefore, stderr)
+				}
+				if ok, names := keysDirEmptyPath(decoyDir); !ok && !slices.Equal(names, []string{v.log}) {
+					t.Errorf("%s: the decoy directory now lists %v\nstderr:\n%s", pl.name, names, stderr)
+				}
+				if pl.clean {
+					if code != v.code {
+						t.Fatalf("%s: exit %d, want %d (staging cleaned, the verb finishes)\nstdout:\n%s\nstderr:\n%s", pl.name, code, v.code, stdout, stderr)
+					}
+					m.checkLive(v, pl.name, code, stderr)
+					return
+				}
+				if code != keysRefused {
+					t.Fatalf("%s: exit %d, want %d (refused)\nstdout:\n%s\nstderr:\n%s", pl.name, code, keysRefused, stdout, stderr)
+				}
+				after := m.snapshot()
+				m.allowRefusedAuditLine(before, after)
+				for n, b := range before {
+					if a, ok := after[n]; !ok || a != b {
+						t.Errorf("%s: %s changed: %+v, was %+v\nstderr:\n%s", pl.name, n, after[n], b, stderr)
+					}
+				}
+				for n := range after {
+					if _, ok := before[n]; !ok {
+						t.Errorf("%s: the refused verb left %s\nstderr:\n%s", pl.name, n, stderr)
+					}
+				}
+				if got := keysState(t, filepath.Join(m.root, planted)); got != plantedBefore {
+					t.Errorf("%s: the planted %s changed: %+v, was %+v\nstderr:\n%s", pl.name, planted, got, plantedBefore, stderr)
+				}
+			})
+		}
+	}
+}
+
+// keysDirEmptyPath lists the directory p.
+func keysDirEmptyPath(p string) (bool, []string) {
+	names, err := os.ReadDir(p)
+	if err != nil {
+		return false, []string{err.Error()}
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, n.Name())
+	}
+	return len(out) == 0, out
 }

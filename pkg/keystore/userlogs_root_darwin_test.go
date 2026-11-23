@@ -18,6 +18,8 @@ package keystore
 
 import (
 	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -37,7 +39,8 @@ type fpunchhole struct {
 // sappnd) on a log the service user owns at 0600, and proves what the
 // flag variant of the user-scope floor rests on: an O_APPEND write lands,
 // while every attempt of the defeat list (docs/design/keystore.md § "The
-// user-scope floor") fails with EPERM exactly and leaves every byte in
+// user-scope floor"), F_SETFL clearing O_APPEND among them, fails with
+// EPERM exactly and leaves every byte in
 // place. The store's own check, through the real flag source, admits the
 // flagged file and refuses it as errLogNotAppendOnly once the flag is
 // cleared. Only root can set SF_APPEND, so it skips unless root.
@@ -187,5 +190,80 @@ func TestAppendOnlyFlagHoldsAsRoot(t *testing.T) {
 	var st unix.Stat_t
 	if err := s.judgeLog(g, &st); !errors.Is(err, errLogNotAppendOnly) {
 		t.Fatalf("judgeLog with the flag cleared: %v, want errLogNotAppendOnly", err)
+	}
+}
+
+// TestStoreReadsSwappedLogDirAsRoot is the store's side of the directory
+// swap (docs/design/keystore.md § "The swap"), root-run: once a
+// replacement directory holding the service user's flagged 0600 log is
+// exchanged with floor/ by renameatx_np(RENAME_SWAP), the store opens the
+// canonical floor and reads the new log at once, admitting it; a
+// replacement whose log is unflagged is refused as errLogNotAppendOnly,
+// whatever directory it came in by. Root's own rename of a directory
+// holding a flagged file succeeds, which is what the swap rests on.
+func TestStoreReadsSwappedLogDirAsRoot(t *testing.T) {
+	if !asRoot() {
+		t.Skip("root-only: SF_APPEND can only be set by root")
+	}
+	s, _ := newTestStore(t)
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(s.dataRoot, func(p string, d fs.DirEntry, err error) error {
+			if err == nil && d.Type()&fs.ModeSymlink == 0 {
+				_ = unix.Chflags(p, 0)
+			}
+			return nil
+		})
+	})
+	floorDir := filepath.Join(s.dataRoot, logsDirName, floorDirName)
+	place := func(dir, data string, flag bool) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, userFloorLogName)
+		if err := os.WriteFile(p, []byte(data), logMode); err != nil {
+			t.Fatal(err)
+		}
+		giveToService(t, p)
+		if flag {
+			if err := unix.Chflags(p, sfAppend); err != nil {
+				t.Fatalf("chflags sappnd: %v", err)
+			}
+		}
+	}
+	place(floorDir, "old\n", true)
+	repl := filepath.Join(s.dataRoot, "repl")
+	place(repl, "new\n", true)
+	if err := unix.RenamexNp(repl, floorDir, unix.RENAME_SWAP); err != nil {
+		t.Fatalf("root's RENAME_SWAP of two directories each holding a flagged log: %v", err)
+	}
+	s.logFlags = fileFlags
+	l := newFileFloorLog(s).log
+	g, _, err := l.open(unix.O_RDONLY)
+	if err != nil {
+		t.Fatalf("the store refused the swapped-in flagged log: %v", err)
+	}
+	b, err := io.ReadAll(g)
+	_ = g.Close() // read-only
+	if err != nil || string(b) != "new\n" {
+		t.Fatalf("the store read %q (%v) after the swap, want the new log", b, err)
+	}
+
+	bad := filepath.Join(s.dataRoot, "bad")
+	place(bad, "unflagged\n", false)
+	if err := unix.RenamexNp(bad, floorDir, unix.RENAME_SWAP); err != nil {
+		t.Fatalf("RENAME_SWAP of the unflagged replacement: %v", err)
+	}
+	f, err := os.Open(filepath.Join(floorDir, userFloorLogName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }() // read-only
+	var st unix.Stat_t
+	if err := s.judgeLog(f, &st); !errors.Is(err, errLogNotAppendOnly) {
+		t.Fatalf("judgeLog of a swapped-in unflagged log: %v, want errLogNotAppendOnly", err)
 	}
 }
