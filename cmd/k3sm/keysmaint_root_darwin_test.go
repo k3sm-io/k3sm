@@ -940,7 +940,8 @@ func TestMaintenanceSwapRefusesServiceUser(t *testing.T) {
 // same verb finishes, leaving no marker and no staging: the rebuild, whose
 // old floor holds a line that does not parse, exits 4 and prints the
 // uncrashed run's counts, whether the crash came before or past the
-// commit; rotate keeps one new archive. Run instead, the other verb harms
+// commit, past it saying they are an earlier run's that committed and that
+// this run did not rebuild or rotate; rotate keeps one new archive. Run instead, the other verb harms
 // nothing of the first verb's log, replaces its marker and finishes, and
 // the first verb's rerun then runs from step 1 and finishes too.
 func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
@@ -966,7 +967,15 @@ func TestMaintenanceCrashAtEverySwapStepReruns(t *testing.T) {
 				m.checkCrashed(v, step, r.code, r.stderr)
 				rerun := m.runProbed(v, "", false)
 				rerun.report(t, "the rerun after a crash before "+step)
-				if rerun.code != v.code || (ref != "" && rerun.stdout != ref) {
+				// A crash past the commit leaves the report in the marker: the
+				// rerun prints it as an earlier run's, never as a run of its
+				// own, and otherwise the same.
+				committed := strings.Contains(r.stderr, "the swap committed")
+				got, earlier := earlierAsUncrashed(rerun.stdout)
+				if earlier != committed {
+					t.Fatalf("the rerun after a crash before %s printed %q: says an earlier run committed %v, want %v", step, rerun.stdout, earlier, committed)
+				}
+				if rerun.code != v.code || (ref != "" && got != ref) {
 					t.Fatalf("the rerun after a crash before %s: exit %d, want %d; stdout %q; want (the uncrashed run's) %q; crashed run's stderr %q; rerun's stderr %q", step, rerun.code, v.code, rerun.stdout, ref, r.stderr, rerun.stderr)
 				}
 				m.checkLive(v, "the rerun after a crash before "+step, rerun.code, rerun.stderr)
@@ -1311,4 +1320,17 @@ func keysDirEmptyPath(p string) (bool, []string) {
 		out = append(out, n.Name())
 	}
 	return len(out) == 0, out
+}
+
+// earlierAsUncrashed is out, a rerun's stdout, with the line that says it
+// printed an earlier committed run's report rewritten as the uncrashed
+// run prints it, and whether out said so.
+func earlierAsUncrashed(out string) (string, bool) {
+	if rest, ok := strings.CutPrefix(out, "an earlier run committed; this run did not rebuild: the user-scope floor has "); ok {
+		return "rebuilt the user-scope floor: " + rest, true
+	}
+	if rest, ok := strings.CutPrefix(out, "an earlier run committed; this run did not rotate:\n"); ok {
+		return rest, true
+	}
+	return out, false
 }
