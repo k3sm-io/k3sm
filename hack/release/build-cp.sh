@@ -123,7 +123,9 @@ STAMP_NAME="BUILD-STAMP"
 # (x/net v0.62.0 requires x/crypto v0.58.0 and x/text v0.43.0, so those two are
 # listed at the versions they land at; it also requires x/sys v0.49.0 and x/term
 # v0.47.0, which carry no reachable finding and so arrive as pulled-in changes,
-# not raises). The re-vendor refuses any other landing.
+# not raises; the OpenTelemetry raises likewise pull in otel/metric, otel/log,
+# otel/sdk/metric and the modules they require, recorded in the stamp's vendor
+# lines). The re-vendor refuses any other landing.
 # <published> is the version's `Time` at
 # https://proxy.golang.org/<module>/@v/<version>.info, in full; the build re-reads
 # it and refuses on a mismatch. A version younger than COOLDOWN_DAYS is refused
@@ -133,6 +135,11 @@ STAMP_NAME="BUILD-STAMP"
 COOLDOWN_DAYS=14
 RAISES="github.com/google/cel-go v0.30.0 2026-07-25T00:08:13Z GO-2026-6094
 go.etcd.io/etcd/client/pkg/v3 v3.7.1 2026-07-23T19:30:42Z GO-2026-6107
+go.opentelemetry.io/otel v1.47.0 2026-10-02T08:10:46Z GO-2026-6975
+go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.47.0 2026-10-02T08:10:46Z GO-2026-6505
+go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.47.0 2026-10-02T08:10:46Z GO-2026-6505
+go.opentelemetry.io/otel/sdk v1.47.0 2026-10-02T08:10:46Z GO-2026-6505,GO-2026-6974
+go.opentelemetry.io/otel/trace v1.47.0 2026-10-02T08:10:46Z GO-2026-6974
 golang.org/x/crypto v0.58.0 2026-10-09T16:24:17Z GO-2026-6303,GO-2026-6354,GO-2026-6355
 golang.org/x/net v0.62.0 2026-10-27T19:00:16Z GO-2026-6603,GO-2026-6610,GO-2026-6611,GO-2026-6612,GO-2026-6617,GO-2026-6860,GO-2026-6866
 golang.org/x/text v0.43.0 2026-10-09T15:18:32Z GO-2026-6629
@@ -154,7 +161,11 @@ EXEMPT=""
 # The modules the re-vendor is expected to drop from vendor/modules.txt, one per
 # line: <module> <vendored version> <the raise that drops it>. Any other removal
 # is refused, so a module cannot leave the build unnoticed.
-REMOVALS="go.opentelemetry.io/otel/sdk/metric v1.44.0 google.golang.org/grpc: v1.83.2 no longer imports it"
+REMOVALS="github.com/kr/pretty v0.3.1 go.opentelemetry.io/otel: v1.47.0 pulls in github.com/stretchr/testify v1.12.1, which drops gopkg.in/yaml.v3 and the test modules it brought in
+github.com/kr/text v0.2.0 go.opentelemetry.io/otel: v1.47.0 pulls in github.com/stretchr/testify v1.12.1, which drops gopkg.in/yaml.v3 and the test modules it brought in
+github.com/rogpeppe/go-internal v1.14.1 go.opentelemetry.io/otel: v1.47.0 pulls in github.com/stretchr/testify v1.12.1, which drops gopkg.in/yaml.v3 and the test modules it brought in
+gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c go.opentelemetry.io/otel: v1.47.0 pulls in github.com/stretchr/testify v1.12.1, which drops gopkg.in/yaml.v3 and the test modules it brought in
+gopkg.in/yaml.v3 v3.0.1 go.opentelemetry.io/otel: v1.47.0 pulls in github.com/stretchr/testify v1.12.1, which drops gopkg.in/yaml.v3 and the test modules it brought in"
 
 # The findings the raise list leaves open, one per line:
 #   <module> <advisory> <why it is not raised>

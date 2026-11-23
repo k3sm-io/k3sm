@@ -87,9 +87,55 @@ func TestApply(t *testing.T) {
 	}
 }
 
+// TestApplyAdded pins an added requirement: a "// indirect" require line is
+// appended after the last line and its hashes go to go.sum, and a tree that
+// already requires the module is refused as ErrNotARaise.
+func TestApplyAdded(t *testing.T) {
+	add := Requirement{Path: "go.opentelemetry.io/otel/log", Version: "v1.47.0", Sum: "h1:zip=", GoModSum: "h1:mod=", Added: true}
+	cases := []struct {
+		name, mod, wantMod string
+		notARaise          bool
+	}{
+		{
+			name:    "appended after the last line",
+			mod:     "module x\n\nrequire (\n\tgo.opentelemetry.io/otel v1.46.0 // indirect\n)\n",
+			wantMod: "module x\n\nrequire (\n\tgo.opentelemetry.io/otel v1.46.0 // indirect\n)\n\nrequire go.opentelemetry.io/otel/log v1.47.0 // indirect\n",
+		},
+		{name: "already required in a block", mod: "module x\n\nrequire (\n\tgo.opentelemetry.io/otel/log v1.40.0 // indirect\n)\n", notARaise: true},
+		{name: "already required on its own line", mod: "module x\n\nrequire go.opentelemetry.io/otel/log v1.50.0\n", notARaise: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte(tc.mod), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := Apply(root, []Requirement{add})
+			if tc.notARaise {
+				if !errors.Is(err, ErrNotARaise) {
+					t.Fatalf("Apply = %v, want ErrNotARaise", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			mod, _ := os.ReadFile(filepath.Join(root, "go.mod"))
+			if string(mod) != tc.wantMod {
+				t.Errorf("go.mod =\n%s\nwant\n%s", mod, tc.wantMod)
+			}
+			sum, _ := os.ReadFile(filepath.Join(root, "go.sum"))
+			if want := "go.opentelemetry.io/otel/log v1.47.0 h1:zip=\ngo.opentelemetry.io/otel/log v1.47.0/go.mod h1:mod=\n"; string(sum) != want {
+				t.Errorf("go.sum =\n%s\nwant\n%s", sum, want)
+			}
+		})
+	}
+}
+
 // TestRaises pins the raise set: x/net at XNetVersion, compress at
-// CompressVersion, and the modules x/net XNetVersion needs above kine's tag at
-// their constants, each with both hashes present.
+// CompressVersion, the modules x/net XNetVersion needs above kine's tag at
+// their constants, and the OpenTelemetry family at OTelVersion with otel/log the
+// one added requirement, each with both hashes present.
 func TestRaises(t *testing.T) {
 	want := []struct{ path, version string }{
 		{"golang.org/x/net", XNetVersion},
@@ -99,6 +145,11 @@ func TestRaises(t *testing.T) {
 		{"golang.org/x/text", XTextVersion},
 		{"golang.org/x/sync", XSyncVersion},
 		{"github.com/klauspost/compress", CompressVersion},
+		{"go.opentelemetry.io/otel/sdk", OTelVersion},
+		{"go.opentelemetry.io/otel", OTelVersion},
+		{"go.opentelemetry.io/otel/metric", OTelVersion},
+		{"go.opentelemetry.io/otel/trace", OTelVersion},
+		{"go.opentelemetry.io/otel/log", OTelVersion},
 	}
 	if len(Raises) != len(want) {
 		t.Fatalf("Raises = %+v, want %d raises: %+v", Raises, len(want), want)
@@ -106,6 +157,9 @@ func TestRaises(t *testing.T) {
 	for i, w := range want {
 		if Raises[i].Path != w.path || Raises[i].Version != w.version {
 			t.Errorf("Raises[%d] = %s %s, want %s %s", i, Raises[i].Path, Raises[i].Version, w.path, w.version)
+		}
+		if added := w.path == "go.opentelemetry.io/otel/log"; Raises[i].Added != added {
+			t.Errorf("Raises[%d] %s: Added = %v, want %v", i, w.path, Raises[i].Added, added)
 		}
 	}
 	for _, r := range Raises {
