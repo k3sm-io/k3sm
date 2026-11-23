@@ -2791,6 +2791,7 @@ service user can only add to.
   | the service user's, on the judged path | the held key must be the judged one, read again after the take | exit 0 only if the judged key is in the record; record full: exit 4 |
   | the service user's, on the no-key or untrusted path | must be the directory the judge opened (device, inode), else refuses; removes it | exit 0 only if a listed key was read; else exit 4 |
   | any row above that gives exit 0, with a line of `user/<uid>` in the floor after the proving key's listing, or a floor that cannot be judged | as that row | exit 4 (the newest-scope rule) |
+  | any row above that gives exit 0, with more than one sequence-1 delivery-record line of `user/<uid>` in the floor since the uid's last listing before this run | as that row | exit 4 (the created-twice rule) |
   | the service user's with a valid unlisted key, or not what its path found | refuses | exit 1 (exit 4 if this run added a key to the record) |
   | absent at the walk's open | removes nothing | exit 4 "found absent" if this run added a key, else exit 1 |
 
@@ -2834,6 +2835,30 @@ service user can only add to.
   activity after the listing, or, on a floor rebuilt since, when the rebuild kept a line of the
   uid (a floor without a whole identity, as on a file system with no birth time, keeps the
   listed scope's own lines and so always trips it).
+
+  *The created-twice rule.* Inside the same scan, a partial detection of the open limit below.
+  Every mint of a scope appends the same floor line for the uid, its empty delivery record at
+  sequence 1 (`user/<uid> .deliveries <GeneratedUID> 1`), before `scope.key` is written, with no
+  de-duplication, and the append-only floor keeps it. One such line since the uid's last listing
+  is the judged scope's own mint; more than one means the uid's scope was created more than once
+  since, so another scope of this uid may be held away from its name. The rule counts the uid's
+  sequence-1 delivery-record lines in its own window: from the uid's `floor_size` in the record
+  as this run read it before any write, when that position's identity is whole and is the
+  current floor's, else from byte 0 (the record does not list the uid, the floor was rebuilt
+  since, or the identity has no birth time), to the floor's end at the open. For a key this run
+  listed, that window starts before the listing, not at it, since the judged scope's own mint
+  line lies before the listing position; the later-line rule keeps its own window (from the
+  listing). For a key an earlier run listed both windows start at the recorded position. More
+  than one line in the window is not exit 0 (exit 4, as the newest-scope rule accounts it),
+  saying the floor shows this uid's scope was created more than once since its last listing, so
+  another scope of this uid may be held away from its name, and that rm-scope removed and listed
+  the one at the name; when a later line also exists, the later-line text is the one given. The
+  rule is fail-closed: an extra line only turns exit 0 into exit 4, so a forged line costs a
+  false exit 4, never a false exit 0. It is partial: a `floor --rebuild` between the mints and
+  the rm-scope drops the earlier scope's lines and erases the evidence, and it does nothing when
+  the name is left empty (there is no scope to judge: exit 1, found absent). A torn or over-long
+  line before a mint's line does not hide it, since the writer leads every append with a
+  newline.
 
   *Directory mode.* rm-scope, and only it, reads through the mode of `keystore/`, of `.user`
   and of the scope directory, which the service user can set (a judge that refused it would
