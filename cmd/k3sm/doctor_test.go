@@ -534,10 +534,15 @@ func TestDoctorKeystoreUserScopeRow(t *testing.T) {
 		remedy    string
 		detailHas string
 	}{
-		{name: "start checks pass", seam: userScopeChecks(func(*socket.Preconditions) {}), status: statusPass, detail: "keystore user scope: start checks pass; a socket owned by the service user is at /var/lib/k3sm/keystore-sock/keys.sock"},
-		{name: "start checks pass, no socket", seam: userScope(func(u *doctorUserScope) {
+		{name: "start checks pass", seam: userScopeChecks(func(*socket.Preconditions) {}), status: statusPass, detail: "keystore user scope: start checks pass; a root-owned 0666 socket is at /var/lib/k3sm/keystore-sock/keys.sock (path facts only: whether the server is serving it is not checked)"},
+		{name: "start checks pass, no socket, plist without the entry", seam: userScope(func(u *doctorUserScope) {
 			u.sockState = func() error { return fmt.Errorf("%w: nothing is at the path", errNoListeningSocket) }
-		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path"},
+			u.plistHasSockets = func() (bool, error) { return false, nil }
+		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path]; run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)", remedy: "sudo k3sm install   # it rewrites the server plist and re-bootstraps the job"},
+		{name: "start checks pass, no socket, plist with the entry", seam: userScope(func(u *doctorUserScope) {
+			u.sockState = func() error { return fmt.Errorf("%w: nothing is at the path", errNoListeningSocket) }
+			u.plistHasSockets = func() (bool, error) { return true, nil }
+		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path]; the plist has the socket entry, but launchd has no `keys` socket for this job: its loaded definition has no such entry, or a parent of the socket path is missing (measured with three missing levels); or the server has not started yet or is restarting; run `sudo k3sm install` (it rewrites and reloads the server's definition); if the data root is on a volume that is not mounted, mount it first", remedy: "sudo k3sm install   # it rewrites and reloads the server's definition; if the data root is on a volume that is not mounted, mount it first"},
 		{name: "two servers", seam: userScope(func(u *doctorUserScope) {
 			u.pre.ServerCount = func(context.Context) (int, error) { return 2, nil }
 			u.servers = func() ([]string, error) { return []string{"mac-a", "mac-b"}, nil }

@@ -2755,10 +2755,9 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// the ledger and the index a re-run needs to finish the job.
 	identity := netdsvc.NodeIdentityPath(MeshKeyDir)
 	icIndex := interconnectNodeIndex(sys)
-	// The lo0 flush scope, read from the installed netd plist BEFORE the walk
-	// removes it, so a non-default --service-cidr is flushed. With the plist
-	// already gone (a partial earlier uninstall) the uninstall configuration's
-	// scope stands in: uninstall is the last chance to clear these aliases.
+	// The lo0 flush scope, read from the installed netd plist BEFORE the walk removes it, so a
+	// non-default --service-cidr is flushed. With the plist already gone (a partial earlier
+	// uninstall) the uninstall configuration's scope stands in: the last chance to clear them.
 	flush := recordedFlushPrefixes(sys, cfg)
 	if flush.err != nil {
 		if flush.refused != "" {
@@ -2766,6 +2765,7 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 		}
 		flush = configFlushPrefixes(cfg)
 	}
+	bootedOut := bootouts{}
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
 		if a.disp == dispRemove && a.kind == kindFile && a.path == identity {
@@ -2793,7 +2793,7 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 				// which returns nil), the root job may still be loaded — do not delete
 				// its plist definition (that would orphan a live root job until reboot,
 				// a variant of the same leak). Record the error and leave the plist.
-				if err := sys.LaunchctlBootout(a.label); err != nil {
+				if err := bootedOut.bootout(sys, a.label); err != nil {
 					note(err)
 					continue
 				}
@@ -2817,7 +2817,7 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 					}
 				}
 			} else {
-				note(safeRemove(a.path))
+				note(bootedOut.remove(cfg, a, safeRemove))
 			}
 		}
 	}

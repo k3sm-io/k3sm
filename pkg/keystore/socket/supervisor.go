@@ -70,12 +70,49 @@ const (
 	OffMountUnknown         OffReason = "the data root's mount flags cannot be read"
 	OffInstall              OffReason = "the socket directory or an append-only log is missing, wrong or unflagged"
 	OffLogsUnavailable      OffReason = "the append-only logs cannot be opened (logs-unavailable)"
+	OffStoreDir             OffReason = "the store directory is missing or refused"
 	OffServers              OffReason = "more than one server registered"
 	OffServersUnknown       OffReason = "the server count is unknown"
 	OffListenerUnavailable  OffReason = "the listening socket is unavailable"
 	OffListenerFailed       OffReason = "the listener failed"
 	OffSandboxCheckUnusable OffReason = "the peer sandbox check is unusable (sandbox-check-unusable)"
 	OffUserScopeStart       OffReason = "the user scope's start step failed"
+	// The activation's terminal reasons (ActivationError): launchd hands a
+	// job's socket over once per process, so none is retried.
+	//
+	// OffNotActivated is ESRCH: the process is not the server's launchd job,
+	// or the job's plist has no Sockets entry; only a new bootstrap of the
+	// job, which install does, can give one.
+	OffNotActivated OffReason = "launchd activated no socket for this server"
+	// OffSocketParentMissing is ENOENT (<launch.h>: no socket of that name
+	// owned by the caller): launchd's loaded definition of the job has no
+	// such entry, or a parent of the socket path is missing at the job's
+	// activation call (measured with three missing levels). Install
+	// rewrites and reloads the definition; a data root on a volume that is
+	// not mounted is mounted first (not measured; a default-layout data
+	// root that is not mounted is refused earlier, by the shadowed-work-dir
+	// check).
+	OffSocketParentMissing OffReason = "launchd has no `keys` socket for this job: its loaded definition has no such entry, or a parent of the socket path is missing (measured with three missing levels)"
+	// OffAlreadyActivated is EALREADY, <launch.h>'s documented answer to a
+	// second activation in one process (not measured: the process-wide
+	// holder never asks twice).
+	OffAlreadyActivated OffReason = "launchd already handed this process the socket"
+	// OffActivatedInheritable is a descriptor launchd handed over without
+	// FD_CLOEXEC, closed and refused (ErrActivatedInheritable). A restart
+	// does not change launchd's flag, so no command puts it right: it is
+	// reported (InheritableRemedy).
+	OffActivatedInheritable OffReason = "the activated socket arrived without FD_CLOEXEC"
+	// OffActivatedWrong is an activated descriptor, or the socket path
+	// clients connect to, that is not the keystore's (ErrActivatedWrong).
+	// Its remedy is install, which rewrites and reloads the server's
+	// definition, so launchd binds the socket afresh at the next start.
+	OffActivatedWrong OffReason = "the activated socket or its path is not the keystore's"
+	// OffPodProfile is a Pod profile, rendered by the runtime this binary
+	// embeds for this node's posture, that does not deny the socket
+	// (SupervisorConfig.PodProfile). It is terminal for the process: the
+	// profile is this build's, so no retry and no reinstall of the same
+	// build changes it.
+	OffPodProfile OffReason = "this build's Pod profile does not deny the keystore socket"
 )
 
 // The supervisor's log text: every off line starts with offMsg, and the
@@ -83,6 +120,18 @@ const (
 const (
 	offMsg        = "keystore user scope is off"
 	installRemedy = "run `sudo k3sm install`"
+	// NotActivatedRemedy is OffNotActivated's remedy, which doctor names
+	// for a server with no socket at the path too.
+	NotActivatedRemedy = "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"
+	// ParentMissingRemedy is OffSocketParentMissing's remedy.
+	ParentMissingRemedy = "run `sudo k3sm install` (it rewrites and reloads the server's definition); if the data root is on a volume that is not mounted, mount it first"
+	// InheritableRemedy is OffActivatedInheritable's: no command changes
+	// launchd's flag.
+	InheritableRemedy = "report it: launchd handed the server an inheritable descriptor; the user scope stays off"
+	// PodProfileRemedy is OffPodProfile's remedy.
+	PodProfileRemedy = "install a k3sm built with a matching runtimed"
+	// RestartRemedy is the remedy of every other terminal activation reason.
+	RestartRemedy = "run `sudo k3sm restart`"
 )
 
 // Phase is where the supervisor is.
@@ -147,6 +196,9 @@ type SupervisorConfig struct {
 	// MaintenanceMarked reports whether the maintenance marker stands. It
 	// only reads: the supervisor polls it while serving.
 	MaintenanceMarked func() (bool, error)
+	// StoreDir is Preconditions.StoreDir; production creates the store
+	// directory in it (keystore.FileStore.EnsureDir). Optional.
+	StoreDir func(ctx context.Context) error
 	// OpenLogs reopens the server's audit and floor append descriptors and
 	// recounts what is charged from the new files (Preconditions.OpenLogs);
 	// production passes (*keystore.ServerLogs).Reopen.
@@ -158,6 +210,12 @@ type SupervisorConfig struct {
 	// store's start step (keystore.FileStore.StartUserScopes) in it.
 	// Optional.
 	StartScopes func(ctx context.Context) error
+	// PodProfile, when set, is asked once, when Run starts and before any
+	// start check, whether the Pod profile this node renders denies the
+	// socket (ProfileDeniesSocket over the generator's text). An error, or a
+	// panic, is terminal: the supervisor is off with OffPodProfile, logs one
+	// Warn naming PodProfileRemedy, and serves nothing until Run returns.
+	PodProfile func() error
 	// Creds, Sandbox, Audit and Handler are given to each run's Listener.
 	Creds   PeerCredSource
 	Sandbox PeerSandboxSource
@@ -263,6 +321,12 @@ func (s *Supervisor) Run(ctx context.Context) {
 	// failures and starts again only after a run served HealthyPeriod (or
 	// stopped for the marker), so a listener that fails at once after
 	// every passing check still backs off.
+	if s.cfg.PodProfile != nil {
+		if _, err := guard(func() (struct{}, error) { return struct{}{}, s.cfg.PodProfile() }); err != nil {
+			s.terminal(ctx, OffPodProfile, err.Error())
+			return
+		}
+	}
 	checkBackoff, runBackoff := MinBackoff, MinBackoff
 	reopenTries := 0
 	var last OffReason
@@ -301,6 +365,13 @@ func (s *Supervisor) Run(ctx context.Context) {
 		}
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			var ae *ActivationError
+			if errors.As(err, &ae) {
+				// launchd hands a job's socket over once per process: no
+				// retry in this process can get one.
+				s.notActivated(ctx, ae)
 				return
 			}
 			if !s.backOff(ctx, OffListenerUnavailable, err, &runBackoff) {
@@ -351,6 +422,7 @@ func (s *Supervisor) check(ctx context.Context) (OffReason, string) {
 		EUID:              s.cfg.EUID,
 		ServiceUID:        s.cfg.ServiceUID,
 		MaintenanceMarked: s.cfg.MaintenanceMarked,
+		StoreDir:          s.cfg.StoreDir,
 		OpenLogs:          s.cfg.OpenLogs,
 		IgnoresOwnership:  s.cfg.IgnoresOwnership,
 		CheckInstall:      s.cfg.CheckInstall,
@@ -372,9 +444,16 @@ type Preconditions struct {
 	// MaintenanceMarked reports whether the maintenance marker stands,
 	// reading it only.
 	MaintenanceMarked func() (bool, error)
-	// OpenLogs is the step after the marker: the supervisor reopens both
-	// append-only logs on it, so the listener starts against the files as
-	// they are now (after maintenance swapped them, too); doctor judges
+	// StoreDir is optional and runs after the marker, before OpenLogs,
+	// whose reopen takes the store lock, whose file is in the store
+	// directory: the supervisor creates that directory in it if it is
+	// missing, and judges one that exists without repairing it; doctor
+	// judges it only, so before the server's first start doctor finds it
+	// missing. An error keeps the listener off with OffStoreDir.
+	StoreDir func(ctx context.Context) error
+	// OpenLogs is the step after the store directory: the supervisor
+	// reopens both append-only logs on it, so the listener starts against
+	// the files as they are now (after maintenance swapped them, too); doctor judges
 	// both logs read-only, holding and writing nothing. An error keeps the
 	// listener off with OffLogsUnavailable.
 	OpenLogs func(ctx context.Context) error
@@ -405,10 +484,9 @@ type Preconditions struct {
 }
 
 // Check runs the start checks in the design's order (the effective uid, the
-// mount flags, the installed files, the maintenance marker, the log reopen,
-// the sandbox self-check, a server count of exactly one, the user scope's
-// start step) and returns the
-// first reason the listener may not start, with its error's text, or ""
+// mount flags, the installed files, the maintenance marker, the store
+// directory, the log reopen, the sandbox self-check, a server count of
+// exactly one, the user scope's start step) and returns the first reason the listener may not start, with its error's text, or ""
 // when every check passes. Nothing is opened on the data root before its
 // mount flags and the installed files are vetted, so an install that
 // predates the logs is reported as the install reason, naming its remedy.
@@ -445,6 +523,11 @@ func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
 		return OffMaintenanceUnknown, err.Error()
 	} else if marked {
 		return OffMaintenance, ""
+	}
+	if p.StoreDir != nil {
+		if _, err := guard(func() (struct{}, error) { return struct{}{}, p.StoreDir(ctx) }); err != nil {
+			return OffStoreDir, err.Error()
+		}
 	}
 	if _, err := guard(func() (struct{}, error) { return struct{}{}, p.OpenLogs(ctx) }); err != nil {
 		return OffLogsUnavailable, err.Error()
@@ -493,8 +576,21 @@ func guard[T any](f func() (T, error)) (v T, err error) {
 // no command puts it right: only a missing, wrong or unflagged installed
 // file names `sudo k3sm install`.
 func (r OffReason) Remedy() string {
-	if r == OffInstall {
+	switch r {
+	case OffInstall:
 		return installRemedy
+	case OffNotActivated:
+		return NotActivatedRemedy
+	case OffSocketParentMissing:
+		return ParentMissingRemedy
+	case OffAlreadyActivated:
+		return RestartRemedy
+	case OffActivatedInheritable:
+		return InheritableRemedy
+	case OffActivatedWrong:
+		return NotActivatedRemedy
+	case OffPodProfile:
+		return PodProfileRemedy
 	}
 	return ""
 }
@@ -519,6 +615,27 @@ func (s *Supervisor) off(reason OffReason, detail string, last OffReason, wait t
 	default:
 		s.cfg.Log.Warn(offMsg, "reason", string(reason), "err", detail, "retry", wait)
 	}
+}
+
+// notActivated records the activation's terminal reason, logs it once at
+// Warn naming the remedy (RestartRemedy for a reason without its own), and
+// waits for ctx: nothing is retried.
+func (s *Supervisor) notActivated(ctx context.Context, ae *ActivationError) {
+	remedy := ae.Reason.Remedy()
+	if remedy == "" {
+		remedy = RestartRemedy
+	}
+	s.set(State{Phase: PhaseOff, Reason: ae.Reason, Detail: ae.Error()})
+	s.cfg.Log.Warn(offMsg+"; "+remedy, "reason", string(ae.Reason), "err", ae.Error())
+	<-ctx.Done()
+}
+
+// terminal records a reason no retry in this process changes, logs it once
+// at Warn naming its remedy, and waits for ctx.
+func (s *Supervisor) terminal(ctx context.Context, reason OffReason, detail string) {
+	s.set(State{Phase: PhaseOff, Reason: reason, Detail: detail})
+	s.cfg.Log.Warn(offMsg+"; "+reason.Remedy(), "reason", string(reason), "err", detail)
+	<-ctx.Done()
 }
 
 // backOff records and logs a listener failure and waits out the backoff,

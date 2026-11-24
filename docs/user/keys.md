@@ -141,20 +141,52 @@ log) and names `sudo k3sm keys audit --rotate` for the audit log or
 
 ### The keystore user scope row in `k3sm doctor`
 
+The server creates `/var/lib/k3sm/server/keystore/` when it starts, as its own user at mode 0700,
+the way the first `put` would. So on a fresh install the user scope comes up once the server
+has started, without a `sudo k3sm keys put` first. The master key is still created only by the
+first root `put` (see the table above), so until then a user's `put` fails.
+
 `doctor` runs in its own process and cannot ask the server whether the listener is serving, so
 its `keystore-user-scope` row says only what it can check:
 
-- `keystore user scope: start checks pass; a socket owned by the service user is at <path>`
-  (PASS): every check the server makes before it starts the listener passes, and a socket is at
-  the path. `doctor` looks at the path; it never connects, since the server refuses root and
-  the service user.
+- `keystore user scope: start checks pass; a root-owned <mode> socket is at <path> (path facts
+  only: whether the server is serving it is not checked)` (PASS):
+  every check the server makes before it starts the listener passes, and the socket at the path
+  is owned by root, in the daemon group, at the mode the server's LaunchDaemon plist names (the
+  row prints it), in a directory owned by root:wheel that only root can write to. launchd
+  creates the socket, as root, from the `Sockets` entry that `sudo k3sm install` writes into
+  that plist, and hands it to the server. `doctor` looks at the path; it never connects, since
+  the server refuses root and the service user.
 - `keystore user scope: start checks pass, but no listening socket at <path>` (WARN): the
-  checks pass but nothing, something other than a socket, or another user's socket is at the
-  path.
+  checks pass but nothing, something other than a socket, a socket with another owner, group
+  or mode, or a socket in a directory with another owner or mode is at the path. The remedy
+  depends on the installed server plist:
+  - without the `Sockets` entry (a plist written by an install from before the socket existed)
+    it names `run sudo k3sm install (it rewrites the server plist and re-bootstraps the job)`;
+    launchd reads that entry only when the job is bootstrapped, and a server whose plist lacks
+    it is refused the socket (measured). The server logs one warning, `launchd activated no
+    socket for this server`, and does not retry.
+  - with the entry, launchd has no `keys` socket for this job: its loaded definition has no
+    such entry, or a parent of the socket path is missing (measured with three missing
+    levels); or the server has not started yet or is restarting. It names `run sudo k3sm
+    install (it rewrites and reloads the server's definition); if the data root is on a volume
+    that is not mounted, mount it first`. The server logs one warning, `launchd has no keys
+    socket for this job`, and does not retry until it is restarted.
+  The PASS line states path facts only. `doctor` cannot see inside the server, so it cannot
+  tell whether the server is serving the socket. A socket stays at the path in two cases where
+  nothing serves it: after the job is unloaded (`launchctl bootout` leaves `keys.sock`), and
+  after the server refused the socket it was handed (a wrong descriptor or path, or one
+  without `FD_CLOEXEC`); the server's log names that refusal.
 - `keystore user scope: off (<reason>)` (WARN): a check fails, with the server's own reason.
   For a missing, wrong or unflagged log or socket directory it adds `run sudo k3sm install`;
   for `more than one server registered` it names the servers (up to 8, then how many more);
   for `the append-only logs cannot be opened (logs-unavailable)` it shows the error;
+  for `the store directory is missing or refused` it shows why: before the server's first start
+  there is no `/var/lib/k3sm/server/keystore/` yet, and the row says the server creates the store
+  directory at start; once the server has started, the row passes. A directory that is there but
+  not the server's user's at mode 0700 is refused, by the server and by `doctor`, and the server
+  never repairs it: as root, make it the server's user's at 0700, or remove it if it holds
+  nothing, and the server creates it again;
   `the service uid is in the login range` means the service user's uid is 501 or above, where
   login users' uids start, and the listener does not start until the service user is a system
   account below 501;
@@ -162,6 +194,13 @@ its `keystore-user-scope` row says only what it can check:
   the server runs before it serves).
 - `keystore user scope: the server count cannot be read as this user` (WARN): run
   `sudo k3sm doctor`; this does not mean the user scope is off.
+
+The server makes one check `doctor` does not repeat: before it serves the socket, it renders the
+Pod profile its built-in runtime gives Pods on this node and checks that the profile denies Pods
+the socket under this node's data root. If it does not, the user scope stays off for the life of
+the server, with `this build's Pod profile does not deny the keystore socket`. The server logs
+one warning naming the remedy, `install a k3sm built with a matching runtimed`, and keeps
+running; reinstalling or restarting the same build does not change it.
 
 ### When a user scope blocks the rebuild
 
@@ -524,7 +563,7 @@ The keystore is not part of `k3sm snapshot save`. It lives in three places:
 
 | Path | What it is |
 |---|---|
-| `/var/lib/k3sm/server/keystore/` | The entries and all their versions. |
+| `/var/lib/k3sm/server/keystore/` | The entries and all their versions. The server creates it, empty, when it starts. |
 | `/var/lib/k3sm/server/cred/keystore-master/` | The master key and its fingerprint. |
 | `/var/lib/k3sm/keystore-floor.json` | Root's record of the newest version of each entry, which is how an older copy put back is caught. |
 | `/var/lib/k3sm/keystore-delivery.json` | Which entries are delivered as which Secrets. It holds no value. |
@@ -639,7 +678,9 @@ the same warning, and the merge keeps each deletion it records. An `rm` at this 
 the deletion, but the restored entry's files are still in `pre-restore.d/restored`, out of its
 reach. The merge removes those files before it moves the restored copy into place, so you do not
 need to run `rm` again. A server started before the merge delivers no keys to the cluster and
-deletes no delivered Secret: it logs an error and tries again until the merge has run. Once it
+deletes no delivered Secret: it logs an error and tries again until the merge has run. It also
+creates an empty `/var/lib/k3sm/server/keystore` at start, which the merge then moves aside as
+`planted-<time>` and reports, exiting 4, so keep the server stopped until the merge has run. Once it
 has, the server deletes the Secret delivered from each entry the merge or an `rm` deleted, as
 after any `rm`: once the restore hold has passed and unless the breaker holds (see [Delivering
 an Entry as a Secret](#delivering-an-entry-as-a-secret)). Merge those deletions into the restored floor:

@@ -46,6 +46,8 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/k3sm/pkg/keystore/socket"
+	"k3sm.io/k3sm/pkg/provider/podlogs"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // stillClock is a socket.Clock whose waits never end on their own: a test
@@ -183,8 +185,18 @@ func newWiringFixture(t *testing.T) *wiringFixture {
 		creds:        fakePeerCreds{},
 		sandbox:      fakePeerSandbox{},
 		sandboxCheck: func() error { return errFakeSandboxCheck },
-		clock:        f.clock,
-		log:          f.logger,
+		// The runtime's generator over a posture whose pod root and data
+		// root are the temp data root, as on a default node.
+		podProfile: func() (string, error) {
+			return keystorePodProfile(sandbox.Posture{
+				WorkDir:    f.dataRoot,
+				DataRoot:   f.dataRoot,
+				StateDir:   filepath.Join(f.dataRoot, "server"),
+				PodLogsDir: podlogs.DefaultPodLogsDir,
+			})
+		},
+		clock: f.clock,
+		log:   f.logger,
 	}
 	return f
 }
@@ -593,17 +605,32 @@ func mustHandler(t *testing.T) *socket.Handler {
 }
 
 // TestDoctorKeystoreSocketLstat holds the doctor row's socket fact to an
-// lstat: a socket of the service user's passes; nothing there, a file, a
-// symlink, or another owner's socket is no listening socket. The socket
+// lstat: launchd's socket, root's at 0666, passes; nothing there, a file, a
+// symlink, a socket of the service user's (the self-bind form, which does
+// not ship) or one at another mode is no listening socket. The socket
 // cases are judged from the mode and owner an lstat returns, so no socket
 // is bound.
 func TestDoctorKeystoreSocketLstat(t *testing.T) {
 	const svc = 260
-	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, svc, svc); err != nil {
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, 0, 1, launchdSocketOwner); err != nil {
+		t.Fatalf("launchd's socket: %v", err)
+	}
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, svc, 1, launchdSocketOwner); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "owned by uid 260, not root's") {
 		t.Fatalf("the service user's socket: %v", err)
 	}
-	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, 0, svc); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "owned by uid 0") {
-		t.Fatalf("root's socket: %v", err)
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o600, 0, 1, launchdSocketOwner); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "mode 0600, not 0666") {
+		t.Fatalf("a root socket at 0600: %v", err)
+	}
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, 0, 0, launchdSocketOwner); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "group is 0, not daemon's 1") {
+		t.Fatalf("a root:wheel socket: %v", err)
+	}
+	if err := judgeKeystoreSockDir(unix.S_IFDIR|0o755, 0, 0); err != nil {
+		t.Fatalf("a root:wheel 0755 directory: %v", err)
+	}
+	for _, d := range []struct{ mode, owner, group uint32 }{{unix.S_IFDIR | 0o775, 0, 0}, {unix.S_IFDIR | 0o755, svc, 0}, {unix.S_IFDIR | 0o755, 0, 20}, {unix.S_IFREG | 0o755, 0, 0}} {
+		if err := judgeKeystoreSockDir(d.mode, d.owner, d.group); !errors.Is(err, errNoListeningSocket) {
+			t.Errorf("directory %#o %d:%d: %v, want no listening socket", d.mode, d.owner, d.group, err)
+		}
 	}
 	dir := t.TempDir()
 	file := filepath.Join(dir, "file")
@@ -847,6 +874,14 @@ func TestDoctorKeystoreReopenJudgement(t *testing.T) {
 // mint it. It returns a login uid that is not the service user's.
 func newInstalledWiringFixture(t *testing.T) (*wiringFixture, uint32) {
 	t.Helper()
+	return installedWiringFixture(t, true)
+}
+
+// installedWiringFixture is newInstalledWiringFixture; with put unset it is
+// a fresh install: no store directory under the work dir and no root put,
+// so no master either.
+func installedWiringFixture(t *testing.T, put bool) (*wiringFixture, uint32) {
+	t.Helper()
 	if os.Geteuid() == 0 {
 		t.Skip("the test user stands in for the service user, which is never root")
 	}
@@ -870,7 +905,6 @@ func newInstalledWiringFixture(t *testing.T) (*wiringFixture, uint32) {
 		mode os.FileMode
 	}{
 		{f.deps.workDir, 0o700},
-		{storeCfg.Dir, 0o700},
 		{filepath.Join(f.dataRoot, "keystore-sock"), 0o755},
 		{filepath.Join(f.dataRoot, keystore.LogsDirName), 0o755},
 		{filepath.Join(f.dataRoot, keystore.LogsDirName, keystore.FloorDirName), 0o755},
@@ -894,8 +928,11 @@ func newInstalledWiringFixture(t *testing.T) (*wiringFixture, uint32) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := keystore.New(storeCfg).Put(t.Context(), "seed", keystore.KindOpaque, []byte("x")); err != nil {
-		t.Fatalf("minting the master: %v", err)
+	if put {
+		// A root put creates the store directory and mints the master.
+		if _, err := keystore.New(storeCfg).Put(t.Context(), "seed", keystore.KindOpaque, []byte("x")); err != nil {
+			t.Fatalf("minting the master: %v", err)
+		}
 	}
 	peer := uint32(600)
 	if peer == me {
@@ -1005,4 +1042,13 @@ func TestStartUserScopesStepRefusesOnLaterPass(t *testing.T) {
 	if err := cfg.StartScopes(t.Context()); err == nil {
 		t.Fatal("a later pass with the audit log gone passed; want the bounds check's failure")
 	}
+}
+
+// runKeystoreSocket runs the built ks (superviseKeystoreSocket) on the wall
+// clock. A nil ks (a worker) runs nothing and stops at once.
+func runKeystoreSocket(ctx context.Context, ks *keystoreSocket) (stop func()) {
+	if ks == nil {
+		return noStop
+	}
+	return superviseKeystoreSocket(ctx, func() (*keystoreSocket, error) { return ks, nil }, wallClock{}, ks.log)
 }

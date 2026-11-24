@@ -28,6 +28,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"k3sm.io/k3sm/pkg/keystore"
+	"k3sm.io/runtimed/pkg/keystorepaths"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -40,12 +41,14 @@ import (
 
 // keystoreLogMode is both logs' mode; keystoreRunDirMode the run
 // directory's; keystoreLogsDirMode keystore-logs/'s and each log
-// directory's; keystoreStagingDirMode keystore-staging/'s.
+// directory's; keystoreStagingDirMode keystore-staging/'s;
+// keystoreSockDirMode keystore-sock/'s.
 const (
 	keystoreLogMode        = 0o600
 	keystoreRunDirMode     = 0o700
 	keystoreLogsDirMode    = 0o755
 	keystoreStagingDirMode = 0o700
+	keystoreSockDirMode    = 0o755
 )
 
 // keystoreKeystoreSubdir is the entries' directory in the server work dir,
@@ -88,8 +91,8 @@ func keystoreStep(sys System, cfg Config, uid uint32) error {
 	return nil
 }
 
-// ensureKeystoreFiles creates keystore-run/, keystore-logs/ and both
-// append-only logs in dataRoot, for the service user svcUID:svcGID, and
+// ensureKeystoreFiles creates keystore-run/, keystore-sock/, keystore-logs/
+// and both append-only logs in dataRoot, for the service user svcUID:svcGID, and
 // keeps what an earlier install made. rootUID is the data root's owner: 0
 // in production; only a non-root test passes its own uid. Every step goes
 // through one descriptor on the data root, opened O_DIRECTORY|O_NOFOLLOW
@@ -147,6 +150,9 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 		}
 	}
 	if err := ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID); err != nil {
+		return err
+	}
+	if err := ensureKeystoreSockDir(dfd, rootUID); err != nil {
 		return err
 	}
 	g, err := openKeystoreLogs(dfd, rootUID)
@@ -273,6 +279,53 @@ func ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID int) error {
 		if err := fileAttrSeam.Fchown(fd, svcUID, svcGID); err != nil {
 			return fmt.Errorf("chown %s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+// keystoreSockGID is keystore-sock/'s group: wheel, the group the server's
+// start check requires (keystore.JudgeSocketDir). A non-root test sets the
+// test user's own group, which it can chown to.
+var keystoreSockGID = 0
+
+// ensureKeystoreSockDir creates keystore-sock/, the keystore socket's
+// directory, rootUID's 0755 in keystoreSockGID (root:wheel), whatever the
+// data root's group BSD mkdir would hand it, or keeps the one there; and
+// judges it as the server's start check does (keystore.JudgeSocketDir:
+// rootUID's, in keystoreSockGID, at 0755, with no flag and no ACL), with
+// the same refusal text. launchd creates keys.sock in it when the server
+// activates its socket; no service-uid process can create, unlink or
+// replace a name there (docs/design/keystore.md § "The socket's directory
+// is root's"). A directory that is anything else is refused and kept as
+// found: an existing keystore-sock/ is never chowned or chmodded.
+func ensureKeystoreSockDir(dfd, rootUID int) error {
+	name := keystorepaths.SockDir
+	created := true
+	if err := unix.Mkdirat(dfd, name, keystoreSockDirMode); err != nil {
+		if !errors.Is(err, unix.EEXIST) {
+			return fmt.Errorf("create %s: %w", name, err)
+		}
+		created = false
+	}
+	fd, err := unix.Openat(dfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w: %w", name, err, errKeystoreFileUntrusted)
+	}
+	defer func() { _ = unix.Close(fd) }() // a directory, read-only
+	// Mkdirat gave the directory this call created the data root's group
+	// (BSD mkdir), and a restrictive umask narrows its mode: both are set
+	// through the descriptor. A directory that was already there is judged
+	// as found.
+	if created {
+		if err := unix.Fchown(fd, rootUID, keystoreSockGID); err != nil {
+			return fmt.Errorf("chown %s: %w", name, err)
+		}
+		if err := unix.Fchmod(fd, keystoreSockDirMode); err != nil {
+			return fmt.Errorf("chmod %s: %w", name, err)
+		}
+	}
+	if err := keystore.JudgeSocketDir(fd, rootUID, keystoreSockGID); err != nil {
+		return fmt.Errorf("%w: %w", err, errKeystoreFileUntrusted)
 	}
 	return nil
 }

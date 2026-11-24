@@ -1961,19 +1961,43 @@ creates `keystore-sock/` root:wheel 0755. The socket in it is a launchd `Sockets
 server's own job: `ServerPlist` (`pkg/install/plist.go:218`) gains a `Sockets` dictionary with
 one listener, `SockPathName` `/var/lib/k3sm/keystore-sock/keys.sock` and `SockPathMode` 0666,
 rendered by `renderPlist` (`pkg/install/plist.go:609`) from a new field of `launchdPlist`
-(`pkg/install/plist.go:573`). launchd creates and binds the socket as root before it starts the
-job, and the server takes the listening descriptor with `launch_activate_socket`, sets
-`FD_CLOEXEC` on it and passes it to no child (Open requirement 3, U120). No service-uid process can create, unlink or
+(`pkg/install/plist.go:573`). launchd records the socket at the job's bootstrap and binds it at
+the path, as root, when the job takes it with `launch_activate_socket` (K7a amendment
+2026-11-23); the server confirms `FD_CLOEXEC` on the descriptor and passes it to no child (Open
+requirement 3, U120). No service-uid process can create, unlink or
 replace a name in a root-owned 0755 directory, so no service-uid process, the server's
 children and a Pod's processes included, can bind `keys.sock`, whether or not the server is
 running (U104, E24). That launchd activates a `Sockets` socket for a job with `UserName` set,
-and that the server, as the service user, receives it, is a K7a measurement. **If it fails,
-the fallback is deny plus pin**: install makes `keystore-sock/` the service user's, 0755, the
+and that the server, as the service user, receives it, was a K7a measurement; the fallback,
+had it failed, was deny plus pin: install makes `keystore-sock/` the service user's, 0755, the
 server binds `keys.sock` itself, and the bind is kept from Pods by the Seatbelt deny and from
-other service-uid code by the client's server pin ("The client pins the server"), as before;
-the K7a amendment records which form ships. Two more K7a outcomes select the fallback: a
-client-side peer that names launchd (Open requirement 4), and a Pod that can obtain the
-listener from launchd itself (Open requirement 5).
+other service-uid code by the client's server pin ("The client pins the server"). **The K7a
+amendment of 2026-11-23 records that the activated form ships**: launchd activated the socket
+for a `UserName` job, root:daemon 0666 in the root 0755 directory; the job got one descriptor,
+`FD_CLOEXEC` already set; no process tried but the job, a Pod's included, obtained the
+listener, since launchd answered each with `ESRCH` (measured on macOS 27.2.1 only: a bonus
+barrier, not a guarantee, Open requirement 5); and the client-side peer reads as launchd
+(`LOCAL_PEERCRED` uid 0) while the audit token names the accepting server, which the client check of Open requirement 4 accepts.
+A server launchd did not start, or whose plist has no `Sockets` key, gets `ESRCH` (both
+measured); one for which launchd has no `keys` socket, because its loaded definition has no
+such entry or a parent of the socket path is missing at the activation call (measured with
+three missing levels), gets `ENOENT`. Each keeps the user scope off for the life of the
+process; the server never binds `keys.sock` itself. **The server checks its Pod profile at
+start.** Before the supervisor serves, the server renders a Pod profile with the embedded
+runtimed's own generator (`sandbox.Generate`) over the posture its runtime is built with
+(`serverPodPosture`, `cmd/k3sm/keystoreprofile.go`), and requires that the text deny
+`file-read*`, `file-write*` and unix-socket `network-outbound` on `keystore-sock/` under the
+data root it serves, in each spelling the generator writes (`/var`, `/private/var`,
+`/System/Volumes/Data`), with no overlapping allow after the deny (`socket.ProfileDeniesSocket`).
+A profile that does not, as from a k3sm built against a runtimed older than the deny or a data
+root the posture does not name, keeps the user scope off for the life of the process with `this
+build's Pod profile does not deny the keystore socket`; the server logs one warning naming
+`install a k3sm built with a matching runtimed` and keeps running. The barriers relied on are
+that Seatbelt deny and the listener's sandboxed-peer refusal (Open requirement 15); launchd's
+`ESRCH` to a Pod is not one of them. A data root on a volume that is not
+mounted was not measured; a default-layout data root that is not mounted is refused earlier,
+by the shadowed-work-dir check (`refuseShadowedWorkDir`, `cmd/k3sm/server.go`), before the
+server reaches this step.
 
 ### Key hierarchy
 
@@ -4277,9 +4301,27 @@ directory is root's"). A worker node runs no listener (E18).
   names `sudo k3sm install` (U31, U38, E15).
 - **Supervision details.** The start checks run at start and before every retry, in this order:
   the effective uid, the data root's mount flags, the installed files, the maintenance marker
-  (read only), the reopen of both append-only logs (its own step: a reopen that fails keeps the
-  listener off as `logs-unavailable`, with the error), the peer-sandbox self-check, and a server
-  count of exactly one (a count that cannot be read, or of none, keeps the listener off too).
+  (read only), the store directory, the reopen of both append-only logs (its own step: a reopen
+  that fails keeps the listener off as `logs-unavailable`, with the error), the peer-sandbox
+  self-check, and a server count of exactly one (a count that cannot be read, or of none, keeps
+  the listener off too).
+- **The server creates the store directory at start.** The log reopen takes the store lock,
+  whose `.lock` is in `server/keystore/`, so the store-directory step runs before it. When
+  `server/keystore/` is missing, the server, which runs as the service user and owns `server/`,
+  creates it with the store's own helper, the one a first `keys put` uses (`mkdirOwned`: the
+  service user's, 0700, any inherited ACL removed, `server/` fsynced). A directory that exists
+  is judged as every open of the store judges it (a directory, the service user's, granting
+  nothing to group or others), and one that fails is never repaired: the listener stays off as
+  `the store directory is missing or refused`, with the open's refusal and its repair (as root,
+  make it the service user's at 0700, or remove it if it holds nothing), on every pass. So a
+  fresh install's user scope comes up without a root `keys put`. Only the installed server
+  creates it: the step runs after the effective-uid check, and a worker builds no listener. A
+  root `put` racing the step is safe: whichever `mkdir` lands first makes the directory and the
+  other only judges it; the server's `mkdir` makes a directory the service user already owns,
+  which the put's judgement accepts, and a put's `mkdir` makes one root owns until its
+  handover, which the server refuses for that pass only, finding it handed over on the next.
+  Doctor runs the same judgement read-only: before the server's first start it shows the
+  user scope off for the store directory, saying the server creates it at start.
   Nothing is opened on the data root before its mount flags and the installed files are
   vetted, so an install that predates the logs is reported as the install reason, naming
   `sudo k3sm install`. A failed check retries on a doubling backoff from 1 second to 5 minutes,
@@ -4369,14 +4411,14 @@ such a name is well formed and simply has no scope.
 
 **The client's checks are advisory.** The CLI opens the socket through an `os.Root` on the
 data root, checks by realpath that `keystore-sock/` is root's, mode 0755, under the root-owned
-data root, and that `keys.sock` is a socket (the service user's directory in the fallback), then reads the server's uid off the connected descriptor (`LOCAL_PEERCRED` from the
-client side; under socket activation, whether that names the server or launchd, the process
-that listened, is measured in K7a with the token below, and if it names launchd the self-bind
-form ships, Open requirement 4). **The connected-descriptor peer uid is
-the authority in both directions**: a
-value is never written to a socket whose peer is not the service user, whatever the path
-checks said (U36). That `LOCAL_PEERCRED` reports the service uid on the client side
-is measured (K0 amendment 2026-11-21).
+data root, and that `keys.sock` is a socket, then judges the peer of the connected descriptor
+by the client check (Open requirement 4): `LOCAL_PEERCRED` reads uid 0, since under activation
+it names launchd, the socket's creator (K7a amendment 2026-11-23); the audit token
+(`LOCAL_PEERTOKEN`) names a process whose euid is the service uid; and that process's code has
+the installed binary's cdhash (below). **The connected descriptor is the authority in both
+directions**: a value is never written to a socket whose peer fails any of the three, whatever
+the path checks said (U36). The uid 0 is accepted only beside the token's euid and the cdhash,
+never alone: a peer whose token names root, launchd or any other uid is refused.
 
 **The client pins the server, not just its uid.** With the socket activated from a root-owned
 directory, no service-uid process can bind `keys.sock`, and the pin is the second layer. In the
@@ -4430,13 +4472,13 @@ socket before both checks pass (U69, E24).
   them run as the service user inside the server's trust domain, which can read `M`
   ("Who can hold which key"), so admitting one grants it nothing that domain lacks.
 - *Which process the token names.* Under socket activation launchd created and listened on
-  the socket, and the server only accepts on the descriptor it was given. Whether the
-  client-side `LOCAL_PEERTOKEN` names the accepting process or the process that listened is a
-  K7a measurement. U69 holds the case either way: a listener inherited or passed to another
-  process must not let that process pass the pin, and the server sets `FD_CLOEXEC` on the
-  activated descriptor and passes it to no one (Open requirement 3, U120). If the token names
-  launchd, the self-bind form ships, and U36 is never relaxed to accept uid 0 (Open
-  requirement 4).
+  the socket, and the server only accepts on the descriptor it was given. K7a measured
+  (amendment 2026-11-23) that the client-side `LOCAL_PEERTOKEN` names the accepting server, its
+  pid and euid, while `LOCAL_PEERCRED` names launchd (uid 0). U69 holds either way: a listener
+  inherited or passed to another process must not let that process pass the pin, and the
+  server marks the activated descriptor `FD_CLOEXEC` as it takes it and passes it to no one
+  (Open requirement 3, U120). The uid 0 of `LOCAL_PEERCRED` is accepted only with the token's
+  euid and cdhash (Open requirement 4).
 - This pins the server for the client; it does not pin the client for the server, which stays
   unpinned by ruling (residual 1). That `LOCAL_PEERTOKEN` is readable on the client side and
   that `SecCodeCopyGuestWithAttributes` resolves a service-user process from a login user's
@@ -5662,8 +5704,12 @@ no datastore migration. The skew window:
 (G18); the cluster has one server, or the user scope stays off; and `sudo k3sm install` runs
 after the upgrade, since it creates `keystore-sock/`, the server plist's `Sockets` entry and
 the two append-only files. Without it
-the user scope stays off, the server Warns at start and on every retry, `doctor` says why and
-the CLI's error names the command; the system scope works.
+the user scope stays off: a missing or wrong directory or log Warns at start and on every
+retry; a server plist without the `Sockets` entry, which launchd fixed at the job's bootstrap,
+is the terminal "launchd activated no socket for this server", Warned once and never retried;
+`doctor` names `sudo k3sm install` for both, and "mount the data root, then `sudo k3sm
+restart`" when the plist has the entry but the socket's parent was missing at the server's start, and the CLI's error names the command; the
+system scope works.
 
 **Rollback** is revert, rebuild and reinstall the previous binary. The release before M20 has
 no keystore, so a downgrade leaves every keystore file unused rather than misread. Three
@@ -5865,20 +5911,41 @@ text points here.
    *Test:* U120, server-side integration: spawn each child type (an `exec.Command` child, the
    runtimed helper, a Pod through the exec shim), list each one's open descriptors, and fail if
    the listening socket is among them.
-4. **Under activation the client may see launchd as the peer (K9a, measured in K7a).** The
-   client-side `LOCAL_PEERCRED` and `LOCAL_PEERTOKEN` may name launchd (uid 0), the process
-   that listened, not the accepting server. *Binding rule, a K7a outcome:* K7a measures both
-   from a login user's process. If either names launchd, or names anything but the accepting
-   server, the build ships the deny-plus-pin self-bind form ("The socket's directory is
-   root's"). U36's rule is never relaxed to accept uid 0. *Test:* U121: a client whose peer
-   reads as uid 0 or as launchd's code refuses and writes nothing.
-5. **A Pod might obtain the listener from launchd (K9a, measured in K7a).** A process
-   descended from the server's job can ask launchd for the job's sockets with
-   `launch_activate_socket`, and Pods descend from it (`runtimed/pkg/runtime/podreap.go:40`).
-   *Fix:* K7a measures this from a Pod. If a Pod can obtain the listener, the build ships the
-   self-bind form, and the Pod profile denies the launchd socket-activation lookup in either
-   form. *Test:* U122 (the rendered Pod profile carries the deny) and rig leg E27 (a Pod's
-   `launch_activate_socket` for the server's socket name gets no descriptor).
+4. **Under activation the client sees launchd as the credential peer (K9a, measured in K7a).**
+   K7a measured (amendment 2026-11-23), from a login user's process, that the client-side
+   `LOCAL_PEERCRED` reads euid 0 gid 0 (launchd, which created the socket) for every client,
+   while `LOCAL_PEERTOKEN` names the accepting server (euid the service uid, its pid) and the
+   code lookup from the token resolves the server's code and cdhash. *Binding rule, the client
+   check:* the client writes to the socket only when all three hold: `LOCAL_PEERCRED` uid 0,
+   the audit token's euid equal to the service uid, and the token's code the installed
+   binary's cdhash (U69). uid 0 is never accepted on its own, and a token naming root, launchd
+   or any uid but the service uid is refused. *Test:* U121: a client whose peer reads as uid 0
+   with a token naming launchd, root or another uid, or other code, refuses and writes
+   nothing; one whose token names the service uid and the installed cdhash proceeds.
+5. **A Pod might obtain the listener from launchd, or reach the socket by path (K9a, measured
+   in K7a).** A process descended from the server's job can ask launchd for the job's sockets
+   with `launch_activate_socket`, and Pods descend from it (`runtimed/pkg/runtime/podreap.go:40`).
+   Two denies are in question, and they differ:
+   (i) *No launchd activation-lookup deny is added, and launchd's answer is not relied on.* In
+   K7a (amendment 2026-11-23) launchd answered `ESRCH` to a Pod process and to every other
+   process but the job. That is measured on macOS 27.2.1 only; it is a bonus barrier, not a
+   guarantee, and another macOS release may answer otherwise. The activated form ships because
+   the barriers relied on do not depend on it: the Seatbelt deny of (ii) and the listener's
+   sandboxed-peer refusal (Open requirement 15). No Pod profile carries a lookup deny. *Test:*
+   rig leg E27 (a Pod's `launch_activate_socket` for the server's socket name gets no
+   descriptor), which also owes the macOS 26 measurement; U122.
+   (ii) *The Seatbelt path deny on `keystore-sock/` is required and stays.* It is the first
+   barrier between a Pod and the socket: without it a native Pod connected to `keys.sock` (K0
+   leg 4). Every Pod profile carries runtimed's keystore stanza
+   (`runtimed/pkg/sandbox/keystore.go`, `keystoreDenyStanza`), which denies connect and bind on
+   `keystore-sock/` and `keys.sock` (U16), and the provider's socket denies name `keys.sock`
+   (U46, `k3sm/pkg/provider::TestRuntimedSocketDeniedToPods`). The server checks at start that
+   the Pod profile its embedded runtime renders for its own posture carries this deny for the
+   data root it serves, in every spelling, and keeps the user scope off if it does not (K7a
+   amendment; `this build's Pod profile does not deny the keystore socket`). *Test:*
+   `k3sm/cmd/k3sm::TestServerPodProfileDeniesKeystoreSocket`, which renders the profile with
+   the linked runtimed for the default and for custom data roots, so a k3sm built against a
+   runtimed without the deny fails it; `TestKeystorePodProfileMismatchTurnsScopeOff`.
 6. **Same-target cross-record deletion (K13b).** Two honoured records, of two uids, can name
    the same `(namespace, secretName)`. The orphan sweep, the lost-authority delete and
    `rm-scope` match a Secret against one record's target, so one uid's tombstone, or a forged
@@ -5941,6 +6008,12 @@ text points here.
     reports a Seatbelt-confined Pod process as sandboxed and an unconfined login shell as not.
     *Test:* U137 with a fake token source, and rig leg E26: a real Pod's connect is refused with
     the keystore deny stanza removed.
+16. **launchd keeps the socket listening while the server does not accept (K9a).** Under
+    activation launchd holds `keys.sock` bound and listening whether the server is serving,
+    paused by the maintenance marker, backing off, off or not running, so a client's connect
+    succeeds into the backlog and then waits. *Fix:* the client (the non-root CLI) puts a
+    deadline on the connect and on `HELLO`, and reports the server unavailable when either
+    passes, rather than hang. *Test:* the non-root CLI's change names it.
 
 ### Facts from the rig spike
 
@@ -5967,6 +6040,98 @@ second, inside the root-only `keystore-staging/`, before it is reachable.
 | 3 | `mbr_uid_to_uuid` is stable across a server restart; its cold latency; what it returns for a uid with no record | **Measured.** The GeneratedUID equals `dscl`'s and is stable across processes. Cold first lookup about 1.4 ms, worst of 20 cold processes 2.8 ms, warm median 0.17 ms, so a 250 ms deadline has wide margin. A uid with no record returns the synthesized form `FFFFEEEE-DDDD-CCCC-BBBB-AAAA<uid hex>` with status 0, and so does root; the synthesized-prefix rule is required. | "Key hierarchy" |
 | 4 | a Pod with the data-root denies cannot reach the socket or any `keystore-*` path; without them, what a Pod reaches today | **Without the denies, measured:** a native Pod on the server connected to `keys.sock` (two accepts), so the denies are a hard prerequisite of any keystore file or socket (K5 before K8). Phase A's two data-root files did not exist on the rig, so their readability today is unmeasured. **Pending:** the Pod with the denies is the K5 rig leg (E10). | "Pod denies", "Threat model" |
 | 5 | which uid a native Pod's processes run as; whether a Pod spec field or runtimed path can make it 501 or above | **Measured for a default Pod:** uid 250 (the service user), below 501, and the socket saw peer euid 250. **Pending:** the spec-field and runtimed-path half (`runAsUser` and the other fields) is K5's row U15. Pods and the server share uid 250, which is why the client pins the server by more than its uid. | "Pod denies" (layer 2, row U15) |
+
+**K7a amendment, 2026-11-23: socket activation ships.** Every fact below was measured on
+macOS 27.2.1 only; rig leg E27 owes the same measurements on macOS 26, the oldest supported
+release. The activation probe (`hack/acceptance/keystore-activation-probe`) ran on a worker lab
+Mac as root, with a test job carrying `UserName` and a `Sockets` entry at mode 0666, and cleaned
+up after itself; the missing-parent run used the same probe on 2026-11-24, as root, with its own
+test job (evidence: `missing-parent-2026-11-24/RESULT.md` and `probe.log` in the keystore
+evidence set, beside the probe's 2026-11-23 logs); the respawn run did too, on the worker lab
+Mac, with the probe exec'd directly by launchd (evidence: `activation-respawn-2026-11-24/RESULT.md`
+and `probe.log` in the same set). Measured on macOS 27.2.1:
+
+- At bootstrap launchd records the socket but has not bound it at the path (`launchctl print`
+  shows `needs_rename = 1`). It binds it, root:daemon 0666 in the root 0755 directory, when the
+  job calls `launch_activate_socket`; the job (euid the service uid) gets one descriptor,
+  `FD_CLOEXEC` already set, whose address reads launchd's bind name,
+  `/var/run/com.apple.launchd.<random>/<entry>`, not the plist's path.
+- On the server side each peer's `LOCAL_PEERCRED`, `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` agree.
+- On the client side `LOCAL_PEERCRED` reads euid 0 gid 0 (launchd) for every client, while
+  `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` name the accepting server, whose code and cdhash the
+  lookup from the token resolves from a login user's process.
+- No other process (a login user, the service user, a child of the job before and after it
+  took the socket, with and without `setsid`, a Pod process) obtains the listener:
+  `launch_activate_socket` returns `ESRCH`.
+- A missing socket directory never fails the bootstrap and never stops the job. When one level
+  is missing, launchd creates it root:wheel 0755 at the job's `launch_activate_socket` and
+  hands over the socket; with three levels missing it answers `ENOENT` with no descriptor and
+  creates nothing, and the job runs on. A real unmounted volume was not measured. `<launch.h>`
+  words `ENOENT` as no socket of the specified name owned by the caller: launchd has no `keys`
+  socket for this job, because its loaded definition has no such entry, or a parent of the
+  socket path is missing at the activation call.
+- A job whose plist has no `Sockets` key, running the probe itself, gets `ESRCH`, as does any
+  process that is not the job: `ESRCH` names `sudo k3sm install`, measured.
+- With `KeepAlive` true, a `SIGKILL` respawn and a `kickstart -k` each activate again: rc 0,
+  one descriptor, the same socket inode. launchd holds the socket across the job's runs, so a
+  restarted server gets the socket back (`sudo k3sm restart`).
+- The activated descriptor's address is always launchd's bind name, never the `SockPathName`.
+- `launchctl bootout` leaves `keys.sock` on disk, root:daemon 0666. Uninstall removes the whole
+  `keystore-sock/` once the server's bootout succeeded; until then, and after a bootout that
+  is not an uninstall, `doctor`'s lstat can find a socket of a job that is not loaded. Its pass
+  text therefore states path facts only (a root-owned socket at the plist's mode is at the
+  path), never that a server is listening.
+
+On that evidence the activated form ships, not the deny-plus-pin fallback, and the client check
+changes: the client accepts the `LOCAL_PEERCRED` uid 0 that activation produces only beside an
+audit token whose euid is the service uid and whose code has the installed binary's cdhash.
+U36, U121 and Open requirement 4 are reworded to that check. Open requirement 5 splits in two:
+the launchd activation-lookup deny is not needed, since a Pod gets `ESRCH`; the Seatbelt path
+deny on `keystore-sock/` stays required. Open requirement 16 is new.
+
+Delivered with this amendment: the server plist's `Sockets` entry `keys` at
+`<dataRoot>/keystore-sock/keys.sock`, mode 0666; install's `keystore-sock/`, root:wheel 0755
+(set through its descriptor when install creates it, whatever the umask), removed by uninstall
+only once the server's bootout succeeded; and the server's one activation per process, for one
+work dir (a second work dir is refused). It calls `launch_activate_socket` outside
+`syscall.ForkLock`, because holding that lock across a launchd call would block every new Go
+socket in the server (net takes its read lock per socket on darwin, and a waiting `os/exec`
+writer blocks new readers), and then confirms `FD_CLOEXEC` on every descriptor under the read
+lock. The tradeoff: launchd sets the flag (measured on macOS 27.2.1); were it ever unset, a Go
+fork in the window between the call and the confirm could inherit the descriptor, which the
+confirm cannot take back, so the server closes what it holds and refuses to serve for the life
+of the process, and the release gate requires E27's macOS 26 measurement of the flag. It
+requires one listening `SOCK_STREAM` socket whose address has the shape of launchd's bind name
+(a shape check only, since that is all an activated descriptor reports), and then judges the
+path clients connect to, `keystorepaths.SocketPath(dataRoot)`, with `doctor`'s rule: a
+root:daemon socket at the plist's mode in a root:wheel 0755 directory. It checks that only root
+could have put a socket at the clients' path; the descriptor's own address is launchd's
+private bind name, so the descriptor cannot be tied to the path. It serves a close-on-exec
+duplicate, held until the process exits. A process-wide holder makes the one call, so it never
+asks launchd twice; the result of a second call would be `<launch.h>`'s documented `EALREADY`,
+which was not measured. Every other outcome is a terminal off state, logged once at Warn and
+never retried: `ESRCH` "launchd activated no socket for this server", naming `sudo k3sm
+install` (it rewrites the server plist and re-bootstraps the job); `ENOENT` "launchd has no
+`keys` socket for this job: its loaded definition has no such entry, or a parent of the socket
+path is missing (measured with three missing levels)", naming "run `sudo k3sm install` (it
+rewrites and reloads the server's definition); if the data root is on a volume that is not
+mounted, mount it first"; a wrong descriptor or path, naming `sudo k3sm install`, which
+rewrites and reloads the definition so launchd binds the socket afresh; `EALREADY`, naming
+`sudo k3sm restart`; and a descriptor without `FD_CLOEXEC`, which a restart does not change,
+naming "report it: launchd handed the server an inheritable descriptor; the user scope stays
+off". `doctor` judges the same path rule, and with no socket there names `sudo k3sm install`
+in both cases: when the installed plist lacks the `Sockets` entry, and otherwise with the
+`ENOENT` text, saying the state is also seen while the server has not started yet or is
+restarting. Its pass text states path facts only: whether the server is serving the socket is
+not checked.
+
+**What is reachable meanwhile.** Until the non-root CLI ships with the client check (U36,
+U121) and the connect and `HELLO` deadlines (Open requirement 16), the socket's only clients are
+ones that speak the raw protocol themselves. In that window the barriers are the server's own
+refusals: the eligible-uid floor and ceiling, the refusal of the service uid and of root, the
+refusal of a sandboxed peer, and the per-uid rate limits, budgets and caps. Rig leg E27 must
+pass on macOS 26 before any release that includes this change. Not measured here: the 50 ms
+exclusive hold bound and GeneratedUID stability.
 
 **Owed to K7a.** K7a is the measurement run before the changes that depend on it, recorded
 as a dated amendment like K0's. It measures: `LOCAL_PEERTOKEN` and the code lookup from it on
@@ -6948,7 +7113,7 @@ carried by the unit rows.
 | U33 | `refused` lines are rate-limited per uid with a summary of the dropped count | `k3sm/pkg/keystore/socket::TestRefusedLinesRateLimited` | checked: the socket operations (the post-frame refused line) |
 | U34 | 5 mutating ops a second per uid; 30 `read-for-exec` a minute per uid, each audited `exec-read` | `k3sm/pkg/keystore/socket::TestMutationRateLimit`, `TestExecReadCapPerUID`, `k3sm/pkg/keystore::TestExecReadAudited` | checked: the socket operations (the bridge's rate limits) |
 | U35 | the socket server's store interface has no reveal, show or rewrap method | `k3sm/pkg/keystore/socket::TestStoreInterfaceHasNoRevealMethod` | checked: the socket operations (the store bridge) |
-| U36 | the client refuses a socket whose connected peer uid is not the service uid, whatever the path checks said (seam: peer-credential source, client side) | `k3sm/cmd/k3sm::TestClientRefusesForeignServerUID` | pending: the non-root CLI and `exec` |
+| U36 | the client refuses a socket whose connected peer fails the client check, whatever the path checks said: `LOCAL_PEERCRED` uid 0 (launchd, under activation), the audit token's euid equal to the service uid, and the installed binary's cdhash (seam: peer-credential source, client side) | `k3sm/cmd/k3sm::TestClientRefusesForeignServerUID` | pending: the non-root CLI and `exec` |
 | U37 | `exec` sets the variable only in the child; nothing on stdout, nothing on disk; the value never enters argv; no non-root verb writes a value to stdout | `k3sm/cmd/k3sm::TestKeysExecEnvOnlyInChild`, `TestNoNonRootVerbWritesValue` | pending: the non-root CLI and `exec` |
 | U38 | an unknown error code prints the code; a connect failure names `sudo k3sm install` | `k3sm/cmd/k3sm::TestUnknownErrorCodeFallback`, `TestConnectErrorNamesInstall` | pending: the non-root CLI and `exec` |
 | U39 | (unused: there are no system grants) | none | none |
@@ -7016,7 +7181,7 @@ carried by the unit rows.
 | U101 | `rewrap` prints a warning whenever `.user/` exists, before it starts and when it finishes, saying Rewrap does not re-key `K_u` and naming the procedure: each user re-puts their values after a suspected master exposure; with no `.user/` it prints none (seam: euid source) | `k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist` | checked: user-scope quotas, scope-key Rewrap and the delivery record |
 | U102 | the sealed record stores the last delivered version per delivery, raised after the Secret write succeeds; the repair-versus-owner classifier uses only that recorded version: a Secret whose version annotation is rewritten and a KeyDelivery whose `status.deliveredVersion` is rewritten each leave the charge unchanged, a repair stays on the reconciler budget and an owner's new version stays charged to the owner | `k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus` | pending: the KeyDelivery reconciler (lifecycle) |
 | U103 | a Secret at a recorded target whose label or owner annotation was removed is never overwritten or deleted, under a revocation, the object's deletion and `rm-scope` alike; the KeyDelivery gets `SecretRetained=True` with reason `LabelRemoved`, and `doctor` names the Secret and the KeyDelivery | `k3sm/pkg/keystore/reconcile::TestStrippedLabelReportedNotDeleted` | pending: the KeyDelivery reconciler (lifecycle) |
-| U104 | the socket's directory is root's: run as root (a root-run row, `--root`), install creates `keystore-sock/` root:wheel 0755 and the server plist carries a `Sockets` listener for `keystore-sock/keys.sock`; a process running as the service uid cannot unlink, replace or bind `keys.sock`, whether or not the server runs, and gets `EACCES` | `k3sm/pkg/install::TestSocketDirRootOwnedServiceUIDCannotBind` (integration, root-run); rig leg E24 | pending: the socket listener |
+| U104 | the socket's directory is root's: run as root (a root-run row, `--root`), install creates `keystore-sock/` root:wheel 0755 and the server plist carries a `Sockets` listener for `keystore-sock/keys.sock`; a process running as the service uid cannot unlink, replace or bind `keys.sock`, whether or not the server runs: the unlink, a rename over it and a bind of a new name (`keys.sock` once it is gone) get `EACCES`, and a bind of the existing `keys.sock` gets `EADDRINUSE` with root's name left in place (measured in rig leg E24) | `k3sm/pkg/install::TestServerPlistActivatesKeystoreSocket`, `TestKeystoreSockDirAtInstall`, `TestSocketDirRootOwnedServiceUIDCannotBind` (integration, root-run); rig leg E24 | partial: the plist entry and the directory are delivered and unit-tested, and `--root` runs the root-run test, built with `-tags integration`, a SKIP failing it; pending: rig leg E24 |
 | U105 | every root path walks the keystore trees by descriptor: run as root (a root-run row, `--root`), `sudo k3sm install` over an existing tree, `uninstall --purge` and `doctor` each refuse a planted symlink, FIFO or swapped directory under `.user/` and at every `keystore-*` name, with `openat`, `O_NOFOLLOW`, bounded reads and a `SameFile` re-check, and change nothing they were not meant to | `k3sm/pkg/install::TestInstallOverExistingTreeWalksByDescriptor`, `TestPurgeWalksKeystoreByDescriptor`, `k3sm/cmd/k3sm::TestDoctorWalksKeystoreByDescriptor` (integration, root-run) | pending: the append-only files |
 | U106 | every root verb refuses a non-root caller: one table test runs `rm-scope`, `floor --rebuild`, `audit --rotate`, `rewrap` and `deliver system/…` with a non-root euid through the euid source, and each is refused with the same message and exit code, changing nothing (seam: euid source) | `k3sm/cmd/k3sm::TestRootVerbsRefuseNonRootEUID` | pending: the KeyDelivery reconciler (lifecycle), each verb's case added by the change that adds the verb |
 | U107 | with the user floor missing or unflagged, an absence-driven delete (`ErrNotFound`) is `Indeterminate` and deletes nothing, while a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial) deletes the Secret after its two spaced observations | `k3sm/pkg/keystore/reconcile::TestNotFoundDeleteWaitsForFloor`, `TestRevocationDeleteProceedsWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
@@ -7031,9 +7196,9 @@ carried by the unit rows.
 | U116 | the Pod uid refusal applies to native Pods only: a vm Pod with `runAsUser: 1000` is allowed, since a guest uid has no host meaning, while a native Pod with the same drop target is refused; the guest's groups skip the host group rules the same way | `runtimed/pkg/runtime::TestVMPodGuestUIDNotRefused` (the refusal sits on the native spawn path, `checkPodUID` in `pkg/runtime/security.go`; the same test, in `pkg/runtime/vmcontainers_test.go`, also pins that a vm Pod's `runAsGroup` of 1000 reaches the guest's GID and SupplementalGIDs unrefused) | checked: runtimed's sandbox change |
 | U118 | root-run: the old log is retired, never re-owned: in audit --rotate and floor --rebuild the new log gets, in staging, its fchown to the service user, its fchmod 0600 and then its flag, between the build and report steps; the old log's one attribute call is its flag clear, made after the swap has made it unreachable by path, in the retired directory in keystore-staging/, which is then removed unread; it is never chowned or chmodded, ends unlinked with its owner, mode and bytes unchanged; rotate's archives, in archives/, are fresh root-owned unflagged copies, 0600 with one link, and the older archives carried by link are the same inodes and bytes (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceOldLogRetiredNeverReowned` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
 | U119 | the floor lock is `keystore-lock`, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root (`put`, `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise of `list` and `show`, `rm-scope`, `floor --rebuild`, `audit --rotate`); run as root (a root-run row, `--root`), a non-root process other than the service user holding the old data-root flock blocks none of them | `k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb` (integration, root-run) | checked as a root-run row (`--root`) for the verbs that exist: `put`, `rotate`, `rm`, `rewrap` and the floor raise; `rm-scope`, `floor --rebuild` and `audit --rotate` take it as they land (the append-only files) |
-| U120 | the activated listening descriptor reaches no child (integration): the server spawns each child type, an `exec.Command` child, the runtimed helper and a Pod through the exec shim, lists each one's open descriptors, and the listening socket is among none of them | `k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild` (integration) | pending: the socket listener |
-| U121 | under activation, a client whose connected peer reads as uid 0 or as launchd's code refuses and writes nothing; U36 is never relaxed to accept uid 0, and if K7a finds the client-side peer names launchd the self-bind form ships (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer` | pending: the socket listener |
-| U122 | when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup | `k3sm/pkg/provider::TestPodProfileDeniesLaunchdSocketActivation`; rig leg E27 | pending: the socket listener |
+| U120 | the activated listening descriptor reaches no child: the server spawns each child type, an `exec.Command` child, the runtimed helper and a Pod through the exec shim, lists each one's open descriptors, and the listening socket is among none of them | `k3sm/pkg/keystore/socket::TestActivatedListenerIsCloseOnExecAndHeld` (integration); rig | partial: the activation confirms the descriptor's `FD_CLOEXEC` under `syscall.ForkLock`, refusing one without it, closes launchd's original, and an `exec.Command` child does not hold it; pending (rig): the runtimed helper and a Pod through the exec shim |
+| U121 | under activation, the client accepts a `LOCAL_PEERCRED` uid 0 only when the audit token's euid is the service uid and its code the installed binary's cdhash; a uid-0 peer whose token names launchd, root or another uid, or other code, is refused and nothing is written (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer` | pending: the non-root CLI and `exec` |
+| U122 | a Pod cannot obtain the server's listener from launchd: its `launch_activate_socket` for the server's socket name gets `ESRCH` (measured on macOS 27.2.1), so no Pod profile needs a launchd lookup deny; the Seatbelt path deny on `keystore-sock/` (U16, U46) is a separate deny and stays required | rig leg E27 | pending (rig): leg E27, which also owes macOS 26 |
 | U123 | same-target cross-record deletion: the orphan sweep, a lost-authority delete and `rm-scope` never delete a Secret that another honoured record claims at the same `(namespace, secretName)`; a forged owner annotation naming one uid's tombstone on another uid's live Secret deletes nothing; the owner annotation never selects which record's tombstone governs a delete; nothing is charged to the victim | `k3sm/pkg/keystore/reconcile::TestForgedTombstoneAnnotationOnOtherUsersLiveSecretIsNotDeleted` | pending: the KeyDelivery reconciler (lifecycle) |
 | U124 | a tombstone is pruned when its target is not this UID's owned Secret on two observations at least 60 s apart, not only on a Get that answers not found: a target occupied by another Secret still prunes; a failed Get keeps it | `k3sm/pkg/keystore/reconcile::TestTombstonePrunesWhenTargetOccupied` | pending: the KeyDelivery reconciler (lifecycle) |
 | U125 | every reconciler Secret delete or update and every `rm-scope` delete passes `Preconditions{UID, ResourceVersion}` from the ownership read: a fake client swaps the Secret between the read and the delete, the delete is refused, and the outcome is `Indeterminate` | `k3sm/pkg/keystore/reconcile::TestDeleteRefusedWhenSecretSwappedAfterRead` | pending: the KeyDelivery reconciler (lifecycle) |
@@ -7158,10 +7323,10 @@ E20 attended.
 | E21 | a native Pod with `securityContext.runAsUser: 501` | refused at spawn: the container never starts, and its status carries the uid refusal | no (U17) | runtimed's sandbox change: the Pod runs as uid 501 |
 | E22 | a native Pod with `securityContext.runAsUser: 0` on a node whose runtimed runs as root; then, from a root shell on the node, a connect to `keys.sock` | the Pod runs: `runAsUser: 0` sets no drop and an inherited uid is allowed (residual 17); the root connect is refused before any frame (U26) | no (U17, U26) | none: a guard that the refusal does not reach an inherited uid, which passes on the previous release too |
 | E23 | against the real authorizer: an admin binds, for `k3sm:local:<uid>` in `ks-e2e-3`, `k3sm:keystore-delivery-author` and a Role with `create` on `secrets` and `update` and `delete` on `secrets` with `resourceNames: [e2e-named]`; the user delivers `user/<uid>/e2e-token` as `e2e-named`, then as `e2e-other`; then an admin, impersonating another principal (`kubectl --as k3sm-e2e-other`, bound to the built-in `edit` ClusterRole in `ks-e2e-3`), deletes `e2e-named`'s KeyDelivery and, separately, patches its finalizer away | `e2e-named`: `Ready`, `Delivered`; `e2e-other`: `Authorized=False`, `NotAuthorized`, no Secret: the reconciler allows exactly what the API server allows the user; the other principal's delete and finalizer patch are each refused at admission, and the object, its finalizer and the Secret stay | yes | the KeyDelivery reconciler (authority): `e2e-other` is delivered, or `e2e-named` is refused; KeyDelivery authoring: another principal deletes the object or strips its finalizer |
-| E24 | first, with the server running, the operator, as the service user (`sudo -u _k3sm`), runs a program that is not k3sm and tries to unlink `keystore-sock/keys.sock` and to bind a socket at that path; then, with the listener stopped by the maintenance marker, a native Pod execs the real installed `/Library/k3sm/k3sm` and that process tries the same bind; in the deny-plus-pin fallback only, the service-user program binds `keys.sock` while the listener is stopped and the user runs `k3sm keys list` and `k3sm keys put user/<me>/e2e-pin` | the service-user unlink and bind each fail with `EACCES` and `keys.sock` is still launchd's; the bind from the Pod gets `EPERM` and no socket appears; in the fallback, the CLI refuses each before writing a frame, naming the server pin, and the stand-in receives no bytes past the connect; after the marker goes, the real server is accepted | yes | the root-owned socket directory (U104): the service-user program replaces `keys.sock`; the server pin (U69): the CLI talks to the stand-in; the Pod bind deny (U16): the installed binary in a Pod binds `keys.sock` |
+| E24 | first, with the server running, the operator, as the service user (`sudo -u _k3sm`), runs a program that is not k3sm and tries to unlink `keystore-sock/keys.sock`, to bind a socket at that path and to bind a socket at a new name in `keystore-sock/`; then, with the listener stopped by the maintenance marker, a native Pod execs the real installed `/Library/k3sm/k3sm` and that process tries the same bind; in the deny-plus-pin fallback only, the service-user program binds `keys.sock` while the listener is stopped and the user runs `k3sm keys list` and `k3sm keys put user/<me>/e2e-pin` | the service-user unlink and the bind of a new name each fail with `EACCES`, the bind of `keys.sock` fails with `EADDRINUSE` (the name is root's and stays in place), and `keys.sock` is still launchd's; the bind from the Pod gets `EPERM` and no socket appears; in the fallback, the CLI refuses each before writing a frame, naming the server pin, and the stand-in receives no bytes past the connect; after the marker goes, the real server is accepted | yes | the root-owned socket directory (U104): the service-user program replaces `keys.sock`; the server pin (U69): the CLI talks to the stand-in; the Pod bind deny (U16): the installed binary in a Pod binds `keys.sock` |
 | E25 | (helper variant only) a native Pod tries `connect(2)` to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an `append` | `EPERM` for the Pod; the helper refuses the user by uid and the program by the pin, and no line is appended | yes | the helper pin (U70): a line from an unpinned peer is appended |
 | E26 | a native Pod on a test build whose Pod profile omits the keystore deny stanza (restored at the end) tries `connect(2)` to `keys.sock` | the listener refuses the connection before any frame, since the peer is sandboxed, and writes a `refused` line | yes | the sandboxed-peer refusal (U137): the Pod's connection reaches the frame reader |
-| E27 | a native Pod calls `launch_activate_socket` for the server's socket name | no descriptor is returned, and nothing in the Pod can accept on `keys.sock` | yes | the launchd lookup deny (U122): the Pod obtains the server's listener |
+| E27 | on macOS 26 and 27, a native Pod calls `launch_activate_socket` for the server's socket name, and the server's activated descriptor is read | the Pod gets `ESRCH` with no descriptor and nothing in it can accept on `keys.sock`; launchd set `FD_CLOEXEC` on the activated descriptor | yes | launchd answering a Pod's `launch_activate_socket` with `ESRCH` and setting `FD_CLOEXEC` on the activated descriptor, measured on macOS 26 and 27 (U122) |
 | E28 | **the typed-credential tracer** ("Rig credentials and custody"): a generated deploy key and a server-refreshed oauth pair delivered into one pod, which pushes over ssh and opens a pull request; then `k3sm keys refresh` | push and pull request succeed; the access-token file's hash changes in the same pod with `restartCount` 0; mount lines; the positive-controlled scans find nothing they should not; PENDING (exit 3) if the oauth pair is missing or not `ok` | yes | typed projection, the mount audit or the refresher |
 | E29 | a synthetic `token` put with `--expires-at` now+8 m, delivered | `Valid`, then `Expiring` after about 6 m, then `Expired` at 8 m; one Warning Event each, `related` the Secret; the Secret kept; `Ready` unchanged | no (U165, U166, U168) | expiry and revocation |
 | E30 | `generate --kind ssh`; deliver `--item privateKey=id_ed25519 --item publicKey=id_ed25519.pub` (`defaultMode` 0400); the pod runs `ssh-keygen -y -f id_ed25519`; a delivery without items is refused | the output equals `k3sm keys pubkey`; the fingerprint matches | no (U148, U163) | typed projection |

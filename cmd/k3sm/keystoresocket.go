@@ -17,10 +17,13 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -37,6 +40,7 @@ import (
 	"k3sm.io/k3sm/pkg/keystore/socket"
 	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/runtimed/pkg/keystorepaths"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // keystoreServerCountTimeout bounds one count of the cluster's servers, so a
@@ -257,8 +261,13 @@ type keystoreSocketDeps struct {
 	creds        socket.PeerCredSource
 	sandbox      socket.PeerSandboxSource
 	sandboxCheck func() error
-	clock        socket.Clock
-	log          *slog.Logger
+	// podProfile renders the Pod profile this node's runtime gives a pod
+	// (keystorePodProfile over serverPodPosture in production); the
+	// supervisor asks once, before it serves, whether that text denies the
+	// socket under the data root layout derives (podProfileCheck).
+	podProfile func() (string, error)
+	clock      socket.Clock
+	log        *slog.Logger
 }
 
 // keystoreSocket is a built supervisor and what it holds open: the server's
@@ -339,6 +348,9 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 	if deps.openDataRoot == nil || deps.ignoresOwnership == nil {
 		return socket.SupervisorConfig{}, nil, errors.New("no data-root opener or mount-flag check")
 	}
+	if deps.podProfile == nil {
+		return socket.SupervisorConfig{}, nil, errors.New("no Pod profile source")
+	}
 	pass := &dataRootPass{path: storeCfg.DataRoot, open: deps.openDataRoot, ignores: deps.ignoresOwnership}
 	closeAll := func() {
 		_ = logs.Close() // the listener is stopped: nothing appends any more
@@ -354,6 +366,7 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 		CheckInstall:      checkInstallOn(pass, store.CheckSocketInstall),
 		ServerCount:       func(ctx context.Context) (int, error) { return countKeystoreServers(ctx, cs) },
 		MaintenanceMarked: logs.MaintenanceMarked,
+		StoreDir:          serverStoreDir(store),
 		OpenLogs: func(ctx context.Context) error {
 			if err := logs.Reopen(ctx); err != nil {
 				return err
@@ -366,6 +379,7 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 			return nil
 		},
 		SandboxCheck: deps.sandboxCheck,
+		PodProfile:   podProfileCheck(deps.podProfile, keystorepaths.SocketPath(storeCfg.DataRoot)),
 		StartScopes:  startUserScopesStep(store, deps.log),
 		Creds:        deps.creds,
 		Sandbox:      deps.sandbox,
@@ -374,6 +388,58 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 		Clock:        deps.clock,
 		Log:          deps.log,
 	}, closeAll, nil
+}
+
+// storeDirRepair is the remedy a refused store directory names: the server
+// creates a missing one, but never repairs one that exists.
+const storeDirRepair = "the server never repairs an existing store directory: as root, make it the service user's at mode 0700, or remove it if it holds nothing, and the next start check creates it"
+
+// serverStoreDir is the server's store-directory step: the store directory
+// created if it is missing, with the store's own helper, and judged as
+// every open judges it (keystore.FileStore.EnsureDir). It runs on every
+// pass, so a directory a racing root put has made but not yet handed to
+// the service user is refused for that pass only; one that stays wrong is
+// refused on every pass and never repaired.
+func serverStoreDir(store *keystore.FileStore) func(context.Context) error {
+	return func(context.Context) error {
+		if err := store.EnsureDir(); err != nil {
+			return fmt.Errorf("%w (%s)", err, storeDirRepair)
+		}
+		return nil
+	}
+}
+
+// doctorStoreDir is doctor's store-directory step: the server's judgement,
+// read-only (keystore.FileStore.CheckDir). A missing directory is one the
+// server has not created yet, since it creates it at start.
+func doctorStoreDir(store *keystore.FileStore) func(context.Context) error {
+	return func(context.Context) error {
+		err := store.CheckDir()
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, fs.ErrNotExist):
+			return fmt.Errorf("%w (the server creates the store directory at start, and has not yet: a server that is running logs why it could not)", err)
+		case errors.Is(err, fs.ErrPermission):
+			return fmt.Errorf("%w (sudo k3sm doctor: the store directory is the service user's)", err)
+		}
+		return fmt.Errorf("%w (%s)", err, storeDirRepair)
+	}
+}
+
+// podProfileCheck is the supervisor's Pod-profile check: the profile render
+// returns, read for a deny of the socket at socketPath
+// (socket.ProfileDeniesSocket). A render that fails is the same failure: a
+// node whose generator refuses its own posture has no profile that denies
+// the socket.
+func podProfileCheck(render func() (string, error), socketPath string) func() error {
+	return func() error {
+		profile, err := render()
+		if err != nil {
+			return fmt.Errorf("%w: render the Pod profile: %w", socket.ErrPodProfileOpen, err)
+		}
+		return socket.ProfileDeniesSocket(profile, socketPath)
+	}
 }
 
 // startUserScopesStep is the supervisor's last start check: the store's
@@ -394,17 +460,6 @@ func startUserScopesStep(store *keystore.FileStore, log *slog.Logger) func(conte
 		}
 		return err
 	}
-}
-
-// runKeystoreSocket runs the built ks (superviseKeystoreSocket). A nil ks
-// (a worker) runs nothing and stops at once.
-//
-//lint:ignore U1000 not called until the listener's socket source is chosen; the server start then runs the socket it built through it
-func runKeystoreSocket(ctx context.Context, ks *keystoreSocket) (stop func()) {
-	if ks == nil {
-		return noStop
-	}
-	return superviseKeystoreSocket(ctx, func() (*keystoreSocket, error) { return ks, nil }, wallClock{}, ks.log)
 }
 
 // superviseKeystoreSocket builds the listener's supervisor with build and
@@ -508,16 +563,80 @@ func (wallClock) After(d time.Duration) (<-chan time.Time, func() bool) {
 	return t.C, t.Stop
 }
 
+// keystoreActivationHolder holds the process's one activation of the
+// keystore socket: it never calls launch_activate_socket twice (a second
+// call's answer would be <launch.h>'s documented EALREADY, not measured),
+// so every listener source this process builds shares it, and its socket lives until the process exits.
+// It records the work dir of the first call; a later call naming another
+// work dir gets a source that refuses, never the first one's listener.
+type keystoreActivationHolder struct {
+	mu      sync.Mutex // guards workDir and v
+	workDir string
+	v       *socket.Activation
+}
+
+// errActivationWorkDir is a listener source asked for a work dir other
+// than the one the process's activation was made for.
+var errActivationWorkDir = errors.New("the keystore socket was activated for another work dir")
+
+// source returns the activation's listener source for workDir, making the
+// activation with a on the first call.
+func (h *keystoreActivationHolder) source(workDir string, a socket.Activator) socket.ListenerSource {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	workDir = filepath.Clean(workDir)
+	if h.v == nil {
+		h.workDir = workDir
+		h.v = socket.NewActivation(install.KeystoreSocketsEntry, keystoreSocketPath(workDir), a, checkKeystoreSocketPath)
+	}
+	if workDir != h.workDir {
+		err := &socket.ActivationError{Reason: socket.OffActivatedWrong, Err: fmt.Errorf("%w: %s, not %s", errActivationWorkDir, workDir, h.workDir)}
+		return func(context.Context) (net.Listener, error) { return nil, err }
+	}
+	return h.v.Source()
+}
+
+// keystoreActivation is the process's holder.
+var keystoreActivation keystoreActivationHolder
+
+// checkKeystoreSocketPath is the activation's check of the path clients
+// connect to: doctor's rule (lstatKeystoreSocket), a root:daemon socket at
+// the plist's mode in a root:wheel 0755 directory. It checks that only
+// root could have put a socket at the clients' path; the descriptor's own
+// address is launchd's private bind name, so the descriptor cannot be
+// tied to the path.
+func checkKeystoreSocketPath(path string) error {
+	return lstatKeystoreSocket(path, launchdSocketOwner)
+}
+
+// keystoreSocketListener is the server's listener source: the socket
+// launchd activated for the server plist's Sockets entry
+// (install.KeystoreSocketsEntry), through the process's one activation. A
+// server launchd did not start, or whose plist predates the entry, gets
+// socket.ErrNotActivated, and the user scope stays off for the life of the
+// process; the server never binds keys.sock itself.
+func keystoreSocketListener(workDir string) socket.ListenerSource {
+	return keystoreActivation.source(workDir, socket.LaunchdActivator{})
+}
+
+// keystoreSocketPath is the keystore socket's path for the server whose
+// work dir is workDir: the path the server plist's Sockets entry names.
+func keystoreSocketPath(workDir string) string {
+	return keystorepaths.SocketPath(keystoreLayout(filepath.Clean(workDir)).DataRoot)
+}
+
 // startKeystoreSocket is the server's one entry point for the keystore's
 // user socket: it builds the supervisor over the real primitives and runs
 // it, returning the stop runServer defers beside keystore-delivery's, so
 // LIFO drains it before the control plane stops. listen is how the
-// listening socket is obtained, which this wiring leaves to its caller. A
+// listening socket is obtained (keystoreSocketListener in runServer), and
+// posture is the server runtime's Seatbelt posture (serverPodPosture), whose
+// Pod profile must deny the socket before the listener serves. A
 // build failure is logged and retried with backoff
-// (superviseKeystoreSocket); the stop is never nil.
-//
-//lint:ignore U1000 the server start calls it once the listening socket's source is chosen
-func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Interface, listen socket.ListenerSource, logger *slog.Logger) (stop func()) {
+// (superviseKeystoreSocket); the stop is never nil. Everything it runs is
+// in its own goroutine with recover, so nothing it does stops the
+// apiserver or kine.
+func startKeystoreSocket(ctx context.Context, workDir string, posture sandbox.Posture, cs kubernetes.Interface, listen socket.ListenerSource, logger *slog.Logger) (stop func()) {
 	deps := keystoreSocketDeps{
 		workDir:          workDir,
 		layout:           keystoreLayout,
@@ -531,6 +650,7 @@ func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Inte
 		creds:            socket.KernelPeerCreds{},
 		sandbox:          socket.KernelPeerSandbox{},
 		sandboxCheck:     socket.SandboxSelfCheck,
+		podProfile:       func() (string, error) { return keystorePodProfile(posture) },
 		clock:            wallClock{},
 		log:              logger,
 	}
@@ -575,19 +695,34 @@ type doctorUserScope struct {
 	// error.
 	servers  func() ([]string, error)
 	sockPath string
-	// sockState lstats sockPath, never following or connecting: nil when a
-	// socket owned by the service user is there.
+	// sockState lstats sockPath and its directory, never following or
+	// connecting: nil when launchd's socket is there (root:daemon, at
+	// install.KeystoreSocketMode, in a root:wheel 0755 directory).
 	sockState func() error
+	// plistHasSockets reports whether the installed server plist carries
+	// the keystore's Sockets entry, which tells doctor's two no-socket
+	// remedies apart.
+	plistHasSockets func() (bool, error)
 }
 
-// errNoListeningSocket is a socket path that holds no socket of the
-// service user's.
+// errNoListeningSocket is a socket path that holds no socket of
+// launchd's.
 var errNoListeningSocket = errors.New("no listening socket")
 
+// launchdSocketOwner and launchdSocketGroup are the owner and group of a
+// socket launchd creates for a job's Sockets entry: root:daemon, whatever
+// the job's UserName (measured on macOS 27.2.1, in a root:wheel 0755
+// directory).
+const (
+	launchdSocketOwner = 0
+	launchdSocketGroup = 1
+)
+
 // lstatKeystoreSocket judges what is at path by lstat alone: nil for a
-// socket owned by uid, else an error wrapping errNoListeningSocket (or the
-// lstat's error) that says what is there.
-func lstatKeystoreSocket(path string, uid uint32) error {
+// socket owned by owner (launchdSocketOwner in production) at
+// install.KeystoreSocketMode, else an error wrapping errNoListeningSocket
+// (or the lstat's error) that says what is there.
+func lstatKeystoreSocket(path string, owner uint32) error {
 	var st unix.Stat_t
 	if err := unix.Lstat(path, &st); err != nil {
 		if errors.Is(err, unix.ENOENT) {
@@ -595,19 +730,54 @@ func lstatKeystoreSocket(path string, uid uint32) error {
 		}
 		return fmt.Errorf("lstat the socket path: %w", err)
 	}
-	return judgeKeystoreSocket(uint32(st.Mode), st.Uid, uid)
+	if err := judgeKeystoreSocket(uint32(st.Mode), st.Uid, st.Gid, owner); err != nil {
+		return err
+	}
+	if err := unix.Lstat(filepath.Dir(path), &st); err != nil {
+		return fmt.Errorf("lstat the socket's directory: %w", err)
+	}
+	return judgeKeystoreSockDir(uint32(st.Mode), st.Uid, st.Gid)
+}
+
+// judgeKeystoreSockDir is the rule for the socket's directory: root:wheel
+// 0755, a directory.
+func judgeKeystoreSockDir(mode, owner, group uint32) error {
+	switch {
+	case mode&unix.S_IFMT != unix.S_IFDIR:
+		return fmt.Errorf("%w: the socket's directory is not a directory", errNoListeningSocket)
+	case owner != 0 || group != 0:
+		return fmt.Errorf("%w: the socket's directory is owned by %d:%d, not root:wheel", errNoListeningSocket, owner, group)
+	case mode&0o7777 != 0o755:
+		return fmt.Errorf("%w: the socket's directory is at mode %04o, not 0755", errNoListeningSocket, mode&0o7777)
+	}
+	return nil
 }
 
 // judgeKeystoreSocket is lstatKeystoreSocket's rule over an lstat's mode
-// and owner.
-func judgeKeystoreSocket(mode, owner, uid uint32) error {
+// and owner. A socket of the service user's is the self-bind form, which
+// does not ship, so it is no listening socket either.
+func judgeKeystoreSocket(mode, owner, group, want uint32) error {
 	switch {
 	case mode&unix.S_IFMT != unix.S_IFSOCK:
 		return fmt.Errorf("%w: the path is not a socket", errNoListeningSocket)
-	case owner != uid:
-		return fmt.Errorf("%w: the socket is owned by uid %d, not the service user's %d", errNoListeningSocket, owner, uid)
+	case group != launchdSocketGroup:
+		return fmt.Errorf("%w: the socket's group is %d, not daemon's %d, which launchd's socket's is", errNoListeningSocket, group, launchdSocketGroup)
+	case owner != want:
+		return fmt.Errorf("%w: the socket is owned by uid %d, not root's, which launchd's socket is (run sudo k3sm install, which renders the server plist's Sockets entry)", errNoListeningSocket, owner)
+	case mode&0o7777 != install.KeystoreSocketMode:
+		return fmt.Errorf("%w: the socket is at mode %04o, not %04o", errNoListeningSocket, mode&0o7777, install.KeystoreSocketMode)
 	}
 	return nil
+}
+
+// installedPlistHasSockets reports whether the installed io.k3sm.server
+// plist names the keystore's Sockets entry.
+func installedPlistHasSockets() (bool, error) {
+	b, err := os.ReadFile(filepath.Join(install.DefaultLaunchDaemonDir, install.ServerLabel+".plist"))
+	if err != nil {
+		return false, err
+	}
+	return bytes.Contains(b, []byte("<key>Sockets</key>")) && bytes.Contains(b, []byte("<key>"+install.KeystoreSocketsEntry+"</key>")), nil
 }
 
 // readAdminKubeconfig loads the admin kubeconfig at path, opening it first
@@ -671,6 +841,7 @@ func doctorKeystoreUserScope(workDir string) (doctorUserScope, error) {
 			EUID:              euid,
 			ServiceUID:        uid,
 			MaintenanceMarked: store.MaintenanceMarked,
+			StoreDir:          doctorStoreDir(store),
 			OpenLogs:          doctorOpenLogs(store, pass),
 			SandboxCheck:      socket.SandboxSelfCheck,
 			IgnoresOwnership:  pass.ignoresOwnership,
@@ -679,9 +850,10 @@ func doctorKeystoreUserScope(workDir string) (doctorUserScope, error) {
 			ServerCount:       count,
 			StartScopes:       doctorStartScopes(store),
 		},
-		release:   pass.end,
-		servers:   func() ([]string, error) { return names, countErr },
-		sockPath:  sock,
-		sockState: func() error { return lstatKeystoreSocket(sock, uid) },
+		release:         pass.end,
+		servers:         func() ([]string, error) { return names, countErr },
+		sockPath:        sock,
+		sockState:       func() error { return lstatKeystoreSocket(sock, launchdSocketOwner) },
+		plistHasSockets: installedPlistHasSockets,
 	}, nil
 }

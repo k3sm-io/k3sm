@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -30,6 +31,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // pausableListener is a listening socket with SetDeadline, as an activated
@@ -117,8 +120,11 @@ type startChecks struct {
 	ignores    bool
 	mountErr   error
 	install    error
+	listenErr  error
 	logsErr    error
 	sandboxErr error
+	profileErr error // what the Pod-profile check returns
+	profiled   int   // how many times it was asked
 	reopens    int
 	servers    int
 	serversErr error
@@ -126,7 +132,7 @@ type startChecks struct {
 	listens    int
 	counted    int
 	ln         net.Listener // what the listener source returns
-	panics     string       // the step that panics: euid, marker, mount, install, logs, sandbox, count or listen
+	panics     string       // the step that panics: profile, euid, marker, mount, install, logs, sandbox, count or listen
 }
 
 // boom panics when step is the one set to.
@@ -248,6 +254,9 @@ func (r *supRig) config() SupervisorConfig {
 			defer ck.mu.Unlock()
 			ck.listens++
 			ck.boom("listen")
+			if ck.listenErr != nil {
+				return nil, ck.listenErr
+			}
 			return ck.ln, nil
 		},
 		EUID:       func() int { ck.mu.Lock(); defer ck.mu.Unlock(); ck.boom("euid"); return ck.euid },
@@ -283,6 +292,13 @@ func (r *supRig) config() SupervisorConfig {
 			return ck.marked, ck.markerErr
 		},
 		SandboxCheck: func() error { ck.mu.Lock(); defer ck.mu.Unlock(); ck.boom("sandbox"); return ck.sandboxErr },
+		PodProfile: func() error {
+			ck.mu.Lock()
+			defer ck.mu.Unlock()
+			ck.profiled++
+			ck.boom("profile")
+			return ck.profileErr
+		},
 		OpenLogs: func(context.Context) error {
 			ck.mu.Lock()
 			defer ck.mu.Unlock()
@@ -628,6 +644,110 @@ func TestListenerSourceFailureBacksOff(t *testing.T) {
 		r.ck.set(func(c *startChecks) { c.ln = r.ln })
 		advance(MinBackoff)
 		r.wantState(t, PhaseServing, "", 0)
+	})
+}
+
+// Every outcome of the activation that is not a listener is terminal for
+// the process: the supervisor is off with the outcome's reason, logs one
+// Warn naming its remedy, and never asks the source again, however long it
+// waits. A listener source error that is not the activation's backs off as
+// before.
+func TestActivationOutcomesAreTerminal(t *testing.T) {
+	for _, tt := range []struct {
+		reason OffReason
+		cause  error
+		remedy string
+	}{
+		{OffNotActivated, unix.ESRCH, "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"},
+		{OffSocketParentMissing, unix.ENOENT, "run `sudo k3sm install` (it rewrites and reloads the server's definition); if the data root is on a volume that is not mounted, mount it first"},
+		{OffAlreadyActivated, unix.EALREADY, "run `sudo k3sm restart`"},
+		{OffActivatedInheritable, ErrActivatedInheritable, "report it: launchd handed the server an inheritable descriptor; the user scope stays off"},
+		{OffActivatedWrong, ErrActivatedWrong, "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"},
+		{OffListenerUnavailable, unix.EINVAL, "run `sudo k3sm restart`"},
+	} {
+		synctest.Test(t, func(t *testing.T) {
+			r := newSupRig(t, func(c *startChecks) {
+				c.listenErr = &ActivationError{Reason: tt.reason, Err: fmt.Errorf("the Sockets entry \"keys\": %w", tt.cause)}
+			})
+			st := r.wantState(t, PhaseOff, tt.reason, 0)
+			if !strings.Contains(st.Detail, "keys") {
+				t.Fatalf("detail %q", st.Detail)
+			}
+			advance(time.Hour)
+			r.ck.mu.Lock()
+			listens := r.ck.listens
+			r.ck.mu.Unlock()
+			if listens != 1 {
+				t.Fatalf("%s: %d listens, want 1: no retry", tt.reason, listens)
+			}
+			if n := r.log.count("level=WARN", tt.remedy); n != 1 {
+				t.Fatalf("%s: %d Warn lines naming %q, want 1:\n%s", tt.reason, n, tt.remedy, r.log.b.String())
+			}
+			if n := r.log.count("level=ERROR"); n != 0 {
+				t.Fatalf("%s: %d Error lines, want none", tt.reason, n)
+			}
+		})
+	}
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, func(c *startChecks) { c.listenErr = errors.New("some other listener source failure") })
+		r.wantState(t, PhaseBackingOff, OffListenerUnavailable, MinBackoff)
+		advance(MinBackoff)
+		r.wantState(t, PhaseBackingOff, OffListenerUnavailable, 2*MinBackoff)
+	})
+}
+
+// A Pod profile that does not deny the socket is terminal: the supervisor
+// is off with OffPodProfile before any start check runs, logs one Warn
+// naming the remedy, never asks the listener source or the checks, and
+// never asks the profile again, however long it waits. A panicking check
+// is the same failure. A passing check is asked once and the listener
+// serves.
+func TestPodProfileOffIsTerminal(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(c *startChecks)
+	}{
+		{"open", func(c *startChecks) {
+			c.profileErr = fmt.Errorf("%w: no network-outbound deny covers /x", ErrPodProfileOpen)
+		}},
+		{"panicked", func(c *startChecks) { c.panics = "profile" }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := newSupRig(t, tt.setup)
+				st := r.wantState(t, PhaseOff, OffPodProfile, 0)
+				if st.Detail == "" {
+					t.Fatal("no detail")
+				}
+				advance(time.Hour)
+				got := r.ck.get()
+				r.ck.mu.Lock()
+				profiled := r.ck.profiled
+				r.ck.mu.Unlock()
+				if profiled != 1 || got.listens != 0 || got.counted != 0 || got.reopens != 0 {
+					t.Fatalf("profiled %d, listens %d, counts %d, reopens %d; want the profile asked once and nothing else", profiled, got.listens, got.counted, got.reopens)
+				}
+				if n := r.log.count("level=WARN", "install a k3sm built with a matching runtimed", string(OffPodProfile)); n != 1 {
+					t.Fatalf("%d Warn lines naming the remedy, want 1:\n%s", n, r.log.b.String())
+				}
+				if n := r.log.count("level=ERROR"); n != 0 {
+					t.Fatalf("%d Error lines, want none", n)
+				}
+				if r.s.State().Reason.Remedy() != PodProfileRemedy {
+					t.Fatal("the reason names no remedy")
+				}
+			})
+		})
+	}
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, nil)
+		r.wantState(t, PhaseServing, "", 0)
+		r.ck.mu.Lock()
+		profiled := r.ck.profiled
+		r.ck.mu.Unlock()
+		if profiled != 1 {
+			t.Fatalf("a passing profile asked %d times, want once", profiled)
+		}
 	})
 }
 

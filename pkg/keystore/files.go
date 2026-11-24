@@ -540,6 +540,45 @@ func readDirEntries(root *os.Root, max int) ([]fs.DirEntry, error) {
 	}
 }
 
+// EnsureDir creates the entries' directory if it is missing, with the
+// helper a first put uses (mkdirOwned: the service user's, at dirMode, any
+// inherited extended ACL removed, its parent fsynced), and then judges it as
+// every open does (openDir: a directory, the store's uid's, granting nothing
+// to group or others). An existing directory is only judged: one that fails
+// is refused with the open's text and left as it is, never repaired. The
+// server runs it before its log reopen, which takes the store lock, whose
+// file is in this directory.
+//
+// A put racing it is safe. Whichever mkdir lands first makes the directory,
+// and the other's mkdir finds it and only judges it. The server's mkdir
+// makes a directory its own uid, the service user's, already owns, which a
+// put's judgement accepts. A put's mkdir makes one root owns until its
+// handover, which the server's judgement refuses for that one pass, and the
+// next pass finds the directory handed over.
+func (s *FileStore) EnsureDir() error {
+	if err := s.checkConfig(); err != nil {
+		return err
+	}
+	root, err := s.openDir(s.dir, true)
+	if err != nil {
+		return err
+	}
+	return root.Close()
+}
+
+// CheckDir is EnsureDir's judgement, read-only, for doctor: a missing
+// directory is an error matching fs.ErrNotExist, and nothing is created.
+func (s *FileStore) CheckDir() error {
+	if err := s.checkConfig(); err != nil {
+		return err
+	}
+	root, err := s.openDir(s.dir, false)
+	if err != nil {
+		return err
+	}
+	return root.Close()
+}
+
 // openLocked opens the entries' directory, creating it with create set, and
 // takes the store lock on it, exclusive or shared. A missing directory is an
 // error matching fs.ErrNotExist, for the caller to map. The returned function

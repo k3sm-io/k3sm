@@ -105,10 +105,13 @@
 # package's source directory as go test does, so the tests that read the
 # source tree find it; root builds nothing. It passes when
 # no test failed and the binary exited 0. It then runs the root-run rows
-# (declared with rootpend or rootcheck): each by name, in its own k3sm
-# package's binary, built the same way and run the same way. A checked
+# (declared with rootpend, rootcheck or rootpartial): each by name, in its own
+# k3sm package's binary, built the same way (with -tags when the row is declared
+# tagged, for a test in a tagged tier) and run the same way. A checked
 # root-run row passes only if each named test printed PASS: a SKIP fails it,
-# and so does a test that did not run. A pending one prints PENDING. Neither
+# and so does a test that did not run. A pending one prints PENDING. A partial
+# one is checked the same way and, when it passes, prints PASS with its pending
+# part, which keeps the exit status at 3. Neither
 # --check nor a unit mode runs a root-run row: each prints it as ROOT and
 # leaves it out of the count, as pending. Exit status: 0 pass; 1 fail; 3 sudo
 # -n is unavailable (run sudo -v first, or run as a user sudo lets run it), or
@@ -267,6 +270,15 @@ tree_dirtied() {
 	fi
 }
 
+# root_run_tail prints the last 40 lines of a failed root run's output, $1,
+# unfiltered and indented: the summary filter keeps only FAIL, panic and
+# file:line lines, and drops what a test logged across lines, a child
+# process's stderr among them.
+root_run_tail() {
+	echo "  the run's last 40 lines:"
+	printf '%s\n' "$1" | tail -n 40 | sed 's/^/    | /'
+}
+
 run_root() {
 	local t out rc=0 n m f before
 	t="$(mktemp -d "${TMPDIR:-/tmp}/keystore-root.XXXXXX")" || { echo "R1 FAIL as root: mktemp -d failed"; return 1; }
@@ -317,13 +329,15 @@ run_root() {
 		return 0
 	fi
 	printf '%s\n' "$out" | grep -E -- '^ *(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' || true
+	root_run_tail "$out"
 	echo "R1 FAIL as root: $n tests passed, $m skipped"
 	return 1
 }
 
 # root_build sets RB to a fresh directory under root_t holding package $1's
-# test binary, pkg.test, built as the invoking user, and RS to that
-# package's source directory, where the binary runs, as go test runs it.
+# test binary, pkg.test, built as the invoking user with build tags $2 (none
+# when empty), and RS to that package's source directory, where the binary
+# runs, as go test runs it.
 RB=""
 RS=""
 root_bin_n=0
@@ -337,7 +351,7 @@ root_build() {
 	root_bin_n=$((root_bin_n + 1))
 	d="$root_t/b$root_bin_n"
 	mkdir -p "$d/tmp" || return 1
-	if ! CGO_ENABLED=1 go test -race -c -o "$d/pkg.test" "$rel" >"$d/build.out" 2>&1; then
+	if ! CGO_ENABLED=1 go test -race ${2:+-tags "$2"} -c -o "$d/pkg.test" "$rel" >"$d/build.out" 2>&1; then
 		cat "$d/build.out"
 		return 1
 	fi
@@ -349,7 +363,7 @@ root_build() {
 # judge_root_row runs root-run row $1's named tests by name under sudo -n, one
 # binary per package, and fails it unless each printed PASS: a SKIP fails.
 judge_root_row() {
-	local i="$1" id="${R_ID[$1]}" spec p pkgs="" names t out rc bad=0 before
+	local i="$1" id="${R_ID[$1]}" spec p pkgs="" names t out rc bad=0 before pbad
 	for spec in ${R_TESTS[$i]}; do
 		case " $pkgs " in *" ${spec%%::*} "*) ;; *) pkgs="$pkgs ${spec%%::*}" ;; esac
 	done
@@ -358,32 +372,38 @@ judge_root_row() {
 		for spec in ${R_TESTS[$i]}; do
 			if [ "${spec%%::*}" = "$p" ]; then names="${names:+$names|}${spec#*::}"; fi
 		done
-		if ! root_build "$p"; then
+		if ! root_build "$p" "${R_TAGS[$i]}"; then
 			echo "$id FAIL as root: the test binary of $p did not build"
 			return 1
 		fi
 		rc=0
+		pbad=$bad
 		before="$(tree_state)" || { echo "$id FAIL as root: git status of $K3SM_ROOT failed"; return 1; }
 		out="$(cd "$RS" && sudo -n env TMPDIR="$RB/tmp" ${root_ids[@]+"${root_ids[@]}"} "$RB/pkg.test" -test.count=1 -test.v -test.run "^($names)\$" 2>&1)" || rc=$?
 		if ! tree_dirtied "$before"; then
 			echo "$id FAIL as root: the run of $p changed the source tree"
-			bad=1
+			bad=$((bad + 1))
 		fi
 		for t in ${names//|/ }; do
 			if grep -q -- "--- SKIP: $t " <<<"$out"; then
 				echo "$id FAIL as root: $t ($p) skipped, and a root-run row fails on SKIP"
-				bad=1
+				bad=$((bad + 1))
 			elif ! grep -q -- "--- PASS: $t " <<<"$out"; then
 				echo "$id FAIL as root: $t ($p) did not pass"
-				bad=1
+				bad=$((bad + 1))
 			fi
 		done
 		if [ "$rc" -ne 0 ]; then
 			printf '%s\n' "$out" | grep -E -- '^ *(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' || true
-			bad=1
+			bad=$((bad + 1))
 		fi
+		if [ "$bad" -ne "$pbad" ]; then root_run_tail "$out"; fi
 	done
 	if [ "$bad" -ne 0 ]; then return 1; fi
+	if [ "${R_KIND[$i]}" = rootpartial ]; then
+		echo "$id PASS as root: ${R_DESC[$i]}; pending: ${R_TODO[$i]}"
+		return 0
+	fi
 	echo "$id PASS as root: ${R_DESC[$i]}"
 }
 
@@ -409,6 +429,13 @@ run_root_mode() {
 			if [ "$rc" -eq 0 ]; then rc=3; fi
 			;;
 		rootcheck) judge_root_row "$i" || rc=1 ;;
+		rootpartial)
+			if judge_root_row "$i"; then
+				if [ "$rc" -eq 0 ]; then rc=3; fi
+			else
+				rc=1
+			fi
+			;;
 		esac
 		i=$((i + 1))
 	done
@@ -423,6 +450,7 @@ R_KIND=()
 R_DESC=()
 R_TODO=()
 R_TESTS=()
+R_TAGS=()
 # add kind id desc todo tests... records a row, its tests as <pkg>::<Test>.
 add() {
 	local kind="$1" id="$2" desc="$3" todo="$4" pkg="k3sm/pkg/keystore" t specs=""
@@ -438,6 +466,18 @@ add() {
 	R_DESC+=("$desc")
 	R_TODO+=("$todo")
 	R_TESTS+=("${specs# }")
+	R_TAGS+=("")
+}
+# tagged id tags: the row just declared, id, builds and lists its tests with
+# -tags tags, for a test in a tagged tier (a root-run test behind
+# //go:build integration).
+tagged() {
+	local n=$((${#R_ID[@]} - 1))
+	if [ "$n" -lt 0 ] || [ "${R_ID[$n]}" != "$1" ]; then
+		echo "keystore: tagged $1 must follow its row" >&2
+		exit 2
+	fi
+	R_TAGS[n]="$2"
 }
 check() { local id="$1" desc="$2"; shift 2; add check "$id" "$desc" "" "$@"; }   # row, description, tests...
 partial() { local id="$1" d="$2" t="$3"; shift 3; add partial "$id" "$d" "$t" "$@"; } # row, delivered part, pending part, tests...
@@ -448,6 +488,7 @@ special() { add "$1" "$2" "" ""; }                                              
 # root-run rows: --root runs them by name; --check prints them as ROOT, uncounted
 rootcheck() { local id="$1" desc="$2"; shift 2; add rootcheck "$id" "$desc" "" "$@"; } # row, description, tests...
 rootpend() { local id="$1" desc="$2"; shift 2; add rootpend "$id" "$desc" "" "$@"; }   # row, description (its change), tests...
+rootpartial() { local id="$1" d="$2" t="$3"; shift 3; add rootpartial "$id" "$d" "$t" "$@"; } # row, delivered part, pending part, tests...
 # a row of the floor variant K0 did not pick: printed N/A, never run, and
 # counted neither as pending nor as passed (K0 amendment 2026-11-21: the
 # flag variant, so the helper rows do not apply)
@@ -596,7 +637,7 @@ check U34 "5 mutating ops a second per uid; 30 read-for-exec a minute per uid, e
 	k3sm/pkg/keystore/socket::TestMutationRateLimit TestExecReadCapPerUID k3sm/pkg/keystore::TestExecReadAudited
 check U35 "the socket server's store interface has no reveal, show or rewrap method (socket operations)" \
 	k3sm/pkg/keystore/socket::TestStoreInterfaceHasNoRevealMethod
-pend U36 "the client refuses a socket whose connected peer uid is not the service uid, whatever the path checks said (non-root CLI and exec)" \
+pend U36 "the client refuses a socket whose connected peer fails the client check, whatever the path checks said: LOCAL_PEERCRED uid 0 (launchd, under activation), the audit token's euid equal to the service uid, and the installed binary's cdhash (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestClientRefusesForeignServerUID
 pend U37 "exec sets the variable only in the child; nothing on stdout, nothing on disk; the value never enters argv; no non-root verb writes a value to stdout (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestKeysExecEnvOnlyInChild TestNoNonRootVerbWritesValue
@@ -734,8 +775,9 @@ pend U102 "the sealed record stores the last delivered version per delivery, rai
 	k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus
 pend U103 "a Secret at a recorded target whose label or owner annotation was removed is never overwritten or deleted, under a revocation, the object's deletion and rm-scope alike; the KeyDelivery gets SecretRetained=True with reason LabelRemoved, and doctor names the Secret and the KeyDelivery (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestStrippedLabelReportedNotDeleted
-rootpend U104 "root-run: install creates keystore-sock/ root:wheel 0755 and the server plist carries a Sockets listener for keystore-sock/keys.sock; a process running as the service uid cannot unlink, replace or bind keys.sock, whether or not the server runs, and gets EACCES; rig leg E24 (socket listener)" \
-	k3sm/pkg/install::TestSocketDirRootOwnedServiceUIDCannotBind
+rootpartial U104 "root-run: install creates keystore-sock/ root:wheel 0755 and the server plist carries a Sockets listener for keystore-sock/keys.sock; a process running as the service uid cannot unlink, replace or bind keys.sock, whether or not the server runs: the unlink, a rename over it and a bind of a new name (keys.sock once it is gone) get EACCES, and a bind of the existing keys.sock gets EADDRINUSE with root's name left in place (rig leg E24 measures that bind; the root-run test is in the integration tier, run with -tags integration)" "rig leg E24" \
+	k3sm/pkg/install::TestServerPlistActivatesKeystoreSocket TestKeystoreSockDirAtInstall TestSocketDirRootOwnedServiceUIDCannotBind
+tagged U104 integration
 rootpend U105 "root-run: every root path walks the keystore trees by descriptor: install over an existing tree, uninstall --purge and doctor each refuse a planted symlink, FIFO or swapped directory, with openat, O_NOFOLLOW, bounded reads and a SameFile re-check (append-only files)" \
 	k3sm/pkg/install::TestInstallOverExistingTreeWalksByDescriptor TestPurgeWalksKeystoreByDescriptor k3sm/cmd/k3sm::TestDoctorWalksKeystoreByDescriptor
 pend U106 "every root verb refuses a non-root caller: one table test runs rm-scope, floor --rebuild, audit --rotate, rewrap and deliver system/... with a non-root euid through the euid source; each is refused, changing nothing (KeyDelivery lifecycle)" \
@@ -764,12 +806,12 @@ rootcheck U118 "root-run: the old log is retired, never re-owned: in audit --rot
 	k3sm/cmd/k3sm::TestMaintenanceOldLogRetiredNeverReowned
 rootcheck U119 "root-run: the floor lock is keystore-lock, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root, rm-scope, floor --rebuild and audit --rotate included; a non-root process other than the service user holding the old data-root flock blocks none of them (append-only files)" \
 	k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb
-pend U120 "the activated listening descriptor reaches no child (integration): an exec.Command child, the runtimed helper and a Pod through the exec shim each list their open descriptors, and the listening socket is among none of them (socket listener)" \
-	k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild
-pend U121 "under activation, a client whose connected peer reads as uid 0 or as launchd's code refuses and writes nothing; U36 is never relaxed to accept uid 0, and if K7a finds the client-side peer names launchd the self-bind form ships (socket listener)" \
+partial U120 "the activated listening descriptor reaches no child: an exec.Command child, the runtimed helper and a Pod through the exec shim each list their open descriptors, and the listening socket is among none of them; delivered: the descriptor's FD_CLOEXEC is confirmed under syscall.ForkLock (one without it is refused), launchd's original is closed, and an exec.Command child does not hold it" "rig: the runtimed helper and a Pod through the exec shim" \
+	k3sm/pkg/keystore/socket::TestActivatedListenerIsCloseOnExecAndHeld
+tagged U120 integration
+pend U121 "under activation, the client accepts a LOCAL_PEERCRED uid 0 only when the audit token's euid is the service uid and its code the installed binary's cdhash; a uid-0 peer whose token names launchd, root or another uid, or other code, is refused and nothing is written (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer
-pend U122 "when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup; rig leg E27 (socket listener)" \
-	k3sm/pkg/provider::TestPodProfileDeniesLaunchdSocketActivation
+pend U122 "a Pod cannot obtain the server's listener from launchd: its launch_activate_socket for the server's socket name gets ESRCH (measured on macOS 27.2.1), so no Pod profile needs a launchd lookup deny; the Seatbelt path deny on keystore-sock/ (U16, U46) is a separate deny and stays required; rig: leg E27, which also owes macOS 26"
 pend U123 "same-target cross-record deletion: the orphan sweep, a lost-authority delete and rm-scope never delete a Secret that another honoured record claims at the same (namespace, secretName); a forged owner annotation naming one uid's tombstone on another uid's live Secret deletes nothing; the owner annotation never selects which record's tombstone governs a delete; nothing is charged to the victim (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestForgedTombstoneAnnotationOnOtherUsersLiveSecretIsNotDeleted
 pend U124 "a tombstone is pruned when its target is not this UID's owned Secret on two observations at least 60 s apart, not only on a Get that answers not found: a target occupied by another Secret still prunes; a failed Get keeps it (KeyDelivery lifecycle)" \
@@ -962,10 +1004,10 @@ leg E20 "files" "reboot of the server node, operator-attended (--attended reboot
 leg E21 "sandbox" "a native pod with runAsUser 501 is refused at spawn: the container never starts, and its status carries the uid refusal" "runtimed's sandbox change"
 leg E22 "socket" "a native pod with runAsUser 0 on a root runtimed runs (no drop, an inherited uid is allowed); a root connect to keys.sock is refused before any frame" "none: a guard that the uid refusal does not reach an inherited uid"
 leg E23 "kd-reconcile" "against the real authorizer, a role with create on secrets and update and delete on one named secret: delivery as that name is Ready, Delivered; delivery as another name is Authorized=False, NotAuthorized, with no Secret; then another principal (kubectl --as, with edit in the namespace) deletes the KeyDelivery and patches its finalizer away: each refused at admission, the object, its finalizer and the Secret stay" "the KeyDelivery reconciler; KeyDelivery authoring"
-leg E24 "exec" "with the server running, a non-k3sm program run as the service user tries to unlink keystore-sock/keys.sock and bind that path: EACCES for each, keys.sock still launchd's; with the listener stopped by the maintenance marker, the real installed k3sm binary, exec'd inside a native pod, tries the same bind and gets EPERM; in the deny-plus-pin fallback only, the service-user program binds keys.sock and the user's k3sm keys list and put refuse before any frame, naming the server pin; the real server is accepted afterwards" "the root-owned socket directory; the server pin; the pod bind deny"
+leg E24 "exec" "with the server running, a non-k3sm program run as the service user tries to unlink keystore-sock/keys.sock, bind that path and bind a new name in keystore-sock/: the unlink and the new-name bind get EACCES, the bind of keys.sock gets EADDRINUSE (the name is root's and stays in place), keys.sock still launchd's; with the listener stopped by the maintenance marker, the real installed k3sm binary, exec'd inside a native pod, tries the same bind and gets EPERM; in the deny-plus-pin fallback only, the service-user program binds keys.sock and the user's k3sm keys list and put refuse before any frame, naming the server pin; the real server is accepted afterwards" "the root-owned socket directory; the server pin; the pod bind deny"
 leg E25 "files" "helper variant only: a native pod tries connect(2) to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an append: EPERM for the pod, both refused, no line appended" "the helper pin"
 leg E26 "socket" "a native pod on a test build whose pod profile omits the keystore deny stanza (restored at the end) tries connect(2) to keys.sock: the listener refuses it before any frame, since the peer is sandboxed, and writes a refused line" "the sandboxed-peer refusal"
-leg E27 "socket" "a native pod calls launch_activate_socket for the server's socket name: no descriptor is returned, and nothing in the pod can accept on keys.sock" "the launchd lookup deny"
+leg E27 "socket" "on macOS 26 and 27, a native pod calls launch_activate_socket for the server's socket name, and the server's activated descriptor is read: the pod gets ESRCH with no descriptor and nothing in it can accept on keys.sock; launchd set FD_CLOEXEC on the activated descriptor" "launchd answering a pod's launch_activate_socket with ESRCH and setting FD_CLOEXEC on the activated descriptor, measured on macOS 26 and 27"
 leg E28 "" "the typed-credential tracer (\"Rig credentials and custody\"): a generated deploy key and a server-refreshed oauth pair delivered into one pod, which pushes over ssh and opens a pull request; then k3sm keys refresh: push and pull request succeed; the access-token file's hash changes in the same pod with restartCount 0; mount lines; the positive-controlled scans find nothing they should not; PENDING (exit 3) if the oauth pair is missing or not ok" "typed projection, the mount audit or the refresher"
 leg E29 "expiry" "a synthetic token put with --expires-at now+8 m, delivered: Valid, then Expiring after about 6 m, then Expired at 8 m; one Warning Event each, related the Secret; the Secret kept; Ready unchanged" "expiry and revocation"
 leg E30 "projection" "generate --kind ssh; deliver --item privateKey=id_ed25519 --item publicKey=id_ed25519.pub (defaultMode 0400); the pod runs ssh-keygen -y -f id_ed25519; a delivery without items is refused: the output equals k3sm keys pubkey; the fingerprint matches" "typed projection"
@@ -1092,6 +1134,7 @@ E10|vm Pod
 E10|network-bind
 E10|EPERM
 E24|EPERM
+E24|EADDRINUSE
 U85|reconciler budget, 1 MiB per log
 U85|excluded from the hard-cap test
 U85|bounded LRU of 1024
@@ -1145,6 +1188,7 @@ U103|never overwritten or deleted
 U103|LabelRemoved
 U104|keystore-sock/ root:wheel 0755
 U104|cannot unlink, replace or bind keys.sock
+U104|EADDRINUSE
 U105|install over an existing tree, uninstall --purge and doctor
 U106|refuses a non-root caller
 U106|through the euid source
@@ -1177,7 +1221,7 @@ U119|keystore-lock
 U119|blocks none of them
 U119|other than the service user
 U120|among none of them
-U121|never relaxed to accept uid 0
+U121|the audit token's euid is the service uid
 U123|another honoured record claims at the same (namespace, secretName)
 U124|a target occupied by another Secret still prunes
 U125|Preconditions{UID, ResourceVersion}
@@ -1203,13 +1247,14 @@ if [ "$mode" = listed ]; then
 	# the file $list_dir/<n>.list: go (go test -list), grep, or none (no checkout).
 	L_PKG=()
 	L_HOW=()
-	# list_pkg sets LK to the index of package $1's test list, making it on
-	# first use (not in a subshell: the arrays must persist).
+	# list_pkg sets LK to the index of package $1's test list built with tags
+	# $2 (none when empty), making it on first use (not in a subshell: the
+	# arrays must persist).
 	LK=0
 	list_pkg() {
 		local k=0 dir how n
 		while [ "$k" -lt "${#L_PKG[@]}" ]; do
-			if [ "${L_PKG[$k]}" = "$1" ]; then LK=$k; return 0; fi
+			if [ "${L_PKG[$k]}" = "$1|$2" ]; then LK=$k; return 0; fi
 			k=$((k + 1))
 		done
 		n=${#L_PKG[@]}
@@ -1217,13 +1262,13 @@ if [ "$mode" = listed ]; then
 		: >"$list_dir/$n.list"
 		if [ ! -d "$dir" ]; then
 			how=none
-		elif gotest "$1" -list '.*' "$(pkg_rel "$1")" >"$list_dir/$n.list" 2>/dev/null; then
+		elif gotest "$1" ${2:+-tags "$2"} -list '.*' "$(pkg_rel "$1")" >"$list_dir/$n.list" 2>/dev/null; then
 			how=go
 		else
 			how="grep"
 			grep -h -o -E '^func (Test|Fuzz|Benchmark|Example)[A-Za-z0-9_]*' "$dir"*_test.go 2>/dev/null | sed 's/^func //' >"$list_dir/$n.list" || true
 		fi
-		L_PKG+=("$1")
+		L_PKG+=("$1|$2")
 		L_HOW+=("$how")
 		LK=$n
 	}
@@ -1258,7 +1303,7 @@ if [ "$mode" = listed ]; then
 		fb=""
 		for spec in ${R_TESTS[$i]}; do
 			pkg="${spec%%::*}" t="${spec#*::}"
-			list_pkg "$pkg"
+			list_pkg "$pkg" "${R_TAGS[$i]}"
 			k=$LK
 			if [ "${L_HOW[$k]}" = grep ]; then fb=" (grep fallback)"; fi
 			if grep -q -x -- "$t" "$list_dir/$k.list"; then
@@ -1363,16 +1408,20 @@ wanted() {
 	return 1
 }
 
-# The packages the wanted rows' tests are in, each run once. P_PKG, P_TESTS
-# and P_RC are parallel; P_RC is the go test status, or "absent" for a repo
-# that is not checked out. Pending rows name tests but run none.
+# The packages the wanted rows' tests are in, each run once per set of build
+# tags (a row declared tagged runs in its own run with those tags). P_PKG,
+# P_TAGS, P_TESTS and P_RC are parallel; P_RC is the go test status, or
+# "absent" for a repo that is not checked out. Pending rows name tests but run
+# none.
 P_PKG=()
+P_TAGS=()
 P_TESTS=()
 P_RC=()
+# pkg_index prints the index of package $1's run with tags $2, or nothing.
 pkg_index() {
 	local j=0
 	while [ "$j" -lt "${#P_PKG[@]}" ]; do
-		if [ "${P_PKG[$j]}" = "$1" ]; then echo "$j"; return 0; fi
+		if [ "${P_PKG[$j]}" = "$1" ] && [ "${P_TAGS[$j]}" = "$2" ]; then echo "$j"; return 0; fi
 		j=$((j + 1))
 	done
 }
@@ -1383,10 +1432,11 @@ while [ "$i" -lt "$nrows" ]; do
 		if wanted "${R_ID[$i]}"; then
 			for spec in ${R_TESTS[$i]}; do
 				pkg="${spec%%::*}" t="${spec#*::}"
-				j="$(pkg_index "$pkg")"
+				j="$(pkg_index "$pkg" "${R_TAGS[$i]}")"
 				if [ -z "$j" ]; then
 					j=${#P_PKG[@]}
 					P_PKG+=("$pkg")
+					P_TAGS+=("${R_TAGS[$i]}")
 					P_TESTS+=("")
 					P_RC+=("")
 				fi
@@ -1404,7 +1454,7 @@ if [ "${#P_PKG[@]}" -gt 0 ]; then
 	trap 'rm -rf "$out_dir"' EXIT
 fi
 # One run of each package's tests (under --check, the whole package; under a
-# unit mode, the mode's tests only), verbose so each named test can be checked:
+# unit mode, and for a tagged run in every mode, the named tests only), verbose so each named test can be checked:
 # a test that does not run is not a pass. Under -race unless the package runs
 # with CGO_ENABLED=0, which the run says.
 j=0
@@ -1413,7 +1463,8 @@ while [ "$j" -lt "${#P_PKG[@]}" ]; do
 	dir="$(repo_dir "$pkg")"
 	: >"$out_dir/$j.out"
 	run=()
-	if [ "$mode" != check ]; then run=(-run "^($(tr ' ' '|' <<<"${P_TESTS[$j]}"))\$"); fi
+	if [ "$mode" != check ] || [ -n "${P_TAGS[$j]}" ]; then run=(-run "^($(tr ' ' '|' <<<"${P_TESTS[$j]}"))\$"); fi
+	if [ -n "${P_TAGS[$j]}" ]; then run+=(-tags "${P_TAGS[$j]}"); fi
 	rc=0
 	if [ ! -d "$dir" ]; then
 		rc=absent
@@ -1433,7 +1484,7 @@ ran() {
 	why=""
 	for spec in ${R_TESTS[$1]}; do
 		pkg="${spec%%::*}" t="${spec#*::}"
-		j="$(pkg_index "$pkg")"
+		j="$(pkg_index "$pkg" "${R_TAGS[$1]}")"
 		[ -n "$j" ] || return 1
 		if [ "${P_RC[$j]}" = absent ]; then
 			why=" (../${pkg%%/*} is not checked out beside k3sm)"
@@ -1515,7 +1566,7 @@ while [ "$i" -lt "$nrows" ]; do
 			;;
 		pend) pending_row "$id" "${R_DESC[$i]}" ;;
 		na) row "$id" N/A "${R_DESC[$i]} (not applicable: the flag variant was built; not counted)" ;;
-		rootpend | rootcheck) row "$id" ROOT "${R_DESC[$i]} (root-run row: --root runs it; pending here, not counted)" ;;
+		rootpend | rootcheck | rootpartial) row "$id" ROOT "${R_DESC[$i]} (root-run row: --root runs it; pending here, not counted)" ;;
 		leg) judge_leg "$i" ;;
 		esac
 	fi
@@ -1528,7 +1579,7 @@ while [ "$j" -lt "${#P_PKG[@]}" ]; do
 	0) ;;
 	absent) echo "keystore: ${P_PKG[$j]}: ../${P_PKG[$j]%%/*} is not checked out beside k3sm" ;;
 	*)
-		echo "keystore: ${P_PKG[$j]} failed:"
+		echo "keystore: ${P_PKG[$j]}${P_TAGS[$j]:+ (-tags ${P_TAGS[$j]})} failed:"
 		grep -E -- '^(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' "$out_dir/$j.out" || true
 		;;
 	esac
