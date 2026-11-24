@@ -3644,6 +3644,14 @@ service user can only add to.
     limits hold for the post-frame and unaudited counts the same way: a rotate that stops at
     that point can report one twice, and a server write landing during a rotate can lose one
     second's increment.
+    The persisted counts file is therefore **best-effort evidence**, not an exact ledger.
+    Besides that race, a count can be lost three ways: the service user, which owns the
+    store directory and is trusted, can edit or truncate the file; root's clear after a
+    rotate can race the server's own write of the file, so one side's update overwrites the
+    other's; and a crash between a revocation's commit and its audit append leaves neither
+    the line nor an `unaudited` count (as does a crash after a failed append and before the
+    server's next write of the file). Each loss undercounts; none hides a line that was
+    written, and the audit log itself stays the record of what was.
     The count in that `via: root` line is the service user's persisted claim, which root
     carries without vouching for it: the service user owns the store directory and can write
     any count there, the same residual as forged pre-frame lines (below), with a root label.
