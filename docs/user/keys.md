@@ -660,29 +660,57 @@ directory or link the service user made, the merge moves it into `pre-restore.d`
 so on stderr and in a `moved aside` line of its report, then goes on, and exits 4 so you read it. With `--dry-run` it prints
 where it would move it and moves nothing. Every line ends in
 `|| exit 1`, so the first one that fails stops the steps (and closes the shell), and no later
-line moves a copy into or over one that is set aside. Before anything moves, the first three
-lines check that nothing runs as the service user, that `/path/to/backup` is owned by root with
-no write access for group or others, and that `/path/to/backup/$B` is owned by root with mode
-0700.
+line moves a copy into or over one that is set aside. Every check comes before the first `mv`,
+so a check that fails stops the steps with nothing moved. The first three lines check that
+nothing runs as the service user, that `/path/to/backup` is owned by root with no write access
+for group or others, and that `/path/to/backup/$B` is owned by root with mode 0700. The `test`
+lines then check that no earlier restore is set aside (`keystore-floor.json.pre-restore` and
+`pre-restore.d` are both missing), that what the steps move is there (the live floor and
+`server/keystore`), and that what they copy in is there (the saved floor and the backup's
+`keystore`, which must not be a link).
 If `pgrep` prints process IDs, the server has not stopped yet: wait for it and start the steps
 again. If the second or third check fails, fix the owner or mode it names (`sudo chown root:wheel`
 on either directory, `sudo chmod go-w /path/to/backup`, `sudo chmod 0700 /path/to/backup/$B`)
 and start again. The
-`test ! -L` before `ditto` stops if the backup's `keystore` is a link, which `ditto` would follow:
+`test ! -L` on the backup's `keystore` stops if it is a link, which `ditto` would follow:
 
 ```
 ! pgrep -u _k3sm || exit 1
 test "$(sudo find /path/to/backup -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 1 || exit 1
 test "$(sudo find /path/to/backup/$B -maxdepth 0 -user root -perm 0700 | grep -c .)" -eq 1 || exit 1
 sudo test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo test ! -e /var/lib/k3sm/pre-restore.d || exit 1
+sudo test -f /var/lib/k3sm/keystore-floor.json || exit 1
+sudo test -d /var/lib/k3sm/server/keystore || exit 1
+sudo test -f /var/root/keystore-floor-backup/$B/keystore-floor.json || exit 1
+sudo test ! -L /path/to/backup/$B/keystore || exit 1
+sudo test -d /path/to/backup/$B/keystore || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
-sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
-sudo test ! -L /path/to/backup/$B/keystore || exit 1
 sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
 sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json || exit 1
 ```
+
+If a line after the first `mv` fails, the keystore stays mid-restore, so it changes nothing and
+the server keeps its user scope off. The way back is to undo, from the last, each step that
+ran. Each line below undoes one step, in reverse order: start at the line for the last step
+that succeeded, and skip the lines for the steps that never ran. The two checks come first.
+The `rm -f` removes the floor `install` put in place, the `rm -rf` the copy `ditto` made, and
+the `mv -n` lines put back what moved without replacing anything:
+
+```
+sudo test -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo test ! -e /var/lib/k3sm/server/keystore || exit 1
+sudo rm -f /var/lib/k3sm/keystore-floor.json || exit 1
+sudo rm -rf /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo mv -n /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/server/keystore || exit 1
+sudo rmdir /var/lib/k3sm/pre-restore.d || exit 1
+sudo mv -n /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json || exit 1
+```
+
+If the line that failed is the `mv` of `server/keystore`, skip the second check too, since
+`server/keystore` is still in place.
 
 Before you start the server, carry over every deletion recorded since the backup. The floor you
 moved aside records every entry deleted while it was live. Until you merge it, `put`, `rotate`
@@ -835,8 +863,10 @@ To undo the restore instead, stop the server and stage the two copies the other 
 and the restored `keystore/` becomes the moved-aside copy. Every line ends in `|| exit 1`, as
 above. The floors swap places: the floor you moved aside
 goes back in place, and the restored floor becomes `keystore-floor.json.pre-restore`, so the
-merge runs in reverse and keeps every deletion you made after the restore. The two `test`
-lines come first, before anything moves. The floors move next, as in the restore, so the
+merge runs in reverse and keeps every deletion you made after the restore. Every `test` line
+comes first, before anything moves: nothing is at `pre-restore.d/restored` or
+`keystore-floor.json.undo`, and the source of every `mv` is there, the second floor `mv`'s
+included. Every `mv` takes `-n`, so it never replaces a file. The floors move next, as in the restore, so the
 restored floor is `keystore-floor.json.pre-restore` before `server/keystore` leaves: the
 restored floor goes to `keystore-floor.json.undo`, the floor you moved aside into place, and
 `keystore-floor.json.undo` to `keystore-floor.json.pre-restore`. While either
@@ -844,7 +874,7 @@ restored floor goes to `keystore-floor.json.undo`, the floor you moved aside int
 counts as mid-restore, as in the restore, so every step of the swap keeps it so; a
 `keystore-floor.json.undo` left behind names itself in the refusal. If you already ran
 the merge, the floor you moved aside is now `keystore-floor.json.merged-<time>`: use that name
-in the second floor `mv` instead. `--undo` tells the reverse merge to read the record the first
+in the second floor `mv`, and in the `test -f` that checks its source, instead. `--undo` tells the reverse merge to read the record the first
 merge left beside that file, `keystore-floor.json.merged-<time>.retired`, which lists what the
 first merge retired; leave that record in place. `--undo` uses only the record whose merge read
 the floor you put back, so it refuses when that floor is not the first merge's input, or when no
@@ -857,11 +887,15 @@ sudo k3sm stop
 ! pgrep -u _k3sm || exit 1
 sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
 sudo test ! -e /var/lib/k3sm/keystore-floor.json.undo || exit 1
-sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.undo || exit 1
-sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json || exit 1
-sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
-sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
-sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
+sudo test -f /var/lib/k3sm/keystore-floor.json || exit 1
+sudo test -f /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo test -d /var/lib/k3sm/pre-restore.d/keystore || exit 1
+sudo test -d /var/lib/k3sm/server/keystore || exit 1
+sudo mv -n /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.undo || exit 1
+sudo mv -n /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json || exit 1
+sudo mv -n /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo mv -n /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo mv -n /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
 sudo k3sm keys floor merge --undo --dry-run
 sudo k3sm keys floor merge --undo
 sudo rm -rf /var/lib/k3sm/pre-restore.d
@@ -869,6 +903,21 @@ sudo k3sm start
 ```
 
 The last `rm -rf` removes the restored copy, which the steps above left in `pre-restore.d`.
+
+If an `mv` line fails, the keystore stays mid-restore at every step, as above, so it changes
+nothing until you finish or go back. The way back is the same moves in reverse, each with
+`-n`. Start at the line that undoes the last `mv` that succeeded, and run every line after it:
+
+```
+sudo mv -n /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/server/keystore || exit 1
+sudo mv -n /var/lib/k3sm/pre-restore.d/restored /var/lib/k3sm/pre-restore.d/keystore || exit 1
+sudo mv -n /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1
+sudo mv -n /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo mv -n /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1
+```
+
+If you used `keystore-floor.json.merged-<time>` in the second floor `mv`, use it in the fourth
+line here as well.
 
 Read the `--dry-run` report before you run the merge. A `buried live` line names an entry that
 the restored floor records as deleted, and says which kind it is. `retired by the restore` is a

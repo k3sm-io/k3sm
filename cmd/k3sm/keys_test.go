@@ -786,6 +786,47 @@ func recipeLines(doc string) map[int]string {
 	return out
 }
 
+// recipeBlocks returns each fenced block of doc, its lines trimmed.
+func recipeBlocks(doc string) [][]string {
+	var (
+		out   [][]string
+		block []string
+	)
+	fenced := false
+	for _, line := range strings.Split(doc, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			if fenced {
+				out = append(out, block)
+				block = nil
+			}
+			fenced = !fenced
+			continue
+		}
+		if fenced {
+			block = append(block, strings.TrimSpace(line))
+		}
+	}
+	return out
+}
+
+// blockWith returns the one block of blocks holding the line want.
+func blockWith(t *testing.T, blocks [][]string, want string) []string {
+	t.Helper()
+	var found [][]string
+	for _, b := range blocks {
+		for _, line := range b {
+			if strings.HasPrefix(line, want) {
+				found = append(found, b)
+				break
+			}
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("%d recipe blocks hold %q, want 1", len(found), want)
+	}
+	return found[0]
+}
+
 // recursiveChange reports whether line runs chown, chgrp, chmod or chflags
 // with a short-option cluster holding -R.
 func recursiveChange(line string) bool {
@@ -910,12 +951,17 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			"! pgrep -u _k3sm || exit 1",
 			`test "$(sudo find /path/to/backup -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 1 || exit 1`,
 			`test "$(sudo find /path/to/backup/$B -maxdepth 0 -user root -perm 0700 | grep -c .)" -eq 1 || exit 1`,
+			// Every precondition before the first mv.
 			"sudo test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
+			"sudo test ! -e /var/lib/k3sm/pre-restore.d || exit 1",
+			"sudo test -f /var/lib/k3sm/keystore-floor.json || exit 1",
+			"sudo test -d /var/lib/k3sm/server/keystore || exit 1",
+			"sudo test -f /var/root/keystore-floor-backup/$B/keystore-floor.json || exit 1",
+			"sudo test ! -L /path/to/backup/$B/keystore || exit 1",
+			"sudo test -d /path/to/backup/$B/keystore || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
 			"sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1",
 			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
-			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
-			"sudo test ! -L /path/to/backup/$B/keystore || exit 1",
 			"sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
 			"sudo install -o root -g wheel -m 0644 /var/root/keystore-floor-backup/$B/keystore-floor.json /var/lib/k3sm/keystore-floor.json || exit 1",
 			"sudo k3sm keys floor merge",
@@ -931,11 +977,15 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			// step; then the trees.
 			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
 			"sudo test ! -e /var/lib/k3sm/keystore-floor.json.undo || exit 1",
-			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.undo || exit 1",
-			"sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json || exit 1",
-			"sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
-			"sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
-			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
+			"sudo test -f /var/lib/k3sm/keystore-floor.json || exit 1",
+			"sudo test -f /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
+			"sudo test -d /var/lib/k3sm/pre-restore.d/keystore || exit 1",
+			"sudo test -d /var/lib/k3sm/server/keystore || exit 1",
+			"sudo mv -n /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.undo || exit 1",
+			"sudo mv -n /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json || exit 1",
+			"sudo mv -n /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
+			"sudo mv -n /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo mv -n /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
 			"sudo k3sm keys floor merge --undo --dry-run",
 			"sudo k3sm keys floor merge --undo",
 			"sudo rm -rf /var/lib/k3sm/pre-restore.d",
@@ -948,6 +998,38 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 				t.Fatalf("docs/user/keys.md does not say %q after the step before it", step)
 			}
 			at += i + len(step)
+		}
+		// In the restore and the undo blocks, every check comes before the
+		// first mv, so a failed check stops the steps with nothing moved,
+		// and every mv of the undo takes -n, so it never replaces a file.
+		blocks := recipeBlocks(string(raw))
+		restore := blockWith(t, blocks, "sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored")
+		undo := blockWith(t, blocks, "sudo k3sm keys floor merge --undo --dry-run")
+		for name, block := range map[string][]string{"restore": restore, "undo": undo} {
+			firstMv := -1
+			for i, line := range block {
+				if strings.HasPrefix(line, "sudo mv ") && firstMv < 0 {
+					firstMv = i
+				}
+				if strings.HasPrefix(line, "sudo test ") && firstMv >= 0 {
+					t.Errorf("the %s recipe checks %q after its first mv, %q", name, line, block[firstMv])
+				}
+			}
+			if firstMv < 0 {
+				t.Errorf("the %s recipe has no mv", name)
+			}
+		}
+		mvs := 0
+		for _, line := range undo {
+			if strings.HasPrefix(line, "sudo mv ") {
+				mvs++
+				if !strings.HasPrefix(line, "sudo mv -n ") {
+					t.Errorf("the undo recipe's %q does not take -n", line)
+				}
+			}
+		}
+		if mvs != 5 {
+			t.Errorf("the undo recipe has %d mv lines, want 5", mvs)
 		}
 	})
 	// A recursive ownership, mode or flag change run as root over a tree the
