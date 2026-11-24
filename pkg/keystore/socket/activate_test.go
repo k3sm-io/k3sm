@@ -177,7 +177,8 @@ func TestActivatedListenerRefusals(t *testing.T) {
 		{"not the launchd job", &fakeActivator{err: unix.ESRCH}, "not the server's launchd job"},
 		{"no such entry", &fakeActivator{err: unix.ENOENT}, "Sockets entry \"keys\""},
 		{"error with descriptors", &fakeActivator{err: unix.EINVAL, fds: pipe}, "Sockets entry"},
-		{"two descriptors", &fakeActivator{fds: two}, "2 descriptors"},
+		{"two descriptors", &fakeActivator{fds: two}, "more than one descriptor"},
+		{"no descriptor", &fakeActivator{}, "no descriptor"},
 		{"not a socket", &fakeActivator{fds: one}, "not a listening socket"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

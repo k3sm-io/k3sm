@@ -112,9 +112,12 @@ func activate(name string, a Activator) (*net.UnixListener, error) {
 		}
 		return nil, fmt.Errorf("%w for the Sockets entry %q: %w", ErrNotActivated, name, err)
 	}
-	if len(fds) != 1 {
+	switch {
+	case len(fds) == 0:
+		return nil, fmt.Errorf("%w: launchd returned no descriptor for the Sockets entry %q", ErrNotActivated, name)
+	case len(fds) > 1:
 		closeAll(fds)
-		return nil, fmt.Errorf("%w: launchd returned %d descriptors for the Sockets entry %q, want 1", ErrNotActivated, len(fds), name)
+		return nil, fmt.Errorf("%w: launchd returned more than one descriptor for the Sockets entry %q, want one", ErrNotActivated, name)
 	}
 	f := os.NewFile(uintptr(fds[0]), name)
 	fl, err := net.FileListener(f) // a close-on-exec duplicate
