@@ -25,6 +25,7 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"k3sm.io/k3sm/pkg/keystore/internal/strictjson"
@@ -57,6 +58,9 @@ type Handler struct {
 	ops map[string]opFunc // the operations; an op not here is unknown-op
 	log *slog.Logger      // receives the store errors that are damage (logStoreError)
 	dmg damageLimiter     // bounds those lines per uid, op and class
+	// supervised is set once a Supervisor owns the Handler (NewSupervisor),
+	// which sets log before anything serves; no second one may.
+	supervised atomic.Bool
 }
 
 // Peer is the admitted peer of a connection, as the listener read it at

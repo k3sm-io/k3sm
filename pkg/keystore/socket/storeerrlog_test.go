@@ -395,6 +395,13 @@ func TestSupervisorLogReceivesDamage(t *testing.T) {
 	if _, err := NewSupervisor(cfg); err != nil {
 		t.Fatal(err)
 	}
+	// The handler is that supervisor's: a second one may not take it and
+	// replace its logger.
+	other := r.config()
+	other.Log = slog.New(slog.DiscardHandler)
+	if s, err := NewSupervisor(other); err == nil || s != nil {
+		t.Fatalf("a second supervisor took the handler: %v", err)
+	}
 	serveOne(t, h, hdr(t, OpReadForExec, entryOf(uidA, "a"), nil))
 	recs := c.records(t)
 	if len(recs) != 1 {

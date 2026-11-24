@@ -166,7 +166,9 @@ type SupervisorConfig struct {
 	// Clock times the backoff, the marker polls and the Listener's.
 	Clock Clock
 	// Log receives the supervisor's lines, and NewSupervisor gives it to
-	// Handler for the store errors that are damage (logStoreError).
+	// Handler for the store errors that are damage (logStoreError). Handler
+	// is the supervisor's from then on: NewSupervisor refuses a Handler
+	// another supervisor already owns.
 	Log *slog.Logger
 }
 
@@ -220,8 +222,14 @@ func NewSupervisor(cfg SupervisorConfig) (*Supervisor, error) {
 	if missing != "" {
 		return nil, fmt.Errorf("keystore socket: nil %s", missing)
 	}
-	// The handler's damage lines go where the supervisor's lines go: the
-	// server's log, not the process default.
+	// The supervisor owns its handler: the handler's damage lines go where
+	// the supervisor's lines go, the server's log, set here, before Run
+	// starts anything that serves, so no goroutine reads log while it is
+	// set. A handler is given to one supervisor only, so no other owner's
+	// logger is replaced under it.
+	if !cfg.Handler.supervised.CompareAndSwap(false, true) {
+		return nil, errors.New("keystore socket: the handler is already another supervisor's")
+	}
 	cfg.Handler.log = cfg.Log
 	return &Supervisor{cfg: cfg, state: State{Phase: PhaseStarting}}, nil
 }

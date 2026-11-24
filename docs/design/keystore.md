@@ -4577,7 +4577,8 @@ surface, and the app consumes only those.
   *The server's log.* The reply carries only the code, so the request boundary
   (`Handler.serveRequest`) logs each store error that is damage at Warn, to the supervisor's
   logger (`SupervisorConfig.Log`, which `NewSupervisor` gives the handler, so the lines reach
-  the server's log; `TestSupervisorLogReceivesDamage`): the op, the peer's
+  the server's log; the handler is then that supervisor's alone, set before anything serves,
+  and a second supervisor is refused it; `TestSupervisorLogReceivesDamage`): the op, the peer's
   uid, `requested_entry` when the request header names a valid entry (by its exact name, in
   the API grammar), a class from a closed set and that class's fixed remedy. The classes are
   `orphan-version` (answered `refused`; the owner can `rm` the entry and `put` it again),
