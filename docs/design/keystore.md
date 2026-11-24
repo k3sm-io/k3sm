@@ -4328,6 +4328,12 @@ directory is root's"). A worker node runs no listener (E18).
   other only judges it; the server's `mkdir` makes a directory the service user already owns,
   which the put's judgement accepts, and a put's `mkdir` makes one root owns until its
   handover, which the server refuses for that pass only, finding it handed over on the next.
+  The race's one-pass errors (the directory cannot be opened, as a root-owned one before its
+  handover cannot; or a directory the server has just made already holds a name a racing put
+  wrote, `ErrCorrupt` "is not empty") name no repair: they say `a root keys put may be creating
+  it; retried` (`keystore.StoreDirRace`). Only a refusal of an existing directory on what it is
+  (not a directory, its owner, its mode: `keystore.StoreDirRefused`) names the repair
+  (`TestStoreDirRaceTextIsTransient`, `TestEnsureDirClassifiesRefusals`).
   Doctor runs the same judgement read-only: before the server's first start it shows the
   user scope off for the store directory, saying the server creates it at start.
   Nothing is opened on the data root before its mount flags and the installed files are

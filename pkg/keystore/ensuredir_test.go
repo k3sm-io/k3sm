@@ -120,3 +120,58 @@ func TestEnsureDir(t *testing.T) {
 		}
 	})
 }
+
+// TestEnsureDirClassifiesRefusals: EnsureDir marks a persistent refusal of
+// an existing directory (its mode or owner) as StoreDirRefused, and the
+// one-pass errors of the race with a root put as StoreDirRace: a directory
+// it cannot open (EACCES, as on one root has made and not yet handed over),
+// and a directory it has just made that a racing put already writes in
+// (ErrCorrupt, not empty). Neither is the other, and the text is the
+// open's.
+func TestEnsureDirClassifiesRefusals(t *testing.T) {
+	t.Run("a wider mode is a refusal", func(t *testing.T) {
+		s, server := newTestStore(t)
+		dir := filepath.Join(server, "keystore")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		giveToService(t, dir)
+		err := s.EnsureDir()
+		if !StoreDirRefused(err) || StoreDirRace(err) || !strings.Contains(err.Error(), "grants more than") {
+			t.Fatalf("EnsureDir = %v: refused %v race %v, want a refusal", err, StoreDirRefused(err), StoreDirRace(err))
+		}
+	})
+	t.Run("a directory it cannot open is the race", func(t *testing.T) {
+		s, server := newTestStore(t)
+		dir := filepath.Join(server, "keystore")
+		if err := os.Mkdir(dir, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		err := s.EnsureDir()
+		if !errors.Is(err, fs.ErrPermission) || !StoreDirRace(err) || StoreDirRefused(err) {
+			t.Fatalf("EnsureDir = %v: refused %v race %v, want the race", err, StoreDirRefused(err), StoreDirRace(err))
+		}
+	})
+	t.Run("a new directory a put already writes in is the race", func(t *testing.T) {
+		s, server := newTestStore(t)
+		dir := filepath.Join(server, "keystore")
+		s.dirMade = func(string) {
+			if err := os.WriteFile(filepath.Join(dir, "planted"), nil, 0o600); err != nil {
+				t.Error(err)
+			}
+		}
+		err := s.EnsureDir()
+		if !errors.Is(err, ErrCorrupt) || !StoreDirRace(err) || StoreDirRefused(err) || !strings.Contains(err.Error(), "not empty") {
+			t.Fatalf("EnsureDir = %v: refused %v race %v, want the race", err, StoreDirRefused(err), StoreDirRace(err))
+		}
+	})
+	t.Run("a nil error is neither", func(t *testing.T) {
+		if StoreDirRefused(nil) || StoreDirRace(nil) {
+			t.Fatal("nil classified")
+		}
+	})
+}

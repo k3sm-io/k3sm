@@ -70,6 +70,9 @@ var (
 	// not a regular file, or over its size bound. A reader turns it into its
 	// own refusal; any other read error is an I/O failure and stays one.
 	errBadFile = errors.New("not a readable regular file")
+	// errNewDirNotEmpty is a directory mkdirAt has just made that already
+	// holds a name: another writer found it first and writes in it.
+	errNewDirNotEmpty = errors.New("is not empty")
 )
 
 // openDir opens the directory at path as a root and checks it (see
@@ -87,7 +90,7 @@ func (s *FileStore) openDir(path string, create bool) (*os.Root, error) {
 		return nil, err
 	}
 	if !named.IsDir() {
-		return nil, fmt.Errorf("%s is not a directory (mode %s)", path, named.Mode())
+		return nil, &dirRefusal{fmt.Errorf("%s is not a directory (mode %s)", path, named.Mode())}
 	}
 	root, err := os.OpenRoot(path)
 	if err != nil {
@@ -160,7 +163,8 @@ func (s *FileStore) openSubdir(parent *os.Root, name string, create bool) (*os.R
 // checkRoot checks an opened directory: it must be the very directory Lstat
 // saw as named, so a swap between the two cannot substitute another (and
 // OpenRoot, which follows a symlink, did not), owned by the store's uid, and
-// granting nothing to group or others.
+// granting nothing to group or others. An owner or mode refusal is a
+// dirRefusal.
 func (s *FileStore) checkRoot(root *os.Root, named fs.FileInfo) error {
 	opened, err := root.Stat(".")
 	if err != nil {
@@ -169,7 +173,10 @@ func (s *FileStore) checkRoot(root *os.Root, named fs.FileInfo) error {
 	if !os.SameFile(named, opened) {
 		return errors.New("changed while it was opened")
 	}
-	return s.checkOwned(opened, dirMode)
+	if err := s.checkOwned(opened, dirMode); err != nil {
+		return &dirRefusal{err}
+	}
+	return nil
 }
 
 // mkdirOwned creates the directory at path at dirMode, handed to the service
@@ -279,7 +286,7 @@ func (s *FileStore) checkNewDir(f *os.File, made, opened fs.FileInfo) error {
 	}
 	names, err := f.Readdirnames(1)
 	if len(names) > 0 {
-		return errors.New("is not empty")
+		return errNewDirNotEmpty
 	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("could not be listed: %w", err)
@@ -555,16 +562,72 @@ func readDirEntries(root *os.Root, max int) ([]fs.DirEntry, error) {
 // put's judgement accepts. A put's mkdir makes one root owns until its
 // handover, which the server's judgement refuses for that one pass, and the
 // next pass finds the directory handed over.
+//
+// Its error says which: StoreDirRefused for an existing directory refused
+// on what it is (not a directory, its owner, its mode), which every pass
+// refuses again until it is changed, and StoreDirRace for the one-pass
+// errors of that race (the directory cannot be opened, as one root owns
+// before its handover cannot; or a directory just made already holds a
+// name a racing put wrote). Any other error is neither.
 func (s *FileStore) EnsureDir() error {
 	if err := s.checkConfig(); err != nil {
 		return err
 	}
-	root, err := s.openDir(s.dir, true)
+	if err := s.mkdirOwned(s.dir); err != nil {
+		if errors.Is(err, errNewDirNotEmpty) {
+			return &storeDirError{err: err, race: true}
+		}
+		return err
+	}
+	root, err := s.openDir(s.dir, false)
 	if err != nil {
+		var refused *dirRefusal
+		switch {
+		case errors.As(err, &refused):
+			return &storeDirError{err: err}
+		case errors.Is(err, fs.ErrPermission):
+			return &storeDirError{err: err, race: true}
+		}
 		return err
 	}
 	return root.Close()
 }
+
+// storeDirError is an EnsureDir error marked as a refusal of the existing
+// directory or, with race set, as the one-pass race with a root put. Its
+// text and chain are err's.
+type storeDirError struct {
+	err  error
+	race bool
+}
+
+func (e *storeDirError) Error() string { return e.err.Error() }
+func (e *storeDirError) Unwrap() error { return e.err }
+
+// StoreDirRefused reports whether err, from EnsureDir, refuses an existing
+// store directory on what it is: not a directory, another owner, or a mode
+// granting group or others anything. Only a change to the directory clears
+// it.
+func StoreDirRefused(err error) bool {
+	var e *storeDirError
+	return errors.As(err, &e) && !e.race
+}
+
+// StoreDirRace reports whether err, from EnsureDir, is a one-pass error of
+// the race with a root put creating the directory: the directory cannot be
+// opened, or the directory EnsureDir just made already holds a name. A
+// later pass finds the directory handed over.
+func StoreDirRace(err error) bool {
+	var e *storeDirError
+	return errors.As(err, &e) && e.race
+}
+
+// dirRefusal marks openDir's refusal of a directory on what it is (not a
+// directory, its owner, its mode). Its text and chain are err's.
+type dirRefusal struct{ err error }
+
+func (e *dirRefusal) Error() string { return e.err.Error() }
+func (e *dirRefusal) Unwrap() error { return e.err }
 
 // CheckDir is EnsureDir's judgement, read-only, for doctor: a missing
 // directory is an error matching fs.ErrNotExist, and nothing is created.

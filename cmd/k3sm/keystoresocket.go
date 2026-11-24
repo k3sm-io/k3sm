@@ -390,22 +390,35 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 	}, closeAll, nil
 }
 
-// storeDirRepair is the remedy a refused store directory names: the server
-// creates a missing one, but never repairs one that exists.
+// storeDirRepair is the remedy a refused store directory names
+// (keystore.StoreDirRefused): the server creates a missing one, but never
+// repairs one that exists.
 const storeDirRepair = "the server never repairs an existing store directory: as root, make it the service user's at mode 0700, or remove it if it holds nothing, and the next start check creates it"
+
+// storeDirRaceText is what the one-pass errors of the race with a root put
+// name (keystore.StoreDirRace): nothing to repair, the next pass retries.
+const storeDirRaceText = "a root keys put may be creating it; retried"
 
 // serverStoreDir is the server's store-directory step: the store directory
 // created if it is missing, with the store's own helper, and judged as
 // every open judges it (keystore.FileStore.EnsureDir). It runs on every
 // pass, so a directory a racing root put has made but not yet handed to
 // the service user is refused for that pass only; one that stays wrong is
-// refused on every pass and never repaired.
+// refused on every pass and never repaired. Only that persistent refusal
+// names the repair (storeDirRepair); the race's errors say they are
+// retried (storeDirRaceText), and any other error stands on its own text.
 func serverStoreDir(store *keystore.FileStore) func(context.Context) error {
 	return func(context.Context) error {
-		if err := store.EnsureDir(); err != nil {
+		err := store.EnsureDir()
+		switch {
+		case err == nil:
+			return nil
+		case keystore.StoreDirRefused(err):
 			return fmt.Errorf("%w (%s)", err, storeDirRepair)
+		case keystore.StoreDirRace(err):
+			return fmt.Errorf("%w (%s)", err, storeDirRaceText)
 		}
-		return nil
+		return err
 	}
 }
 

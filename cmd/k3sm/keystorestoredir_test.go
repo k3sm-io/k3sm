@@ -199,3 +199,33 @@ func TestDoctorStoreDirRow(t *testing.T) {
 		t.Fatalf("doctor's step took the store lock: %v", err)
 	}
 }
+
+// TestStoreDirRaceTextIsTransient: the server's store-directory step names
+// the "as root, make it ... or remove it" repair only for a persistent
+// refusal of an existing directory; a directory it cannot open, as one a
+// root put has made and not yet handed over, is worded as the one-pass race
+// it is, retried, with no repair.
+func TestStoreDirRaceTextIsTransient(t *testing.T) {
+	f, _ := installedWiringFixture(t, false)
+	storeCfg := f.deps.layout(f.deps.workDir)
+	storeCfg.UID, storeCfg.GID = uint32(os.Getuid()), uint32(os.Getgid())
+	store := keystore.New(storeCfg)
+	if err := os.Mkdir(storeCfg.Dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(storeCfg.Dir, 0o700) })
+	err := serverStoreDir(store)(t.Context())
+	if err == nil || !strings.Contains(err.Error(), storeDirRaceText) || strings.Contains(err.Error(), storeDirRepair) {
+		t.Fatalf("a directory the server cannot open: %v, want %q and no repair", err, storeDirRaceText)
+	}
+	if !strings.Contains(storeDirRaceText, "a root keys put may be creating it; retried") {
+		t.Fatalf("the race text %q does not say it is transient", storeDirRaceText)
+	}
+	if err := os.Chmod(storeCfg.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err = serverStoreDir(store)(t.Context())
+	if err == nil || !strings.Contains(err.Error(), storeDirRepair) || strings.Contains(err.Error(), storeDirRaceText) {
+		t.Fatalf("a wider mode: %v, want the repair and not the race text", err)
+	}
+}
