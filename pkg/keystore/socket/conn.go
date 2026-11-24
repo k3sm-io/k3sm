@@ -23,7 +23,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
+
+	"k3sm.io/k3sm/pkg/keystore/internal/strictjson"
 )
 
 // RequestBound is how long the server waits for a complete HELLO from
@@ -51,6 +54,8 @@ type Conn interface {
 type Handler struct {
 	now func() time.Time
 	ops map[string]opFunc // the operations; an op not here is unknown-op
+	log *slog.Logger      // receives the store errors that are damage (logStoreError)
+	dmg damageLimiter     // bounds those lines per op and class
 }
 
 // Peer is the admitted peer of a connection, as the listener read it at
@@ -107,16 +112,63 @@ func NewHandler(now func() time.Time, opts ...HandlerOption) (*Handler, error) {
 	if now == nil {
 		return nil, errors.New("keystore socket: nil clock")
 	}
-	h := &Handler{now: now}
+	h := &Handler{now: now, log: slog.Default()}
 	for _, o := range opts {
 		o(h)
 	}
 	return h, nil
 }
 
-// requestHeader is the part of a request header the dispatcher reads.
-type requestHeader struct {
-	Op string `json:"op"`
+// decodeField decodes raw, a field strictjson.Object read, into dst; an absent
+// field, or one set to null, leaves dst as it is.
+func decodeField(raw json.RawMessage, dst any) error {
+	if raw == nil || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	return json.Unmarshal(raw, dst)
+}
+
+// requestKeys are the names of every request header field an operation
+// reads (requestFields): the dispatcher judges all of them, whichever op
+// the request names.
+var requestKeys = []string{"op", "entry", "kind", "from_version"}
+
+// requestOp is the op a request header names, read with the keystore's
+// strict-object rule (strictjson.Object) over every request field: a
+// header that is not an object, any key given twice in any case, a
+// request field spelled in another case, an op that is not a string, and a
+// missing or empty op all close the connection.
+func requestOp(header []byte) (string, error) {
+	fields, err := strictjson.Object(header, requestKeys...)
+	if err != nil {
+		return "", protocolErrorf("malformed request header: %v", err)
+	}
+	var op string
+	if err := decodeField(fields["op"], &op); err != nil {
+		return "", protocolErrorf("malformed request header: the op is not a string")
+	}
+	if op == "" {
+		return "", protocolErrorf("request names no op")
+	}
+	return op, nil
+}
+
+// helloOf is the client's HELLO header, read with the strict-object rule
+// (strictjson.Object): a header that is not an object, any key given
+// twice, a known field spelled in another case or of the wrong type closes
+// the connection.
+func helloOf(header []byte) (helloRequest, error) {
+	var hello helloRequest
+	fields, err := strictjson.Object(header, "proto", "min", "max")
+	if err != nil {
+		return hello, protocolErrorf("malformed HELLO header: %v", err)
+	}
+	for name, dst := range map[string]any{"proto": &hello.Proto, "min": &hello.Min, "max": &hello.Max} {
+		if err := decodeField(fields[name], dst); err != nil {
+			return helloRequest{}, protocolErrorf("malformed HELLO header: the field %s has the wrong type", name)
+		}
+	}
+	return hello, nil
 }
 
 // Serve runs one connection: HELLO within RequestBound of the call, then
@@ -148,9 +200,9 @@ func (h *Handler) Serve(ctx context.Context, c Conn, p Peer) error {
 	if err != nil {
 		return err
 	}
-	var hello helloRequest
-	if err := json.Unmarshal(f.Header, &hello); err != nil {
-		return protocolErrorf("malformed HELLO header: %v", err)
+	hello, err := helloOf(f.Header)
+	if err != nil {
+		return err
 	}
 	if hello.Proto != Proto {
 		return protocolErrorf("HELLO names protocol %q", hello.Proto)
@@ -211,18 +263,17 @@ func (h *Handler) serveRequest(ctx context.Context, c Conn, p Peer, first byte) 
 	if f.Type != TypeRequest {
 		return protocolErrorf("frame type %#02x after HELLO, not a request", byte(f.Type))
 	}
-	var req requestHeader
-	if err := json.Unmarshal(f.Header, &req); err != nil {
-		return protocolErrorf("malformed request header: %v", err)
-	}
-	if req.Op == "" {
-		return protocolErrorf("request names no op")
+	name, err := requestOp(f.Header)
+	if err != nil {
+		return err
 	}
 	// An op the server does not have is answered unknown-op, and the
 	// connection stays open so a newer client can fall back.
 	rt, header, value := TypeError, any(errorHeader{Code: CodeUnknownOp}), []byte(nil)
-	if op, ok := h.ops[req.Op]; ok {
-		rt, header, value = answer(op(ctx, Request{Peer: p, Op: req.Op, Header: f.Header, Value: f.Value}))
+	if op, ok := h.ops[name]; ok {
+		rep, oerr := op(ctx, Request{Peer: p, Op: name, Header: f.Header, Value: f.Value})
+		h.logStoreError(name, p, f.Header, oerr)
+		rt, header, value = answer(rep, oerr)
 	}
 	// A reply the server cannot encode (a header that does not marshal,
 	// or one past its cap) is answered internal: the operation has run,

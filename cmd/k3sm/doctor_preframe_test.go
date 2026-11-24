@@ -55,10 +55,10 @@ func TestDoctorKeystorePreFrameDropped(t *testing.T) {
 		}, statusWarn, "9 pre-frame refusal(s) not recorded for 256 uid(s), 3 of them for further uids not named"},
 		{"warn-post-frame", func(e *doctorEnv) {
 			e.keystorePreFrameDropped = counts(keystore.PreFrameDroppedCounts{PostFrame: 4, PostFrameUIDs: 2}, nil)
-		}, statusWarn, "4 post-frame refusal(s) not recorded for 2 uid(s)"},
+		}, statusWarn, "4 post-frame refusal line(s), the socket's and the store's, not recorded for 2 uid(s)"},
 		{"warn-pre-and-post-frame", func(e *doctorEnv) {
 			e.keystorePreFrameDropped = counts(keystore.PreFrameDroppedCounts{Refusals: 7, UIDs: 2, PostFrame: 1, PostFrameUIDs: 1}, nil)
-		}, statusWarn, "7 pre-frame refusal(s) not recorded for 2 uid(s); 1 post-frame refusal(s) not recorded for 1 uid(s)"},
+		}, statusWarn, "7 pre-frame refusal(s) not recorded for 2 uid(s); 1 post-frame refusal line(s), the socket's and the store's, not recorded for 1 uid(s)"},
 		{"warn-unreadable", func(e *doctorEnv) {
 			e.keystorePreFrameDropped = counts(keystore.PreFrameDroppedCounts{}, errors.New("does not parse"))
 		}, statusWarn, "the persisted pre-frame refusal count is unreadable"},
@@ -106,7 +106,7 @@ func TestDoctorCountsUnauditedOps(t *testing.T) {
 		{"pass-none", keystore.PreFrameDroppedCounts{}, statusPass, "flagged SF_APPEND"},
 		{"warn-unaudited", keystore.PreFrameDroppedCounts{Unaudited: 3}, statusWarn, "3 committed keystore revocation(s) have no audit line"},
 		{"warn-with-refusals", keystore.PreFrameDroppedCounts{Refusals: 1, UIDs: 1, PostFrame: 2, PostFrameUIDs: 1, Unaudited: 1},
-			statusWarn, "1 pre-frame refusal(s) not recorded for 1 uid(s); 2 post-frame refusal(s) not recorded for 1 uid(s); 1 committed keystore revocation(s) have no audit line"},
+			statusWarn, "1 pre-frame refusal(s) not recorded for 1 uid(s); 2 post-frame refusal line(s), the socket's and the store's, not recorded for 1 uid(s); 1 committed keystore revocation(s) have no audit line"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

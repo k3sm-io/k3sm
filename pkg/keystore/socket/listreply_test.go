@@ -19,6 +19,7 @@ package socket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -160,8 +161,13 @@ func TestListDamagedScopeIsNotEmpty(t *testing.T) {
 				t.Fatal(err)
 			}
 			f := w.call(t, hdr(t, OpList, "", nil), nil)
-			if f.Type == TypeReply {
-				t.Fatalf("list of a scope with no %s replied %s, want the damage's code", gone, f.Header)
+			if code := codeOf(t, f); f.Type != TypeError || code != CodeNotFound {
+				t.Fatalf("list of a scope with no %s replied %#02x %s, want the error frame not-found (ErrScopeAbsent)", gone, byte(f.Type), f.Header)
+			}
+			// The store's answer is the damage, ErrScopeAbsent, never the
+			// no-scope-key absence a list serves as empty.
+			if _, err := r.b.List(t.Context(), Peer{UID: uidA}); !errors.Is(err, keystore.ErrScopeAbsent) || keystore.NoScopeKey(err) {
+				t.Fatalf("the store's list of a scope with no %s = %v, want ErrScopeAbsent that is not NoScopeKey", gone, err)
 			}
 		})
 	}

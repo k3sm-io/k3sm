@@ -264,6 +264,44 @@ func TestOutcomeOfMapsStoreErrors(t *testing.T) {
 	}
 }
 
+// The bridge's mapping of a put the store refuses for its value: an
+// Ed25519 key of the wrong length or with a foreign public half, put
+// through the real bridge (the socket's put sends opaque only), matches
+// InvalidValue and outcomeOf answers it refused, never internal. The
+// wire's own put path is not what this checks.
+func TestBridgeMapsEd25519ValueRefusalRefused(t *testing.T) {
+	r := newStartedBridge(t, nil)
+	seed := bytes.Repeat([]byte{7}, 32)
+	mismatched := append(bytes.Clone(seed), bytes.Repeat([]byte{9}, 32)...)
+	for i, v := range [][]byte{seed[:31], mismatched} {
+		_, err := r.b.Put(t.Context(), Peer{UID: uidA}, entryOf(uidA, fmt.Sprintf("k%d", i)), keystore.KindEd25519, v)
+		if code, _ := outcomeOf(err); code != CodeRefused || !keystore.InvalidValue(err) {
+			t.Errorf("a put of a %d-byte Ed25519 value = %v, code %q; want refused", len(v), err, code)
+		}
+	}
+}
+
+// Read-side damage answers internal even when its chain also matches a
+// refusal: a stored Ed25519 version that authenticates and fails its check
+// is ErrCorrupt wrapping the InvalidValue a put of the same bytes gets
+// (the store's shape, TestStoredEd25519FailingCheckIsCorrupt). The orphan
+// version, which also matches ErrCorrupt, is still refused.
+func TestReadSideDamageAnswersInternal(t *testing.T) {
+	r := newStartedBridge(t, nil)
+	_, refusal := r.b.Put(t.Context(), Peer{UID: uidA}, entryOf(uidA, "k"), keystore.KindEd25519, []byte("SECRET!"))
+	if !keystore.InvalidValue(refusal) {
+		t.Fatalf("a put of a 7-byte Ed25519 value = %v, want InvalidValue", refusal)
+	}
+	read := fmt.Errorf("user scope exec-read: %w: version 1: %w", keystore.ErrCorrupt, refusal)
+	if code, _ := outcomeOf(read); code != CodeInternal {
+		t.Errorf("a stored version failing its check = %q, want internal", code)
+	}
+	orphan := fmt.Errorf("%w: %w", keystore.ErrCorrupt, keystore.ErrOrphanVersion)
+	if code, _ := outcomeOf(orphan); code != CodeRefused {
+		t.Errorf("an orphan version = %q, want refused", code)
+	}
+}
+
 // The store's own states, made by the real store: its busy lock, the user
 // scope not started, a uid's spent share, and a committed change whose
 // audit line failed.

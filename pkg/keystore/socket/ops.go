@@ -17,15 +17,14 @@ limitations under the License.
 package socket
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	keyentry "k3sm.io/apis/keystore/entry"
 	"k3sm.io/k3sm/pkg/keystore"
+	"k3sm.io/k3sm/pkg/keystore/internal/strictjson"
 )
 
 // The operations' names, as a request's op carries them.
@@ -381,8 +380,10 @@ func requestFields(dst any) (map[string]any, error) {
 // decodeRequest decodes header into dst, one of the request types. A
 // header over MaxHeader is refused before it is parsed; a header that is
 // not a JSON object, or a known field of the wrong JSON type, refuses the
-// request. Field names match exactly, never case-folded, and a field set
-// to null is absent.
+// request. Field names match exactly, never case-folded, under the
+// keystore's strict-object rule (strictjson.Object), the one the
+// dispatcher closes on first: a key given twice in any case, or a field
+// spelled in another case, refuses it too. A field set to null is absent.
 func decodeRequest(header []byte, dst any) error {
 	fields, err := requestFields(dst)
 	if err != nil {
@@ -391,16 +392,16 @@ func decodeRequest(header []byte, dst any) error {
 	if len(header) > MaxHeader {
 		return refusedf("the header is over the %d-byte cap", MaxHeader)
 	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(header, &raw); err != nil || raw == nil {
-		return refusedf("the header is not a JSON object")
+	names := make([]string, 0, len(fields))
+	for name := range fields {
+		names = append(names, name)
+	}
+	raw, err := strictjson.Object(header, names...)
+	if err != nil {
+		return refusedf("the header is not a strict JSON object")
 	}
 	for name, ptr := range fields {
-		v, ok := raw[name]
-		if !ok || bytes.Equal(v, []byte("null")) {
-			continue
-		}
-		if err := json.Unmarshal(v, ptr); err != nil {
+		if err := decodeField(raw[name], ptr); err != nil {
 			return refusedf("the header field %s has the wrong type", name)
 		}
 	}

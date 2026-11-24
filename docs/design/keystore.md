@@ -3877,7 +3877,12 @@ refused before its first frame:
   `show`, `exec-read`, `deliver`, `withdraw`, `rewrap`, `rm-scope`, `floor-rebuild`,
   `floor-merge`, `floor-merge-dry-run`, `audit-rotate`, `deliver-write`, `deliver-delete`,
   `refused`, `unaudited` (root's `audit --rotate` line for the committed revocations whose
-  lines were not written, with result `committed`); and `ok`, `committed` or a sentinel name: `ok` is a change committed whole,
+  lines were not written, with result `committed`); and `ok`, `committed` or a sentinel name: a
+  user-scope operation's result is one of a closed set (`keystore.auditResult`): `ok`,
+  `committed`, `quota`, `not-found`, `exists`, `scope-absent`, `corrupt`, `log-full`,
+  `invalid-name`, `kind-mismatch`, `quarantined` (the start step quarantined the scope),
+  `floor-degraded` (the floor's damage refused a grant or read), and `error` for any refusal
+  with no name of its own (`TestAuditResultNamesRefusals`). `ok` is a change committed whole,
   `committed` a revocation committed in part and reported after its commit, such as an `rm`
   whose burial stopped part way or a `withdraw` whose floor line failed; a root verb that
   exits 4 or 5, its change made and its report to read, is `committed` too). When such a partial commit's own audit line then fails, the reply
@@ -3922,7 +3927,9 @@ refused before its first frame:
   same hold, and a refusal after the lock was taken appends before it is released; a refusal
   that came before the lock takes it briefly to append, and one for which the lock cannot be
   had (the keystore directory missing, the lock held past its wait, an invalid configuration)
-  is not audited rather than appended without it.
+  is not audited rather than appended without it; that line is counted in the uid's
+  post-frame dropped count, which its next refused-line summary or root's next
+  `audit --rotate` writes and `doctor` shows (`TestAuditBrieflyCountsLineLockKeptOut`).
 - **Lock modes and fairness.** Reads (`list`, `read-for-exec`, `deliveries` and the
   reconciler's reads) take the store lock shared, and their audit lines are appended under that
   shared hold (a read is admitted against the share first, then reads, then appends its line,
@@ -3962,7 +3969,9 @@ refused before its first frame:
   reply says so: `ok` with the warning `committed; audit failed`, which the CLI prints. The
   server counts every such unaudited operation as its `unaudited` count, persisted in the
   server-counts file `.preframe-dropped` and read back when the server opens its logs, so it
-  outlasts a restart; `doctor` shows the count, and root's next `audit --rotate` writes it as
+  outlasts a clean restart, whose close writes any change still unwritten. The file is written
+  at most once a second, by the next change past that second or by the close, so a crash
+  before that write loses the counts changed since the last one; `doctor` shows the count, and root's next `audit --rotate` writes it as
   one line charged to no uid (U112). The two limits of the pre-frame counts hold for it
   ("Per-uid fairness"): a rotate that stops between its swap and its rewrite of the file can
   report it twice, and a server write landing during a rotate can lose one second's increment.
@@ -4032,7 +4041,10 @@ refused before its first frame:
   appended under the store lock taken for it alone, and is charged to the caller's share,
   so a line past the share is not written. The 10 a minute are counted per uid on a sliding
   minute, rate-limited answers included, before the line is written; every line not written
-  (past the limit or the share, the lock not had, the append failed) is counted, and the
+  (past the limit or the share, the lock not had, the append failed) is counted, and so is
+  a store operation's refusal line that came before its lock and could not have it
+  (`auditBriefly`), in the same per-uid count, which `doctor` names as the socket's and the
+  store's refusal lines, and the
   count is written as one summary, `"result":"dropped"` with a `dropped` count and no
   `request`, at most once a minute (the first a minute after the uid's first refusal), the
   next time that uid is refused, before that refusal's own line. So a uid writes at most 11
@@ -4306,7 +4318,8 @@ surface, and the app consumes only those.
 - **The reply header cap.** A reply's header alone may pass 8 KiB, up to `MaxReplyHeader`
   (128,818 bytes): the list of a full scope, 256 rows each at its widest (a 269-byte API name,
   a 7-byte kind, a 20-digit version, a 20-character versions count, a 29-byte RFC 3339 time, a
-  64-hex-digit fingerprint, a 7-byte status, the field names and punctuation: 502 bytes), plus
+  64-hex-digit fingerprint, a 7-byte status, the field names and punctuation, and the comma
+  that separates it from the next: 503 bytes), plus
   the wrapper and the `committed; audit failed` warning. So one list call names every entry
   of a full scope, and no cursor is needed. The cap is computed from those widths and a
   compile check holds it inside the 128 KiB frame cap with the type and header prefix; a test
@@ -4322,9 +4335,14 @@ surface, and the app consumes only those.
   present value may be empty). Frame types: `0x01` HELLO, `0x02` request, `0x03` reply,
   `0x04` error; any other byte is an unknown type. The client sends HELLO first and requests
   after it; any other type from the client, a second HELLO included, closes the connection. A
-  request header names its operation in `op` (missing or empty closes); an error header is
-  `{"code":"<code>"}`. A HELLO or request header that is not a JSON object, or a HELLO whose
-  `proto` is not `k3sm-keys`, closes the connection. The names live in one place,
+  request header names its operation in `op` (missing, empty, null or not a string closes); an
+  error header is `{"code":"<code>"}`. A HELLO or request header that is not a JSON object, or a
+  HELLO whose `proto` is not `k3sm-keys`, closes the connection. The dispatcher reads `op`, and
+  the HELLO its `proto`, `min` and `max`, by their exact names, as the operations read their
+  fields ("Strict enough"), never through a case-insensitive, last-key-wins decode: such a field
+  spelled in another case (`{"OP":"rm"}`, `{"Proto":…}`), given twice in any case
+  (`{"op":"list","Op":"rm"}`) or of the wrong JSON type closes the connection
+  (`TestDispatchOpExactKey`, `TestHelloProtoExactKey`, `FuzzRequestHeader`). The names live in one place,
   `pkg/keystore/socket` (U27).
 - **The frame cap follows the value cap.** The largest frame a request needs is the store's
   maximum value, 65,536 bytes (64 KiB), plus the 8,192-byte header cap, plus 9 bytes of type
@@ -4360,8 +4378,14 @@ surface, and the app consumes only those.
   | `ErrNotFound`, `ErrVersionNotFound`, `ErrScopeAbsent` | `not-found` |
   | `ErrQuota` | `quota` |
   | `ErrScopeOwnerChanged`, `ErrScopeOwnerUnknown` | the code of the same name |
-  | a request the socket refuses before the store (`socket.ErrRequestRefused`, below); the socket's fail-closed refusal while the global append failure has any cause but the hard cap (`socket.ErrAuditFailing`); an operation refused because its audit line could not be written, the global append failure (`keystore.AuditRefused`); `ErrExists`; `ErrInvalidName`; `ErrKindMismatch`; `ErrTypedCredential`; `ErrRewrapInProgress`; a uid the store gives no user scope (`keystore.IneligibleUID`, with an `ineligible-uid` refused line); a sealed version above the entry's pointer (`ErrOrphanVersion`, which also matches `ErrCorrupt`); the floor's damage or the scope's quarantine (`keystore.FloorDegraded`) | `refused` |
+  | a request the socket refuses before the store (`socket.ErrRequestRefused`, below); the socket's fail-closed refusal while the global append failure has any cause but the hard cap (`socket.ErrAuditFailing`); an operation refused because its audit line could not be written, the global append failure (`keystore.AuditRefused`); `ErrExists`; `ErrInvalidName`; `ErrKindMismatch`; a value its kind does not take, an Ed25519 key of the wrong length or with a foreign public half (`keystore.InvalidValue`); `ErrTypedCredential`; `ErrRewrapInProgress`; a uid the store gives no user scope (`keystore.IneligibleUID`, with an `ineligible-uid` refused line); a sealed version above the entry's pointer (`ErrOrphanVersion`, which also matches `ErrCorrupt`); the floor's damage or the scope's quarantine (`keystore.FloorDegraded`) | `refused` |
   | anything else: `ErrCorrupt`, `ErrMasterMissing`, `ErrMasterUntrusted`, `ErrKindUnsupported`, a cancelled request | `internal` |
+
+  `ErrCorrupt` is judged before the `refused` row: damage read back from the store answers
+  `internal` whatever else its chain matches, so a stored Ed25519 version that authenticates
+  and fails its check, which also matches `keystore.InvalidValue`, is `internal`; only
+  `ErrOrphanVersion` among the errors that match `ErrCorrupt` is `refused`
+  (`TestReadSideDamageAnswersInternal`, `TestStoredEd25519FailingCheckIsCorrupt`).
 
   `refused` is a request the store will not carry out as it stands, which the client can
   change (another name, rotate rather than put, root finishing a rewrap or acknowledging the
@@ -4379,11 +4403,28 @@ surface, and the app consumes only those.
   an empty list rather than `not-found`, and only for a uid with no scope key yet (no scope
   directory, or one with no `scope.key`: `keystore.NoScopeKey`); a scope whose `scope.key`
   is there but whose `entries/` directory or `deliveries` record is gone is damage, and its
-  `list` answers that error's own code, never an empty list (`TestListDamagedScopeIsNotEmpty`).
+  `list` answers that error's own code, `not-found` (`ErrScopeAbsent`), never an empty list
+  (`TestListDamagedScopeIsNotEmpty`).
   A `log-full` from the
   uid's own share is never the global append failure: that one is answered alike for every
   uid, `log-full` when its cause is the audit log past its hard cap and `refused` for any
   other cause (a full disk, an I/O error).
+  *The server's log.* The reply carries only the code, so the request boundary
+  (`Handler.serveRequest`) logs each store error that is damage at Warn: the op, the peer's
+  uid, `requested_entry` when the request header names a valid entry (by its exact name, in
+  the API grammar), a class from a closed set and that class's fixed remedy. The classes are
+  `orphan-version` (answered `refused`; the owner can `rm` the entry and `put` it again),
+  `floor-records-entry`, `floor-degraded` (the floor's damage or the scope's quarantine,
+  answered `refused`), `corrupt`, and `internal` for any other error answered `internal` (a
+  missing or untrusted master). The error's own text is never logged: a chain can carry text a
+  decoder built from a decrypted value, and no error in `pkg/keystore` names a length, tag or
+  byte of a value either (`TestNoErrorCarriesValueDerivedNumbers`). The ordinary outcomes
+  (`not-found`, `exists`, `quota`, `rate-limited`, `busy`, `log-full`, and the socket's own
+  refusals), a change that committed, and a cancelled or timed-out request are not logged.
+  Standing damage cannot flood the log: each (op, class) pair logs at most one line every
+  10 seconds (`socket.DamageLogInterval`), and its next line carries the count it suppressed
+  meanwhile as `suppressed`; the pairs are bounded by the closed sets
+  (`TestStoreErrorLogged`, `TestStoreErrorLogBounded`).
 - **Operations on the wire.** The request and reply headers are named Go types in
   `pkg/keystore/socket` (`PutRequest`, `RotateRequest`, `ListRequest`, `RmRequest`,
   `ReadForExecRequest`; `VersionReply`, `ListReply` with `ListEntry`, `RmReply`,
@@ -4409,7 +4450,11 @@ surface, and the app consumes only those.
   - *Fingerprints.* `put` and `rotate` return the fingerprint the store computed as it sealed
     the value, never by reading it back; it is per scope (U9).
   - *Strict enough.* Unknown fields are ignored and a field set to `null` is absent. Field
-    names match exactly, never case-folded. A known field of the wrong JSON type (a string
+    names match exactly, never case-folded: every header, HELLO and request alike, is read
+    under the keystore's one strict-object rule (`keystore/internal/strictjson.Object`, the
+    audit log's reader's rule too), so any key given twice in any case, unknown keys included,
+    or a request field (`op`, `entry`, `kind`, `from_version`) spelled in another case closes
+    the connection at the dispatcher, whichever op the request names (`TestDispatchOpExactKey`). A known field of the wrong JSON type (a string
     where a number is expected, a negative or fractional `from_version`) is `refused`, and so
     is a header over the 8 KiB cap, judged before it is parsed. A value that is missing or
     empty where one is required, over the store's 64 KiB value cap, or present on an
@@ -4427,7 +4472,13 @@ surface, and the app consumes only those.
     error frame `{"code":"not-found"}`; the store refuses it before it opens any scope, and
     its line is the operation's own, with the result `not-found`, the peer as `caller` and
     the peer's scope, never the other uid's (U45). `list` names no entry: a name in its header
-    is an unknown field.
+    is an unknown field. The answers are byte-identical only in the peer's normal state (a
+    started scope, under its rate limit and share, the store lock had, the scope not
+    quarantined). Outside it an absent entry of the peer's own answers from the peer's own
+    state, a spent share `log-full`, a lock held past its wait `busy`, a quarantine `refused`;
+    so another uid's or a `system/` name need not answer as the peer's own absent entry then.
+    With the share spent it still answers `not-found` (`TestCrossUserRefusedShareSpent`). What
+    differs tells the peer about its own state only, never about the other scope.
 - CLI and server are one binary, so version skew exists only between an upgrade's install
   and the server's restart; the server pin refuses that window first ("The client pins the
   server"), and the CLI prints "the server is not running the installed build; restart it" and
@@ -6694,7 +6745,7 @@ carried by the unit rows.
 | U42 | an unrecorded UID, a digest mismatch, or a denied SAR gets no Secret; the SARs ask `create keydeliveries` and `create secrets` with no name, and `update` and `delete` secrets with `resourceNames` `spec.secretName`; encryption off refuses (G18 for KeyDelivery); each SAR carries the user `k3sm:local:<uid>` and the groups the impersonated create carried, so a grant bound to `k3sm:local-users` passes the create and every sweep alike | `k3sm/pkg/keystore/reconcile::TestUnrecordedOrRetargetedDeliveryGetsNoSecret`, `TestSARCreateUnnamedUpdateDeleteNamed`, `TestSARCarriesImpersonatedUserAndGroups`, `TestGroupBoundGrantHonouredConsistently`, `TestEncryptionOffRefusesKeyDelivery`; rig leg E23 | pending: the KeyDelivery reconciler (authority) |
 | U43 | reasons are the closed set, each on the condition type and status the reason table gives; "absent" and "not yours" both read `EntryUnavailable`; a pre-existing Secret not claimed by a KeyDelivery (unlabelled, or Phase A's) is `SecretExists`; a second declaration is `SecretClaimed`, the oldest honoured record by `creationTimestamp`, then name, winning; `observedGeneration` tracks; `Ready=False` for any authority failure carries the one reason `NotAuthorized` with the `Authorized` reason in its message; `Ready` is `Unknown`, `Pending` before the first sweep and while `Authorized` is `Unknown`; each `Authorized=False` reason is tied to its action (`EntryUnavailable`, `NotRecorded` for a withdrawn UID or a digest mismatch, and `NotAuthorized` delete; `NotRecorded` for a UID never recorded retains), and a Secret kept under `Authorized=False` sets `SecretRetained=True` (`DeletePending` or `Unowned`) | `k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet`, `TestReasonConditionTable`, `TestOneDeclarationPerSecret`, `TestReadyFalseCarriesNotAuthorized`, `TestReadyUnknownPending`, `TestAuthorizedFalseReasonActionMap`, `TestSecretRetainedWhenKept` | pending: the KeyDelivery reconciler (authority) |
 | U44 | losing authority (a definitive denial) deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; ownership is the label, the owner annotation and that UID in the sealed record, not the ownerReference; the Secret's namespace and name must equal the record's target for that UID, and the record's entry must match the owner annotation; the orphan sweep removes a labelled Secret only when its owner annotation names a KeyDelivery UID the sealed record holds, it is that UID's recorded target, and that object no longer exists or is withdrawn, and never one with the label and owner annotation alone, an unlabelled or a foreign one; a forged label and a real UID on another Secret are left alone, charged to no share and logged as one `refused` line under the reconciler, against the reconciler budget, never as the owner's `deliver-delete` | `k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret`, `TestFinalizerCrashOrder`, `TestOrphanSweep`, `TestForgedOwnerAnnotationOnOtherSecretIsLeftAlone` | pending: the KeyDelivery reconciler (lifecycle) |
-| U45 | cross-user refusal with a fake peer-credential source: a peer with uid B, in its normal state (a started scope, under its rate limit and share), asks for `read-for-exec`, `rotate` and `rm` of uid A's entries, for `list`, and for any `system/…` name; every call answers byte for byte as for an absent entry of B's own (`list` shows B's own scope only), and the audit lines carry uid B. The delivery operations (`deliver`, `withdraw` and `deliveries`) answer `refused` to every caller until they are served, so they are not part of this claim yet | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestNonRootCannotNameSystemEntries`, `k3sm/pkg/keystore::TestUserRotateNotFoundIsNoOp`, `TestExecReadAudited` | pending: the socket operations |
+| U45 | cross-user refusal with a fake peer-credential source: a peer with uid B, in its normal state (a started scope, under its rate limit and share), asks for `read-for-exec`, `rotate` and `rm` of uid A's entries, for `list`, and for any `system/…` name; every call answers byte for byte as for an absent entry of B's own (`list` shows B's own scope only), and the audit lines carry uid B. The byte-identical answer holds in that normal state only: a spent share, a lock held past its wait or a quarantine answers B's own absent entry from B's own state (`log-full`, `busy`, `refused`), so it need not match the answer for A's name; with B's share spent, A's and `system/…` names still answer `not-found` (`TestCrossUserRefusedShareSpent`). The delivery operations (`deliver`, `withdraw` and `deliveries`) answer `refused` to every caller until they are served, so they are not part of this claim yet | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestCrossUserRefusedShareSpent`, `TestNonRootCannotNameSystemEntries`, `k3sm/pkg/keystore::TestUserRotateNotFoundIsNoOp`, `TestExecReadAudited` | pending: the socket operations |
 | U46 | `baseSocketDenies` derives the `keys.sock` path from `runtimed/pkg/keystorepaths` (`SocketPath(dataRoot)`, `<dataRoot>/keystore-sock/keys.sock`) and denies `connect(2)` to it | `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket`, `TestBaseSocketDeniesResolvesDataRoot`; `runtimed/pkg/keystorepaths::TestNames` | checked: the socket listener (pod denies) |
 | U47 | seam guard: `pkg/keystore`'s `TestMain` installs a panicking stub on each of its seams, so no unit test reaches a real primitive | `k3sm/pkg/keystore::TestRealPrimitivesUnreachable` | pending: the user-scope store |
 | U48 | seam guard: `pkg/keystore/socket`'s `TestMain` installs a panicking stub on each of its seams, so no unit test reaches a real primitive; the server-side peer-credential source is a constructor parameter of the listener, not a package variable, and the constructor refuses nil | `k3sm/pkg/keystore/socket::TestRealPrimitivesUnreachable`, `TestListenerRequiresPeerCredSource` | checked: the socket listener (seam guard) |

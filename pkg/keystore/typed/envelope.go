@@ -267,10 +267,10 @@ func HasEnvelope(kind credential.Kind) bool {
 }
 
 // check reports why value v is not a valid f, or nil. The reason names the
-// field and lengths only, never the value's bytes.
+// field and its bounds only, never the value's bytes or its length.
 func (f *field) check(v []byte) error {
 	if len(v) < f.min || len(v) > f.max {
-		return fmt.Errorf("%s is %d bytes, want %d to %d", f.name, len(v), f.min, f.max)
+		return fmt.Errorf("%s is outside its %d to %d bytes", f.name, f.min, f.max)
 	}
 	if f.valid != nil && !f.valid(v) {
 		return fmt.Errorf("%s is outside its grammar", f.name)
@@ -315,7 +315,7 @@ func Encode(kind credential.Kind, e Envelope) ([]byte, error) {
 		b = append(b, v...)
 	}
 	if len(b) > MaxEnvelopeSize {
-		return nil, fmt.Errorf("%w: the envelope is %d bytes, over %d", ErrInvalidCredential, len(b), MaxEnvelopeSize)
+		return nil, fmt.Errorf("%w: the envelope is over %d bytes", ErrInvalidCredential, MaxEnvelopeSize)
 	}
 	if err := checkExpiryOrder(kind, &e); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidCredential, err)
@@ -357,8 +357,9 @@ func (e *Envelope) wipe() {
 
 // Decode parses the envelope b of kind. It accepts exactly what Encode
 // writes: anything else is ErrCorrupt, except an envelope version other than
-// EnvelopeVersion, which is ErrKindUnsupported. Its errors carry tag numbers,
-// lengths and field names, never the envelope's bytes. A refusal clears the
+// EnvelopeVersion, which is ErrKindUnsupported. Its errors carry the kind,
+// field names and fixed bounds only, never a byte, tag or length read from
+// the envelope, which is a decrypted value. A refusal clears the
 // field values it had already copied out of b.
 func Decode(kind credential.Kind, b []byte) (Envelope, error) {
 	var e Envelope
@@ -370,10 +371,10 @@ func Decode(kind credential.Kind, b []byte) (Envelope, error) {
 		return e, fmt.Errorf("%w: empty", ErrCorrupt)
 	}
 	if len(b) > MaxEnvelopeSize {
-		return e, fmt.Errorf("%w: %d bytes, over %d", ErrCorrupt, len(b), MaxEnvelopeSize)
+		return e, fmt.Errorf("%w: the envelope is over %d bytes", ErrCorrupt, MaxEnvelopeSize)
 	}
 	if b[0] != EnvelopeVersion {
-		return e, fmt.Errorf("%w: envelope version %d, this build reads %d", ErrKindUnsupported, b[0], EnvelopeVersion)
+		return e, fmt.Errorf("%w: the envelope's version is not %d, the one this build reads", ErrKindUnsupported, EnvelopeVersion)
 	}
 	// A refusal after a field was set clears the clones made so far: they
 	// may hold a secret and the caller never sees them.
@@ -390,7 +391,7 @@ func Decode(kind credential.Kind, b []byte) (Envelope, error) {
 		}
 		tag, n := rest[0], int(binary.BigEndian.Uint16(rest[1:3]))
 		if len(rest)-3 < n {
-			return refuse(fmt.Errorf("%w: tag %#02x claims %d bytes past the end", ErrCorrupt, tag, n))
+			return refuse(fmt.Errorf("%w: a field claims bytes past the end", ErrCorrupt))
 		}
 		v := rest[3 : 3+n]
 		rest = rest[3+n:]
@@ -402,7 +403,7 @@ func Decode(kind credential.Kind, b []byte) (Envelope, error) {
 			i++
 		}
 		if i == len(fs) || fs[i].tag != tag {
-			return refuse(fmt.Errorf("%w: tag %#02x is unknown, repeated or out of order for kind %s", ErrCorrupt, tag, kind))
+			return refuse(fmt.Errorf("%w: a field's tag is unknown, repeated or out of order for kind %s", ErrCorrupt, kind))
 		}
 		f := &fs[i]
 		if err := f.check(v); err != nil {

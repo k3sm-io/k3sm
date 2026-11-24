@@ -115,13 +115,14 @@ The server writes a line to the audit log for each connection it refuses before 
 request. When it cannot (the log's share for refusals is spent, or the keystore was busy), it
 counts the refusal instead, keeps the counts in `.preframe-dropped` in its keystore directory so
 a restart does not lose them, and writes them with its next refusal line. The same file keeps
-two more counts: the refusal lines of requests the server refused itself that it did not write
-(past a user's limit of refusal lines a minute, or that user's share of the log), which it
-writes as one summary line with that user's next refusal; and the revocations (`rm`, `rotate`,
+two more counts: the refusal lines of requests the server refused that it did not write
+(past a user's limit of refusal lines a minute, or that user's share of the log, or, for a
+request the store refused before it took its lock, the lock not had), which it writes as one
+summary line with that user's next refusal; and the revocations (`rm`, `rotate`,
 a delivery's withdrawal) that went ahead while the audit log took no appends, so they have no
 audit line. While any are unwritten, the `keystore-logs` row in `k3sm doctor` warns
 `N pre-frame refusal(s) not recorded for M uid(s)`,
-`N post-frame refusal(s) not recorded for M uid(s)` and
+`N post-frame refusal line(s), the socket's and the store's, not recorded for M uid(s)` and
 `N committed keystore revocation(s) have no audit line`, each when its count is not zero, and
 names `sudo k3sm keys audit --rotate`, which writes one line per kind of count into the new
 audit log and clears the counts. If the file cannot be read, the row warns that

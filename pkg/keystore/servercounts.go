@@ -108,10 +108,11 @@ func postFrameKey(uid uint32) preFrameKey { return preFrameKey{class: countClass
 // AddPostFrameDropped adds n to uid's post-frame refused lines dropped and
 // not yet summarized: the socket's bridge hands each line its limiter or
 // the caller's share dropped, and each summary that could not be written,
-// to the store here, which persists the count (PreFrameDroppedName) until
+// and the store adds each refusal line auditBriefly could not write for
+// want of the lock, here, which persists the count (PreFrameDroppedName) until
 // a summary line or root's next audit --rotate writes it.
 func (s *FileStore) AddPostFrameDropped(uid uint32, n uint64) {
-	if n == 0 {
+	if n == 0 || s.counts == nil {
 		return
 	}
 	s.counts.change(func(d preFrameDropped) {

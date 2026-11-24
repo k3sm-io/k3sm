@@ -17,12 +17,12 @@ limitations under the License.
 package keystore
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
+
+	"k3sm.io/k3sm/pkg/keystore/internal/strictjson"
 )
 
 // auditFormat is the audit line format's version, "v". It bumps only on a
@@ -182,40 +182,12 @@ var auditKeys = []string{"v", "ts", "op", "via", "caller", "scope", "name", "ver
 // each known field from the one key a strict decoder would.
 func auditKeysStrict(line []byte) error { return auditKeysStrictOf(line, auditKeys) }
 
-// auditKeysStrictOf is auditKeysStrict over the known keys known.
+// auditKeysStrictOf is auditKeysStrict over the known keys known: the
+// keystore's one strict-object rule (strictjson.Object), so the audit
+// reader and the socket's request headers judge keys alike.
 func auditKeysStrictOf(line []byte, known []string) error {
-	dec := json.NewDecoder(bytes.NewReader(line))
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return errors.New("an audit line is not a JSON object")
-	}
-	var seen []string
-	for dec.More() {
-		tok, err := dec.Token()
-		if err != nil {
-			return fmt.Errorf("an audit line does not parse: %w", err)
-		}
-		key, ok := tok.(string)
-		if !ok {
-			return errors.New("an audit line does not parse: a key is not a string")
-		}
-		for _, k := range seen {
-			if strings.EqualFold(k, key) {
-				return errors.New("an audit line gives a key twice")
-			}
-		}
-		seen = append(seen, key)
-		for _, k := range known {
-			if strings.EqualFold(k, key) && k != key {
-				return errors.New("an audit line spells a known key in another case")
-			}
-		}
-		var v json.RawMessage
-		if err := dec.Decode(&v); err != nil {
-			return fmt.Errorf("an audit line does not parse: %w", err)
-		}
-	}
-	if _, err := dec.Token(); err != nil {
-		return fmt.Errorf("an audit line does not parse: %w", err)
+	if _, err := strictjson.Object(line, known...); err != nil {
+		return fmt.Errorf("an audit line does not parse strictly: %w", err)
 	}
 	return nil
 }
