@@ -144,13 +144,16 @@ log) and names `sudo k3sm keys audit --rotate` for the audit log or
 `doctor` runs in its own process and cannot ask the server whether the listener is serving, so
 its `keystore-user-scope` row says only what it can check:
 
-- `keystore user scope: start checks pass; a socket owned by the service user is at <path>`
-  (PASS): every check the server makes before it starts the listener passes, and a socket is at
-  the path. `doctor` looks at the path; it never connects, since the server refuses root and
-  the service user.
+- `keystore user scope: start checks pass; launchd's socket (root's, mode 0666) is at <path>`
+  (PASS): every check the server makes before it starts the listener passes, and launchd's
+  socket is at the path. launchd creates it, as root, from the `Sockets` entry that
+  `sudo k3sm install` writes into the server's LaunchDaemon plist, and hands it to the server.
+  `doctor` looks at the path; it never connects, since the server refuses root and the service
+  user.
 - `keystore user scope: start checks pass, but no listening socket at <path>` (WARN): the
-  checks pass but nothing, something other than a socket, or another user's socket is at the
-  path.
+  checks pass but nothing, something other than a socket, a socket not owned by root, or one at
+  another mode is at the path. A server plist written by an install from before the socket
+  existed has no `Sockets` entry: run `sudo k3sm install`.
 - `keystore user scope: off (<reason>)` (WARN): a check fails, with the server's own reason.
   For a missing, wrong or unflagged log or socket directory it adds `run sudo k3sm install`;
   for `more than one server registered` it names the servers (up to 8, then how many more);
