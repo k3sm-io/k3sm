@@ -588,7 +588,7 @@ check U30 "with two servers registered, the listener does not start and doctor s
 	k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers TestSecondServerStopsServingListener k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow TestKeystoreServerCountNames
 check U31 "a missing or unflagged file logs the install Warn at start and on each retry; doctor reports user scope off (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry TestInstallMissingLogNamesInstall TestPreconditionsCheck k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow TestDoctorKeystoreSocketLstat TestDoctorKeystoreKubeconfigPermission TestDoctorKeystoreReopenJudgement
-pend U32 "the order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (socket operations)" \
+pend U32 "a grant (put, deliver) appends its audit line before its first write, and every other operation's order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (socket operations)" \
 	k3sm/pkg/keystore/socket::TestAuditBeforeReply TestAuditFailureRefusesOps k3sm/pkg/keystore::TestExecReadRefusedWhenAuditFails TestUserRotateCrashOrder
 pend U33 "refused lines are rate-limited per uid with a summary of the dropped count (socket operations)" \
 	k3sm/pkg/keystore/socket::TestRefusedLinesRateLimited
@@ -750,7 +750,7 @@ pend U110 "when a second server registers at runtime, the next single-server che
 	k3sm/pkg/keystore/reconcile::TestSecondServerAtRuntimeStopsListenerAndReports
 pend U111 "the owner annotation never decides precedence: a Secret whose owner annotation is rewritten to name another recorded UID stays with the object that holds the claim by honoured record, creationTimestamp and name; an Indeterminate object counts as honoured (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestAnnotationRewriteCannotTakeOverTarget
-pend U112 "the order is commit, then append, then reply: an append that fails after the commit answers ok with the warning committed; audit failed, the server then refuses user mutations except the revocation class, and doctor counts the unaudited operations (socket operations)" \
+pend U112 "outside a grant (put, deliver), which appends before its first write, the order is commit, then append, then reply: an append that fails after the commit answers ok with the warning committed; audit failed, the server then refuses user mutations except the revocation class, and doctor counts the unaudited operations (socket operations)" \
 	k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps k3sm/pkg/keystore::TestUnauditedOpsCountsCommittedRevocations TestUserRotateCrashOrder
 check U113 "the listener refuses to start unless the server's effective uid is the service uid: a rootless k3sm server runs no listener, and the server log and doctor say user scope needs the installed server (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerRefusesUnlessServiceUID
