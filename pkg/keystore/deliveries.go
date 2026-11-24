@@ -1055,6 +1055,10 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 	if s.userScopesStarted == nil {
 		return fmt.Errorf("%w: the store was not made by New", errInvalidConfig)
 	}
+	// A listener starting again (a rebuild, a restart after a panic, a
+	// second server gone) may follow writes this process did not make: no
+	// usage figure taken before is trusted (usage.go).
+	s.usage.forgetAll()
 	damage, spent, err := s.CheckLogBounds(ctx)
 	if err != nil {
 		return err
@@ -1364,6 +1368,7 @@ func rootHasUserScopes(root *os.Root) (bool, error) {
 // before its own first write, so a failed append writes nothing. It
 // appends at most once.
 func (u *UserScope) grantLocked(ctx context.Context, g *grantAudit, fn func(*openedScope) error) (err error) {
+	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)

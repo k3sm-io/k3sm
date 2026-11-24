@@ -33,6 +33,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -466,13 +467,57 @@ func (v *keysVerb) store() (keysStore, error) {
 }
 
 // keystoreLayout is the store's Config, without its owner, for the server
-// work dir work (absolute and clean): the layout the keys verbs and the
-// server's delivery reconciler both open.
+// work dir work (absolute and clean): the layout the keys verbs, the
+// server's delivery reconciler and its socket all open. Every Config it
+// returns for one work dir carries the same keystore.TreeState
+// (keystoreTree), so the stores this process opens over the tree share one
+// in-process lock and one set of usage figures.
 func keystoreLayout(work string) keystore.Config {
+	dir := filepath.Join(work, keystoreSubdir)
 	return keystore.Config{
-		Dir:       filepath.Join(work, keystoreSubdir),
+		Dir:       dir,
 		MasterDir: filepath.Join(executor.CredDir(work), keystoreMasterSubdir),
 		DataRoot:  executor.RuntimeRoot(work),
+		Tree:      keystoreTree(dir),
+	}
+}
+
+// keystoreTrees is this process's keystore.TreeState for each store
+// directory it opened.
+var keystoreTrees = struct {
+	mu    sync.Mutex
+	byDir map[string]*keystore.TreeState
+}{byDir: map[string]*keystore.TreeState{}}
+
+// keystoreTree is the one TreeState this process uses for the store at
+// dir, keyed by the directory resolved (keystoreTreeKey), so two spellings
+// of one tree (/var and /private/var, a symlinked work dir) share it.
+func keystoreTree(dir string) *keystore.TreeState {
+	key := keystoreTreeKey(dir)
+	keystoreTrees.mu.Lock()
+	defer keystoreTrees.mu.Unlock()
+	t, ok := keystoreTrees.byDir[key]
+	if !ok {
+		t = keystore.NewTreeState()
+		keystoreTrees.byDir[key] = t
+	}
+	return t
+}
+
+// keystoreTreeKey is dir with the symlinks of its nearest existing ancestor
+// resolved and the rest of dir joined back on, so a store directory keyed
+// before it is created gets the same key as after.
+func keystoreTreeKey(dir string) string {
+	dir = filepath.Clean(dir)
+	rest := ""
+	for p := dir; ; p = filepath.Dir(p) {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(r, rest)
+		}
+		if filepath.Dir(p) == p {
+			return dir
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
 	}
 }
 

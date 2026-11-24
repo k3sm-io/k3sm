@@ -122,6 +122,38 @@ type UserScope struct {
 	// origin is where the view's operations come from, for their audit
 	// lines (WithOrigin); the zero Origin writes no via and no caller.
 	origin Origin
+	// guid is the uid's GeneratedUID lookup answer, taken before the store
+	// lock (withGUID) and used for the whole hold; nil looks it up at use.
+	guid *guidAnswer
+}
+
+// guidAnswer is one GeneratedUID lookup's answer: the GeneratedUID, or the
+// lookup's error.
+type guidAnswer struct {
+	g   [generationSize]byte
+	err error
+}
+
+// withGUID is a copy of u carrying the uid's GeneratedUID lookup, run now,
+// before the caller takes the store lock: the lookup's deadline (250 ms)
+// is never spent inside a hold, and the hold asks the directory service
+// nothing (docs/design/keystore.md § "Lock modes and fairness", the
+// hold-time bound). Every check under the hold reads the one answer, an
+// error included, as it would have read a lookup made there.
+func (u *UserScope) withGUID() *UserScope {
+	c := *u
+	g, err := u.s.generatedUIDOf(u.uid)
+	c.guid = &guidAnswer{g: g, err: err}
+	return &c
+}
+
+// liveGUID is the uid's live GeneratedUID: the answer withGUID took, or,
+// on a view that took none, a lookup now.
+func (u *UserScope) liveGUID() ([generationSize]byte, error) {
+	if u.guid != nil {
+		return u.guid.g, u.guid.err
+	}
+	return u.s.generatedUIDOf(u.uid)
 }
 
 // UserScope returns uid's view of the store. A uid outside 501 to
@@ -228,6 +260,16 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	}
 	// The entries' directory is never created here: a root put creates it
 	// with the master.
+	unlockUID, err := u.s.usage.lockUID(ctx, u.uid, u.s.lockWait)
+	if err != nil {
+		return Version{}, err
+	}
+	defer unlockUID()
+	u.prepareUsage(ctx) // the scope's figure, walked before the store lock
+	if err := ctx.Err(); err != nil {
+		return Version{}, err // done during the walk: no hold, nothing written
+	}
+	u = u.withGUID() // then the lookup, so the answer is at most the store lock's wait (plus its 250 ms deadline) old in the hold
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Version{}, fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)
@@ -278,11 +320,7 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 			return Version{}, err
 		}
 	}
-	base, err := u.deliveriesBytes(root)
-	if err != nil {
-		return Version{}, err
-	}
-	if err := checkScopeQuota(entries, name, value, base); err != nil {
+	if err := u.checkUsageQuota(root, name, value); err != nil {
 		return Version{}, err
 	}
 	// The ok line names the version the put writes and its fingerprint,
@@ -294,8 +332,14 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	if err := grant(); err != nil {
 		return Version{}, err
 	}
+	// The figure is out of the table from the mkdir to its update, so a
+	// failure or a panic in between leaves none (usageOp).
+	op := u.s.usage.begin(u.uid)
 	e, err := u.createUserEntry(entries, name)
 	if err != nil {
+		if errors.Is(err, ErrExists) {
+			op.confirm(nil) // the mkdir found the entry: nothing written
+		}
 		return Version{}, err
 	}
 	defer e.close()
@@ -303,6 +347,7 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	if err != nil {
 		return Version{}, err
 	}
+	u.usageAfterPut(op, entries, name)
 	// The record, the pointer, then the floor line: a crash between the
 	// last two leaves the floor one behind, which a read accepts.
 	if err := u.s.userFloor.append(u.scope, name, e.generation, 1, false); err != nil {
@@ -447,8 +492,10 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 }
 
 // List returns every entry of the scope, sorted by name, as FileStore.List
-// does: an entry that cannot be opened carries Err. A uid with no scope is
-// ErrScopeAbsent. It is audited as list (auditedRead).
+// does: an entry that cannot be opened carries Err. Each entry carries its
+// current version and its version count, not every version
+// (listUserEntry). A uid with no scope is ErrScopeAbsent. It is audited as
+// list (auditedRead).
 func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 	if err := u.quarantineErr(); err != nil {
 		u.auditBriefly(ctx, auditLine{op: "list"}, err)
@@ -478,7 +525,7 @@ func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 				e.close()
 				continue
 			}
-			out = append(out, listEntry(e, uk, nil))
+			out = append(out, listUserEntry(e, uk))
 			e.close()
 		}
 		return nil
@@ -545,6 +592,10 @@ func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Ro
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err // done before the lookup: none runs, no lock is taken
+	}
+	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -584,6 +635,10 @@ func (u *UserScope) readScope(ctx context.Context, fn func(*os.Root, *openedScop
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err // done before the lookup: none runs, no lock is taken
+	}
+	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -752,7 +807,7 @@ func (u *UserScope) readScopeKey(dir *os.Root, wrap func() (keys, error)) ([]byt
 	if err != nil {
 		return nil, zero, err
 	}
-	live, err := u.s.generatedUIDOf(u.uid)
+	live, err := u.liveGUID()
 	if err != nil {
 		return nil, zero, err
 	}
@@ -995,7 +1050,7 @@ func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, 
 	if err := u.s.eligibleUID(u.uid); err != nil {
 		return keys{}, nil, err
 	}
-	g, err := u.s.generatedUIDOf(u.uid)
+	g, err := u.liveGUID()
 	if err != nil {
 		return keys{}, nil, err
 	}

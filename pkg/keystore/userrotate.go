@@ -111,6 +111,16 @@ func (u *UserScope) rotate(ctx context.Context, name string, next nextValue) (v 
 	if err := u.s.checkConfig(); err != nil {
 		return Version{}, err
 	}
+	unlockUID, err := u.s.usage.lockUID(ctx, u.uid, u.s.lockWait)
+	if err != nil {
+		return Version{}, err
+	}
+	defer unlockUID()
+	u.prepareUsage(ctx) // the scope's figure, walked before the store lock
+	if err := ctx.Err(); err != nil {
+		return Version{}, err // done during the walk: no hold, nothing written
+	}
+	u = u.withGUID() // then the lookup, so the answer is at most the store lock's wait (plus its 250 ms deadline) old in the hold
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Version{}, fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -189,14 +199,17 @@ func (u *UserScope) rotateBody(ctx context.Context, root *os.Root, name string, 
 	if cur >= versionLimit(old.Kind) || seq == math.MaxUint64 {
 		return Version{}, fmt.Errorf("%w: the pointer is at the last version or sequence", ErrCorrupt)
 	}
-	base, err := u.deliveriesBytes(root)
+	if err := u.checkUsageQuota(root, name, value); err != nil {
+		return Version{}, err
+	}
+	// The orphan check may remove a junk version: the figure is out of
+	// the table across it, and back only when nothing was removed.
+	op := u.s.usage.begin(u.uid)
+	discarded, err := orphanAbove(e, uk, cur)
+	if discarded == 0 {
+		op.confirm(nil)
+	}
 	if err != nil {
-		return Version{}, err
-	}
-	if err := checkScopeQuota(entries, name, value, base); err != nil {
-		return Version{}, err
-	}
-	if err := discardOrphans(ctx, e, uk, 1, cur); err != nil {
 		if errors.Is(err, ErrOrphanVersion) {
 			// The scope's owner cannot adopt it (root's verb) or reach
 			// the file: its remedy is rm, then put. The orphan is kept,
@@ -211,7 +224,64 @@ func (u *UserScope) rotateBody(ctx context.Context, root *os.Root, name string, 
 	if err := u.s.admit(u.uid, true); err != nil {
 		return Version{}, err
 	}
-	return u.commitRotation(e, uk, old, cur, seq, value)
+	before, berr := lstatSize(e.root, currentName)
+	// The figure is out of the table from the version's write to its
+	// update, so a failure or a panic in between leaves none (usageOp).
+	op = u.s.usage.begin(u.uid)
+	v, err := u.commitRotation(e, uk, old, cur, seq, value)
+	if err != nil && !Committed(err) {
+		// Nothing committed, and the version written may not have been
+		// removed: no figure, so the next judgement walks.
+		return v, err
+	}
+	u.usageAfterRotate(op, e, before, berr, v.Version)
+	return v, err
+}
+
+// usageAfterRotate ends op, the rotation's hold on the figure, with what a
+// committed rotation wrote to e: version nv, and the pointer's change from
+// before (berr: its size before could not be read, so no figure is kept).
+func (u *UserScope) usageAfterRotate(op *usageOp, e *entry, before int64, berr error, nv uint64) {
+	vsize, verr := lstatSize(e.root, versionName(nv))
+	after, aerr := lstatSize(e.root, currentName)
+	if berr != nil || verr != nil || aerr != nil {
+		return
+	}
+	op.confirm(func(m map[string]int64) { m[e.name] += vsize + after - before })
+}
+
+// orphanAbove is a user rotate's orphan check, in one Lstat and at most one
+// record open whatever the entry's size: only version cur+1 is looked at.
+// That is sufficient under the user scope's crash model: a user rotation
+// writes exactly the version above the pointer, so a crash before its flip
+// leaves at most v<cur+1>, and a pointer copied back from V to an older cur
+// leaves cur+1 to V, whose lowest is again cur+1. Every user version is
+// kept (none is pruned), so no state those leave has a version file above
+// the pointer without v<cur+1>; a file further up with none at cur+1 is
+// planted. It is not examined now: the invariant is that every version file
+// is examined before a rotate writes over its name, and the rotate that
+// reaches its version examines it here first, as that rotate's v<cur+1>. A
+// v<cur+1> that authenticates is the orphan, refused (ErrOrphanVersion) and
+// kept; one that does not is junk, removed, and counted in discarded.
+func orphanAbove(e *entry, uk keys, cur uint64) (discarded int, err error) {
+	n := versionName(cur + 1)
+	if _, err := e.root.Lstat(n); errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	} else if err != nil {
+		return 0, fmt.Errorf("check for an orphaned %s: %w", n, err)
+	}
+	r, pt, err := e.openRecord(uk, n, false, cur+1)
+	clear(pt) // only whether it opens is wanted
+	switch {
+	case err == nil:
+		return 0, orphanError(e, Kind(r.kind) == KindOAuth, cur+1, cur)
+	case !errors.Is(err, ErrCorrupt):
+		return 0, fmt.Errorf("check the orphaned %s: %w", n, err)
+	}
+	if err := e.root.Remove(n); err != nil {
+		return 0, fmt.Errorf("discard the orphaned %s: %w", n, err)
+	}
+	return 1, syncDir(e.root)
 }
 
 // commitRotation writes version cur+1 sealing value, flips the pointer to

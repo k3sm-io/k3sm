@@ -126,11 +126,20 @@ type Entry struct {
 	// Current is the version the current pointer names.
 	Current Version
 	// Versions is every stored version, oldest first, including Current.
+	// UserScope.List leaves it nil: it opens the current version only, and
+	// says how many there are in VersionCount.
 	Versions []Version
+	// VersionCount is how many versions the entry holds, Current included:
+	// len(Versions) from FileStore.List, and the pointer's committed range
+	// from UserScope.List.
+	VersionCount int
 	// Err is non-nil exactly when the entry could not be opened: its generation
 	// file, its current pointer or any version the pointer covers is missing,
 	// fails authentication or does not parse, or the floor rules the pointer
-	// out (an older sequence, or another generation). A directory with no current
+	// out (an older sequence, or another generation). UserScope.List
+	// authenticates the current version only and checks the others for
+	// presence: a missing one is Err there, a damaged one is not;
+	// FileStore.List opens every version. A directory with no current
 	// pointer is an interrupted Put, which is not an entry and is not listed,
 	// only when it holds nothing, generation, or generation and v1 (plus
 	// temporary files) and the floor does not record its generation; any other

@@ -353,7 +353,7 @@ func TestUserScopeQuota(t *testing.T) {
 			t.Fatalf("put of an existing name at the bound: %v, want ErrExists", err)
 		}
 		if err := checkScopeQuotaAt(t, u, "e1"); err != nil {
-			t.Fatalf("checkScopeQuota of an existing name at the bound: %v, want nil", err)
+			t.Fatalf("the quota of an existing name at the bound: %v, want nil", err)
 		}
 		if err := u.Delete(ctx, "user/1001/e1"); err != nil {
 			t.Fatalf("rm at the bound: %v", err)
@@ -458,7 +458,8 @@ func FuzzParseDeliveriesRecord(f *testing.F) {
 	})
 }
 
-// checkScopeQuotaAt runs checkScopeQuota for name in uid 1001's entries.
+// checkScopeQuotaAt judges the quota for name on a walk of uid 1001's
+// entries.
 func checkScopeQuotaAt(t *testing.T, u *UserScope, name string) error {
 	t.Helper()
 	root, err := os.OpenRoot(filepath.Join(scopeDir(filepath.Dir(u.s.dir), "1001"), scopeEntriesName))
@@ -466,7 +467,11 @@ func checkScopeQuotaAt(t *testing.T, u *UserScope, name string) error {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	return checkScopeQuota(root, name, []byte("v"), 0)
+	used, err := walkScopeEntries(root, nil)
+	if err != nil {
+		return err
+	}
+	return judgeScopeQuota(used, name, []byte("v"), 0)
 }
 
 // scopeFileBytes sums the regular files under uid 1001's entries/.
@@ -510,6 +515,10 @@ func TestUserScopeQuotaCountsDeliveriesAndGeneration(t *testing.T) {
 	if err := os.Truncate(pad, maxScopeBytes-add-scopeFileBytes(t, server)); err != nil {
 		t.Fatal(err)
 	}
+	// The pad is written behind the store's back, so the figure the puts
+	// kept does not count it: the put is judged as by a server just
+	// started, which walks the scope (usage.go).
+	u.s.usage.forget(1001)
 	_, err := u.Put(ctx, "user/1001/"+name, KindOpaque, []byte(value))
 	if !errors.Is(err, ErrQuota) || !strings.Contains(err.Error(), "sealed records would be") {
 		t.Fatalf("put that fits only without the deliveries record and generation file: %v, want ErrQuota", err)

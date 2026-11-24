@@ -45,32 +45,42 @@ const (
 	maxScopeBytes = 16 << 20
 )
 
-// checkScopeQuota refuses, as ErrQuota, a put of value as name into
-// entries when name is new and the scope already holds maxScopeEntries
-// entries, or when its sealed records (every file in every entry
-// directory), base (the deliveries record's size) and the new entry's
-// files (version 1, its pointer and its generation file) would pass
-// maxScopeBytes.
-func checkScopeQuota(entries *os.Root, name string, value []byte, base int64) error {
+// walkScopeEntries is every entry name in entries with its sealed bytes
+// (entryBytes); lstat, when set, is called before each file's Lstat, where
+// a test counts the walk, and a non-nil return stops the walk with it.
+func walkScopeEntries(entries *os.Root, lstat func() error) (map[string]int64, error) {
 	names, err := readDirNames(entries, maxDirNames)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	count := 0
-	exists := false
-	total := base
+	used := make(map[string]int64, len(names))
 	for _, n := range names {
 		if checkName(n) != nil {
 			continue
 		}
-		exists = exists || n == name
-		count++
-		size, err := entryBytes(entries, n)
+		size, err := entryBytes(entries, n, lstat)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		used[n] = size
+	}
+	return used, nil
+}
+
+// judgeScopeQuota refuses, as ErrQuota, a put of value as name when name
+// is new and the scope already holds maxScopeEntries entries, or when its
+// sealed records (used: every entry name in entries/ with the bytes of
+// every file in its directory, walkScopeEntries), base (the deliveries
+// record's size) and the new entry's files (version 1, its pointer and its
+// generation file) would pass maxScopeBytes. It reads no file: a user put
+// or rotate judges the scope's usage figure (usage.go).
+func judgeScopeQuota(used map[string]int64, name string, value []byte, base int64) error {
+	total := base
+	for _, size := range used {
 		total += size
 	}
+	_, exists := used[name]
+	count := len(used)
 	// The count bounds new names: an existing name is the caller's
 	// ErrExists (or a Rotate's version), never ErrQuota.
 	if !exists && count >= maxScopeEntries {
@@ -105,8 +115,9 @@ func (u *UserScope) deliveriesBytes(root *os.Root) (int64, error) {
 }
 
 // entryBytes sums the sizes of the regular files in entries/name, without
-// following a symlink. A name that is not a directory counts nothing.
-func entryBytes(entries *os.Root, name string) (int64, error) {
+// following a symlink; lstat, when set, is called before each file's
+// Lstat. A name that is not a directory counts nothing.
+func entryBytes(entries *os.Root, name string, lstat func() error) (int64, error) {
 	e, err := openEntryDirRaw(entries, name)
 	if errors.Is(err, ErrNotFound) || errors.Is(err, ErrCorrupt) {
 		return 0, nil
@@ -121,6 +132,11 @@ func entryBytes(entries *os.Root, name string) (int64, error) {
 	}
 	var total int64
 	for _, f := range files {
+		if lstat != nil {
+			if err := lstat(); err != nil {
+				return 0, err
+			}
+		}
 		fi, err := e.root.Lstat(f)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
@@ -166,6 +182,15 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
+	unlockUID, err := u.s.usage.lockUID(ctx, u.uid, u.s.lockWait)
+	if err != nil {
+		return err
+	}
+	defer unlockUID()
+	if err := ctx.Err(); err != nil {
+		return err // done during the uid's wait: no lookup, no hold
+	}
+	u = u.withGUID() // after the uid's wait, so the answer is at most the store lock's wait (plus its 250 ms deadline) old in the hold
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -178,11 +203,26 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 		l := auditLine{op: "rm", name: name, revoke: err == nil || Committed(err)}
 		err = u.keepAuditFailure("rm", err, u.appendAudit(l, err))
 	}()
-	return u.deleteBody(root, name)
+	// The scope's figure is taken out at the first removal from the
+	// entry's tree (mark) and put back, without the entry, only by an rm
+	// that removed it all; an rm that removed nothing from the tree, a
+	// refusal or a burial alone, leaves the figure as it was.
+	var op *usageOp
+	mark := func() {
+		if op == nil {
+			op = u.s.usage.begin(u.uid)
+		}
+	}
+	err = u.deleteBody(root, name, mark)
+	if op != nil && err == nil {
+		op.confirm(func(m map[string]int64) { delete(m, name) })
+	}
+	return err
 }
 
-// deleteBody is delete's work under the lock.
-func (u *UserScope) deleteBody(root *os.Root, name string) error {
+// deleteBody is delete's work under the lock. It calls mark before each
+// removal from the entry's tree.
+func (u *UserScope) deleteBody(root *os.Root, name string, mark func()) error {
 	// A scope.key that cannot be read refuses the rm before anything is
 	// written; entries/ that cannot be opened (entErr) is judged after the
 	// owner check, below.
@@ -197,7 +237,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	// or timed out is no answer, and rm goes ahead. One refused for
 	// capacity, where no lookup ran, refuses rm, retryably: going ahead on
 	// it would let a burst of stuck lookups stand in for the owner check.
-	live, err := u.s.generatedUIDOf(u.uid)
+	live, err := u.liveGUID()
 	switch {
 	case errors.Is(err, errLookupNotRun):
 		return err
@@ -254,6 +294,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		if err := b.bury(u); err != nil {
 			return err
 		}
+		mark()
 		err := entries.RemoveAll(name)
 		if err == nil {
 			err = syncDir(entries)
@@ -299,6 +340,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		// Nothing sealed stands (a crash between the put's mkdir and its
 		// generation write): no copy of it could be served, so there is
 		// nothing to bury and it is removed.
+		mark()
 		err := entries.RemoveAll(name)
 		if err == nil {
 			err = syncDir(entries)
@@ -314,6 +356,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	// never what it names. A removal that fails from here on is after the
 	// commit: the tombstones are written, so the entry is refused as
 	// deleted whatever of its tree stays.
+	mark()
 	err = e.root.RemoveAll(currentName)
 	if err == nil {
 		err = syncDir(e.root)

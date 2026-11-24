@@ -233,6 +233,9 @@ type keystoreSocketDeps struct {
 	// data root from it (keystoreLayout in production).
 	workDir string
 	layout  func(work string) keystore.Config
+	// opened, when set, is handed the store the config builds, where a
+	// test inspects it.
+	opened func(*keystore.FileStore)
 	// client is the admin client the server count lists nodes through.
 	client kubernetes.Interface
 	// listen supplies the listening socket. How it is obtained is the
@@ -314,6 +317,9 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 	// it a request is answered busy.
 	storeCfg.LockWait = socket.LockWait
 	store := keystore.New(storeCfg)
+	if deps.opened != nil {
+		deps.opened(store)
+	}
 	logs := store.ServerLogs()
 	audit, err := socket.NewStoreAuditor(logs, deps.log)
 	if err != nil {

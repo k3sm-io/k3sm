@@ -288,7 +288,7 @@ func listEntryOf(uid uint32, e keystore.Entry) ListEntry {
 	}
 	out.Kind = e.Current.Kind.String()
 	out.Version = e.Current.Version
-	out.Versions = len(e.Versions)
+	out.Versions = e.VersionCount
 	out.Created = e.Current.Created.UTC().Format(time.RFC3339)
 	out.Fingerprint = e.Current.Fingerprint
 	return out

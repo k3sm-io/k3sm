@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -515,6 +516,30 @@ func readDirNames(root *os.Root, max int) ([]string, error) {
 	}
 }
 
+// readDirEntries is readDirNames with each name's type, as the directory
+// listing gives it (no Lstat where the volume reports types).
+func readDirEntries(root *os.Root, max int) ([]fs.DirEntry, error) {
+	d, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = d.Close() }() // read-only; nothing to flush
+	var des []fs.DirEntry
+	for {
+		batch, err := d.ReadDir(dirBatch)
+		des = append(des, batch...)
+		if len(des) > max {
+			return nil, fmt.Errorf("%s holds over %d names", root.Name(), max)
+		}
+		if errors.Is(err, io.EOF) {
+			return des, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
 // openLocked opens the entries' directory, creating it with create set, and
 // takes the store lock on it, exclusive or shared. A missing directory is an
 // error matching fs.ErrNotExist, for the caller to map. The returned function
@@ -532,10 +557,40 @@ func (s *FileStore) openLocked(ctx context.Context, create, exclusive bool) (*os
 	return root, func() { unlock(); _ = root.Close() }, nil
 }
 
-// lock takes the store-wide flock on root's lock file, exclusive or shared,
-// waiting at most s.lockWait, or until ctx is done. The returned function
-// releases it.
+// lock takes the store lock, exclusive or shared: first the store's
+// in-process writer-preferring lock (storelock.go), then the store-wide
+// flock on root's lock file, waiting at most s.lockWait for the two
+// together, or until ctx is done. The returned function releases the flock,
+// then the in-process lock, once: a second call does nothing, so a caller's
+// deferred release after an explicit one never releases another holder's
+// in-process lock.
 func (s *FileStore) lock(ctx context.Context, root *os.Root, exclusive bool) (func(), error) {
+	start := time.Now()
+	if err := s.inproc.acquire(ctx, exclusive, s.lockWait); err != nil {
+		return nil, err
+	}
+	unlock, err := s.flock(ctx, root, exclusive, s.lockWait-time.Since(start))
+	if err != nil {
+		s.inproc.release(exclusive)
+		return nil, err
+	}
+	held := time.Now()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if s.holdObserver != nil {
+				s.holdObserver(exclusive, time.Since(held))
+			}
+			unlock()
+			s.inproc.release(exclusive)
+		})
+	}, nil
+}
+
+// flock takes the store-wide flock on root's lock file, exclusive or shared,
+// waiting at most wait, or until ctx is done. The returned function
+// releases it.
+func (s *FileStore) flock(ctx context.Context, root *os.Root, exclusive bool, wait time.Duration) (func(), error) {
 	// The lock file is created exclusively, then opened without O_CREATE.
 	// Concurrent O_CREATE opens of one name through an os.Root fail with a
 	// spurious ENOENT (seen on go1.27.3 darwin in about 40% of 8-way races),
@@ -562,7 +617,7 @@ func (s *FileStore) lock(ctx context.Context, root *os.Root, exclusive bool) (fu
 	if exclusive {
 		how = syscall.LOCK_EX
 	}
-	if err := s.flockWait(ctx, f, how); err != nil {
+	if err := s.flockWaitFor(ctx, f, how, wait); err != nil {
 		_ = f.Close() // abandoned; nothing to flush
 		return nil, err
 	}
@@ -575,7 +630,16 @@ func (s *FileStore) lock(ctx context.Context, root *os.Root, exclusive bool) (fu
 // flockWait takes flock how on f, waiting at most s.lockWait (then
 // errLockTimeout), or until ctx is done (then ctx's error).
 func (s *FileStore) flockWait(ctx context.Context, f *os.File, how int) error {
-	deadline := time.Now().Add(s.lockWait)
+	return s.flockWaitFor(ctx, f, how, s.lockWait)
+}
+
+// flockWaitFor is flockWait, waiting at most wait. A ctx already done
+// takes nothing, even an uncontended flock.
+func (s *FileStore) flockWaitFor(ctx context.Context, f *os.File, how int, wait time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(wait)
 	for {
 		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
 		if err == nil {

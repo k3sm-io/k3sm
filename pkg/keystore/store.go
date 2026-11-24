@@ -48,9 +48,10 @@ const (
 	generationFileSize = 2*generationSize + 1
 	// maxVersion is the highest version a current pointer may name. The
 	// pointer authenticates, but whoever holds the master can seal any value,
-	// and List sizes its result by it and opens every version up to it, so a
-	// pointer above the bound is ErrCorrupt rather than an allocation or a walk
-	// it chooses. 65536 versions is far beyond any rotation cadence, and an
+	// and root's FileStore.List sizes its result by it and opens every version
+	// up to it (a user List authenticates only the current version and checks
+	// the rest of the range for presence, by one listing), so a pointer above
+	// the bound is ErrCorrupt rather than an allocation or a walk it chooses. 65536 versions is far beyond any rotation cadence, and an
 	// entry directory at the bound still lists under maxDirNames.
 	maxVersion = 1 << 16
 	// maxOAuthVersion is maxVersion for an oauth entry, which keeps only its
@@ -145,6 +146,16 @@ type Config struct {
 	// judged as the lookup's is: an error, an all-zero or a synthesized
 	// answer fails closed with ErrScopeOwnerUnknown.
 	GeneratedUID func(uid uint32) ([16]byte, error)
+	// Tree is the in-process state every FileStore over this tree in one
+	// process must share: the store lock's in-process half and the user
+	// scopes' usage figures (TreeState). Two stores over one tree with
+	// their own would let one's holds skip the other's writer preference,
+	// and one's writes go missing from the other's figures. Nil gives the
+	// store a state of its own, which only a process with one store over
+	// the tree may use: every opener in the server (the socket, the
+	// delivery reconciler, the keys verbs run in it) must pass the one
+	// shared TreeState for the tree, as k3sm's keystoreLayout does.
+	Tree *TreeState
 }
 
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
@@ -240,6 +251,24 @@ type FileStore struct {
 	// (servercounts.go). A pointer, as userScopesStarted is; New allocates
 	// it.
 	counts *serverCounts
+	// tree is Config.Tree, or a state of the store's own; inproc and
+	// usage are its parts.
+	tree *TreeState
+	// inproc is the store lock's in-process half (storelock.go), taken
+	// before the flock. A pointer, as userScopesStarted is, so a copy of
+	// the store shares it; it is tree's.
+	inproc *prefLock
+	// holdObserver, when set, is called as each store lock hold ends, with
+	// its mode and how long it was held on the clock, where a test bounds
+	// the hold.
+	holdObserver func(exclusive bool, held time.Duration)
+	// usage is the user scopes' usage figures and the uids' mutation locks
+	// (usage.go). A pointer, as userScopesStarted is; it is tree's.
+	usage *usageTable
+	// usageLstat, when set, is called before each file Lstat of a scope
+	// usage walk, with whether the walk runs under the store lock, where a
+	// test counts the walk.
+	usageLstat func(underLock bool)
 }
 
 var _ Store = (*FileStore)(nil)
@@ -281,6 +310,11 @@ func New(cfg Config) *FileStore {
 		audit:             new(auditState),
 		counts:            newServerCounts(),
 	}
+	tree := cfg.Tree
+	if tree == nil {
+		tree = NewTreeState()
+	}
+	s.tree, s.inproc, s.usage = tree, tree.inproc, tree.usage
 	if cfg.LogFlags != nil {
 		s.logFlags = cfg.LogFlags
 	}
@@ -932,7 +966,52 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 		out.Versions = append(out.Versions, v)
 	}
 	out.Current = out.Versions[len(out.Versions)-1]
+	out.VersionCount = len(out.Versions)
 	return out
+}
+
+// listUserEntry is a user entry's List row: its current version, opened
+// and authenticated, and the others checked for presence only, by one
+// listing of the entry's directory: every version in the pointer's
+// committed range must have its file, a regular one (a symlink, a
+// directory or any other type under a version's name counts as no file),
+// and the first that has none is the entry's Err (ErrCorrupt). No other
+// record is opened, so a list costs one
+// record open and one directory listing an entry under the shared lock
+// however many versions it keeps. VersionCount is the number of version
+// files present in the range. Any other failure is the entry's Err. A version file present but damaged is
+// reported by no list: root's keys list (FileStore.List) and doctor open no
+// user-scope version, so that damage surfaces only through a rotate
+// --from-version of that version, which opens and refuses it, or a
+// user-scope rm, whose burial reads each version's header; a Rewrap opens
+// no user record. The floor is not checked here: List rules out a pointer
+// the floor forbids (flooredPointer) before it calls this.
+func listUserEntry(e *entry, k keys) Entry {
+	cur, _, low, err := e.checkedRange(k, nil)
+	if err != nil {
+		return Entry{Name: e.name, Err: err}
+	}
+	v, val, err := e.version(k, cur)
+	clear(val) // List carries metadata only
+	if err != nil {
+		return Entry{Name: e.name, Err: fmt.Errorf("version %d: %w", cur, err)}
+	}
+	des, err := readDirEntries(e.root, maxDirNames)
+	if err != nil {
+		return Entry{Name: e.name, Err: err}
+	}
+	present := make(map[uint64]bool, len(des))
+	for _, de := range des {
+		if x, ok := parseVersionName(de.Name()); ok && x >= low && x <= cur && de.Type().IsRegular() {
+			present[x] = true
+		}
+	}
+	for x := low; x <= cur; x++ {
+		if !present[x] {
+			return Entry{Name: e.name, Err: fmt.Errorf("%w: version %d of the pointer's range %d to %d has no file", ErrCorrupt, x, low, cur)}
+		}
+	}
+	return Entry{Name: e.name, Current: v, VersionCount: len(present)}
 }
 
 // Delete removes name and every version of it. It takes keystore-lock and
@@ -1561,14 +1640,21 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 // ErrOrphanVersion, before anything is unlinked; Adopt promotes it.
 // docs/design/keystore.md § "Rotation and rollback".
 func discardOrphans(ctx context.Context, e *entry, k keys, low, cur uint64) error {
+	_, err := discardOrphansCounted(ctx, e, k, low, cur)
+	return err
+}
+
+// discardOrphansCounted is discardOrphans, returning how many files it
+// removed.
+func discardOrphansCounted(ctx context.Context, e *entry, k keys, low, cur uint64) (removed int, err error) {
 	names, err := readDirNames(e.root, maxDirNames)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var doomed []string
 	for i, n := range names {
 		if err := loopCtx(ctx, i); err != nil {
-			return err
+			return 0, err
 		}
 		v, ok := parseVersionName(n)
 		if !ok || (v >= low && v <= cur) {
@@ -1579,25 +1665,25 @@ func discardOrphans(ctx context.Context, e *entry, k keys, low, cur uint64) erro
 			clear(pt) // only whether it opens is wanted
 			switch {
 			case err == nil:
-				return orphanError(e, Kind(r.kind) == KindOAuth, v, cur)
+				return 0, orphanError(e, Kind(r.kind) == KindOAuth, v, cur)
 			case !errors.Is(err, ErrCorrupt):
-				return fmt.Errorf("check the orphaned %s: %w", n, err)
+				return 0, fmt.Errorf("check the orphaned %s: %w", n, err)
 			}
 		}
 		doomed = append(doomed, n)
 	}
 	for i, n := range doomed {
 		if err := loopCtx(ctx, i); err != nil {
-			return err
+			return i, err
 		}
 		if err := e.root.Remove(n); err != nil {
-			return fmt.Errorf("discard the orphaned %s: %w", n, err)
+			return i, fmt.Errorf("discard the orphaned %s: %w", n, err)
 		}
 	}
 	if len(doomed) == 0 {
-		return nil
+		return 0, nil
 	}
-	return syncDir(e.root)
+	return len(doomed), syncDir(e.root)
 }
 
 // versionLimit is the highest version an entry of kind may reach:
