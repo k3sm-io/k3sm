@@ -247,7 +247,7 @@ func TestOutcomeOfMapsStoreErrors(t *testing.T) {
 		{"typed credential", wrap(keystore.ErrTypedCredential), CodeRefused},
 		{"rewrap in progress", wrap(keystore.ErrRewrapInProgress), CodeRefused},
 		{"corrupt", wrap(keystore.ErrCorrupt), CodeInternal},
-		{"orphan version", wrap(keystore.ErrOrphanVersion), CodeInternal},
+		{"orphan version", wrap(fmt.Errorf("%w: %w", keystore.ErrCorrupt, keystore.ErrOrphanVersion)), CodeRefused},
 		{"master missing", wrap(keystore.ErrMasterMissing), CodeInternal},
 		{"master untrusted", wrap(keystore.ErrMasterUntrusted), CodeInternal},
 		{"kind unsupported", wrap(keystore.ErrKindUnsupported), CodeInternal},

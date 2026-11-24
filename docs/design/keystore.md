@@ -4340,13 +4340,20 @@ surface, and the app consumes only those.
   | `ErrNotFound`, `ErrVersionNotFound`, `ErrScopeAbsent` | `not-found` |
   | `ErrQuota` | `quota` |
   | `ErrScopeOwnerChanged`, `ErrScopeOwnerUnknown` | the code of the same name |
-  | a request the socket refuses before the store (`socket.ErrRequestRefused`, below); the socket's fail-closed refusal while the global append failure has any cause but the hard cap (`socket.ErrAuditFailing`); an operation refused because its audit line could not be written, the global append failure (`keystore.AuditRefused`); `ErrExists`; `ErrInvalidName`; `ErrKindMismatch`; `ErrTypedCredential`; `ErrRewrapInProgress`; the floor's damage or the scope's quarantine (`keystore.FloorDegraded`) | `refused` |
-  | anything else: `ErrCorrupt`, `ErrOrphanVersion`, `ErrMasterMissing`, `ErrMasterUntrusted`, `ErrKindUnsupported`, a cancelled request | `internal` |
+  | a request the socket refuses before the store (`socket.ErrRequestRefused`, below); the socket's fail-closed refusal while the global append failure has any cause but the hard cap (`socket.ErrAuditFailing`); an operation refused because its audit line could not be written, the global append failure (`keystore.AuditRefused`); `ErrExists`; `ErrInvalidName`; `ErrKindMismatch`; `ErrTypedCredential`; `ErrRewrapInProgress`; a sealed version above the entry's pointer (`ErrOrphanVersion`, which also matches `ErrCorrupt`); the floor's damage or the scope's quarantine (`keystore.FloorDegraded`) | `refused` |
+  | anything else: `ErrCorrupt`, `ErrMasterMissing`, `ErrMasterUntrusted`, `ErrKindUnsupported`, a cancelled request | `internal` |
 
   `refused` is a request the store will not carry out as it stands, which the client can
   change (another name, rotate rather than put, root finishing a rewrap or acknowledging the
   floor's damage, or appends that succeed again); `internal` is damage or a missing key only
-  root can repair, so the client says to run `doctor`. `ErrScopeAbsent` is `not-found` on the
+  root can repair, so the client says to run `doctor`. A user rotate that finds a sealed
+  version above the pointer (a rotation that crashed before its flip, or an older pointer
+  copied back inside the floor's lag window) is `refused`, not `internal`: the scope's owner
+  cannot adopt it (`adopt` is root's, for the system scope) and cannot reach the file, but
+  can repair the entry itself, with `rm` and then `put` of the value. The store never
+  discards an orphan that authenticates (it may be the newer committed version), so the
+  refusal stands until the owner does that; the error the server logs names the entry and
+  that remedy. `ErrScopeAbsent` is `not-found` on the
   socket: the peer's own scope holds nothing it can read, and nothing on the socket path
   deletes on that answer, so it is never taken as a definitive absence. A `log-full` from the
   uid's own share is never the global append failure: that one is answered alike for every

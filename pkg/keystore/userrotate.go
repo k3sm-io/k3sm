@@ -23,6 +23,8 @@ import (
 	"io/fs"
 	"math"
 	"os"
+
+	keyentry "k3sm.io/apis/keystore/entry"
 )
 
 // This file is the user scope's rotate: docs/design/keystore.md § "Rotation
@@ -195,6 +197,12 @@ func (u *UserScope) rotateBody(ctx context.Context, root *os.Root, name string, 
 		return Version{}, err
 	}
 	if err := discardOrphans(ctx, e, uk, 1, cur); err != nil {
+		if errors.Is(err, ErrOrphanVersion) {
+			// The scope's owner cannot adopt it (root's verb) or reach
+			// the file: its remedy is rm, then put. The orphan is kept,
+			// never discarded here, as discardOrphans keeps it.
+			return Version{}, fmt.Errorf("%w: %w: %s holds a sealed version above its current one, left by a crashed rotation or a copied-back pointer; nothing was removed: rm the entry, then put its value again", ErrCorrupt, ErrOrphanVersion, keyentry.Entry{Scope: keyentry.ScopeUser, UID: u.uid, Name: name})
+		}
 		return Version{}, err
 	}
 	// A rotation revokes the value it replaces: past the share or the hard

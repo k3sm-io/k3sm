@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -267,4 +268,36 @@ func TestUserRotateCrashOrder(t *testing.T) {
 			t.Fatalf("current is %d after a committed rotate, want 2", cur.Version)
 		}
 	})
+}
+
+// A sealed version above the pointer (a committed rotate whose floor line
+// failed, then the older pointer copied back) refuses the user's rotate as
+// an orphan, naming the user's remedy, rm then put, and keeps the orphan.
+func TestUserRotateOrphanNamesRmThenPut(t *testing.T) {
+	ctx := context.Background()
+	s, u := rotateScope(t)
+	cur := filepath.Join(s.dir, userScopesName, "1001", scopeEntriesName, "a", currentName)
+	old, err := os.ReadFile(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.step = failAt("floor a")
+	if v, err := u.Rotate(ctx, "user/1001/a", []byte("two")); !Committed(err) || v.Version != 2 {
+		t.Fatalf("rotate whose floor line failed: %+v %v, want version 2 committed", v, err)
+	}
+	s.step = func(string) error { return nil }
+	if err := os.WriteFile(cur, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = u.Rotate(ctx, "user/1001/a", []byte("three"))
+	if !errors.Is(err, ErrOrphanVersion) || !strings.Contains(err.Error(), "rm the entry, then put") || strings.Contains(err.Error(), "keys adopt") {
+		t.Fatalf("rotate over an orphan: %v, want ErrOrphanVersion naming rm then put, not root's adopt", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(cur), versionName(2))); err != nil {
+		t.Fatalf("the orphan was discarded: %v", err)
+	}
+	if err := u.Delete(ctx, "user/1001/a"); err != nil {
+		t.Fatalf("rm of the orphaned entry: %v", err)
+	}
+	userPut(t, u, "user/1001/a", "again")
 }
