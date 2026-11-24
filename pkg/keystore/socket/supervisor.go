@@ -165,7 +165,8 @@ type SupervisorConfig struct {
 	Handler *Handler
 	// Clock times the backoff, the marker polls and the Listener's.
 	Clock Clock
-	// Log receives the supervisor's lines.
+	// Log receives the supervisor's lines, and NewSupervisor gives it to
+	// Handler for the store errors that are damage (logStoreError).
 	Log *slog.Logger
 }
 
@@ -219,6 +220,9 @@ func NewSupervisor(cfg SupervisorConfig) (*Supervisor, error) {
 	if missing != "" {
 		return nil, fmt.Errorf("keystore socket: nil %s", missing)
 	}
+	// The handler's damage lines go where the supervisor's lines go: the
+	// server's log, not the process default.
+	cfg.Handler.log = cfg.Log
 	return &Supervisor{cfg: cfg, state: State{Phase: PhaseStarting}}, nil
 }
 

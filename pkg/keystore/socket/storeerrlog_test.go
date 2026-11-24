@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -363,4 +364,33 @@ func TestDamageLimiterBounded(t *testing.T) {
 	if _, ok := l.keys[key(2*maxDamageKeys-1)]; !ok {
 		t.Fatal("the newest key was evicted")
 	}
+}
+
+// The supervisor gives its logger to the handler, so the store errors that
+// are damage reach the server's log, not the process default.
+func TestSupervisorLogReceivesDamage(t *testing.T) {
+	var c logCapture
+	corrupt := func(context.Context, Request) (Reply, error) { return Reply{}, keystore.ErrCorrupt }
+	h, err := NewHandler(time.Now, withOp(OpReadForExec, corrupt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &supRig{
+		ck:    &startChecks{euid: serviceUID, servers: 1},
+		creds: &panickyCreds{fakeCreds: &fakeCreds{peers: make(map[net.Conn]PeerCred)}},
+		box:   &fakeSandbox{sandboxed: make(map[AuditToken]bool), fail: make(map[AuditToken]bool)},
+		log:   &logBuf{},
+		h:     h,
+	}
+	cfg := r.config()
+	cfg.Log = c.logger()
+	if _, err := NewSupervisor(cfg); err != nil {
+		t.Fatal(err)
+	}
+	serveOne(t, h, hdr(t, OpReadForExec, entryOf(uidA, "a"), nil))
+	recs := c.records(t)
+	if len(recs) != 1 {
+		t.Fatalf("the supervisor's logger received %v, want the damage line", recs)
+	}
+	checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"), DamageCorrupt, 0)
 }
