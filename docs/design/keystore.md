@@ -1967,13 +1967,17 @@ job, and the server takes the listening descriptor with `launch_activate_socket`
 replace a name in a root-owned 0755 directory, so no service-uid process, the server's
 children and a Pod's processes included, can bind `keys.sock`, whether or not the server is
 running (U104, E24). That launchd activates a `Sockets` socket for a job with `UserName` set,
-and that the server, as the service user, receives it, is a K7a measurement. **If it fails,
-the fallback is deny plus pin**: install makes `keystore-sock/` the service user's, 0755, the
+and that the server, as the service user, receives it, was a K7a measurement; the fallback,
+had it failed, was deny plus pin: install makes `keystore-sock/` the service user's, 0755, the
 server binds `keys.sock` itself, and the bind is kept from Pods by the Seatbelt deny and from
-other service-uid code by the client's server pin ("The client pins the server"), as before;
-the K7a amendment records which form ships. Two more K7a outcomes select the fallback: a
-client-side peer that names launchd (Open requirement 4), and a Pod that can obtain the
-listener from launchd itself (Open requirement 5).
+other service-uid code by the client's server pin ("The client pins the server"). **The K7a
+amendment of 2026-11-23 records that the activated form ships**: launchd activated the socket
+for a `UserName` job, root:daemon 0666 in the root 0755 directory; the job got one descriptor,
+`FD_CLOEXEC` already set; no other process, a Pod's included, could obtain the listener (Open
+requirement 5); and the client-side peer reads as launchd (`LOCAL_PEERCRED` uid 0) while the
+audit token names the accepting server, which the client check of Open requirement 4 accepts.
+A server launchd did not start gets no socket (`ESRCH`) and keeps the user scope off as "the
+listening socket is unavailable"; it never binds `keys.sock` itself.
 
 ### Key hierarchy
 
@@ -4369,14 +4373,14 @@ such a name is well formed and simply has no scope.
 
 **The client's checks are advisory.** The CLI opens the socket through an `os.Root` on the
 data root, checks by realpath that `keystore-sock/` is root's, mode 0755, under the root-owned
-data root, and that `keys.sock` is a socket (the service user's directory in the fallback), then reads the server's uid off the connected descriptor (`LOCAL_PEERCRED` from the
-client side; under socket activation, whether that names the server or launchd, the process
-that listened, is measured in K7a with the token below, and if it names launchd the self-bind
-form ships, Open requirement 4). **The connected-descriptor peer uid is
-the authority in both directions**: a
-value is never written to a socket whose peer is not the service user, whatever the path
-checks said (U36). That `LOCAL_PEERCRED` reports the service uid on the client side
-is measured (K0 amendment 2026-11-21).
+data root, and that `keys.sock` is a socket, then judges the peer of the connected descriptor
+by the client check (Open requirement 4): `LOCAL_PEERCRED` reads uid 0, since under activation
+it names launchd, the socket's creator (K7a amendment 2026-11-23); the audit token
+(`LOCAL_PEERTOKEN`) names a process whose euid is the service uid; and that process's code has
+the installed binary's cdhash (below). **The connected descriptor is the authority in both
+directions**: a value is never written to a socket whose peer fails any of the three, whatever
+the path checks said (U36). The uid 0 is accepted only beside the token's euid and the cdhash,
+never alone: a peer whose token names root, launchd or any other uid is refused.
 
 **The client pins the server, not just its uid.** With the socket activated from a root-owned
 directory, no service-uid process can bind `keys.sock`, and the pin is the second layer. In the
@@ -4430,13 +4434,13 @@ socket before both checks pass (U69, E24).
   them run as the service user inside the server's trust domain, which can read `M`
   ("Who can hold which key"), so admitting one grants it nothing that domain lacks.
 - *Which process the token names.* Under socket activation launchd created and listened on
-  the socket, and the server only accepts on the descriptor it was given. Whether the
-  client-side `LOCAL_PEERTOKEN` names the accepting process or the process that listened is a
-  K7a measurement. U69 holds the case either way: a listener inherited or passed to another
-  process must not let that process pass the pin, and the server sets `FD_CLOEXEC` on the
-  activated descriptor and passes it to no one (Open requirement 3, U120). If the token names
-  launchd, the self-bind form ships, and U36 is never relaxed to accept uid 0 (Open
-  requirement 4).
+  the socket, and the server only accepts on the descriptor it was given. K7a measured
+  (amendment 2026-11-23) that the client-side `LOCAL_PEERTOKEN` names the accepting server, its
+  pid and euid, while `LOCAL_PEERCRED` names launchd (uid 0). U69 holds either way: a listener
+  inherited or passed to another process must not let that process pass the pin, and the
+  server marks the activated descriptor `FD_CLOEXEC` as it takes it and passes it to no one
+  (Open requirement 3, U120). The uid 0 of `LOCAL_PEERCRED` is accepted only with the token's
+  euid and cdhash (Open requirement 4).
 - This pins the server for the client; it does not pin the client for the server, which stays
   unpinned by ruling (residual 1). That `LOCAL_PEERTOKEN` is readable on the client side and
   that `SecCodeCopyGuestWithAttributes` resolves a service-user process from a login user's
@@ -5865,19 +5869,25 @@ text points here.
    *Test:* U120, server-side integration: spawn each child type (an `exec.Command` child, the
    runtimed helper, a Pod through the exec shim), list each one's open descriptors, and fail if
    the listening socket is among them.
-4. **Under activation the client may see launchd as the peer (K9a, measured in K7a).** The
-   client-side `LOCAL_PEERCRED` and `LOCAL_PEERTOKEN` may name launchd (uid 0), the process
-   that listened, not the accepting server. *Binding rule, a K7a outcome:* K7a measures both
-   from a login user's process. If either names launchd, or names anything but the accepting
-   server, the build ships the deny-plus-pin self-bind form ("The socket's directory is
-   root's"). U36's rule is never relaxed to accept uid 0. *Test:* U121: a client whose peer
-   reads as uid 0 or as launchd's code refuses and writes nothing.
+4. **Under activation the client sees launchd as the credential peer (K9a, measured in K7a).**
+   K7a measured (amendment 2026-11-23), from a login user's process, that the client-side
+   `LOCAL_PEERCRED` reads euid 0 gid 0 (launchd, which created the socket) for every client,
+   while `LOCAL_PEERTOKEN` names the accepting server (euid the service uid, its pid) and the
+   code lookup from the token resolves the server's code and cdhash. *Binding rule, the client
+   check:* the client writes to the socket only when all three hold: `LOCAL_PEERCRED` uid 0,
+   the audit token's euid equal to the service uid, and the token's code the installed
+   binary's cdhash (U69). uid 0 is never accepted on its own, and a token naming root, launchd
+   or any uid but the service uid is refused. *Test:* U121: a client whose peer reads as uid 0
+   with a token naming launchd, root or another uid, or other code, refuses and writes
+   nothing; one whose token names the service uid and the installed cdhash proceeds.
 5. **A Pod might obtain the listener from launchd (K9a, measured in K7a).** A process
    descended from the server's job can ask launchd for the job's sockets with
    `launch_activate_socket`, and Pods descend from it (`runtimed/pkg/runtime/podreap.go:40`).
    *Fix:* K7a measures this from a Pod. If a Pod can obtain the listener, the build ships the
    self-bind form, and the Pod profile denies the launchd socket-activation lookup in either
-   form. *Test:* U122 (the rendered Pod profile carries the deny) and rig leg E27 (a Pod's
+   form. Measured (K7a amendment 2026-11-23): a Pod process, and every other process but the
+   job, gets `ESRCH`, so the activated form ships and the deny is not required; E27 checks it
+   again on the rig. *Test:* U122 (the rendered Pod profile carries the deny) and rig leg E27 (a Pod's
    `launch_activate_socket` for the server's socket name gets no descriptor).
 6. **Same-target cross-record deletion (K13b).** Two honoured records, of two uids, can name
    the same `(namespace, secretName)`. The orphan sweep, the lost-authority delete and
@@ -5967,6 +5977,30 @@ second, inside the root-only `keystore-staging/`, before it is reachable.
 | 3 | `mbr_uid_to_uuid` is stable across a server restart; its cold latency; what it returns for a uid with no record | **Measured.** The GeneratedUID equals `dscl`'s and is stable across processes. Cold first lookup about 1.4 ms, worst of 20 cold processes 2.8 ms, warm median 0.17 ms, so a 250 ms deadline has wide margin. A uid with no record returns the synthesized form `FFFFEEEE-DDDD-CCCC-BBBB-AAAA<uid hex>` with status 0, and so does root; the synthesized-prefix rule is required. | "Key hierarchy" |
 | 4 | a Pod with the data-root denies cannot reach the socket or any `keystore-*` path; without them, what a Pod reaches today | **Without the denies, measured:** a native Pod on the server connected to `keys.sock` (two accepts), so the denies are a hard prerequisite of any keystore file or socket (K5 before K8). Phase A's two data-root files did not exist on the rig, so their readability today is unmeasured. **Pending:** the Pod with the denies is the K5 rig leg (E10). | "Pod denies", "Threat model" |
 | 5 | which uid a native Pod's processes run as; whether a Pod spec field or runtimed path can make it 501 or above | **Measured for a default Pod:** uid 250 (the service user), below 501, and the socket saw peer euid 250. **Pending:** the spec-field and runtimed-path half (`runAsUser` and the other fields) is K5's row U15. Pods and the server share uid 250, which is why the client pins the server by more than its uid. | "Pod denies" (layer 2, row U15) |
+
+**K7a amendment, 2026-11-23: socket activation ships.** The activation probe
+(`hack/acceptance/keystore-activation-probe`) ran on a worker lab Mac (macOS 27.2.1) as root,
+with a test job carrying `UserName` and a `Sockets` entry at mode 0666, and cleaned up after
+itself. It measured: launchd creates the socket root:daemon 0666 in the root 0755 directory
+before the job runs, and the job (euid the service uid) gets one descriptor from
+`launch_activate_socket`, `FD_CLOEXEC` already set; on the server side each peer's
+`LOCAL_PEERCRED`, `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` agree; on the client side
+`LOCAL_PEERCRED` reads euid 0 gid 0 (launchd) for every client while `LOCAL_PEERPID` and
+`LOCAL_PEERTOKEN` name the accepting server, whose code and cdhash the lookup from the token
+resolves from a login user's process; no other process (a login user, the service user, a
+child of the job before and after it took the socket, with and without `setsid`, a Pod
+process) obtains the listener: `launch_activate_socket` returns `ESRCH`. On that evidence the
+activated form ships, not the deny-plus-pin fallback, and the client check changes: the client
+accepts the `LOCAL_PEERCRED` uid 0 that activation produces only beside an audit token whose
+euid is the service uid and whose code has the installed binary's cdhash. U36, U121 and Open
+requirement 4 are reworded to that check; Open requirement 5 needs no deny. Delivered with
+this amendment: the server plist's `Sockets` entry `keys` at `<dataRoot>/keystore-sock/keys.sock`,
+mode 0666; install's `keystore-sock/`, root:wheel 0755, removed by uninstall; the server's
+listener source over `launch_activate_socket`, which marks the descriptor `FD_CLOEXEC` inside
+`syscall.ForkLock` and serves a close-on-exec duplicate; the supervisor started by the server;
+and `doctor` expecting launchd's root-owned socket. The client side of the check is the
+non-root CLI's change. Not measured here: the 50 ms exclusive hold bound and GeneratedUID
+stability.
 
 **Owed to K7a.** K7a is the measurement run before the changes that depend on it, recorded
 as a dated amendment like K0's. It measures: `LOCAL_PEERTOKEN` and the code lookup from it on
@@ -6948,7 +6982,7 @@ carried by the unit rows.
 | U33 | `refused` lines are rate-limited per uid with a summary of the dropped count | `k3sm/pkg/keystore/socket::TestRefusedLinesRateLimited` | checked: the socket operations (the post-frame refused line) |
 | U34 | 5 mutating ops a second per uid; 30 `read-for-exec` a minute per uid, each audited `exec-read` | `k3sm/pkg/keystore/socket::TestMutationRateLimit`, `TestExecReadCapPerUID`, `k3sm/pkg/keystore::TestExecReadAudited` | checked: the socket operations (the bridge's rate limits) |
 | U35 | the socket server's store interface has no reveal, show or rewrap method | `k3sm/pkg/keystore/socket::TestStoreInterfaceHasNoRevealMethod` | checked: the socket operations (the store bridge) |
-| U36 | the client refuses a socket whose connected peer uid is not the service uid, whatever the path checks said (seam: peer-credential source, client side) | `k3sm/cmd/k3sm::TestClientRefusesForeignServerUID` | pending: the non-root CLI and `exec` |
+| U36 | the client refuses a socket whose connected peer fails the client check, whatever the path checks said: `LOCAL_PEERCRED` uid 0 (launchd, under activation), the audit token's euid equal to the service uid, and the installed binary's cdhash (seam: peer-credential source, client side) | `k3sm/cmd/k3sm::TestClientRefusesForeignServerUID` | pending: the non-root CLI and `exec` |
 | U37 | `exec` sets the variable only in the child; nothing on stdout, nothing on disk; the value never enters argv; no non-root verb writes a value to stdout | `k3sm/cmd/k3sm::TestKeysExecEnvOnlyInChild`, `TestNoNonRootVerbWritesValue` | pending: the non-root CLI and `exec` |
 | U38 | an unknown error code prints the code; a connect failure names `sudo k3sm install` | `k3sm/cmd/k3sm::TestUnknownErrorCodeFallback`, `TestConnectErrorNamesInstall` | pending: the non-root CLI and `exec` |
 | U39 | (unused: there are no system grants) | none | none |
@@ -7016,7 +7050,7 @@ carried by the unit rows.
 | U101 | `rewrap` prints a warning whenever `.user/` exists, before it starts and when it finishes, saying Rewrap does not re-key `K_u` and naming the procedure: each user re-puts their values after a suspected master exposure; with no `.user/` it prints none (seam: euid source) | `k3sm/cmd/k3sm::TestRewrapWarnsWhenUserScopesExist` | checked: user-scope quotas, scope-key Rewrap and the delivery record |
 | U102 | the sealed record stores the last delivered version per delivery, raised after the Secret write succeeds; the repair-versus-owner classifier uses only that recorded version: a Secret whose version annotation is rewritten and a KeyDelivery whose `status.deliveredVersion` is rewritten each leave the charge unchanged, a repair stays on the reconciler budget and an owner's new version stays charged to the owner | `k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus` | pending: the KeyDelivery reconciler (lifecycle) |
 | U103 | a Secret at a recorded target whose label or owner annotation was removed is never overwritten or deleted, under a revocation, the object's deletion and `rm-scope` alike; the KeyDelivery gets `SecretRetained=True` with reason `LabelRemoved`, and `doctor` names the Secret and the KeyDelivery | `k3sm/pkg/keystore/reconcile::TestStrippedLabelReportedNotDeleted` | pending: the KeyDelivery reconciler (lifecycle) |
-| U104 | the socket's directory is root's: run as root (a root-run row, `--root`), install creates `keystore-sock/` root:wheel 0755 and the server plist carries a `Sockets` listener for `keystore-sock/keys.sock`; a process running as the service uid cannot unlink, replace or bind `keys.sock`, whether or not the server runs, and gets `EACCES` | `k3sm/pkg/install::TestSocketDirRootOwnedServiceUIDCannotBind` (integration, root-run); rig leg E24 | pending: the socket listener |
+| U104 | the socket's directory is root's: run as root (a root-run row, `--root`), install creates `keystore-sock/` root:wheel 0755 and the server plist carries a `Sockets` listener for `keystore-sock/keys.sock`; a process running as the service uid cannot unlink, replace or bind `keys.sock`, whether or not the server runs, and gets `EACCES` | `k3sm/pkg/install::TestServerPlistActivatesKeystoreSocket`, `TestKeystoreSockDirAtInstall`, `TestSocketDirRootOwnedServiceUIDCannotBind` (integration, root-run); rig leg E24 | partial: the plist entry and the directory are delivered and unit-tested; pending: the root-run service-uid unlink and bind test, and rig leg E24 |
 | U105 | every root path walks the keystore trees by descriptor: run as root (a root-run row, `--root`), `sudo k3sm install` over an existing tree, `uninstall --purge` and `doctor` each refuse a planted symlink, FIFO or swapped directory under `.user/` and at every `keystore-*` name, with `openat`, `O_NOFOLLOW`, bounded reads and a `SameFile` re-check, and change nothing they were not meant to | `k3sm/pkg/install::TestInstallOverExistingTreeWalksByDescriptor`, `TestPurgeWalksKeystoreByDescriptor`, `k3sm/cmd/k3sm::TestDoctorWalksKeystoreByDescriptor` (integration, root-run) | pending: the append-only files |
 | U106 | every root verb refuses a non-root caller: one table test runs `rm-scope`, `floor --rebuild`, `audit --rotate`, `rewrap` and `deliver system/…` with a non-root euid through the euid source, and each is refused with the same message and exit code, changing nothing (seam: euid source) | `k3sm/cmd/k3sm::TestRootVerbsRefuseNonRootEUID` | pending: the KeyDelivery reconciler (lifecycle), each verb's case added by the change that adds the verb |
 | U107 | with the user floor missing or unflagged, an absence-driven delete (`ErrNotFound`) is `Indeterminate` and deletes nothing, while a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial) deletes the Secret after its two spaced observations | `k3sm/pkg/keystore/reconcile::TestNotFoundDeleteWaitsForFloor`, `TestRevocationDeleteProceedsWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
@@ -7031,9 +7065,9 @@ carried by the unit rows.
 | U116 | the Pod uid refusal applies to native Pods only: a vm Pod with `runAsUser: 1000` is allowed, since a guest uid has no host meaning, while a native Pod with the same drop target is refused; the guest's groups skip the host group rules the same way | `runtimed/pkg/runtime::TestVMPodGuestUIDNotRefused` (the refusal sits on the native spawn path, `checkPodUID` in `pkg/runtime/security.go`; the same test, in `pkg/runtime/vmcontainers_test.go`, also pins that a vm Pod's `runAsGroup` of 1000 reaches the guest's GID and SupplementalGIDs unrefused) | checked: runtimed's sandbox change |
 | U118 | root-run: the old log is retired, never re-owned: in audit --rotate and floor --rebuild the new log gets, in staging, its fchown to the service user, its fchmod 0600 and then its flag, between the build and report steps; the old log's one attribute call is its flag clear, made after the swap has made it unreachable by path, in the retired directory in keystore-staging/, which is then removed unread; it is never chowned or chmodded, ends unlinked with its owner, mode and bytes unchanged; rotate's archives, in archives/, are fresh root-owned unflagged copies, 0600 with one link, and the older archives carried by link are the same inodes and bytes (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceOldLogRetiredNeverReowned` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
 | U119 | the floor lock is `keystore-lock`, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root (`put`, `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise of `list` and `show`, `rm-scope`, `floor --rebuild`, `audit --rotate`); run as root (a root-run row, `--root`), a non-root process other than the service user holding the old data-root flock blocks none of them | `k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb` (integration, root-run) | checked as a root-run row (`--root`) for the verbs that exist: `put`, `rotate`, `rm`, `rewrap` and the floor raise; `rm-scope`, `floor --rebuild` and `audit --rotate` take it as they land (the append-only files) |
-| U120 | the activated listening descriptor reaches no child (integration): the server spawns each child type, an `exec.Command` child, the runtimed helper and a Pod through the exec shim, lists each one's open descriptors, and the listening socket is among none of them | `k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild` (integration) | pending: the socket listener |
-| U121 | under activation, a client whose connected peer reads as uid 0 or as launchd's code refuses and writes nothing; U36 is never relaxed to accept uid 0, and if K7a finds the client-side peer names launchd the self-bind form ships (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer` | pending: the socket listener |
-| U122 | when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup | `k3sm/pkg/provider::TestPodProfileDeniesLaunchdSocketActivation`; rig leg E27 | pending: the socket listener |
+| U120 | the activated listening descriptor reaches no child: the server spawns each child type, an `exec.Command` child, the runtimed helper and a Pod through the exec shim, lists each one's open descriptors, and the listening socket is among none of them | `k3sm/pkg/keystore/socket::TestActivatedListenerIsCloseOnExecAndReused`; rig | partial: the listener source marks the descriptor `FD_CLOEXEC` inside `syscall.ForkLock`, closes launchd's original, and an `exec.Command` child does not hold it; pending (rig): the runtimed helper and a Pod through the exec shim |
+| U121 | under activation, the client accepts a `LOCAL_PEERCRED` uid 0 only when the audit token's euid is the service uid and its code the installed binary's cdhash; a uid-0 peer whose token names launchd, root or another uid, or other code, is refused and nothing is written (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer` | pending: the non-root CLI and `exec` |
+| U122 | when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup; K7a found a Pod gets `ESRCH` (amendment 2026-11-23), so the activated form ships and the deny is not required | `k3sm/pkg/provider::TestPodProfileDeniesLaunchdSocketActivation`; rig leg E27 | pending (rig): leg E27 re-checks a Pod's `ESRCH` on each release |
 | U123 | same-target cross-record deletion: the orphan sweep, a lost-authority delete and `rm-scope` never delete a Secret that another honoured record claims at the same `(namespace, secretName)`; a forged owner annotation naming one uid's tombstone on another uid's live Secret deletes nothing; the owner annotation never selects which record's tombstone governs a delete; nothing is charged to the victim | `k3sm/pkg/keystore/reconcile::TestForgedTombstoneAnnotationOnOtherUsersLiveSecretIsNotDeleted` | pending: the KeyDelivery reconciler (lifecycle) |
 | U124 | a tombstone is pruned when its target is not this UID's owned Secret on two observations at least 60 s apart, not only on a Get that answers not found: a target occupied by another Secret still prunes; a failed Get keeps it | `k3sm/pkg/keystore/reconcile::TestTombstonePrunesWhenTargetOccupied` | pending: the KeyDelivery reconciler (lifecycle) |
 | U125 | every reconciler Secret delete or update and every `rm-scope` delete passes `Preconditions{UID, ResourceVersion}` from the ownership read: a fake client swaps the Secret between the read and the delete, the delete is refused, and the outcome is `Indeterminate` | `k3sm/pkg/keystore/reconcile::TestDeleteRefusedWhenSecretSwappedAfterRead` | pending: the KeyDelivery reconciler (lifecycle) |

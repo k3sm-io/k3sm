@@ -596,7 +596,7 @@ check U34 "5 mutating ops a second per uid; 30 read-for-exec a minute per uid, e
 	k3sm/pkg/keystore/socket::TestMutationRateLimit TestExecReadCapPerUID k3sm/pkg/keystore::TestExecReadAudited
 check U35 "the socket server's store interface has no reveal, show or rewrap method (socket operations)" \
 	k3sm/pkg/keystore/socket::TestStoreInterfaceHasNoRevealMethod
-pend U36 "the client refuses a socket whose connected peer uid is not the service uid, whatever the path checks said (non-root CLI and exec)" \
+pend U36 "the client refuses a socket whose connected peer fails the client check, whatever the path checks said: LOCAL_PEERCRED uid 0 (launchd, under activation), the audit token's euid equal to the service uid, and the installed binary's cdhash (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestClientRefusesForeignServerUID
 pend U37 "exec sets the variable only in the child; nothing on stdout, nothing on disk; the value never enters argv; no non-root verb writes a value to stdout (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestKeysExecEnvOnlyInChild TestNoNonRootVerbWritesValue
@@ -734,8 +734,8 @@ pend U102 "the sealed record stores the last delivered version per delivery, rai
 	k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus
 pend U103 "a Secret at a recorded target whose label or owner annotation was removed is never overwritten or deleted, under a revocation, the object's deletion and rm-scope alike; the KeyDelivery gets SecretRetained=True with reason LabelRemoved, and doctor names the Secret and the KeyDelivery (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestStrippedLabelReportedNotDeleted
-rootpend U104 "root-run: install creates keystore-sock/ root:wheel 0755 and the server plist carries a Sockets listener for keystore-sock/keys.sock; a process running as the service uid cannot unlink, replace or bind keys.sock, whether or not the server runs, and gets EACCES; rig leg E24 (socket listener)" \
-	k3sm/pkg/install::TestSocketDirRootOwnedServiceUIDCannotBind
+rootpend U104 "root-run: install creates keystore-sock/ root:wheel 0755 and the server plist carries a Sockets listener for keystore-sock/keys.sock; a process running as the service uid cannot unlink, replace or bind keys.sock, whether or not the server runs, and gets EACCES; rig leg E24 (delivered: the plist entry and the directory, unit-tested; pending: the root-run unlink and bind test and rig leg E24)" \
+	k3sm/pkg/install::TestServerPlistActivatesKeystoreSocket TestKeystoreSockDirAtInstall TestSocketDirRootOwnedServiceUIDCannotBind
 rootpend U105 "root-run: every root path walks the keystore trees by descriptor: install over an existing tree, uninstall --purge and doctor each refuse a planted symlink, FIFO or swapped directory, with openat, O_NOFOLLOW, bounded reads and a SameFile re-check (append-only files)" \
 	k3sm/pkg/install::TestInstallOverExistingTreeWalksByDescriptor TestPurgeWalksKeystoreByDescriptor k3sm/cmd/k3sm::TestDoctorWalksKeystoreByDescriptor
 pend U106 "every root verb refuses a non-root caller: one table test runs rm-scope, floor --rebuild, audit --rotate, rewrap and deliver system/... with a non-root euid through the euid source; each is refused, changing nothing (KeyDelivery lifecycle)" \
@@ -764,11 +764,11 @@ rootcheck U118 "root-run: the old log is retired, never re-owned: in audit --rot
 	k3sm/cmd/k3sm::TestMaintenanceOldLogRetiredNeverReowned
 rootcheck U119 "root-run: the floor lock is keystore-lock, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root, rm-scope, floor --rebuild and audit --rotate included; a non-root process other than the service user holding the old data-root flock blocks none of them (append-only files)" \
 	k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb
-pend U120 "the activated listening descriptor reaches no child (integration): an exec.Command child, the runtimed helper and a Pod through the exec shim each list their open descriptors, and the listening socket is among none of them (socket listener)" \
-	k3sm/pkg/keystore/socket::TestActivatedListenerReachesNoChild
-pend U121 "under activation, a client whose connected peer reads as uid 0 or as launchd's code refuses and writes nothing; U36 is never relaxed to accept uid 0, and if K7a finds the client-side peer names launchd the self-bind form ships (socket listener)" \
+partial U120 "the activated listening descriptor reaches no child: an exec.Command child, the runtimed helper and a Pod through the exec shim each list their open descriptors, and the listening socket is among none of them; delivered: the descriptor is marked FD_CLOEXEC inside syscall.ForkLock, launchd's original is closed, and an exec.Command child does not hold it" "rig: the runtimed helper and a Pod through the exec shim" \
+	k3sm/pkg/keystore/socket::TestActivatedListenerIsCloseOnExecAndReused
+pend U121 "under activation, the client accepts a LOCAL_PEERCRED uid 0 only when the audit token's euid is the service uid and its code the installed binary's cdhash; a uid-0 peer whose token names launchd, root or another uid, or other code, is refused and nothing is written (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer
-pend U122 "when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup; rig leg E27 (socket listener)" \
+pend U122 "when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup; K7a found a Pod gets ESRCH (amendment 2026-11-23), so the activated form ships and the deny is not required; rig: leg E27 re-checks it on each release" \
 	k3sm/pkg/provider::TestPodProfileDeniesLaunchdSocketActivation
 pend U123 "same-target cross-record deletion: the orphan sweep, a lost-authority delete and rm-scope never delete a Secret that another honoured record claims at the same (namespace, secretName); a forged owner annotation naming one uid's tombstone on another uid's live Secret deletes nothing; the owner annotation never selects which record's tombstone governs a delete; nothing is charged to the victim (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestForgedTombstoneAnnotationOnOtherUsersLiveSecretIsNotDeleted
@@ -1177,7 +1177,7 @@ U119|keystore-lock
 U119|blocks none of them
 U119|other than the service user
 U120|among none of them
-U121|never relaxed to accept uid 0
+U121|the audit token's euid is the service uid
 U123|another honoured record claims at the same (namespace, secretName)
 U124|a target occupied by another Secret still prunes
 U125|Preconditions{UID, ResourceVersion}
