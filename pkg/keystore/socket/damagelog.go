@@ -49,7 +49,7 @@ var damageRemedies = map[string]string{
 	DamageFloorDegraded:     "the user-scope floor holds damage, or the start step quarantined the scope; grants and reads are refused, rm still runs; root runs sudo k3sm doctor",
 	DamageCorrupt:           "a record of the entry fails authentication or does not parse; restore it from backup, or rm the entry and put its value again",
 	DamageUnsupportedKind:   "a record of the entry has a kind or envelope version this build cannot read, written by a newer k3sm or altered to read as one; upgrade k3sm, and if it is already current, restore the entry from backup or rm the entry and put its value again",
-	DamageScopeIncomplete:   "part of the user scope is missing (a scope.key with no entries/ directory or deliveries record beside it, or entries with no scope.key), as a partial restore leaves; root restores the whole scope from one backup, or runs sudo k3sm doctor",
+	DamageScopeIncomplete:   "part of the user scope is missing (a scope.key with no entries/ directory or deliveries record beside it, or entries with no scope.key), as a partial restore leaves; root restores the whole scope from one backup, or runs sudo k3sm keys rm-scope user/<uid> --yes and then sudo k3sm keys floor --rebuild, after which the owner puts its values again",
 	DamageInternal:          "the store could not serve the request (a missing or untrusted master key, or another failure only root can repair); root runs sudo k3sm doctor",
 }
 

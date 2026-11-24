@@ -4583,7 +4583,10 @@ surface, and the app consumes only those.
   (an `ErrScopeAbsent` that is damage, `keystore.ScopeIncomplete`: a `scope.key` with no
   `entries/` directory or `deliveries` record beside it, or entries with no `scope.key`, as a
   partial restore leaves; still answered `not-found`, and never a uid with no scope yet,
-  `keystore.NoScopeKey`), and `internal` for any other error answered `internal` (a missing
+  `keystore.NoScopeKey`; `doctor` has no check of a scope's shape, so its remedy is the
+  recovery the design gives instead: restore the whole scope from one backup, or `sudo k3sm
+  keys rm-scope user/<uid> --yes` and then `floor --rebuild`, after which the owner puts its
+  values again, as for a scope whose key was lost to a Rewrap, above), and `internal` for any other error answered `internal` (a missing
   or untrusted master). The store's interrupted put (`errInterruptedPut`, a `not-found`) is
   not damage, a put that never committed which the next put discards ("Settled by the
   implementation"), and it is the system scope's: no socket operation meets it. A user entry
