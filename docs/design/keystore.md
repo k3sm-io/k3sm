@@ -5666,8 +5666,11 @@ no datastore migration. The skew window:
 (G18); the cluster has one server, or the user scope stays off; and `sudo k3sm install` runs
 after the upgrade, since it creates `keystore-sock/`, the server plist's `Sockets` entry and
 the two append-only files. Without it
-the user scope stays off, the server Warns at start and on every retry, `doctor` says why and
-the CLI's error names the command; the system scope works.
+the user scope stays off: a missing or wrong directory or log Warns at start and on every
+retry; a server plist without the `Sockets` entry, which launchd fixed at the job's bootstrap,
+is the terminal "launchd activated no socket for this server", Warned once and never retried;
+`doctor` names `sudo k3sm install` either way, and the CLI's error names the command; the
+system scope works.
 
 **Rollback** is revert, rebuild and reinstall the previous binary. The release before M20 has
 no keystore, so a downgrade leaves every keystore file unused rather than misread. Three
@@ -5880,15 +5883,21 @@ text points here.
    or any uid but the service uid is refused. *Test:* U121: a client whose peer reads as uid 0
    with a token naming launchd, root or another uid, or other code, refuses and writes
    nothing; one whose token names the service uid and the installed cdhash proceeds.
-5. **A Pod might obtain the listener from launchd (K9a, measured in K7a).** A process
-   descended from the server's job can ask launchd for the job's sockets with
-   `launch_activate_socket`, and Pods descend from it (`runtimed/pkg/runtime/podreap.go:40`).
-   *Fix:* K7a measures this from a Pod. If a Pod can obtain the listener, the build ships the
-   self-bind form, and the Pod profile denies the launchd socket-activation lookup in either
-   form. Measured (K7a amendment 2026-11-23): a Pod process, and every other process but the
-   job, gets `ESRCH`, so the activated form ships and the deny is not required; E27 checks it
-   again on the rig. *Test:* U122 (the rendered Pod profile carries the deny) and rig leg E27 (a Pod's
-   `launch_activate_socket` for the server's socket name gets no descriptor).
+5. **A Pod might obtain the listener from launchd, or reach the socket by path (K9a, measured
+   in K7a).** A process descended from the server's job can ask launchd for the job's sockets
+   with `launch_activate_socket`, and Pods descend from it (`runtimed/pkg/runtime/podreap.go:40`).
+   Two denies are in question, and they differ:
+   (i) *The launchd activation-lookup deny is not needed.* A Pod process, and every other
+   process but the job, gets `ESRCH` (measured on macOS 27.2.1, K7a amendment 2026-11-23), so
+   the activated form ships and no Pod profile carries a lookup deny. *Test:* rig leg E27 (a
+   Pod's `launch_activate_socket` for the server's socket name gets no descriptor), which also
+   owes the macOS 26 measurement; U122.
+   (ii) *The Seatbelt path deny on `keystore-sock/` is required and stays.* It is the first
+   barrier between a Pod and the socket: without it a native Pod connected to `keys.sock` (K0
+   leg 4). Every Pod profile carries runtimed's keystore stanza
+   (`runtimed/pkg/sandbox/keystore.go`, `keystoreDenyStanza`), which denies connect and bind on
+   `keystore-sock/` and `keys.sock` (U16), and the provider's socket denies name `keys.sock`
+   (U46, `k3sm/pkg/provider::TestRuntimedSocketDeniedToPods`).
 6. **Same-target cross-record deletion (K13b).** Two honoured records, of two uids, can name
    the same `(namespace, secretName)`. The orphan sweep, the lost-authority delete and
    `rm-scope` match a Secret against one record's target, so one uid's tombstone, or a forged
@@ -5951,6 +5960,12 @@ text points here.
     reports a Seatbelt-confined Pod process as sandboxed and an unconfined login shell as not.
     *Test:* U137 with a fake token source, and rig leg E26: a real Pod's connect is refused with
     the keystore deny stanza removed.
+16. **launchd keeps the socket listening while the server does not accept (K9a).** Under
+    activation launchd holds `keys.sock` bound and listening whether the server is serving,
+    paused by the maintenance marker, backing off, off or not running, so a client's connect
+    succeeds into the backlog and then waits. *Fix:* the client (the non-root CLI) puts a
+    deadline on the connect and on `HELLO`, and reports the server unavailable when either
+    passes, rather than hang. *Test:* the non-root CLI's change names it.
 
 ### Facts from the rig spike
 
@@ -5978,29 +5993,46 @@ second, inside the root-only `keystore-staging/`, before it is reachable.
 | 4 | a Pod with the data-root denies cannot reach the socket or any `keystore-*` path; without them, what a Pod reaches today | **Without the denies, measured:** a native Pod on the server connected to `keys.sock` (two accepts), so the denies are a hard prerequisite of any keystore file or socket (K5 before K8). Phase A's two data-root files did not exist on the rig, so their readability today is unmeasured. **Pending:** the Pod with the denies is the K5 rig leg (E10). | "Pod denies", "Threat model" |
 | 5 | which uid a native Pod's processes run as; whether a Pod spec field or runtimed path can make it 501 or above | **Measured for a default Pod:** uid 250 (the service user), below 501, and the socket saw peer euid 250. **Pending:** the spec-field and runtimed-path half (`runAsUser` and the other fields) is K5's row U15. Pods and the server share uid 250, which is why the client pins the server by more than its uid. | "Pod denies" (layer 2, row U15) |
 
-**K7a amendment, 2026-11-23: socket activation ships.** The activation probe
-(`hack/acceptance/keystore-activation-probe`) ran on a worker lab Mac (macOS 27.2.1) as root,
-with a test job carrying `UserName` and a `Sockets` entry at mode 0666, and cleaned up after
-itself. It measured: launchd creates the socket root:daemon 0666 in the root 0755 directory
-before the job runs, and the job (euid the service uid) gets one descriptor from
-`launch_activate_socket`, `FD_CLOEXEC` already set; on the server side each peer's
-`LOCAL_PEERCRED`, `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` agree; on the client side
-`LOCAL_PEERCRED` reads euid 0 gid 0 (launchd) for every client while `LOCAL_PEERPID` and
-`LOCAL_PEERTOKEN` name the accepting server, whose code and cdhash the lookup from the token
-resolves from a login user's process; no other process (a login user, the service user, a
-child of the job before and after it took the socket, with and without `setsid`, a Pod
-process) obtains the listener: `launch_activate_socket` returns `ESRCH`. On that evidence the
-activated form ships, not the deny-plus-pin fallback, and the client check changes: the client
-accepts the `LOCAL_PEERCRED` uid 0 that activation produces only beside an audit token whose
-euid is the service uid and whose code has the installed binary's cdhash. U36, U121 and Open
-requirement 4 are reworded to that check; Open requirement 5 needs no deny. Delivered with
-this amendment: the server plist's `Sockets` entry `keys` at `<dataRoot>/keystore-sock/keys.sock`,
-mode 0666; install's `keystore-sock/`, root:wheel 0755, removed by uninstall; the server's
-listener source over `launch_activate_socket`, which marks the descriptor `FD_CLOEXEC` inside
-`syscall.ForkLock` and serves a close-on-exec duplicate; the supervisor started by the server;
-and `doctor` expecting launchd's root-owned socket. The client side of the check is the
-non-root CLI's change. Not measured here: the 50 ms exclusive hold bound and GeneratedUID
-stability.
+**K7a amendment, 2026-11-23: socket activation ships.** Every fact below was measured on
+macOS 27.2.1 only; rig leg E27 owes the same measurements on macOS 26, the oldest supported
+release. The activation probe (`hack/acceptance/keystore-activation-probe`) ran on a worker lab
+Mac as root, with a test job carrying `UserName` and a `Sockets` entry at mode 0666, and cleaned
+up after itself. Measured on macOS 27.2.1:
+
+- launchd creates the socket root:daemon 0666 in the root 0755 directory before the job runs,
+  and the job (euid the service uid) gets one descriptor from `launch_activate_socket`,
+  `FD_CLOEXEC` already set.
+- On the server side each peer's `LOCAL_PEERCRED`, `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` agree.
+- On the client side `LOCAL_PEERCRED` reads euid 0 gid 0 (launchd) for every client, while
+  `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` name the accepting server, whose code and cdhash the
+  lookup from the token resolves from a login user's process.
+- No other process (a login user, the service user, a child of the job before and after it
+  took the socket, with and without `setsid`, a Pod process) obtains the listener:
+  `launch_activate_socket` returns `ESRCH`.
+- A missing socket directory never fails the bootstrap and never stops the job (a second run
+  the same day, as root, with a test job). When one level is missing, launchd creates it
+  root:wheel 0755 at the job's `launch_activate_socket` and hands over the socket; when deeper
+  levels are missing, as for a data root on a volume that is not mounted, it answers `ENOENT`
+  and the job runs on, which the server keeps as the terminal off state (below).
+
+On that evidence the activated form ships, not the deny-plus-pin fallback, and the client check
+changes: the client accepts the `LOCAL_PEERCRED` uid 0 that activation produces only beside an
+audit token whose euid is the service uid and whose code has the installed binary's cdhash.
+U36, U121 and Open requirement 4 are reworded to that check. Open requirement 5 splits in two:
+the launchd activation-lookup deny is not needed, since a Pod gets `ESRCH`; the Seatbelt path
+deny on `keystore-sock/` stays required. Open requirement 16 is new.
+
+Delivered with this amendment: the server plist's `Sockets` entry `keys` at
+`<dataRoot>/keystore-sock/keys.sock`, mode 0666; install's `keystore-sock/`, root:wheel 0755,
+removed by uninstall only once the server's bootout succeeded; the server's listener source over
+`launch_activate_socket`, which reads and sets each descriptor's `FD_CLOEXEC` under
+`syscall.ForkLock` (refusing one that arrived without it), requires a listening `SOCK_STREAM`
+socket bound at the keystore path, and serves a close-on-exec duplicate; the supervisor started
+by the server, for which `ESRCH` or `ENOENT` is the terminal off state "launchd activated no
+socket for this server", logged once at Warn naming `sudo k3sm install` (it rewrites the server
+plist and re-bootstraps the job); and `doctor` expecting a root-owned 0666 socket and naming
+the same command when none is there. The client side of the check is the non-root CLI's change.
+Not measured here: the 50 ms exclusive hold bound and GeneratedUID stability.
 
 **Owed to K7a.** K7a is the measurement run before the changes that depend on it, recorded
 as a dated amendment like K0's. It measures: `LOCAL_PEERTOKEN` and the code lookup from it on
@@ -7067,7 +7099,7 @@ carried by the unit rows.
 | U119 | the floor lock is `keystore-lock`, a root 0600 file in the data root that only root can open, taken by every root verb that writes the floor or a keystore file in the data root (`put`, `rotate`, `rm`, `rewrap`, `deliver system/…`, the floor raise of `list` and `show`, `rm-scope`, `floor --rebuild`, `audit --rotate`); run as root (a root-run row, `--root`), a non-root process other than the service user holding the old data-root flock blocks none of them | `k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb` (integration, root-run) | checked as a root-run row (`--root`) for the verbs that exist: `put`, `rotate`, `rm`, `rewrap` and the floor raise; `rm-scope`, `floor --rebuild` and `audit --rotate` take it as they land (the append-only files) |
 | U120 | the activated listening descriptor reaches no child: the server spawns each child type, an `exec.Command` child, the runtimed helper and a Pod through the exec shim, lists each one's open descriptors, and the listening socket is among none of them | `k3sm/pkg/keystore/socket::TestActivatedListenerIsCloseOnExecAndReused`; rig | partial: the listener source marks the descriptor `FD_CLOEXEC` inside `syscall.ForkLock`, closes launchd's original, and an `exec.Command` child does not hold it; pending (rig): the runtimed helper and a Pod through the exec shim |
 | U121 | under activation, the client accepts a `LOCAL_PEERCRED` uid 0 only when the audit token's euid is the service uid and its code the installed binary's cdhash; a uid-0 peer whose token names launchd, root or another uid, or other code, is refused and nothing is written (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer` | pending: the non-root CLI and `exec` |
-| U122 | when K7a finds that a Pod can obtain the server's listener from launchd, the self-bind form ships and every rendered Pod profile denies the launchd socket-activation lookup; K7a found a Pod gets `ESRCH` (amendment 2026-11-23), so the activated form ships and the deny is not required | `k3sm/pkg/provider::TestPodProfileDeniesLaunchdSocketActivation`; rig leg E27 | pending (rig): leg E27 re-checks a Pod's `ESRCH` on each release |
+| U122 | a Pod cannot obtain the server's listener from launchd: its `launch_activate_socket` for the server's socket name gets `ESRCH` (measured on macOS 27.2.1), so no Pod profile needs a launchd lookup deny; the Seatbelt path deny on `keystore-sock/` (U16, U46) is a separate deny and stays required | rig leg E27 | pending (rig): leg E27, which also owes macOS 26 |
 | U123 | same-target cross-record deletion: the orphan sweep, a lost-authority delete and `rm-scope` never delete a Secret that another honoured record claims at the same `(namespace, secretName)`; a forged owner annotation naming one uid's tombstone on another uid's live Secret deletes nothing; the owner annotation never selects which record's tombstone governs a delete; nothing is charged to the victim | `k3sm/pkg/keystore/reconcile::TestForgedTombstoneAnnotationOnOtherUsersLiveSecretIsNotDeleted` | pending: the KeyDelivery reconciler (lifecycle) |
 | U124 | a tombstone is pruned when its target is not this UID's owned Secret on two observations at least 60 s apart, not only on a Get that answers not found: a target occupied by another Secret still prunes; a failed Get keeps it | `k3sm/pkg/keystore/reconcile::TestTombstonePrunesWhenTargetOccupied` | pending: the KeyDelivery reconciler (lifecycle) |
 | U125 | every reconciler Secret delete or update and every `rm-scope` delete passes `Preconditions{UID, ResourceVersion}` from the ownership read: a fake client swaps the Secret between the read and the delete, the delete is refused, and the outcome is `Indeterminate` | `k3sm/pkg/keystore/reconcile::TestDeleteRefusedWhenSecretSwappedAfterRead` | pending: the KeyDelivery reconciler (lifecycle) |
