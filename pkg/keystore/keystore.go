@@ -136,7 +136,10 @@ type Entry struct {
 	// Err is non-nil exactly when the entry could not be opened: its generation
 	// file, its current pointer or any version the pointer covers is missing,
 	// fails authentication or does not parse, or the floor rules the pointer
-	// out (an older sequence, or another generation). A directory with no current
+	// out (an older sequence, or another generation). UserScope.List
+	// authenticates the current version only and checks the others for
+	// presence: a missing one is Err there, a damaged one is not;
+	// FileStore.List opens every version. A directory with no current
 	// pointer is an interrupted Put, which is not an entry and is not listed,
 	// only when it holds nothing, generation, or generation and v1 (plus
 	// temporary files) and the floor does not record its generation; any other

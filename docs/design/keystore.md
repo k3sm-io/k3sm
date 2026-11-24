@@ -648,6 +648,13 @@ non-nil exactly when the entry could not be opened, and `Current` and `Versions`
 zero. `List` returns a non-nil error for the whole call only for a failure that is not
 about one entry: the master missing or untrusted, or the lock timing out.
 
+A user scope's `list` (the socket's) checks less, to keep its shared hold short: it opens and
+authenticates the current version only, and checks every other version of the pointer's
+committed range for presence, by one listing of the entry's directory and no record opened. A
+version missing from the range marks the entry with `Err` (`ErrCorrupt`); a version whose file
+is present but damaged is reported by the read or rotate that opens it, not by `list`. Root's
+`keys list` and `doctor` (`FileStore.List`) still open every version.
+
 **An entry directory with no `current`.** Put writes `generation`, then `v1`, then
 `current`, and writes each file through a temporary file renamed into place, so a crash
 before the pointer leaves a directory holding `generation` and at most `v1`, plus possibly a
@@ -830,7 +837,8 @@ the conservative way:
   refresh token. The break-glass procedure: the operator adopts it (`k3sm keys adopt`), or
   removes that entry with `rm` (for a kind other than oauth, removing only the named version
   file also clears it); then the Rewrap proceeds.
-- *An entry that does not open* (one `list` reports with `Err`) refuses the Rewrap before
+- *An entry that does not open* (one root `list` reports with `Err`; a user scope's `list`
+  authenticates only the current version and checks the rest for presence) refuses the Rewrap before
   anything is written, since the swap would strand it under a master that no longer exists.
   It is removed with `rm`, or restored, first.
 - *Discarding a bad `master.next`* (one that does not agree with its fingerprint, or a
@@ -3960,10 +3968,9 @@ refused before its first frame:
   (`TestWriterPreferringLock`). The order every hold keeps is the uid's mutation lock (a `put`,
   `rotate` or `rm`, so only the uid's own operations wait on it), then the in-process lock, then
   the `.lock` `flock`, then the user-scope floor's lock; a system-scope verb, run as root in a
-  process of its own, takes `keystore-lock` before the store lock. A user `list` opens each
-  entry's current version only and counts the others from the pointer's committed range, so an
-  older version that does not read is reported by the read or rotate that reaches it, not by
-  `list`.
+  process of its own, takes `keystore-lock` before the store lock. A user `list` authenticates
+  each entry's current version only and checks the others for presence with one listing of the
+  entry's directory ("List, when one entry is corrupt").
   - *A hold-time bound.* An exclusive hold by the server does at most 50 ms of work per
     operation; larger work (a sweep, a scope's many deliveries) is chunked into separate holds,
     and no hold spans a call to the API server or a directory lookup. The GeneratedUID lookup
@@ -3976,7 +3983,7 @@ refused before its first frame:
     error included, serves the whole hold (`TestExclusiveHoldBound`), and the quota judgement walks
     nothing under the lock (the usage figure, "Quotas"). On the wall clock a hold is dominated by
     its fsyncs: a `rotate` holds the lock about 21 ms on a developer Mac, about 31 ms on an entry of
-    20,000 versions, and a `list` of that entry 0.5 ms (720 ms when it opened every version). Two
+    20,000 versions, and a `list` of that entry 11 ms (720 ms when it opened every version). Two
     holds still grow with the versions of the entry they act on, the uid's own: `rotate`'s orphan
     check lists the entry's directory, and `rm` reads each version record's header for its
     burial and unlinks each file. Both are bounded by an entry's 65,536 versions; neither is
@@ -6705,7 +6712,7 @@ last pull request lands and no row is pending.
 | G13 | A crash between the two master renames leaves a master that passes its trust check, and the next verb completes the swap | unit: stop after the first rename |
 | G14 | One lock serializes Rewrap, Rotate, Put and reads, with a bounded wait | unit: a held lock gives a timeout error within the bound, not a hang |
 | G15 | Files a root-run verb writes under `server/` are owned by the service user at the layout's modes | unit with a fake owner seam |
-| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1. A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put unless the floor records its generation: not listed, `ErrNotFound` from `Current`, `Get` and `Delete` (Delete removes it too, and leaves the floor alone; with a live record for the name it buries that record and succeeds), discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included), or in one of those shapes with its generation recorded in the floor, is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm`, its floor entry replaced by a tombstone, and `ErrExists` from Put with every file left in place | unit: each incomplete-Put shape with no floor entry, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, no floor file, a floor of another generation; damage: `v1` without `generation`, `v2` without `v1`, a `v1`-and-`v2` directory with `current` removed, and the one-version entry that lost `current` (`generation` and `v1`, or `current` renamed to a temporary name) with its generation in the floor; a retried `rm` after an interrupted one; a CLI exit-code test for `list` and `rm` |
+| G16 | `list` returns every entry, marks an unreadable one with `Err`, and exits 1 (a user scope's `list` authenticates the current version and checks the others for presence only: "List, when one entry is corrupt"). A directory holding nothing, `generation`, or `generation` and `v1`, with or without leftover `.tmp` files, is an incomplete Put unless the floor records its generation: not listed, `ErrNotFound` from `Current`, `Get` and `Delete` (Delete removes it too, and leaves the floor alone; with a live record for the name it buries that record and succeeds), discarded by the next Put. A directory with no `current` and any other file (`v1` without `generation` included), or in one of those shapes with its generation recorded in the floor, is damage: listed with `Err` wrapping `ErrCorrupt`, removed by `rm`, its floor entry replaced by a tombstone, and `ErrExists` from Put with every file left in place | unit: each incomplete-Put shape with no floor entry, an empty directory, a `generation`-and-`.tmp` directory standing in for a crash while writing `v1`, no floor file, a floor of another generation; damage: `v1` without `generation`, `v2` without `v1`, a `v1`-and-`v2` directory with `current` removed, and the one-version entry that lost `current` (`generation` and `v1`, or `current` renamed to a temporary name) with its generation in the floor; a retried `rm` after an interrupted one; a CLI exit-code test for `list` and `rm` |
 | G17 | `show` prints a value only with `--reveal`, and then writes exactly the stored bytes with no trailing newline; no verb takes a value as an argument | CLI test over the usage strings; a `--reveal` test comparing stdout to the stored bytes for an opaque value and for 32- and 64-byte Ed25519 values |
 | G18 | Delivery is refused while encryption is off unless the override flag was set at server start; a delivered target stays when the override is removed | unit over the reconciler with a fake client |
 | G19 | The delivery declaration is root-owned and not shared-writable, and is refused otherwise | unit, the same cases as the manifest directory |
@@ -6891,7 +6898,7 @@ carried by the unit rows.
 | U149 | write-only, structurally: a planted refresh token appears in no result of any exported method or consumer interface, raw, base64 or URL-encoded; `Get` returns a `typed.Credential` for kinds 3 to 5; only `refresh` (and the installing `pkg/keystore`) imports `internal/refreshopen` | `k3sm/pkg/keystore::TestPlantedRefreshTokenNeverReturned`, `TestGetReturnsRedactedCredential`, `k3sm/pkg/keystore/typed::TestEnvelopeRefusalsNeverCarryRefreshToken`, `TestShortSecretNeverInRefusals`, `TestSecretTypesRedactWhenFormatted`, `TestNoUnexportedSecretField`, `TestDecodeRefusalClearsClones`, `k3sm/pkg/keystore::TestTypedPlaintextZeroedAfterSeal` | partial: every exported method of `*FileStore` and `*UserScope`, enumerated by reflection (a method neither called by hand, callable with built arguments nor allowlisted with a reason fails the test), the typed reads and the deliveries path checked (the typed store); pending: the consumer interfaces and `internal/refreshopen`'s import graph, `TestRefreshOpenerImportGraph` (the refresher) |
 | U150 | `RotateIf` refuses a stale version, and a version read from an entry since deleted and put again; a rotation never changes an oauth entry's refresh owner | `k3sm/pkg/keystore::TestRotateIfStaleVersionRefused`, `TestRotateIfRefusesRecreatedEntry`, `TestRotateIfRefusesVersionBuiltOutside`, `TestRefreshOwnerFixedPerEntry`, `TestRotateIfRefusesSameNumberDifferentRecord` | checked: the typed store |
 | U151 | oauth keeps current and one previous; the low-water mark is in the sealed pointer (24 bytes only after a prune, 16 means `low = 1`); crash-safe at every step, prune included (the prune cases of the crash test); a failure after the pointer flip reports the commit | `k3sm/pkg/keystore::TestOAuthPruneKeepsTwo`, `TestPointerLowWaterMark`, `TestRotateCrashAtEveryStep`; a failure after the flip returns the new version with `ErrCommitted`, `TestRotateReportsCommitAfterFlip`, and so does a failure after any write's pointer rename (the directory fsync, the floor, the prune; put, rotate and generate alike), never also `ErrCorrupt`, `TestCommitPointReported`; the floor-lag window refuses rather than unlink a newer committed version, `TestFloorLagNeverDeletesCommittedVersion`; the pointer has one canonical form, `TestPointerCanonicalForm`, the oauth retention window is checked on read, `TestOAuthRetentionWindowOnRead`, and the decoder accepts only the writer's output, `FuzzPointerPlaintext`; an oauth entry's version ceiling is 2^32 and every other kind's 2^16, `TestOAuthVersionCeiling` | checked: the typed store |
-| U152 | a pruned oauth entry: List shows it healthy, Rewrap re-seals `low..current`, Delete removes leftovers, a gap inside the range is damage, a copied-back pointer is caught | `k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt`, `TestRewrapHandlesPrunedOAuth`, `TestDeletePrunedOAuthEntry`, `TestGapInsideCommittedRangeIsCorrupt`, `TestCopyBackAcrossPruneCaught` | checked: the typed store |
+| U152 | a pruned oauth entry: List shows it healthy, Rewrap re-seals `low..current`, Delete removes leftovers, a gap inside the range is damage (to a user scope's `list` too, which checks the range for presence), a copied-back pointer is caught | `k3sm/pkg/keystore::TestListPrunedOAuthEntryNotCorrupt`, `TestRewrapHandlesPrunedOAuth`, `TestDeletePrunedOAuthEntry`, `TestGapInsideCommittedRangeIsCorrupt`, `TestCopyBackAcrossPruneCaught` | checked: the typed store |
 | U153 | `--from-version` is refused for oauth | `k3sm/pkg/keystore::TestFromVersionRefusedForOAuth` | checked: the typed store |
 | U154 | every `Fuzz*` target in the keystore packages has a non-empty committed seed directory | `k3sm/pkg/keystore::TestEveryFuzzTargetHasSeeds` | checked: the typed envelope |
 | U155 | HELLO lists capabilities; mutating ops refuse an unknown header (`unknown-header`), non-mutating ops tolerate it; the CLI refuses a typed request to a daemon without the capability | `k3sm/pkg/keystore/socket::TestHelloListsCapabilities`, `TestMutatingOpRefusesUnknownHeader`, `TestNonMutatingOpToleratesUnknownHeader`, `k3sm/cmd/k3sm::TestCLIRefusesTypedAgainstOldDaemon` | pending: the typed verbs |

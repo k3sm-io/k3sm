@@ -148,10 +148,10 @@ func TestUsageFigureMatchesWalk(t *testing.T) {
 	}
 }
 
-// list opens each entry's current version only, and counts the rest from
-// the pointer's committed range: an older version that does not read (here
-// removed) costs nothing and does not mark the entry, which a read or a
-// rotate reaching that version reports.
+// list authenticates each entry's current version only and checks the
+// others for presence: an older version removed marks the entry
+// ErrCorrupt, and one present but damaged costs no record open and is left
+// to the read or rotate that reaches it.
 func TestUserListOpensOnlyCurrentVersion(t *testing.T) {
 	ctx := context.Background()
 	s, u := rotateScope(t)
@@ -160,8 +160,9 @@ func TestUserListOpensOnlyCurrentVersion(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	server := filepath.Dir(s.dir)
-	if err := os.Remove(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "a", versionName(1))); err != nil {
+	dir := filepath.Join(scopeDir(filepath.Dir(s.dir), "1001"), scopeEntriesName, "a")
+	// Damaged, not missing: v2's bytes replaced, its file kept.
+	if err := os.WriteFile(filepath.Join(dir, versionName(2)), []byte("not a record"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	es, err := u.List(ctx)
@@ -169,9 +170,13 @@ func TestUserListOpensOnlyCurrentVersion(t *testing.T) {
 		t.Fatalf("List: %+v, %v", es, err)
 	}
 	if e := es[0]; e.Err != nil || e.Current.Version != 3 || e.VersionCount != 3 || e.Versions != nil {
-		t.Fatalf("the entry is %+v, want version 3 of 3 with no version list and no error", e)
+		t.Fatalf("with v2 damaged the entry is %+v, want version 3 of 3, no version list, no error", e)
 	}
-	if _, err := u.RotateFrom(ctx, "user/1001/a", 1); err == nil {
-		t.Fatal("a rotate from the removed version succeeded")
+	if err := os.Remove(filepath.Join(dir, versionName(1))); err != nil {
+		t.Fatal(err)
+	}
+	es, err = u.List(ctx)
+	if err != nil || len(es) != 1 || !errors.Is(es[0].Err, ErrCorrupt) {
+		t.Fatalf("with v1 removed: %+v, %v; want the entry marked ErrCorrupt", es, err)
 	}
 }
