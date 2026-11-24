@@ -506,12 +506,16 @@ func assertRefusedLikeAbsent(t *testing.T, r *opsRig, other string) {
 	}
 }
 
-// TestCrossUserRefusedFakePeerCred (U45): a peer with uid B asks for
-// list, read-for-exec, rotate, rm, deliver, withdraw and deliveries of uid
-// A's entry; every reply is byte for byte the reply for an absent entry of
-// B's own, each store refusal is audited under B, and nothing of A's scope
-// is opened or audited: A's scope key is unreadable throughout, so an open
-// would answer otherwise, and A's value is unchanged after.
+// TestCrossUserRefusedFakePeerCred (U45): a peer with uid B, in its normal
+// state (a started scope, under its rate limit and share), asks for
+// read-for-exec, rotate (with a value and from_version) and rm of uid A's
+// entry, and lists; every reply is byte for byte the reply for an absent
+// entry of B's own, each store refusal is audited under B, list shows B's
+// own scope only, and nothing of A's scope is opened or audited: A's scope
+// key is unreadable throughout, so an open would answer otherwise, and A's
+// value is unchanged after. (The delivery operations are also asked, but
+// they are not served yet and answer refused to every caller alike, so
+// they show nothing about cross-user refusal here.)
 func TestCrossUserRefusedFakePeerCred(t *testing.T) {
 	r := refusalRig(t)
 	beforeA := r.linesOf(t, uidA)
@@ -580,10 +584,13 @@ func (c *replyWatch) Write(b []byte) (int, error) {
 	return c.Conn.Write(b)
 }
 
-// TestAuditBeforeReply (U32): for each operation the audit line is in the
-// log when the reply's write begins. A grant (put) appends before its
-// first write and every other operation commits, then appends; either way
-// the line precedes the reply, refusals included.
+// TestAuditBeforeReply (U32): for put, rotate (with a value and with
+// from_version), read-for-exec, list and rm, and for the store's own
+// refusals among them (rm of an absent entry, put of an existing one,
+// read-for-exec of another uid's), the request's one audit line, with its
+// op, result and caller, is in the log when the reply's write begins. It
+// checks the line's place before the reply only, not the order of the
+// line against the operation's own writes.
 func TestAuditBeforeReply(t *testing.T) {
 	r := newOpsRig(t, nil)
 	read := func() []auditEntry { ls, _ := readAudit(t, r.auditPath()); return ls }

@@ -81,6 +81,14 @@ func TestCheckConfigRevocationBudgetFloor(t *testing.T) {
 // full RFC3339Nano timestamp, each audit line as the socket writes it, the
 // socket margin's own lines: via socket and the caller with the longest
 // uid and pid.
+//
+// A user rotate's lines (up to 535 bytes each: its audit line and its
+// floor line) are revocations too and draw on the same socket margin; they
+// are not counted here. That is an accepted residual, not a gap this
+// margin closes: a uid that rotates without end spends its own margin and
+// refuses only its own further socket revocations (docs/design/keystore.md
+// § "Per-uid fairness", "The socket margin keeps a user able to revoke").
+// The margin is not changed for them.
 func worstRevocationLines(t *testing.T) (tomb, rmAudit, withdrawFloor, withdrawAudit int) {
 	t.Helper()
 	scope := userScopeOf(maxScopeUID)
