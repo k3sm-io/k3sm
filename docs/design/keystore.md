@@ -4016,7 +4016,13 @@ refused before its first frame:
   had (the keystore directory missing, the lock held past its wait, an invalid configuration)
   is not audited rather than appended without it; that line is counted in the uid's
   post-frame dropped count, which its next refused-line summary or root's next
-  `audit --rotate` writes and `doctor` shows (`TestAuditBrieflyCountsLineLockKeptOut`).
+  `audit --rotate` writes and `doctor` shows (`TestAuditBrieflyCountsLineLockKeptOut`). A
+  `rotate` or `rm` whose work inside its hold panics (a panic the socket's listener recovers)
+  writes no line: its outcome is not known, so an `ok` line would record an operation that
+  never finished and a refused line could hide an `rm` whose burial committed. It is counted
+  with the unaudited operations instead (`UnauditedOps`, U112), the one count of a change that
+  may stand without its line, which `doctor` shows and root's `audit --rotate` writes
+  (`TestPanicInHoldWritesNoOKLine`).
 - **Lock modes and fairness.** Reads (`list`, `read-for-exec`, `deliveries` and the
   reconciler's reads) take the store lock shared, and their audit lines are appended under that
   shared hold (a read is admitted against the share first, then reads, then appends its line,

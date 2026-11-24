@@ -199,7 +199,12 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 		return err
 	}
 	defer done()
+	finished := false
 	defer func() { // before done: the line is appended under the lock
+		if !finished {
+			u.panicGap()
+			return
+		}
 		l := auditLine{op: "rm", name: name, revoke: err == nil || Committed(err)}
 		err = u.keepAuditFailure("rm", err, u.appendAudit(l, err))
 	}()
@@ -214,6 +219,7 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 		}
 	}
 	err = u.deleteBody(root, name, mark)
+	finished = true
 	if op != nil && err == nil {
 		op.confirm(func(m map[string]int64) { delete(m, name) })
 	}
