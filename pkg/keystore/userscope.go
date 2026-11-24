@@ -202,6 +202,11 @@ func (u *UserScope) Put(ctx context.Context, input string, kind Kind, value []by
 	}
 	v, err := u.put(ctx, name, kind, value, u.grant("put", name, ""))
 	if err != nil {
+		// A put that committed stands: its version is answered with the
+		// error, as Rotate answers its own.
+		if Committed(err) {
+			return v, fail("put", err)
+		}
 		return Version{}, fail("put", err)
 	}
 	return v, nil

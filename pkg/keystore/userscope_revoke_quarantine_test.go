@@ -157,3 +157,18 @@ func TestWithdrawRunsUnderDeliveryRecordTaint(t *testing.T) {
 		t.Fatalf("a second withdraw: %v", err)
 	}
 }
+
+// A user put that commits but whose floor line is not written answers the
+// version it committed with ErrCommitted, as a rotate does, never version
+// 0.
+func TestCommittedUserPutAnswersVersion(t *testing.T) {
+	ctx := context.Background()
+	s, _, u := fileLogScope(t)
+	fl := s.userFloor.(*fileFloorLog).log
+	fl.write = func(*os.File, []byte) (int, error) { return 0, errors.New("injected floor write failure") }
+	v, err := u.Put(ctx, "user/1001/committed", KindOpaque, []byte("v"))
+	fl.write = nil
+	if !Committed(err) || v.Version != 1 || v.Fingerprint == "" {
+		t.Fatalf("put whose floor line failed: %+v %v, want version 1 with its fingerprint and ErrCommitted", v, err)
+	}
+}
