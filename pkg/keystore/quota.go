@@ -166,6 +166,7 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
+	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -197,7 +198,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	// or timed out is no answer, and rm goes ahead. One refused for
 	// capacity, where no lookup ran, refuses rm, retryably: going ahead on
 	// it would let a burst of stuck lookups stand in for the owner check.
-	live, err := u.s.generatedUIDOf(u.uid)
+	live, err := u.liveGUID()
 	switch {
 	case errors.Is(err, errLookupNotRun):
 		return err

@@ -122,6 +122,38 @@ type UserScope struct {
 	// origin is where the view's operations come from, for their audit
 	// lines (WithOrigin); the zero Origin writes no via and no caller.
 	origin Origin
+	// guid is the uid's GeneratedUID lookup answer, taken before the store
+	// lock (withGUID) and used for the whole hold; nil looks it up at use.
+	guid *guidAnswer
+}
+
+// guidAnswer is one GeneratedUID lookup's answer: the GeneratedUID, or the
+// lookup's error.
+type guidAnswer struct {
+	g   [generationSize]byte
+	err error
+}
+
+// withGUID is a copy of u carrying the uid's GeneratedUID lookup, run now,
+// before the caller takes the store lock: the lookup's deadline (250 ms)
+// is never spent inside a hold, and the hold asks the directory service
+// nothing (docs/design/keystore.md § "Lock modes and fairness", the
+// hold-time bound). Every check under the hold reads the one answer, an
+// error included, as it would have read a lookup made there.
+func (u *UserScope) withGUID() *UserScope {
+	c := *u
+	g, err := u.s.generatedUIDOf(u.uid)
+	c.guid = &guidAnswer{g: g, err: err}
+	return &c
+}
+
+// liveGUID is the uid's live GeneratedUID: the answer withGUID took, or,
+// on a view that took none, a lookup now.
+func (u *UserScope) liveGUID() ([generationSize]byte, error) {
+	if u.guid != nil {
+		return u.guid.g, u.guid.err
+	}
+	return u.s.generatedUIDOf(u.uid)
 }
 
 // UserScope returns uid's view of the store. A uid outside 501 to
@@ -228,6 +260,7 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	}
 	// The entries' directory is never created here: a root put creates it
 	// with the master.
+	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Version{}, fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)
@@ -545,6 +578,7 @@ func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Ro
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
+	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -584,6 +618,7 @@ func (u *UserScope) readScope(ctx context.Context, fn func(*os.Root, *openedScop
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
+	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -752,7 +787,7 @@ func (u *UserScope) readScopeKey(dir *os.Root, wrap func() (keys, error)) ([]byt
 	if err != nil {
 		return nil, zero, err
 	}
-	live, err := u.s.generatedUIDOf(u.uid)
+	live, err := u.liveGUID()
 	if err != nil {
 		return nil, zero, err
 	}
@@ -995,7 +1030,7 @@ func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, 
 	if err := u.s.eligibleUID(u.uid); err != nil {
 		return keys{}, nil, err
 	}
-	g, err := u.s.generatedUIDOf(u.uid)
+	g, err := u.liveGUID()
 	if err != nil {
 		return keys{}, nil, err
 	}

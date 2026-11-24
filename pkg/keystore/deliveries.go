@@ -1364,6 +1364,7 @@ func rootHasUserScopes(root *os.Root) (bool, error) {
 // before its own first write, so a failed append writes nothing. It
 // appends at most once.
 func (u *UserScope) grantLocked(ctx context.Context, g *grantAudit, fn func(*openedScope) error) (err error) {
+	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)

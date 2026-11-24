@@ -111,6 +111,7 @@ func (u *UserScope) rotate(ctx context.Context, name string, next nextValue) (v 
 	if err := u.s.checkConfig(); err != nil {
 		return Version{}, err
 	}
+	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Version{}, fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
