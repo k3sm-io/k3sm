@@ -949,7 +949,27 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 		out.Versions = append(out.Versions, v)
 	}
 	out.Current = out.Versions[len(out.Versions)-1]
+	out.VersionCount = len(out.Versions)
 	return out
+}
+
+// listUserEntry is a user entry's List row: its current version, opened,
+// and how many versions its pointer's committed range holds, none of the
+// others opened, so a list costs one record open an entry under the
+// shared lock however many versions the entry keeps. Any failure, a
+// pointer the floor rules out included, is the entry's Err; damage to an
+// older version is the read's or the rotate's that reaches it.
+func listUserEntry(e *entry, k keys) Entry {
+	cur, _, low, err := e.checkedRange(k, nil)
+	if err != nil {
+		return Entry{Name: e.name, Err: err}
+	}
+	v, val, err := e.version(k, cur)
+	clear(val) // List carries metadata only
+	if err != nil {
+		return Entry{Name: e.name, Err: fmt.Errorf("version %d: %w", cur, err)}
+	}
+	return Entry{Name: e.name, Current: v, VersionCount: int(cur - low + 1)}
 }
 
 // Delete removes name and every version of it. It takes keystore-lock and

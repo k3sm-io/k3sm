@@ -485,8 +485,10 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 }
 
 // List returns every entry of the scope, sorted by name, as FileStore.List
-// does: an entry that cannot be opened carries Err. A uid with no scope is
-// ErrScopeAbsent. It is audited as list (auditedRead).
+// does: an entry that cannot be opened carries Err. Each entry carries its
+// current version and its version count, not every version
+// (listUserEntry). A uid with no scope is ErrScopeAbsent. It is audited as
+// list (auditedRead).
 func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 	if err := u.quarantineErr(); err != nil {
 		u.auditBriefly(ctx, auditLine{op: "list"}, err)
@@ -516,7 +518,7 @@ func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 				e.close()
 				continue
 			}
-			out = append(out, listEntry(e, uk, nil))
+			out = append(out, listUserEntry(e, uk))
 			e.close()
 		}
 		return nil

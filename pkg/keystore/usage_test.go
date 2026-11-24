@@ -147,3 +147,31 @@ func TestUsageFigureMatchesWalk(t *testing.T) {
 		t.Fatalf("after the re-walk the figure is %v, a walk counts %v", got, want)
 	}
 }
+
+// list opens each entry's current version only, and counts the rest from
+// the pointer's committed range: an older version that does not read (here
+// removed) costs nothing and does not mark the entry, which a read or a
+// rotate reaching that version reports.
+func TestUserListOpensOnlyCurrentVersion(t *testing.T) {
+	ctx := context.Background()
+	s, u := rotateScope(t)
+	for _, v := range []string{"two", "three"} {
+		if _, err := u.Rotate(ctx, "user/1001/a", []byte(v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := filepath.Dir(s.dir)
+	if err := os.Remove(filepath.Join(scopeDir(server, "1001"), scopeEntriesName, "a", versionName(1))); err != nil {
+		t.Fatal(err)
+	}
+	es, err := u.List(ctx)
+	if err != nil || len(es) != 1 {
+		t.Fatalf("List: %+v, %v", es, err)
+	}
+	if e := es[0]; e.Err != nil || e.Current.Version != 3 || e.VersionCount != 3 || e.Versions != nil {
+		t.Fatalf("the entry is %+v, want version 3 of 3 with no version list and no error", e)
+	}
+	if _, err := u.RotateFrom(ctx, "user/1001/a", 1); err == nil {
+		t.Fatal("a rotate from the removed version succeeded")
+	}
+}
