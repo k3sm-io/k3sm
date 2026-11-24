@@ -65,6 +65,27 @@ func TestKeystoreSockDirAtInstall(t *testing.T) {
 			}
 		}
 	})
+	t.Run("a 077 umask still makes it 0755", func(t *testing.T) {
+		root := setup(t)
+		dfd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = unix.Close(dfd) }() // a directory, read-only
+		var rst unix.Stat_t
+		if err := unix.Fstat(dfd, &rst); err != nil {
+			t.Fatal(err)
+		}
+		old := unix.Umask(0o077)
+		err = ensureKeystoreSockDir(dfd, me, rst.Gid)
+		unix.Umask(old)
+		if err != nil {
+			t.Fatalf("under a 077 umask: %v", err)
+		}
+		if fi, err := os.Lstat(sock(root)); err != nil || fi.Mode().Perm() != 0o755 {
+			t.Fatalf("keystore-sock/ under a 077 umask: %v, %v; want 0755", fi, err)
+		}
+	})
 	t.Run("wrong mode refused", func(t *testing.T) {
 		root := setup(t)
 		if err := os.Mkdir(sock(root), 0o700); err != nil {

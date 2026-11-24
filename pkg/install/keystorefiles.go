@@ -294,11 +294,29 @@ func ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID int) error {
 // found: an existing keystore-sock/ is never chowned.
 func ensureKeystoreSockDir(dfd, rootUID int, rootGID uint32) error {
 	name := keystorepaths.SockDir
-	fd, err := openRootDir(dfd, name, keystoreSockDirMode, rootUID, keystoreSockDirMode)
+	created := true
+	if err := unix.Mkdirat(dfd, name, keystoreSockDirMode); err != nil {
+		if !errors.Is(err, unix.EEXIST) {
+			return fmt.Errorf("create %s: %w", name, err)
+		}
+		created = false
+	}
+	fd, err := unix.Openat(dfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("open %s: %w: %w", name, err, errKeystoreFileUntrusted)
 	}
 	defer func() { _ = unix.Close(fd) }() // a directory, read-only
+	// A restrictive umask narrows the mode Mkdirat gave the directory this
+	// call created; it is set through the descriptor. A directory that
+	// was already there is judged as found and never chmodded.
+	if created {
+		if err := unix.Fchmod(fd, keystoreSockDirMode); err != nil {
+			return fmt.Errorf("chmod %s: %w", name, err)
+		}
+	}
+	if err := judgeRootDir(fd, name, rootUID, keystoreSockDirMode); err != nil {
+		return err
+	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		return fmt.Errorf("stat %s: %w", name, err)
