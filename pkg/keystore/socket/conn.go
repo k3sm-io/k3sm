@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"time"
 
 	"k3sm.io/k3sm/pkg/keystore/internal/strictjson"
@@ -129,9 +130,25 @@ func decodeField(raw json.RawMessage, dst any) error {
 }
 
 // requestKeys are the names of every request header field an operation
-// reads (requestFields): the dispatcher judges all of them, whichever op
-// the request names.
-var requestKeys = []string{"op", "entry", "kind", "from_version"}
+// reads, derived from requestFields over every request type
+// (requestHeaders), so the two cannot drift: the dispatcher judges all of
+// them, whichever op the request names.
+var requestKeys = func() []string {
+	var keys []string
+	for _, dst := range requestHeaders() {
+		fields, err := requestFields(dst)
+		if err != nil {
+			panic(err) // requestHeaders lists only the types requestFields reads
+		}
+		for k := range fields {
+			if !slices.Contains(keys, k) {
+				keys = append(keys, k)
+			}
+		}
+	}
+	slices.Sort(keys)
+	return keys
+}()
 
 // requestOp is the op a request header names, read with the keystore's
 // strict-object rule (strictjson.Object) over every request field: a

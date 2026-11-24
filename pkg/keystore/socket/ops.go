@@ -359,6 +359,12 @@ func noValue(v []byte) error {
 	return nil
 }
 
+// requestHeaders is one zero header of each request type requestFields
+// reads.
+func requestHeaders() []any {
+	return []any{&PutRequest{}, &RotateRequest{}, &ListRequest{}, &RmRequest{}, &ReadForExecRequest{}}
+}
+
 // requestFields are the header fields each request type reads, by their
 // exact JSON names; every other field is ignored.
 func requestFields(dst any) (map[string]any, error) {

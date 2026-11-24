@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -848,6 +849,54 @@ func checkHelloAgrees(t *testing.T, header []byte) {
 		t.Fatalf("helloOf(%q) = %+v, the oracle refuses it", header, got)
 	case accept && got != want:
 		t.Fatalf("helloOf(%q) = %+v, the oracle reads %+v", header, got, want)
+	}
+}
+
+// The dispatcher judges the same field names the operations read:
+// requestKeys is the union of requestFields over every request type, each
+// type's fields are its struct's JSON names, and the fuzzer's request
+// types are the ones requestFields reads.
+func TestRequestKeysAreRequestFields(t *testing.T) {
+	var union, tested []string
+	for _, dst := range requestHeaders() {
+		fields, err := requestFields(dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names, tags []string
+		for k := range fields {
+			names = append(names, k)
+		}
+		rt := reflect.TypeOf(dst).Elem()
+		for i := range rt.NumField() {
+			tag, _, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ",")
+			tags = append(tags, tag)
+		}
+		slices.Sort(names)
+		slices.Sort(tags)
+		if !slices.Equal(names, tags) {
+			t.Errorf("%T: requestFields reads %q, its JSON names are %q", dst, names, tags)
+		}
+		for _, k := range names {
+			if !slices.Contains(union, k) {
+				union = append(union, k)
+			}
+		}
+	}
+	slices.Sort(union)
+	keys := slices.Sorted(slices.Values(requestKeys))
+	if !slices.Equal(keys, union) {
+		t.Errorf("requestKeys = %q, the request fields are %q", keys, union)
+	}
+	for _, mk := range requestTypes {
+		tested = append(tested, fmt.Sprintf("%T", mk()))
+	}
+	var listed []string
+	for _, dst := range requestHeaders() {
+		listed = append(listed, fmt.Sprintf("%T", dst))
+	}
+	if !slices.Equal(tested, listed) {
+		t.Errorf("the fuzzer's request types %q are not requestHeaders %q", tested, listed)
 	}
 }
 
