@@ -122,6 +122,15 @@ file cannot be read, the row warns that `the persisted pre-frame refusal count i
 the server keeps counting in memory and does not overwrite the file. Run `doctor` with `sudo`
 to see this part of the row; as another user it is left out.
 
+### A log past its hard cap
+
+Past its hard cap a log takes only revocations (`rm`, `rotate`, a delivery's withdrawal), each
+user's bounded by that user's own budgets, and every other user-scope change is refused. The
+`keystore-logs` row in `k3sm doctor` then warns
+`the audit log is N bytes, M bytes past its hard cap of H` (or the same for the user-scope floor
+log) and names `sudo k3sm keys audit --rotate` for the audit log or
+`sudo k3sm keys floor --rebuild` for the floor. At or below the hard cap it names no overshoot.
+
 ### The keystore user scope row in `k3sm doctor`
 
 `doctor` runs in its own process and cannot ask the server whether the listener is serving, so
@@ -140,7 +149,9 @@ its `keystore-user-scope` row says only what it can check:
   for `the append-only logs cannot be opened (logs-unavailable)` it shows the error;
   `the service uid is in the login range` means the service user's uid is 501 or above, where
   login users' uids start, and the listener does not start until the service user is a system
-  account below 501.
+  account below 501;
+  for `the user scope's start step failed` it shows the store's error (the log bounds check
+  the server runs before it serves).
 - `keystore user scope: the server count cannot be read as this user` (WARN): run
   `sudo k3sm doctor`; this does not mean the user scope is off.
 

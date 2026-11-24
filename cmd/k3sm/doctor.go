@@ -422,7 +422,9 @@ func keystorePreFrameDroppedHint(env doctorEnv, r checkResult) checkResult {
 }
 
 // keystoreSoftCapHint is the keystore-logs row's WARN when either log is
-// past its soft cap, and whether one is: the audit log's hint says to
+// past its soft cap, and whether one is; a log past its hard cap is named
+// with its overshoot in bytes, and one at or below it never is. The audit
+// log's hint says to
 // export the archives first (copy them off the Mac), then rotate, and the
 // floor's to rebuild it. A size that cannot be read gives no hint: the
 // flag check already passed.
@@ -436,18 +438,32 @@ func keystoreSoftCapHint(env doctorEnv) (checkResult, bool) {
 		return checkResult{}, false
 	}
 	var details, remedies []string
+	overshoot := false
+	past := func(log string, size int64) string {
+		if size > sz.HardCap {
+			overshoot = true
+			return fmt.Sprintf("the %s is %d bytes, %d bytes past its hard cap of %d", log, size, size-sz.HardCap, sz.HardCap)
+		}
+		return fmt.Sprintf("the %s is %d bytes, past its soft cap of %d", log, size, sz.SoftCap)
+	}
 	if sz.Audit > sz.SoftCap {
-		details = append(details, fmt.Sprintf("the audit log is %d bytes, past its soft cap of %d", sz.Audit, sz.SoftCap))
+		details = append(details, past("audit log", sz.Audit))
 		remedies = append(remedies, "export the audit archives first: as root (only root can read them), copy keystore-audit.log.1 to .4 from keystore-logs/audit/archives/ in the data root off the Mac, then run sudo k3sm keys audit --rotate (with --discard-oldest once .4 exists)")
 	}
 	if sz.UserFloor > sz.SoftCap {
-		details = append(details, fmt.Sprintf("the user-scope floor log is %d bytes, past its soft cap of %d", sz.UserFloor, sz.SoftCap))
+		details = append(details, past("user-scope floor log", sz.UserFloor))
 		remedies = append(remedies, "sudo k3sm keys floor --rebuild")
 	}
 	if len(details) == 0 {
 		return checkResult{}, false
 	}
-	return checkResult{name: name, status: statusWarn, detail: strings.Join(details, "; ") + fmt.Sprintf("; past the hard cap of %d no user-scope change is recorded", sz.HardCap), remedy: strings.Join(remedies, "; ")}, true
+	tail := fmt.Sprintf("; past the hard cap of %d no user-scope change is recorded", sz.HardCap)
+	if overshoot {
+		// Only revocation lines pass the hard cap, each uid's bounded by
+		// its own budgets (docs/design/keystore.md § "Per-uid fairness").
+		tail = "; past the hard cap only revocations are recorded, each on its uid's own budgets, and every other user-scope change is refused"
+	}
+	return checkResult{name: name, status: statusWarn, detail: strings.Join(details, "; ") + tail, remedy: strings.Join(remedies, "; ")}, true
 }
 
 // checkArch verifies the binary runs on Apple Silicon (arm64). k3sm is
