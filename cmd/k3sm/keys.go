@@ -490,16 +490,27 @@ var keystoreTrees = struct {
 }{byDir: map[string]*keystore.TreeState{}}
 
 // keystoreTree is the one TreeState this process uses for the store at
-// dir.
+// dir, keyed by the directory resolved (keystoreTreeKey), so two spellings
+// of one tree (/var and /private/var, a symlinked work dir) share it.
 func keystoreTree(dir string) *keystore.TreeState {
+	key := keystoreTreeKey(dir)
 	keystoreTrees.mu.Lock()
 	defer keystoreTrees.mu.Unlock()
-	t, ok := keystoreTrees.byDir[dir]
+	t, ok := keystoreTrees.byDir[key]
 	if !ok {
 		t = keystore.NewTreeState()
-		keystoreTrees.byDir[dir] = t
+		keystoreTrees.byDir[key] = t
 	}
 	return t
+}
+
+// keystoreTreeKey is dir with its symlinks resolved when it exists, else
+// dir cleaned.
+func keystoreTreeKey(dir string) string {
+	if r, err := filepath.EvalSymlinks(dir); err == nil {
+		return r
+	}
+	return filepath.Clean(dir)
 }
 
 // scrubTokens name scrubPaths' roots, by position.

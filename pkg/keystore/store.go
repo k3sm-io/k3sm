@@ -151,7 +151,9 @@ type Config struct {
 	// their own would let one's holds skip the other's writer preference,
 	// and one's writes go missing from the other's figures. Nil gives the
 	// store a state of its own, which only a process with one store over
-	// the tree may use.
+	// the tree may use: every opener in the server (the socket, the
+	// delivery reconciler, the keys verbs run in it) must pass the one
+	// shared TreeState for the tree, as k3sm's keystoreLayout does.
 	Tree *TreeState
 }
 
