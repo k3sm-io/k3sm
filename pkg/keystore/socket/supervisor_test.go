@@ -751,6 +751,37 @@ func TestPodProfileOffIsTerminal(t *testing.T) {
 	})
 }
 
+// A Pod profile the generator refuses for this node's configuration
+// (ErrPodProfileConfig) is retried, not terminal: off with
+// OffPodProfileConfig and its flag remedy, asked again after the start-check
+// backoff, running no start check meanwhile, and the start checks run once
+// it passes.
+func TestPodProfileConfigIsRetried(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, func(c *startChecks) {
+			c.profileErr = fmt.Errorf("%w: render the Pod profile: sbpl: invalid pod-logs dir", ErrPodProfileConfig)
+		})
+		st := r.wantState(t, PhaseOff, OffPodProfileConfig, MinBackoff)
+		if !strings.Contains(st.Detail, "pod-logs dir") || st.Reason.Remedy() != PodProfileConfigRemedy {
+			t.Fatalf("state %+v, remedy %q", st, st.Reason.Remedy())
+		}
+		if n := r.log.count("level=WARN", PodProfileConfigRemedy, string(OffPodProfileConfig)); n != 1 {
+			t.Fatalf("%d Warn lines naming the flag remedy, want 1:\n%s", n, r.log.b.String())
+		}
+		advance(MinBackoff)
+		r.wantState(t, PhaseOff, OffPodProfileConfig, 2*MinBackoff)
+		r.ck.mu.Lock()
+		profiled, counted := r.ck.profiled, r.ck.counted
+		r.ck.profileErr = nil
+		r.ck.mu.Unlock()
+		if profiled != 2 || counted != 0 {
+			t.Fatalf("profiled %d, counted %d; want the profile asked twice and no start check", profiled, counted)
+		}
+		advance(2 * MinBackoff)
+		r.wantState(t, PhaseServing, "", 0)
+	})
+}
+
 func TestBackoffDoublesToFiveMinutes(t *testing.T) {
 	d, waits := MinBackoff, []time.Duration{MinBackoff}
 	for d < MaxBackoff {

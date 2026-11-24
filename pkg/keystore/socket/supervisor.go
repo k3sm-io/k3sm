@@ -113,6 +113,13 @@ const (
 	// profile is this build's, so no retry and no reinstall of the same
 	// build changes it.
 	OffPodProfile OffReason = "this build's Pod profile does not deny the keystore socket"
+	// OffPodProfileConfig is a Pod profile the runtime's generator refuses
+	// to render for this node's configuration (ErrPodProfileConfig): a
+	// posture value from the server's flags, such as the pod logs dir, the
+	// pod root, the data root or the state dir, that cannot hold its deny.
+	// It is retried with the start-check backoff, not terminal; the flag is
+	// fixed and the server restarted (PodProfileConfigRemedy).
+	OffPodProfileConfig OffReason = "the Pod profile does not render for this node's configuration"
 )
 
 // The supervisor's log text: every off line starts with offMsg, and the
@@ -130,6 +137,8 @@ const (
 	InheritableRemedy = "report it: launchd handed the server an inheritable descriptor; the user scope stays off"
 	// PodProfileRemedy is OffPodProfile's remedy.
 	PodProfileRemedy = "install a k3sm built with a matching runtimed"
+	// PodProfileConfigRemedy is OffPodProfileConfig's remedy.
+	PodProfileConfigRemedy = "fix the flag, then `sudo k3sm restart`"
 	// RestartRemedy is the remedy of every other terminal activation reason.
 	RestartRemedy = "run `sudo k3sm restart`"
 )
@@ -212,9 +221,13 @@ type SupervisorConfig struct {
 	StartScopes func(ctx context.Context) error
 	// PodProfile, when set, is asked once, when Run starts and before any
 	// start check, whether the Pod profile this node renders denies the
-	// socket (ProfileDeniesSocket over the generator's text). An error, or a
-	// panic, is terminal: the supervisor is off with OffPodProfile, logs one
-	// Warn naming PodProfileRemedy, and serves nothing until Run returns.
+	// socket (ProfileDeniesSocket over the generator's text). An error
+	// wrapping ErrPodProfileConfig is the node's configuration: the
+	// supervisor is off with OffPodProfileConfig, logs a Warn naming
+	// PodProfileConfigRemedy, and asks again after the start-check backoff,
+	// running no start check until it passes. Any other error, or a panic,
+	// is terminal: the supervisor is off with OffPodProfile, logs one Warn
+	// naming PodProfileRemedy, and serves nothing until Run returns.
 	PodProfile func() error
 	// Creds, Sandbox, Audit and Handler are given to each run's Listener.
 	Creds   PeerCredSource
@@ -321,13 +334,10 @@ func (s *Supervisor) Run(ctx context.Context) {
 	// failures and starts again only after a run served HealthyPeriod (or
 	// stopped for the marker), so a listener that fails at once after
 	// every passing check still backs off.
-	if s.cfg.PodProfile != nil {
-		if _, err := guard(func() (struct{}, error) { return struct{}{}, s.cfg.PodProfile() }); err != nil {
-			s.terminal(ctx, OffPodProfile, err.Error())
-			return
-		}
-	}
 	checkBackoff, runBackoff := MinBackoff, MinBackoff
+	if !s.podProfileHolds(ctx, &checkBackoff) {
+		return
+	}
 	reopenTries := 0
 	var last OffReason
 	for ctx.Err() == nil {
@@ -414,6 +424,37 @@ func (s *Supervisor) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// podProfileHolds asks the PodProfile check until it passes, reporting
+// false when Run must return: ctx ended a wait, or the check failed in a
+// way no retry changes (terminal, OffPodProfile). A configuration error
+// (ErrPodProfileConfig) is off with OffPodProfileConfig and asked again
+// after the start-check backoff, which it doubles.
+func (s *Supervisor) podProfileHolds(ctx context.Context, backoff *time.Duration) bool {
+	if s.cfg.PodProfile == nil {
+		return true
+	}
+	var last OffReason
+	for ctx.Err() == nil {
+		_, err := guard(func() (struct{}, error) { return struct{}{}, s.cfg.PodProfile() })
+		if err == nil {
+			*backoff = MinBackoff
+			return true
+		}
+		if !errors.Is(err, ErrPodProfileConfig) {
+			s.terminal(ctx, OffPodProfile, err.Error())
+			return false
+		}
+		wait := *backoff
+		*backoff = nextBackoff(wait)
+		s.off(OffPodProfileConfig, err.Error(), last, wait)
+		last = OffPodProfileConfig
+		if !s.wait(ctx, wait) {
+			return false
+		}
+	}
+	return false
 }
 
 // check runs the start checks over the supervisor's config.
@@ -591,6 +632,8 @@ func (r OffReason) Remedy() string {
 		return NotActivatedRemedy
 	case OffPodProfile:
 		return PodProfileRemedy
+	case OffPodProfileConfig:
+		return PodProfileConfigRemedy
 	}
 	return ""
 }
@@ -610,7 +653,7 @@ func (s *Supervisor) off(reason OffReason, detail string, last OffReason, wait t
 		if last != OffNotInstalledServer {
 			s.cfg.Log.Info(offMsg, "reason", string(reason), "err", detail)
 		}
-	case OffInstall:
+	case OffInstall, OffPodProfileConfig:
 		s.cfg.Log.Warn(offMsg+"; "+reason.Remedy(), "reason", string(reason), "err", detail, "retry", wait)
 	default:
 		s.cfg.Log.Warn(offMsg, "reason", string(reason), "err", detail, "retry", wait)

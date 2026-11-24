@@ -150,3 +150,70 @@ func TestKeystorePodProfileMismatchTurnsScopeOff(t *testing.T) {
 		}
 	})
 }
+
+// A Pod profile the generator refuses to render for this node's
+// configuration (a flag-fed posture value it cannot hold a deny for) is not
+// a build that lacks the deny: the user scope goes off with
+// OffPodProfileConfig, naming the render error and the flag remedy, and the
+// check is retried rather than terminal. A rendered profile that does not
+// deny the socket, and a render error the configuration does not cause,
+// stay OffPodProfile with the build remedy.
+func TestPodProfileRemedyNamesConfiguration(t *testing.T) {
+	root := "/Volumes/node"
+	base := sandbox.Posture{WorkDir: root, DataRoot: root, StateDir: root + "/server", PodLogsDir: podlogs.DefaultPodLogsDir}
+	for _, tt := range []struct {
+		name   string
+		mutate func(p *sandbox.Posture)
+		detail string
+	}{
+		{"a relative pod logs dir", func(p *sandbox.Posture) { p.PodLogsDir = "logs" }, "pod-logs dir"},
+		{"a relative pod root", func(p *sandbox.Posture) { p.WorkDir = "node" }, "work-dir"},
+		{"a data root the deny cannot hold", func(p *sandbox.Posture) { p.DataRoot = "/" }, "data root"},
+		{"a state dir above the pods root", func(p *sandbox.Posture) { p.StateDir = root }, "state dir"},
+		{"a pods root under a keystore name", func(p *sandbox.Posture) { p.WorkDir = root + "/keystore-x" }, "keystore"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p := base
+			tt.mutate(&p)
+			err := podProfileCheck(func() (string, error) { return keystorePodProfile(p) }, keystorepaths.SocketPath(root))()
+			if !errors.Is(err, socket.ErrPodProfileConfig) || errors.Is(err, socket.ErrPodProfileOpen) || !strings.Contains(err.Error(), tt.detail) {
+				t.Fatalf("got %v, want a configuration error naming %q", err, tt.detail)
+			}
+		})
+	}
+	t.Run("off, naming the flag remedy, and retried", func(t *testing.T) {
+		f := newWiringFixture(t)
+		p := base
+		p.PodLogsDir = "logs"
+		f.deps.podProfile = func() (string, error) { return keystorePodProfile(p) }
+		logs := &bytes.Buffer{}
+		f.deps.log = slog.New(slog.NewTextHandler(logs, nil))
+		synctest.Test(t, func(t *testing.T) {
+			ks, err := newKeystoreSocket(f.deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stop := runKeystoreSocket(context.Background(), ks)
+			synctest.Wait()
+			st := ks.sup.State()
+			stop()
+			if st.Phase != socket.PhaseOff || st.Reason != socket.OffPodProfileConfig || !strings.Contains(st.Detail, "pod-logs dir") || st.Until.IsZero() {
+				t.Fatalf("state = %+v, want off with %q naming the render error and a retry", st, socket.OffPodProfileConfig)
+			}
+			if st.Reason.Remedy() != socket.PodProfileConfigRemedy || !strings.Contains(logs.String(), "fix the flag, then `sudo k3sm restart`") {
+				t.Fatalf("remedy %q, log:\n%s", st.Reason.Remedy(), logs.String())
+			}
+			if strings.Contains(logs.String(), socket.PodProfileRemedy) {
+				t.Fatalf("the build remedy is named for a configuration error:\n%s", logs.String())
+			}
+		})
+	})
+	t.Run("a profile that does not deny stays the build's", func(t *testing.T) {
+		other := base
+		other.WorkDir, other.DataRoot, other.StateDir = "/Volumes/other", "/Volumes/other", "/Volumes/other/server"
+		err := podProfileCheck(func() (string, error) { return keystorePodProfile(other) }, keystorepaths.SocketPath(root))()
+		if !errors.Is(err, socket.ErrPodProfileOpen) || errors.Is(err, socket.ErrPodProfileConfig) {
+			t.Fatalf("got %v, want ErrPodProfileOpen", err)
+		}
+	})
+}

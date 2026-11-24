@@ -427,15 +427,36 @@ func doctorStoreDir(store *keystore.FileStore) func(context.Context) error {
 	}
 }
 
+// podPostureErrors are the generator's refusals of a posture value the
+// server's flags set (serverPodPosture): the pod root, the pod logs dir,
+// the status record dir, the data root (a pods root under a keystore name
+// included) and the state dir. A render that fails with one of them is the
+// node's configuration, not the build's.
+var podPostureErrors = []error{
+	sandbox.ErrInvalidWorkDir,
+	sandbox.ErrWorkDirEscapesHome,
+	sandbox.ErrInvalidPodLogsDir,
+	sandbox.ErrInvalidStatusRecordDir,
+	sandbox.ErrInvalidDataRoot,
+	sandbox.ErrInvalidStateDir,
+}
+
 // podProfileCheck is the supervisor's Pod-profile check: the profile render
 // returns, read for a deny of the socket at socketPath
-// (socket.ProfileDeniesSocket). A render that fails is the same failure: a
-// node whose generator refuses its own posture has no profile that denies
-// the socket.
+// (socket.ProfileDeniesSocket). A render the generator refuses for a
+// posture value the flags set (podPostureErrors) is the node's
+// configuration (socket.ErrPodProfileConfig), cleared by fixing the flag
+// and restarting; any other render error is the build's, as a profile that
+// does not deny the socket is (socket.ErrPodProfileOpen).
 func podProfileCheck(render func() (string, error), socketPath string) func() error {
 	return func() error {
 		profile, err := render()
 		if err != nil {
+			for _, target := range podPostureErrors {
+				if errors.Is(err, target) {
+					return fmt.Errorf("%w: render the Pod profile: %w", socket.ErrPodProfileConfig, err)
+				}
+			}
 			return fmt.Errorf("%w: render the Pod profile: %w", socket.ErrPodProfileOpen, err)
 		}
 		return socket.ProfileDeniesSocket(profile, socketPath)

@@ -1992,7 +1992,15 @@ data root it serves, in each spelling the generator writes (`/var`, `/private/va
 A profile that does not, as from a k3sm built against a runtimed older than the deny or a data
 root the posture does not name, keeps the user scope off for the life of the process with `this
 build's Pod profile does not deny the keystore socket`; the server logs one warning naming
-`install a k3sm built with a matching runtimed` and keeps running. The barriers relied on are
+`install a k3sm built with a matching runtimed` and keeps running. A render the generator
+refuses for a posture value the server's flags set (an invalid pod logs dir, pod root, status
+record dir, data root or state dir, or a pods root under a `keystore-*` name:
+`podPostureErrors`, `cmd/k3sm/keystoresocket.go`) is the node's configuration, not the build's:
+the user scope is off with `the Pod profile does not render for this node's configuration`,
+naming the render error and "fix the flag, then `sudo k3sm restart`", and the check is retried
+with the start-check backoff, running no other start check until it passes
+(`TestPodProfileRemedyNamesConfiguration`, `TestPodProfileConfigIsRetried`). Any other render
+error stays the build's state above. The barriers relied on are
 that Seatbelt deny and the listener's sandboxed-peer refusal (Open requirement 15); launchd's
 `ESRCH` to a Pod is not one of them. A data root on a volume that is not
 mounted was not measured; a default-layout data root that is not mounted is refused earlier,

@@ -29,6 +29,12 @@ import (
 // file or its connect deny, or an allow after that deny re-opens it.
 var ErrPodProfileOpen = errors.New("the Pod profile does not deny the keystore socket")
 
+// ErrPodProfileConfig is a Pod profile the runtime's generator refuses to
+// render for this node's configuration: a posture value the server's flags
+// set cannot hold its deny. Fixing the flag and restarting clears it, so it
+// is not ErrPodProfileOpen.
+var ErrPodProfileConfig = errors.New("the Pod profile does not render for this node's configuration")
+
 // dataVolumeAlias is the macOS data volume's mount point: a path under a
 // firmlink is also reachable through it.
 const dataVolumeAlias = "/System/Volumes/Data"

@@ -200,7 +200,12 @@ Pod profile its built-in runtime gives Pods on this node and checks that the pro
 the socket under this node's data root. If it does not, the user scope stays off for the life of
 the server, with `this build's Pod profile does not deny the keystore socket`. The server logs
 one warning naming the remedy, `install a k3sm built with a matching runtimed`, and keeps
-running; reinstalling or restarting the same build does not change it.
+running; reinstalling or restarting the same build does not change it. If instead the runtime
+refuses to render the profile for this node's settings (an invalid `--pod-logs-dir`, pod root,
+data root or state dir), the user scope is off with `the Pod profile does not render for this
+node's configuration`, the warning names the setting's error and "fix the flag, then
+`sudo k3sm restart`", and the server keeps retrying the check. `doctor` does not render the
+profile, so neither state shows in its row; the server log names it.
 
 ### When a user scope blocks the rebuild
 
