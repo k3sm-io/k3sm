@@ -233,6 +233,7 @@ func TestOutcomeOfMapsStoreErrors(t *testing.T) {
 		{"committed", fmt.Errorf("%w: the floor line was not written", keystore.ErrCommitted), ""},
 		{"socket busy", ErrBusy, CodeBusy},
 		{"rate limited", ErrRateLimited, CodeRateLimited},
+		{"request refused", refusedf("x"), CodeRefused},
 		{"log full", wrap(keystore.ErrLogFull), CodeLogFull},
 		{"not found", wrap(keystore.ErrNotFound), CodeNotFound},
 		{"version not found", wrap(keystore.ErrVersionNotFound), CodeNotFound},

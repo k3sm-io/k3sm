@@ -66,7 +66,8 @@ func outcomeOf(err error) (Code, string) {
 		return CodeScopeOwnerChanged, ""
 	case errors.Is(err, keystore.ErrScopeOwnerUnknown):
 		return CodeScopeOwnerUnknown, ""
-	case keystore.AuditRefused(err),
+	case errors.Is(err, ErrRequestRefused),
+		keystore.AuditRefused(err),
 		errors.Is(err, keystore.ErrExists),
 		errors.Is(err, keystore.ErrInvalidName),
 		errors.Is(err, keystore.ErrKindMismatch),

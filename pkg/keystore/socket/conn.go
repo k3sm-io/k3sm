@@ -91,9 +91,8 @@ type opFunc func(ctx context.Context, req Request) (Reply, error)
 // HandlerOption configures a Handler at construction.
 type HandlerOption func(*Handler)
 
-// withOp registers op under name. Production registers none yet.
-//
-//lint:ignore U1000 the socket operations register through it as they land; the bridge's tests use it now.
+// withOp registers op under name (NewOpsHandler registers the
+// operations; a later registration of a name replaces the earlier).
 func withOp(name string, op opFunc) HandlerOption {
 	return func(h *Handler) {
 		if h.ops == nil {

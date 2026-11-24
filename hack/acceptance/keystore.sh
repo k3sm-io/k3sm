@@ -578,8 +578,8 @@ check U25 "backup and restore round trip: a restored tree with cleared flags is 
 	TestBackupRestoreRoundTripRebuild TestRebuildKeepsDamagedEntryCorrupt TestSwapCallOrder TestSwapRerunFromEachStep TestMaintenanceRepairsHardLinkedLog TestMaintenanceStagingDirIsRootOnly TestMaintenanceLocksBeforeMarker TestOldLogUnflaggedServiceOwnedRefused
 check U26 "peers uid 0, the service uid and uid < 501 are refused before any frame is read (socket listener)" \
 	k3sm/pkg/keystore/socket::TestPeerEligibility
-check U27 "framing: an oversize frame, unknown type or missing HELLO closes; an unknown header field is ignored; HELLO picks the highest common version (socket listener)" \
-	k3sm/pkg/keystore/socket::FuzzFrameReader TestFramingBounds TestSubLengthsWithinFrame TestHelloReadDeadline TestUnknownHeaderFieldsIgnored TestHelloVersionRange TestHelloReplyCarriesVersionAndMaxFrame TestHelloNoOverlapSendsUnsupportedVersion TestUnknownOpKeepsConnection TestFrameCapCoversMaxValue
+check U27 "framing: an oversize frame, unknown type or missing HELLO closes; an unknown header field is ignored; HELLO picks the highest common version; a known request header field of the wrong type is refused (socket listener)" \
+	k3sm/pkg/keystore/socket::FuzzFrameReader FuzzRequestHeader TestFramingBounds TestSubLengthsWithinFrame TestHelloReadDeadline TestUnknownHeaderFieldsIgnored TestHelloVersionRange TestHelloReplyCarriesVersionAndMaxFrame TestHelloNoOverlapSendsUnsupportedVersion TestUnknownOpKeepsConnection TestFrameCapCoversMaxValue
 check U28 "64 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after HELLO or between requests is closed (socket listener)" \
 	k3sm/pkg/keystore/socket::TestConnectionCapsPerUID TestRequestTimeout TestIdleTimeoutAfterHelloAndBetweenRequests
 check U29 "a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request (socket listener)" \

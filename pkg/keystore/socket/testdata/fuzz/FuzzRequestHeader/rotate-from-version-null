@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"op\":\"rotate\",\"entry\":\"user/501/a\",\"from_version\":null}")
