@@ -143,24 +143,32 @@ func testBridgeOps(b Store) []HandlerOption {
 	version := func(v keystore.Version, err error) (Reply, error) {
 		return Reply{Header: map[string]any{"version": v.Version}}, err
 	}
+	admitted := func(op string, fn opFunc) HandlerOption {
+		return withOp(op, func(ctx context.Context, req Request) (Reply, error) {
+			if err := b.Admit(req.Peer, op); err != nil {
+				return Reply{}, err
+			}
+			return fn(ctx, req)
+		})
+	}
 	return []HandlerOption{
-		withOp("put", func(ctx context.Context, req Request) (Reply, error) {
+		admitted("put", func(ctx context.Context, req Request) (Reply, error) {
 			return version(b.Put(ctx, req.Peer, parse(req).Entry, keystore.KindOpaque, req.Value))
 		}),
-		withOp("rotate", func(ctx context.Context, req Request) (Reply, error) {
+		admitted("rotate", func(ctx context.Context, req Request) (Reply, error) {
 			if r := parse(req); r.From != 0 {
 				return version(b.RotateFrom(ctx, req.Peer, r.Entry, r.From))
 			}
 			return version(b.Rotate(ctx, req.Peer, parse(req).Entry, req.Value))
 		}),
-		withOp("rm", func(ctx context.Context, req Request) (Reply, error) {
+		admitted("rm", func(ctx context.Context, req Request) (Reply, error) {
 			return Reply{}, b.Remove(ctx, req.Peer, parse(req).Entry)
 		}),
-		withOp("list", func(ctx context.Context, req Request) (Reply, error) {
+		admitted("list", func(ctx context.Context, req Request) (Reply, error) {
 			es, err := b.List(ctx, req.Peer)
 			return Reply{Header: map[string]any{"entries": len(es)}}, err
 		}),
-		withOp("read-for-exec", func(ctx context.Context, req Request) (Reply, error) {
+		admitted("read-for-exec", func(ctx context.Context, req Request) (Reply, error) {
 			v, val, err := b.ReadForExec(ctx, req.Peer, parse(req).Entry)
 			return Reply{Header: map[string]any{"version": v.Version}, Value: val}, err
 		}),
@@ -293,7 +301,7 @@ func (r *bridgeRig) linesOf(t *testing.T, uid uint32) []auditEntry {
 // operations' calls; none reveals, shows, rewraps, or reads a value
 // unaudited.
 func TestStoreInterfaceHasNoRevealMethod(t *testing.T) {
-	want := []string{"List", "Put", "ReadForExec", "Remove", "Rotate", "RotateFrom"}
+	want := []string{"Admit", "List", "Put", "ReadForExec", "Remove", "Rotate", "RotateFrom"}
 	banned := []string{"reveal", "show", "rewrap", "current", "get", "export", "dump"}
 	for _, typ := range []reflect.Type{reflect.TypeFor[Store](), reflect.TypeFor[*FileStoreBridge]()} {
 		var got []string

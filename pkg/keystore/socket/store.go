@@ -19,6 +19,7 @@ package socket
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"k3sm.io/k3sm/pkg/keystore"
@@ -51,6 +52,29 @@ type Store interface {
 	List(ctx context.Context, p Peer) ([]keystore.Entry, error)
 	// ReadForExec returns the entry's current value, for exec injection.
 	ReadForExec(ctx context.Context, p Peer, entry string) (keystore.Version, []byte, error)
+	// Admit judges a request of op (one of the Op* names) for p after
+	// its header and value passed and before it reaches the store: while
+	// the store's audit appends fail for everyone, a mutation or read
+	// outside the revocation class is ErrAuditFailing. Every operation
+	// calls it, the delivery placeholders included.
+	Admit(p Peer, op string) error
+}
+
+// ErrAuditFailing refuses a mutation or read while the store's audit
+// appends fail for everyone (keystore.FileStore.AuditFailing): the
+// fail-closed rule (docs/design/keystore.md § "The audit log"). rotate, rm
+// and withdraw, the revocation class, are never refused so. It is answered
+// refused, the code of the global append failure.
+var ErrAuditFailing = fmt.Errorf("%w: the audit log takes no appends, so mutations and reads are refused until one succeeds", ErrRequestRefused)
+
+// revocationOp reports whether op is in the revocation class, which goes
+// ahead while appends fail (its line dropped and counted unaudited).
+func revocationOp(op string) bool {
+	switch op {
+	case OpRotate, OpRm, OpWithdraw:
+		return true
+	}
+	return false
 }
 
 // ListsPerSecond is how many list requests one uid may make a second
@@ -141,6 +165,15 @@ func (b *FileStoreBridge) List(ctx context.Context, p Peer) ([]keystore.Entry, e
 		return nil, err
 	}
 	return u.List(ctx)
+}
+
+// Admit implements Store: the fail-closed rule, judged from the store's
+// own account of its appends, before the store is called.
+func (b *FileStoreBridge) Admit(_ Peer, op string) error {
+	if !revocationOp(op) && b.fs.AuditFailing() {
+		return ErrAuditFailing
+	}
+	return nil
 }
 
 // ReadForExec implements Store.

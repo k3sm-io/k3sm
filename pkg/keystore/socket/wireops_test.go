@@ -222,6 +222,8 @@ func (s *countingStore) List(context.Context, Peer) ([]keystore.Entry, error) {
 	return nil, nil
 }
 
+func (s *countingStore) Admit(Peer, string) error { return nil }
+
 func (s *countingStore) ReadForExec(context.Context, Peer, string) (keystore.Version, []byte, error) {
 	s.hit()
 	return keystore.Version{Version: 1}, []byte("v"), nil

@@ -146,9 +146,9 @@ func NewOpsHandler(now func() time.Time, store Store, opts ...HandlerOption) (*H
 		withOp(OpList, o.list),
 		withOp(OpRm, o.rm),
 		withOp(OpReadForExec, o.readForExec),
-		withOp(OpDeliver, notServed),
-		withOp(OpWithdraw, notServed),
-		withOp(OpDeliveries, notServed),
+		withOp(OpDeliver, o.notServed(OpDeliver)),
+		withOp(OpWithdraw, o.notServed(OpWithdraw)),
+		withOp(OpDeliveries, o.notServed(OpDeliveries)),
 	}, opts...)
 	return NewHandler(now, all...)
 }
@@ -171,6 +171,9 @@ func (o ops) put(ctx context.Context, req Request) (Reply, error) {
 	if err := checkValue(req.Value); err != nil {
 		return Reply{}, err
 	}
+	if err := o.store.Admit(req.Peer, OpPut); err != nil {
+		return Reply{}, err
+	}
 	v, err := o.store.Put(ctx, req.Peer, h.Entry, kind, req.Value)
 	return Reply{Header: VersionReply{Version: v.Version, Fingerprint: v.Fingerprint}}, err
 }
@@ -188,9 +191,15 @@ func (o ops) rotate(ctx context.Context, req Request) (Reply, error) {
 		if req.Value != nil {
 			return Reply{}, refusedf("a rotate carries a value or from_version, not both")
 		}
+		if err := o.store.Admit(req.Peer, OpRotate); err != nil {
+			return Reply{}, err
+		}
 		v, err = o.store.RotateFrom(ctx, req.Peer, h.Entry, *h.FromVersion)
 	} else {
 		if err := checkValue(req.Value); err != nil {
+			return Reply{}, err
+		}
+		if err := o.store.Admit(req.Peer, OpRotate); err != nil {
 			return Reply{}, err
 		}
 		v, err = o.store.Rotate(ctx, req.Peer, h.Entry, req.Value)
@@ -208,11 +217,15 @@ func (o ops) list(ctx context.Context, req Request) (Reply, error) {
 	if err := noValue(req.Value); err != nil {
 		return Reply{}, err
 	}
+	if err := o.store.Admit(req.Peer, OpList); err != nil {
+		return Reply{}, err
+	}
 	es, err := o.store.List(ctx, req.Peer)
 	if errors.Is(err, keystore.ErrScopeAbsent) {
 		// A uid with no scope yet holds nothing: an empty list, as an
 		// empty scope gives (docs/design/keystore.md § "A read never
-		// mints a scope"). The store has audited the list already.
+		// mints a scope"). The store has audited the list already: one
+		// whose line failed is refused (keystore.AuditRefused), not this.
 		es, err = nil, nil
 	}
 	if err != nil {
@@ -251,6 +264,9 @@ func (o ops) rm(ctx context.Context, req Request) (Reply, error) {
 	if err := noValue(req.Value); err != nil {
 		return Reply{}, err
 	}
+	if err := o.store.Admit(req.Peer, OpRm); err != nil {
+		return Reply{}, err
+	}
 	return Reply{Header: RmReply{}}, o.store.Remove(ctx, req.Peer, h.Entry)
 }
 
@@ -262,6 +278,9 @@ func (o ops) readForExec(ctx context.Context, req Request) (Reply, error) {
 	if err := noValue(req.Value); err != nil {
 		return Reply{}, err
 	}
+	if err := o.store.Admit(req.Peer, OpReadForExec); err != nil {
+		return Reply{}, err
+	}
 	v, val, err := o.store.ReadForExec(ctx, req.Peer, h.Entry)
 	if err != nil {
 		clear(val)
@@ -270,9 +289,16 @@ func (o ops) readForExec(ctx context.Context, req Request) (Reply, error) {
 	return Reply{Header: ReadForExecReply{Version: v.Version}, Value: val}, nil
 }
 
-// notServed answers an operation of the delivery slice refused.
-func notServed(context.Context, Request) (Reply, error) {
-	return Reply{}, refusedf("%s", reasonDeliverySlice)
+// notServed answers op, an operation of the delivery slice, refused, once
+// the store admitted it: the placeholder keeps the limits and the
+// fail-closed rule the operation will have.
+func (o ops) notServed(op string) opFunc {
+	return func(_ context.Context, req Request) (Reply, error) {
+		if err := o.store.Admit(req.Peer, op); err != nil {
+			return Reply{}, err
+		}
+		return Reply{}, refusedf("%s", reasonDeliverySlice)
+	}
 }
 
 // checkValue refuses a value the store would not take, before the store

@@ -533,7 +533,8 @@ var errReadAuditRefused = errors.New("the audit line could not be written, so th
 // reply, fail closed). A uid past its share is refused first, with nothing
 // read and no line written (errShareSpent): reads are charged to the share
 // like any line and are not in the revocation class. A read whose line
-// cannot be appended is refused (errReadAuditRefused); a refused read's
+// cannot be appended is refused (errReadAuditRefused), and so is a
+// scope-absent one, which a list serves as empty; any other refused read's
 // line is written best effort, with the refusal's result.
 func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Root, keys) error) error {
 	if err := u.s.checkConfig(); err != nil {
@@ -557,7 +558,10 @@ func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Ro
 		o.close()
 	}
 	l.result = auditResult(err)
-	if aerr := u.audit(l); aerr != nil && err == nil {
+	// A scope-absent answer is served as an empty list (the socket's list),
+	// so a read whose line failed is refused then too, never served with
+	// no line.
+	if aerr := u.audit(l); aerr != nil && (err == nil || errors.Is(err, ErrScopeAbsent)) {
 		return fmt.Errorf("%w: %w", errReadAuditRefused, aerr)
 	}
 	return err
