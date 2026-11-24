@@ -970,8 +970,10 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // listUserEntry is a user entry's List row: its current version, opened
 // and authenticated, and the others checked for presence only, by one
 // listing of the entry's directory: every version in the pointer's
-// committed range must have its file, and the first that has none is the
-// entry's Err (ErrCorrupt). No other record is opened, so a list costs one
+// committed range must have its file, a regular one (a symlink, a
+// directory or any other type under a version's name counts as no file),
+// and the first that has none is the entry's Err (ErrCorrupt). No other
+// record is opened, so a list costs one
 // record open and one directory listing an entry under the shared lock
 // however many versions it keeps. VersionCount is the number of version
 // files present in the range. Any other failure, a pointer the floor rules
@@ -988,13 +990,13 @@ func listUserEntry(e *entry, k keys) Entry {
 	if err != nil {
 		return Entry{Name: e.name, Err: fmt.Errorf("version %d: %w", cur, err)}
 	}
-	names, err := readDirNames(e.root, maxDirNames)
+	des, err := readDirEntries(e.root, maxDirNames)
 	if err != nil {
 		return Entry{Name: e.name, Err: err}
 	}
-	present := make(map[uint64]bool, len(names))
-	for _, n := range names {
-		if x, ok := parseVersionName(n); ok && x >= low && x <= cur {
+	present := make(map[uint64]bool, len(des))
+	for _, de := range des {
+		if x, ok := parseVersionName(de.Name()); ok && x >= low && x <= cur && de.Type().IsRegular() {
 			present[x] = true
 		}
 	}

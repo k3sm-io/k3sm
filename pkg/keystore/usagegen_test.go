@@ -152,3 +152,38 @@ func TestStartUserScopesForgetsUsageFigures(t *testing.T) {
 		t.Fatal("a listener start kept a usage figure from before it")
 	}
 }
+
+// A user list counts a version name that is not a regular file (a
+// symlink, even to a good version, or a directory) as no file: the entry
+// is marked ErrCorrupt.
+func TestUserListVersionNotRegularIsAbsent(t *testing.T) {
+	ctx := context.Background()
+	for _, kind := range []string{"symlink", "directory"} {
+		t.Run(kind, func(t *testing.T) {
+			s, u := rotateScope(t)
+			for _, v := range []string{"two", "three"} {
+				if _, err := u.Rotate(ctx, "user/1001/a", []byte(v)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dir := filepath.Join(scopeDir(filepath.Dir(s.dir), "1001"), scopeEntriesName, "a")
+			v1 := filepath.Join(dir, versionName(1))
+			if err := os.Remove(v1); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			if kind == "symlink" {
+				err = os.Symlink(versionName(3), v1)
+			} else {
+				err = os.Mkdir(v1, 0o700)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			es, err := u.List(ctx)
+			if err != nil || len(es) != 1 || !errors.Is(es[0].Err, ErrCorrupt) {
+				t.Fatalf("with v1 a %s: %+v, %v; want the entry marked ErrCorrupt", kind, es, err)
+			}
+		})
+	}
+}

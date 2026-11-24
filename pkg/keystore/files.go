@@ -515,6 +515,30 @@ func readDirNames(root *os.Root, max int) ([]string, error) {
 	}
 }
 
+// readDirEntries is readDirNames with each name's type, as the directory
+// listing gives it (no Lstat where the volume reports types).
+func readDirEntries(root *os.Root, max int) ([]fs.DirEntry, error) {
+	d, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = d.Close() }() // read-only; nothing to flush
+	var des []fs.DirEntry
+	for {
+		batch, err := d.ReadDir(dirBatch)
+		des = append(des, batch...)
+		if len(des) > max {
+			return nil, fmt.Errorf("%s holds over %d names", root.Name(), max)
+		}
+		if errors.Is(err, io.EOF) {
+			return des, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
 // openLocked opens the entries' directory, creating it with create set, and
 // takes the store lock on it, exclusive or shared. A missing directory is an
 // error matching fs.ErrNotExist, for the caller to map. The returned function
