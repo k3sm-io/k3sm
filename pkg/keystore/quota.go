@@ -50,27 +50,47 @@ const (
 // entries, or when its sealed records (every file in every entry
 // directory), base (the deliveries record's size) and the new entry's
 // files (version 1, its pointer and its generation file) would pass
-// maxScopeBytes.
+// maxScopeBytes. It walks the scope; a user put or rotate judges the
+// scope's usage figure instead (usage.go, judgeScopeQuota).
 func checkScopeQuota(entries *os.Root, name string, value []byte, base int64) error {
-	names, err := readDirNames(entries, maxDirNames)
+	used, err := walkScopeEntries(entries, nil)
 	if err != nil {
 		return err
 	}
-	count := 0
-	exists := false
-	total := base
+	return judgeScopeQuota(used, name, value, base)
+}
+
+// walkScopeEntries is every entry name in entries with its sealed bytes
+// (entryBytes); lstat, when set, is called before each file's Lstat, where
+// a test counts the walk.
+func walkScopeEntries(entries *os.Root, lstat func()) (map[string]int64, error) {
+	names, err := readDirNames(entries, maxDirNames)
+	if err != nil {
+		return nil, err
+	}
+	used := make(map[string]int64, len(names))
 	for _, n := range names {
 		if checkName(n) != nil {
 			continue
 		}
-		exists = exists || n == name
-		count++
-		size, err := entryBytes(entries, n)
+		size, err := entryBytes(entries, n, lstat)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		used[n] = size
+	}
+	return used, nil
+}
+
+// judgeScopeQuota is checkScopeQuota's judgement on used, every entry
+// name with its sealed bytes: no file is read.
+func judgeScopeQuota(used map[string]int64, name string, value []byte, base int64) error {
+	total := base
+	for _, size := range used {
 		total += size
 	}
+	_, exists := used[name]
+	count := len(used)
 	// The count bounds new names: an existing name is the caller's
 	// ErrExists (or a Rotate's version), never ErrQuota.
 	if !exists && count >= maxScopeEntries {
@@ -105,8 +125,9 @@ func (u *UserScope) deliveriesBytes(root *os.Root) (int64, error) {
 }
 
 // entryBytes sums the sizes of the regular files in entries/name, without
-// following a symlink. A name that is not a directory counts nothing.
-func entryBytes(entries *os.Root, name string) (int64, error) {
+// following a symlink; lstat, when set, is called before each file's
+// Lstat. A name that is not a directory counts nothing.
+func entryBytes(entries *os.Root, name string, lstat func()) (int64, error) {
 	e, err := openEntryDirRaw(entries, name)
 	if errors.Is(err, ErrNotFound) || errors.Is(err, ErrCorrupt) {
 		return 0, nil
@@ -121,6 +142,9 @@ func entryBytes(entries *os.Root, name string) (int64, error) {
 	}
 	var total int64
 	for _, f := range files {
+		if lstat != nil {
+			lstat()
+		}
 		fi, err := e.root.Lstat(f)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
@@ -167,6 +191,11 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 		return err
 	}
 	u = u.withGUID()
+	unlockUID, err := u.s.usage.lockUID(ctx, u.uid, u.s.lockWait)
+	if err != nil {
+		return err
+	}
+	defer unlockUID()
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -175,6 +204,13 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 		return err
 	}
 	defer done()
+	defer func() { // the scope's figure: the entry removed, or recomputed
+		if err == nil {
+			u.s.usage.update(u.uid, func(m map[string]int64) { delete(m, name) })
+		} else if !errors.Is(err, ErrNotFound) {
+			u.s.usage.forget(u.uid)
+		}
+	}()
 	defer func() { // before done: the line is appended under the lock
 		l := auditLine{op: "rm", name: name, revoke: err == nil || Committed(err)}
 		err = u.keepAuditFailure("rm", err, u.appendAudit(l, err))

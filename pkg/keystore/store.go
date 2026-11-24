@@ -248,6 +248,13 @@ type FileStore struct {
 	// its mode and how long it was held on the clock, where a test bounds
 	// the hold.
 	holdObserver func(exclusive bool, held time.Duration)
+	// usage is the user scopes' usage figures and the uids' mutation locks
+	// (usage.go). A pointer, as userScopesStarted is; New allocates it.
+	usage *usageTable
+	// usageLstat, when set, is called before each file Lstat of a scope
+	// usage walk, with whether the walk runs under the store lock, where a
+	// test counts the walk.
+	usageLstat func(underLock bool)
 }
 
 var _ Store = (*FileStore)(nil)
@@ -289,6 +296,7 @@ func New(cfg Config) *FileStore {
 		audit:             new(auditState),
 		counts:            newServerCounts(),
 		inproc:            newPrefLock(),
+		usage:             newUsageTable(),
 	}
 	if cfg.LogFlags != nil {
 		s.logFlags = cfg.LogFlags
@@ -1570,14 +1578,21 @@ func (s *FileStore) rotate(ctx context.Context, name string, nextVal nextValue) 
 // ErrOrphanVersion, before anything is unlinked; Adopt promotes it.
 // docs/design/keystore.md § "Rotation and rollback".
 func discardOrphans(ctx context.Context, e *entry, k keys, low, cur uint64) error {
+	_, err := discardOrphansCounted(ctx, e, k, low, cur)
+	return err
+}
+
+// discardOrphansCounted is discardOrphans, returning how many files it
+// removed.
+func discardOrphansCounted(ctx context.Context, e *entry, k keys, low, cur uint64) (removed int, err error) {
 	names, err := readDirNames(e.root, maxDirNames)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var doomed []string
 	for i, n := range names {
 		if err := loopCtx(ctx, i); err != nil {
-			return err
+			return 0, err
 		}
 		v, ok := parseVersionName(n)
 		if !ok || (v >= low && v <= cur) {
@@ -1588,25 +1603,25 @@ func discardOrphans(ctx context.Context, e *entry, k keys, low, cur uint64) erro
 			clear(pt) // only whether it opens is wanted
 			switch {
 			case err == nil:
-				return orphanError(e, Kind(r.kind) == KindOAuth, v, cur)
+				return 0, orphanError(e, Kind(r.kind) == KindOAuth, v, cur)
 			case !errors.Is(err, ErrCorrupt):
-				return fmt.Errorf("check the orphaned %s: %w", n, err)
+				return 0, fmt.Errorf("check the orphaned %s: %w", n, err)
 			}
 		}
 		doomed = append(doomed, n)
 	}
 	for i, n := range doomed {
 		if err := loopCtx(ctx, i); err != nil {
-			return err
+			return i, err
 		}
 		if err := e.root.Remove(n); err != nil {
-			return fmt.Errorf("discard the orphaned %s: %w", n, err)
+			return i, fmt.Errorf("discard the orphaned %s: %w", n, err)
 		}
 	}
 	if len(doomed) == 0 {
-		return nil
+		return 0, nil
 	}
-	return syncDir(e.root)
+	return len(doomed), syncDir(e.root)
 }
 
 // versionLimit is the highest version an entry of kind may reach:

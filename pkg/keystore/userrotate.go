@@ -112,6 +112,12 @@ func (u *UserScope) rotate(ctx context.Context, name string, next nextValue) (v 
 		return Version{}, err
 	}
 	u = u.withGUID()
+	unlockUID, err := u.s.usage.lockUID(ctx, u.uid, u.s.lockWait)
+	if err != nil {
+		return Version{}, err
+	}
+	defer unlockUID()
+	u.prepareUsage() // the scope's figure, walked before the store lock
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Version{}, fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -190,14 +196,15 @@ func (u *UserScope) rotateBody(ctx context.Context, root *os.Root, name string, 
 	if cur >= versionLimit(old.Kind) || seq == math.MaxUint64 {
 		return Version{}, fmt.Errorf("%w: the pointer is at the last version or sequence", ErrCorrupt)
 	}
-	base, err := u.deliveriesBytes(root)
+	if err := u.checkUsageQuota(root, name, value); err != nil {
+		return Version{}, err
+	}
+	discarded, err := discardOrphansCounted(ctx, e, uk, 1, cur)
+	if discarded > 0 {
+		// Damage removed from the entry: the figure no longer matches it.
+		u.s.usage.forget(u.uid)
+	}
 	if err != nil {
-		return Version{}, err
-	}
-	if err := checkScopeQuota(entries, name, value, base); err != nil {
-		return Version{}, err
-	}
-	if err := discardOrphans(ctx, e, uk, 1, cur); err != nil {
 		if errors.Is(err, ErrOrphanVersion) {
 			// The scope's owner cannot adopt it (root's verb) or reach
 			// the file: its remedy is rm, then put. The orphan is kept,
@@ -212,7 +219,29 @@ func (u *UserScope) rotateBody(ctx context.Context, root *os.Root, name string, 
 	if err := u.s.admit(u.uid, true); err != nil {
 		return Version{}, err
 	}
-	return u.commitRotation(e, uk, old, cur, seq, value)
+	before, berr := lstatSize(e.root, currentName)
+	v, err := u.commitRotation(e, uk, old, cur, seq, value)
+	if err != nil && !Committed(err) {
+		// Nothing committed, and the version written may not have been
+		// removed: the figure is recomputed.
+		u.s.usage.forget(u.uid)
+		return v, err
+	}
+	u.usageAfterRotate(e, before, berr, v.Version)
+	return v, err
+}
+
+// usageAfterRotate adds to the scope's figure what a committed rotation
+// wrote to e: version nv, and the pointer's change from before (berr: its
+// size before could not be read, so the figure is recomputed).
+func (u *UserScope) usageAfterRotate(e *entry, before int64, berr error, nv uint64) {
+	vsize, verr := lstatSize(e.root, versionName(nv))
+	after, aerr := lstatSize(e.root, currentName)
+	if berr != nil || verr != nil || aerr != nil {
+		u.s.usage.forget(u.uid)
+		return
+	}
+	u.s.usage.update(u.uid, func(m map[string]int64) { m[e.name] += vsize + after - before })
 }
 
 // commitRotation writes version cur+1 sealing value, flips the pointer to

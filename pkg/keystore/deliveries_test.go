@@ -510,6 +510,10 @@ func TestUserScopeQuotaCountsDeliveriesAndGeneration(t *testing.T) {
 	if err := os.Truncate(pad, maxScopeBytes-add-scopeFileBytes(t, server)); err != nil {
 		t.Fatal(err)
 	}
+	// The pad is written behind the store's back, so the figure the puts
+	// kept does not count it: the put is judged as by a server just
+	// started, which walks the scope (usage.go).
+	u.s.usage.forget(1001)
 	_, err := u.Put(ctx, "user/1001/"+name, KindOpaque, []byte(value))
 	if !errors.Is(err, ErrQuota) || !strings.Contains(err.Error(), "sealed records would be") {
 		t.Fatalf("put that fits only without the deliveries record and generation file: %v, want ErrQuota", err)
