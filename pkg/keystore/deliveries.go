@@ -1496,7 +1496,7 @@ func (u *UserScope) appendAudit(l auditLine, err error) error {
 	l.result = auditResult(err)
 	if aerr := u.audit(l); aerr != nil {
 		if err == nil || Committed(err) {
-			u.s.audit.countUnaudited()
+			u.s.countUnaudited()
 		}
 		// committedf's text, with errAuditLost matchable for AuditLost.
 		return fmt.Errorf("%w: %w: %v", ErrCommitted, errAuditLost, aerr)

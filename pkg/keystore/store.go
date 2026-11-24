@@ -228,9 +228,14 @@ type FileStore struct {
 	// pointer, as userScopesStarted is; New allocates it.
 	lostLines *lostEntryLines
 	// audit is the user-scope audit appends' state: the global append
-	// failure and the unaudited-operation count (userorigin.go). A pointer,
-	// as userScopesStarted is; New allocates it.
+	// failure (userorigin.go). A pointer, as userScopesStarted is; New
+	// allocates it.
 	audit *auditState
+	// counts is the server's persisted counts past the pre-frame ones:
+	// post-frame refused lines dropped, and unaudited operations
+	// (servercounts.go). A pointer, as userScopesStarted is; New allocates
+	// it.
+	counts *serverCounts
 }
 
 var _ Store = (*FileStore)(nil)
@@ -269,6 +274,7 @@ func New(cfg Config) *FileStore {
 		quarantined:       new(atomic.Pointer[map[uint32]bool]),
 		lostLines:         new(lostEntryLines),
 		audit:             new(auditState),
+		counts:            newServerCounts(),
 	}
 	if cfg.LogFlags != nil {
 		s.logFlags = cfg.LogFlags

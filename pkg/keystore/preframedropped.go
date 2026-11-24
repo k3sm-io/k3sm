@@ -31,37 +31,80 @@ import (
 	"time"
 )
 
-// PreFrameDroppedName is the file in the store directory that persists the
-// pre-frame refusals counted as dropped and not yet written to the audit log
-// (docs/design/keystore.md § "Per-uid fairness": the count is persisted, not
-// kept only in memory). The audit log's directory is root's, so the server
-// keeps it in the store directory it owns; the leading dot keeps it out of
-// every enumerator of entries, which refuse a name that is not one
-// (checkName).
+// PreFrameDroppedName is the server-counts file in the store directory:
+// the counts that live in the server's memory and must outlast it, for
+// doctor (another process) and the next root audit --rotate. Its name says
+// pre-frame, but it carries three kinds of count (docs/design/keystore.md §
+// "Per-uid fairness" and § "The audit log"): the pre-frame refusals counted
+// as dropped and not yet written to the audit log, by class and uid; the
+// post-frame refused lines the socket's limiter or the caller's share
+// dropped and not yet summarized, by uid (countClassPostFrame); and the
+// committed revocations whose audit line could not be written
+// (countClassUnaudited), with no uid. The audit log's directory is root's,
+// so the server keeps it in the store directory it owns; the leading dot
+// keeps it out of every enumerator of entries, which refuse a name that is
+// not one (checkName).
 const PreFrameDroppedName = ".preframe-dropped"
 
 // The persisted counts' format: one header line, then at most
 // preFrameDroppedUIDs uids' lines "<uid> <class> <count>", sorted by uid
-// then class, then at most one "others <class> <count>" line per class for
-// the uids past preFrameDroppedUIDs, in class order. No line is longer than
-// preFrameDroppedMaxLine; every count is above 0; a file with only the header
-// holds no count.
+// then class, then at most one "others <class> <count>" line per class, in
+// class order: for a uid class, the count of the uids past
+// preFrameDroppedUIDs; for countClassUnaudited, which names no uid, its
+// whole count, and it is written in no other form. No line is longer than
+// preFrameDroppedMaxLine; every count is above 0; a file with only the
+// header holds no count.
 const (
 	preFrameDroppedHeader  = "k3sm-preframe-dropped 1\n"
 	preFrameDroppedOthers  = "others"
 	preFrameDroppedUIDs    = 256
 	preFrameDroppedMaxLine = 64
-	// maxPreFrameDroppedSize bounds the file: the header and every line it
-	// can hold, each at the fixed maximum.
-	maxPreFrameDroppedSize = (1 + preFrameDroppedUIDs + 5) * preFrameDroppedMaxLine
+	// maxPreFrameDroppedSize bounds the file: the header, a line for each
+	// named uid in each class a uid line may carry, and an others line for
+	// each class, each at the fixed maximum.
+	maxPreFrameDroppedSize = (1 + preFrameDroppedUIDs*(countClassesN-1) + countClassesN) * preFrameDroppedMaxLine
+	// countClassesN is len(countClasses), untyped, so the bound above stays
+	// an untyped constant; the array checks below hold the two equal.
+	countClassesN = 7
 	// preFrameDroppedEvery is the least time between two writes of the
 	// file: a change inside it waits for the next call past it, or Close.
 	preFrameDroppedEvery = time.Second
 )
 
+// The classes the file carries past the pre-frame ones (preFrameClasses).
+// They are never a pre-frame line's class: the pre-frame charge and its
+// summaries know only preFrameClasses.
+const (
+	// countClassPostFrame is a uid's post-frame refused lines the socket's
+	// limiter or the caller's share dropped, not yet in a summary line.
+	countClassPostFrame preFrameClass = "post-frame"
+	// countClassUnaudited is the committed revocations whose audit line
+	// could not be written; it names no uid.
+	countClassUnaudited preFrameClass = "unaudited"
+)
+
+// countClasses is every class the file carries: the pre-frame classes in
+// their order, then countClassPostFrame and countClassUnaudited. An array,
+// so its length bounds the file as a constant.
+var countClasses = [...]preFrameClass{
+	preFrameClassLogin, preFrameClassRoot, preFrameClassServiceUID, preFrameClassNoUID, preFrameClassSystemHigh,
+	countClassPostFrame, countClassUnaudited,
+}
+
+// countClasses holds exactly countClassesN classes: a class added alone
+// fails to compile (a negative array length).
+var (
+	_ [len(countClasses) - countClassesN]struct{}
+	_ [countClassesN - len(countClasses)]struct{}
+)
+
+// preFrameCount reports whether c is a pre-frame class, which the server's
+// pre-frame summaries write, rather than one of the server's other counts.
+func preFrameCount(c preFrameClass) bool { return slices.Contains(preFrameClasses, c) }
+
 // errPreFrameDroppedMalformed refuses a persisted-count file that does not
 // parse strictly.
-var errPreFrameDroppedMalformed = errors.New("the persisted pre-frame refusal count does not parse")
+var errPreFrameDroppedMalformed = errors.New("the persisted server counts do not parse")
 
 // preFrameDropped is the persisted counts: each uid's, by class, and the
 // folded others, by class.
@@ -130,47 +173,105 @@ func (d preFrameDropped) totals() map[preFrameClass]uint64 {
 }
 
 // PreFrameDroppedCounts is what doctor shows of the persisted counts: the
-// refusals not yet in the audit log, the uids named, and the count folded
-// into the others lines (uids past the file's limit, not named).
+// pre-frame refusals not yet in the audit log, the uids named, and the
+// count folded into the others lines (uids past the file's limit, not
+// named); the post-frame refused lines dropped and not yet summarized, and
+// the uids named for them; and the committed revocations with no audit
+// line.
 type PreFrameDroppedCounts struct {
 	Refusals uint64
 	UIDs     int
 	Others   uint64
+	// PostFrame is the post-frame refused lines dropped, the others line's
+	// included, and PostFrameUIDs the uids named for them.
+	PostFrame     uint64
+	PostFrameUIDs int
+	// Unaudited is the committed revocations whose audit line could not be
+	// written.
+	Unaudited uint64
 }
 
 // counts is d summarised for doctor.
 func (d preFrameDropped) counts() PreFrameDroppedCounts {
 	var out PreFrameDroppedCounts
-	seen := map[uint32]bool{}
+	pre, post := map[uint32]bool{}, map[uint32]bool{}
 	for k, c := range d.uids {
-		if c == 0 {
-			continue
+		switch {
+		case c == 0:
+		case k.class == countClassPostFrame:
+			out.PostFrame = satAdd(out.PostFrame, c)
+			post[k.uid] = true
+		case preFrameCount(k.class):
+			out.Refusals = satAdd(out.Refusals, c)
+			pre[k.uid] = true
 		}
-		out.Refusals = satAdd(out.Refusals, c)
-		seen[k.uid] = true
 	}
-	for _, c := range d.others {
-		out.Refusals = satAdd(out.Refusals, c)
-		out.Others = satAdd(out.Others, c)
+	for k, c := range d.others {
+		switch {
+		case k == countClassPostFrame:
+			out.PostFrame = satAdd(out.PostFrame, c)
+		case k == countClassUnaudited:
+			out.Unaudited = satAdd(out.Unaudited, c)
+		case preFrameCount(k):
+			out.Refusals = satAdd(out.Refusals, c)
+			out.Others = satAdd(out.Others, c)
+		}
 	}
-	out.UIDs = len(seen)
+	out.UIDs, out.PostFrameUIDs = len(pre), len(post)
+	return out
+}
+
+// split is d's pre-frame counts and its other counts, each a copy.
+func (d preFrameDropped) split() (pre, other preFrameDropped) {
+	pre, other = newPreFrameDropped(), newPreFrameDropped()
+	for k, c := range d.uids {
+		if preFrameCount(k.class) {
+			pre.uids[k] = c
+		} else {
+			other.uids[k] = c
+		}
+	}
+	for k, c := range d.others {
+		if preFrameCount(k) {
+			pre.others[k] = c
+		} else {
+			other.others[k] = c
+		}
+	}
+	return pre, other
+}
+
+// join is a copy of a's counts and b's together.
+func join(a, b preFrameDropped) preFrameDropped {
+	out := a.clone()
+	for k, c := range b.uids {
+		out.uids[k] = satAdd(out.uids[k], c)
+	}
+	for k, c := range b.others {
+		out.others[k] = satAdd(out.others[k], c)
+	}
 	return out
 }
 
 // encodePreFrameDropped is d in the file's format: the preFrameDroppedUIDs
-// lowest uids named, the rest folded into one others line per class.
+// lowest uids named, the rest folded into one others line per class, and
+// countClassUnaudited on its others line alone.
 func encodePreFrameDropped(d preFrameDropped) []byte {
-	keys := make([]preFrameKey, 0, len(d.uids))
-	for k, c := range d.uids {
-		if c > 0 {
-			keys = append(keys, k)
-		}
-	}
-	slices.SortFunc(keys, comparePreFrameKey)
 	others := map[preFrameClass]uint64{}
 	for k, c := range d.others {
 		others[k] = c
 	}
+	keys := make([]preFrameKey, 0, len(d.uids))
+	for k, c := range d.uids {
+		switch {
+		case c == 0:
+		case k.class == countClassUnaudited:
+			others[k.class] = satAdd(others[k.class], c) // it names no uid
+		default:
+			keys = append(keys, k)
+		}
+	}
+	slices.SortFunc(keys, comparePreFrameKey)
 	var b bytes.Buffer
 	b.WriteString(preFrameDroppedHeader)
 	named := 0
@@ -186,7 +287,7 @@ func encodePreFrameDropped(d preFrameDropped) []byte {
 		}
 		fmt.Fprintf(&b, "%d %s %d\n", k.uid, k.class, d.uids[k])
 	}
-	classes := slices.Clone(preFrameClasses)
+	classes := slices.Clone(countClasses[:])
 	slices.Sort(classes)
 	for _, c := range classes {
 		if others[c] > 0 {
@@ -207,8 +308,9 @@ func comparePreFrameKey(a, b preFrameKey) int {
 // parsePreFrameDropped reads b strictly: the header exactly, then lines in
 // the order encodePreFrameDropped writes them, each ending in a newline, no
 // longer than preFrameDroppedMaxLine, with canonical decimal numbers, a
-// class of the closed set and a count above 0; at most preFrameDroppedUIDs
-// uids named. Anything else is errPreFrameDroppedMalformed.
+// class of the closed set (countClasses) and a count above 0, the
+// unaudited count on an others line only; at most preFrameDroppedUIDs uids
+// named. Anything else is errPreFrameDroppedMalformed.
 func parsePreFrameDropped(b []byte) (preFrameDropped, error) {
 	d := newPreFrameDropped()
 	bad := func(why string, args ...any) (preFrameDropped, error) {
@@ -239,7 +341,7 @@ func parsePreFrameDropped(b []byte) (preFrameDropped, error) {
 			return bad("line %d has %d fields", line, len(f))
 		}
 		class := preFrameClass(f[1])
-		if !slices.Contains(preFrameClasses, class) {
+		if !slices.Contains(countClasses[:], class) {
 			return bad("line %d names no class", line)
 		}
 		n, ok := canonicalUint(f[2], 64)
@@ -256,6 +358,9 @@ func parsePreFrameDropped(b []byte) (preFrameDropped, error) {
 		}
 		if prevOthers != "" {
 			return bad("line %d names a uid after an others line", line)
+		}
+		if class == countClassUnaudited {
+			return bad("line %d names a uid for a count that has none", line)
 		}
 		u, ok := canonicalUint(f[0], 32)
 		if !ok {
@@ -357,7 +462,8 @@ func (s *FileStore) PreFrameDropped(ctx context.Context) (PreFrameDroppedCounts,
 	return d.counts(), nil
 }
 
-// loadDroppedLocked reads the persisted counts and merges them into l's:
+// loadDroppedLocked reads the persisted counts and merges them into l's,
+// the pre-frame counts, and the store's (serverCounts), the others:
 // each count moves by what the file gained or lost since l last wrote it,
 // so a count already in memory is not added twice, and a count a root
 // rotate wrote to the audit log and took out of the file leaves memory too.
@@ -376,13 +482,15 @@ func (l *ServerLogs) loadDroppedLocked() {
 	}
 	if err != nil {
 		l.droppedErr = err
-		l.s.logger().Warn("keystore: the persisted pre-frame refusal count is unreadable; the server keeps its counts in memory and does not overwrite the file", "file", PreFrameDroppedName, "err", err)
+		l.s.logger().Warn("keystore: the persisted server counts are unreadable; the server keeps its counts in memory and does not overwrite the file", "file", PreFrameDroppedName, "err", err)
 		return
 	}
 	l.droppedErr = nil
-	mergeDelta(l.pending, d.uids, l.written.uids)
-	mergeDelta(l.others, d.others, l.written.others)
-	l.written = d
+	pre, other := d.split()
+	mergeDelta(l.pending, pre.uids, l.written.uids)
+	mergeDelta(l.others, pre.others, l.written.others)
+	l.written = pre
+	l.s.counts.merge(other)
 }
 
 // mergeDelta moves each count in mem by what file holds past, or short of,
@@ -411,8 +519,9 @@ func mergeDelta[K comparable](mem, file, written map[K]uint64) {
 	}
 }
 
-// persistDropped writes the pending counts to PreFrameDroppedName when
-// they changed since the last write, at most once per preFrameDroppedEvery
+// persistDropped writes the pending counts, and the store's other counts
+// (serverCounts), to PreFrameDroppedName when either changed since the
+// last write, at most once per preFrameDroppedEvery
 // on the store's clock unless force is set. It runs under l.mu, the
 // in-process mutex, and never takes the store lock: the lock may be what
 // a dropped line timed out on. A write that fails keeps the change for the
@@ -420,7 +529,7 @@ func mergeDelta[K comparable](mem, file, written map[K]uint64) {
 func (l *ServerLogs) persistDropped(force bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !l.droppedDirty || l.droppedErr != nil {
+	if (!l.droppedDirty && l.s.counts.generation() == l.countsGen) || l.droppedErr != nil {
 		return
 	}
 	now := l.s.now()
@@ -429,16 +538,18 @@ func (l *ServerLogs) persistDropped(force bool) {
 	}
 	root, err := l.s.openDir(l.s.dir, false)
 	if err != nil {
-		l.s.logger().Warn("keystore: could not persist the pre-frame refusal count", "file", PreFrameDroppedName, "err", err)
+		l.s.logger().Warn("keystore: could not persist the server counts", "file", PreFrameDroppedName, "err", err)
 		return
 	}
 	defer func() { _ = root.Close() }() // the write is synced through it
 	d := preFrameDropped{uids: l.pending, others: l.others}.clone()
-	if err := l.s.writePreFrameDropped(root, d); err != nil {
-		l.s.logger().Warn("keystore: could not persist the pre-frame refusal count", "file", PreFrameDroppedName, "err", err)
+	other, gen := l.s.counts.snapshot()
+	if err := l.s.writePreFrameDropped(root, join(d, other)); err != nil {
+		l.s.logger().Warn("keystore: could not persist the server counts", "file", PreFrameDroppedName, "err", err)
 		return
 	}
-	l.written, l.droppedAt, l.droppedDirty = d, now, false
+	l.s.counts.wrote(other)
+	l.written, l.droppedAt, l.droppedDirty, l.countsGen = d, now, false, gen
 }
 
 // DroppedPersistError is why the persisted pre-frame refusal count was

@@ -24,15 +24,8 @@ import (
 	"time"
 )
 
-// pending is uid's dropped count not yet summarized.
-func (l *refusedLines) pending(uid uint32) uint64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if rc := l.uids[uid]; rc != nil {
-		return rc.dropped
-	}
-	return 0
-}
+// pending is uid's dropped count not yet summarized, the store's.
+func (l *refusedLines) pending(uid uint32) uint64 { return l.dropped.PostFrameDropped(uid) }
 
 // refusedOfUID is uid's post-frame refused lines, summaries included.
 func (r *bridgeRig) refusedOfUID(t *testing.T, uid uint32) []auditEntry {
@@ -158,6 +151,10 @@ func TestRefusedLinesRateLimited(t *testing.T) {
 	}
 	if p := r.b.refusals.pending(uidA); p != RefusalLinesPerMinute+1 {
 		t.Fatalf("%d refusals pending a summary, want %d", p, RefusalLinesPerMinute+1)
+	}
+	// The count is the store's, which persists it: the limiter keeps none.
+	if p := r.fs.PostFrameDropped(uidA); p != RefusalLinesPerMinute+1 {
+		t.Fatalf("the store holds %d post-frame lines dropped for %d, want %d", p, uidA, RefusalLinesPerMinute+1)
 	}
 }
 

@@ -74,7 +74,8 @@ func (u *UserScope) audit(l auditLine) error {
 
 // auditState is the store's in-memory account of its audit appends:
 // whether appends are failing for everyone (a full disk, an I/O error, the
-// hard cap), and how many committed operations went unaudited. A pointer on
+// hard cap). The unaudited-operation count is the server's persisted one
+// (serverCounts, FileStore.UnauditedOps). A pointer on
 // FileStore, so a copy of the store shares it; New allocates it.
 type auditState struct {
 	failing atomic.Bool
@@ -82,8 +83,7 @@ type auditState struct {
 	// its hard cap (ErrLogFull, not one uid's own share or budget); it is
 	// written before failing, so a reader that sees failing set sees the
 	// cause of the failure that set it or of a later one.
-	full      atomic.Bool
-	unaudited atomic.Uint64
+	full atomic.Bool
 }
 
 // note records an append's outcome. A share or revocation-budget refusal is
@@ -100,25 +100,6 @@ func (a *auditState) note(err error) {
 		a.full.Store(errors.Is(err, ErrLogFull))
 		a.failing.Store(true)
 	}
-}
-
-// countUnaudited counts one committed operation whose audit line was not
-// written: a revocation (rm, rotate, withdraw) that commits first and
-// appends after, and goes ahead while appends fail.
-func (a *auditState) countUnaudited() {
-	if a != nil {
-		a.unaudited.Add(1)
-	}
-}
-
-// UnauditedOps is the number of committed user-scope operations whose audit
-// line could not be written since the store was made: the count doctor
-// shows (U112). It is kept in memory, as the design states.
-func (s *FileStore) UnauditedOps() uint64 {
-	if s.audit == nil {
-		return 0
-	}
-	return s.audit.unaudited.Load()
 }
 
 // AuditFailing reports whether the last user-scope audit append failed for

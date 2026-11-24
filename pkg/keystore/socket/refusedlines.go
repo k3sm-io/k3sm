@@ -30,7 +30,8 @@ import (
 // "The audit log", refused lines): at most RefusalLinesPerMinute lines per
 // uid in any sliding minute, the rest counted and written as one summary
 // line, at most once a minute (the first a minute after the uid's first
-// refusal), the next time that uid is refused. So a uid
+// refusal), the next time that uid is refused. The dropped count is the
+// store's, persisted in its server-counts file. So a uid
 // gets at most RefusalLinesPerMinute+1 lines a minute however many of its
 // requests are refused, a rate-limited answer's included.
 
@@ -71,30 +72,43 @@ func auditOpName(op string) string {
 	return op
 }
 
-// refusedLines is the per-uid limiter of post-frame refused lines, on the
-// injected clock.
-type refusedLines struct {
-	now func() time.Time
+// postFrameCounter is the store's persisted count of each uid's post-frame
+// refused lines dropped and not yet summarized
+// (keystore.FileStore.AddPostFrameDropped): the limiter keeps no count of
+// its own, so the count outlasts the server and a root rotate that wrote
+// it takes it out of memory too.
+type postFrameCounter interface {
+	AddPostFrameDropped(uid uint32, n uint64)
+	PostFrameDropped(uid uint32) uint64
+	PostFrameSummarized(uid uint32, n uint64)
+}
 
-	mu   sync.Mutex // guards uids
+// refusedLines is the per-uid limiter of post-frame refused lines, on the
+// injected clock, over the store's dropped count.
+type refusedLines struct {
+	now     func() time.Time
+	dropped postFrameCounter
+
+	mu   sync.Mutex // guards uids; taken before the counter's own lock
 	uids map[uint32]*refusedCount
 }
 
-// refusedCount is one uid's lines written in the last window, its dropped
-// count since its last summary, and when that summary was written.
+// refusedCount is one uid's lines written in the last window and when its
+// last summary was due.
 type refusedCount struct {
 	passed     []time.Time // within the last window, oldest first
-	dropped    uint64
 	summarized time.Time
 }
 
-func newRefusedLines(now func() time.Time) *refusedLines {
-	return &refusedLines{now: now, uids: map[uint32]*refusedCount{}}
+func newRefusedLines(now func() time.Time, dropped postFrameCounter) *refusedLines {
+	return &refusedLines{now: now, dropped: dropped, uids: map[uint32]*refusedCount{}}
 }
 
 // take decides one refusal of uid: whether its line is written, and the
 // dropped count to summarize first, zero for no summary. A summary is due
-// once a window has passed since the uid's last one.
+// once a window has passed since the uid's last one. The count stays the
+// store's until the summary is written (summarized); a line not passed is
+// the caller's to count (count).
 func (l *refusedLines) take(uid uint32) (pass bool, summary uint64) {
 	now := l.now()
 	l.mu.Lock()
@@ -102,7 +116,7 @@ func (l *refusedLines) take(uid uint32) (pass bool, summary uint64) {
 	if len(l.uids) >= pruneAt {
 		for u, rc := range l.uids {
 			rc.expire(now)
-			if len(rc.passed) == 0 && rc.dropped == 0 {
+			if len(rc.passed) == 0 && l.dropped.PostFrameDropped(u) == 0 {
 				delete(l.uids, u)
 			}
 		}
@@ -114,29 +128,22 @@ func (l *refusedLines) take(uid uint32) (pass bool, summary uint64) {
 		l.uids[uid] = rc
 	}
 	rc.expire(now)
-	if rc.dropped > 0 && !now.Before(rc.summarized.Add(refusalWindow)) {
-		summary, rc.dropped, rc.summarized = rc.dropped, 0, now
+	if n := l.dropped.PostFrameDropped(uid); n > 0 && !now.Before(rc.summarized.Add(refusalWindow)) {
+		summary, rc.summarized = n, now
 	}
 	if len(rc.passed) < RefusalLinesPerMinute {
 		rc.passed = append(rc.passed, now)
 		return true, summary
 	}
-	rc.dropped++
 	return false, summary
 }
 
-// count adds n to uid's dropped count: lines, or a summary, that could
-// not be written.
-func (l *refusedLines) count(uid uint32, n uint64) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	rc := l.uids[uid]
-	if rc == nil {
-		rc = &refusedCount{summarized: l.now()}
-		l.uids[uid] = rc
-	}
-	rc.dropped += n
-}
+// count adds n to uid's dropped count, the store's: lines that could not
+// be written.
+func (l *refusedLines) count(uid uint32, n uint64) { l.dropped.AddPostFrameDropped(uid, n) }
+
+// summarized takes n, a summary written for uid, out of its dropped count.
+func (l *refusedLines) summarized(uid uint32, n uint64) { l.dropped.PostFrameSummarized(uid, n) }
 
 // expire forgets the lines a window or more old.
 func (rc *refusedCount) expire(now time.Time) {
@@ -149,24 +156,29 @@ func (rc *refusedCount) expire(now time.Time) {
 
 // Refused implements Store: the post-frame refused line of op for p,
 // refused for reason, behind the per-uid limiter, with the uid's dropped
-// count summarized first when one is due. A line or summary that cannot
-// be written (past the uid's share, the store lock not had, appends
-// failing) is counted dropped for the next summary.
+// count summarized first when one is due. A line that cannot be written
+// (past the limiter or the uid's share, the store lock not had, appends
+// failing) is handed to the store's dropped count, which persists it; a
+// summary that cannot be written leaves the count there for the next.
 func (b *FileStoreBridge) Refused(ctx context.Context, p Peer, op, reason string) {
 	pass, summary := b.refusals.take(p.UID)
-	if !pass && summary == 0 {
-		return
+	if !pass {
+		b.refusals.count(p.UID, 1)
+		if summary == 0 {
+			return
+		}
 	}
 	u, err := b.view(p)
 	if err != nil {
 		if pass {
-			summary++
+			b.refusals.count(p.UID, 1)
 		}
-		b.refusals.count(p.UID, summary)
 		return
 	}
-	if err := u.RefusedDropped(ctx, summary); err != nil {
-		b.refusals.count(p.UID, summary)
+	if summary > 0 {
+		if err := u.RefusedDropped(ctx, summary); err == nil {
+			b.refusals.summarized(p.UID, summary)
+		}
 	}
 	if pass {
 		if err := u.Refused(ctx, auditOpName(op), reason); err != nil {

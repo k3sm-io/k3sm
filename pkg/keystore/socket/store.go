@@ -138,7 +138,7 @@ func NewFileStoreBridge(fs *keystore.FileStore, now func() time.Time) (*FileStor
 		mutations: newUIDRate(MutationsPerSecond, time.Second, now),
 		lists:     newUIDRate(ListsPerSecond, time.Second, now),
 		execReads: newUIDRate(ExecReadsPerMinute, time.Minute, now),
-		refusals:  newRefusedLines(now),
+		refusals:  newRefusedLines(now, fs),
 	}, nil
 }
 
