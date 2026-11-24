@@ -59,8 +59,8 @@ func bridgeConfig(share int64, lockWait time.Duration) func(*keystore.Config) {
 	}
 }
 
-// stepClock is a clock that moves on a second at every reading, so no
-// per-uid rate limit is reached; fixedClock never moves until told to.
+// fixedClock moves on by step at every reading (a second keeps every
+// per-uid rate limit unreached; zero never moves) and by advance.
 type fixedClock struct {
 	mu   sync.Mutex
 	t    time.Time

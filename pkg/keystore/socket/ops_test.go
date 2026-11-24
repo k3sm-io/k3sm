@@ -198,9 +198,8 @@ func TestListenerPassesAdmittedPeer(t *testing.T) {
 }
 
 // auditLostErr is a real store's error for a committed change whose audit
-// line failed: an rm on a store whose audit log is replaced by a directory
-// after the entry is put cannot be made from outside the store, so the
-// error is reached through the store's own predicate on a wrapped value.
+// line failed: an rm after the audit log is made unwritable, which commits
+// and then cannot append; it is returned wrapped, as an operation would.
 func auditLostErr(t *testing.T) error {
 	t.Helper()
 	r := newStartedBridge(t, nil)
