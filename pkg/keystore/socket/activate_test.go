@@ -47,28 +47,36 @@ func (a *fakeActivator) Activate(string) ([]int, error) {
 	return fds, a.err
 }
 
-// listeningFD binds and listens on a unix socket in a short temp dir and
-// returns the raw descriptor, deliberately without FD_CLOEXEC, as a
-// launchd that dropped the flag would hand it over.
-func listeningFD(t *testing.T) int {
+// sockDir is a short temp dir for socket paths.
+func sockDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "ksact")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	return dir
+}
+
+// rawSocket makes a unix socket of typ bound at path, listening when
+// listen is set, with FD_CLOEXEC set when cloexec is, and returns the raw
+// descriptor, as launchd would hand it over.
+func rawSocket(t *testing.T, typ int, path string, listen, cloexec bool) int {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_UNIX, typ, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: filepath.Join(dir, "keys.sock")}); err != nil {
+	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: path}); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Listen(fd, 8); err != nil {
-		t.Fatal(err)
+	if listen {
+		if err := unix.Listen(fd, 8); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if fl, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil || fl&unix.FD_CLOEXEC != 0 {
-		t.Fatalf("the fixture's descriptor: flags %#x, %v, want FD_CLOEXEC clear", fl, err)
+	if cloexec {
+		unix.CloseOnExec(fd)
 	}
 	return fd
 }
@@ -90,24 +98,32 @@ func listenerFD(t *testing.T, ln net.Listener) int {
 	return fd
 }
 
+func closed(fd int) bool {
+	_, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	return errors.Is(err, unix.EBADF)
+}
+
 // U120 (the server's half): the listener source takes launchd's
 // descriptor, never binds, closes the original, and serves a close-on-exec
 // duplicate that an exec'd child does not hold; the same listener is
 // handed back until it is closed, and then launchd is asked again.
 func TestActivatedListenerIsCloseOnExecAndReused(t *testing.T) {
+	dir := sockDir(t)
+	path := filepath.Join(dir, "keys.sock")
 	var orig []int
 	a := &fakeActivator{t: t, fds: func(t *testing.T) []int {
-		fd := listeningFD(t)
+		_ = os.Remove(path)
+		fd := rawSocket(t, unix.SOCK_STREAM, path, true, true)
 		orig = append(orig, fd)
 		return []int{fd}
 	}}
-	src := ActivatedListener("keys", a)
+	src := ActivatedListener("keys", path, a)
 	ln, err := src(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := unix.FcntlInt(uintptr(orig[0]), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
-		t.Fatalf("launchd's original descriptor is still open: %v", err)
+	if !closed(orig[0]) {
+		t.Fatal("launchd's original descriptor is still open")
 	}
 	fd := listenerFD(t, ln)
 	fl, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
@@ -123,7 +139,7 @@ func TestActivatedListenerIsCloseOnExecAndReused(t *testing.T) {
 		t.Fatalf("second call: %v, same %v, %d activations; want the same listener and one activation", err, again == ln, a.calls)
 	}
 	go func() {
-		if c, err := net.Dial("unix", ln.Addr().String()); err == nil {
+		if c, err := net.Dial("unix", path); err == nil {
 			_ = c.Close()
 		}
 	}()
@@ -142,63 +158,76 @@ func TestActivatedListenerIsCloseOnExecAndReused(t *testing.T) {
 	_ = third.Close()
 }
 
-// No activated socket keeps the user scope off with a named reason, and
-// whatever launchd handed over that is not one listening unix socket is
-// closed, never served.
+// No activated socket is ErrNotActivated (the supervisor's terminal off);
+// a descriptor without FD_CLOEXEC is ErrActivatedInheritable; anything
+// that is not exactly one listening stream socket at the keystore path is
+// ErrActivatedWrong. Every descriptor handed over is closed.
 func TestActivatedListenerRefusals(t *testing.T) {
+	dir := sockDir(t)
+	path := filepath.Join(dir, "keys.sock")
 	var handed []int
-	pipe := func(t *testing.T) []int {
-		var p [2]int
-		if err := unix.Pipe(p[:]); err != nil {
-			t.Fatal(err)
+	n := 0
+	fresh := func() string { n++; return filepath.Join(dir, "s"+strconv.Itoa(n)) }
+	give := func(make func(t *testing.T) []int) func(t *testing.T) []int {
+		return func(t *testing.T) []int {
+			fds := make(t)
+			handed = append(handed, fds...)
+			return fds
 		}
-		handed = append(handed, p[0], p[1])
-		return p[:]
 	}
-	two := func(t *testing.T) []int {
-		fds := []int{listeningFD(t), listeningFD(t)}
-		handed = append(handed, fds...)
-		return fds
-	}
-	one := func(t *testing.T) []int {
-		var p [2]int
-		if err := unix.Pipe(p[:]); err != nil {
-			t.Fatal(err)
-		}
-		_ = unix.Close(p[1])
-		handed = append(handed, p[0])
-		return p[:1]
+	atPath := func(typ int, listen, cloexec bool) func(t *testing.T) []int {
+		return give(func(t *testing.T) []int {
+			_ = os.Remove(path)
+			return []int{rawSocket(t, typ, path, listen, cloexec)}
+		})
 	}
 	for _, tt := range []struct {
 		name string
 		a    *fakeActivator
+		is   error
 		want string
 	}{
-		{"not the launchd job", &fakeActivator{err: unix.ESRCH}, "not the server's launchd job"},
-		{"no such entry", &fakeActivator{err: unix.ENOENT}, "Sockets entry \"keys\""},
-		{"error with descriptors", &fakeActivator{err: unix.EINVAL, fds: pipe}, "Sockets entry"},
-		{"two descriptors", &fakeActivator{fds: two}, "more than one descriptor"},
-		{"no descriptor", &fakeActivator{}, "no descriptor"},
-		{"not a socket", &fakeActivator{fds: one}, "not a listening socket"},
+		{"not the launchd job", &fakeActivator{err: unix.ESRCH}, ErrNotActivated, "not the server's launchd job"},
+		{"no such entry or path", &fakeActivator{err: unix.ENOENT}, ErrNotActivated, "could not create its path"},
+		{"another launchd error", &fakeActivator{err: unix.EINVAL, fds: atPath(unix.SOCK_STREAM, true, true)}, unix.EINVAL, "did not activate"},
+		{"no descriptor", &fakeActivator{}, ErrActivatedWrong, "no descriptor"},
+		{"two descriptors", &fakeActivator{fds: give(func(t *testing.T) []int {
+			return []int{rawSocket(t, unix.SOCK_STREAM, fresh(), true, true), rawSocket(t, unix.SOCK_STREAM, fresh(), true, true)}
+		})}, ErrActivatedWrong, "more than one descriptor"},
+		{"without FD_CLOEXEC", &fakeActivator{fds: atPath(unix.SOCK_STREAM, true, false)}, ErrActivatedInheritable, "FD_CLOEXEC"},
+		{"a datagram socket", &fakeActivator{fds: atPath(unix.SOCK_DGRAM, false, true)}, ErrActivatedWrong, "not a stream socket"},
+		{"bound, not listening", &fakeActivator{fds: atPath(unix.SOCK_STREAM, false, true)}, ErrActivatedWrong, "not listening"},
+		{"listening at another path", &fakeActivator{fds: give(func(t *testing.T) []int {
+			return []int{rawSocket(t, unix.SOCK_STREAM, fresh(), true, true)}
+		})}, ErrActivatedWrong, "not " + path},
+		{"not a socket", &fakeActivator{fds: give(func(t *testing.T) []int {
+			var p [2]int
+			if err := unix.Pipe(p[:]); err != nil {
+				t.Fatal(err)
+			}
+			_ = unix.Close(p[1])
+			unix.CloseOnExec(p[0])
+			return p[:1]
+		})}, ErrActivatedWrong, "SO_TYPE"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			handed = nil
 			tt.a.t = t
-			ln, err := ActivatedListener("keys", tt.a)(context.Background())
-			if ln != nil || !errors.Is(err, ErrNotActivated) {
-				t.Fatalf("got %v, %v; want ErrNotActivated", ln, err)
+			ln, err := ActivatedListener("keys", path, tt.a)(context.Background())
+			if ln != nil || !errors.Is(err, tt.is) {
+				t.Fatalf("got %v, %v; want %v", ln, err, tt.is)
 			}
 			if !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("error %q does not say %q", err, tt.want)
 			}
 			for _, fd := range handed {
-				if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
-					t.Errorf("descriptor %d left open: %v", fd, err)
+				if !closed(fd) {
+					t.Errorf("descriptor %d left open", fd)
 				}
 			}
 		})
 	}
-	if _, err := ActivatedListener("keys", nil)(context.Background()); !errors.Is(err, ErrNotActivated) {
+	if _, err := ActivatedListener("keys", path, nil)(context.Background()); !errors.Is(err, ErrNotActivated) {
 		t.Fatalf("nil activator: %v", err)
 	}
 }

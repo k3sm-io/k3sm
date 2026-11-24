@@ -25,9 +25,33 @@ package socket
 // fails with ESRCH (measured 2026-11-23: a login user, the service user, a
 // child of the job and a Pod process each got ESRCH).
 
+//
+// proc_pidfdinfo is public API (<libproc.h>). It reads this process's own
+// descriptor's socket options, because getsockopt(SO_ACCEPTCONN) is not
+// supported on darwin (ENOPROTOOPT).
+
 /*
+#include <errno.h>
 #include <launch.h>
+#include <libproc.h>
 #include <stdlib.h>
+#include <sys/proc_info.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+// k3sm_accepting is 1 when fd is a socket in the listening state, 0 when it
+// is not, and -1 with errno set when its socket info cannot be read.
+static int k3sm_accepting(int fd) {
+	struct socket_fdinfo si;
+	int n = proc_pidfdinfo(getpid(), fd, PROC_PIDFDSOCKETINFO, &si, sizeof(si));
+	if (n != (int)sizeof(si)) {
+		if (errno == 0) {
+			errno = EINVAL;
+		}
+		return -1;
+	}
+	return (si.psi.soi_options & SO_ACCEPTCONN) ? 1 : 0;
+}
 
 static int k3sm_activate(const char *name, int **fds, size_t *cnt) {
 	return launch_activate_socket(name, fds, cnt);
@@ -63,4 +87,14 @@ func (LaunchdActivator) Activate(name string) ([]int, error) {
 		return out, syscall.Errno(rc)
 	}
 	return out, nil
+}
+
+// socketAccepting reports whether fd is a socket in the listening state
+// (SO_ACCEPTCONN in its socket options).
+func socketAccepting(fd int) (bool, error) {
+	rc, err := C.k3sm_accepting(C.int(fd))
+	if rc < 0 {
+		return false, err
+	}
+	return rc == 1, nil
 }

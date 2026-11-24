@@ -638,7 +638,7 @@ func runServer(args []string) (err error) {
 	defer timedTeardownStep(logger, "helm-controller", stopHelm)
 	defer timedTeardownStep(logger, "manifest-dir", startManifestDir(ctx, restCfg, cs, logger))
 	defer timedTeardownStep(logger, "keystore-delivery", startKeystoreDelivery(ctx, plan, cs, logger))
-	defer timedTeardownStep(logger, "keystore-socket", startKeystoreSocket(ctx, plan.opts.workDir, cs, keystoreSocketListener(), logger))
+	defer timedTeardownStep(logger, "keystore-socket", startKeystoreSocket(ctx, plan.opts.workDir, cs, keystoreSocketListener(plan.opts.workDir), logger))
 	vmCapable := vmBackendAvailable() // can this node host vm guests? (3d registry, 4c datapath)
 	// 3d. The ingest registry; torn down EARLY, on cpStop's lane, and the defer is its backstop.
 	stopRegistry, registryPuller := startServerRegistry(ctx, plan, restCfg, cs, vmCapable, cpStop, logger)

@@ -22,19 +22,33 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-// ErrNotActivated is a listener source that found no socket launchd
-// activated for this process: the server was not started by its launchd
-// job (a rootless or hand-started server), the job's plist predates the
-// Sockets entry, or launchd answered with an error. The user scope stays
-// off; the server never binds keys.sock itself (docs/design/keystore.md §
-// "The socket's directory is root's").
+// ErrNotActivated is launchd answering that this process has no socket for
+// the Sockets entry: ESRCH (the process is not the server's launchd job, a
+// rootless or hand-started server) or ENOENT (the job has no such entry,
+// or launchd could not create the socket's path, such as a data root on a
+// volume that is not mounted). launchd fixed the job's definition at its
+// bootstrap, so neither changes for the life of the process: the
+// supervisor stays off as OffNotActivated and does not retry. The server
+// never binds keys.sock itself (docs/design/keystore.md § "The socket's
+// directory is root's").
 var ErrNotActivated = errors.New("no socket activated by launchd")
+
+// ErrActivatedInheritable is a descriptor launchd handed over without
+// FD_CLOEXEC. A fork between its arrival and the check could have
+// inherited it, so it is closed and refused (OffActivatedInheritable).
+var ErrActivatedInheritable = errors.New("launchd handed over the socket without FD_CLOEXEC")
+
+// ErrActivatedWrong is an activated descriptor this server will not serve:
+// other than exactly one, not a listening stream socket, or bound at
+// another path than the keystore socket's.
+var ErrActivatedWrong = errors.New("the activated socket is not the keystore's listening socket")
 
 // Activator asks launchd for the descriptors of one Sockets entry of the
 // calling process's job. LaunchdActivator is production's.
@@ -66,14 +80,24 @@ func (l activatedListener) Close() error {
 // activated for the Sockets entry name of the server's job, taken with a,
 // never a socket this process binds. The first call activates it and later
 // calls return the same listener, so the supervisor pauses and reuses it;
-// once the supervisor has closed it, the next call activates again. Each
-// descriptor enters the process inside syscall.ForkLock and is marked
-// FD_CLOEXEC there, then is duplicated close-on-exec into the listener and
-// the original closed, so no child the server starts, at any moment,
-// inherits it (Open requirement 3). No socket, more than one, or one that
-// is not a listening unix socket is an error wrapping ErrNotActivated,
-// which the supervisor reports as OffListenerUnavailable.
-func ActivatedListener(name string, a Activator) ListenerSource {
+// once the supervisor has closed it, the next call activates again.
+//
+// What it checks, closing every descriptor and refusing on any failure:
+// that launchd answered (else ErrNotActivated or the error, wrapped); that
+// it returned exactly one descriptor; that the descriptor already carries
+// FD_CLOEXEC, checked and set under syscall.ForkLock (else
+// ErrActivatedInheritable); and that it is a SOCK_STREAM socket in the
+// listening state (SO_TYPE, and SO_ACCEPTCONN read with proc_pidfdinfo) whose bound path is path (else
+// ErrActivatedWrong). The served listener is a close-on-exec duplicate and
+// the original is closed.
+//
+// What that guarantees about children: a Go fork (os/exec, which takes
+// ForkLock) sees the descriptor only with FD_CLOEXEC set, since the flag is
+// confirmed under the lock before the descriptor is used, and one that
+// arrived without it is refused. A fork made outside Go's lock (a cgo
+// spawn) relies on launchd's own flag, which it sets (measured), and Pods
+// are spawned with POSIX_SPAWN_CLOEXEC_DEFAULT.
+func ActivatedListener(name, path string, a Activator) ListenerSource {
 	var (
 		mu     sync.Mutex // guards cur and closed
 		cur    *net.UnixListener
@@ -85,7 +109,7 @@ func ActivatedListener(name string, a Activator) ListenerSource {
 		if cur != nil && !closed {
 			return activatedListener{UnixListener: cur, closed: &closed, mu: &mu}, nil
 		}
-		ln, err := activate(name, a)
+		ln, err := activate(name, path, a)
 		if err != nil {
 			return nil, err
 		}
@@ -95,42 +119,100 @@ func ActivatedListener(name string, a Activator) ListenerSource {
 }
 
 // activate takes the entry's descriptors and makes the one listener.
-func activate(name string, a Activator) (*net.UnixListener, error) {
+func activate(name, path string, a Activator) (*net.UnixListener, error) {
 	if a == nil {
 		return nil, fmt.Errorf("%w: no activator", ErrNotActivated)
 	}
-	syscall.ForkLock.RLock()
-	fds, err := a.Activate(name)
-	for _, fd := range fds {
-		unix.CloseOnExec(fd)
+	fds, err := a.Activate(name) // launchd IPC, outside ForkLock
+	if ferr := confirmCloseOnExec(fds); ferr != nil {
+		closeAll(fds)
+		return nil, fmt.Errorf("%w (Sockets entry %q)", ferr, name)
 	}
-	syscall.ForkLock.RUnlock()
 	if err != nil {
 		closeAll(fds)
 		if errors.Is(err, unix.ESRCH) {
 			return nil, fmt.Errorf("%w for the Sockets entry %q: this process is not the server's launchd job: %w", ErrNotActivated, name, err)
 		}
-		return nil, fmt.Errorf("%w for the Sockets entry %q: %w", ErrNotActivated, name, err)
+		if errors.Is(err, unix.ENOENT) {
+			return nil, fmt.Errorf("%w for the Sockets entry %q: the job has no such entry, or launchd could not create its path: %w", ErrNotActivated, name, err)
+		}
+		return nil, fmt.Errorf("launchd did not activate the Sockets entry %q: %w", name, err)
 	}
 	switch {
 	case len(fds) == 0:
-		return nil, fmt.Errorf("%w: launchd returned no descriptor for the Sockets entry %q", ErrNotActivated, name)
+		return nil, fmt.Errorf("%w: launchd returned no descriptor for the Sockets entry %q", ErrActivatedWrong, name)
 	case len(fds) > 1:
 		closeAll(fds)
-		return nil, fmt.Errorf("%w: launchd returned more than one descriptor for the Sockets entry %q, want one", ErrNotActivated, name)
+		return nil, fmt.Errorf("%w: launchd returned more than one descriptor for the Sockets entry %q, want one", ErrActivatedWrong, name)
+	}
+	if err := checkListening(fds[0], path); err != nil {
+		closeAll(fds)
+		return nil, fmt.Errorf("%w: the Sockets entry %q: %w", ErrActivatedWrong, name, err)
 	}
 	f := os.NewFile(uintptr(fds[0]), name)
 	fl, err := net.FileListener(f) // a close-on-exec duplicate
 	_ = f.Close()                  // the duplicate is the listener; the original goes
 	if err != nil {
-		return nil, fmt.Errorf("%w: the Sockets entry %q is not a listening socket: %w", ErrNotActivated, name, err)
+		return nil, fmt.Errorf("%w: the Sockets entry %q: %w", ErrActivatedWrong, name, err)
 	}
 	ln, ok := fl.(*net.UnixListener)
 	if !ok {
 		_ = fl.Close() // not ours to serve
-		return nil, fmt.Errorf("%w: the Sockets entry %q is not a unix socket", ErrNotActivated, name)
+		return nil, fmt.Errorf("%w: the Sockets entry %q is not a unix socket", ErrActivatedWrong, name)
 	}
 	return ln, nil
+}
+
+// confirmCloseOnExec, under syscall.ForkLock, reads each descriptor's
+// flags and sets FD_CLOEXEC on it; any that arrived without the flag (or
+// whose flags cannot be read) makes it return ErrActivatedInheritable.
+func confirmCloseOnExec(fds []int) error {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	var bad error
+	for _, fd := range fds {
+		fl, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+		if err != nil {
+			bad = fmt.Errorf("%w: read the descriptor's flags: %w", ErrActivatedInheritable, err)
+			continue
+		}
+		if fl&unix.FD_CLOEXEC == 0 {
+			unix.CloseOnExec(fd)
+			bad = ErrActivatedInheritable
+		}
+	}
+	return bad
+}
+
+// checkListening refuses fd unless it is a SOCK_STREAM socket in the
+// listening state bound at path.
+func checkListening(fd int, path string) error {
+	typ, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
+	if err != nil {
+		return fmt.Errorf("read SO_TYPE: %w", err)
+	}
+	if typ != unix.SOCK_STREAM {
+		return errors.New("not a stream socket")
+	}
+	acc, err := socketAccepting(fd)
+	if err != nil {
+		return fmt.Errorf("read SO_ACCEPTCONN: %w", err)
+	}
+	if !acc {
+		return errors.New("not listening")
+	}
+	sa, err := unix.Getsockname(fd)
+	if err != nil {
+		return fmt.Errorf("read its address: %w", err)
+	}
+	ua, ok := sa.(*unix.SockaddrUnix)
+	if !ok {
+		return errors.New("not a unix socket")
+	}
+	if filepath.Clean(ua.Name) != filepath.Clean(path) {
+		return fmt.Errorf("bound at %s, not %s", ua.Name, path)
+	}
+	return nil
 }
 
 // closeAll closes descriptors this process will not use.

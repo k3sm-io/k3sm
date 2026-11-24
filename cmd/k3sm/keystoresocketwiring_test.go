@@ -23,8 +23,10 @@ import (
 	"go/parser"
 	"go/token"
 	"strconv"
+	"strings"
 	"testing"
 
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/keystore/socket"
 )
 
@@ -96,12 +98,23 @@ func TestRunServerStartsKeystoreSocket(t *testing.T) {
 // binds nothing, which keeps the user scope off as the listening socket
 // being unavailable.
 func TestKeystoreSocketListenerOffOutsideLaunchd(t *testing.T) {
-	ln, err := keystoreSocketListener()(context.Background())
+	ln, err := keystoreSocketListener("/var/lib/k3sm/server")(context.Background())
 	if ln != nil {
 		_ = ln.Close()
 		t.Fatal("a listener outside the launchd job")
 	}
 	if !errors.Is(err, socket.ErrNotActivated) {
 		t.Fatalf("got %v, want ErrNotActivated", err)
+	}
+}
+
+// The path the server requires of launchd's descriptor is the one the
+// server plist's Sockets entry names.
+func TestKeystoreSocketPathIsThePlists(t *testing.T) {
+	cfg := install.Config{}
+	plist := string(install.ServerPlist(cfg))
+	want := keystoreSocketPath("/var/lib/k3sm/server")
+	if want != "/var/lib/k3sm/keystore-sock/keys.sock" || !strings.Contains(plist, "<string>"+want+"</string>") {
+		t.Fatalf("the server requires %s; the plist names it: %v", want, strings.Contains(plist, want))
 	}
 }

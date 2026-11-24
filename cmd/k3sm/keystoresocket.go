@@ -502,9 +502,16 @@ func (wallClock) After(d time.Duration) (<-chan time.Time, func() bool) {
 // (install.KeystoreSocketsEntry). A server launchd did not start, or whose
 // plist predates the entry, gets socket.ErrNotActivated, and the user scope
 // stays off as "the listening socket is unavailable"; the server never
-// binds keys.sock itself.
-func keystoreSocketListener() socket.ListenerSource {
-	return socket.ActivatedListener(install.KeystoreSocketsEntry, socket.LaunchdActivator{})
+// binds keys.sock itself. The descriptor must be bound at the keystore
+// socket's path under the work dir's data root.
+func keystoreSocketListener(workDir string) socket.ListenerSource {
+	return socket.ActivatedListener(install.KeystoreSocketsEntry, keystoreSocketPath(workDir), socket.LaunchdActivator{})
+}
+
+// keystoreSocketPath is the keystore socket's path for the server whose
+// work dir is workDir: the path the server plist's Sockets entry names.
+func keystoreSocketPath(workDir string) string {
+	return keystorepaths.SocketPath(keystoreLayout(filepath.Clean(workDir)).DataRoot)
 }
 
 // startKeystoreSocket is the server's one entry point for the keystore's

@@ -18,7 +18,11 @@ limitations under the License.
 
 package socket
 
-import "golang.org/x/sys/unix"
+import (
+	"errors"
+
+	"golang.org/x/sys/unix"
+)
 
 // LaunchdActivator is the Activator over launch_activate_socket. Without
 // cgo on darwin, or off darwin, there is no launchd to ask: every call
@@ -27,3 +31,8 @@ type LaunchdActivator struct{}
 
 // Activate reports that no socket was activated.
 func (LaunchdActivator) Activate(string) ([]int, error) { return nil, unix.ESRCH }
+
+// socketAccepting cannot read a socket's state without darwin's libproc.
+func socketAccepting(int) (bool, error) {
+	return false, errors.New("the listening state cannot be read on this build")
+}
