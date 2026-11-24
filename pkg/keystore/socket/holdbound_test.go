@@ -29,21 +29,26 @@ import (
 	"k3sm.io/k3sm/pkg/keystore"
 )
 
-// U89 and U108 end to end: uid A's scope holds tens of thousands of files
-// (an entry padded as many versions would leave it) and A rotates in a
-// loop at its mutation rate limit, while uid B removes its entries; each
-// of B's rm answers ok within a lock wait far below the 2 s default.
-// Before the usage figure, each of A's rotations walked A's whole scope
-// under the exclusive lock, longer than that wait, and B's rm answered
-// busy.
+// U89 and U108 end to end, on the wall clock: uid A's scope holds tens of
+// thousands of files in one entry (as many versions would leave it) and A
+// rotates that entry in a loop at its mutation rate limit, while uid B
+// removes its entries; each of B's rm answers ok within a lock wait far
+// below the 2 s default. Before the usage figure, each of A's rotations
+// walked A's whole scope under the exclusive lock, longer than that wait,
+// and B's rm answered busy. A wall-clock measurement, so it runs only with
+// K3SM_KEYSTORE_MEASURE set; pkg/keystore's
+// TestRotateHoldServesOtherUIDWithinLockWait is its fake-clock gate.
 func TestLockHoldBoundPerUID(t *testing.T) {
+	if os.Getenv("K3SM_KEYSTORE_MEASURE") == "" {
+		t.Skip("a wall-clock measurement: set K3SM_KEYSTORE_MEASURE to run it")
+	}
 	const (
 		padFiles = 60000
 		lockWait = 100 * time.Millisecond
 		removals = 6
 	)
 	r := newStartedBridge(t, bridgeConfig(0, lockWait))
-	for _, name := range []string{"token", "bulk"} {
+	for _, name := range []string{"bulk"} {
 		if _, err := r.b.Put(t.Context(), Peer{UID: uidA, PID: 1}, entryOf(uidA, name), keystore.KindOpaque, []byte(name)); err != nil {
 			t.Fatal(err)
 		}
@@ -66,12 +71,13 @@ func TestLockHoldBoundPerUID(t *testing.T) {
 		rotated atomic.Int64
 		sent    = make(chan struct{}, 1)
 	)
-	rotate, err := json.Marshal(map[string]string{"op": "rotate", "entry": entryOf(uidA, "token")})
+	rotate, err := json.Marshal(map[string]string{"op": "rotate", "entry": entryOf(uidA, "bulk")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	wg.Go(func() {
-		pace := time.Second / MutationsPerSecond
+		pace := time.NewTicker(time.Second / MutationsPerSecond)
+		defer pace.Stop()
 		for !stop.Load() {
 			a.s.send(t, TypeRequest, string(rotate), []byte("next"))
 			select {
@@ -81,7 +87,7 @@ func TestLockHoldBoundPerUID(t *testing.T) {
 			if f, _ := a.s.recvFrame(t); f.Type == TypeReply {
 				rotated.Add(1)
 			}
-			time.Sleep(pace)
+			<-pace.C
 		}
 	})
 	for i := range removals {
@@ -92,7 +98,7 @@ func TestLockHoldBoundPerUID(t *testing.T) {
 		default:
 		}
 		<-sent
-		time.Sleep(5 * time.Millisecond)
+		<-time.NewTimer(5 * time.Millisecond).C
 		began := time.Now()
 		code, _ := b.do(t, "rm", entryOf(uidB, "e"+strconv.Itoa(i)), nil)
 		if code != "" {

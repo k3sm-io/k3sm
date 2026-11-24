@@ -55,19 +55,19 @@ func TestWriterPreferringLock(t *testing.T) {
 			wg.Go(func() {
 				// Staggered, so the holds overlap and the share is never
 				// empty while the stream runs.
-				time.Sleep(time.Duration(i) * hold / readers)
+				bubbleWait(time.Duration(i) * hold / readers)
 				for !stop.Load() {
 					unlock, err := s.lock(ctx, root, false)
 					if err != nil {
 						continue // queued behind the writer past the wait
 					}
 					shared.Add(1)
-					time.Sleep(hold)
+					bubbleWait(hold)
 					unlock()
 				}
 			})
 		}
-		time.Sleep(2 * hold) // the stream is running
+		bubbleWait(2 * hold) // the stream is running
 		asked := time.Now()
 		unlock, err := s.lock(ctx, root, true)
 		served := time.Since(asked)
@@ -130,18 +130,18 @@ func TestPrefLockAdmitsReaderUnderWriterStream(t *testing.T) {
 		)
 		for i := range writers {
 			wg.Go(func() {
-				time.Sleep(time.Duration(i) * hold / writers)
+				bubbleWait(time.Duration(i) * hold / writers)
 				for !stop.Load() {
 					if err := l.acquire(ctx, true, wait); err != nil {
 						continue
 					}
 					held.Add(1)
-					time.Sleep(hold)
+					bubbleWait(hold)
 					l.release(true)
 				}
 			})
 		}
-		time.Sleep(2 * hold)
+		bubbleWait(2 * hold)
 		asked := time.Now()
 		err := l.acquire(ctx, false, wait)
 		served := time.Since(asked)
