@@ -47,3 +47,25 @@ func TestKeystoreTreeKeyedOnResolvedDir(t *testing.T) {
 		t.Fatal("a directory not there yet, spelled with a trailing slash, got its own TreeState")
 	}
 }
+
+// TestKeystoreTreeSameKeyAcrossCreation checks that a store directory keyed
+// before it exists, through a symlinked parent (/var on macOS), keeps its
+// TreeState once it is created.
+func TestKeystoreTreeSameKeyAcrossCreation(t *testing.T) {
+	parent := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(parent, link); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(link, "keystore")
+	before := keystoreTree(dir)
+	if err := os.Mkdir(filepath.Join(parent, "keystore"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if after := keystoreTree(dir); after != before {
+		t.Fatalf("TreeState before creation %p, after %p, want one", before, after)
+	}
+	if direct := keystoreTree(filepath.Join(parent, "keystore")); direct != before {
+		t.Fatalf("the direct spelling got TreeState %p, want %p", direct, before)
+	}
+}

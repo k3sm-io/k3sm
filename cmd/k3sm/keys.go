@@ -504,13 +504,21 @@ func keystoreTree(dir string) *keystore.TreeState {
 	return t
 }
 
-// keystoreTreeKey is dir with its symlinks resolved when it exists, else
-// dir cleaned.
+// keystoreTreeKey is dir with the symlinks of its nearest existing ancestor
+// resolved and the rest of dir joined back on, so a store directory keyed
+// before it is created gets the same key as after.
 func keystoreTreeKey(dir string) string {
-	if r, err := filepath.EvalSymlinks(dir); err == nil {
-		return r
+	dir = filepath.Clean(dir)
+	rest := ""
+	for p := dir; ; p = filepath.Dir(p) {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(r, rest)
+		}
+		if filepath.Dir(p) == p {
+			return dir
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
 	}
-	return filepath.Clean(dir)
 }
 
 // scrubTokens name scrubPaths' roots, by position.
