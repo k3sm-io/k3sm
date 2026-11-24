@@ -4016,7 +4016,20 @@ refused before its first frame:
   had (the keystore directory missing, the lock held past its wait, an invalid configuration)
   is not audited rather than appended without it; that line is counted in the uid's
   post-frame dropped count, which its next refused-line summary or root's next
-  `audit --rotate` writes and `doctor` shows (`TestAuditBrieflyCountsLineLockKeptOut`).
+  `audit --rotate` writes and `doctor` shows (`TestAuditBrieflyCountsLineLockKeptOut`). An
+  operation whose work inside its hold panics (a panic the socket's listener recovers and
+  logs) has an outcome that is not known. A revocation (`rotate`, `rm`, `withdraw`) then
+  writes no line: an `ok` line would record an operation that never finished, and a refused
+  line could hide an `rm` whose burial committed. It is counted with the unaudited operations
+  instead (`UnauditedOps`, U112), the one count of a change that may stand without its line,
+  which `doctor` shows and root's `audit --rotate` writes; the count names no uid or entry,
+  and the socket's Error line for the panicked operation, with its op, uid and
+  `requested_entry`, written as the panic leaves the operation and before the listener
+  recovers it, is where they are found (`TestPanickedOperationLogged`). A grant (`put`, a minting `put`,
+  `deliver`) has already written its `ok` line before its first write, so it follows the
+  grant's own rule for a commit that fails after the line ("Order", below): a second line,
+  with result `error`, and no count, since the grant is not unrecorded
+  (`TestPanicInHoldWritesNoOKLine`).
 - **Lock modes and fairness.** Reads (`list`, `read-for-exec`, `deliveries` and the
   reconciler's reads) take the store lock shared, and their audit lines are appended under that
   shared hold (a read is admitted against the share first, then reads, then appends its line,
@@ -4106,7 +4119,8 @@ refused before its first frame:
   or malformed refuses the grant with nothing written and no `ok` line, so no grant commits a
   write whose floor line cannot follow (U20). A refusal
   before that point is audited best effort with its result, and a commit that fails after the
-  line gets a second line with its result. Every other socket operation, and the revocation
+  line gets a second line with its result; a panic in the hold after the line is such a
+  failure, and its second line names `error`. Every other socket operation, and the revocation
   class above all (`withdraw`, `rm`, `rotate`), commits its change to the store, then appends
   its audit line, then replies. If the append fails after the commit, the change stands and the
   reply says so: `ok` with the warning `committed; audit failed`, which the CLI prints. The
@@ -4485,7 +4499,10 @@ surface, and the app consumes only those.
   fields ("Strict enough"), never through a case-insensitive, last-key-wins decode: such a field
   spelled in another case (`{"OP":"rm"}`, `{"Proto":…}`), given twice in any case
   (`{"op":"list","Op":"rm"}`) or of the wrong JSON type closes the connection
-  (`TestDispatchOpExactKey`, `TestHelloProtoExactKey`, `FuzzRequestHeader`). The names live in one place,
+  (`TestDispatchOpExactKey`, `TestHelloProtoExactKey`, `FuzzRequestHeader`, whose oracle
+  tokenizes each header with `encoding/json`'s Decoder, so a key given twice that a reader
+  accepted is seen rather than folded by a last-key-wins decode, and holds the HELLO reader to
+  the same strict rule). The names live in one place,
   `pkg/keystore/socket` (U27).
 - **The frame cap follows the value cap.** The largest frame a request needs is the store's
   maximum value, 65,536 bytes (64 KiB), plus the 8,192-byte header cap, plus 9 bytes of type
@@ -4544,7 +4561,12 @@ surface, and the app consumes only those.
   socket: the peer's own scope holds nothing it can read, and nothing on the socket path
   deletes on that answer, so it is never taken as a definitive absence. `list` alone answers
   an empty list rather than `not-found`, and only for a uid with no scope key yet (no scope
-  directory, or one with no `scope.key`: `keystore.NoScopeKey`); a scope whose `scope.key`
+  directory, or one with no `scope.key` and no entry in its `entries/`, which is what a mint
+  that crashed before its `scope.key` leaves: `keystore.NoScopeKey`). A scope directory whose
+  `entries/` holds a name and which has no `scope.key` lost its key: a mint over it would
+  orphan those entries and is refused, so every read (`read-for-exec`, `list`, `rotate`, `rm`)
+  answers it `not-found` as an incomplete scope (`keystore.ScopeIncomplete`), never an empty
+  list, and logs it (`TestNotFoundDamageLogged`, `TestCrashedMintIsNoScopeKey`); a scope whose `scope.key`
   is there but whose `entries/` directory or `deliveries` record is gone is damage, and its
   `list` answers that error's own code, `not-found` (`ErrScopeAbsent`), never an empty list
   (`TestListDamagedScopeIsNotEmpty`).
@@ -4553,21 +4575,68 @@ surface, and the app consumes only those.
   uid, `log-full` when its cause is the audit log past its hard cap and `refused` for any
   other cause (a full disk, an I/O error).
   *The server's log.* The reply carries only the code, so the request boundary
-  (`Handler.serveRequest`) logs each store error that is damage at Warn: the op, the peer's
+  (`Handler.serveRequest`) logs each store error that is damage at Warn, to the supervisor's
+  logger (`SupervisorConfig.Log`, which `NewSupervisor` gives the handler, so the lines reach
+  the server's log; the handler is then that supervisor's alone, set before anything serves,
+  and a second supervisor is refused it; `TestSupervisorLogReceivesDamage`): the op, the peer's
   uid, `requested_entry` when the request header names a valid entry (by its exact name, in
   the API grammar), a class from a closed set and that class's fixed remedy. The classes are
   `orphan-version` (answered `refused`; the owner can `rm` the entry and `put` it again),
   `floor-records-entry`, `floor-degraded` (the floor's damage or the scope's quarantine,
-  answered `refused`), `corrupt`, and `internal` for any other error answered `internal` (a
-  missing or untrusted master). The error's own text is never logged: a chain can carry text a
-  decoder built from a decrypted value, and no error in `pkg/keystore` names a length, tag or
-  byte of a value either (`TestNoErrorCarriesValueDerivedNumbers`). The ordinary outcomes
+  answered `refused`), `corrupt`, `unsupported-kind` (`ErrKindUnsupported`, a record of a kind
+  or envelope version this build cannot read: its remedy names the upgrade first, then a
+  restore or `rm` and `put` when this k3sm is current, never `doctor`; judged before `corrupt`,
+  so an unsupported envelope version a typed decode wraps in `ErrCorrupt` never gets the
+  corrupt class's `rm` and `put`), `scope-incomplete`
+  (an `ErrScopeAbsent` that is damage, `keystore.ScopeIncomplete`: a `scope.key` with no
+  `entries/` directory or `deliveries` record beside it, or entries with no `scope.key`, as a
+  partial restore leaves; still answered `not-found`, and never a uid with no scope yet,
+  `keystore.NoScopeKey`; `doctor` has no check of a scope's shape, so its remedy is the
+  recovery the design gives instead: restore the whole scope from one backup, or `sudo k3sm
+  keys rm-scope user/<uid> --yes` and then `floor --rebuild`, after which the owner puts its
+  values again, as for a scope whose key was lost to a Rewrap, above), and `internal` for any other error answered `internal` (a missing
+  or untrusted master). The store's interrupted put (`errInterruptedPut`, a `not-found`) is
+  not damage, a put that never committed which the next put discards ("Settled by the
+  implementation"), and it is the system scope's: no socket operation meets it. A user entry
+  directory with no `current`, whatever its shape, is `ErrCorrupt`, answered `internal` and
+  logged `corrupt` (`TestNotFoundDamageLogged`, `TestScopeIncompleteIsNotNoScopeKey`). The class is judged inside the reply this table gives, in its
+  order, so the log and the reply never disagree on a chain that matches more than one row:
+  the floor's damage with `ErrCorrupt` answers `internal` and logs `corrupt`, and damage
+  behind a row that is not damage (`busy`, `not-found`) logs nothing. That agreement holds by
+  construction: `damageClass` calls `outcomeOf` first and picks a class only among those its
+  code can carry. What `TestDamageClassAgreesWithOutcome` pins is each error kind's reply and
+  class: every sentinel of the table, every predicate `outcomeOf` branches on, each made by
+  the real store where it is unexported (`LockBusy`, `UserScopeOff`, `AuditRefused`,
+  `AuditLost`, `InvalidValue`, `IneligibleUID`, `FloorDegraded`, `ScopeIncomplete`), and the
+  chains read-side damage takes; and, over every pair of those joined in one chain, that the
+  class is one logged beside the reply and that an internal reply is never left unlogged. The error's own text is never logged: a chain can carry text a
+  decoder built from a decrypted value. That is the control on the reply path: an operation's
+  error reaches the client only as its code (`answer`), a reply the server cannot encode
+  (`marshalFrame`'s error) is dropped and answered `internal`, the listener discards the error
+  `Serve` returns, and the damage line carries the class and remedy, never the text. The
+  error texts themselves are kept free of a value's numbers as a second line, not the control.
+  `TestNoErrorCarriesValueDerivedNumbers` is a tripwire for the common shapes only: a `len`,
+  an index or a `tag` written inside an error constructor in `pkg/keystore` must be on a
+  reviewed list keyed by file and function; it cannot see a number that reaches an error
+  through a variable. The sites found that way are fixed and each has its own test: a quota
+  refusal names the cap and not the total that counts the value, a refused refresh-owner
+  change names neither owner, and no frame error, read or written, names a number that counts
+  a value (no frame length, no value length, no count of bytes after a header; only a cap or a
+  header length) (`TestValueNumbersNotInErrorTexts`, `TestFrameValueLengthErrorNamesNoLength`,
+  `TestFrameErrorsNameNoValueLength`). The ordinary outcomes
   (`not-found`, `exists`, `quota`, `rate-limited`, `busy`, `log-full`, and the socket's own
   refusals), a change that committed, and a cancelled or timed-out request are not logged.
-  Standing damage cannot flood the log: each (op, class) pair logs at most one line every
+  Standing damage cannot flood the log: each (uid, op, class) key logs at most one line every
   10 seconds (`socket.DamageLogInterval`), and its next line carries the count it suppressed
-  meanwhile as `suppressed`; the pairs are bounded by the closed sets
-  (`TestStoreErrorLogged`, `TestStoreErrorLogBounded`).
+  meanwhile as `suppressed`. The key carries the uid, so one login user's standing damage
+  never suppresses another uid's line (`TestStoreErrorLogPerUID`). One uid's keys are bounded
+  by the closed sets of ops and classes, and the table holds at most 1024 keys across uids: a
+  new key past that evicts the key whose last line is the oldest. `suppressed` counts the
+  whole key's suppressed lines, those of every entry its requests named, not only the
+  `requested_entry` the line names. An evicted key's next line passes at once and carries no
+  `suppressed` figure: the count it held moves to `evicted`, which the next line to pass, of
+  any key, reports once (`TestStoreErrorLogged`, `TestStoreErrorLogBounded`,
+  `TestDamageLimiterBounded`, `TestDamageLimiterReportsEvicted`).
 - **Operations on the wire.** The request and reply headers are named Go types in
   `pkg/keystore/socket` (`PutRequest`, `RotateRequest`, `ListRequest`, `RmRequest`,
   `ReadForExecRequest`; `VersionReply`, `ListReply` with `ListEntry`, `RmReply`,
@@ -6955,7 +7024,7 @@ carried by the unit rows.
 | U109 | with every audit append failing (a full disk), revocation deletes go ahead: the reconciler's `deliver-delete` and a socket `withdraw`, `rm` or `rotate` still act, their lines dropped and counted in memory and shown by `doctor`, while user mutations and reads stay refused | `k3sm/pkg/keystore/reconcile::TestRevocationDeleteProceedsOnAppendFailure` | pending: the KeyDelivery reconciler (lifecycle) |
 | U110 | when a second server registers at runtime, the next single-server check stops the listener, closing its connections, and each KeyDelivery gets `Ready=False` and `SecretRetained=True` with reason `UserScopeOff`; the delivered Secrets stay, nothing rotates or deletes them, and `doctor` says they must be deleted by hand | `k3sm/pkg/keystore/reconcile::TestSecondServerAtRuntimeStopsListenerAndReports` | pending: the KeyDelivery reconciler (lifecycle) |
 | U111 | the owner annotation never decides precedence: a Secret whose owner annotation is rewritten to name another recorded UID of the same target stays with the object that holds the claim by honoured record, `creationTimestamp` and name; an `Indeterminate` object counts as honoured | `k3sm/pkg/keystore/reconcile::TestAnnotationRewriteCannotTakeOverTarget` | pending: the KeyDelivery reconciler (authority) |
-| U112 | outside a grant (put, deliver), which appends before its first write, the order is commit, then append, then reply: an append that fails after the commit answers `ok` with the warning `committed; audit failed`, the server then refuses user mutations except the revocation class, and `doctor` counts the unaudited operations | `k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed`, `k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps`, `k3sm/pkg/keystore::TestUnauditedOpsCountsCommittedRevocations`, `TestUserRotateCrashOrder` | checked: the socket operations (the persisted unaudited count) |
+| U112 | outside a grant (put, deliver), which appends before its first write, the order is commit, then append, then reply: an append that fails after the commit answers `ok` with the warning `committed; audit failed`, the server then refuses user mutations except the revocation class, and `doctor` counts the unaudited operations: those that committed or may have committed with no line, a revocation that panicked in its hold counted whether or not it committed, the socket's Error line for the panicked operation (op, uid, `requested_entry`) being where its uid and entry are found | `k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed`, `k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps`, `k3sm/pkg/keystore::TestUnauditedOpsCountsCommittedRevocations`, `TestUserRotateCrashOrder` | checked: the socket operations (the persisted unaudited count) |
 | U113 | the listener refuses to start unless the server's effective uid is the service uid (the `_k3sm` uid install creates): a rootless `k3sm server`, whose Pods inherit the daemon's login uid, runs no listener, and the server log and `doctor` say "user scope needs the installed server" (seam: euid source) | `k3sm/pkg/keystore/socket::TestListenerRefusesUnlessServiceUID` | checked: the socket listener (lifecycle) |
 | U114 | `rm-scope` writes `keystore-removed-scopes.json` in the data root, root-owned, through the data-root descriptor rules, listing the removed scope's uid and bound GeneratedUID before it removes the scope; only a scope listed there counts as removed for the finalizer, and a plain `ErrScopeAbsent` stays non-definitive and keeps the finalizer (seam: euid source) | `k3sm/cmd/k3sm::TestRmScopeRecordsRemovedScope`, `k3sm/pkg/keystore/reconcile::TestOnlyRecordedRemovalCountsAsWithdrawn` | pending: the KeyDelivery reconciler (lifecycle) |
 | U115 | `rm-scope` names each blocking binding, a RoleBinding with its namespace; `--remove-bindings` deletes each listed binding through the admin client before anything else changes, and a failed delete stops the verb, changing nothing further | `k3sm/cmd/k3sm::TestRmScopeNamesBindingsAndRemovesThem` | pending: the KeyDelivery reconciler (lifecycle) |

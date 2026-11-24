@@ -278,11 +278,23 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	defer done()
+	finished := false
 	defer func() { // before done: the refusal's line is appended under the lock
+		if !finished {
+			g.refused(errHoldPanicked)
+			return
+		}
 		if err != nil {
 			g.refused(err)
 		}
 	}()
+	v, err := u.putLocked(root, name, kind, value, g)
+	finished = true
+	return v, err
+}
+
+// putLocked is put's work under the exclusive lock.
+func (u *UserScope) putLocked(root *os.Root, name string, kind Kind, value []byte, g *grantAudit) (Version, error) {
 	if err := u.s.admit(u.uid, false); err != nil {
 		return Version{}, err
 	}
@@ -689,7 +701,7 @@ func (u *UserScope) openScopeFull(root *os.Root, wrap func() (keys, error)) (*op
 	}()
 	ku, gen, err := u.readScopeKey(dir, wrap)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, u.lostScopeKey(dir, err)
 	}
 	uk, err := deriveKeys(ku, u.scope)
 	dk := deliveriesKey(ku, u.scope)
@@ -698,19 +710,47 @@ func (u *UserScope) openScopeFull(root *os.Root, wrap func() (keys, error)) (*op
 		return nil, nil, err
 	}
 	if _, err := dir.Lstat(deliveriesName); errors.Is(err, fs.ErrNotExist) {
-		return nil, nil, fmt.Errorf("%w: the scope has a scope key and no %s record", ErrScopeAbsent, deliveriesName)
+		return nil, nil, incompleteScope(fmt.Errorf("%w: the scope has a scope key and no %s record", ErrScopeAbsent, deliveriesName))
 	} else if err != nil {
 		return nil, nil, fmt.Errorf("check for %s: %w", deliveriesName, err)
 	}
 	entries, err := u.s.openSubdir(dir, scopeEntriesName, false)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil, fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent)
+		return nil, nil, incompleteScope(fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent))
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err)
 	}
 	ok = true
 	return &openedScope{dir: dir, key: dk, gen: gen, uk: uk}, entries, nil
+}
+
+// lostScopeKey is err, from reading dir's scope.key, made an incomplete
+// scope (ScopeIncomplete) when it is errNoScopeKey and dir's entries/
+// holds a name: the scope lost its key, and a mint over it would orphan
+// those entries, so it is neither a uid with no scope yet nor mintable
+// (checkMintable refuses it the same way). An entries/ that is empty, with
+// or without a deliveries record, is what a mint that crashed before its
+// scope.key leaves, and stays errNoScopeKey; so does an entries/ that does
+// not open as the store's, which a mint would judge itself.
+func (u *UserScope) lostScopeKey(dir *os.Root, err error) error {
+	if !errors.Is(err, errNoScopeKey) {
+		return err
+	}
+	entries, oerr := u.s.openSubdir(dir, scopeEntriesName, false)
+	if oerr != nil {
+		return err
+	}
+	defer func() { _ = entries.Close() }() // read-only
+	f, oerr := entries.Open(".")
+	if oerr != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }() // read-only
+	if names, _ := f.Readdirnames(1); len(names) == 0 {
+		return err
+	}
+	return incompleteScope(fmt.Errorf("%w: entries/ holds names and there is no scope key; restore scope.key", ErrScopeAbsent))
 }
 
 // openScopeDir opens .user/<uid>/ under root, each level with openSubdir,
@@ -1062,7 +1102,7 @@ func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, 
 	if fl, err := u.s.userFloor.floor(u.scope, deliveriesFloorName, g); err != nil {
 		return keys{}, nil, err
 	} else if fl > 1 {
-		return keys{}, nil, fmt.Errorf("%w: the user-scope floor records %s writes under a scope key that is gone; restore scope.key", ErrScopeAbsent, deliveriesName)
+		return keys{}, nil, incompleteScope(fmt.Errorf("%w: the user-scope floor records %s writes under a scope key that is gone; restore scope.key", ErrScopeAbsent, deliveriesName))
 	}
 	// Its own refusals come before the grant line, which is appended only
 	// for a mint that goes ahead, and still before its first write.
@@ -1101,7 +1141,7 @@ func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, 
 		return keys{}, nil, err
 	}
 	if len(names) > 0 {
-		return keys{}, nil, fmt.Errorf("%w: entries/ holds %d names and there is no scope key, so a new key would orphan them; restore scope.key", ErrScopeAbsent, len(names))
+		return keys{}, nil, incompleteScope(fmt.Errorf("%w: entries/ holds %d names and there is no scope key, so a new key would orphan them; restore scope.key", ErrScopeAbsent, len(names)))
 	}
 	ku := make([]byte, scopeKeySize)
 	defer clear(ku) // only the derived keys outlive the mint
@@ -1152,7 +1192,7 @@ func (u *UserScope) checkMintable(dir *os.Root) error {
 		return err
 	}
 	if len(names) > 0 {
-		return fmt.Errorf("%w: entries/ holds %d names and there is no scope key, so a new key would orphan them; restore scope.key", ErrScopeAbsent, len(names))
+		return incompleteScope(fmt.Errorf("%w: entries/ holds %d names and there is no scope key, so a new key would orphan them; restore scope.key", ErrScopeAbsent, len(names)))
 	}
 	return nil
 }

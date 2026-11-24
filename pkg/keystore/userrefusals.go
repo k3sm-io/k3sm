@@ -55,6 +55,28 @@ func ScopesNotCaughtUp(err error) bool { return errors.Is(err, errScopesNotCaugh
 // record is ErrScopeAbsent too, but damage, and is not this.
 func NoScopeKey(err error) bool { return errors.Is(err, errNoScopeKey) }
 
+// incompleteScopeError marks an ErrScopeAbsent that is damage: part of a
+// scope is there and part is gone, a scope.key with no entries/ directory
+// or no deliveries record beside it, or entries (or the floor's record of
+// deliveries) with no scope.key. Its text is the wrapped error's.
+type incompleteScopeError struct{ err error }
+
+func (e incompleteScopeError) Error() string { return e.err.Error() }
+func (e incompleteScopeError) Unwrap() error { return e.err }
+
+// incompleteScope marks err, an ErrScopeAbsent, as an incomplete scope.
+func incompleteScope(err error) error { return incompleteScopeError{err: err} }
+
+// ScopeIncomplete reports whether err is an ErrScopeAbsent that is damage:
+// a scope.key with no entries/ directory or no deliveries record beside it
+// (a partial restore), or entries or the floor's deliveries record with no
+// scope.key. It is never NoScopeKey, the absence a uid with no scope yet
+// answers.
+func ScopeIncomplete(err error) bool {
+	var e incompleteScopeError
+	return errors.As(err, &e)
+}
+
 // InvalidValue reports whether err refused the caller's value as one its
 // kind does not take: an Ed25519 key of the wrong length, or one whose
 // public half does not match its seed. Nothing was written.

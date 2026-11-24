@@ -22,6 +22,8 @@ import (
 	"errors"
 	"io"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 
 	"k3sm.io/k3sm/pkg/keystore"
@@ -273,5 +275,63 @@ func TestReadHelloRefusesBeforeTheBody(t *testing.T) {
 	}
 	if f, err := ReadHello(bytes.NewReader(ok)); err != nil || string(f.Header) != helloV1 {
 		t.Fatalf("ReadHello on a HELLO = %q, %v", f.Header, err)
+	}
+}
+
+// A frame whose value length does not fill it is refused without naming
+// either length: what is left of the frame after the header is the
+// value's length, and an error's text can reach a log.
+//
+// The one rule for every frame error: no number that counts a value, so
+// no frame length (read or written), no count of bytes after a header;
+// a cap, a constant, and a header length, which is no value's, may be
+// named.
+func TestFrameErrorsNameNoValueLength(t *testing.T) {
+	big := bytes.Repeat([]byte("v"), MaxFrame)
+	n := uint32(MaxFrame + 4321)
+	for _, tc := range []struct {
+		name  string
+		err   error
+		leaks []string
+	}{
+		{"a written frame over the cap", func() error {
+			_, err := AppendFrame(nil, Frame{Type: TypeRequest, Header: []byte("{}"), Value: big})
+			return err
+		}(), []string{strconv.Itoa(minFrame + 2 + 4 + len(big))}},
+		{"a read frame over the cap", func() error {
+			_, err := ReadFrame(bytes.NewReader(be(n)))
+			return err
+		}(), []string{strconv.FormatUint(uint64(n), 10)}},
+		{"a HELLO with bytes after its header", func() error {
+			hdr := []byte("{}")
+			_, err := ReadHello(bytes.NewReader(cat(be(uint32(1+4+len(hdr)+4+1234)), []byte{byte(TypeHello)}, be(uint32(len(hdr))), hdr, be(1234), bytes.Repeat([]byte("v"), 1234))))
+			return err
+		}(), []string{"1238", "1234"}},
+	} {
+		if !isProtocolError(tc.err) {
+			t.Errorf("%s: %v, want a protocol error", tc.name, tc.err)
+			continue
+		}
+		for _, leak := range tc.leaks {
+			if strings.Contains(tc.err.Error(), leak) {
+				t.Errorf("%s: the refusal %q carries %s, a length that counts a value", tc.name, tc.err, leak)
+			}
+		}
+	}
+}
+
+func TestFrameValueLengthErrorNamesNoLength(t *testing.T) {
+	value := bytes.Repeat([]byte("v"), 1234)
+	hdr := []byte("{}")
+	n := uint32(1 + 4 + len(hdr) + 4 + len(value))
+	b := cat(be(n), []byte{byte(TypeRequest)}, be(uint32(len(hdr))), hdr, be(4321), value)
+	_, err := ReadFrame(bytes.NewReader(b))
+	if !isProtocolError(err) {
+		t.Fatalf("a short value length: %v, want a protocol error", err)
+	}
+	for _, leak := range []string{"1234", "4321"} {
+		if bytes.Contains([]byte(err.Error()), []byte(leak)) {
+			t.Errorf("the refusal %q carries %s, a value length", err, leak)
+		}
 	}
 }

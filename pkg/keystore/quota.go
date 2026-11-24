@@ -88,7 +88,8 @@ func judgeScopeQuota(used map[string]int64, name string, value []byte, base int6
 	}
 	add := entryWriteBytes(name, value)
 	if total+add > maxScopeBytes {
-		return fmt.Errorf("%w: the scope's sealed records would be %d bytes with its deliveries record, over %d", ErrQuota, total+add, maxScopeBytes)
+		// The total is not named: it counts the value's length.
+		return fmt.Errorf("%w: the scope's sealed records would be over %d bytes with its deliveries record and this value", ErrQuota, maxScopeBytes)
 	}
 	return nil
 }
@@ -199,7 +200,12 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 		return err
 	}
 	defer done()
+	finished := false
 	defer func() { // before done: the line is appended under the lock
+		if !finished {
+			u.panicGap()
+			return
+		}
 		l := auditLine{op: "rm", name: name, revoke: err == nil || Committed(err)}
 		err = u.keepAuditFailure("rm", err, u.appendAudit(l, err))
 	}()
@@ -214,6 +220,7 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 		}
 	}
 	err = u.deleteBody(root, name, mark)
+	finished = true
 	if op != nil && err == nil {
 		op.confirm(func(m map[string]int64) { delete(m, name) })
 	}
@@ -715,11 +722,11 @@ func (u *UserScope) openEntriesForRevoke(root *os.Root) (entries *os.Root, gen [
 	defer func() { _ = dir.Close() }() // nothing is written in the scope directory
 	r, err := u.s.readScopeKeyRecord(dir)
 	if err != nil {
-		return nil, gen, nil, err
+		return nil, gen, nil, u.lostScopeKey(dir, err)
 	}
 	entries, err = u.s.openSubdir(dir, scopeEntriesName, false)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, r.generation, fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent), nil
+		return nil, r.generation, incompleteScope(fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent)), nil
 	}
 	if err != nil {
 		return nil, r.generation, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err), nil

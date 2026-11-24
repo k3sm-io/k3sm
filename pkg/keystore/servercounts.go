@@ -156,9 +156,13 @@ func (s *FileStore) countUnaudited() {
 	})
 }
 
-// UnauditedOps is the number of committed user-scope operations whose audit
-// line could not be written and no root audit --rotate has written yet: the
-// count doctor shows (U112). It is persisted in the server-counts file
+// UnauditedOps is the number of user-scope operations that committed, or
+// may have committed, with no audit line, and that no root audit --rotate
+// has written yet: the count doctor shows (U112). A revocation whose append
+// failed after its commit is counted, and so is a rotate, rm or withdraw
+// that panicked under the store lock, whether or not it committed. The
+// count names no uid or entry: for a panic, the socket listener's log line
+// of the recovered panic, at the same time, is where those are found. It is persisted in the server-counts file
 // (PreFrameDroppedName), read back when the store's ServerLogs opens and
 // at every reopen, so it outlasts a restart.
 func (s *FileStore) UnauditedOps() uint64 {

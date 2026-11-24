@@ -129,7 +129,12 @@ func (u *UserScope) rotate(ctx context.Context, name string, next nextValue) (v 
 		return Version{}, err
 	}
 	defer done()
+	finished := false
 	defer func() { // before done: the line is appended under the lock
+		if !finished {
+			u.panicGap()
+			return
+		}
 		committed := err == nil || Committed(err)
 		l := auditLine{op: "rotate", name: name, revoke: committed}
 		if committed {
@@ -137,7 +142,21 @@ func (u *UserScope) rotate(ctx context.Context, name string, next nextValue) (v 
 		}
 		err = u.keepAuditFailure("rotate", err, u.appendAudit(l, err))
 	}()
-	return u.rotateBody(ctx, root, name, next)
+	v, err = u.rotateBody(ctx, root, name, next)
+	finished = true
+	return v, err
+}
+
+// panicGap is the audit of a revocation (rotate, rm, withdraw) whose work
+// under the lock panicked: no line, since its err is nil and an ok line
+// would record an operation that never finished, and a refused line could
+// hide one that committed (an rm's burial); the operation is counted
+// unaudited instead (UnauditedOps), which doctor shows and root's
+// audit --rotate writes. The panic goes on to the socket's listener, which
+// recovers it and logs it. A grant, whose ok line is written before its
+// first write, names errHoldPanicked in a second line instead.
+func (u *UserScope) panicGap() {
+	u.s.countUnaudited()
 }
 
 // rotateBody is rotate's work under the lock.
