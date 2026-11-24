@@ -17,9 +17,12 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"maps"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -75,5 +78,42 @@ func TestUserScopeOffWhileMergePending(t *testing.T) {
 	userPut(t, u, "user/1001/b", "v")
 	if err := u.Delete(ctx, "user/1001/a"); err != nil {
 		t.Fatalf("a user rm after the merge: %v", err)
+	}
+}
+
+// TestUserScopeDeliverRefusedWhileMergePending: while a restore is staged,
+// a user deliver is refused with errMergePending and writes nothing: the
+// scope's delivery record is byte for byte what it was, and the delivery is
+// not recorded, so the reconciler, which writes Secrets only from recorded
+// deliveries (and itself holds every sweep while a restore is staged,
+// TestDeliveryRefusedWhileMergePending), has none to write. Once keys
+// floor merge has run, the same deliver lands.
+func TestUserScopeDeliverRefusedWhileMergePending(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := newDeliveryScope(t)
+	record := filepath.Join(scopeDir(server, "1001"), deliveriesName)
+	before, beforeErr := os.ReadFile(record)
+	aside := maps.Clone(floorOf(t, server))
+	aside["gone"] = floorEntry{Buried: []burial{{Generation: mgen(100), Deleted: 1}}}
+	writeAsideFloor(t, server, aside)
+	d := testDelivery(1)
+	if err := u.Deliver(ctx, exportDelivery(d)); !errors.Is(err, errMergePending) {
+		t.Fatalf("a user deliver with a restore staged: %v, want errMergePending", err)
+	}
+	after, afterErr := os.ReadFile(record)
+	if !bytes.Equal(before, after) || (beforeErr == nil) != (afterErr == nil) {
+		t.Fatalf("the delivery record changed under a refused deliver: %d bytes (%v) became %d (%v)", len(before), beforeErr, len(after), afterErr)
+	}
+	if _, err := u.Delivery(ctx, d.uid); err == nil {
+		t.Fatal("the refused delivery is recorded")
+	}
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); err != nil {
+		t.Fatalf("keys floor merge: %v", err)
+	}
+	if err := u.Deliver(ctx, exportDelivery(d)); err != nil {
+		t.Fatalf("a user deliver after the merge: %v", err)
+	}
+	if _, err := u.Delivery(ctx, d.uid); err != nil {
+		t.Fatalf("the delivery after the merge: %v", err)
 	}
 }
