@@ -23,6 +23,8 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"k3sm.io/k3sm/pkg/keystore"
 )
 
 // secretValue is the request value the clearing tests look for.
@@ -31,9 +33,10 @@ var secretValue = []byte("SECRET-VALUE-BYTES")
 // recordingConn is a Conn over in, which keeps every buffer it read into,
 // so a test can see whether the value read into one was zeroed.
 type recordingConn struct {
-	in   *bytes.Reader
-	bufs [][]byte
-	out  bytes.Buffer
+	in     *bytes.Reader
+	bufs   [][]byte
+	out    bytes.Buffer
+	writes [][]byte // each buffer written from, as the server passed it
 }
 
 func (c *recordingConn) Read(p []byte) (int, error) {
@@ -41,7 +44,10 @@ func (c *recordingConn) Read(p []byte) (int, error) {
 	c.bufs = append(c.bufs, p[:n])
 	return n, err
 }
-func (c *recordingConn) Write(p []byte) (int, error)      { return c.out.Write(p) }
+func (c *recordingConn) Write(p []byte) (int, error) {
+	c.writes = append(c.writes, p)
+	return c.out.Write(p)
+}
 func (c *recordingConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *recordingConn) SetWriteDeadline(time.Time) error { return nil }
 
@@ -116,6 +122,38 @@ func TestServeClearsValueOnEveryExit(t *testing.T) {
 			}
 		})
 	}
+	// A real read-for-exec reply: the store's value is encoded into the
+	// reply's frame and written; after the write, both the value the store
+	// returned and the encoded buffer the server wrote from are zeroed.
+	t.Run("read-for-exec reply", func(t *testing.T) {
+		st := &execValueStore{value: bytes.Clone(secretValue)}
+		oh, err := NewOpsHandler(time.Now, st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := frameBytes(t, Frame{Type: TypeRequest, Header: []byte(`{"op":"read-for-exec","entry":"user/70001/a"}`)})
+		c := &recordingConn{in: bytes.NewReader(append(bytes.Clone(hello), req...))}
+		if err := oh.Serve(t.Context(), c, Peer{UID: uidA}); err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+		hr, err := ReadReply(&c.out) // the HELLO reply
+		if err != nil || hr.Type != TypeHello {
+			t.Fatalf("the HELLO reply: %+v, %v", hr, err)
+		}
+		f, err := ReadReply(&c.out)
+		if err != nil || f.Type != TypeReply || !bytes.Equal(f.Value, secretValue) {
+			t.Fatalf("the read-for-exec reply: %+v, %v; want the value as its binary part", f, err)
+		}
+		if len(c.writes) != 2 {
+			t.Fatalf("%d writes, want the HELLO reply and the read-for-exec reply", len(c.writes))
+		}
+		if w := c.writes[1]; !bytes.Equal(w, make([]byte, len(w))) {
+			t.Fatalf("the reply's encoded buffer was not zeroed after the write: %q", w)
+		}
+		if !bytes.Equal(st.value, make([]byte, len(st.value))) {
+			t.Fatalf("the value the store returned was not zeroed after the write: %q", st.value)
+		}
+	})
 	// readFrame alone, on a value cut part way.
 	c := &recordingConn{in: bytes.NewReader(cut)}
 	if _, err := ReadFrame(c); !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -124,4 +162,18 @@ func TestServeClearsValueOnEveryExit(t *testing.T) {
 	if c.leftover() {
 		t.Fatal("ReadFrame left a part-read value in its buffer")
 	}
+}
+
+// execValueStore is a Store whose read-for-exec returns value, the
+// slice itself, so a test can see whether the server zeroed it. Admit
+// admits everything; no other call is made.
+type execValueStore struct {
+	Store
+	value []byte
+}
+
+func (s *execValueStore) Admit(Peer, string) error                      { return nil }
+func (s *execValueStore) Refused(context.Context, Peer, string, string) {}
+func (s *execValueStore) ReadForExec(context.Context, Peer, string) (keystore.Version, []byte, error) {
+	return keystore.Version{Version: 3}, s.value, nil
 }
