@@ -588,11 +588,11 @@ check U30 "with two servers registered, the listener does not start and doctor s
 	k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers TestSecondServerStopsServingListener k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow TestKeystoreServerCountNames
 check U31 "a missing or unflagged file logs the install Warn at start and on each retry; doctor reports user scope off (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry TestInstallMissingLogNamesInstall TestPreconditionsCheck k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow TestDoctorKeystoreSocketLstat TestDoctorKeystoreKubeconfigPermission TestDoctorKeystoreReopenJudgement
-pend U32 "a grant (put, deliver) appends its audit line before its first write, and every other operation's order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (socket operations)" \
+check U32 "a grant (put, deliver) appends its audit line before its first write, and every other operation's order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (socket operations)" \
 	k3sm/pkg/keystore/socket::TestAuditBeforeReply TestAuditFailureRefusesOps k3sm/pkg/keystore::TestExecReadRefusedWhenAuditFails TestUserRotateCrashOrder
-pend U33 "refused lines are rate-limited per uid with a summary of the dropped count (socket operations)" \
+check U33 "refused lines are rate-limited per uid with a summary of the dropped count (socket operations)" \
 	k3sm/pkg/keystore/socket::TestRefusedLinesRateLimited
-pend U34 "5 mutating ops a second per uid; 30 read-for-exec a minute per uid, each audited exec-read (socket operations)" \
+check U34 "5 mutating ops a second per uid; 30 read-for-exec a minute per uid, each audited exec-read (socket operations)" \
 	k3sm/pkg/keystore/socket::TestMutationRateLimit TestExecReadCapPerUID k3sm/pkg/keystore::TestExecReadAudited
 check U35 "the socket server's store interface has no reveal, show or rewrap method (socket operations)" \
 	k3sm/pkg/keystore/socket::TestStoreInterfaceHasNoRevealMethod

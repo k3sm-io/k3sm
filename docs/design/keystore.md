@@ -3932,7 +3932,19 @@ refused before its first frame:
   append succeeds (U32). The revocation class is the exception: a socket `withdraw`, `rm` or
   `rotate` and the reconciler's revocation deletes still go ahead, their lines dropped and
   counted in memory, and `doctor` shows the count. A full disk must not keep a revoked
-  credential delivered (U109). The user docs recommend, without requiring, a data volume with
+  credential delivered (U109). As built: the failure is the store's own account of its
+  appends (`FileStore.AuditFailing`), set by an append the file system or the hard cap
+  refused and cleared by the next one that succeeds, and the socket refuses a request with
+  `refused` while it is set, after the request's header, value and rate limit pass and
+  before the store is called (the deliver and deliveries placeholders too; `withdraw` is
+  in the revocation class). Past the hard cap a grant's own refusal line cannot be written,
+  so a `put` refused `log-full` there sets the failure, and later puts and reads answer
+  `refused` until an append succeeds. Two appends can still succeed while it is set, so the
+  state recovers without a restart: a revocation's line (which, past the hard cap, draws on
+  its uid's margin) and a refused request's own post-frame `refused` line (rate-limited per
+  uid as below); either ends the failure for every uid. A read whose line fails is refused
+  even when its answer is that the scope does not exist, so a `list` for a uid with no
+  scope is never served as an empty list without its line. The user docs recommend, without requiring, a data volume with
   an APFS reserve (`diskutil apfs addVolume … -reserve`), so that other writers on the Mac
   cannot fill the keystore's disk.
 - **Coverage.** Three sources write lines besides the socket's operations, so no act on the
@@ -3949,6 +3961,24 @@ refused before its first frame:
     carrying the peer uid (U54).
 - **`refused` lines are rate-limited per uid**, at most 10 a minute, with one summary line
   giving the count dropped, so a hostile local user cannot fill the log with refusals (U33).
+  A post-frame line is the line of a request the socket refused itself, after the peer was
+  admitted and before the store was called: `{"v":1,"ts":…,"op":"refused","via":"socket","caller":{"uid":<peer
+  uid>,"pid":<pid>},"scope":"user/<peer uid>","name":"","namespace":"","request":"<op>","result":"<reason>"}`,
+  `request` naming the operation as the log names it (`put`, `rotate`, `rm`, `list`,
+  `exec-read`, `deliver`, `withdraw`, `deliveries`) and `result` one of a closed set:
+  `bad-header` (a header field of the wrong type, a kind the socket does not store, a header
+  over its cap), `bad-value` (a value missing, empty, oversize, or where the operation takes
+  none), `not-served` (a delivery placeholder), `rate-limited`, and `audit-failing` (the
+  fail-closed rule below). It carries no entry name, value or other text the peer sent, is
+  appended under the store lock taken for it alone, and is charged to the caller's share,
+  so a line past the share is not written. The 10 a minute are counted per uid on a sliding
+  minute, rate-limited answers included, before the line is written; every line not written
+  (past the limit or the share, the lock not had, the append failed) is counted, and the
+  count is written as one summary, `"result":"dropped"` with a `dropped` count and no
+  `request`, at most once a minute (the first a minute after the uid's first refusal), the
+  next time that uid is refused, before that refusal's own line. So a uid writes at most 11
+  such lines a minute however many of its requests are refused. A count still pending when
+  the server stops is lost with it (`keystore/socket.FileStoreBridge`, `keystore.UserScope.Refused`).
   Pre-frame refusals are rate-limited the same way, per peer uid, with their own dropped-count
   summary (U54).
   A pre-frame line is `{"v":1,"ts":…,"op":"refused","via":"socket","caller":{"uid":<peer
@@ -4275,7 +4305,7 @@ surface, and the app consumes only those.
   | `list` | nothing more | none | `entries`: each `name`, `kind`, `version`, `versions`, `created` (RFC 3339, UTC), `fingerprint`, `status` | none |
   | `rm` | `entry` | none | `{}` | none |
   | `read-for-exec` | `entry` | none | `version` | the entry's current value |
-  | `deliver`, `withdraw`, `deliveries` | (the delivery slice defines them) | | answered `refused` until that slice serves them, never `unknown-op` | |
+  | `deliver`, `withdraw`, `deliveries` | (the delivery slice defines them) | | answered `refused` until that slice serves them, never `unknown-op`, with a post-frame `refused` line, `not-served` | |
 
   - *Names.* `entry` is the API form only, `user/<uid>/<name>` ("Scope strings and names":
     no bare name, and the short name is CLI input, resolved before it reaches the API). The
@@ -4294,7 +4324,8 @@ surface, and the app consumes only those.
     empty where one is required, over the store's 64 KiB value cap, or present on an
     operation that takes none (`list`, `rm`, `read-for-exec`, and `rotate` with
     `from_version`), and a `rotate` with both a value or neither, are `refused` before the
-    store is reached, so they write no store line; they are never `internal`. A value is
+    store is reached, so they write no store line, only the socket's post-frame `refused`
+    line ("The audit log", refused lines); they are never `internal`. A value is
     zeroed once its reply is written, whatever the outcome.
   - *A uid with no scope.* `list` for a peer whose scope does not exist yet answers an empty
     `entries` list, not `not-found` ("A read never mints a scope"). The store has already
@@ -4319,7 +4350,14 @@ before it; a connection past either connection cap is closed at accept with noth
 no `refused` line);
 5 mutating operations a second per uid; `list` and `deliveries` rate-limited per uid like
 mutations, at 5 a second; `read-for-exec` at most 30 a minute per uid, each audited as
-`exec-read` (U28, U34, U51). Reads are limited too because each one writes an audit line; that
+`exec-read` (U28, U34, U51). As built (`socket.MutationsPerSecond`, `ListsPerSecond`,
+`ExecReadsPerMinute`): each is a sliding window per uid on the server's clock; the 5
+mutations count `put`, `rotate` (either form), `rm`, `deliver` and `withdraw` together; the
+5 a second of `list` and `deliveries` count the two together; the delivery placeholders
+take their operation's limit before they answer `refused`. A request is judged in this
+order: its header and value, then its uid's rate limit, then the fail-closed rule, then the
+store; a request past its limit is `rate-limited` and the store is not called, and one
+refused by the fail-closed rule has used its place in the limit. Reads are limited too because each one writes an audit line; that
 line is charged to the uid's log share like a mutation's, and past the share the read is
 refused ("Per-uid fairness").
 
@@ -6552,9 +6590,9 @@ carried by the unit rows.
 | U29 | a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request (seam: clock) | `k3sm/pkg/keystore/socket::TestListenerRecoversPanic`, `TestStaleSocketUnlinkChecksOwner`, `TestBoundedLockWait`, `TestAbandonedLockWaitsBounded`, `TestCheckBackoffResetsOnPassingChecks`, `k3sm/cmd/k3sm::TestKeystoreSocketWiring`, `TestKeystoreSocketRecoversSupervisorPanic` | checked: the socket listener (lifecycle) |
 | U30 | with two servers registered, the listener does not start and `doctor` says why | `k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers`, `TestSecondServerStopsServingListener`, `k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow`, `TestKeystoreServerCountNames` | checked: the socket listener (lifecycle) |
 | U31 | a missing or unflagged file logs the install Warn at start and on each retry; `doctor` reports user scope off (seams: chflags flag source, clock) | `k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry`, `TestInstallMissingLogNamesInstall`, `TestPreconditionsCheck`, `k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow`, `TestDoctorKeystoreSocketLstat`, `TestDoctorKeystoreKubeconfigPermission`, `TestDoctorKeystoreReopenJudgement` | checked: the socket listener (server wiring and doctor) |
-| U32 | a grant (put, deliver) appends its audit line before its first write, and every other operation's order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (U109, U112) | `k3sm/pkg/keystore/socket::TestAuditBeforeReply`, `TestAuditFailureRefusesOps`, `k3sm/pkg/keystore::TestExecReadRefusedWhenAuditFails`, `TestUserRotateCrashOrder` | pending: the socket operations |
-| U33 | `refused` lines are rate-limited per uid with a summary of the dropped count | `k3sm/pkg/keystore/socket::TestRefusedLinesRateLimited` | pending: the socket operations |
-| U34 | 5 mutating ops a second per uid; 30 `read-for-exec` a minute per uid, each audited `exec-read` | `k3sm/pkg/keystore/socket::TestMutationRateLimit`, `TestExecReadCapPerUID`, `k3sm/pkg/keystore::TestExecReadAudited` | pending: the socket operations |
+| U32 | a grant (put, deliver) appends its audit line before its first write, and every other operation's order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (U109, U112) | `k3sm/pkg/keystore/socket::TestAuditBeforeReply`, `TestAuditFailureRefusesOps`, `k3sm/pkg/keystore::TestExecReadRefusedWhenAuditFails`, `TestUserRotateCrashOrder` | checked: the socket operations (the bridge's fail-closed rule) |
+| U33 | `refused` lines are rate-limited per uid with a summary of the dropped count | `k3sm/pkg/keystore/socket::TestRefusedLinesRateLimited` | checked: the socket operations (the post-frame refused line) |
+| U34 | 5 mutating ops a second per uid; 30 `read-for-exec` a minute per uid, each audited `exec-read` | `k3sm/pkg/keystore/socket::TestMutationRateLimit`, `TestExecReadCapPerUID`, `k3sm/pkg/keystore::TestExecReadAudited` | checked: the socket operations (the bridge's rate limits) |
 | U35 | the socket server's store interface has no reveal, show or rewrap method | `k3sm/pkg/keystore/socket::TestStoreInterfaceHasNoRevealMethod` | checked: the socket operations (the store bridge) |
 | U36 | the client refuses a socket whose connected peer uid is not the service uid, whatever the path checks said (seam: peer-credential source, client side) | `k3sm/cmd/k3sm::TestClientRefusesForeignServerUID` | pending: the non-root CLI and `exec` |
 | U37 | `exec` sets the variable only in the child; nothing on stdout, nothing on disk; the value never enters argv; no non-root verb writes a value to stdout | `k3sm/cmd/k3sm::TestKeysExecEnvOnlyInChild`, `TestNoNonRootVerbWritesValue` | pending: the non-root CLI and `exec` |
