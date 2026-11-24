@@ -50,36 +50,38 @@ func release(t taken) {
 	}
 }
 
-// MaxAbandonedLockWaits is how many lock waits WithStoreLock may have
-// outstanding at once, abandoned or not. A wait reserves its slot before it
-// calls lock and gives it back when lock returns, so a wait abandoned past
-// LockWait (lock, ignoring its context, has not returned) keeps its slot and
-// its goroutine until lock returns. A request that finds every slot taken
-// is busy at once and starts no wait, so requests arriving together cannot
-// all pass the bound.
-const MaxAbandonedLockWaits = 4
+// MaxLockWaits bounds the store-lock calls WithStoreLock may have
+// outstanding at once, waiting or abandoned. A wait reserves its slot
+// before it calls lock and gives it back when lock returns, so a wait
+// abandoned past LockWait (lock, ignoring its context, has not returned)
+// keeps its slot and its goroutine until lock returns. A request that finds
+// every slot taken is busy at once and starts no wait, so requests arriving
+// together cannot all pass the bound. It is set well above one connection's
+// request so that ordinary contention among the listener's connections
+// waits rather than failing busy.
+const MaxLockWaits = 16
 
-// abandonedLockWaits counts the process's outstanding lock calls.
-var abandonedLockWaits atomic.Int32
+// lockWaits counts the process's outstanding lock calls.
+var lockWaits atomic.Int32
 
 // WithStoreLock runs fn holding the lock lock takes, waiting at most
 // LockWait for it. A wait past LockWait is ErrBusy, even when lock does not
 // give up as it should: a lock taken after that is released at once. A done
 // ctx is its error, and any other failure to lock is returned wrapped.
 //
-// Each lock call holds one of MaxAbandonedLockWaits slots, reserved before
+// Each lock call holds one of MaxLockWaits slots, reserved before
 // the call and returned when it returns (for an abandoned wait, whenever
 // lock finally does); with every slot held, WithStoreLock returns ErrBusy
 // at once without calling lock, so a lock that ignores its context costs
 // at most that many goroutines.
 func WithStoreLock(ctx context.Context, lock LockFunc, fn func() error) error {
-	return withStoreLock(ctx, lock, fn, &abandonedLockWaits)
+	return withStoreLock(ctx, lock, fn, &lockWaits)
 }
 
 // withStoreLock is WithStoreLock counting its outstanding lock calls in
 // slots.
 func withStoreLock(ctx context.Context, lock LockFunc, fn func() error, slots *atomic.Int32) error {
-	if slots.Add(1) > MaxAbandonedLockWaits {
+	if slots.Add(1) > MaxLockWaits {
 		slots.Add(-1)
 		if err := ctx.Err(); err != nil {
 			return err

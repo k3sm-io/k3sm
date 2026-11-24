@@ -4037,10 +4037,10 @@ directory is root's"). A worker node runs no listener (E18).
   starts the backoff again from 1 second. A panic serving one connection is recovered and ends
   that connection only. A lock taken after the 2-second wait is released at once, and `busy`
   fails the request, never the connection. A lock call that ignores its deadline holds a
-  goroutine until it returns; at most 4 lock calls are outstanding at once, abandoned waits
-  included (`MaxAbandonedLockWaits`): each request reserves its slot before it calls the lock,
-  so requests arriving together cannot all pass the bound, and past it a request is `busy` at
-  once and starts no wait; a slot is given back when its lock call returns.
+  goroutine until it returns; at most 16 store-lock calls are outstanding at once, waiting or
+  abandoned (`MaxLockWaits`): each request reserves its slot before it calls the lock, so
+  requests arriving together cannot all pass the bound, and past it a request is `busy` at once
+  and starts no wait; a slot is given back when its lock call returns.
 
 **Peer identity.** At accept, `getsockopt(SOL_LOCAL, LOCAL_PEERCRED)` on the connected
 descriptor gives the peer's **effective uid at connect time**, and that is the authority. A
