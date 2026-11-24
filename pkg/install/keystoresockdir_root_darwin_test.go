@@ -124,7 +124,7 @@ func TestSocketDirRootOwnedServiceUIDCannotBind(t *testing.T) {
 		t.Helper()
 		cmd := exec.Command(bin, "-test.run="+u104ChildRun, "-test.v", "-test.count=1")
 		cmd.Dir = own
-		cmd.Env = append(os.Environ(), u104SockEnv+"="+sock, "K3SM_U104_PHASE="+phase, "K3SM_U104_OWN="+own)
+		cmd.Env = u104ChildEnv(os.Environ(), own, u104SockEnv+"="+sock, "K3SM_U104_PHASE="+phase, "K3SM_U104_OWN="+own)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
 		out, err := cmd.CombinedOutput()
 		t.Logf("child as uid %d (%s):\n%s", uid, phase, out)
@@ -142,6 +142,28 @@ func TestSocketDirRootOwnedServiceUIDCannotBind(t *testing.T) {
 	child("absent")
 	if _, err := os.Lstat(sock); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("keys.sock after the bind attempt: %v; want nothing", err)
+	}
+}
+
+// u104ChildEnv is the service-uid child's environment: env without its
+// TMPDIR and HOME, which are root's and which the service user cannot
+// write (TestMain's os.MkdirTemp would fail, and the child exit 1), then
+// TMPDIR=<own>/ and HOME=<own>, the directory the service user owns, and
+// extra.
+func u104ChildEnv(env []string, own string, extra ...string) []string {
+	env = slices.DeleteFunc(slices.Clone(env), func(e string) bool {
+		return strings.HasPrefix(e, "TMPDIR=") || strings.HasPrefix(e, "HOME=")
+	})
+	return append(append(env, "TMPDIR="+own+"/", "HOME="+own), extra...)
+}
+
+// The child's environment drops root's TMPDIR and HOME and names the
+// service user's own directory for both, once each.
+func TestU104ChildEnvReplacesTMPDIRAndHOME(t *testing.T) {
+	env := u104ChildEnv([]string{"PATH=/usr/bin", "TMPDIR=/var/root/tmp/", "HOME=/var/root", "TMPDIRX=keep"}, "/private/tmp/own", "K=V")
+	want := []string{"PATH=/usr/bin", "TMPDIRX=keep", "TMPDIR=/private/tmp/own/", "HOME=/private/tmp/own", "K=V"}
+	if !slices.Equal(env, want) {
+		t.Fatalf("child env = %q, want %q", env, want)
 	}
 }
 
