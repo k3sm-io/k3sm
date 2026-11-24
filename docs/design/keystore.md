@@ -3969,7 +3969,9 @@ refused before its first frame:
   reply says so: `ok` with the warning `committed; audit failed`, which the CLI prints. The
   server counts every such unaudited operation as its `unaudited` count, persisted in the
   server-counts file `.preframe-dropped` and read back when the server opens its logs, so it
-  outlasts a restart; `doctor` shows the count, and root's next `audit --rotate` writes it as
+  outlasts a clean restart, whose close writes any change still unwritten. The file is written
+  at most once a second, by the next change past that second or by the close, so a crash
+  before that write loses the counts changed since the last one; `doctor` shows the count, and root's next `audit --rotate` writes it as
   one line charged to no uid (U112). The two limits of the pre-frame counts hold for it
   ("Per-uid fairness"): a rotate that stops between its swap and its rewrite of the file can
   report it twice, and a server write landing during a rotate can lose one second's increment.
@@ -4313,7 +4315,8 @@ surface, and the app consumes only those.
 - **The reply header cap.** A reply's header alone may pass 8 KiB, up to `MaxReplyHeader`
   (128,818 bytes): the list of a full scope, 256 rows each at its widest (a 269-byte API name,
   a 7-byte kind, a 20-digit version, a 20-character versions count, a 29-byte RFC 3339 time, a
-  64-hex-digit fingerprint, a 7-byte status, the field names and punctuation: 502 bytes), plus
+  64-hex-digit fingerprint, a 7-byte status, the field names and punctuation, and the comma
+  that separates it from the next: 503 bytes), plus
   the wrapper and the `committed; audit failed` warning. So one list call names every entry
   of a full scope, and no cursor is needed. The cap is computed from those widths and a
   compile check holds it inside the 128 KiB frame cap with the type and header prefix; a test
@@ -4391,7 +4394,8 @@ surface, and the app consumes only those.
   an empty list rather than `not-found`, and only for a uid with no scope key yet (no scope
   directory, or one with no `scope.key`: `keystore.NoScopeKey`); a scope whose `scope.key`
   is there but whose `entries/` directory or `deliveries` record is gone is damage, and its
-  `list` answers that error's own code, never an empty list (`TestListDamagedScopeIsNotEmpty`).
+  `list` answers that error's own code, `not-found` (`ErrScopeAbsent`), never an empty list
+  (`TestListDamagedScopeIsNotEmpty`).
   A `log-full` from the
   uid's own share is never the global append failure: that one is answered alike for every
   uid, `log-full` when its cause is the audit log past its hard cap and `refused` for any
@@ -4450,7 +4454,13 @@ surface, and the app consumes only those.
     error frame `{"code":"not-found"}`; the store refuses it before it opens any scope, and
     its line is the operation's own, with the result `not-found`, the peer as `caller` and
     the peer's scope, never the other uid's (U45). `list` names no entry: a name in its header
-    is an unknown field.
+    is an unknown field. The answers are byte-identical only in the peer's normal state (a
+    started scope, under its rate limit and share, the store lock had, the scope not
+    quarantined). Outside it an absent entry of the peer's own answers from the peer's own
+    state, a spent share `log-full`, a lock held past its wait `busy`, a quarantine `refused`;
+    so another uid's or a `system/` name need not answer as the peer's own absent entry then.
+    With the share spent it still answers `not-found` (`TestCrossUserRefusedShareSpent`). What
+    differs tells the peer about its own state only, never about the other scope.
 - CLI and server are one binary, so version skew exists only between an upgrade's install
   and the server's restart; the server pin refuses that window first ("The client pins the
   server"), and the CLI prints "the server is not running the installed build; restart it" and
@@ -6717,7 +6727,7 @@ carried by the unit rows.
 | U42 | an unrecorded UID, a digest mismatch, or a denied SAR gets no Secret; the SARs ask `create keydeliveries` and `create secrets` with no name, and `update` and `delete` secrets with `resourceNames` `spec.secretName`; encryption off refuses (G18 for KeyDelivery); each SAR carries the user `k3sm:local:<uid>` and the groups the impersonated create carried, so a grant bound to `k3sm:local-users` passes the create and every sweep alike | `k3sm/pkg/keystore/reconcile::TestUnrecordedOrRetargetedDeliveryGetsNoSecret`, `TestSARCreateUnnamedUpdateDeleteNamed`, `TestSARCarriesImpersonatedUserAndGroups`, `TestGroupBoundGrantHonouredConsistently`, `TestEncryptionOffRefusesKeyDelivery`; rig leg E23 | pending: the KeyDelivery reconciler (authority) |
 | U43 | reasons are the closed set, each on the condition type and status the reason table gives; "absent" and "not yours" both read `EntryUnavailable`; a pre-existing Secret not claimed by a KeyDelivery (unlabelled, or Phase A's) is `SecretExists`; a second declaration is `SecretClaimed`, the oldest honoured record by `creationTimestamp`, then name, winning; `observedGeneration` tracks; `Ready=False` for any authority failure carries the one reason `NotAuthorized` with the `Authorized` reason in its message; `Ready` is `Unknown`, `Pending` before the first sweep and while `Authorized` is `Unknown`; each `Authorized=False` reason is tied to its action (`EntryUnavailable`, `NotRecorded` for a withdrawn UID or a digest mismatch, and `NotAuthorized` delete; `NotRecorded` for a UID never recorded retains), and a Secret kept under `Authorized=False` sets `SecretRetained=True` (`DeletePending` or `Unowned`) | `k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet`, `TestReasonConditionTable`, `TestOneDeclarationPerSecret`, `TestReadyFalseCarriesNotAuthorized`, `TestReadyUnknownPending`, `TestAuthorizedFalseReasonActionMap`, `TestSecretRetainedWhenKept` | pending: the KeyDelivery reconciler (authority) |
 | U44 | losing authority (a definitive denial) deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; ownership is the label, the owner annotation and that UID in the sealed record, not the ownerReference; the Secret's namespace and name must equal the record's target for that UID, and the record's entry must match the owner annotation; the orphan sweep removes a labelled Secret only when its owner annotation names a KeyDelivery UID the sealed record holds, it is that UID's recorded target, and that object no longer exists or is withdrawn, and never one with the label and owner annotation alone, an unlabelled or a foreign one; a forged label and a real UID on another Secret are left alone, charged to no share and logged as one `refused` line under the reconciler, against the reconciler budget, never as the owner's `deliver-delete` | `k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret`, `TestFinalizerCrashOrder`, `TestOrphanSweep`, `TestForgedOwnerAnnotationOnOtherSecretIsLeftAlone` | pending: the KeyDelivery reconciler (lifecycle) |
-| U45 | cross-user refusal with a fake peer-credential source: a peer with uid B, in its normal state (a started scope, under its rate limit and share), asks for `read-for-exec`, `rotate` and `rm` of uid A's entries, for `list`, and for any `system/…` name; every call answers byte for byte as for an absent entry of B's own (`list` shows B's own scope only), and the audit lines carry uid B. The delivery operations (`deliver`, `withdraw` and `deliveries`) answer `refused` to every caller until they are served, so they are not part of this claim yet | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestNonRootCannotNameSystemEntries`, `k3sm/pkg/keystore::TestUserRotateNotFoundIsNoOp`, `TestExecReadAudited` | pending: the socket operations |
+| U45 | cross-user refusal with a fake peer-credential source: a peer with uid B, in its normal state (a started scope, under its rate limit and share), asks for `read-for-exec`, `rotate` and `rm` of uid A's entries, for `list`, and for any `system/…` name; every call answers byte for byte as for an absent entry of B's own (`list` shows B's own scope only), and the audit lines carry uid B. The byte-identical answer holds in that normal state only: a spent share, a lock held past its wait or a quarantine answers B's own absent entry from B's own state (`log-full`, `busy`, `refused`), so it need not match the answer for A's name; with B's share spent, A's and `system/…` names still answer `not-found` (`TestCrossUserRefusedShareSpent`). The delivery operations (`deliver`, `withdraw` and `deliveries`) answer `refused` to every caller until they are served, so they are not part of this claim yet | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestCrossUserRefusedShareSpent`, `TestNonRootCannotNameSystemEntries`, `k3sm/pkg/keystore::TestUserRotateNotFoundIsNoOp`, `TestExecReadAudited` | pending: the socket operations |
 | U46 | `baseSocketDenies` derives the `keys.sock` path from `runtimed/pkg/keystorepaths` (`SocketPath(dataRoot)`, `<dataRoot>/keystore-sock/keys.sock`) and denies `connect(2)` to it | `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket`, `TestBaseSocketDeniesResolvesDataRoot`; `runtimed/pkg/keystorepaths::TestNames` | checked: the socket listener (pod denies) |
 | U47 | seam guard: `pkg/keystore`'s `TestMain` installs a panicking stub on each of its seams, so no unit test reaches a real primitive | `k3sm/pkg/keystore::TestRealPrimitivesUnreachable` | pending: the user-scope store |
 | U48 | seam guard: `pkg/keystore/socket`'s `TestMain` installs a panicking stub on each of its seams, so no unit test reaches a real primitive; the server-side peer-credential source is a constructor parameter of the listener, not a package variable, and the constructor refuses nil | `k3sm/pkg/keystore/socket::TestRealPrimitivesUnreachable`, `TestListenerRequiresPeerCredSource` | checked: the socket listener (seam guard) |
