@@ -48,9 +48,10 @@ const (
 	generationFileSize = 2*generationSize + 1
 	// maxVersion is the highest version a current pointer may name. The
 	// pointer authenticates, but whoever holds the master can seal any value,
-	// and List sizes its result by it and opens every version up to it, so a
-	// pointer above the bound is ErrCorrupt rather than an allocation or a walk
-	// it chooses. 65536 versions is far beyond any rotation cadence, and an
+	// and root's FileStore.List sizes its result by it and opens every version
+	// up to it (a user List authenticates only the current version and checks
+	// the rest of the range for presence, by one listing), so a pointer above
+	// the bound is ErrCorrupt rather than an allocation or a walk it chooses. 65536 versions is far beyond any rotation cadence, and an
 	// entry directory at the bound still lists under maxDirNames.
 	maxVersion = 1 << 16
 	// maxOAuthVersion is maxVersion for an oauth entry, which keeps only its
@@ -980,8 +981,10 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // however many versions it keeps. VersionCount is the number of version
 // files present in the range. Any other failure, a pointer the floor rules
 // out included, is the entry's Err. A version file present but damaged is
-// reported by the read or rotate that opens it; root's keys list and doctor
-// (FileStore.List) open every version.
+// reported by no list: root's keys list (FileStore.List) and doctor open no
+// user-scope version, so that damage surfaces only through a rotate
+// --from-version of that version, which opens it, or a Rewrap, which then
+// refuses.
 func listUserEntry(e *entry, k keys) Entry {
 	cur, _, low, err := e.checkedRange(k, nil)
 	if err != nil {

@@ -696,8 +696,12 @@ and `rm` answer not found, the sealed record stays on disk, and the next Put of 
 discards it without saying so. The restore procedure under "Backup and snapshots" recovers
 it.
 
-The reason is what an operator running `list` needs: the truth about every entry,
-including which one is wrong, not a refusal that hides the healthy ones. A consumer that
+The reason is what an operator running `list` needs: every entry, with the ones its
+checks find wrong marked, not a refusal that hides the healthy ones. What it checks differs by
+scope. Root's `list` (`FileStore.List`, the system scope) opens and authenticates every
+version of every entry. A user scope's `list` authenticates only each entry's current version
+and checks the rest of the pointer's range for presence, so it reports a missing older
+version but not a damaged one that is still present (below). A consumer that
 must not skip a corrupt entry checks `Err`; the `list` verb prints `corrupt` for that entry
 and exits 1 if any entry has one. The delivery reconciler does not use `List`; it opens
 each declared target with `Current`, which still returns `ErrCorrupt`.
@@ -1273,7 +1277,12 @@ with the new pair held in memory, never refresh again from the stored pair; a re
 kept file is refused with `ErrOrphanVersion`, and the refresher stops there. **A version file above the
 one `current` names is never reused**: it holds whatever value an interrupted attempt
 carried, and promoting it would publish a value the retry did not supply. Before it writes,
-a Rotate looks at every such file under the exclusive lock. One that does not open as this
+a system-scope Rotate (`FileStore`) looks at every such file under the exclusive lock, by one
+listing of the entry's directory. A user-scope Rotate looks only at `v<cur+1>`, the name it is
+about to write, in one `Lstat` and at most one record open, whatever the entry's size. The
+invariant both keep: every version file is examined before a rotate writes over its name. In
+the user scope a file planted further up is not examined until the pointer reaches the
+version below it, and the rotate to its version then examines it first. One that does not open as this
 entry's sealed record of the version its name says (it fails authentication, is another
 generation's or another version's) is a true orphan and is unlinked. One that does open is
 refused, as `ErrCorrupt` and `ErrOrphanVersion`, and nothing is unlinked: see the floor-lag
@@ -4491,7 +4500,7 @@ surface, and the app consumes only those.
   change (another name, rotate rather than put, root finishing a rewrap or acknowledging the
   floor's damage, or appends that succeed again); `internal` is damage or a missing key only
   root can repair, so the client says to run `doctor`. A user rotate that finds a sealed
-  version above the pointer (a rotation that crashed before its flip, or an older pointer
+  version at `v<cur+1>`, the one above the pointer, which is the only one it examines (a rotation that crashed before its flip, or an older pointer
   copied back inside the floor's lag window) is `refused`, not `internal`: the scope's owner
   cannot adopt it (`adopt` is root's, for the system scope) and cannot reach the file, but
   can repair the entry itself, with `rm` and then `put` of the value. The store never
@@ -6758,7 +6767,7 @@ last pull request lands and no row is pending.
 | G6 | The floor is root-owned and checked on the opened descriptor; a floor that is group- or other-writable, a symlink, or not root-owned is refused. The floor file names the `system` scope and is parsed strictly, and a verb that cannot write it changes nothing | unit with a fake FS for each case; a missing, other or unknown-field scope; a fuzz target over the parser with committed seeds; a read-only data root on a first Put |
 | G7 | The floor is raised by every mutating verb (Delete only when the master opens) and by the start of every root verb (`list` and `show` through `RaiseFloor`), and a floor one behind the pointer is accepted. Each floor write re-reads the floor under the data-root lock and applies only its own change, and a held data-root lock times out within the bound. A verb that takes both locks, a maintenance verb (`floor --rebuild`, `audit --rotate`, `rm-scope`) included, takes `keystore-lock` before `keystore/.lock` | unit: crash after the flip, before the floor write; a floor moved on during a Rotate or a Delete keeps its newer entries; a held data-root lock on a real `flock`; a maintenance verb waiting for a held `.lock` already holds `keystore-lock` |
 | G8 | Rotate flips the pointer last; a crash at each of its steps leaves the old version current | unit: fault injection between each step |
-| G9 | A Rotate retry never promotes an orphaned next version: a failed Rotate removes its own, the version's fsync failure included, a sealed one a crash left is refused (`ErrCorrupt` and `ErrOrphanVersion`, nothing removed, oauth told not to delete it), one that does not authenticate is discarded, and the retry seals the value it was given; only the attended, root-only `Adopt` (`k3sm keys adopt`) promotes a sealed orphan, at exactly the next version | unit: orphan with value A, refused; removed, retry with value B, expect B; a fault after the version's rename; an oauth crash, then adopt, then the new pair is current; adopt's refusals; the CLI verb |
+| G9 | A Rotate retry never promotes an orphaned next version: a failed Rotate removes its own, the version's fsync failure included, a sealed one a crash left is refused (`ErrCorrupt` and `ErrOrphanVersion`, nothing removed, oauth told not to delete it), one that does not authenticate is discarded, and the retry seals the value it was given; every version file is examined before a rotate writes over its name: a system-scope Rotate examines every file above the pointer, a user-scope Rotate only `v<cur+1>`, so a file planted further up in a user scope is examined when the pointer reaches the version below it; only the attended, root-only `Adopt` (`k3sm keys adopt`) promotes a sealed orphan, at exactly the next version | unit: orphan with value A, refused; removed, retry with value B, expect B; a fault after the version's rename; an oauth crash, then adopt, then the new pair is current; adopt's refusals; the CLI verb |
 | G10 | The master is minted only by the first `put`, never over existing entries, and never by an operator-supplied value | unit: absent master with entries is `ErrMasterMissing`; no verb accepts an operator-made key: `rewrap --key-in` refuses a key that is neither the recorded `master.next.sha256` nor one some record already opens under |
 | G11 | The master is opened with O_NOFOLLOW and judged by fstat on the open descriptor; wrong mode, owner or fingerprint is `ErrMasterUntrusted` | unit: one case each |
 | G12 | Rewrap resumes after a crash at every step, trying the old then the new key, and leaves no record readable by neither; a `master.next` that disagrees with its fingerprint is discarded only when no `.new` file exists, and refused with `ErrMasterUntrusted` otherwise | unit: fault injection at each of steps 2 to 5, then rerun; a corrupted `master.next` with and without a `.new` file |

@@ -258,9 +258,11 @@ func (u *UserScope) usageAfterRotate(op *usageOp, e *entry, before int64, berr e
 // leaves cur+1 to V, whose lowest is again cur+1. Every user version is
 // kept (none is pruned), so no state those leave has a version file above
 // the pointer without v<cur+1>; a file further up with none at cur+1 is
-// planted, and a later rotation renames over it. A v<cur+1> that
-// authenticates is the orphan, refused (ErrOrphanVersion) and kept; one that
-// does not is junk, removed, and counted in discarded.
+// planted. It is not examined now: the invariant is that every version file
+// is examined before a rotate writes over its name, and the rotate that
+// reaches its version examines it here first, as that rotate's v<cur+1>. A
+// v<cur+1> that authenticates is the orphan, refused (ErrOrphanVersion) and
+// kept; one that does not is junk, removed, and counted in discarded.
 func orphanAbove(e *entry, uk keys, cur uint64) (discarded int, err error) {
 	n := versionName(cur + 1)
 	if _, err := e.root.Lstat(n); errors.Is(err, fs.ErrNotExist) {
