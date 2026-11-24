@@ -25,6 +25,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"k3sm.io/k3sm/pkg/keystore"
 )
 
 // U89 and U108 end to end: uid A's scope holds tens of thousands of files
@@ -41,15 +43,20 @@ func TestLockHoldBoundPerUID(t *testing.T) {
 		removals = 6
 	)
 	r := newStartedBridge(t, bridgeConfig(0, lockWait))
-	a, b := r.connect(t, uidA), r.connect(t, uidB)
-	a.must(t, "put", entryOf(uidA, "token"), []byte("one"))
-	a.must(t, "put", entryOf(uidA, "bulk"), []byte("bulk"))
+	for _, name := range []string{"token", "bulk"} {
+		if _, err := r.b.Put(t.Context(), Peer{UID: uidA, PID: 1}, entryOf(uidA, name), keystore.KindOpaque, []byte(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	bulk := filepath.Join(r.data, "server", "keystore", ".user", strconv.FormatUint(uint64(uidA), 10), "entries", "bulk")
 	for i := range padFiles {
 		if err := os.WriteFile(filepath.Join(bulk, "pad-"+strconv.Itoa(i)), nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
+	// Connected once the scope is planted, which can outlast an idle
+	// connection on a loaded host.
+	a, b := r.connect(t, uidA), r.connect(t, uidB)
 	for i := range removals {
 		b.must(t, "put", entryOf(uidB, "e"+strconv.Itoa(i)), []byte("v"))
 	}
