@@ -19,10 +19,13 @@ package keystore
 import (
 	"bytes"
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // writeDropped persists d as the server would, in s's store directory.
@@ -128,59 +131,135 @@ func TestRotateAuditKeepsDroppedOnRefusal(t *testing.T) {
 	}
 }
 
-// TestRotateAuditIgnoresHostileDropped: a server-counts file rotate cannot
-// read (it does not parse, the unaudited count on a uid line or a class
-// it does not know included; it is not the service user's 0600 file; it is
-// a symlink) never blocks the rotation: the new audit log carries no count
-// line and the file is left as it was, for doctor to report.
+// TestRotateAuditIgnoresHostileDropped: whatever the service user leaves
+// at PreFrameDroppedName in place of the server's file cannot block audit
+// --rotate. A symlink to another file, a FIFO, a second hard link, mode
+// 0644, a file over the size cap and a file that does not parse (the
+// unaudited count on a uid line, a class it does not know and a post-frame
+// line out of order included) each leave the rotate succeeding, the new
+// audit log with no count line, and the name exactly as it was (a
+// symlink's target untouched too), for doctor to report.
 func TestRotateAuditIgnoresHostileDropped(t *testing.T) {
-	h := preFrameDroppedHeader
-	cases := []struct {
-		name string
-		body string
-		mode os.FileMode
-		link bool
-	}{
-		{"no-header", "1001 login 2\n", 0o600, false},
-		{"unaudited-on-a-uid-line", h + "1001 unaudited 2\n", 0o600, false},
-		{"unknown-class", h + "1001 postframe 2\n", 0o600, false},
-		{"post-frame-out-of-order", h + "others post-frame 1\n1001 post-frame 2\n", 0o600, false},
-		{"over-the-bound", h + strings.Repeat("1 login 1\n", maxPreFrameDroppedSize/10+1), 0o600, false},
-		{"mode-0644", h + "1001 post-frame 2\nothers unaudited 1\n", 0o644, false},
-		{"symlink", h + "others unaudited 1\n", 0o600, true},
+	valid := func() []byte {
+		d := newPreFrameDropped()
+		d.uids[preFrameKey{preFrameClassLogin, 1001}] = 2
+		return encodePreFrameDropped(d)
 	}
-	for _, tc := range cases {
+	write := func(t *testing.T, path string, b []byte, mode fs.FileMode) {
+		t.Helper()
+		if err := os.WriteFile(path, b, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := func(b string, mode fs.FileMode) func(t *testing.T, name, _ string) {
+		return func(t *testing.T, name, _ string) { write(t, name, []byte(b), mode) }
+	}
+	h := preFrameDroppedHeader
+	for _, tc := range []struct {
+		name  string
+		place func(t *testing.T, name, other string)
+	}{
+		{"symlink to another file", func(t *testing.T, name, other string) {
+			write(t, other, valid(), fileMode)
+			if err := os.Symlink(other, name); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"symlink to an unaudited count", func(t *testing.T, name, other string) {
+			write(t, other, []byte(h+"others unaudited 1\n"), fileMode)
+			if err := os.Symlink(other, name); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"fifo", func(t *testing.T, name, _ string) {
+			if err := unix.Mkfifo(name, uint32(fileMode)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"second hard link", func(t *testing.T, name, other string) {
+			write(t, name, valid(), fileMode)
+			if err := os.Link(name, other); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"mode 0644", func(t *testing.T, name, _ string) {
+			write(t, name, valid(), 0o644)
+		}},
+		{"mode 0644 with the new classes", body(h+"1001 post-frame 2\nothers unaudited 1\n", 0o644)},
+		{"over the size cap", func(t *testing.T, name, _ string) {
+			b := append(valid(), bytes.Repeat([]byte("x"), maxPreFrameDroppedSize)...)
+			write(t, name, b, fileMode)
+		}},
+		{"over the size cap in lines", body(h+strings.Repeat("1 login 1\n", maxPreFrameDroppedSize/10+1), fileMode)},
+		{"does not parse", body(h+"1001 login 02\n", fileMode)},
+		{"no header", body("1001 login 2\n", fileMode)},
+		{"unaudited on a uid line", body(h+"1001 unaudited 2\n", fileMode)},
+		{"unknown class", body(h+"1001 postframe 2\n", fileMode)},
+		{"post-frame out of order", body(h+"others post-frame 1\n1001 post-frame 2\n", fileMode)},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, _ := fileLogScope(t)
-			p := filepath.Join(s.dir, PreFrameDroppedName)
-			target := p
-			if tc.link {
-				target = filepath.Join(t.TempDir(), "counts")
-				if err := os.Symlink(target, p); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if err := os.WriteFile(target, []byte(tc.body), tc.mode); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Chmod(target, tc.mode); err != nil {
-				t.Fatal(err)
-			}
+			name := filepath.Join(s.dir, PreFrameDroppedName)
+			other := filepath.Join(t.TempDir(), "other")
+			tc.place(t, name, other)
+			before := snapshotPath(t, name)
+			otherBefore := snapshotPath(t, other)
 			if _, err := s.RotateAudit(context.Background(), &inoRecorder{}, false); err != nil {
-				t.Fatalf("a hostile counts file blocked the rotation: %v", err)
+				t.Fatalf("audit --rotate with a hostile %s: %v", PreFrameDroppedName, err)
 			}
 			if log := readLog(t, s, auditLogName); len(log) != 0 {
-				t.Fatalf("the new audit log carries %q, want no count line", log)
+				t.Fatalf("the new audit log holds a line for a hostile %s:\n%s", PreFrameDroppedName, log)
 			}
-			after, err := os.ReadFile(target)
-			if err != nil || string(after) != tc.body {
-				t.Fatalf("the counts file after the rotate: %q %v, want it as it was", after, err)
+			if after := snapshotPath(t, name); after != before {
+				t.Fatalf("%s after the rotate: %+v, want it as it was: %+v", PreFrameDroppedName, after, before)
 			}
-			if tc.link {
-				if fi, err := os.Lstat(p); err != nil || fi.Mode()&os.ModeSymlink == 0 {
-					t.Fatalf("the symlink after the rotate: %v %v", fi, err)
-				}
+			if after := snapshotPath(t, other); after != otherBefore {
+				t.Fatalf("the other file after the rotate: %+v, want it as it was: %+v", after, otherBefore)
 			}
 		})
 	}
+}
+
+// pathSnapshot is what TestRotateAuditIgnoresHostileDropped compares of a
+// name: its lstat identity and mode, its link target, and a regular file's
+// bytes.
+type pathSnapshot struct {
+	exists  bool
+	mode    fs.FileMode
+	ino     uint64
+	nlink   uint64
+	target  string
+	content string
+}
+
+func snapshotPath(t *testing.T, path string) pathSnapshot {
+	t.Helper()
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		if err == unix.ENOENT {
+			return pathSnapshot{}
+		}
+		t.Fatal(err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := pathSnapshot{exists: true, mode: fi.Mode(), ino: uint64(st.Ino), nlink: uint64(st.Nlink)}
+	switch {
+	case fi.Mode()&fs.ModeSymlink != 0:
+		if snap.target, err = os.Readlink(path); err != nil {
+			t.Fatal(err)
+		}
+	case fi.Mode().IsRegular():
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snap.content = string(b)
+	}
+	return snap
 }
