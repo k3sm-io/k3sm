@@ -299,6 +299,14 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 // in the data root (FileStore.MergePending), so no user change lands before
 // keys floor merge has run, to be moved aside by it. The start step refuses
 // the same, so the listener is off for that window too.
+//
+// It asks by path, not through the data-root descriptor keystore-lock
+// judged as the root verbs do (floorLock.mergePending): a user verb runs
+// as the service user, which cannot take keystore-lock (the floor owner's,
+// granting nothing to group or others) and holds no data-root descriptor.
+// It is safe against keys floor merge anyway, which only removes the
+// marker, never makes one. Against the operator's lock-free mv that makes
+// it, no check is, which is why the restore recipe stops the server first.
 func (u *UserScope) userWriteAllowed() error {
 	return u.s.MergePending()
 }

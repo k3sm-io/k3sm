@@ -664,6 +664,13 @@ func restoreRecipeBackup(t *testing.T, h *keysHarness, b recipeBackup, withFloor
 			return "", err
 		}
 	}
+	// The live floor moves aside first, so the pending-merge marker stands
+	// before keystore/ leaves.
+	if withFloor {
+		if err := os.Rename(floor, floor+".pre-restore"); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := os.Mkdir(recipePreRestore(h), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -683,9 +690,6 @@ func restoreRecipeBackup(t *testing.T, h *keysHarness, b recipeBackup, withFloor
 	}
 	copyTree(t, b.keystore, staged)
 	if withFloor {
-		if err := os.Rename(floor, floor+".pre-restore"); err != nil {
-			t.Fatal(err)
-		}
 		raw, err := os.ReadFile(b.floor)
 		if err != nil {
 			t.Fatal(err)
@@ -877,10 +881,10 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			"! pgrep -u _k3sm || exit 1",
 			`test "$(sudo find /path/to/backup -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 1 || exit 1`,
 			`test "$(sudo find /path/to/backup/$B -maxdepth 0 -user root -perm 0700 | grep -c .)" -eq 1 || exit 1`,
-			"sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1",
-			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
 			"sudo test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
+			"sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1",
+			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
 			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
 			"sudo test ! -L /path/to/backup/$B/keystore || exit 1",
 			"sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
@@ -893,12 +897,12 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			// restore survives the undo.
 			"sudo k3sm stop",
 			"! pgrep -u _k3sm || exit 1",
-			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
-			"sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
-			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
 			"sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1",
+			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
 			"sudo k3sm keys floor merge --undo --dry-run",
 			"sudo k3sm keys floor merge --undo",
 			"sudo rm -rf /var/lib/k3sm/pre-restore.d",

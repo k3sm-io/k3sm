@@ -636,7 +636,10 @@ sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha
 restore was never finished or undone, and moving the live copies aside now would replace it:
 finish or undo that restore first, as below, and do not go on. `shasum` must print `OK`. If it
 does not, the saved floor has changed since you saved it: do not use it. Then move the live
-copies aside and put the backup in place. `mkdir` makes a new directory that only root can
+copies aside and put the backup in place. The live floor moves aside first: its new name,
+`keystore-floor.json.pre-restore`, is what marks the restore unfinished, and from then on the
+keystore writes nothing and the server creates no `server/keystore` in place of the one you move
+next. `mkdir` makes a new directory that only root can
 open, in `/var/lib/k3sm`, which root owns, and fails if the name already exists. `mv` then moves the live `keystore/` into it, so
 nothing running as the service user can reach the moved-aside entries or copy one back into the
 restored keystore. The files inside are not changed: they keep their owner and mode, so an undo
@@ -670,10 +673,10 @@ and start again. The
 ! pgrep -u _k3sm || exit 1
 test "$(sudo find /path/to/backup -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 1 || exit 1
 test "$(sudo find /path/to/backup/$B -maxdepth 0 -user root -perm 0700 | grep -c .)" -eq 1 || exit 1
-sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1
-sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
 sudo test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
 sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
 sudo test ! -L /path/to/backup/$B/keystore || exit 1
 sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
@@ -831,7 +834,9 @@ To undo the restore instead, stop the server and stage the two copies the other 
 and the restored `keystore/` becomes the moved-aside copy. Every line ends in `|| exit 1`, as
 above. The floors swap places: the floor you moved aside
 goes back in place, and the restored floor becomes `keystore-floor.json.pre-restore`, so the
-merge runs in reverse and keeps every deletion you made after the restore. If you already ran
+merge runs in reverse and keeps every deletion you made after the restore. The floors move
+first, as in the restore, so the restored floor is `keystore-floor.json.pre-restore` before
+`server/keystore` leaves. If you already ran
 the merge, the floor you moved aside is now `keystore-floor.json.merged-<time>`: use that name
 in the first floor `mv` instead. `--undo` tells the reverse merge to read the record the first
 merge left beside that file, `keystore-floor.json.merged-<time>.retired`, which lists what the
@@ -844,12 +849,12 @@ the steps while anything still runs as the service user, as in the restore.
 ```
 sudo k3sm stop
 ! pgrep -u _k3sm || exit 1
-sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
-sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
-sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1
+sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
 sudo k3sm keys floor merge --undo --dry-run
 sudo k3sm keys floor merge --undo
 sudo rm -rf /var/lib/k3sm/pre-restore.d

@@ -1545,8 +1545,18 @@ merge is recorded. The user scope is off for the same window, in code: the serve
 (`startUserScopes`) and its store-directory step (`EnsureDir`, which so makes no `keystore/` the
 merge would move aside as planted) refuse with `errMergePending`, as doctor's start step does,
 and every user write verb (put, rotate, rm, deliver, withdraw) asks `FileStore.MergePending` first
-under `keystore-lock` (`userWriteAllowed`) and refuses with it, writing nothing
-(`TestUserScopeOffWhileMergePending`, `TestKeystoreListenerOffWhileMergePending`). `list` and `show` run with a warning on stderr and, until the merge, find no
+under the store lock (`userWriteAllowed`) and refuses with it, writing nothing
+(`TestUserScopeOffWhileMergePending`, `TestUserScopeDeliverRefusedWhileMergePending`,
+`TestKeystoreListenerOffWhileMergePending`). The guard's limit: it holds from the moment the
+marker exists, not before. The root verbs ask it through the data-root descriptor `keystore-lock`
+judged (`floorLock.mergePending`), so their check and write are atomic against `keys floor
+merge`, which holds that lock. A user write verb runs as the service user, which cannot take
+`keystore-lock` and holds no data-root descriptor, so it asks by path (`MergePending`), under the
+store lock only; it is still safe against the merge, which only ever clears the marker, never
+makes it, so a check that saw no marker is never overtaken by one the merge writes. Neither
+check is atomic against the operator's own `mv`s, which take no lock: a write whose check ran
+just before the floor `mv` lands. That is why the recipe stops the server first, and moves the
+floor aside before anything else, so the marker stands before `server/keystore` leaves. `list` and `show` run with a warning on stderr and, until the merge, find no
 entry, since the restored tree is staged (below). A successful merge renames its input to
 `keystore-floor.json.merged-<unix>` beside it, through the data root descriptor the lock
 judged (never over an existing file, and only if the name is still the file it read), which
@@ -1570,8 +1580,11 @@ that the backup's directory and its parent are owned by root with no group or ot
 `find -maxdepth 0 -user root ! -perm +022` that must match both), so the service user cannot swap
 the source between the checks and the copy, and, just before `ditto`, `test ! -L` on its source,
 which `ditto` would follow (`TestKeysRollbackRoundTrip`, the recipe-steps subtest). The save
-recipe makes those directories so (`install -d -o root -g wheel -m 0755`). The
-recipe moves the live `keystore/` into `pre-restore.d/` in the data root, a directory it creates
+recipe makes those directories so (`install -d -o root -g wheel -m 0755`). The recipe moves the
+live floor aside to `keystore-floor.json.pre-restore` first, before anything else moves, so the
+pending-merge guard (below) holds before `server/keystore` leaves and no `EnsureDir` can make a
+new one in its place; the undo likewise swaps the floors before it moves either tree. Then it
+moves the live `keystore/` into `pre-restore.d/` in the data root, a directory it creates
 root:wheel 0700 with `mkdir` (which fails on an existing name) under a parent only root can
 write, so the service user cannot reach the moved-aside entries to copy one back, nor rename the
 directory, as it could under `server/`. It changes no file inside: a rename changes no inode's
