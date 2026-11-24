@@ -394,3 +394,106 @@ func TestSupervisorLogReceivesDamage(t *testing.T) {
 	}
 	checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"), DamageCorrupt, 0)
 }
+
+// damageCodes is the reply each class is logged beside (outcomeOf).
+var damageCodes = map[string]Code{
+	DamageOrphanVersion:     CodeRefused,
+	DamageFloorDegraded:     CodeRefused,
+	DamageFloorRecordsEntry: CodeInternal,
+	DamageCorrupt:           CodeInternal,
+	DamageInternal:          CodeInternal,
+}
+
+// floorDegradedErr is a real store's refusal of a put over a floor line no
+// key can be read from (keystore.FloorDegraded).
+func floorDegradedErr(t *testing.T) error {
+	t.Helper()
+	r := newStartedBridge(t, nil)
+	p := Peer{UID: uidA, PID: 1}
+	if _, err := r.b.Put(t.Context(), p, entryOf(uidA, "a"), keystore.KindOpaque, []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	fp := filepath.Join(r.data, "keystore-logs", "floor", "keystore-user-floor.log")
+	fb, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := bytes.LastIndexByte(fb[:len(fb)-1], '\n')
+	for i := last + 1; i < len(fb)-1; i++ {
+		fb[i] = 'X'
+	}
+	if err := os.WriteFile(fp, fb, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.b.Put(t.Context(), p, entryOf(uidA, "c"), keystore.KindOpaque, []byte("v"))
+	if !keystore.FloorDegraded(err) {
+		t.Fatalf("a put over floor damage = %v, want FloorDegraded", err)
+	}
+	return err
+}
+
+// damageClass and outcomeOf judge every error in one order: each error
+// kind either function reads has its pinned reply and class, and over
+// every pair of them joined in one chain the class is one logged beside
+// the reply outcomeOf gives, and every internal reply that is not a
+// cancelled or timed-out request is logged.
+func TestDamageClassAgreesWithOutcome(t *testing.T) {
+	wrap := func(err error) error { return fmt.Errorf("user scope op: %w", err) }
+	kinds := []struct {
+		name  string
+		err   error
+		code  Code
+		class string
+	}{
+		{"committed", fmt.Errorf("%w: the floor line was not written", keystore.ErrCommitted), "", ""},
+		{"socket busy", ErrBusy, CodeBusy, ""},
+		{"rate limited", ErrRateLimited, CodeRateLimited, ""},
+		{"request refused", refusedf("x"), CodeRefused, ""},
+		{"log full", wrap(keystore.ErrLogFull), CodeLogFull, ""},
+		{"not found", wrap(keystore.ErrNotFound), CodeNotFound, ""},
+		{"version not found", wrap(keystore.ErrVersionNotFound), CodeNotFound, ""},
+		{"scope absent", wrap(keystore.ErrScopeAbsent), CodeNotFound, ""},
+		{"quota", wrap(keystore.ErrQuota), CodeQuota, ""},
+		{"owner changed", wrap(keystore.ErrScopeOwnerChanged), CodeScopeOwnerChanged, ""},
+		{"owner unknown", wrap(keystore.ErrScopeOwnerUnknown), CodeScopeOwnerUnknown, ""},
+		{"exists", wrap(keystore.ErrExists), CodeRefused, ""},
+		{"invalid name", wrap(keystore.ErrInvalidName), CodeRefused, ""},
+		{"kind mismatch", wrap(keystore.ErrKindMismatch), CodeRefused, ""},
+		{"typed credential", wrap(keystore.ErrTypedCredential), CodeRefused, ""},
+		{"rewrap in progress", wrap(keystore.ErrRewrapInProgress), CodeRefused, ""},
+		{"floor degraded", floorDegradedErr(t), CodeRefused, DamageFloorDegraded},
+		{"orphan version", wrap(fmt.Errorf("%w: %w", keystore.ErrCorrupt, keystore.ErrOrphanVersion)), CodeRefused, DamageOrphanVersion},
+		{"corrupt", wrap(keystore.ErrCorrupt), CodeInternal, DamageCorrupt},
+		{"floor records entry", wrap(keystore.ErrFloorRecordsEntry), CodeInternal, DamageFloorRecordsEntry},
+		{"master missing", wrap(keystore.ErrMasterMissing), CodeInternal, DamageInternal},
+		{"master untrusted", wrap(keystore.ErrMasterUntrusted), CodeInternal, DamageInternal},
+		{"kind unsupported", wrap(keystore.ErrKindUnsupported), CodeInternal, DamageInternal},
+		{"cancelled", context.Canceled, CodeInternal, ""},
+		{"timed out", context.DeadlineExceeded, CodeInternal, ""},
+		{"unknown", errors.New("x"), CodeInternal, DamageInternal},
+	}
+	for _, k := range kinds {
+		if code, _ := outcomeOf(k.err); code != k.code {
+			t.Errorf("%s: outcomeOf = %q, want %q", k.name, code, k.code)
+		}
+		if class := damageClass(k.err); class != k.class {
+			t.Errorf("%s: damageClass = %q, want %q", k.name, class, k.class)
+		}
+	}
+	cancelled := func(err error) bool {
+		return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	}
+	for _, a := range kinds {
+		for _, b := range kinds {
+			err := errors.Join(a.err, b.err)
+			code, _ := outcomeOf(err)
+			class := damageClass(err)
+			if class != "" && damageCodes[class] != code {
+				t.Errorf("%s with %s: class %q is logged beside %q, but the reply is %q", a.name, b.name, class, damageCodes[class], code)
+			}
+			if code == CodeInternal && class == "" && !cancelled(err) {
+				t.Errorf("%s with %s: an internal reply logs no class", a.name, b.name)
+			}
+		}
+	}
+}

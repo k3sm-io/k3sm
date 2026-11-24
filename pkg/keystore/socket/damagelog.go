@@ -54,22 +54,32 @@ var damageRemedies = map[string]string{
 // log-full, the socket's own refusals), a change that committed, and a
 // cancelled or timed-out request, which is the server stopping or the
 // request's bound, not damage.
+//
+// The class is judged inside the reply outcomeOf gives err, so the two
+// never disagree on an error whose chain matches more than one sentinel:
+// a chain that is both the floor's damage and ErrCorrupt answers internal
+// and logs corrupt, and one that is both ErrOrphanVersion and ErrNotFound
+// answers not-found and logs nothing.
 func damageClass(err error) string {
-	switch {
-	case err == nil, keystore.Committed(err),
-		errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return ""
-	case errors.Is(err, keystore.ErrOrphanVersion):
-		return DamageOrphanVersion
-	case errors.Is(err, keystore.ErrFloorRecordsEntry):
-		return DamageFloorRecordsEntry
-	case keystore.FloorDegraded(err):
-		return DamageFloorDegraded
-	case errors.Is(err, keystore.ErrCorrupt):
-		return DamageCorrupt
 	}
-	if code, _ := outcomeOf(err); code == CodeInternal {
+	switch code, _ := outcomeOf(err); code {
+	case CodeInternal:
+		switch {
+		case errors.Is(err, keystore.ErrFloorRecordsEntry):
+			return DamageFloorRecordsEntry
+		case errors.Is(err, keystore.ErrCorrupt):
+			return DamageCorrupt
+		}
 		return DamageInternal
+	case CodeRefused:
+		switch {
+		case errors.Is(err, keystore.ErrOrphanVersion):
+			return DamageOrphanVersion
+		case keystore.FloorDegraded(err):
+			return DamageFloorDegraded
+		}
 	}
 	return ""
 }

@@ -4567,7 +4567,11 @@ surface, and the app consumes only those.
   `orphan-version` (answered `refused`; the owner can `rm` the entry and `put` it again),
   `floor-records-entry`, `floor-degraded` (the floor's damage or the scope's quarantine,
   answered `refused`), `corrupt`, and `internal` for any other error answered `internal` (a
-  missing or untrusted master). The error's own text is never logged: a chain can carry text a
+  missing or untrusted master). The class is judged inside the reply this table gives, in its
+  order, so the log and the reply never disagree on a chain that matches more than one row:
+  the floor's damage with `ErrCorrupt` answers `internal` and logs `corrupt`, and damage
+  behind a row that is not damage (`busy`, `not-found`) logs nothing
+  (`TestDamageClassAgreesWithOutcome`, over every kind both read and every pair of them). The error's own text is never logged: a chain can carry text a
   decoder built from a decrypted value, and no error in `pkg/keystore` names a length, tag or
   byte of a value either (`TestNoErrorCarriesValueDerivedNumbers`). The ordinary outcomes
   (`not-found`, `exists`, `quota`, `rate-limited`, `busy`, `log-full`, and the socket's own
