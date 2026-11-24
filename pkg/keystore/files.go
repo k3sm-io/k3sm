@@ -569,8 +569,15 @@ func readDirEntries(root *os.Root, max int) ([]fs.DirEntry, error) {
 // errors of that race (the directory cannot be opened, as one root owns
 // before its handover cannot; or a directory just made already holds a
 // name a racing put wrote). Any other error is neither.
+//
+// While a restore is staged (MergePending) it refuses with errMergePending
+// and creates nothing: a directory made then would be moved aside by keys
+// floor merge as planted.
 func (s *FileStore) EnsureDir() error {
 	if err := s.checkConfig(); err != nil {
+		return err
+	}
+	if err := s.MergePending(); err != nil {
 		return err
 	}
 	if err := s.mkdirOwned(s.dir); err != nil {

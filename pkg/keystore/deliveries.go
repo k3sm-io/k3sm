@@ -895,6 +895,9 @@ func (u *UserScope) auditSealed(sealed []delivery, err error) error {
 // the other deliveries a seal under a delivery-record taint withdrew, each
 // of which is audited too.
 func (u *UserScope) withdrawBody(root *os.Root, uid string) (string, bool, []delivery, error) {
+	if err := u.userWriteAllowed(); err != nil {
+		return "", false, nil, err
+	}
 	k, err := u.s.loadMaster()
 	if err != nil {
 		return "", false, nil, err
@@ -1065,6 +1068,12 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 	// second server gone) may follow writes this process did not make: no
 	// usage figure taken before is trusted (usage.go).
 	s.usage.forgetAll()
+	// A staged restore keeps the user scope off until keys floor merge has
+	// run: a user write in that window would land in a keystore whose
+	// floor lacks every deletion since the backup (userWriteAllowed).
+	if err := s.MergePending(); err != nil {
+		return err
+	}
 	damage, spent, err := s.CheckLogBounds(ctx)
 	if err != nil {
 		return err
@@ -1400,6 +1409,9 @@ func (u *UserScope) grantLocked(ctx context.Context, g *grantAudit, fn func(*ope
 
 // grantLockedBody is grantLocked's work under the exclusive lock.
 func (u *UserScope) grantLockedBody(root *os.Root, g *grantAudit, fn func(*openedScope) error) error {
+	if err := u.userWriteAllowed(); err != nil {
+		return err
+	}
 	if err := u.s.admit(u.uid, false); err != nil {
 		return err
 	}

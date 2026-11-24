@@ -229,3 +229,33 @@ func TestStoreDirRaceTextIsTransient(t *testing.T) {
 		t.Fatalf("a wider mode: %v, want the repair and not the race text", err)
 	}
 }
+
+// TestKeystoreListenerOffWhileMergePending: with a restore staged (the
+// floor moved aside as keystore-floor.json.pre-restore in the data root)
+// the server's start checks keep the user scope off, naming keys floor
+// merge, and create no store directory; once the merge has renamed the
+// file every check passes.
+func TestKeystoreListenerOffWhileMergePending(t *testing.T) {
+	f, _ := installedWiringFixture(t, false)
+	aside := filepath.Join(f.dataRoot, "keystore-floor.json.pre-restore")
+	if err := os.WriteFile(aside, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, closeAll, err := keystoreSocketConfig(f.deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAll()
+	if reason, detail := passingChecks(cfg).Check(t.Context()); reason == "" || !strings.Contains(detail, "keys floor merge") {
+		t.Fatalf("the start checks with a restore staged: %q %q, want off naming keys floor merge", reason, detail)
+	}
+	if _, err := os.Lstat(f.deps.layout(f.deps.workDir).Dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the server made a store directory with a restore staged: %v", err)
+	}
+	if err := os.Rename(aside, aside+".merged"); err != nil {
+		t.Fatal(err)
+	}
+	if reason, detail := passingChecks(cfg).Check(t.Context()); reason != "" {
+		t.Fatalf("the start checks after the merge: %q %q, want every check to pass", reason, detail)
+	}
+}

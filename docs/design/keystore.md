@@ -1541,7 +1541,12 @@ Until the merge runs, the restore is unfinished, and the store enforces that: wh
 under `keystore-lock`, before they write anything, with a message naming `keys floor merge`
 (`errMergePending`); Delete runs and writes only its burials (below); and RaiseFloor, which the
 read verbs call first, raises nothing and logs that at Warn, so no pointer put back before the
-merge is recorded. `list` and `show` run with a warning on stderr and, until the merge, find no
+merge is recorded. The user scope is off for the same window, in code: the server's start step
+(`startUserScopes`) and its store-directory step (`EnsureDir`, which so makes no `keystore/` the
+merge would move aside as planted) refuse with `errMergePending`, as doctor's start step does,
+and every user write verb (put, rotate, rm, deliver, withdraw) asks `FileStore.MergePending` first
+under `keystore-lock` (`userWriteAllowed`) and refuses with it, writing nothing
+(`TestUserScopeOffWhileMergePending`, `TestKeystoreListenerOffWhileMergePending`). `list` and `show` run with a warning on stderr and, until the merge, find no
 entry, since the restored tree is staged (below). A successful merge renames its input to
 `keystore-floor.json.merged-<unix>` beside it, through the data root descriptor the lock
 judged (never over an existing file, and only if the name is still the file it read), which

@@ -683,10 +683,12 @@ the same warning, and the merge keeps each deletion it records. An `rm` at this 
 the deletion, but the restored entry's files are still in `pre-restore.d/restored`, out of its
 reach. The merge removes those files before it moves the restored copy into place, so you do not
 need to run `rm` again. A server started before the merge delivers no keys to the cluster and
-deletes no delivered Secret: it logs an error and tries again until the merge has run. It also
-creates an empty `/var/lib/k3sm/server/keystore` at start, which the merge then moves aside as
-`planted-<time>` and reports, exiting 4, so keep the server stopped until the merge has run. Once it
-has, the server deletes the Secret delivered from each entry the merge or an `rm` deleted, as
+deletes no delivered Secret: it logs an error and tries again until the merge has run. The
+server enforces the rest too: until the merge has run, its keystore user scope stays off, naming
+`keys floor merge` (`sudo k3sm doctor` shows the same), it creates no
+`/var/lib/k3sm/server/keystore`, and a user's `put`, `rotate`, `rm` or delivery change is refused
+with the same message, changing nothing. Keeping the server stopped until the merge has run is
+still the recipe. Once it has, the server deletes the Secret delivered from each entry the merge or an `rm` deleted, as
 after any `rm`: once the restore hold has passed and unless the breaker holds (see [Delivering
 an Entry as a Secret](#delivering-an-entry-as-a-secret)). Merge those deletions into the restored floor:
 

@@ -161,6 +161,9 @@ func (u *UserScope) panicGap() {
 
 // rotateBody is rotate's work under the lock.
 func (u *UserScope) rotateBody(ctx context.Context, root *os.Root, name string, next nextValue) (Version, error) {
+	if err := u.userWriteAllowed(); err != nil {
+		return Version{}, err
+	}
 	k, err := u.masterForWrite()
 	if err != nil {
 		return Version{}, err

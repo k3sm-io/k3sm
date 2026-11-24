@@ -293,8 +293,21 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	return v, err
 }
 
+// userWriteAllowed is the first step of every user write verb's work
+// under the store lock (put, rotate, rm, deliver, withdraw): it refuses
+// (errMergePending) while a restore is staged, keystore-floor.json.pre-restore
+// in the data root (FileStore.MergePending), so no user change lands before
+// keys floor merge has run, to be moved aside by it. The start step refuses
+// the same, so the listener is off for that window too.
+func (u *UserScope) userWriteAllowed() error {
+	return u.s.MergePending()
+}
+
 // putLocked is put's work under the exclusive lock.
 func (u *UserScope) putLocked(root *os.Root, name string, kind Kind, value []byte, g *grantAudit) (Version, error) {
+	if err := u.userWriteAllowed(); err != nil {
+		return Version{}, err
+	}
 	if err := u.s.admit(u.uid, false); err != nil {
 		return Version{}, err
 	}

@@ -706,11 +706,15 @@ func doctorOpenLogs(store *keystore.FileStore, pass *dataRootPass) func(context.
 }
 
 // doctorStartScopes is doctor's start step: the read-only half of the
-// server's (keystore.FileStore.CheckLogBounds), whose refusal leaves the
-// server's user scope unstarted with the same reason. The catch-up, which
-// writes, is the server's alone.
+// server's (a staged restore, keystore.FileStore.MergePending, then
+// keystore.FileStore.CheckLogBounds), whose refusal leaves the server's
+// user scope unstarted with the same reason. The catch-up, which writes, is
+// the server's alone.
 func doctorStartScopes(store *keystore.FileStore) func(context.Context) error {
 	return func(ctx context.Context) error {
+		if err := store.MergePending(); err != nil {
+			return err
+		}
 		_, _, err := store.CheckLogBounds(ctx)
 		return err
 	}
