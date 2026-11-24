@@ -144,7 +144,8 @@ log) and names `sudo k3sm keys audit --rotate` for the audit log or
 `doctor` runs in its own process and cannot ask the server whether the listener is serving, so
 its `keystore-user-scope` row says only what it can check:
 
-- `keystore user scope: start checks pass; a root-owned <mode> socket is at <path>` (PASS):
+- `keystore user scope: start checks pass; a root-owned <mode> socket is at <path> (path facts
+  only: whether the server is serving it is not checked)` (PASS):
   every check the server makes before it starts the listener passes, and the socket at the path
   is owned by root, in the daemon group, at the mode the server's LaunchDaemon plist names (the
   row prints it), in a directory owned by root:wheel that only root can write to. launchd
@@ -160,14 +161,17 @@ its `keystore-user-scope` row says only what it can check:
     launchd reads that entry only when the job is bootstrapped, and a server whose plist lacks
     it is refused the socket (measured). The server logs one warning, `launchd activated no
     socket for this server`, and does not retry.
-  - with the entry, launchd provided no socket: a parent of its path is missing (for example a
-    data root on a volume that is not mounted), or the server has not started yet or is
-    restarting. It names `mount the data root, then run sudo k3sm restart; if that does not
-    clear it, run sudo k3sm install`. The server logs one warning, `the job has a socket entry
-    but launchd could not provide the keys socket`, and does not retry until it is restarted.
-  A socket can also be found at the path while the server is not running: launchd leaves it
-  there when the job is unloaded, so the PASS line says what is at the path, not that the server
-  is listening.
+  - with the entry, launchd has no `keys` socket for this job: its loaded definition has no
+    such entry, or a parent of the socket path is missing (measured with three missing
+    levels); or the server has not started yet or is restarting. It names `run sudo k3sm
+    install (it rewrites and reloads the server's definition); if the data root is on a volume
+    that is not mounted, mount it first`. The server logs one warning, `launchd has no keys
+    socket for this job`, and does not retry until it is restarted.
+  The PASS line states path facts only. `doctor` cannot see inside the server, so it cannot
+  tell whether the server is serving the socket. A socket stays at the path in two cases where
+  nothing serves it: after the job is unloaded (`launchctl bootout` leaves `keys.sock`), and
+  after the server refused the socket it was handed (a wrong descriptor or path, or one
+  without `FD_CLOEXEC`); the server's log names that refusal.
 - `keystore user scope: off (<reason>)` (WARN): a check fails, with the server's own reason.
   For a missing, wrong or unflagged log or socket directory it adds `run sudo k3sm install`;
   for `more than one server registered` it names the servers (up to 8, then how many more);

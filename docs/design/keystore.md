@@ -1978,11 +1978,13 @@ for a `UserName` job, root:daemon 0666 in the root 0755 directory; the job got o
 requirement 5); and the client-side peer reads as launchd (`LOCAL_PEERCRED` uid 0) while the
 audit token names the accepting server, which the client check of Open requirement 4 accepts.
 A server launchd did not start, or whose plist has no `Sockets` key, gets `ESRCH` (both
-measured); one whose socket launchd cannot provide, a parent of its path being missing at the
-activation call (an unmounted data volume, measured), gets `ENOENT`. Each keeps the user scope
-off for the life of the process; the server never binds `keys.sock` itself. The second is rare:
-the server refuses to start on a declared data root that is not mounted
-(`refuseShadowedWorkDir`, `cmd/k3sm/server.go`) before it reaches this step.
+measured); one for which launchd has no `keys` socket, because its loaded definition has no
+such entry or a parent of the socket path is missing at the activation call (measured with
+three missing levels), gets `ENOENT`. Each keeps the user scope off for the life of the
+process; the server never binds `keys.sock` itself. A data root on a volume that is not
+mounted was not measured; a default-layout data root that is not mounted is refused earlier,
+by the shadowed-work-dir check (`refuseShadowedWorkDir`, `cmd/k3sm/server.go`), before the
+server reaches this step.
 
 ### Key hierarchy
 
@@ -6023,11 +6025,11 @@ and `probe.log` in the same set). Measured on macOS 27.2.1:
   `launch_activate_socket` returns `ESRCH`.
 - A missing socket directory never fails the bootstrap and never stops the job. When one level
   is missing, launchd creates it root:wheel 0755 at the job's `launch_activate_socket` and
-  hands over the socket; when deeper levels are missing, as for a data root on a volume that is
-  not mounted, it answers `ENOENT` with no descriptor and creates nothing, and the job runs on.
-  Since the bind happens at the activation call, `ENOENT` means the parent path is missing at
-  that moment, not that the plist lacks the entry. `<launch.h>` words `ENOENT` as no socket of
-  the specified name owned by the caller.
+  hands over the socket; with three levels missing it answers `ENOENT` with no descriptor and
+  creates nothing, and the job runs on. A real unmounted volume was not measured. `<launch.h>`
+  words `ENOENT` as no socket of the specified name owned by the caller: launchd has no `keys`
+  socket for this job, because its loaded definition has no such entry, or a parent of the
+  socket path is missing at the activation call.
 - A job whose plist has no `Sockets` key, running the probe itself, gets `ESRCH`, as does any
   process that is not the job: `ESRCH` names `sudo k3sm install`, measured.
 - With `KeepAlive` true, a `SIGKILL` respawn and a `kickstart -k` each activate again: rc 0,
@@ -6062,19 +6064,26 @@ of the process, and the release gate requires E27's macOS 26 measurement of the 
 requires one listening `SOCK_STREAM` socket whose address has the shape of launchd's bind name
 (a shape check only, since that is all an activated descriptor reports), and then judges the
 path clients connect to, `keystorepaths.SocketPath(dataRoot)`, with `doctor`'s rule: a
-root:daemon socket at the plist's mode in a root:wheel 0755 directory, a name only root can
-replace. It serves a close-on-exec duplicate, held until the process exits, since launchd
-answers `EALREADY` to a second call. Every other outcome is a terminal off state, logged once at
-Warn and never retried: `ESRCH` "launchd activated no socket for this server", naming `sudo
-k3sm install` (it rewrites the server plist and re-bootstraps the job); `ENOENT` "the job has a
-socket entry but launchd could not provide the keys socket: a parent of its path is missing,
-for example a data root on a volume that is not mounted", naming "mount the data root, then
-`sudo k3sm restart`; if that does not clear it, `sudo k3sm install`"; a wrong descriptor or
-path, naming `sudo k3sm install`; `EALREADY` and a descriptor without `FD_CLOEXEC`, naming
-`sudo k3sm restart`. `doctor` judges the same path rule, and with no socket there names `sudo
-k3sm install` when the installed plist lacks the `Sockets` entry, and otherwise the
-mount-then-restart remedy, saying the state is also seen while the server has not started yet
-or is restarting.
+root:daemon socket at the plist's mode in a root:wheel 0755 directory. It checks that only root
+could have put a socket at the clients' path; the descriptor's own address is launchd's
+private bind name, so the descriptor cannot be tied to the path. It serves a close-on-exec
+duplicate, held until the process exits. A process-wide holder makes the one call, so it never
+asks launchd twice; the result of a second call would be `<launch.h>`'s documented `EALREADY`,
+which was not measured. Every other outcome is a terminal off state, logged once at Warn and
+never retried: `ESRCH` "launchd activated no socket for this server", naming `sudo k3sm
+install` (it rewrites the server plist and re-bootstraps the job); `ENOENT` "launchd has no
+`keys` socket for this job: its loaded definition has no such entry, or a parent of the socket
+path is missing (measured with three missing levels)", naming "run `sudo k3sm install` (it
+rewrites and reloads the server's definition); if the data root is on a volume that is not
+mounted, mount it first"; a wrong descriptor or path, naming `sudo k3sm install`, which
+rewrites and reloads the definition so launchd binds the socket afresh; `EALREADY`, naming
+`sudo k3sm restart`; and a descriptor without `FD_CLOEXEC`, which a restart does not change,
+naming "report it: launchd handed the server an inheritable descriptor; the user scope stays
+off". `doctor` judges the same path rule, and with no socket there names `sudo k3sm install`
+in both cases: when the installed plist lacks the `Sockets` entry, and otherwise with the
+`ENOENT` text, saying the state is also seen while the server has not started yet or is
+restarting. Its pass text states path facts only: whether the server is serving the socket is
+not checked.
 
 **What is reachable meanwhile.** Until the non-root CLI ships with the client check (U36,
 U121) and the connect and `HELLO` deadlines (Open requirement 16), the socket's only clients are
@@ -7277,7 +7286,7 @@ E20 attended.
 | E24 | first, with the server running, the operator, as the service user (`sudo -u _k3sm`), runs a program that is not k3sm and tries to unlink `keystore-sock/keys.sock` and to bind a socket at that path; then, with the listener stopped by the maintenance marker, a native Pod execs the real installed `/Library/k3sm/k3sm` and that process tries the same bind; in the deny-plus-pin fallback only, the service-user program binds `keys.sock` while the listener is stopped and the user runs `k3sm keys list` and `k3sm keys put user/<me>/e2e-pin` | the service-user unlink and bind each fail with `EACCES` and `keys.sock` is still launchd's; the bind from the Pod gets `EPERM` and no socket appears; in the fallback, the CLI refuses each before writing a frame, naming the server pin, and the stand-in receives no bytes past the connect; after the marker goes, the real server is accepted | yes | the root-owned socket directory (U104): the service-user program replaces `keys.sock`; the server pin (U69): the CLI talks to the stand-in; the Pod bind deny (U16): the installed binary in a Pod binds `keys.sock` |
 | E25 | (helper variant only) a native Pod tries `connect(2)` to the floor helper's socket, and the login user and a non-k3sm service-user program each send it an `append` | `EPERM` for the Pod; the helper refuses the user by uid and the program by the pin, and no line is appended | yes | the helper pin (U70): a line from an unpinned peer is appended |
 | E26 | a native Pod on a test build whose Pod profile omits the keystore deny stanza (restored at the end) tries `connect(2)` to `keys.sock` | the listener refuses the connection before any frame, since the peer is sandboxed, and writes a `refused` line | yes | the sandboxed-peer refusal (U137): the Pod's connection reaches the frame reader |
-| E27 | a native Pod calls `launch_activate_socket` for the server's socket name | no descriptor is returned, and nothing in the Pod can accept on `keys.sock` | yes | the launchd lookup deny (U122): the Pod obtains the server's listener |
+| E27 | on macOS 26 and 27, a native Pod calls `launch_activate_socket` for the server's socket name, and the server's activated descriptor is read | the Pod gets `ESRCH` with no descriptor and nothing in it can accept on `keys.sock`; launchd set `FD_CLOEXEC` on the activated descriptor | yes | launchd answering a Pod's `launch_activate_socket` with `ESRCH` and setting `FD_CLOEXEC` on the activated descriptor, measured on macOS 26 and 27 (U122) |
 | E28 | **the typed-credential tracer** ("Rig credentials and custody"): a generated deploy key and a server-refreshed oauth pair delivered into one pod, which pushes over ssh and opens a pull request; then `k3sm keys refresh` | push and pull request succeed; the access-token file's hash changes in the same pod with `restartCount` 0; mount lines; the positive-controlled scans find nothing they should not; PENDING (exit 3) if the oauth pair is missing or not `ok` | yes | typed projection, the mount audit or the refresher |
 | E29 | a synthetic `token` put with `--expires-at` now+8 m, delivered | `Valid`, then `Expiring` after about 6 m, then `Expired` at 8 m; one Warning Event each, `related` the Secret; the Secret kept; `Ready` unchanged | no (U165, U166, U168) | expiry and revocation |
 | E30 | `generate --kind ssh`; deliver `--item privateKey=id_ed25519 --item publicKey=id_ed25519.pub` (`defaultMode` 0400); the pod runs `ssh-keygen -y -f id_ed25519`; a delivery without items is refused | the output equals `k3sm keys pubkey`; the fingerprint matches | no (U148, U163) | typed projection |
