@@ -28,6 +28,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"k3sm.io/k3sm/pkg/keystore"
+	"k3sm.io/runtimed/pkg/keystorepaths"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -40,12 +41,14 @@ import (
 
 // keystoreLogMode is both logs' mode; keystoreRunDirMode the run
 // directory's; keystoreLogsDirMode keystore-logs/'s and each log
-// directory's; keystoreStagingDirMode keystore-staging/'s.
+// directory's; keystoreStagingDirMode keystore-staging/'s;
+// keystoreSockDirMode keystore-sock/'s.
 const (
 	keystoreLogMode        = 0o600
 	keystoreRunDirMode     = 0o700
 	keystoreLogsDirMode    = 0o755
 	keystoreStagingDirMode = 0o700
+	keystoreSockDirMode    = 0o755
 )
 
 // keystoreKeystoreSubdir is the entries' directory in the server work dir,
@@ -88,8 +91,8 @@ func keystoreStep(sys System, cfg Config, uid uint32) error {
 	return nil
 }
 
-// ensureKeystoreFiles creates keystore-run/, keystore-logs/ and both
-// append-only logs in dataRoot, for the service user svcUID:svcGID, and
+// ensureKeystoreFiles creates keystore-run/, keystore-sock/, keystore-logs/
+// and both append-only logs in dataRoot, for the service user svcUID:svcGID, and
 // keeps what an earlier install made. rootUID is the data root's owner: 0
 // in production; only a non-root test passes its own uid. Every step goes
 // through one descriptor on the data root, opened O_DIRECTORY|O_NOFOLLOW
@@ -127,6 +130,7 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 	if int64(st.Uid) != int64(rootUID) || st.Mode&0o022 != 0 {
 		return fmt.Errorf("the data root %s is not root's, or is group- or other-writable: %w", dataRoot, errKeystoreFileUntrusted)
 	}
+	rootGID := st.Gid
 	if err := keystore.JudgeDirFlagsACL(dfd); err != nil {
 		return fmt.Errorf("the data root %s: %w: %w", dataRoot, err, errKeystoreFileUntrusted)
 	}
@@ -147,6 +151,9 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 		}
 	}
 	if err := ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID); err != nil {
+		return err
+	}
+	if err := ensureKeystoreSockDir(dfd, rootUID, rootGID); err != nil {
 		return err
 	}
 	g, err := openKeystoreLogs(dfd, rootUID)
@@ -273,6 +280,31 @@ func ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID int) error {
 		if err := fileAttrSeam.Fchown(fd, svcUID, svcGID); err != nil {
 			return fmt.Errorf("chown %s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+// ensureKeystoreSockDir creates keystore-sock/, the keystore socket's
+// directory, root's 0755 in the data root's group (wheel), or keeps the one
+// there, and judges it as the server's install check does: rootUID's, in
+// rootGID, at 0755, with no flag and no ACL. launchd creates keys.sock in
+// it at the job's bootstrap; no service-uid process can create, unlink or
+// replace a name there (docs/design/keystore.md § "The socket's directory
+// is root's"). A directory that is anything else is refused and kept as
+// found: an existing keystore-sock/ is never chowned.
+func ensureKeystoreSockDir(dfd, rootUID int, rootGID uint32) error {
+	name := keystorepaths.SockDir
+	fd, err := openRootDir(dfd, name, keystoreSockDirMode, rootUID, keystoreSockDirMode)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }() // a directory, read-only
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("stat %s: %w", name, err)
+	}
+	if st.Gid != rootGID {
+		return fmt.Errorf("%s is in group %d, not the data root's %d: %w", name, st.Gid, rootGID, errKeystoreFileUntrusted)
 	}
 	return nil
 }

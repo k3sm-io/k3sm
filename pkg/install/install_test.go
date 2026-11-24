@@ -41,6 +41,7 @@ import (
 	"k3sm.io/k3sm/pkg/helmchart"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/registrysvc"
+	"k3sm.io/runtimed/pkg/keystorepaths"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
@@ -2404,6 +2405,9 @@ func TestUninstallIdempotent(t *testing.T) {
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootout:io.k3sm.netd",
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.netd.plist",
+		// The keystore socket's directory, after the server whose launchd
+		// job's socket it holds is booted out.
+		"RemoveAll:/var/lib/k3sm/keystore-sock",
 		// The kept control-plane log generations, after the server is booted
 		// out (it is their only writer); the live logs stay.
 		"RemoveAll:/var/lib/k3sm/server/kube-controller-manager.log.2",
@@ -3145,6 +3149,11 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 			for _, p := range executor.ComponentLogKeptPaths(dc.serverWorkDir()) {
 				created[p] = true
 			}
+		}
+		// keystore-sock/: the keystore step's (EnsureKeystoreFiles) on a
+		// server, admitted by its exact path when that step ran.
+		if slices.Contains(installCalls, "EnsureKeystoreFiles:"+dc.DataRoot) {
+			created[filepath.Join(dc.DataRoot, keystorepaths.SockDir)] = true
 		}
 		// The developer-mode marker is written only by an install with
 		// --developer-mode on, which this one is not. Uninstall cannot tell

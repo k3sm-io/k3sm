@@ -24,6 +24,7 @@ import (
 	"k3sm.io/k3sm/pkg/helmchart"
 	"k3sm.io/k3sm/pkg/install/order"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/runtimed/pkg/keystorepaths"
 )
 
 // artifactKind classifies a manifest entry so install/uninstall can perform the
@@ -249,6 +250,12 @@ func artifactManifest(cfg Config) []artifact {
 		for _, p := range executor.ComponentLogKeptPaths(cfg.serverWorkDir()) {
 			items = append(items, artifact{kind: kindFile, disp: dispRemove, path: p, assertExists: false})
 		}
+		// The keystore socket's directory, REMOVED after the server daemon is
+		// booted out: it holds only keys.sock, the socket launchd made for that
+		// job, which names no state; the next install creates it again, root's
+		// 0755. assertExists is false: an install that predates the keystore
+		// socket has none.
+		items = append(items, artifact{kind: kindDir, disp: dispRemove, path: filepath.Join(cfg.DataRoot, keystorepaths.SockDir), assertExists: false})
 		// The secrets encryption pair, PRESERVED with the datastore it unlocks:
 		// deleting the key would leave every Secret in the preserved state.db
 		// unreadable. assertExists is false: encryption is opt-in.
