@@ -24,6 +24,7 @@ import (
 
 	keyentry "k3sm.io/apis/keystore/entry"
 	"k3sm.io/k3sm/pkg/keystore"
+	"k3sm.io/k3sm/pkg/keystore/internal/strictjson"
 )
 
 // A damage class: what the server's log says of a store error that is
@@ -151,7 +152,7 @@ func (h *Handler) logStoreError(op string, p Peer, header []byte, err error) {
 // name, when it is a valid entry name in the API grammar; nothing else of
 // the header is read.
 func requestEntry(header []byte) (string, bool) {
-	fields, err := exactFields(header, "entry")
+	fields, err := strictjson.Object(header, "entry")
 	if err != nil {
 		return "", false
 	}

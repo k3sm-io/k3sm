@@ -4447,7 +4447,11 @@ surface, and the app consumes only those.
   - *Fingerprints.* `put` and `rotate` return the fingerprint the store computed as it sealed
     the value, never by reading it back; it is per scope (U9).
   - *Strict enough.* Unknown fields are ignored and a field set to `null` is absent. Field
-    names match exactly, never case-folded. A known field of the wrong JSON type (a string
+    names match exactly, never case-folded: every header, HELLO and request alike, is read
+    under the keystore's one strict-object rule (`keystore/internal/strictjson.Object`, the
+    audit log's reader's rule too), so any key given twice in any case, unknown keys included,
+    or a request field (`op`, `entry`, `kind`, `from_version`) spelled in another case closes
+    the connection at the dispatcher, whichever op the request names (`TestDispatchOpExactKey`). A known field of the wrong JSON type (a string
     where a number is expected, a negative or fractional `from_version`) is `refused`, and so
     is a header over the 8 KiB cap, judged before it is parsed. A value that is missing or
     empty where one is required, over the store's 64 KiB value cap, or present on an

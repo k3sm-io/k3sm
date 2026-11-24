@@ -24,8 +24,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 	"time"
+
+	"k3sm.io/k3sm/pkg/keystore/internal/strictjson"
 )
 
 // RequestBound is how long the server waits for a complete HELLO from
@@ -118,55 +119,7 @@ func NewHandler(now func() time.Time, opts ...HandlerOption) (*Handler, error) {
 	return h, nil
 }
 
-// exactFields reads header, which must be one JSON object, for the fields
-// named in known, by their exact names: the raw value of each one given,
-// with a null left as given. A known name given twice, or a key that
-// matches a known name only under encoding/json's case folding, is an
-// error, so the field is read from the one key a strict decoder would and
-// never from whichever key a case-insensitive, last-wins decoder picks.
-// Every other key is ignored.
-func exactFields(header []byte, known ...string) (map[string]json.RawMessage, error) {
-	dec := json.NewDecoder(bytes.NewReader(header))
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return nil, errors.New("not a JSON object")
-	}
-	out := make(map[string]json.RawMessage, len(known))
-	for dec.More() {
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		key, ok := tok.(string)
-		if !ok {
-			return nil, errors.New("a key is not a string")
-		}
-		var v json.RawMessage
-		if err := dec.Decode(&v); err != nil {
-			return nil, err
-		}
-		for _, k := range known {
-			switch {
-			case !strings.EqualFold(k, key):
-				continue
-			case k != key:
-				return nil, fmt.Errorf("the field %s is spelled in another case", k)
-			}
-			if _, dup := out[k]; dup {
-				return nil, fmt.Errorf("the field %s is given twice", k)
-			}
-			out[k] = v
-		}
-	}
-	if _, err := dec.Token(); err != nil {
-		return nil, err
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, errors.New("data after the object")
-	}
-	return out, nil
-}
-
-// decodeField decodes raw, a field exactFields read, into dst; an absent
+// decodeField decodes raw, a field strictjson.Object read, into dst; an absent
 // field, or one set to null, leaves dst as it is.
 func decodeField(raw json.RawMessage, dst any) error {
 	if raw == nil || bytes.Equal(raw, []byte("null")) {
@@ -175,12 +128,18 @@ func decodeField(raw json.RawMessage, dst any) error {
 	return json.Unmarshal(raw, dst)
 }
 
-// requestOp is the op a request header names, read with the exact-key
-// rule (exactFields): a header that is not an object, an op spelled in
-// another case or given twice, one that is not a string, and a missing or
-// empty op all close the connection.
+// requestKeys are the names of every request header field an operation
+// reads (requestFields): the dispatcher judges all of them, whichever op
+// the request names.
+var requestKeys = []string{"op", "entry", "kind", "from_version"}
+
+// requestOp is the op a request header names, read with the keystore's
+// strict-object rule (strictjson.Object) over every request field: a
+// header that is not an object, any key given twice in any case, a
+// request field spelled in another case, an op that is not a string, and a
+// missing or empty op all close the connection.
 func requestOp(header []byte) (string, error) {
-	fields, err := exactFields(header, "op")
+	fields, err := strictjson.Object(header, requestKeys...)
 	if err != nil {
 		return "", protocolErrorf("malformed request header: %v", err)
 	}
@@ -194,12 +153,13 @@ func requestOp(header []byte) (string, error) {
 	return op, nil
 }
 
-// helloOf is the client's HELLO header, read with the exact-key rule
-// (exactFields): a header that is not an object, a known field spelled in
-// another case, given twice or of the wrong type closes the connection.
+// helloOf is the client's HELLO header, read with the strict-object rule
+// (strictjson.Object): a header that is not an object, any key given
+// twice, a known field spelled in another case or of the wrong type closes
+// the connection.
 func helloOf(header []byte) (helloRequest, error) {
 	var hello helloRequest
-	fields, err := exactFields(header, "proto", "min", "max")
+	fields, err := strictjson.Object(header, "proto", "min", "max")
 	if err != nil {
 		return hello, protocolErrorf("malformed HELLO header: %v", err)
 	}

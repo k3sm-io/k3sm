@@ -305,7 +305,7 @@ func TestOpsRefuseMalformedRequests(t *testing.T) {
 	for _, tc := range []struct{ name, header string }{
 		{"unknown fields", `{"op":"rm","entry":"` + e + `","x":{"y":[1,2]},"from_version":"z"}`},
 		{"null from_version is absent", `{"op":"rotate","entry":"` + e + `","from_version":null}`},
-		{"a case-folded name is unknown", `{"op":"rotate","entry":"` + e + `","From_Version":"x"}`},
+		{"a field another op reads", `{"op":"rotate","entry":"` + e + `","kind":7}`},
 	} {
 		value := []byte(nil)
 		if strings.Contains(tc.header, "rotate") {

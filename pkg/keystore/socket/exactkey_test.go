@@ -25,10 +25,13 @@ import (
 	"time"
 )
 
-// The dispatcher reads op by its exact name, as decodeRequest reads every
-// field: an op spelled in another case, given twice in any case, missing,
-// empty, null or not a string closes the connection, and no operation runs.
-// An exact op beside an unknown field still dispatches.
+// The dispatcher reads op by its exact name, under the strict-object rule
+// decodeRequest reads every field by: an op spelled in another case, given
+// twice in any case, missing, empty, null or not a string closes the
+// connection, and so does any key given twice in any case, entry included,
+// and any request field (entry, kind, from_version) spelled in another
+// case, whichever op it names; no operation runs. An exact op beside an
+// unknown field still dispatches.
 func TestDispatchOpExactKey(t *testing.T) {
 	for _, tc := range []struct {
 		name, header string
@@ -49,6 +52,12 @@ func TestDispatchOpExactKey(t *testing.T) {
 		{"an object", `{"op":{"op":"rm"}}`, ""},
 		{"not an object", `["op","rm"]`, ""},
 		{"data after the object", `{"op":"rm"}{"op":"list"}`, ""},
+		{"entry duplicated exactly", `{"op":"rm","entry":"user/501/a","entry":"user/502/b"}`, ""},
+		{"entry duplicated, another case", `{"op":"rm","entry":"user/501/a","Entry":"user/502/b"}`, ""},
+		{"entry in another case", `{"op":"rm","ENTRY":"user/501/a"}`, ""},
+		{"kind in another case", `{"op":"rm","Kind":"opaque"}`, ""},
+		{"from_version in another case", `{"op":"rm","From_Version":1}`, ""},
+		{"an unknown field duplicated", `{"op":"rm","later":1,"Later":2}`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
