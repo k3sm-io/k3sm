@@ -144,19 +144,25 @@ log) and names `sudo k3sm keys audit --rotate` for the audit log or
 `doctor` runs in its own process and cannot ask the server whether the listener is serving, so
 its `keystore-user-scope` row says only what it can check:
 
-- `keystore user scope: start checks pass; a root-owned 0666 socket is at <path>` (PASS):
-  every check the server makes before it starts the listener passes, and a socket owned by root
-  at mode 0666 is at the path. launchd creates it, as root, from the `Sockets` entry that
-  `sudo k3sm install` writes into the server's LaunchDaemon plist, and hands it to the server.
-  `doctor` looks at the path; it never connects, since the server refuses root and the service
-  user.
+- `keystore user scope: start checks pass; a root-owned <mode> socket is at <path>` (PASS):
+  every check the server makes before it starts the listener passes, and the socket at the path
+  is owned by root, in the daemon group, at the mode the server's LaunchDaemon plist names (the
+  row prints it), in a directory owned by root:wheel that only root can write to. launchd
+  creates the socket, as root, from the `Sockets` entry that `sudo k3sm install` writes into
+  that plist, and hands it to the server. `doctor` looks at the path; it never connects, since
+  the server refuses root and the service user.
 - `keystore user scope: start checks pass, but no listening socket at <path>` (WARN): the
-  checks pass but nothing, something other than a socket, a socket not owned by root, or one at
-  another mode is at the path. It names `run sudo k3sm install (it rewrites the server plist
-  and re-bootstraps the job)`: a server plist written by an install from before the socket
-  existed has no `Sockets` entry, and launchd reads that entry only when the job is
-  bootstrapped. The server then logs one warning, `launchd activated no socket for this
-  server`, and does not retry until it is restarted that way.
+  checks pass but nothing, something other than a socket, a socket with another owner, group
+  or mode, or a socket in a directory with another owner or mode is at the path. The remedy
+  depends on the installed server plist:
+  - without the `Sockets` entry (a plist written by an install from before the socket existed)
+    it names `run sudo k3sm install (it rewrites the server plist and re-bootstraps the job)`;
+    launchd reads that entry only when the job is bootstrapped. The server logs one warning,
+    `launchd activated no socket for this server`, and does not retry.
+  - with the entry, launchd could not create the socket because the data root's volume was not
+    mounted when the server started; it names `mount the data root, then run sudo k3sm
+    restart`. The server logs one warning, `the socket's parent path was missing when launchd
+    bound it`, and does not retry until it is restarted.
 - `keystore user scope: off (<reason>)` (WARN): a check fails, with the server's own reason.
   For a missing, wrong or unflagged log or socket directory it adds `run sudo k3sm install`;
   for `more than one server registered` it names the servers (up to 8, then how many more);
