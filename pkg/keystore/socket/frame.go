@@ -196,6 +196,9 @@ func readFrame(r io.Reader, mode readMode) (Frame, error) {
 	}
 	f.Value = make([]byte, rest)
 	if err := readBody(r, f.Value); err != nil {
+		// A value cut part way is zeroed: its first bytes may be a
+		// secret's.
+		clear(f.Value)
 		return Frame{}, err
 	}
 	return f, nil

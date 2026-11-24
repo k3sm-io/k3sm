@@ -185,57 +185,62 @@ func (h *Handler) Serve(ctx context.Context, c Conn, p Peer) error {
 			}
 			return err
 		}
-		// The request: the rest of its frame and its reply within
-		// RequestBound of its first byte.
-		end := h.now().Add(RequestBound)
-		if err := c.SetReadDeadline(end); err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		f, err := ReadFrame(io.MultiReader(bytes.NewReader(first[:]), c))
-		if err != nil {
-			return err
-		}
-		if f.Type != TypeRequest {
-			return protocolErrorf("frame type %#02x after HELLO, not a request", byte(f.Type))
-		}
-		var req requestHeader
-		if err := json.Unmarshal(f.Header, &req); err != nil {
-			return protocolErrorf("malformed request header: %v", err)
-		}
-		if req.Op == "" {
-			return protocolErrorf("request names no op")
-		}
-		// An op the server does not have is answered unknown-op, and the
-		// connection stays open so a newer client can fall back.
-		rt, header, value := TypeError, any(errorHeader{Code: CodeUnknownOp}), []byte(nil)
-		if op, ok := h.ops[req.Op]; ok {
-			rt, header, value = answer(op(ctx, Request{Peer: p, Op: req.Op, Header: f.Header, Value: f.Value}))
-		}
-		// A reply the server cannot encode (a header that does not marshal,
-		// or one past its cap) is answered internal: the operation has run,
-		// and the connection stays open for the next request.
-		b, err := marshalFrame(rt, header, value)
-		clear(value)
-		if err != nil {
-			b, err = marshalFrame(TypeError, errorHeader{Code: CodeInternal}, nil)
-		}
-		if err == nil {
-			err = c.SetReadDeadline(h.now().Add(IdleBound))
-		}
-		if err == nil {
-			err = h.writeEncoded(ctx, c, end, b)
-		}
-		// Neither value outlives its request, written or not; the encoding
-		// holds a copy of the reply's value.
-		clear(f.Value)
-		clear(b)
-		if err != nil {
+		if err := h.serveRequest(ctx, c, p, first[0]); err != nil {
 			return err
 		}
 	}
+}
+
+// serveRequest reads and answers one request whose first byte is first:
+// the rest of its frame and its reply within RequestBound of that byte.
+// The request's value is zeroed on every way out, an early return and a
+// panic out of the operation included, and so is the reply's encoding.
+func (h *Handler) serveRequest(ctx context.Context, c Conn, p Peer, first byte) error {
+	end := h.now().Add(RequestBound)
+	if err := c.SetReadDeadline(end); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f, err := ReadFrame(io.MultiReader(bytes.NewReader([]byte{first}), c))
+	defer func() { clear(f.Value) }()
+	if err != nil {
+		return err
+	}
+	if f.Type != TypeRequest {
+		return protocolErrorf("frame type %#02x after HELLO, not a request", byte(f.Type))
+	}
+	var req requestHeader
+	if err := json.Unmarshal(f.Header, &req); err != nil {
+		return protocolErrorf("malformed request header: %v", err)
+	}
+	if req.Op == "" {
+		return protocolErrorf("request names no op")
+	}
+	// An op the server does not have is answered unknown-op, and the
+	// connection stays open so a newer client can fall back.
+	rt, header, value := TypeError, any(errorHeader{Code: CodeUnknownOp}), []byte(nil)
+	if op, ok := h.ops[req.Op]; ok {
+		rt, header, value = answer(op(ctx, Request{Peer: p, Op: req.Op, Header: f.Header, Value: f.Value}))
+	}
+	// A reply the server cannot encode (a header that does not marshal,
+	// or one past its cap) is answered internal: the operation has run,
+	// and the connection stays open for the next request.
+	b, err := marshalFrame(rt, header, value)
+	clear(value)
+	if err != nil {
+		b, err = marshalFrame(TypeError, errorHeader{Code: CodeInternal}, nil)
+	}
+	// The encoding holds a copy of the reply's value: it is zeroed too.
+	defer clear(b)
+	if err != nil {
+		return err
+	}
+	if err := c.SetReadDeadline(h.now().Add(IdleBound)); err != nil {
+		return err
+	}
+	return h.writeEncoded(ctx, c, end, b)
 }
 
 // answer is the frame an operation's result is answered with: its reply,
