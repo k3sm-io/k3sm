@@ -528,6 +528,11 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	mr, err := s.MergeFloor(ctx, MergeOptions{DryRun: true})
 	check("MergeFloor", mr, err)
 
+	// RefusedIneligible takes a pid reflection does not build: the
+	// socket's refused line for a uid with no user scope, by hand.
+	err = s.RefusedIneligible(ctx, 100, 4242, "list")
+	check("RefusedIneligible", err)
+
 	err = s.Delete(ctx, "pair")
 	check("Delete", err)
 
