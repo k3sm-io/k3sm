@@ -30,7 +30,6 @@ import (
 	"syscall"
 	"testing"
 
-	"k3sm.io/darwin-net/pkg/netbind"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
@@ -127,9 +126,10 @@ func (f *fakeWireNetd) seen() ([]string, []string) {
 // as lbHosterConfig builds it, with the "tcp4" network svclb asks for on an
 // IPv4 address, against a daemon that refuses every protocol but "tcp" and
 // "udp" as netd does. A listed port must bind on the wildcard and on a
-// specific address; a raw *netbind.Netd handed the same request is refused,
-// which is what keeps this test non-vacuous. It opens real unix and loopback
-// sockets, so it is integration-tier; TestHosterBinderSpeaksTheNetdWireProtocol
+// specific address; the same "tcp4" put on the wire unmapped, through
+// wire.Client (netbind.Netd maps it to "tcp" itself), is refused, which is
+// what keeps this test non-vacuous. It opens real unix and loopback sockets,
+// so it is integration-tier; TestHosterBinderSpeaksTheNetdWireProtocol
 // is the unit-tier half at the binder seam.
 func TestHosterBinderSpeaksTheNetdWireProtocolOverASocket(t *testing.T) {
 	fake := newFakeWireNetd(t)
@@ -156,9 +156,11 @@ func TestHosterBinderSpeaksTheNetdWireProtocolOverASocket(t *testing.T) {
 		t.Errorf("netd saw protocols %v for %v, want tcp for 0.0.0.0 and 100.64.0.1", protocols, addrs)
 	}
 
-	raw := &netbind.Netd{Client: wire.NewClient(fake.socket)}
-	if ln, err := raw.Listen(context.Background(), "tcp4", netip.MustParseAddrPort("0.0.0.0:80")); err == nil {
-		_ = ln.Close()
+	// netbind.Netd maps "tcp4" to "tcp" itself, so the refusal is probed at
+	// the wire client, which sends the protocol name unchanged.
+	raw := wire.NewClient(fake.socket)
+	if f, err := raw.BindPort(context.Background(), "tcp4", netip.MustParseAddrPort("0.0.0.0:80")); err == nil {
+		_ = f.Close()
 		t.Fatal("the fake daemon accepted protocol tcp4; the assertions above prove nothing")
 	} else if !strings.Contains(err.Error(), "unsupported protocol") {
 		t.Errorf("raw tcp4 refusal = %v, want the unsupported-protocol refusal", err)
