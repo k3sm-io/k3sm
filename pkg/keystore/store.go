@@ -137,6 +137,14 @@ type Config struct {
 	// an append waits at most 2 seconds for the lock). A negative value
 	// makes every operation fail.
 	LockWait time.Duration
+	// GeneratedUID answers a uid's live GeneratedUID in place of the
+	// directory lookup (mbr_uid_to_uuid), for tests only: nil, as
+	// production leaves it, reads the directory service within its
+	// deadline. A test outside this package, which cannot reach the
+	// package's seam, supplies one so no host lookup runs. Its answer is
+	// judged as the lookup's is: an error, an all-zero or a synthesized
+	// answer fails closed with ErrScopeOwnerUnknown.
+	GeneratedUID func(uid uint32) ([16]byte, error)
 }
 
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
@@ -157,6 +165,9 @@ type FileStore struct {
 	now      func() time.Time
 	chown    func(f *os.File, uid, gid int) error
 	lockWait time.Duration
+	// generatedUID is Config.GeneratedUID: nil reads the directory
+	// service through lookupGeneratedUID.
+	generatedUID func(uid uint32) ([16]byte, error)
 	// log is where the store logs; nil is slog.Default(), read at the
 	// call, so a default the binary sets after New still applies.
 	log *slog.Logger
@@ -240,6 +251,7 @@ func New(cfg Config) *FileStore {
 		now:             time.Now,
 		chown:           (*os.File).Chown,
 		lockWait:        time.Duration(orDefault(int64(cfg.LockWait), int64(lockTimeout))),
+		generatedUID:    cfg.GeneratedUID,
 		step:            func(string) error { return nil },
 		owned:           func([]byte) {},
 		entryMade:       func(string) {},

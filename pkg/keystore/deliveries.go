@@ -1051,8 +1051,6 @@ func (u *UserScope) catchUpDeliveryLine(gen [generationSize]byte, rd deliveriesR
 // damage so quarantines only the scopes that have something to catch up. A
 // scope the catch-up could not open at all has no line to write: it is
 // logged and named in the returned error, and it still starts.
-//
-//lint:ignore U1000 the server start calls it once the socket lands; until then TestUserScopeIsUnexported holds the user scope in this package.
 func (s *FileStore) startUserScopes(ctx context.Context) error {
 	if s.userScopesStarted == nil {
 		return fmt.Errorf("%w: the store was not made by New", errInvalidConfig)
@@ -1500,7 +1498,8 @@ func (u *UserScope) appendAudit(l auditLine, err error) error {
 		if err == nil || Committed(err) {
 			u.s.audit.countUnaudited()
 		}
-		return committedf(aerr, "the change stands, but its audit line was not written")
+		// committedf's text, with errAuditLost matchable for AuditLost.
+		return fmt.Errorf("%w: %w: %v", ErrCommitted, errAuditLost, aerr)
 	}
 	return nil
 }

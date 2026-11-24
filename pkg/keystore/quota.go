@@ -194,7 +194,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	// or timed out is no answer, and rm goes ahead. One refused for
 	// capacity, where no lookup ran, refuses rm, retryably: going ahead on
 	// it would let a burst of stuck lookups stand in for the owner check.
-	live, err := lookupGeneratedUID(u.uid)
+	live, err := u.s.generatedUIDOf(u.uid)
 	switch {
 	case errors.Is(err, errLookupNotRun):
 		return err

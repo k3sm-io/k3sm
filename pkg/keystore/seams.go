@@ -83,6 +83,17 @@ var lookups = struct {
 	inflight map[uint32]*flight
 }{inflight: map[uint32]*flight{}}
 
+// generatedUIDOf is lookupGeneratedUID, or the store's test answer
+// (Config.GeneratedUID) when it has one, judged as the lookup's answer is,
+// with no deadline or outstanding bound since it never reaches the host.
+func (s *FileStore) generatedUIDOf(uid uint32) ([generationSize]byte, error) {
+	if s.generatedUID != nil {
+		g, err := s.generatedUID(uid)
+		return checkGeneratedUID(uid, g, err)
+	}
+	return lookupGeneratedUID(uid)
+}
+
 // lookupGeneratedUID reads uid's live GeneratedUID through the seam, within
 // generatedUIDDeadline. A lookup past the deadline, an error, a synthesized
 // answer and an all-zero one each fail closed with ErrScopeOwnerUnknown: a

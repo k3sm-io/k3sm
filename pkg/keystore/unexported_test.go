@@ -166,10 +166,11 @@ var userScopeReach = map[string]bool{
 // left out the same way, by its receiver: it is reachable only through a
 // *UserScope, which the outside ban holds.
 var inPackageReachAllow = map[string]string{
-	"FileStore.UserScope":    "the user scope's own constructor, which the outside ban holds",
-	"ResolveEntry":           "the entry resolver itself, which the outside ban holds",
-	"FileStore.RebuildFloor": "root's floor --rebuild: it reads every scope to write the floor's lines, all root's and charged to no uid, and gives no caller a user scope",
-	"FileStore.RemoveScope":  "root's rm-scope: it removes one scope under the exclusive lock, appends no uid's line, and gives no caller a user scope",
+	"FileStore.UserScope":       "the user scope's own constructor, which the outside ban holds",
+	"ResolveEntry":              "the entry resolver itself, which the outside ban holds",
+	"FileStore.RebuildFloor":    "root's floor --rebuild: it reads every scope to write the floor's lines, all root's and charged to no uid, and gives no caller a user scope",
+	"FileStore.RemoveScope":     "root's rm-scope: it removes one scope under the exclusive lock, appends no uid's line, and gives no caller a user scope",
+	"FileStore.StartUserScopes": "the server's start step: it checks the logs and catches the floor up, and gives no caller a user scope; a scope is still had only through FileStore.UserScope, from pkg/keystore/socket",
 }
 
 // inPackageExports returns, as "<Recv>.<Name>" or "<Name>", in declaration

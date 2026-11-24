@@ -743,7 +743,7 @@ func (u *UserScope) readScopeKey(dir *os.Root, wrap func() (keys, error)) ([]byt
 	if err != nil {
 		return nil, zero, err
 	}
-	live, err := lookupGeneratedUID(u.uid)
+	live, err := u.s.generatedUIDOf(u.uid)
 	if err != nil {
 		return nil, zero, err
 	}
@@ -986,7 +986,7 @@ func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, 
 	if err := u.s.eligibleUID(u.uid); err != nil {
 		return keys{}, nil, err
 	}
-	g, err := lookupGeneratedUID(u.uid)
+	g, err := u.s.generatedUIDOf(u.uid)
 	if err != nil {
 		return keys{}, nil, err
 	}
