@@ -850,7 +850,12 @@ func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (err error) 
 		revoked bool
 		sealed  []delivery
 	)
+	finished := false
 	defer func() { // before done: the line is appended under the lock
+		if !finished {
+			u.panicGap()
+			return
+		}
 		// A revocation is a withdraw that wrote its tombstone or a catch-up
 		// line, whether or not its floor line then failed (errCommitted); a
 		// no-op repeat that wrote neither is not, as for rm.
@@ -863,6 +868,7 @@ func (u *UserScope) withdrawLocked(ctx context.Context, uid string) (err error) 
 		err = u.keepAuditFailure("withdraw", err, aerr)
 	}()
 	ns, revoked, sealed, err = u.withdrawBody(root, uid)
+	finished = true
 	return err
 }
 
@@ -1377,11 +1383,23 @@ func (u *UserScope) grantLocked(ctx context.Context, g *grantAudit, fn func(*ope
 		return err
 	}
 	defer done()
+	finished := false
 	defer func() { // before done: the refusal's line is appended under the lock
+		if !finished {
+			g.refused(errHoldPanicked)
+			return
+		}
 		if err != nil {
 			g.refused(err)
 		}
 	}()
+	err = u.grantLockedBody(root, g, fn)
+	finished = true
+	return err
+}
+
+// grantLockedBody is grantLocked's work under the exclusive lock.
+func (u *UserScope) grantLockedBody(root *os.Root, g *grantAudit, fn func(*openedScope) error) error {
 	if err := u.s.admit(u.uid, false); err != nil {
 		return err
 	}
@@ -1496,6 +1514,12 @@ func (u *UserScope) auditBriefly(ctx context.Context, l auditLine, err error) {
 	defer done()
 	_ = u.appendAudit(l, err) // already refused
 }
+
+// errHoldPanicked is the result a grant's second audit line names when its
+// work under the lock panicked after the ok line: the commit failed after
+// the line, as far as the line can say, and the outcome is not known. The
+// panic goes on to the socket's listener, which recovers it and logs it.
+var errHoldPanicked = errors.New("the operation panicked under the store lock; its outcome is not known")
 
 // errAuditRefused is a grant refused because its audit line could not be
 // appended.

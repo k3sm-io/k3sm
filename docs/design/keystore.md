@@ -4016,12 +4016,16 @@ refused before its first frame:
   had (the keystore directory missing, the lock held past its wait, an invalid configuration)
   is not audited rather than appended without it; that line is counted in the uid's
   post-frame dropped count, which its next refused-line summary or root's next
-  `audit --rotate` writes and `doctor` shows (`TestAuditBrieflyCountsLineLockKeptOut`). A
-  `rotate` or `rm` whose work inside its hold panics (a panic the socket's listener recovers)
-  writes no line: its outcome is not known, so an `ok` line would record an operation that
-  never finished and a refused line could hide an `rm` whose burial committed. It is counted
-  with the unaudited operations instead (`UnauditedOps`, U112), the one count of a change that
-  may stand without its line, which `doctor` shows and root's `audit --rotate` writes
+  `audit --rotate` writes and `doctor` shows (`TestAuditBrieflyCountsLineLockKeptOut`). An
+  operation whose work inside its hold panics (a panic the socket's listener recovers and
+  logs) has an outcome that is not known. A revocation (`rotate`, `rm`, `withdraw`) then
+  writes no line: an `ok` line would record an operation that never finished, and a refused
+  line could hide an `rm` whose burial committed. It is counted with the unaudited operations
+  instead (`UnauditedOps`, U112), the one count of a change that may stand without its line,
+  which `doctor` shows and root's `audit --rotate` writes. A grant (`put`, a minting `put`,
+  `deliver`) has already written its `ok` line before its first write, so it follows the
+  grant's own rule for a commit that fails after the line ("Order", below): a second line,
+  with result `error`, and no count, since the grant is not unrecorded
   (`TestPanicInHoldWritesNoOKLine`).
 - **Lock modes and fairness.** Reads (`list`, `read-for-exec`, `deliveries` and the
   reconciler's reads) take the store lock shared, and their audit lines are appended under that
@@ -4112,7 +4116,8 @@ refused before its first frame:
   or malformed refuses the grant with nothing written and no `ok` line, so no grant commits a
   write whose floor line cannot follow (U20). A refusal
   before that point is audited best effort with its result, and a commit that fails after the
-  line gets a second line with its result. Every other socket operation, and the revocation
+  line gets a second line with its result; a panic in the hold after the line is such a
+  failure, and its second line names `error`. Every other socket operation, and the revocation
   class above all (`withdraw`, `rm`, `rotate`), commits its change to the store, then appends
   its audit line, then replies. If the append fails after the commit, the change stands and the
   reply says so: `ok` with the warning `committed; audit failed`, which the CLI prints. The

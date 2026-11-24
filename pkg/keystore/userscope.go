@@ -278,11 +278,23 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 		return Version{}, err
 	}
 	defer done()
+	finished := false
 	defer func() { // before done: the refusal's line is appended under the lock
+		if !finished {
+			g.refused(errHoldPanicked)
+			return
+		}
 		if err != nil {
 			g.refused(err)
 		}
 	}()
+	v, err := u.putLocked(root, name, kind, value, g)
+	finished = true
+	return v, err
+}
+
+// putLocked is put's work under the exclusive lock.
+func (u *UserScope) putLocked(root *os.Root, name string, kind Kind, value []byte, g *grantAudit) (Version, error) {
 	if err := u.s.admit(u.uid, false); err != nil {
 		return Version{}, err
 	}

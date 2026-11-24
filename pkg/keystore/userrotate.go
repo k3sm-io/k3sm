@@ -147,12 +147,14 @@ func (u *UserScope) rotate(ctx context.Context, name string, next nextValue) (v 
 	return v, err
 }
 
-// panicGap is the audit of a rotate or rm whose work under the lock
-// panicked: no line, since its err is nil and an ok line would record an
-// operation that never finished, and a refused line could hide one that
-// committed (an rm's burial); the operation is counted unaudited instead
-// (UnauditedOps), which doctor shows and root's audit --rotate writes. The
-// panic goes on to the socket's listener, which recovers it.
+// panicGap is the audit of a revocation (rotate, rm, withdraw) whose work
+// under the lock panicked: no line, since its err is nil and an ok line
+// would record an operation that never finished, and a refused line could
+// hide one that committed (an rm's burial); the operation is counted
+// unaudited instead (UnauditedOps), which doctor shows and root's
+// audit --rotate writes. The panic goes on to the socket's listener, which
+// recovers it and logs it. A grant, whose ok line is written before its
+// first write, names errHoldPanicked in a second line instead.
 func (u *UserScope) panicGap() {
 	u.s.countUnaudited()
 }
