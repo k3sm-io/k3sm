@@ -579,8 +579,10 @@ master directly, as here; a user scope seals under its own scope key, wrapped by
 master, as "User scope", "Key hierarchy" specifies.
 
 **Where it is stored: nowhere.** It is computed when a version is read, from the decrypted
-value. `list` therefore opens each version once; that is one small AES-GCM open per version
-(values are capped at 64 KiB), and `list` is an operator command, not a hot path.
+value. A root or system-scope `list` therefore opens each version once; that is one small
+AES-GCM open per version (values are capped at 64 KiB), and `list` is an operator command, not
+a hot path. A user scope's `list` opens only each entry's current version ("List, when one
+entry is corrupt").
 **It changes across a Rewrap** for opaque entries, because its key derives from the master;
 an Ed25519 fingerprint does not. A fingerprint copied into a runbook goes stale after a
 Rewrap, and the verb says so when it finishes.
@@ -642,7 +644,9 @@ An entry whose generation file, `current`, or any version `current` covers fails
 (missing, corrupt, stale, or truncated) is still returned, carrying the error; an old
 version that no longer opens is damage the operator should see. A file that cannot be read
 for want of permission, or an I/O error, is reported as that, not as `ErrCorrupt`, whose
-fix (restore from backup) would be the wrong one. `rm` reads nothing inside an entry, so it
+fix (restore from backup) would be the wrong one. One exception, stated here as the decision:
+a user scope's `list` opens only each entry's current version (below), so a user-scope
+version older than the current one that no longer opens is not reported by `list`. `rm` reads nothing inside an entry, so it
 removes one `list` reports as corrupt. The contract changes: `Entry` gains `Err error`,
 non-nil exactly when the entry could not be opened, and `Current` and `Versions` are then
 zero. `List` returns a non-nil error for the whole call only for a failure that is not
@@ -651,9 +655,10 @@ about one entry: the master missing or untrusted, or the lock timing out.
 A user scope's `list` (the socket's) checks less, to keep its shared hold short: it opens and
 authenticates the current version only, and checks every other version of the pointer's
 committed range for presence, by one listing of the entry's directory and no record opened. A
-version missing from the range marks the entry with `Err` (`ErrCorrupt`); a version whose file
-is present but damaged is reported by the read or rotate that opens it, not by `list`. Root's
-`keys list` and `doctor` (`FileStore.List`) still open every version.
+version missing from the range, or whose name is not a regular file (a symlink, a directory),
+marks the entry with `Err` (`ErrCorrupt`) (`TestUserListVersionNotRegularIsAbsent`). Damage to
+an older user-scope version whose file is present is found only by a `rotate --from-version`
+of that version, which opens it, or by a Rewrap, which then refuses; no `list` reports it.
 
 **An entry directory with no `current`.** Put writes `generation`, then `v1`, then
 `current`, and writes each file through a temporary file renamed into place, so a crash
@@ -2115,24 +2120,39 @@ store lock it is trusted only while the scope's `scope.key` is byte for byte the
 beside (an `rm-scope` and a new mint, or a Rewrap's re-seal, makes it stale, and that judgement
 walks the scope once and keeps the result; the walk before the lock checks the digest too, so
 a stale figure is rebuilt there, outside the hold, and that walk stops when its request's
-context ends, leaving no figure). A `put`, `rotate` or `rm` takes the figure out of the table
+context ends, leaving no figure, and the request then returns its context's error before the
+store lock, taking no hold and writing nothing). That walk under the lock is the one scope walk
+left in a `put` or `rotate` hold, a fallback: the figure is still absent or stale at the lock
+when the walk before it failed, when a root `rm-scope` and a new mint, or a Rewrap, landed
+between that walk and the lock, or when the `put` minted the scope in this hold. The hold does
+not release the lock to walk outside it and retry: that walk is documented, not removed. A `put`, `rotate` or `rm` takes the figure out of the table
 before its first write to the scope's entries and puts it back, changed by what it wrote or
 removed, only through its own confirm after the update, so a failure, an outcome not known, or
 a panic the socket's listener recovers, anywhere in between, leaves no figure and the next one
 walks again (`TestUsagePanicAtWriteDropsFigure`, `TestUsageFailedWriteDropsFigure`). `rm` takes
-it out only at the removals from the entry's tree; a refusal that writes nothing to the entries
-(a rate or log-room refusal, `ErrScopeOwnerChanged`, a lookup not run, `ErrExists`, a quota
-refusal, an `rm` refused with nothing removed, or one that only buries) keeps it
-(`TestUsageRefusalKeepsFigure`). The order before the store lock is the uid's mutation lock,
+it out only at the removals from the entry's tree, so one that only buries keeps it too. A
+refusal that writes nothing to the entries keeps it: `ErrExists`, a quota refusal, a log-room
+refusal, an `rm` of a name not there, `ErrScopeOwnerChanged`, a lookup not run, and an `rm`
+refused with nothing removed (`TestUsageRefusalKeepsFigure`); the mutation rate limit is the
+socket's and refuses before the store is reached, so it never touches the figure. The order before the store lock is the uid's mutation lock,
 that walk, then the GeneratedUID lookup, so the lookup's answer is not spent waiting for either.
-Only the server writes a user scope's entries; a file written behind it is out of this model
-and is counted at the next walk (`TestUsageFigureMatchesWalk`). So is a second server process
+Only the server writes a user scope's entries; a file written behind it is out of this model:
+one planted under the same `scope.key` stays uncounted until a restart, a listener start, or a
+figure dropped for another reason makes the next `put` or `rotate` walk the scope
+(`TestUsageFigureMatchesWalk` shows a figure bound to another `scope.key` re-walked, not a
+planted file counted). So is a second server process
 over the same tree: the listener serves only after the single-server check at its start has
 passed, and a second server registered while one serves is caught at the next count, up to 30
-seconds later (U110), during which the figure's model does not hold. A restore puts a tree back
-under the same `scope.key`s with the server stopped, so the restart holds no figure; the
-restore's merge, which moves the staged tree into place, also forgets every figure the
-process holds (`TestFloorMergeForgetsUsageFigures`).
+seconds later (U110), during which the figure's model does not hold. Every listener start pass
+runs the store's start step, which drops every figure first, so a listener started again (a
+rebuild, a run after a recovered panic, a second server gone) holds none from before
+(`TestStartUserScopesForgetsUsageFigures`); a figure an operation or a walk took before that
+drop is never put back after it, the table's generation having moved
+(`TestForgetAllDuringOpLeavesNoFigure`). A restore puts a tree back under the same
+`scope.key`s with the server stopped, as its recipe requires: the stopped server is the
+protection, since the restart holds no figure. The restore's merge also forgets every figure
+of the process that runs it (`TestFloorMergeForgetsUsageFigures`), which covers only a figure
+held in that process.
 
 **When `rotate` gets `ErrQuota`.** Retention is unbounded, so an entry rotated often fills the
 byte budget. `rm` then `put` recovers: `rm` frees every version of the entry and `put` stores
@@ -3980,9 +4000,12 @@ refused before its first frame:
   a stream of reads cannot starve a mutation.
   As built: `pkg/keystore`'s store lock takes the in-process lock, then the `.lock` `flock`, both
   within the one lock wait. A `put`, `rotate` or `rm` first waits for its uid's mutation lock,
-  under a lock wait of its own, so the longest it waits end to end is the sum of the two, twice
-  the lock wait (4 s at the default); only another operation of the same uid makes it wait for
-  the first. As `sync.RWMutex` does, a waiting writer blocks new readers and a
+  under a lock wait of its own; a `put` or `rotate` then walks the scope when it holds no fresh
+  usage figure ("Quotas"), a walk bounded only by its request's context, and each of the three
+  runs the GeneratedUID lookup, under its own 250 ms deadline. So the longest it waits before
+  its hold is twice the lock wait (4 s at the default), plus 250 ms, plus that walk; only
+  another operation of the same uid makes it wait for the uid's lock. A request whose context
+  ends during the walk, or before the store lock, takes no store lock and writes nothing. As `sync.RWMutex` does, a waiting writer blocks new readers and a
   writer's release hands the lock to every reader already waiting before the next writer, so
   neither mode starves the other; a writer that gives up its wait readmits readers
   (`TestWriterPreferringLock`, `TestPrefLockAdmitsReaderUnderWriterStream`). Every store the
@@ -4003,9 +4026,12 @@ refused before its first frame:
     `rotate`, `rm`, `deliver`, `withdraw` or read contains a GeneratedUID lookup or any other wait
     the clock can see: the lookup is taken before the lock, inside the uid's mutation lock, and
     its one answer, an error included, serves the whole hold. It proves nothing about the work a
-    hold does, which the fake clock does not count. That work is bounded for `put` and `rotate`:
-    the quota is judged on the usage figure ("Quotas") and `rotate`'s orphan check reads only the
-    version above the pointer. On the wall clock their holds are dominated by fsyncs: a `rotate`
+    hold does, which the fake clock does not count. That work is bounded for `put` and `rotate`,
+    but for one fallback: the quota is judged on the usage figure ("Quotas") and `rotate`'s
+    orphan check reads only the version above the pointer. The remaining in-hold walk is that
+    fallback: when the figure is still absent or stale at the lock (the walk before it failed,
+    or a root `rm-scope` and a new mint, or a Rewrap, landed between that walk and the lock, or
+    the `put` minted the scope), the quota judgement walks the scope under the lock. On the wall clock their holds are dominated by fsyncs: a `rotate`
     holds the lock about 21 ms on a developer Mac whether its entry keeps one version or 20,000,
     and a user `list` of an entry of 20,000 versions about 11 ms (720 ms when it opened every
     version). Not bounded yet: an `rm` reads each version record's header for its burial and
@@ -4016,16 +4042,18 @@ refused before its first frame:
     waits, before the result is `Indeterminate` (U89).
   - *What one uid can do to another through the lock.* It cannot be refused for another uid's
     log lines ("Per-uid fairness"), but it can delay another uid: its exclusive holds are at most
-    5 a second (the mutation rate limit, "The socket") of at most 50 ms each, so one uid holds
-    the lock exclusively for at most 250 ms in any second. It does not hold yet for an `rm` of
-    an entry of tens of thousands of versions, whose hold grows with them (the hold-time bound
-    above); a `put` or `rotate` costs no walk of the scope and no listing of the entry under the
-    lock: on synctest's clock, another uid's `rm` that waits behind a `rotate` of an entry padded
-with thousands of files is served within its lock wait once the rotation's hold ends
-(`TestRotateHoldServesOtherUIDWithinLockWait`); `TestLockHoldBoundPerUID` measures the same on
-the wall clock through the socket, run with `K3SM_KEYSTORE_MEASURE` set. Many uids together can push another
-    uid's wait past the 2-second bound, which is `busy`, never a refusal for the share and
-    never a deletion.
+    5 a second (the mutation rate limit, "The socket"), and a `put`'s or `rotate`'s hold does at
+    most 50 ms of work, so one uid's `put`s and `rotate`s hold the lock exclusively for at most
+    250 ms in any second, except that an `rm`'s hold is not bounded yet: an `rm` of an entry of
+    tens of thousands of versions holds the lock for a time that grows with them (the hold-time
+    bound above), so a uid's `rm`s are outside the 250 ms. A `put` or `rotate` lists no entry
+    under the lock, and walks the scope there only in the fallback "Quotas" names (a figure
+    still absent or stale at the lock): on synctest's clock, another uid's `rm` that waits
+    behind a `rotate` of an entry padded with thousands of files is served within its lock wait
+    once the rotation's hold ends (`TestRotateHoldServesOtherUIDWithinLockWait`);
+    `TestLockHoldBoundPerUID` measures the same on the wall clock through the socket, run with
+    `K3SM_KEYSTORE_MEASURE` set. Many uids together can push another uid's wait past the
+    2-second bound, which is `busy`, never a refusal for the share and never a deletion.
 - **Order: a grant appends first; a revocation commits first.** A grant (a user `put`, and
   `deliver`, each with the scope's mint) appends its audit line before its first write, after
   every refusal it can give, and only then commits: a failed append refuses it and nothing is
@@ -6861,7 +6889,7 @@ carried by the unit rows.
 | U86 | a drift repair (the reconciler re-creating or repairing a delivered Secret that someone other than the reconciler edited or deleted, at the version already delivered) is reconciler-class: it draws on the reconciler budget and is never charged to the owner's share or budgets; repairs are coalesced to one audit line per delivery per 10 minutes with a count, and rate-limited per delivery with exponential backoff capped at 10 minutes; a write of a new version after the owner's own `rotate` or `put` stays charged to the owner; `Ready=Delivered` compares `k3sm.io/keystore-digest`, the sha256 of the Secret's `data`, each sweep, so a substituted `data` under an intact version annotation is drift | `k3sm/pkg/keystore/reconcile::TestDriftRepairNotChargedToOwner`, `TestSubstitutedDataIsDrift` | pending: the KeyDelivery reconciler (lifecycle) |
 | U87 | the admission policy also matches UPDATE and DELETE of `keydeliveries` and admits one only when the requester equals `oldObject.spec.requestedBy`, is the k3sm server's identity, or is in `system:masters` (and, for DELETE only, the namespace controller's ServiceAccount); a finalizer edit is an UPDATE, so another author can neither delete the object nor strip its finalizer; the reconciler's and `withdraw`'s own writes pass; on a DELETE `object` is null and only `oldObject` is read; `failurePolicy` is `Fail` | `k3sm/pkg/policy::TestVAPRefusesDeleteByOtherAuthor`, `TestVAPRefusesFinalizerStripByOtherAuthor`; rig leg E23 | pending: KeyDelivery authoring |
 | U88 | `floor --rebuild` never lowers: it reads every scope whose `scope.key` opens under `W` without the GeneratedUID check, so an owner change or a departed account is rebuilt from its pointers (U129); if any scope's `scope.key` does not open under `W` or any other error stops it (`ErrBusy` included), it refuses to finish, names the scope and changes nothing; the `deliveries` record's AAD is scope, kind 0xFD, name `deliveries`, generation and sequence, its floor key is `(user/<uid>, .deliveries, generation, seq)`, and the rebuild writes that key's line; a copied-back older `deliveries` record is refused against the floor, before and after a rebuild | `k3sm/pkg/keystore::TestRebuildRefusesOnUnopenableScope`, `k3sm/pkg/keystore::TestCopiedBackDeliveriesRecordRefused` | done: the append-only files (floor --rebuild) |
-| U89 | reads take the store lock shared and mutations exclusive, through a writer-preferring in-process lock; a server exclusive hold does at most 50 ms of work per operation, larger work chunked, no hold across an API call (the bound measured in K7a); a reconciler revocation that gets `ErrBusy` retries up to 3 times with jitter in the same sweep before it is `Indeterminate`; under a sustained read load from other uids a revocation completes | `k3sm/pkg/keystore::TestWriterPreferringLock`, `TestPrefLockWriterTimeoutAdmitsReaders`, `TestRotateHoldServesOtherUIDWithinLockWait` | partial: the store's writer-preferring lock and the per-uid hold bound checked, through the socket's store bridge (the user-scope store); pending: the reconciler's retries and `k3sm/pkg/keystore/reconcile`'s revocation under other uids' read load (the KeyDelivery reconciler (lifecycle)) |
+| U89 | reads take the store lock shared and mutations exclusive, through a writer-preferring in-process lock; a server exclusive hold does at most 50 ms of work per operation, larger work chunked, no hold across an API call (the bound measured in K7a); a reconciler revocation that gets `ErrBusy` retries up to 3 times with jitter in the same sweep before it is `Indeterminate`; under a sustained read load from other uids a revocation completes | `k3sm/pkg/keystore::TestWriterPreferringLock`, `TestPrefLockWriterTimeoutAdmitsReaders`, `TestPrefLockAdmitsReaderUnderWriterStream`, `TestRotateHoldServesOtherUIDWithinLockWait` | partial: the store's writer-preferring lock, and the per-uid hold bound for `put` and `rotate`, checked, through the socket's store bridge (the user-scope store); pending: the per-uid hold bound for an `rm` of a large entry (U108's pending part), the reconciler's retries and `k3sm/pkg/keystore/reconcile`'s revocation under other uids' read load (the KeyDelivery reconciler (lifecycle)) |
 | U90 | root-run: the directory swap. A process running as the service user holds, from before floor --rebuild, audit --rotate or install's log creation, an O_APPEND descriptor on the old log, a descriptor on the log's live directory and one on keystore-logs/. Before every step and after, by path on the canonical log its open(O_WRONLY), open(O_WRONLY\|O_TRUNC) and link() into its own directory each fail EPERM, and through the held descriptors F_SETFL clearing O_APPEND, pwrite and ftruncate fail EPERM while the file is flagged and openat for write fails EPERM, or ENOENT once the name is gone; at every hook the canonical log by path is a complete judged log, the whole old content or the whole new content, flags exactly SF_APPEND, the service user's, 0600, one link; at the end the new log holds what the verb wrote and the service user's O_APPEND lines, nothing the held descriptors did reaches the new log, and staging and the retired directory are empty. A crash at every step and a rerun of the same verb end valid, a rebuild that dropped lines exiting 4 with the same counts; the other verb run first harms nothing, and the first verb's rerun still finishes; the maintenance wait is the exclusive .lock, bounded at 30 s (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceSwapRefusesServiceUser`, `TestMaintenanceCrashAtEverySwapStepReruns`, `k3sm/pkg/install::TestKeystoreLogCreationRefusesServiceUserAtEveryStep`, `k3sm/pkg/keystore::TestStoreReadsSwappedLogDirAsRoot` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
 | U91 | audit --rotate keeps four archives, .1 to .4, and refuses, changing nothing, when .4 exists unless --discard-oldest; the replacement directory holds an empty flagged log, a fresh root 0600 unflagged .1 holding the old log's bytes up to its size at open, made by cloning the old log, removing every extended attribute and any ACL from the clone (when one cannot be removed the clone is discarded and the archive is a copy), judging it with the logs' flags-and-ACL judge and truncating it to that size, or, when the volume refuses the clone, by a copy that first checks the volume's free space and refuses up front, changing nothing, short of the log's size plus the larger of 1 GiB and 2% of the volume's size, and the older archives carried by hard link as .2 to .4; every archive is root's 0600, unflagged, with no ACL, in keystore-logs/audit/archives/, root's 0700 (a 0755 one refuses), and an old log with an ACL is a Warn, never a refusal (the swap copies no ACL, and chmod -N fails on a flagged log), as a second link on one is; a marker with a second link is read, with a Warn, and a stale staging file is cleaned; a rerun after a crash past the swap prints the crashed run's report and does not rotate twice, and while the marker stands a missing audit log is never skipped; the doctor hint says to export first, as root, from archives/; rotation resets the shares, bounded by the archive count | `k3sm/cmd/k3sm::TestAuditRotateKeepsFourArchives`, `k3sm/pkg/keystore::TestMaintenanceJudgesMarkerAndStale`, `TestSwapRerunFromEachStep`, `TestAuditRootRefusesMissingLogInMaintenance`, `TestRotateAuditClonesArchive`, `TestCloneArchiveTruncatesToSnapshot`, `TestRotateAuditCopyChecksFreeSpace`, `TestCopyArchiveMarginScalesWithVolume`, `TestCloneArchiveStripsXattrsAndACL`, `TestCloneArchiveProtectedXattr`, `TestCloneArchiveRefusesRemainingACL`, `TestJudgeArchiveRefusesACL`, `TestOldLogUnflaggedServiceOwnedRefused` | checked: the append-only files |
 | U92 | a `rotate` whose delivery will stall (owner past share, the delivery's rotation write used) is stored and answered `stored; delivery pending: past your log share`; the CLI prints the warning line and exits 0 | `k3sm/cmd/k3sm::TestRotateReportsDeliveryStall` | pending: the non-root CLI and `exec` |
@@ -6880,7 +6908,7 @@ carried by the unit rows.
 | U105 | every root path walks the keystore trees by descriptor: run as root (a root-run row, `--root`), `sudo k3sm install` over an existing tree, `uninstall --purge` and `doctor` each refuse a planted symlink, FIFO or swapped directory under `.user/` and at every `keystore-*` name, with `openat`, `O_NOFOLLOW`, bounded reads and a `SameFile` re-check, and change nothing they were not meant to | `k3sm/pkg/install::TestInstallOverExistingTreeWalksByDescriptor`, `TestPurgeWalksKeystoreByDescriptor`, `k3sm/cmd/k3sm::TestDoctorWalksKeystoreByDescriptor` (integration, root-run) | pending: the append-only files |
 | U106 | every root verb refuses a non-root caller: one table test runs `rm-scope`, `floor --rebuild`, `audit --rotate`, `rewrap` and `deliver system/…` with a non-root euid through the euid source, and each is refused with the same message and exit code, changing nothing (seam: euid source) | `k3sm/cmd/k3sm::TestRootVerbsRefuseNonRootEUID` | pending: the KeyDelivery reconciler (lifecycle), each verb's case added by the change that adds the verb |
 | U107 | with the user floor missing or unflagged, an absence-driven delete (`ErrNotFound`) is `Indeterminate` and deletes nothing, while a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial) deletes the Secret after its two spaced observations | `k3sm/pkg/keystore/reconcile::TestNotFoundDeleteWaitsForFloor`, `TestRevocationDeleteProceedsWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
-| U108 | the exclusive hold bound on a fake clock: no server exclusive hold does more than 50 ms of work; the GeneratedUID lookup runs before the lock is taken and its answer is cached for the hold, so a lookup that takes its whole 250 ms deadline adds nothing to the hold (seams: clock, GeneratedUID lookup) | `k3sm/pkg/keystore::TestExclusiveHoldBound`, `TestRotateAtQuotaNoFullWalk`, `TestUsageFigureMatchesWalk`, `TestUsagePanicAtWriteDropsFigure`, `TestUsageRefusalKeepsFigure`, `TestUserListOpensOnlyCurrentVersion`, `TestUserRotateOrphanCheckReadsOnlyNextVersion` | partial: no lookup or wait inside a hold, and no scope walk or entry listing in a `put` or `rotate` hold, checked (the user-scope store); pending: an `rm` hold bounded however many versions its entry keeps (its burial's header reads and its unlinks chunked) |
+| U108 | the exclusive hold bound on a fake clock: no server exclusive hold does more than 50 ms of work; the GeneratedUID lookup runs before the lock is taken and its answer is cached for the hold, so a lookup that takes its whole 250 ms deadline adds nothing to the hold (seams: clock, GeneratedUID lookup) | `k3sm/pkg/keystore::TestExclusiveHoldBound`, `TestRotateAtQuotaNoFullWalk`, `TestUsageFigureMatchesWalk`, `TestUsagePanicAtWriteDropsFigure`, `TestUsageRefusalKeepsFigure`, `TestUserListOpensOnlyCurrentVersion`, `TestUserRotateOrphanCheckReadsOnlyNextVersion`, `TestDoneCtxAfterPreWalkTakesNoHold` | partial: no lookup or wait inside a hold, no entry listing in a `put` or `rotate` hold, and no scope walk in one but the fallback walk when the usage figure is still absent or stale at the lock (the walk before it failed, a root `rm-scope` and a new mint or a Rewrap landed between that walk and the lock, or the `put` minted the scope), checked (the user-scope store); pending: an `rm` hold bounded however many versions its entry keeps (its burial's header reads and its unlinks chunked) |
 | U109 | with every audit append failing (a full disk), revocation deletes go ahead: the reconciler's `deliver-delete` and a socket `withdraw`, `rm` or `rotate` still act, their lines dropped and counted in memory and shown by `doctor`, while user mutations and reads stay refused | `k3sm/pkg/keystore/reconcile::TestRevocationDeleteProceedsOnAppendFailure` | pending: the KeyDelivery reconciler (lifecycle) |
 | U110 | when a second server registers at runtime, the next single-server check stops the listener, closing its connections, and each KeyDelivery gets `Ready=False` and `SecretRetained=True` with reason `UserScopeOff`; the delivered Secrets stay, nothing rotates or deletes them, and `doctor` says they must be deleted by hand | `k3sm/pkg/keystore/reconcile::TestSecondServerAtRuntimeStopsListenerAndReports` | pending: the KeyDelivery reconciler (lifecycle) |
 | U111 | the owner annotation never decides precedence: a Secret whose owner annotation is rewritten to name another recorded UID of the same target stays with the object that holds the claim by honoured record, `creationTimestamp` and name; an `Indeterminate` object counts as honoured | `k3sm/pkg/keystore/reconcile::TestAnnotationRewriteCannotTakeOverTarget` | pending: the KeyDelivery reconciler (authority) |
