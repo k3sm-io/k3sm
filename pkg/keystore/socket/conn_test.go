@@ -88,7 +88,7 @@ func (s *session) send(t *testing.T, typ FrameType, header string, value []byte)
 
 func (s *session) recv(t *testing.T, want FrameType, header any) {
 	t.Helper()
-	f, err := ReadFrame(s.client)
+	f, err := ReadReply(s.client)
 	if err != nil {
 		t.Fatalf("recv: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestHelloReplyCarriesVersionAndMaxFrame(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := serve(t, time.Now)
 		s.send(t, TypeHello, helloV1, nil)
-		f, err := ReadFrame(s.client)
+		f, err := ReadReply(s.client)
 		if err != nil {
 			t.Fatal(err)
 		}

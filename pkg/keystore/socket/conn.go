@@ -214,13 +214,24 @@ func (h *Handler) Serve(ctx context.Context, c Conn, p Peer) error {
 		if op, ok := h.ops[req.Op]; ok {
 			rt, header, value = answer(op(ctx, Request{Peer: p, Op: req.Op, Header: f.Header, Value: f.Value}))
 		}
-		err = c.SetReadDeadline(h.now().Add(IdleBound))
-		if err == nil {
-			err = h.write(ctx, c, end, rt, header, value)
-		}
-		// Neither value outlives its request, written or not.
-		clear(f.Value)
+		// A reply the server cannot encode (a header that does not marshal,
+		// or one past its cap) is answered internal: the operation has run,
+		// and the connection stays open for the next request.
+		b, err := marshalFrame(rt, header, value)
 		clear(value)
+		if err != nil {
+			b, err = marshalFrame(TypeError, errorHeader{Code: CodeInternal}, nil)
+		}
+		if err == nil {
+			err = c.SetReadDeadline(h.now().Add(IdleBound))
+		}
+		if err == nil {
+			err = h.writeEncoded(ctx, c, end, b)
+		}
+		// Neither value outlives its request, written or not; the encoding
+		// holds a copy of the reply's value.
+		clear(f.Value)
+		clear(b)
 		if err != nil {
 			return err
 		}
@@ -277,22 +288,34 @@ func (r replyHeader) MarshalJSON() ([]byte, error) {
 // write sends one frame, with value as its binary part when it is not nil,
 // finishing by deadline.
 func (h *Handler) write(ctx context.Context, c Conn, deadline time.Time, t FrameType, header any, value []byte) error {
-	hb, err := json.Marshal(header)
+	b, err := marshalFrame(t, header, value)
 	if err != nil {
 		return err
 	}
+	// The encoding holds a copy of the value: it is zeroed with it.
+	defer clear(b)
+	return h.writeEncoded(ctx, c, deadline, b)
+}
+
+// marshalFrame is the encoding of one frame, header marshalled as JSON and
+// value as its binary part when it is not nil. It fails, encoding nothing,
+// when the header does not marshal or the frame is past a cap.
+func marshalFrame(t FrameType, header any, value []byte) ([]byte, error) {
+	hb, err := json.Marshal(header)
+	if err != nil {
+		return nil, err
+	}
+	return AppendFrame(nil, Frame{Type: t, Header: hb, Value: value})
+}
+
+// writeEncoded writes b, one encoded frame, finishing by deadline.
+func (h *Handler) writeEncoded(ctx context.Context, c Conn, deadline time.Time, b []byte) error {
 	if err := c.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	b, err := AppendFrame(nil, Frame{Type: t, Header: hb, Value: value})
-	if err != nil {
-		return err
-	}
-	// The encoding holds a copy of the value: it is zeroed with it.
-	defer clear(b)
-	_, err = c.Write(b)
+	_, err := c.Write(b)
 	return err
 }

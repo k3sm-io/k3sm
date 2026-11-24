@@ -108,6 +108,25 @@ type ListEntry struct {
 	Status      string `json:"status"`
 }
 
+// The widest each list row's fields can be, which size MaxReplyHeader. The
+// name is in the API grammar (keyentry.MaxLength); the kind is a Kind's
+// name, at most "ed25519" or "unknown"; the version a uint64 and versions an
+// int in decimal; created is RFC 3339 in UTC of a time from int64 seconds,
+// whose year has at most twelve digits and a sign; the fingerprint is at
+// most the 64 hex digits of a SHA-256 (an ssh fingerprint is shorter); the
+// status is ok, corrupt or error. No field holds a byte JSON escapes.
+const (
+	maxListKind        = len("ed25519")
+	maxListUint64      = len("18446744073709551615")
+	maxListInt         = len("-9223372036854775808")
+	maxListCreated     = len("-292277026596-12-31T23:59:59Z")
+	maxListFingerprint = 64
+	maxListStatus      = len("corrupt")
+	// maxListRow is the widest list row with its separating comma.
+	maxListRow = len(`{"name":"","kind":"","version":,"versions":,"created":"","fingerprint":"","status":""},`) +
+		keyentry.MaxLength + maxListKind + maxListUint64 + maxListInt + maxListCreated + maxListFingerprint + maxListStatus
+)
+
 // RmReply is rm's reply: an empty object.
 type RmReply struct{}
 

@@ -4278,6 +4278,19 @@ surface, and the app consumes only those.
   JSON header (at most 8 KiB, never a value) and an optional length-prefixed binary value. Each
   prefix is 4 bytes, big-endian. Each sub-length must be at most the frame length, checked
   before anything is allocated; a frame that breaks this closes the connection.
+- **The reply header cap.** A reply's header alone may pass 8 KiB, up to `MaxReplyHeader`
+  (128,818 bytes): the list of a full scope, 256 rows each at its widest (a 269-byte API name,
+  a 7-byte kind, a 20-digit version, a 20-character versions count, a 29-byte RFC 3339 time, a
+  64-hex-digit fingerprint, a 7-byte status, the field names and punctuation: 502 bytes), plus
+  the wrapper and the `committed; audit failed` warning. So one list call names every entry
+  of a full scope, and no cursor is needed. The cap is computed from those widths and a
+  compile check holds it inside the 128 KiB frame cap with the type and header prefix; a test
+  marshals the worst-case list and holds it under the cap. Only the client's reader
+  (`ReadReply`) takes a reply header past 8 KiB; the server's reader holds every frame,
+  a reply included, to 8 KiB. A reply the server cannot encode (a header that does not
+  marshal, or one past its cap) is answered with an error frame, code `internal`, and the
+  connection stays open: the request's audit line and share charge are already spent, and
+  the client gets an answer rather than a dropped connection.
 - **Frame layout, exactly.** The frame length counts the type byte, both prefixes, the header
   and the value, never its own 4 bytes, and must equal them exactly: the value is present iff
   bytes remain after the header, and then its prefix must account for every one of them (a

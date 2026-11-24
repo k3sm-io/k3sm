@@ -33,7 +33,7 @@ import (
 // recvFrame reads one frame and its header as JSON fields.
 func (s *session) recvFrame(t *testing.T) (Frame, map[string]json.RawMessage) {
 	t.Helper()
-	f, err := ReadFrame(s.client)
+	f, err := ReadReply(s.client)
 	if err != nil {
 		t.Fatalf("recv: %v", err)
 	}
