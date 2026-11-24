@@ -47,6 +47,10 @@ func (s *FileStore) StartUserScopes(ctx context.Context) error {
 // pass, even when an earlier pass started the user scope.
 func ScopesNotCaughtUp(err error) bool { return errors.Is(err, errScopesNotCaughtUp) }
 
+// IneligibleUID reports whether err refused a uid the store gives no user
+// scope: outside the login range, or the store's service uid.
+func IneligibleUID(err error) bool { return errors.Is(err, errIneligibleUID) }
+
 // UserScopesStarted reports whether the start step (StartUserScopes) has
 // started the user scope. The step can return an error and still have
 // started it: a scope it could not catch up is named in the error while

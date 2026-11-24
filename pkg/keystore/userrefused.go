@@ -40,13 +40,17 @@ const (
 	RefusedNotServed    = "not-served"    // an operation the server does not serve yet
 	RefusedRateLimited  = "rate-limited"  // past the uid's rate limit
 	RefusedAuditFailing = "audit-failing" // the fail-closed rule: appends fail for everyone
+	// RefusedIneligibleUID is a peer the listener admitted whose uid the
+	// store gives no user scope (outside the login range, or the store's
+	// own service uid): written by RefusedIneligible.
+	RefusedIneligibleUID = "ineligible-uid"
 )
 
 // refusedReasons and refusedOps are the closed sets a post-frame refused
 // line takes: the reasons above, and the operations named as the audit log
 // names them (read-for-exec as exec-read).
 var (
-	refusedReasons = []string{RefusedBadHeader, RefusedBadValue, RefusedNotServed, RefusedRateLimited, RefusedAuditFailing}
+	refusedReasons = []string{RefusedBadHeader, RefusedBadValue, RefusedNotServed, RefusedRateLimited, RefusedAuditFailing, RefusedIneligibleUID}
 	refusedOps     = []string{"put", "rotate", "rm", "list", "exec-read", "deliver", "withdraw", "deliveries"}
 )
 
@@ -67,6 +71,20 @@ func (u *UserScope) Refused(ctx context.Context, op, reason string) error {
 		return errRefusedField
 	}
 	return u.appendBriefly(ctx, auditLine{op: auditOpRefused, request: op, result: reason})
+}
+
+// RefusedIneligible appends the post-frame refused line of op for uid, a
+// peer the socket admitted that has no user scope (IneligibleUID), with
+// pid as its caller's: reason RefusedIneligibleUID, under the store lock
+// taken for the append alone. It names no scope, as uid has none, so it
+// is charged to no uid's share; the socket rate-limits it per uid like
+// every refused line. op is as for Refused; anything else writes nothing.
+func (s *FileStore) RefusedIneligible(ctx context.Context, uid uint32, pid int32, op string) error {
+	if !slices.Contains(refusedOps, op) {
+		return errRefusedField
+	}
+	u := &UserScope{s: s, uid: uid, origin: SocketOrigin(pid)}
+	return u.appendBriefly(ctx, auditLine{op: auditOpRefused, request: op, result: RefusedIneligibleUID})
 }
 
 // RefusedDropped appends the summary of n post-frame refused lines of the

@@ -4014,8 +4014,13 @@ refused before its first frame:
   `exec-read`, `deliver`, `withdraw`, `deliveries`) and `result` one of a closed set:
   `bad-header` (a header field of the wrong type, a kind the socket does not store, a header
   over its cap), `bad-value` (a value missing, empty, oversize, or where the operation takes
-  none), `not-served` (a delivery placeholder), `rate-limited`, and `audit-failing` (the
-  fail-closed rule below). It carries no entry name, value or other text the peer sent, is
+  none), `not-served` (a delivery placeholder), `rate-limited`, `audit-failing` (the
+  fail-closed rule below), and `ineligible-uid` (a peer the listener admitted whose uid the
+  store gives no user scope, outside the login range or the store's own service uid: the
+  store refuses it before any view, so the socket answers `refused`, not `internal`, and
+  writes this line, which names no scope, `"scope":""`, and is charged to no uid's share;
+  its dropped count waits in the persisted count for root's next `audit --rotate`,
+  `TestIneligibleUIDRefusedWithLine`). It carries no entry name, value or other text the peer sent, is
   appended under the store lock taken for it alone, and is charged to the caller's share,
   so a line past the share is not written. The 10 a minute are counted per uid on a sliding
   minute, rate-limited answers included, before the line is written; every line not written
@@ -4347,7 +4352,7 @@ surface, and the app consumes only those.
   | `ErrNotFound`, `ErrVersionNotFound`, `ErrScopeAbsent` | `not-found` |
   | `ErrQuota` | `quota` |
   | `ErrScopeOwnerChanged`, `ErrScopeOwnerUnknown` | the code of the same name |
-  | a request the socket refuses before the store (`socket.ErrRequestRefused`, below); the socket's fail-closed refusal while the global append failure has any cause but the hard cap (`socket.ErrAuditFailing`); an operation refused because its audit line could not be written, the global append failure (`keystore.AuditRefused`); `ErrExists`; `ErrInvalidName`; `ErrKindMismatch`; `ErrTypedCredential`; `ErrRewrapInProgress`; a sealed version above the entry's pointer (`ErrOrphanVersion`, which also matches `ErrCorrupt`); the floor's damage or the scope's quarantine (`keystore.FloorDegraded`) | `refused` |
+  | a request the socket refuses before the store (`socket.ErrRequestRefused`, below); the socket's fail-closed refusal while the global append failure has any cause but the hard cap (`socket.ErrAuditFailing`); an operation refused because its audit line could not be written, the global append failure (`keystore.AuditRefused`); `ErrExists`; `ErrInvalidName`; `ErrKindMismatch`; `ErrTypedCredential`; `ErrRewrapInProgress`; a uid the store gives no user scope (`keystore.IneligibleUID`, with an `ineligible-uid` refused line); a sealed version above the entry's pointer (`ErrOrphanVersion`, which also matches `ErrCorrupt`); the floor's damage or the scope's quarantine (`keystore.FloorDegraded`) | `refused` |
   | anything else: `ErrCorrupt`, `ErrMasterMissing`, `ErrMasterUntrusted`, `ErrKindUnsupported`, a cancelled request | `internal` |
 
   `refused` is a request the store will not carry out as it stands, which the client can

@@ -60,6 +60,10 @@ func refusalReason(err error) string {
 		return keystore.RefusedBadValue
 	case errors.Is(err, ErrRequestRefused):
 		return keystore.RefusedBadHeader
+	case keystore.IneligibleUID(err):
+		// The store refused the uid before any view, so no line of the
+		// store's names it: the socket writes this one.
+		return keystore.RefusedIneligibleUID
 	}
 	return ""
 }
@@ -170,6 +174,13 @@ func (b *FileStoreBridge) Refused(ctx context.Context, p Peer, op, reason string
 	}
 	u, err := b.view(p)
 	if err != nil {
+		// A uid with no user scope has no view to write through: its line
+		// names no scope (RefusedIneligible). Its summary waits in the
+		// persisted count for root's next audit --rotate.
+		if pass && keystore.IneligibleUID(err) && reason == keystore.RefusedIneligibleUID &&
+			b.fs.RefusedIneligible(ctx, p.UID, p.PID, auditOpName(op)) == nil {
+			return
+		}
 		if pass {
 			b.refusals.count(p.UID, 1)
 		}
