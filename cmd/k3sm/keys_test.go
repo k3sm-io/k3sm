@@ -1726,6 +1726,9 @@ func TestKeysStoreConfigFromLayout(t *testing.T) {
 		UID:       uid,
 		GID:       gid,
 		DataRoot:  filepath.Dir(h.work),
+		// The tree state this process keeps for the store directory: every
+		// store opened over it shares one lock and one set of usage figures.
+		Tree: keystoreTree(filepath.Join(h.work, "keystore")),
 	}
 	got := h.cfg
 	if got.LogFlags != nil {
