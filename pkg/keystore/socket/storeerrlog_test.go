@@ -601,3 +601,29 @@ func TestNotFoundDamageLogged(t *testing.T) {
 		checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"), DamageCorrupt, 0)
 	})
 }
+
+// An operation that panics is logged at Error with its op, the peer's uid
+// and the entry it named, as the panic leaves it: the store's unaudited
+// count names neither, and this line is where they are found. The panic
+// still goes on.
+func TestPanickedOperationLogged(t *testing.T) {
+	var c logCapture
+	boom := func(context.Context, Request) (Reply, error) { panic("injected") }
+	h, err := NewHandler(time.Now, withOp(OpRm, boom))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.log = c.logger()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("the panic did not go on")
+			}
+		}()
+		serveOne(t, h, hdr(t, OpRm, entryOf(uidA, "a"), nil))
+	}()
+	recs := c.records(t)
+	if len(recs) != 1 || recs[0]["level"] != "ERROR" || recs[0]["op"] != OpRm || recs[0]["uid"] != float64(uidA) || recs[0]["requested_entry"] != entryOf(uidA, "a") {
+		t.Fatalf("a panicking rm logged %v, want one Error line naming rm, uid %d and the entry", recs, uidA)
+	}
+}

@@ -288,7 +288,14 @@ func (h *Handler) serveRequest(ctx context.Context, c Conn, p Peer, first byte) 
 	// connection stays open so a newer client can fall back.
 	rt, header, value := TypeError, any(errorHeader{Code: CodeUnknownOp}), []byte(nil)
 	if op, ok := h.ops[name]; ok {
+		returned := false
+		defer func() {
+			if !returned {
+				h.logPanicked(name, p, f.Header)
+			}
+		}()
 		rep, oerr := op(ctx, Request{Peer: p, Op: name, Header: f.Header, Value: f.Value})
+		returned = true
 		h.logStoreError(name, p, f.Header, oerr)
 		rt, header, value = answer(rep, oerr)
 	}

@@ -194,6 +194,19 @@ func (h *Handler) logStoreError(op string, p Peer, header []byte, err error) {
 	h.log.Warn("keystore socket: the store reports damage", attrs...)
 }
 
+// logPanicked logs, at Error, an operation that panicked, before the panic
+// goes on to the listener, which recovers it and logs its stack: the op,
+// the peer's uid and requested_entry when the header names a valid entry.
+// It is how an operation the store counted unaudited for a panic
+// (keystore.FileStore.UnauditedOps) is told apart. It does not recover.
+func (h *Handler) logPanicked(op string, p Peer, header []byte) {
+	attrs := []any{"op", op, "uid", p.UID}
+	if e, ok := requestEntry(header); ok {
+		attrs = append(attrs, "requested_entry", e)
+	}
+	h.log.Error("keystore socket: an operation panicked", attrs...)
+}
+
 // requestEntry is the entry a request header names, read by its exact
 // name, when it is a valid entry name in the API grammar; nothing else of
 // the header is read.
