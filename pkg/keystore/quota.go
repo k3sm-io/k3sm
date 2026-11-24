@@ -45,21 +45,6 @@ const (
 	maxScopeBytes = 16 << 20
 )
 
-// checkScopeQuota refuses, as ErrQuota, a put of value as name into
-// entries when name is new and the scope already holds maxScopeEntries
-// entries, or when its sealed records (every file in every entry
-// directory), base (the deliveries record's size) and the new entry's
-// files (version 1, its pointer and its generation file) would pass
-// maxScopeBytes. It walks the scope; a user put or rotate judges the
-// scope's usage figure instead (usage.go, judgeScopeQuota).
-func checkScopeQuota(entries *os.Root, name string, value []byte, base int64) error {
-	used, err := walkScopeEntries(entries, nil)
-	if err != nil {
-		return err
-	}
-	return judgeScopeQuota(used, name, value, base)
-}
-
 // walkScopeEntries is every entry name in entries with its sealed bytes
 // (entryBytes); lstat, when set, is called before each file's Lstat, where
 // a test counts the walk.
@@ -82,8 +67,13 @@ func walkScopeEntries(entries *os.Root, lstat func()) (map[string]int64, error) 
 	return used, nil
 }
 
-// judgeScopeQuota is checkScopeQuota's judgement on used, every entry
-// name with its sealed bytes: no file is read.
+// judgeScopeQuota refuses, as ErrQuota, a put of value as name when name
+// is new and the scope already holds maxScopeEntries entries, or when its
+// sealed records (used: every entry name in entries/ with the bytes of
+// every file in its directory, walkScopeEntries), base (the deliveries
+// record's size) and the new entry's files (version 1, its pointer and its
+// generation file) would pass maxScopeBytes. It reads no file: a user put
+// or rotate judges the scope's usage figure (usage.go).
 func judgeScopeQuota(used map[string]int64, name string, value []byte, base int64) error {
 	total := base
 	for _, size := range used {

@@ -18,7 +18,6 @@ package keystore
 
 import (
 	"errors"
-	"os"
 	"strings"
 	"testing"
 )
@@ -26,12 +25,7 @@ import (
 // No quota text recommends rm then put as a remedy: rm is a deletion that
 // cannot be undone, and the put after it may itself be refused.
 func TestQuotaTextsNameNoRmThenPut(t *testing.T) {
-	root, err := os.OpenRoot(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = root.Close() }()
-	budget := checkScopeQuota(root, "token", []byte("v"), maxScopeBytes)
+	budget := judgeScopeQuota(map[string]int64{}, "token", []byte("v"), maxScopeBytes)
 	if !errors.Is(budget, ErrQuota) {
 		t.Fatalf("a put past the byte budget: %v, want ErrQuota", budget)
 	}

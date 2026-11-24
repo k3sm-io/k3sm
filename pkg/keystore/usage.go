@@ -29,7 +29,7 @@ import (
 
 // This file is the user scope's usage figure: docs/design/keystore.md §
 // "Quotas" and "Lock modes and fairness". A put or rotate judges the scope's
-// quota (quota.go) against a figure this process keeps per scope, the bytes
+// quota (quota.go, judgeScopeQuota) against a figure this process keeps per scope, the bytes
 // of every entry by name, so the judgement costs no walk of the scope under
 // the store lock. The figure lives in memory only, and its crash model is
 // the process's:
@@ -54,7 +54,7 @@ import (
 // root's rm-scope, which removes the scope with its scope.key.
 
 // scopeUsage is one scope's figure: every entry name in entries/ with its
-// sealed bytes, as checkScopeQuota's walk counts them, beside the digest of
+// sealed bytes, as walkScopeEntries counts them, beside the digest of
 // the scope.key it was taken under (zero: no scope.key).
 type scopeUsage struct {
 	key     [sha256.Size]byte
@@ -245,7 +245,8 @@ func (u *UserScope) usageUnderLock(root *os.Root) (map[string]int64, error) {
 	return f.entries, nil
 }
 
-// checkUsageQuota is checkScopeQuota judged on the scope's figure.
+// checkUsageQuota is judgeScopeQuota on the scope's figure and its
+// deliveries record's size.
 func (u *UserScope) checkUsageQuota(root *os.Root, name string, value []byte) error {
 	base, err := u.deliveriesBytes(root)
 	if err != nil {
