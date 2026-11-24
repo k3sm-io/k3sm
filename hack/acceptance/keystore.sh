@@ -105,10 +105,13 @@
 # package's source directory as go test does, so the tests that read the
 # source tree find it; root builds nothing. It passes when
 # no test failed and the binary exited 0. It then runs the root-run rows
-# (declared with rootpend or rootcheck): each by name, in its own k3sm
-# package's binary, built the same way and run the same way. A checked
+# (declared with rootpend, rootcheck or rootpartial): each by name, in its own
+# k3sm package's binary, built the same way (with -tags when the row is declared
+# tagged, for a test in a tagged tier) and run the same way. A checked
 # root-run row passes only if each named test printed PASS: a SKIP fails it,
-# and so does a test that did not run. A pending one prints PENDING. Neither
+# and so does a test that did not run. A pending one prints PENDING. A partial
+# one is checked the same way and, when it passes, prints PASS with its pending
+# part, which keeps the exit status at 3. Neither
 # --check nor a unit mode runs a root-run row: each prints it as ROOT and
 # leaves it out of the count, as pending. Exit status: 0 pass; 1 fail; 3 sudo
 # -n is unavailable (run sudo -v first, or run as a user sudo lets run it), or
@@ -322,8 +325,9 @@ run_root() {
 }
 
 # root_build sets RB to a fresh directory under root_t holding package $1's
-# test binary, pkg.test, built as the invoking user, and RS to that
-# package's source directory, where the binary runs, as go test runs it.
+# test binary, pkg.test, built as the invoking user with build tags $2 (none
+# when empty), and RS to that package's source directory, where the binary
+# runs, as go test runs it.
 RB=""
 RS=""
 root_bin_n=0
@@ -337,7 +341,7 @@ root_build() {
 	root_bin_n=$((root_bin_n + 1))
 	d="$root_t/b$root_bin_n"
 	mkdir -p "$d/tmp" || return 1
-	if ! CGO_ENABLED=1 go test -race -c -o "$d/pkg.test" "$rel" >"$d/build.out" 2>&1; then
+	if ! CGO_ENABLED=1 go test -race ${2:+-tags "$2"} -c -o "$d/pkg.test" "$rel" >"$d/build.out" 2>&1; then
 		cat "$d/build.out"
 		return 1
 	fi
@@ -358,7 +362,7 @@ judge_root_row() {
 		for spec in ${R_TESTS[$i]}; do
 			if [ "${spec%%::*}" = "$p" ]; then names="${names:+$names|}${spec#*::}"; fi
 		done
-		if ! root_build "$p"; then
+		if ! root_build "$p" "${R_TAGS[$i]}"; then
 			echo "$id FAIL as root: the test binary of $p did not build"
 			return 1
 		fi
@@ -384,6 +388,10 @@ judge_root_row() {
 		fi
 	done
 	if [ "$bad" -ne 0 ]; then return 1; fi
+	if [ "${R_KIND[$i]}" = rootpartial ]; then
+		echo "$id PASS as root: ${R_DESC[$i]}; pending: ${R_TODO[$i]}"
+		return 0
+	fi
 	echo "$id PASS as root: ${R_DESC[$i]}"
 }
 
@@ -409,6 +417,13 @@ run_root_mode() {
 			if [ "$rc" -eq 0 ]; then rc=3; fi
 			;;
 		rootcheck) judge_root_row "$i" || rc=1 ;;
+		rootpartial)
+			if judge_root_row "$i"; then
+				if [ "$rc" -eq 0 ]; then rc=3; fi
+			else
+				rc=1
+			fi
+			;;
 		esac
 		i=$((i + 1))
 	done
@@ -423,6 +438,7 @@ R_KIND=()
 R_DESC=()
 R_TODO=()
 R_TESTS=()
+R_TAGS=()
 # add kind id desc todo tests... records a row, its tests as <pkg>::<Test>.
 add() {
 	local kind="$1" id="$2" desc="$3" todo="$4" pkg="k3sm/pkg/keystore" t specs=""
@@ -438,6 +454,18 @@ add() {
 	R_DESC+=("$desc")
 	R_TODO+=("$todo")
 	R_TESTS+=("${specs# }")
+	R_TAGS+=("")
+}
+# tagged id tags: the row just declared, id, builds and lists its tests with
+# -tags tags, for a test in a tagged tier (a root-run test behind
+# //go:build integration).
+tagged() {
+	local n=$((${#R_ID[@]} - 1))
+	if [ "$n" -lt 0 ] || [ "${R_ID[$n]}" != "$1" ]; then
+		echo "keystore: tagged $1 must follow its row" >&2
+		exit 2
+	fi
+	R_TAGS[n]="$2"
 }
 check() { local id="$1" desc="$2"; shift 2; add check "$id" "$desc" "" "$@"; }   # row, description, tests...
 partial() { local id="$1" d="$2" t="$3"; shift 3; add partial "$id" "$d" "$t" "$@"; } # row, delivered part, pending part, tests...
@@ -448,6 +476,7 @@ special() { add "$1" "$2" "" ""; }                                              
 # root-run rows: --root runs them by name; --check prints them as ROOT, uncounted
 rootcheck() { local id="$1" desc="$2"; shift 2; add rootcheck "$id" "$desc" "" "$@"; } # row, description, tests...
 rootpend() { local id="$1" desc="$2"; shift 2; add rootpend "$id" "$desc" "" "$@"; }   # row, description (its change), tests...
+rootpartial() { local id="$1" d="$2" t="$3"; shift 3; add rootpartial "$id" "$d" "$t" "$@"; } # row, delivered part, pending part, tests...
 # a row of the floor variant K0 did not pick: printed N/A, never run, and
 # counted neither as pending nor as passed (K0 amendment 2026-11-21: the
 # flag variant, so the helper rows do not apply)
@@ -734,8 +763,9 @@ pend U102 "the sealed record stores the last delivered version per delivery, rai
 	k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus
 pend U103 "a Secret at a recorded target whose label or owner annotation was removed is never overwritten or deleted, under a revocation, the object's deletion and rm-scope alike; the KeyDelivery gets SecretRetained=True with reason LabelRemoved, and doctor names the Secret and the KeyDelivery (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestStrippedLabelReportedNotDeleted
-rootpend U104 "root-run: install creates keystore-sock/ root:wheel 0755 and the server plist carries a Sockets listener for keystore-sock/keys.sock; a process running as the service uid cannot unlink, replace or bind keys.sock, whether or not the server runs, and gets EACCES; rig leg E24 (delivered: the plist entry and the directory, unit-tested, and the root-run test written; pending: a --root run of it and rig leg E24)" \
+rootpartial U104 "root-run: install creates keystore-sock/ root:wheel 0755 and the server plist carries a Sockets listener for keystore-sock/keys.sock; a process running as the service uid cannot unlink, replace or bind keys.sock, whether or not the server runs, and gets EACCES (the root-run test is in the integration tier, run with -tags integration)" "rig leg E24" \
 	k3sm/pkg/install::TestServerPlistActivatesKeystoreSocket TestKeystoreSockDirAtInstall TestSocketDirRootOwnedServiceUIDCannotBind
+tagged U104 integration
 rootpend U105 "root-run: every root path walks the keystore trees by descriptor: install over an existing tree, uninstall --purge and doctor each refuse a planted symlink, FIFO or swapped directory, with openat, O_NOFOLLOW, bounded reads and a SameFile re-check (append-only files)" \
 	k3sm/pkg/install::TestInstallOverExistingTreeWalksByDescriptor TestPurgeWalksKeystoreByDescriptor k3sm/cmd/k3sm::TestDoctorWalksKeystoreByDescriptor
 pend U106 "every root verb refuses a non-root caller: one table test runs rm-scope, floor --rebuild, audit --rotate, rewrap and deliver system/... with a non-root euid through the euid source; each is refused, changing nothing (KeyDelivery lifecycle)" \
@@ -766,6 +796,7 @@ rootcheck U119 "root-run: the floor lock is keystore-lock, a root 0600 file in t
 	k3sm/pkg/keystore::TestNonRootDataRootFlockBlocksNoRootVerb
 partial U120 "the activated listening descriptor reaches no child: an exec.Command child, the runtimed helper and a Pod through the exec shim each list their open descriptors, and the listening socket is among none of them; delivered: the descriptor's FD_CLOEXEC is confirmed under syscall.ForkLock (one without it is refused), launchd's original is closed, and an exec.Command child does not hold it" "rig: the runtimed helper and a Pod through the exec shim" \
 	k3sm/pkg/keystore/socket::TestActivatedListenerIsCloseOnExecAndHeld
+tagged U120 integration
 pend U121 "under activation, the client accepts a LOCAL_PEERCRED uid 0 only when the audit token's euid is the service uid and its code the installed binary's cdhash; a uid-0 peer whose token names launchd, root or another uid, or other code, is refused and nothing is written (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestClientRefusesLaunchdAsPeer
 pend U122 "a Pod cannot obtain the server's listener from launchd: its launch_activate_socket for the server's socket name gets ESRCH (measured on macOS 27.2.1), so no Pod profile needs a launchd lookup deny; the Seatbelt path deny on keystore-sock/ (U16, U46) is a separate deny and stays required; rig: leg E27, which also owes macOS 26"
@@ -1202,13 +1233,14 @@ if [ "$mode" = listed ]; then
 	# the file $list_dir/<n>.list: go (go test -list), grep, or none (no checkout).
 	L_PKG=()
 	L_HOW=()
-	# list_pkg sets LK to the index of package $1's test list, making it on
-	# first use (not in a subshell: the arrays must persist).
+	# list_pkg sets LK to the index of package $1's test list built with tags
+	# $2 (none when empty), making it on first use (not in a subshell: the
+	# arrays must persist).
 	LK=0
 	list_pkg() {
 		local k=0 dir how n
 		while [ "$k" -lt "${#L_PKG[@]}" ]; do
-			if [ "${L_PKG[$k]}" = "$1" ]; then LK=$k; return 0; fi
+			if [ "${L_PKG[$k]}" = "$1|$2" ]; then LK=$k; return 0; fi
 			k=$((k + 1))
 		done
 		n=${#L_PKG[@]}
@@ -1216,13 +1248,13 @@ if [ "$mode" = listed ]; then
 		: >"$list_dir/$n.list"
 		if [ ! -d "$dir" ]; then
 			how=none
-		elif gotest "$1" -list '.*' "$(pkg_rel "$1")" >"$list_dir/$n.list" 2>/dev/null; then
+		elif gotest "$1" ${2:+-tags "$2"} -list '.*' "$(pkg_rel "$1")" >"$list_dir/$n.list" 2>/dev/null; then
 			how=go
 		else
 			how="grep"
 			grep -h -o -E '^func (Test|Fuzz|Benchmark|Example)[A-Za-z0-9_]*' "$dir"*_test.go 2>/dev/null | sed 's/^func //' >"$list_dir/$n.list" || true
 		fi
-		L_PKG+=("$1")
+		L_PKG+=("$1|$2")
 		L_HOW+=("$how")
 		LK=$n
 	}
@@ -1257,7 +1289,7 @@ if [ "$mode" = listed ]; then
 		fb=""
 		for spec in ${R_TESTS[$i]}; do
 			pkg="${spec%%::*}" t="${spec#*::}"
-			list_pkg "$pkg"
+			list_pkg "$pkg" "${R_TAGS[$i]}"
 			k=$LK
 			if [ "${L_HOW[$k]}" = grep ]; then fb=" (grep fallback)"; fi
 			if grep -q -x -- "$t" "$list_dir/$k.list"; then
@@ -1362,16 +1394,20 @@ wanted() {
 	return 1
 }
 
-# The packages the wanted rows' tests are in, each run once. P_PKG, P_TESTS
-# and P_RC are parallel; P_RC is the go test status, or "absent" for a repo
-# that is not checked out. Pending rows name tests but run none.
+# The packages the wanted rows' tests are in, each run once per set of build
+# tags (a row declared tagged runs in its own run with those tags). P_PKG,
+# P_TAGS, P_TESTS and P_RC are parallel; P_RC is the go test status, or
+# "absent" for a repo that is not checked out. Pending rows name tests but run
+# none.
 P_PKG=()
+P_TAGS=()
 P_TESTS=()
 P_RC=()
+# pkg_index prints the index of package $1's run with tags $2, or nothing.
 pkg_index() {
 	local j=0
 	while [ "$j" -lt "${#P_PKG[@]}" ]; do
-		if [ "${P_PKG[$j]}" = "$1" ]; then echo "$j"; return 0; fi
+		if [ "${P_PKG[$j]}" = "$1" ] && [ "${P_TAGS[$j]}" = "$2" ]; then echo "$j"; return 0; fi
 		j=$((j + 1))
 	done
 }
@@ -1382,10 +1418,11 @@ while [ "$i" -lt "$nrows" ]; do
 		if wanted "${R_ID[$i]}"; then
 			for spec in ${R_TESTS[$i]}; do
 				pkg="${spec%%::*}" t="${spec#*::}"
-				j="$(pkg_index "$pkg")"
+				j="$(pkg_index "$pkg" "${R_TAGS[$i]}")"
 				if [ -z "$j" ]; then
 					j=${#P_PKG[@]}
 					P_PKG+=("$pkg")
+					P_TAGS+=("${R_TAGS[$i]}")
 					P_TESTS+=("")
 					P_RC+=("")
 				fi
@@ -1403,7 +1440,7 @@ if [ "${#P_PKG[@]}" -gt 0 ]; then
 	trap 'rm -rf "$out_dir"' EXIT
 fi
 # One run of each package's tests (under --check, the whole package; under a
-# unit mode, the mode's tests only), verbose so each named test can be checked:
+# unit mode, and for a tagged run in every mode, the named tests only), verbose so each named test can be checked:
 # a test that does not run is not a pass. Under -race unless the package runs
 # with CGO_ENABLED=0, which the run says.
 j=0
@@ -1412,7 +1449,8 @@ while [ "$j" -lt "${#P_PKG[@]}" ]; do
 	dir="$(repo_dir "$pkg")"
 	: >"$out_dir/$j.out"
 	run=()
-	if [ "$mode" != check ]; then run=(-run "^($(tr ' ' '|' <<<"${P_TESTS[$j]}"))\$"); fi
+	if [ "$mode" != check ] || [ -n "${P_TAGS[$j]}" ]; then run=(-run "^($(tr ' ' '|' <<<"${P_TESTS[$j]}"))\$"); fi
+	if [ -n "${P_TAGS[$j]}" ]; then run+=(-tags "${P_TAGS[$j]}"); fi
 	rc=0
 	if [ ! -d "$dir" ]; then
 		rc=absent
@@ -1432,7 +1470,7 @@ ran() {
 	why=""
 	for spec in ${R_TESTS[$1]}; do
 		pkg="${spec%%::*}" t="${spec#*::}"
-		j="$(pkg_index "$pkg")"
+		j="$(pkg_index "$pkg" "${R_TAGS[$1]}")"
 		[ -n "$j" ] || return 1
 		if [ "${P_RC[$j]}" = absent ]; then
 			why=" (../${pkg%%/*} is not checked out beside k3sm)"
@@ -1514,7 +1552,7 @@ while [ "$i" -lt "$nrows" ]; do
 			;;
 		pend) pending_row "$id" "${R_DESC[$i]}" ;;
 		na) row "$id" N/A "${R_DESC[$i]} (not applicable: the flag variant was built; not counted)" ;;
-		rootpend | rootcheck) row "$id" ROOT "${R_DESC[$i]} (root-run row: --root runs it; pending here, not counted)" ;;
+		rootpend | rootcheck | rootpartial) row "$id" ROOT "${R_DESC[$i]} (root-run row: --root runs it; pending here, not counted)" ;;
 		leg) judge_leg "$i" ;;
 		esac
 	fi
@@ -1527,7 +1565,7 @@ while [ "$j" -lt "${#P_PKG[@]}" ]; do
 	0) ;;
 	absent) echo "keystore: ${P_PKG[$j]}: ../${P_PKG[$j]%%/*} is not checked out beside k3sm" ;;
 	*)
-		echo "keystore: ${P_PKG[$j]} failed:"
+		echo "keystore: ${P_PKG[$j]}${P_TAGS[$j]:+ (-tags ${P_TAGS[$j]})} failed:"
 		grep -E -- '^(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' "$out_dir/$j.out" || true
 		;;
 	esac
