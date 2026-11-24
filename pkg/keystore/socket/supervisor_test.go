@@ -650,9 +650,9 @@ func TestActivationOutcomesAreTerminal(t *testing.T) {
 		remedy string
 	}{
 		{OffNotActivated, unix.ESRCH, "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"},
-		{OffSocketParentMissing, unix.ENOENT, "mount the data root, then run `sudo k3sm restart`; if that does not clear it, run `sudo k3sm install`"},
+		{OffSocketParentMissing, unix.ENOENT, "run `sudo k3sm install` (it rewrites and reloads the server's definition); if the data root is on a volume that is not mounted, mount it first"},
 		{OffAlreadyActivated, unix.EALREADY, "run `sudo k3sm restart`"},
-		{OffActivatedInheritable, ErrActivatedInheritable, "run `sudo k3sm restart`"},
+		{OffActivatedInheritable, ErrActivatedInheritable, "report it: launchd handed the server an inheritable descriptor; the user scope stays off"},
 		{OffActivatedWrong, ErrActivatedWrong, "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"},
 		{OffListenerUnavailable, unix.EINVAL, "run `sudo k3sm restart`"},
 	} {

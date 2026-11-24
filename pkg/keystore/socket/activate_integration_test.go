@@ -98,8 +98,8 @@ func closed(fd int) bool {
 // serves a close-on-exec duplicate that an exec'd child does not hold. It
 // activates once per process: a Close leaves the socket open and serving,
 // every later call returns the same listener without asking launchd, and a
-// second activation in the process gets EALREADY, terminal as
-// OffAlreadyActivated.
+// second activation in the process gets the fake's EALREADY (<launch.h>'s
+// documented answer, not measured), terminal as OffAlreadyActivated.
 func TestActivatedListenerIsCloseOnExecAndHeld(t *testing.T) {
 	dir := sockDir(t)
 	path := filepath.Join(dir, "keys.sock")
@@ -206,7 +206,7 @@ func TestActivatedListenerRefusals(t *testing.T) {
 		check func(string) error
 	}{
 		{"not the launchd job", &fakeActivator{err: unix.ESRCH}, ErrNotActivated, "not the server's launchd job", OffNotActivated, nil},
-		{"the parent path is missing", &fakeActivator{err: unix.ENOENT}, ErrNotActivated, "parent path is missing", OffSocketParentMissing, nil},
+		{"no socket of that name for this job", &fakeActivator{err: unix.ENOENT}, ErrNotActivated, "no socket of that name for this job", OffSocketParentMissing, nil},
 		{"already activated", &fakeActivator{err: unix.EALREADY}, unix.EALREADY, "already handed", OffAlreadyActivated, nil},
 		{"another launchd error", &fakeActivator{err: unix.EINVAL, fds: atPath(unix.SOCK_STREAM, true, true)}, unix.EINVAL, "did not activate", OffListenerUnavailable, nil},
 		{"no descriptor", &fakeActivator{}, ErrActivatedWrong, "no descriptor", OffActivatedWrong, nil},

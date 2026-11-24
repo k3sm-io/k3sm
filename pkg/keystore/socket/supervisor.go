@@ -84,16 +84,27 @@ const (
 	// job, which install does, can give one.
 	OffNotActivated OffReason = "launchd activated no socket for this server"
 	// OffSocketParentMissing is ENOENT (<launch.h>: no socket of that name
-	// owned by the caller), measured when deeper levels of the socket's
-	// path are missing at the job's activation call.
-	OffSocketParentMissing OffReason = "the job has a socket entry but launchd could not provide the keys socket: a parent of its path is missing, for example a data root on a volume that is not mounted"
-	// OffAlreadyActivated is EALREADY: this process took the socket before.
+	// owned by the caller): launchd's loaded definition of the job has no
+	// such entry, or a parent of the socket path is missing at the job's
+	// activation call (measured with three missing levels). Install
+	// rewrites and reloads the definition; a data root on a volume that is
+	// not mounted is mounted first (not measured; a default-layout data
+	// root that is not mounted is refused earlier, by the shadowed-work-dir
+	// check).
+	OffSocketParentMissing OffReason = "launchd has no `keys` socket for this job: its loaded definition has no such entry, or a parent of the socket path is missing (measured with three missing levels)"
+	// OffAlreadyActivated is EALREADY, <launch.h>'s documented answer to a
+	// second activation in one process (not measured: the process-wide
+	// holder never asks twice).
 	OffAlreadyActivated OffReason = "launchd already handed this process the socket"
 	// OffActivatedInheritable is a descriptor launchd handed over without
-	// FD_CLOEXEC, closed and refused (ErrActivatedInheritable).
+	// FD_CLOEXEC, closed and refused (ErrActivatedInheritable). A restart
+	// does not change launchd's flag, so no command puts it right: it is
+	// reported (InheritableRemedy).
 	OffActivatedInheritable OffReason = "the activated socket arrived without FD_CLOEXEC"
 	// OffActivatedWrong is an activated descriptor, or the socket path
 	// clients connect to, that is not the keystore's (ErrActivatedWrong).
+	// Its remedy is install, which rewrites and reloads the server's
+	// definition, so launchd binds the socket afresh at the next start.
 	OffActivatedWrong OffReason = "the activated socket or its path is not the keystore's"
 )
 
@@ -106,7 +117,10 @@ const (
 	// for a server with no socket at the path too.
 	NotActivatedRemedy = "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"
 	// ParentMissingRemedy is OffSocketParentMissing's remedy.
-	ParentMissingRemedy = "mount the data root, then run `sudo k3sm restart`; if that does not clear it, run `sudo k3sm install`"
+	ParentMissingRemedy = "run `sudo k3sm install` (it rewrites and reloads the server's definition); if the data root is on a volume that is not mounted, mount it first"
+	// InheritableRemedy is OffActivatedInheritable's: no command changes
+	// launchd's flag.
+	InheritableRemedy = "report it: launchd handed the server an inheritable descriptor; the user scope stays off"
 	// RestartRemedy is the remedy of every other terminal activation reason.
 	RestartRemedy = "run `sudo k3sm restart`"
 )
@@ -533,8 +547,10 @@ func (r OffReason) Remedy() string {
 		return NotActivatedRemedy
 	case OffSocketParentMissing:
 		return ParentMissingRemedy
-	case OffAlreadyActivated, OffActivatedInheritable:
+	case OffAlreadyActivated:
 		return RestartRemedy
+	case OffActivatedInheritable:
+		return InheritableRemedy
 	case OffActivatedWrong:
 		return NotActivatedRemedy
 	}

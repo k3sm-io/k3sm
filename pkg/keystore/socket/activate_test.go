@@ -42,7 +42,7 @@ type fakeActivator struct {
 }
 
 // Activate answers EALREADY after a call that handed descriptors over, as
-// launch_activate_socket does, and records whether syscall.ForkLock was
+// <launch.h> documents launch_activate_socket does (not measured), and records whether syscall.ForkLock was
 // read-held during the call.
 func (a *fakeActivator) Activate(string) ([]int, error) {
 	a.calls++
@@ -99,7 +99,7 @@ func TestActivationRefusalsWithoutDescriptor(t *testing.T) {
 		r    OffReason
 	}{
 		{"not the launchd job", &fakeActivator{err: unix.ESRCH}, ErrNotActivated, "not the server's launchd job", OffNotActivated},
-		{"the parent path is missing", &fakeActivator{err: unix.ENOENT}, ErrNotActivated, "parent path is missing", OffSocketParentMissing},
+		{"no socket of that name for this job", &fakeActivator{err: unix.ENOENT}, ErrNotActivated, "no socket of that name for this job", OffSocketParentMissing},
 		{"already activated", &fakeActivator{err: unix.EALREADY}, unix.EALREADY, "already handed", OffAlreadyActivated},
 		{"no descriptor", &fakeActivator{}, ErrActivatedWrong, "no descriptor", OffActivatedWrong},
 	} {

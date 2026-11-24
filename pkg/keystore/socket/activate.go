@@ -34,8 +34,9 @@ import (
 // process: ESRCH (the process is not the server's launchd job, a rootless
 // or hand-started server, or a job whose plist has no Sockets key, both
 // measured) or ENOENT (<launch.h>: "no socket of the specified name owned
-// by the caller"; measured when deeper levels of the socket's path are
-// missing, as for a data root on a volume that is not mounted). The server never binds keys.sock itself
+// by the caller": launchd has no socket of that name for this job, because
+// its loaded definition has no such entry or a parent of the socket path
+// is missing, measured with three missing levels). The server never binds keys.sock itself
 // (docs/design/keystore.md § "The socket's directory is root's").
 var ErrNotActivated = errors.New("no socket activated by launchd")
 
@@ -51,8 +52,9 @@ var ErrActivatedWrong = errors.New("the activated socket is not the keystore's l
 
 // ActivationError is the one outcome of the process's activation that is
 // not a listener. Reason is the supervisor's off reason; every one is
-// terminal, since launchd hands a job's socket over once
-// (launch_activate_socket answers EALREADY to a second call).
+// terminal: the process-wide holder never calls launch_activate_socket
+// twice, and a second call's result would be <launch.h>'s documented
+// EALREADY (not measured).
 type ActivationError struct {
 	Reason OffReason
 	Err    error
@@ -68,7 +70,9 @@ func (e *ActivationError) Unwrap() error { return e.Err }
 type Activator interface {
 	// Activate returns the descriptors launchd activated for the entry
 	// name, each now owned by the caller, or an error (ESRCH, ENOENT, or
-	// EALREADY when this process has already activated the entry).
+	// EALREADY, which <launch.h> documents for an entry this process has
+	// already activated; not measured, since the Activation never asks
+	// twice).
 	Activate(name string) ([]int, error)
 }
 
@@ -120,8 +124,10 @@ func NewActivation(name, path string, a Activator, checkPath func(path string) e
 // /var/run/com.apple.launchd.<random>/<name> (always, as measured: launchd
 // binds there and renames the socket into place, so this is a shape check,
 // not a check of the clients' path), or is path itself; and that checkPath
-// passes on path, which ties the descriptor to a name only root can
-// replace. The last three are OffActivatedWrong. The served listener is a
+// passes on path: it checks that only root could have put a socket at
+// the clients' path; the descriptor's own address is launchd's private
+// bind name, so the descriptor cannot be tied to the path. The last three
+// are OffActivatedWrong. The served listener is a
 // close-on-exec duplicate and the original is closed.
 //
 // The fork lock: launch_activate_socket runs outside syscall.ForkLock,
@@ -167,7 +173,7 @@ func activate(name, path string, a Activator, checkPath func(string) error) (*ne
 		case errors.Is(err, unix.ESRCH):
 			return refuse(OffNotActivated, fmt.Errorf("%w for the Sockets entry %q: this process is not the server's launchd job, or its plist has no such entry: %w", ErrNotActivated, name, err))
 		case errors.Is(err, unix.ENOENT):
-			return refuse(OffSocketParentMissing, fmt.Errorf("%w for the Sockets entry %q: the socket's parent path is missing: %w", ErrNotActivated, name, err))
+			return refuse(OffSocketParentMissing, fmt.Errorf("%w for the Sockets entry %q: launchd has no socket of that name for this job (its loaded definition has no such entry, or a parent of the socket path is missing): %w", ErrNotActivated, name, err))
 		case errors.Is(err, unix.EALREADY):
 			return refuse(OffAlreadyActivated, fmt.Errorf("launchd already handed this process the Sockets entry %q: %w", name, err))
 		}
