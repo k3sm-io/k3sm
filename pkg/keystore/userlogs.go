@@ -405,7 +405,9 @@ type auditLine struct {
 //
 // The contract (docs/design/keystore.md § "The audit log": every append
 // takes the store .lock): every append runs while the caller holds the
-// exclusive store lock. A grant appends its line before its first write and
+// store lock, exclusive for a mutation, shared for a read (auditedRead),
+// whose line is appended under that shared hold; the log's own mutex
+// serialises the appends of one process. A grant appends its line before its first write and
 // a revocation after its commit, each under the lock it does its work in; a
 // refusal after the lock was taken is appended before the lock is released;
 // a refusal before it takes the lock briefly to append (auditBriefly), and

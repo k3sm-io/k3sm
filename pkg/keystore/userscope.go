@@ -402,7 +402,9 @@ func openUserEntry(entries *os.Root, name string) (*entry, error) {
 	return e, nil
 }
 
-// Current returns the version input's pointer names, with its value.
+// Current returns the version input's pointer names, with its value. It
+// writes no audit line: it is this package's own read. The socket's read
+// is ReadForExec, audited as exec-read.
 func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte, error) {
 	var (
 		v   Version
@@ -441,13 +443,14 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 
 // List returns every entry of the scope, sorted by name, as FileStore.List
 // does: an entry that cannot be opened carries Err. A uid with no scope is
-// ErrScopeAbsent.
+// ErrScopeAbsent. It is audited as list (auditedRead).
 func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 	if err := u.quarantineErr(); err != nil {
+		u.auditBriefly(ctx, auditLine{op: "list"}, err)
 		return nil, fail("list", err)
 	}
 	var out []Entry
-	err := u.read(ctx, func(entries *os.Root, uk keys) error {
+	err := u.auditedRead(ctx, auditLine{op: "list"}, func(entries *os.Root, uk keys) error {
 		names, err := readDirNames(entries, maxDirNames)
 		if err != nil {
 			return err
@@ -479,6 +482,85 @@ func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 		return nil, fail("list", err)
 	}
 	return out, nil
+}
+
+// ReadForExec returns the value of input's current version, with the
+// version: the socket's read-for-exec, the one way a user reaches its own
+// value. It reads raw kinds only, as Current does, and is audited as
+// exec-read (auditedRead): a read whose line cannot be written returns no
+// value.
+func (u *UserScope) ReadForExec(ctx context.Context, input string) (Version, []byte, error) {
+	name, err := u.own("exec-read", input)
+	if err != nil {
+		u.auditBriefly(ctx, auditLine{op: "exec-read", name: auditPlaceholder}, err)
+		return Version{}, nil, fail("exec-read", err)
+	}
+	if err := u.quarantineErr(); err != nil {
+		u.auditBriefly(ctx, auditLine{op: "exec-read", name: name}, err)
+		return Version{}, nil, fail("exec-read", err)
+	}
+	var (
+		v   Version
+		val []byte
+	)
+	err = u.auditedRead(ctx, auditLine{op: "exec-read", name: name}, func(entries *os.Root, uk keys) error {
+		e, err := openUserEntry(entries, name)
+		if err != nil {
+			return err
+		}
+		defer e.close()
+		cur, err := u.flooredPointer(e, uk)
+		if err != nil {
+			return err
+		}
+		v, val, err = e.version(uk, cur)
+		return rawOnly(v, err)
+	})
+	if err != nil {
+		clear(val) // a refused read never hands out its value
+		return Version{}, nil, fail("exec-read", err)
+	}
+	return v, val, nil
+}
+
+// errReadAuditRefused is a read refused because its audit line could not
+// be written: the fail-closed rule for reads, which no exception covers.
+var errReadAuditRefused = errors.New("the audit line could not be written, so the read is refused")
+
+// auditedRead runs fn as read does, under the shared lock, and appends l
+// under that same hold, after the read and before the caller replies
+// (docs/design/keystore.md § "The audit log": lock modes, audit before
+// reply, fail closed). A uid past its share is refused first, with nothing
+// read and no line written (errShareSpent): reads are charged to the share
+// like any line and are not in the revocation class. A read whose line
+// cannot be appended is refused (errReadAuditRefused); a refused read's
+// line is written best effort, with the refusal's result.
+func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Root, keys) error) error {
+	if err := u.s.checkConfig(); err != nil {
+		return err
+	}
+	root, done, err := u.s.openLocked(ctx, false, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
+	}
+	if err != nil {
+		return err
+	}
+	defer done()
+	if err := u.s.admit(u.uid, false); err != nil {
+		return err
+	}
+	o, entries, err := u.openScopeFull(root, u.s.loadMaster)
+	if err == nil {
+		err = fn(entries, o.uk)
+		_ = entries.Close() // read-only; nothing to flush
+		o.close()
+	}
+	l.result = auditResult(err)
+	if aerr := u.audit(l); aerr != nil && err == nil {
+		return fmt.Errorf("%w: %w", errReadAuditRefused, aerr)
+	}
+	return err
 }
 
 // read runs fn on the scope's entries' directory and keys under the shared
