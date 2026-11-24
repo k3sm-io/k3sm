@@ -181,7 +181,8 @@ func (s *FileStore) checkRoot(root *os.Root, named fs.FileInfo) error {
 
 // mkdirOwned creates the directory at path at dirMode, handed to the service
 // user, with mkdirAt through a root opened on its parent, never by its full
-// path. An existing directory is left as it is for the caller's check. The
+// path. An existing directory is left as it is for the caller's check, its
+// parent fsynced (mkdirAt), so one a racing party made is durable. The
 // parent is opened by path: it is the server work dir, which the openDir note
 // above covers.
 //
@@ -219,11 +220,18 @@ func (s *FileStore) mkdirOwned(path string) error {
 // service user prepared, so it is refused as ErrCorrupt and nothing is chowned
 // or chmodded. Once checked, any extended ACL it inherited from parent is
 // removed on the descriptor (removeExtendedACL; a no-op where the build reads
-// no ACL), before the handover. An existing name is an error matching
-// fs.ErrExist. Once handed over, parent is fsynced, so the new name is
-// durable.
+// no ACL), before the handover. Once handed over, parent is fsynced, so the
+// new name is durable. An existing name is an error matching fs.ErrExist,
+// after parent is fsynced too: the name may be one another party (the
+// server, or a root put, racing this one) has made and not yet synced, and
+// what the caller writes under it must not outlive it on a power loss.
 func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	if err := parent.Mkdir(name, dirMode); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			if serr := syncDir(parent); serr != nil {
+				return nil, serr
+			}
+		}
 		return nil, err
 	}
 	s.dirMade(name)

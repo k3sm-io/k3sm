@@ -22,6 +22,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -174,4 +175,33 @@ func TestEnsureDirClassifiesRefusals(t *testing.T) {
 			t.Fatal("nil classified")
 		}
 	})
+}
+
+// TestEnsureDirSyncsParentOfExistingDir: when the store directory already
+// exists, as when a racing root put made it first, EnsureDir still fsyncs
+// server/, so the name it then works under is durable; a failed fsync is
+// its error.
+func TestEnsureDirSyncsParentOfExistingDir(t *testing.T) {
+	s, server := newTestStore(t)
+	dir := filepath.Join(server, "keystore")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	giveToService(t, dir)
+	var synced []string
+	setSyncDir(t, func(root *os.Root) error {
+		synced = append(synced, root.Name())
+		return fsyncDir(root)
+	})
+	if err := s.EnsureDir(); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+	if !slices.Contains(synced, server) {
+		t.Fatalf("synced %q; want the parent %s of the existing directory", synced, server)
+	}
+	boom := errors.New("fsync failed")
+	setSyncDir(t, func(*os.Root) error { return boom })
+	if err := s.EnsureDir(); !errors.Is(err, boom) {
+		t.Fatalf("EnsureDir with a failing fsync = %v, want it", err)
+	}
 }
