@@ -244,6 +244,15 @@ func TestIntegrationDeadPeerRefused(t *testing.T) {
 	if pc.UIDRead && uid != pc.UID {
 		t.Fatalf("the refusal names uid %d, but uid %d was read", uid, pc.UID)
 	}
+	// A dead login peer is charged to its own uid's share, not to the
+	// no-uid class: the refusal is cred-unreadable under the uid the child
+	// ran as, which is this process's.
+	if reason != ReasonCredUnreadable {
+		t.Fatalf("listener check refused with %q, want %q", reason, ReasonCredUnreadable)
+	}
+	if want := uint32(os.Getuid()); uid != want {
+		t.Fatalf("the refusal names uid %d, want the test process's uid %d", uid, want)
+	}
 }
 
 // TestIntegrationSandboxedPeerRefused: a child that sandboxes itself with
