@@ -138,12 +138,19 @@ func leakyErr(sentinel error) error {
 
 // The server logs the store errors that are damage, at Warn, with the op,
 // the peer's uid, the entry when the request named a valid one, a class of
-// the closed set and its fixed remedy, never the error's text: an error
-// answered internal, a corrupt record, a floor that is stale or records a
-// deleted entry, an orphan version, the floor's damage and the scope's
-// quarantine. The ordinary outcomes, which have their audit lines, a
-// change that committed and a cancelled or timed-out request are not
-// logged, and no line carries a value, a length or a tag from the error.
+// the closed set and its fixed remedy, never the error's text. The first
+// subtest drives the handler with built errors, one per outcome: a
+// corrupt record (one carrying a value's bytes, a length and a tag in its
+// text, and one with a stale floor's text, which is only ErrCorrupt), the
+// floor-records-entry sentinel, an orphan version, a missing master, an
+// unsupported kind and an error no table names; and the ordinary
+// outcomes, which have their audit lines, a change that committed and a
+// cancelled or timed-out request, none of which is logged. The second
+// drives the real store, and produces two kinds of damage there: a
+// version that fails authentication (corrupt) and a floor line no key
+// can be read from (floor-degraded, on a put). It makes no stale floor
+// and no quarantine. No line carries a value, a length or a tag from the
+// error.
 func TestStoreErrorLogged(t *testing.T) {
 	t.Run("each outcome", func(t *testing.T) {
 		wrap := func(err error) error { return fmt.Errorf("user scope exec-read: %w", err) }
