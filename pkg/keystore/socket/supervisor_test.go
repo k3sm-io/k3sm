@@ -123,6 +123,8 @@ type startChecks struct {
 	listenErr  error
 	logsErr    error
 	sandboxErr error
+	profileErr error // what the Pod-profile check returns
+	profiled   int   // how many times it was asked
 	reopens    int
 	servers    int
 	serversErr error
@@ -130,7 +132,7 @@ type startChecks struct {
 	listens    int
 	counted    int
 	ln         net.Listener // what the listener source returns
-	panics     string       // the step that panics: euid, marker, mount, install, logs, sandbox, count or listen
+	panics     string       // the step that panics: profile, euid, marker, mount, install, logs, sandbox, count or listen
 }
 
 // boom panics when step is the one set to.
@@ -290,6 +292,13 @@ func (r *supRig) config() SupervisorConfig {
 			return ck.marked, ck.markerErr
 		},
 		SandboxCheck: func() error { ck.mu.Lock(); defer ck.mu.Unlock(); ck.boom("sandbox"); return ck.sandboxErr },
+		PodProfile: func() error {
+			ck.mu.Lock()
+			defer ck.mu.Unlock()
+			ck.profiled++
+			ck.boom("profile")
+			return ck.profileErr
+		},
 		OpenLogs: func(context.Context) error {
 			ck.mu.Lock()
 			defer ck.mu.Unlock()
@@ -684,6 +693,61 @@ func TestActivationOutcomesAreTerminal(t *testing.T) {
 		r.wantState(t, PhaseBackingOff, OffListenerUnavailable, MinBackoff)
 		advance(MinBackoff)
 		r.wantState(t, PhaseBackingOff, OffListenerUnavailable, 2*MinBackoff)
+	})
+}
+
+// A Pod profile that does not deny the socket is terminal: the supervisor
+// is off with OffPodProfile before any start check runs, logs one Warn
+// naming the remedy, never asks the listener source or the checks, and
+// never asks the profile again, however long it waits. A panicking check
+// is the same failure. A passing check is asked once and the listener
+// serves.
+func TestPodProfileOffIsTerminal(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(c *startChecks)
+	}{
+		{"open", func(c *startChecks) {
+			c.profileErr = fmt.Errorf("%w: no network-outbound deny covers /x", ErrPodProfileOpen)
+		}},
+		{"panicked", func(c *startChecks) { c.panics = "profile" }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				r := newSupRig(t, tt.setup)
+				st := r.wantState(t, PhaseOff, OffPodProfile, 0)
+				if st.Detail == "" {
+					t.Fatal("no detail")
+				}
+				advance(time.Hour)
+				got := r.ck.get()
+				r.ck.mu.Lock()
+				profiled := r.ck.profiled
+				r.ck.mu.Unlock()
+				if profiled != 1 || got.listens != 0 || got.counted != 0 || got.reopens != 0 {
+					t.Fatalf("profiled %d, listens %d, counts %d, reopens %d; want the profile asked once and nothing else", profiled, got.listens, got.counted, got.reopens)
+				}
+				if n := r.log.count("level=WARN", "install a k3sm built with a matching runtimed", string(OffPodProfile)); n != 1 {
+					t.Fatalf("%d Warn lines naming the remedy, want 1:\n%s", n, r.log.b.String())
+				}
+				if n := r.log.count("level=ERROR"); n != 0 {
+					t.Fatalf("%d Error lines, want none", n)
+				}
+				if r.s.State().Reason.Remedy() != PodProfileRemedy {
+					t.Fatal("the reason names no remedy")
+				}
+			})
+		})
+	}
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, nil)
+		r.wantState(t, PhaseServing, "", 0)
+		r.ck.mu.Lock()
+		profiled := r.ck.profiled
+		r.ck.mu.Unlock()
+		if profiled != 1 {
+			t.Fatalf("a passing profile asked %d times, want once", profiled)
+		}
 	})
 }
 

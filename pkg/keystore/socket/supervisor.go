@@ -106,6 +106,12 @@ const (
 	// Its remedy is install, which rewrites and reloads the server's
 	// definition, so launchd binds the socket afresh at the next start.
 	OffActivatedWrong OffReason = "the activated socket or its path is not the keystore's"
+	// OffPodProfile is a Pod profile, rendered by the runtime this binary
+	// embeds for this node's posture, that does not deny the socket
+	// (SupervisorConfig.PodProfile). It is terminal for the process: the
+	// profile is this build's, so no retry and no reinstall of the same
+	// build changes it.
+	OffPodProfile OffReason = "this build's Pod profile does not deny the keystore socket"
 )
 
 // The supervisor's log text: every off line starts with offMsg, and the
@@ -121,6 +127,8 @@ const (
 	// InheritableRemedy is OffActivatedInheritable's: no command changes
 	// launchd's flag.
 	InheritableRemedy = "report it: launchd handed the server an inheritable descriptor; the user scope stays off"
+	// PodProfileRemedy is OffPodProfile's remedy.
+	PodProfileRemedy = "install a k3sm built with a matching runtimed"
 	// RestartRemedy is the remedy of every other terminal activation reason.
 	RestartRemedy = "run `sudo k3sm restart`"
 )
@@ -198,6 +206,12 @@ type SupervisorConfig struct {
 	// store's start step (keystore.FileStore.StartUserScopes) in it.
 	// Optional.
 	StartScopes func(ctx context.Context) error
+	// PodProfile, when set, is asked once, when Run starts and before any
+	// start check, whether the Pod profile this node renders denies the
+	// socket (ProfileDeniesSocket over the generator's text). An error, or a
+	// panic, is terminal: the supervisor is off with OffPodProfile, logs one
+	// Warn naming PodProfileRemedy, and serves nothing until Run returns.
+	PodProfile func() error
 	// Creds, Sandbox, Audit and Handler are given to each run's Listener.
 	Creds   PeerCredSource
 	Sandbox PeerSandboxSource
@@ -303,6 +317,12 @@ func (s *Supervisor) Run(ctx context.Context) {
 	// failures and starts again only after a run served HealthyPeriod (or
 	// stopped for the marker), so a listener that fails at once after
 	// every passing check still backs off.
+	if s.cfg.PodProfile != nil {
+		if _, err := guard(func() (struct{}, error) { return struct{}{}, s.cfg.PodProfile() }); err != nil {
+			s.terminal(ctx, OffPodProfile, err.Error())
+			return
+		}
+	}
 	checkBackoff, runBackoff := MinBackoff, MinBackoff
 	reopenTries := 0
 	var last OffReason
@@ -553,6 +573,8 @@ func (r OffReason) Remedy() string {
 		return InheritableRemedy
 	case OffActivatedWrong:
 		return NotActivatedRemedy
+	case OffPodProfile:
+		return PodProfileRemedy
 	}
 	return ""
 }
@@ -589,6 +611,14 @@ func (s *Supervisor) notActivated(ctx context.Context, ae *ActivationError) {
 	}
 	s.set(State{Phase: PhaseOff, Reason: ae.Reason, Detail: ae.Error()})
 	s.cfg.Log.Warn(offMsg+"; "+remedy, "reason", string(ae.Reason), "err", ae.Error())
+	<-ctx.Done()
+}
+
+// terminal records a reason no retry in this process changes, logs it once
+// at Warn naming its remedy, and waits for ctx.
+func (s *Supervisor) terminal(ctx context.Context, reason OffReason, detail string) {
+	s.set(State{Phase: PhaseOff, Reason: reason, Detail: detail})
+	s.cfg.Log.Warn(offMsg+"; "+reason.Remedy(), "reason", string(reason), "err", detail)
 	<-ctx.Done()
 }
 
