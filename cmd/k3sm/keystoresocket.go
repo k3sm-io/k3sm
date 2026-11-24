@@ -574,19 +574,25 @@ type doctorUserScope struct {
 	// error.
 	servers  func() ([]string, error)
 	sockPath string
-	// sockState lstats sockPath, never following or connecting: nil when a
-	// socket owned by the service user is there.
+	// sockState lstats sockPath, never following or connecting: nil when
+	// launchd's socket is there (root's, at install.KeystoreSocketMode).
 	sockState func() error
 }
 
-// errNoListeningSocket is a socket path that holds no socket of the
-// service user's.
+// errNoListeningSocket is a socket path that holds no socket of
+// launchd's.
 var errNoListeningSocket = errors.New("no listening socket")
 
+// launchdSocketOwner is the owner of a socket launchd creates for a job's
+// Sockets entry: root, whatever the job's UserName (measured 2026-11-23:
+// root:daemon 0666 in the root 0755 directory).
+const launchdSocketOwner = 0
+
 // lstatKeystoreSocket judges what is at path by lstat alone: nil for a
-// socket owned by uid, else an error wrapping errNoListeningSocket (or the
-// lstat's error) that says what is there.
-func lstatKeystoreSocket(path string, uid uint32) error {
+// socket owned by owner (launchdSocketOwner in production) at
+// install.KeystoreSocketMode, else an error wrapping errNoListeningSocket
+// (or the lstat's error) that says what is there.
+func lstatKeystoreSocket(path string, owner uint32) error {
 	var st unix.Stat_t
 	if err := unix.Lstat(path, &st); err != nil {
 		if errors.Is(err, unix.ENOENT) {
@@ -594,17 +600,20 @@ func lstatKeystoreSocket(path string, uid uint32) error {
 		}
 		return fmt.Errorf("lstat the socket path: %w", err)
 	}
-	return judgeKeystoreSocket(uint32(st.Mode), st.Uid, uid)
+	return judgeKeystoreSocket(uint32(st.Mode), st.Uid, owner)
 }
 
 // judgeKeystoreSocket is lstatKeystoreSocket's rule over an lstat's mode
-// and owner.
-func judgeKeystoreSocket(mode, owner, uid uint32) error {
+// and owner. A socket of the service user's is the self-bind form, which
+// does not ship, so it is no listening socket either.
+func judgeKeystoreSocket(mode, owner, want uint32) error {
 	switch {
 	case mode&unix.S_IFMT != unix.S_IFSOCK:
 		return fmt.Errorf("%w: the path is not a socket", errNoListeningSocket)
-	case owner != uid:
-		return fmt.Errorf("%w: the socket is owned by uid %d, not the service user's %d", errNoListeningSocket, owner, uid)
+	case owner != want:
+		return fmt.Errorf("%w: the socket is owned by uid %d, not root's, which launchd's socket is (run sudo k3sm install, which renders the server plist's Sockets entry)", errNoListeningSocket, owner)
+	case mode&0o7777 != install.KeystoreSocketMode:
+		return fmt.Errorf("%w: the socket is at mode %04o, not %04o", errNoListeningSocket, mode&0o7777, install.KeystoreSocketMode)
 	}
 	return nil
 }
@@ -681,6 +690,6 @@ func doctorKeystoreUserScope(workDir string) (doctorUserScope, error) {
 		release:   pass.end,
 		servers:   func() ([]string, error) { return names, countErr },
 		sockPath:  sock,
-		sockState: func() error { return lstatKeystoreSocket(sock, uid) },
+		sockState: func() error { return lstatKeystoreSocket(sock, launchdSocketOwner) },
 	}, nil
 }

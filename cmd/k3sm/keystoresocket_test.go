@@ -593,17 +593,21 @@ func mustHandler(t *testing.T) *socket.Handler {
 }
 
 // TestDoctorKeystoreSocketLstat holds the doctor row's socket fact to an
-// lstat: a socket of the service user's passes; nothing there, a file, a
-// symlink, or another owner's socket is no listening socket. The socket
+// lstat: launchd's socket, root's at 0666, passes; nothing there, a file, a
+// symlink, a socket of the service user's (the self-bind form, which does
+// not ship) or one at another mode is no listening socket. The socket
 // cases are judged from the mode and owner an lstat returns, so no socket
 // is bound.
 func TestDoctorKeystoreSocketLstat(t *testing.T) {
 	const svc = 260
-	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, svc, svc); err != nil {
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, 0, launchdSocketOwner); err != nil {
+		t.Fatalf("launchd's socket: %v", err)
+	}
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, svc, launchdSocketOwner); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "owned by uid 260, not root's") {
 		t.Fatalf("the service user's socket: %v", err)
 	}
-	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, 0, svc); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "owned by uid 0") {
-		t.Fatalf("root's socket: %v", err)
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o600, 0, launchdSocketOwner); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "mode 0600, not 0666") {
+		t.Fatalf("a root socket at 0600: %v", err)
 	}
 	dir := t.TempDir()
 	file := filepath.Join(dir, "file")

@@ -295,8 +295,8 @@ const doctorServersShown = 8
 // the logs read-only where the server reopens them. When every check passes
 // it says "start checks pass" and not "on": all it can add is what an
 // lstat of the socket path shows (it never connects; root and the service
-// user would be refused and write a refusal line), and no socket of the
-// service user's there is a WARN. A failed check is "off (<reason>)" with
+// user would be refused and write a refusal line), and no socket of
+// launchd's there (root's, at the plist's mode) is a WARN. A failed check is "off (<reason>)" with
 // the supervisor's reason, naming `sudo k3sm install` where that puts it
 // right, and the servers by name when more than one is registered; off is a
 // WARN, since the system scope is unaffected. A server count this user may
@@ -331,7 +331,7 @@ func checkKeystoreUserScope(env doctorEnv) checkResult {
 		if serr := scope.sockState(); serr != nil {
 			return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: start checks pass, but no listening socket at %s [%v]", scope.sockPath, serr)}
 		}
-		return checkResult{name: name, status: statusPass, detail: "keystore user scope: start checks pass; a socket owned by the service user is at " + scope.sockPath}
+		return checkResult{name: name, status: statusPass, detail: "keystore user scope: start checks pass; launchd's socket (root's, mode 0666) is at " + scope.sockPath}
 	case reason == socket.OffServersUnknown && errors.Is(countErr, fs.ErrPermission):
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: the server count cannot be read as this user, so the start checks are not all known [%v]", countErr), remedy: "sudo k3sm doctor   # the admin kubeconfig is root's"}
 	}
