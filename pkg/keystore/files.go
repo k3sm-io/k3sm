@@ -253,7 +253,7 @@ func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 		if now, lerr := parent.Lstat(name); errors.Is(err, errBadFile) || lerr != nil || !os.SameFile(made, now) {
 			return nil, fmt.Errorf("%w: the new directory %s was replaced after its mkdir: %w", ErrCorrupt, name, err)
 		}
-		return nil, fmt.Errorf("open %s: %w", name, err)
+		return nil, fmt.Errorf("%w %s: %w", errNewDirOpen, name, err)
 	}
 	defer func() { _ = f.Close() }() // read-only; nothing to flush
 	if err := s.checkNewDir(f, made, opened); err != nil {
@@ -280,6 +280,11 @@ func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	}
 	return opened, nil
 }
+
+// errNewDirOpen marks mkdirAt's error for the open of the directory its
+// mkdir just made, which the parent did not deny: the parent was searched
+// and written to make it, so a denial there is the new directory's own.
+var errNewDirOpen = errors.New("open the new directory")
 
 // errExistSync marks mkdirAt's error for an existing name whose parent's
 // fsync then failed.
@@ -588,13 +593,16 @@ func readDirEntries(root *os.Root, max int) ([]fs.DirEntry, error) {
 // Its error says which: StoreDirRefused for an existing directory refused
 // on what it is (not a directory, its owner, its mode, an extended ACL), which every pass
 // refuses again until it is changed; StoreDirDenied for a directory it
-// cannot open or cannot reach, with what could be read about it without
-// opening it (StoreDirDenial), which is StoreDirRace too only when the
-// directory itself denied the open and its owner is root or the service
-// user (one root owns before its handover cannot be opened, but neither can
-// one a crashed put or an operator left root's); a parent that denies the
-// walk, or a third uid's directory, is never the race; and StoreDirRace for a directory just made that already holds a name a
-// racing put wrote. Any other error is none of these.
+// cannot open or cannot reach (EACCES), with what could be read about it
+// without opening it (StoreDirDenial), which is StoreDirRace too only when
+// the directory itself denied the open and an Lstat read root as its owner
+// (one root owns before its handover cannot be opened, but neither can one
+// a crashed put or an operator left root's); a parent that denies the walk,
+// a third uid's directory, the service user's own (a put hands it over at
+// 0700, which the service user can open) or one whose owner could not be
+// read is never the race; and StoreDirRace for a directory just made that
+// already holds a name a racing put wrote. EPERM is none of these: no
+// mode, owner or ACL repair clears it. Any other error is none of these.
 //
 // While a restore is staged (MergePending) it refuses with errMergePending
 // and creates nothing: a directory made then would be moved aside by keys
@@ -607,32 +615,51 @@ func (s *FileStore) EnsureDir() error {
 		return err
 	}
 	if err := s.mkdirOwned(s.dir); err != nil {
-		switch {
-		case errors.Is(err, errNewDirNotEmpty):
-			return &storeDirError{err: err, race: true}
-		case errors.Is(err, syscall.EACCES):
-			// The parent's open or the mkdir in it was denied: server/, or
-			// the data root above it, which no put touches.
-			return &storeDirError{err: err, denied: true, denial: s.diagnoseDenied(true)}
-		}
-		return err
+		return s.mkdirError(err)
 	}
 	root, err := s.openDir(s.dir, false)
 	if err == nil {
 		err = closeAfter(root, judgeDirACL(root, s.dir))
 	}
 	if err != nil {
-		var refused *dirRefusal
-		switch {
-		case errors.As(err, &refused):
-			return &storeDirError{err: err}
-		case errors.Is(err, fs.ErrPermission):
-			d := s.diagnoseDenied(false)
-			return &storeDirError{err: err, denied: true, denial: d, race: d.Cause == DeniedOwn}
-		}
-		return err
+		return s.openError(err)
 	}
 	return nil
+}
+
+// mkdirError classifies EnsureDir's mkdirOwned error (storeDirError).
+func (s *FileStore) mkdirError(err error) error {
+	switch {
+	case errors.Is(err, errNewDirNotEmpty):
+		return &storeDirError{err: err, race: true}
+	case errors.Is(err, errNewDirOpen) && errors.Is(err, syscall.EACCES):
+		// The directory the mkdir just made denied its own open (a deny ACE
+		// inherited from the parent): the directory, not the parent, which
+		// was searched and written to make it, is the cause.
+		d := s.diagnoseDenied(false)
+		return &storeDirError{err: err, denied: true, denial: d, race: s.deniedRace(d)}
+	case errors.Is(err, syscall.EACCES) && !errors.Is(err, ErrCorrupt):
+		// The parent's open or the mkdir in it was denied: server/, or the
+		// data root above it, which no put touches.
+		return &storeDirError{err: err, denied: true, denial: s.diagnoseDenied(true)}
+	}
+	return err
+}
+
+// openError classifies EnsureDir's error from opening and judging the
+// existing store directory (storeDirError). Only EACCES is a denial:
+// fs.ErrPermission matches EPERM too, which no mode, owner or ACL repair
+// clears, so an EPERM stands on its own text.
+func (s *FileStore) openError(err error) error {
+	var refused *dirRefusal
+	switch {
+	case errors.As(err, &refused):
+		return &storeDirError{err: err}
+	case errors.Is(err, syscall.EACCES):
+		d := s.diagnoseDenied(false)
+		return &storeDirError{err: err, denied: true, denial: d, race: s.deniedRace(d)}
+	}
+	return err
 }
 
 // judgeDirACL refuses (dirRefusal) the store directory root holds when it
@@ -663,7 +690,6 @@ func judgeDirACL(root *os.Root, path string) error {
 func dirACLRefusal(path string) error {
 	return &dirRefusal{fmt.Errorf("%s has an extended ACL, which can grant past its mode (sudo chmod -h -N %s removes it, and never follows a symlink)", path, path)}
 }
-
 
 // closeAfter closes root once err, the judgement made on it, is known, and
 // returns err, or the close's error when err is nil.
@@ -710,9 +736,10 @@ func StoreDirDenied(err error) bool {
 
 // StoreDirRace reports whether err, from EnsureDir, may be a one-pass error
 // of the race with a root put creating the directory: a directory that
-// cannot be opened and is owned by root or the service user (a third uid's,
-// or a parent that denies the walk, is never the race), or the directory EnsureDir just made already holds a
-// name. A later pass finds a raced directory handed over; the caller counts
+// cannot be opened and was read as root's (a third uid's, the service
+// user's, one whose owner could not be read, or a parent that denies the
+// walk, is never the race), or the directory EnsureDir just made already
+// holds a name. A later pass finds a raced directory handed over; the caller counts
 // consecutive denied passes (StoreDirDenied) to tell one that does not.
 func StoreDirRace(err error) bool {
 	var e *storeDirError

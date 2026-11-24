@@ -19,6 +19,7 @@ package keystore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -125,8 +126,9 @@ func TestEnsureDir(t *testing.T) {
 // TestEnsureDirClassifiesRefusals: EnsureDir marks a persistent refusal of
 // an existing directory (its mode or owner) as StoreDirRefused; a directory
 // it cannot open (EACCES) as StoreDirDenied, and as StoreDirRace too when
-// its owner is root or the service user (as one root has made and not yet
-// handed over), never when it is a third uid's; and a directory it has just
+// root (the floor owner) owns it (as one root has made and not yet handed
+// over), never when it is the service user's or a third uid's; and a
+// directory it has just
 // made that a racing put already writes in (ErrCorrupt, not empty) as
 // StoreDirRace alone. The text is the open's.
 func TestEnsureDirClassifiesRefusals(t *testing.T) {
@@ -145,16 +147,37 @@ func TestEnsureDirClassifiesRefusals(t *testing.T) {
 			t.Fatalf("EnsureDir = %v: refused %v race %v, want a refusal", err, StoreDirRefused(err), StoreDirRace(err))
 		}
 	})
-	t.Run("a directory it cannot open is the race", func(t *testing.T) {
+	t.Run("a root-owned directory it cannot open is the race", func(t *testing.T) {
 		s, server := newTestStore(t)
 		dir := filepath.Join(server, "keystore")
 		if err := os.Mkdir(dir, 0); err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		// The directory is the floor owner's (root in production, the test
+		// user here), and the service uid is made another: one a root put
+		// has made and not yet handed over.
+		s.uid = uint32(s.floorUID) + 1
 		err := s.EnsureDir()
 		if !errors.Is(err, fs.ErrPermission) || !StoreDirDenied(err) || !StoreDirRace(err) || StoreDirRefused(err) {
 			t.Fatalf("EnsureDir = %v: refused %v denied %v race %v, want denied and the race", err, StoreDirRefused(err), StoreDirDenied(err), StoreDirRace(err))
+		}
+	})
+	t.Run("a service-owned directory it cannot open is denied, never the race", func(t *testing.T) {
+		s, server := newTestStore(t)
+		dir := filepath.Join(server, "keystore")
+		if err := os.Mkdir(dir, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		// A root put hands the directory over at 0700, which the service
+		// user can open: a service-owned one that denies the open is no
+		// put's, so it is never the race, even when the floor owner is the
+		// service user too, as in this non-root test.
+		err := s.EnsureDir()
+		d, _ := StoreDirDenial(err)
+		if !StoreDirDenied(err) || StoreDirRace(err) || StoreDirRefused(err) || d.Cause != DeniedOwn || !d.Known || d.Owner != s.uid {
+			t.Fatalf("EnsureDir = %v: denied %v race %v denial %+v, want denied by the service user's directory and not the race", err, StoreDirDenied(err), StoreDirRace(err), d)
 		}
 	})
 	t.Run("a third uid's directory it cannot open is denied, never the race", func(t *testing.T) {
@@ -175,6 +198,7 @@ func TestEnsureDirClassifiesRefusals(t *testing.T) {
 		// The service uid made other than the directory's owner, which is
 		// not root either: a third uid's directory.
 		s.uid = owner + 1
+		s.floorUID = int(owner) + 2
 		err = s.EnsureDir()
 		if !errors.Is(err, fs.ErrPermission) || !StoreDirDenied(err) || StoreDirRace(err) || StoreDirRefused(err) {
 			t.Fatalf("EnsureDir = %v: refused %v denied %v race %v, want denied and not the race", err, StoreDirRefused(err), StoreDirDenied(err), StoreDirRace(err))
@@ -299,4 +323,69 @@ func TestStoreDirACLRepairIsSymlinkSafe(t *testing.T) {
 	if !StoreDirRefused(&storeDirError{err: err}) {
 		t.Fatalf("the ACL refusal is not a store-directory refusal")
 	}
+}
+
+// TestStoreDirUnknownOwnerIsNotTheRace: a store directory whose Lstat
+// fails after its open was denied (it was removed or replaced in between)
+// has no known owner, so it is never the race and its denial is no repair
+// of a directory that may not be there; nor is a service-owned one the
+// race; and an EACCES from the open of a directory the mkdir has just made
+// is the directory's own denial, never blamed on the parent, while an
+// EPERM is no denial at all.
+func TestStoreDirUnknownOwnerIsNotTheRace(t *testing.T) {
+	t.Run("an Lstat failure is an unknown owner and never the race", func(t *testing.T) {
+		s, _ := newTestStore(t)
+		s.uid = uint32(s.floorUID) + 1 // a root-owned directory would be the race
+		denied := &fs.PathError{Op: "open", Path: s.dir, Err: syscall.EACCES}
+		err := s.openError(denied) // the store directory is not there to Lstat
+		d, ok := StoreDirDenial(err)
+		if !ok || StoreDirRace(err) || d.Known || d.Cause != DeniedOwn || d.Path != s.dir {
+			t.Fatalf("openError = %v: race %v denial %+v, want an unknown owner and not the race", err, StoreDirRace(err), d)
+		}
+		if s.deniedRace(DirDenial{Cause: DeniedOwn, Path: s.dir, Owner: uint32(s.floorUID)}) {
+			t.Fatal("a denial with Known unset is the race")
+		}
+	})
+	t.Run("a service-owned denial is never the race", func(t *testing.T) {
+		s, _ := newTestStore(t)
+		for _, owner := range []uint32{s.uid, uint32(s.floorUID)} {
+			s.uid = owner
+			if s.deniedRace(DirDenial{Cause: DeniedOwn, Path: s.dir, Owner: owner, Known: true}) {
+				t.Fatalf("a directory of the service user's, uid %d, is the race", owner)
+			}
+		}
+	})
+	t.Run("the new directory's own open is not the parent", func(t *testing.T) {
+		s, server := newTestStore(t)
+		if err := os.Mkdir(s.dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		made := fmt.Errorf("create %s: %w", s.dir, fmt.Errorf("%w %s: %w", errNewDirOpen, "keystore", &fs.PathError{Op: "openat", Path: "keystore", Err: syscall.EACCES}))
+		d, ok := StoreDirDenial(s.mkdirError(made))
+		if !ok || d.Cause != DeniedOwn || d.Path != s.dir {
+			t.Fatalf("the new directory's denied open: denial %+v %v, want the store directory, not the parent %s", d, ok, server)
+		}
+		parent := fmt.Errorf("create %s: %w", s.dir, &fs.PathError{Op: "mkdirat", Path: "keystore", Err: syscall.EACCES})
+		if d, ok := StoreDirDenial(s.mkdirError(parent)); !ok || d.Cause != DeniedParent || d.Path != server {
+			t.Fatalf("a denied mkdir: denial %+v %v, want the parent %s", d, ok, server)
+		}
+		swapped := fmt.Errorf("%w: the new directory keystore was replaced after its mkdir: %w", ErrCorrupt, &fs.PathError{Op: "openat", Path: "keystore", Err: syscall.EACCES})
+		if err := s.mkdirError(swapped); StoreDirDenied(err) || !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("a swapped new directory: %v, want ErrCorrupt and no denial", err)
+		}
+	})
+	t.Run("an EPERM is no denial", func(t *testing.T) {
+		s, _ := newTestStore(t)
+		if err := os.Mkdir(s.dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		eperm := &fs.PathError{Op: "open", Path: s.dir, Err: syscall.EPERM}
+		err := s.openError(eperm)
+		if StoreDirDenied(err) || StoreDirRace(err) || StoreDirRefused(err) || !errors.Is(err, syscall.EPERM) {
+			t.Fatalf("openError(EPERM) = %v: denied %v race %v refused %v, want the EPERM on its own text", err, StoreDirDenied(err), StoreDirRace(err), StoreDirRefused(err))
+		}
+		if err := s.mkdirError(fmt.Errorf("create %s: %w", s.dir, eperm)); StoreDirDenied(err) {
+			t.Fatalf("mkdirError(EPERM) = %v, want no denial", err)
+		}
+	})
 }

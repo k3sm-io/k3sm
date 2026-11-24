@@ -4433,11 +4433,21 @@ directory is root's"). A worker node runs no listener (E18).
   - **A third uid's directory** (neither root nor the service user) is never the race, and
     nothing in it has been checked: `as root, inspect it, then remove it`. No adopt path is
     offered.
-  - **Root's or the service user's** is worded as the race only on the first of consecutive
-    passes denied: a root-owned one before its handover cannot be opened, but neither can one
-    a root put left root's when it died before the handover, an operator's `sudo mkdir -m 700`,
-    or one carrying a deny ACE, and those never clear. From the second consecutive denied pass
-    it names `if this persists, it is not the race`, why (root owns it, or the service user
+  - **Root's or the service user's**: only one an `Lstat` read as root's (the floor owner's) is
+    worded as the race, and only on the first of consecutive passes denied: a root-owned one
+    before its handover cannot be opened, but neither can one a root put left root's when it
+    died before the handover or an operator's `sudo mkdir -m 700`, and those never clear. A
+    service-owned one that denies the open is never the race: a root put hands the directory
+    over at 0700, which the service user can open, so it is a deny ACE, a mode or a flag from
+    the first pass. One whose `Lstat` failed (removed or replaced since the open; its owner is
+    unknown) is never the race either, and names no `chown` or `chmod` of a path that may not
+    be there: it says it could not be examined and the next start check retries
+    (`TestStoreDirUnknownOwnerIsNotTheRace`). Only EACCES is a denial: an EPERM, which
+    `fs.ErrPermission` also matches and no mode, owner or ACL repair clears, stands on its own
+    text, and an EACCES from the open of the directory the server's `mkdir` has just made is
+    that directory's, never blamed on the parent the `mkdir` searched and wrote. From the second
+    consecutive denied pass of a root-owned one, and from the first of a service-owned one, it
+    names `if this persists, it is not the race`, why (root owns it, or the service user
     cannot open it), and the steps: `chflags -h nouchg,noschg` when an immutable flag is set (it
     denies no open, but `chown` and `chmod` fail on it until then), `chmod -h -N` when an
     extended ACL is there or cannot be read, `chown -h <uid>:<gid>` when the owner is wrong,

@@ -34,13 +34,15 @@ const (
 	// put, which never touches either.
 	DeniedParent DenialCause = iota + 1
 	// DeniedForeign is a store directory owned by a uid that is neither
-	// root nor the service user. A root put's mkdir makes it root's until
+	// root (the floor owner) nor the service user. A root put's mkdir makes it root's until
 	// its handover, so it is never that race, and nothing the store wrote
 	// is known to be in it.
 	DeniedForeign
-	// DeniedOwn is a store directory owned by root or the service user. One
-	// pass may be the race with a root put; a denial that persists is one
-	// of the causes DirDenial reads.
+	// DeniedOwn is a store directory owned by root or the service user, or
+	// one whose owner could not be read (Known unset: its Lstat failed). Only
+	// a root-owned one read as such may be, for one pass, the race with a
+	// root put (race); a denial that persists is one of the causes DirDenial
+	// reads.
 	DeniedOwn
 )
 
@@ -101,10 +103,21 @@ func (s *FileStore) diagnoseDenied(inParent bool) DirDenial {
 		return d
 	}
 	d.read(fi)
-	if d.Known && d.Owner != 0 && d.Owner != s.uid {
+	if d.Known && int64(d.Owner) != int64(s.floorUID) && d.Owner != s.uid {
 		d.Cause = DeniedForeign
 	}
 	return d
+}
+
+// deniedRace reports whether d may be the one-pass race with a root put: a
+// store directory read as owned by the uid root verbs run as, the floor
+// owner (root in production; the test user in a non-root test), and not by
+// the service user. A root put makes the directory root's and hands it to
+// the service user at mode 0700, which the service user can open, so a
+// service-owned directory that denies the open is never that race; nor is
+// one whose owner could not be read, which may not be there at all.
+func (s *FileStore) deniedRace(d DirDenial) bool {
+	return d.Cause == DeniedOwn && d.Known && int64(d.Owner) == int64(s.floorUID) && d.Owner != s.uid
 }
 
 // read fills d from fi, an Lstat of d.Path, and the ACL read by that path.

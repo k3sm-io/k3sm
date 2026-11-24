@@ -410,9 +410,11 @@ const storeDirRaceText = "a root keys put may be creating it; retried"
 // built from what EnsureDir read without opening the directory
 // (keystore.StoreDirDenial): a parent that denies the walk names that
 // parent; a third uid's directory is to be inspected and removed, never
-// adopted, since nothing in it has been checked; a directory root or the
-// service user owns names each repair what was read calls for, and every
-// one of them when nothing read explains the denial. uid and gid are the
+// adopted, since nothing in it has been checked; one whose owner could not
+// be read (its Lstat failed) names no repair command, since it may not be
+// there; a directory root or the service user owns names each repair what
+// was read calls for, and every one of them when nothing read explains the
+// denial. uid and gid are the
 // service user's.
 func storeDirAccessRepair(d keystore.DirDenial, uid, gid uint32) string {
 	switch d.Cause {
@@ -425,8 +427,11 @@ func storeDirAccessRepair(d keystore.DirDenial, uid, gid uint32) string {
 	case keystore.DeniedForeign:
 		return fmt.Sprintf("the store directory is owned by uid %d, neither root nor the service user, so nothing in it has been checked: as root, inspect it, then remove it, and the next start check creates it", d.Owner)
 	}
+	if !d.Known {
+		return fmt.Sprintf("%s could not be examined, so it may have been removed or replaced since its open and no repair is named: the next start check retries, and creates it if it is missing; if this persists, as root, inspect it, then remove it, and the next start check creates it", d.Path)
+	}
 	why := "the service user cannot open it"
-	if d.Known && d.Owner == 0 {
+	if d.Owner == 0 {
 		why = "root owns it: a root keys put died before handing it over, or root made it"
 	}
 	return fmt.Sprintf("if this persists, it is not the race: %s; as root, %s, or remove it if it holds nothing", why, strings.Join(dirRepairSteps(d, uid, gid), ", then "))
@@ -477,8 +482,9 @@ func dirRepairSteps(d keystore.DirDenial, uid, gid uint32) []string {
 // directory is names the repair (storeDirRepair). A directory it cannot
 // open is worded as the race (storeDirRaceText) only on the first of
 // consecutive passes that run this step and are denied, and only when
-// its owner could be a racing put's; from the second such pass, or for a
-// third uid's directory, it names the repair (storeDirAccessRepair). Any
+// root owns it, as a racing put's does; from the second such pass, or for
+// any other owner or one whose owner could not be read, it names the
+// repair (storeDirAccessRepair). Any
 // pass that is not denied resets the count. Any other error stands on its
 // own text. The returned step keeps that count, so it is one supervisor's,
 // called from its one start-check loop.

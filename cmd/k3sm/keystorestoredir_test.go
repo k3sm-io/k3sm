@@ -202,15 +202,20 @@ func TestDoctorStoreDirRow(t *testing.T) {
 
 // TestStoreDirRaceTextIsTransient: the server's store-directory step words
 // a directory it cannot open, as one a root put has made and not yet
-// handed over, as the one-pass race it may be (retried, no repair) on the
-// first consecutive denied pass only; from the second it names the repair
-// what it reads of the directory calls for (here the chmod), and a pass that clears resets the count. The "as root,
-// make it ... or remove it" repair is for a refusal on what the directory
-// is.
+// handed over (root's, the floor owner's, and not the service user's), as
+// the one-pass race it may be (retried, no repair) on the first
+// consecutive denied pass only; from the second it names the repair, and a
+// pass that is not denied resets the count. The "as root, make it ... or
+// remove it" repair is for a refusal on what the directory is. A
+// service-owned directory that denies the open is never the race: a root
+// put hands it over at 0700, which the service user can open.
 func TestStoreDirRaceTextIsTransient(t *testing.T) {
 	f, _ := installedWiringFixture(t, false)
 	storeCfg := f.deps.layout(f.deps.workDir)
-	storeCfg.UID, storeCfg.GID = uint32(os.Getuid()), uint32(os.Getgid())
+	// The directory is the test user's, the floor owner here (root in
+	// production), and the service uid is another: a root put's directory.
+	storeCfg.FloorUID, storeCfg.FloorGID = os.Getuid(), os.Getgid()
+	storeCfg.UID, storeCfg.GID = uint32(os.Getuid())+1, uint32(os.Getgid())
 	store := keystore.New(storeCfg)
 	if err := os.Mkdir(storeCfg.Dir, 0); err != nil {
 		t.Fatal(err)
@@ -238,33 +243,61 @@ func TestStoreDirRaceTextIsTransient(t *testing.T) {
 	}
 	persists("the second consecutive pass")
 	persists("the third consecutive pass")
-	// The directory is the service user's at mode 0: the repair is the
-	// chmod, not a chown it does not need.
-	if err := step(t.Context()); err == nil || !strings.Contains(err.Error(), "chmod -h 700 "+storeCfg.Dir) || strings.Contains(err.Error(), "chown") || !strings.Contains(err.Error(), "or remove it if it holds nothing") {
-		t.Fatalf("a mode-0 directory of the service user's: %v, want chmod 700 and no chown", err)
-	}
 	if err := os.Chmod(storeCfg.Dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := step(t.Context()); err != nil {
-		t.Fatalf("a pass that clears: %v", err)
+	// Opened now, and refused on its owner: a pass that is not denied.
+	if err := step(t.Context()); err == nil || !strings.Contains(err.Error(), storeDirRepair) || strings.Contains(err.Error(), storeDirRaceText) {
+		t.Fatalf("a root-owned 0700 directory: %v, want the repair and not the race text", err)
 	}
 	if err := os.Chmod(storeCfg.Dir, 0); err != nil {
 		t.Fatal(err)
 	}
-	race("the first denied pass after one that cleared")
-	persists("the second denied pass after one that cleared")
-	if err := os.Chmod(storeCfg.Dir, 0o755); err != nil {
-		t.Fatal(err)
+	race("the first denied pass after one that was not denied")
+	persists("the second denied pass after one that was not denied")
+
+	t.Run("a service-owned directory is never the race", func(t *testing.T) {
+		f, _ := installedWiringFixture(t, false)
+		storeCfg := f.deps.layout(f.deps.workDir)
+		storeCfg.UID, storeCfg.GID = uint32(os.Getuid()), uint32(os.Getgid())
+		if err := os.Mkdir(storeCfg.Dir, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(storeCfg.Dir, 0o700) })
+		step := serverStoreDir(keystore.New(storeCfg), storeCfg.UID, storeCfg.GID)
+		// The directory is the service user's at mode 0: the repair is the
+		// chmod, not a chown it does not need, from the first pass.
+		for pass := 1; pass <= 2; pass++ {
+			err := step(t.Context())
+			if err == nil || strings.Contains(err.Error(), storeDirRaceText) || !strings.Contains(err.Error(), access) || !strings.Contains(err.Error(), "chmod -h 700 "+storeCfg.Dir) || strings.Contains(err.Error(), "chown") {
+				t.Fatalf("pass %d: %v, want chmod -h 700, no chown, and not the race", pass, err)
+			}
+		}
+		if err := os.Chmod(storeCfg.Dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := step(t.Context()); err != nil {
+			t.Fatalf("a pass that clears: %v", err)
+		}
+		if err := os.Chmod(storeCfg.Dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		err := step(t.Context())
+		if err == nil || !strings.Contains(err.Error(), storeDirRepair) || strings.Contains(err.Error(), storeDirRaceText) {
+			t.Fatalf("a wider mode: %v, want the repair and not the race text", err)
+		}
+	})
+}
+
+// TestStoreDirUnknownOwnerRemedy: a denied store directory whose owner
+// could not be read (its Lstat failed, Known unset) names no chown, chmod
+// or chflags of a path that may not be there, and is never the race text.
+func TestStoreDirUnknownOwnerRemedy(t *testing.T) {
+	d := keystore.DirDenial{Cause: keystore.DeniedOwn, Path: "/var/lib/k3sm/server/keystore"}
+	text := storeDirAccessRepair(d, 270, 270)
+	if repairCommand.MatchString(text) || strings.Contains(text, storeDirRaceText) || !strings.Contains(text, "could not be examined") {
+		t.Fatalf("an unknown owner's remedy %q, want no repair command and not the race", text)
 	}
-	err := step(t.Context())
-	if err == nil || !strings.Contains(err.Error(), storeDirRepair) || strings.Contains(err.Error(), storeDirRaceText) {
-		t.Fatalf("a wider mode: %v, want the repair and not the race text", err)
-	}
-	if err := os.Chmod(storeCfg.Dir, 0); err != nil {
-		t.Fatal(err)
-	}
-	race("the first denied pass after a refusal, which is not denied")
 }
 
 // TestKeystoreListenerOffWhileMergePending: with a restore staged (the

@@ -30,8 +30,9 @@ import (
 
 // TestStoreDirDenialNamesItsCause: a store directory the server cannot
 // open names the repair for what denies it, read without opening it. A
-// service-user-owned 0700 directory with a deny ACE is the race on the
-// first pass only and then names chmod -N; a parent that denies the walk is
+// service-user-owned 0700 directory with a deny ACE is never the race (a
+// root put hands over at 0700, which the service user can open) and names
+// chmod -h -N from the first pass; a parent that denies the walk is
 // never the race and names the parent; a third uid's directory is never the
 // race and is to be inspected and removed, never chowned.
 func TestStoreDirDenialNamesItsCause(t *testing.T) {
@@ -51,15 +52,14 @@ func TestStoreDirDenialNamesItsCause(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = exec.Command("/bin/chmod", "-N", storeCfg.Dir).Run() })
 		step := serverStoreDir(keystore.New(storeCfg), storeCfg.UID, storeCfg.GID)
-		if err := step(t.Context()); err == nil || !strings.Contains(err.Error(), storeDirRaceText) {
-			t.Fatalf("the first pass: %v, want the race text", err)
-		}
-		err = step(t.Context())
-		if err == nil || !strings.Contains(err.Error(), "chmod -h -N "+storeCfg.Dir) || strings.Contains(err.Error(), storeDirRaceText) {
-			t.Fatalf("the second pass: %v, want chmod -N %s and not the race", err, storeCfg.Dir)
-		}
-		if strings.Contains(err.Error(), "chown") || strings.Contains(err.Error(), "chflags") {
-			t.Fatalf("the second pass: %v names a repair the directory does not need", err)
+		for pass := 1; pass <= 2; pass++ {
+			err := step(t.Context())
+			if err == nil || !strings.Contains(err.Error(), "chmod -h -N "+storeCfg.Dir) || strings.Contains(err.Error(), storeDirRaceText) {
+				t.Fatalf("pass %d: %v, want chmod -h -N %s and not the race", pass, err, storeCfg.Dir)
+			}
+			if strings.Contains(err.Error(), "chown") || strings.Contains(err.Error(), "chflags") {
+				t.Fatalf("pass %d: %v names a repair the directory does not need", pass, err)
+			}
 		}
 	})
 	t.Run("an unsearchable parent is never the race", func(t *testing.T) {
@@ -85,6 +85,9 @@ func TestStoreDirDenialNamesItsCause(t *testing.T) {
 		// The store's service uid is another uid than the test user, which
 		// owns the directory: to the store, a third uid.
 		storeCfg.UID, storeCfg.GID = uint32(os.Getuid())+1, uint32(os.Getgid())
+		// Nor the floor owner, root in production: a third uid's, not a
+		// root put's.
+		storeCfg.FloorUID = os.Getuid() + 2
 		if err := os.Mkdir(storeCfg.Dir, 0); err != nil {
 			t.Fatal(err)
 		}
