@@ -4388,20 +4388,34 @@ directory is root's"). A worker node runs no listener (E18).
   handover, which the server refuses for that pass only, finding it handed over on the next.
   A directory the server has just made that already holds a name a racing put wrote
   (`ErrCorrupt` "is not empty") names no repair: it says `a root keys put may be creating it;
-  retried` (`keystore.StoreDirRace`). A directory the server cannot open (EACCES,
-  `keystore.StoreDirDenied`) is worded as that race only on the first of consecutive passes
-  denied, and only when an `Lstat` of its name (which needs only `server/`'s search permission)
-  shows it root's or the service user's: a root-owned one before its handover cannot be opened,
-  but neither can one a root put left root's when it died before the handover, an operator's
-  `sudo mkdir -m 700`, or another uid's, all at 0700, and those never clear. From the second
-  consecutive denied pass, or on the first for a third uid's directory, it names the repair:
-  `if this persists, a root keys put died before handing it over, or the directory is not the
-  service user's: as root, chown <uid>:<gid> and chmod 700 it, or remove it if it holds
-  nothing`. The server's step keeps the count; a pass that runs the step and is not denied
+  retried` (`keystore.StoreDirRace`). A directory the server cannot open or reach (EACCES,
+  `keystore.StoreDirDenied`) names the repair for its cause, read without opening it
+  (`keystore.StoreDirDenial`: an `Lstat`, which needs only the parent's search permission, for
+  the owner, the mode and the immutable flags, and `acl_get_link_np` by path for an extended
+  ACL; a diagnosis only, never a judgement):
+  - **A parent that denies the walk** (the parent's open or the `mkdir` in it is denied, or the
+    `Lstat` of the store directory fails with EACCES) is never the race, which never touches
+    `server/`: it names `server/` and makes it the service user's at mode 0700, as the
+    installer makes it, with the steps what was read of `server/` calls for. A `server/` that
+    cannot itself be `Lstat`'d names the data root above it (root:wheel, 0755).
+  - **A third uid's directory** (neither root nor the service user) is never the race, and
+    nothing in it has been checked: `as root, inspect it, then remove it`. No adopt path is
+    offered.
+  - **Root's or the service user's** is worded as the race only on the first of consecutive
+    passes denied: a root-owned one before its handover cannot be opened, but neither can one
+    a root put left root's when it died before the handover, an operator's `sudo mkdir -m 700`,
+    or one carrying a deny ACE, and those never clear. From the second consecutive denied pass
+    it names `if this persists, it is not the race`, why (root owns it, or the service user
+    cannot open it), and the steps: `chflags nouchg,noschg` when an immutable flag is set (it
+    denies no open, but `chown` and `chmod` fail on it until then), `chmod -N` when an extended
+    ACL is there or cannot be read, `chown <uid>:<gid>` when the owner is wrong, `chmod 700`
+    when the owner lacks a mode bit, or, when nothing read explains the denial, `chmod -N`,
+    `chown` and `chmod 700` all; `or remove it if it holds nothing`.
+  The server's step keeps the count; a pass that runs the step and is not denied
   resets it. A refusal of an existing directory on what it is (not a directory, its owner, its
   mode, an extended ACL: `keystore.StoreDirRefused`) names its repair on every pass
-  (`TestStoreDirRaceTextIsTransient`, `TestEnsureDirClassifiesRefusals`,
-  `TestEnsureDirRefusesExtendedACL`).
+  (`TestStoreDirRaceTextIsTransient`, `TestStoreDirDenialNamesItsCause`,
+  `TestEnsureDirClassifiesRefusals`, `TestEnsureDirRefusesExtendedACL`).
   Doctor runs the same judgement read-only: before the server's first start it shows the
   user scope off for the store directory, saying the server creates it at start.
   Nothing is opened on the data root before its mount flags and the installed files are

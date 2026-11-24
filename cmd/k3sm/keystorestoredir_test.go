@@ -19,7 +19,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -204,8 +203,8 @@ func TestDoctorStoreDirRow(t *testing.T) {
 // TestStoreDirRaceTextIsTransient: the server's store-directory step words
 // a directory it cannot open, as one a root put has made and not yet
 // handed over, as the one-pass race it may be (retried, no repair) on the
-// first consecutive denied pass only; from the second it names the chown
-// and chmod repair, and a pass that clears resets the count. The "as root,
+// first consecutive denied pass only; from the second it names the repair
+// what it reads of the directory calls for (here the chmod), and a pass that clears resets the count. The "as root,
 // make it ... or remove it" repair is for a refusal on what the directory
 // is.
 func TestStoreDirRaceTextIsTransient(t *testing.T) {
@@ -218,7 +217,7 @@ func TestStoreDirRaceTextIsTransient(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(storeCfg.Dir, 0o700) })
 	step := serverStoreDir(store, storeCfg.UID, storeCfg.GID)
-	access := fmt.Sprintf(storeDirAccessRepair, storeCfg.UID, storeCfg.GID)
+	access := "if this persists, it is not the race"
 	race := func(pass string) {
 		t.Helper()
 		err := step(t.Context())
@@ -239,10 +238,10 @@ func TestStoreDirRaceTextIsTransient(t *testing.T) {
 	}
 	persists("the second consecutive pass")
 	persists("the third consecutive pass")
-	for _, want := range []string{"if this persists, a root keys put died before handing it over, or the directory is not the service user's", fmt.Sprintf("chown %d:%d and chmod 700 it", storeCfg.UID, storeCfg.GID), "or remove it if it holds nothing"} {
-		if !strings.Contains(access, want) {
-			t.Fatalf("the repair %q does not say %q", access, want)
-		}
+	// The directory is the service user's at mode 0: the repair is the
+	// chmod, not a chown it does not need.
+	if err := step(t.Context()); err == nil || !strings.Contains(err.Error(), "chmod 700 "+storeCfg.Dir) || strings.Contains(err.Error(), "chown") || !strings.Contains(err.Error(), "or remove it if it holds nothing") {
+		t.Fatalf("a mode-0 directory of the service user's: %v, want chmod 700 and no chown", err)
 	}
 	if err := os.Chmod(storeCfg.Dir, 0o700); err != nil {
 		t.Fatal(err)

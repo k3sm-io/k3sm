@@ -184,3 +184,11 @@ func (w *flagWalk) clear(root *os.Root, name, path string, depth int) error {
 // sfFlagsMask is the system (SF_*) half of st_flags, which only root sets
 // and rm-scope never writes.
 const sfFlagsMask = 0xffff0000
+
+// statImmutable reports whether st carries the user or system immutable
+// flag (chflags uchg, schg). Neither denies an open, but chown and chmod fail
+// with EPERM on a file carrying either, so a repair by chown or chmod clears
+// them first.
+func statImmutable(st *syscall.Stat_t) bool {
+	return st.Flags&(unix.UF_IMMUTABLE|unix.SF_IMMUTABLE) != 0
+}

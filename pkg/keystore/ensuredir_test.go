@@ -180,6 +180,30 @@ func TestEnsureDirClassifiesRefusals(t *testing.T) {
 			t.Fatalf("EnsureDir = %v: refused %v denied %v race %v, want denied and not the race", err, StoreDirRefused(err), StoreDirDenied(err), StoreDirRace(err))
 		}
 	})
+	t.Run("a parent that denies the walk is denied, never the race", func(t *testing.T) {
+		for _, tt := range []struct {
+			name string
+			mk   bool
+		}{{"with the directory there", true}, {"with no directory yet", false}} {
+			t.Run(tt.name, func(t *testing.T) {
+				s, server := newTestStore(t)
+				if tt.mk {
+					if err := os.Mkdir(filepath.Join(server, "keystore"), 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.Chmod(server, 0); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(server, 0o700) })
+				err := s.EnsureDir()
+				d, ok := StoreDirDenial(err)
+				if !StoreDirDenied(err) || StoreDirRace(err) || StoreDirRefused(err) || !ok || d.Cause != DeniedParent || d.Path != server || d.Unreachable {
+					t.Fatalf("EnsureDir = %v: denied %v race %v denial %+v, want the parent %s, not the race", err, StoreDirDenied(err), StoreDirRace(err), d, server)
+				}
+			})
+		}
+	})
 	t.Run("a new directory a put already writes in is the race", func(t *testing.T) {
 		s, server := newTestStore(t)
 		dir := filepath.Join(server, "keystore")

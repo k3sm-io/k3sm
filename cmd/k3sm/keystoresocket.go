@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -402,12 +403,64 @@ const storeDirRepair = "the server never repairs an existing store directory: as
 const storeDirRaceText = "a root keys put may be creating it; retried"
 
 // storeDirAccessRepair is what a store directory the server cannot open
-// names from the second consecutive pass on, or on the first when its
-// owner is neither root nor the service user (keystore.StoreDirDenied and
-// not StoreDirRace): the race clears within a pass, so a denial that
-// persists is a directory that is not the service user's. Its verbs are
-// the service uid and gid.
-const storeDirAccessRepair = "if this persists, a root keys put died before handing it over, or the directory is not the service user's: as root, chown %d:%d and chmod 700 it, or remove it if it holds nothing"
+// names when it is not, or no longer may be, the race with a root put
+// (keystore.StoreDirDenied and not, or no longer, StoreDirRace). It is
+// built from what EnsureDir read without opening the directory
+// (keystore.StoreDirDenial): a parent that denies the walk names that
+// parent; a third uid's directory is to be inspected and removed, never
+// adopted, since nothing in it has been checked; a directory root or the
+// service user owns names each repair what was read calls for, and every
+// one of them when nothing read explains the denial. uid and gid are the
+// service user's.
+func storeDirAccessRepair(d keystore.DirDenial, uid, gid uint32) string {
+	switch d.Cause {
+	case keystore.DeniedParent:
+		if d.Unreachable {
+			return fmt.Sprintf("%s cannot be reached: the data root above it denies the service user its search, and a root keys put never changes it: as root, make %s root:wheel at mode 0755, as the installer makes it", d.Path, filepath.Dir(d.Path))
+		}
+		return fmt.Sprintf("%s denies the service user its search or read, so the store directory cannot be reached, and a root keys put never changes it: as root, make it the service user's at mode 0700, as the installer makes it: %s", d.Path, strings.Join(dirRepairSteps(d, uid, gid), ", then "))
+	case keystore.DeniedForeign:
+		return fmt.Sprintf("the store directory is owned by uid %d, neither root nor the service user, so nothing in it has been checked: as root, inspect it, then remove it, and the next start check creates it", d.Owner)
+	}
+	why := "the service user cannot open it"
+	if d.Known && d.Owner == 0 {
+		why = "root owns it: a root keys put died before handing it over, or root made it"
+	}
+	return fmt.Sprintf("if this persists, it is not the race: %s; as root, %s, or remove it if it holds nothing", why, strings.Join(dirRepairSteps(d, uid, gid), ", then "))
+}
+
+// dirRepairSteps are the commands that repair d.Path, a directory that
+// must be the service user's at mode 0700 with no extended ACL, from what
+// was read of it: chflags first where an immutable flag would fail every
+// other step, chmod -N where an ACL is there or could not be read, then
+// chown and chmod where the owner or the mode is wrong. When nothing read
+// explains the denial (the owner, the mode and the flags are right and no
+// ACL is there), every step that can deny an open is named.
+func dirRepairSteps(d keystore.DirDenial, uid, gid uint32) []string {
+	var steps []string
+	if d.Immutable {
+		steps = append(steps, fmt.Sprintf("chflags nouchg,noschg %s (it is immutable, and chown and chmod fail on it until then)", d.Path))
+	}
+	acl := fmt.Sprintf("chmod -N %s (its extended ACL can deny the open)", d.Path)
+	switch {
+	case d.ACL:
+		steps = append(steps, acl)
+	case d.ACLUnknown:
+		steps = append(steps, fmt.Sprintf("chmod -N %s (its ACL could not be read, and one can deny the open)", d.Path))
+	}
+	chown := fmt.Sprintf("chown %d:%d %s", uid, gid, d.Path)
+	chmod := "chmod 700 " + d.Path
+	if !d.Known || d.Owner != uid {
+		steps = append(steps, chown)
+	}
+	if !d.Known || d.Mode&0o700 != 0o700 {
+		steps = append(steps, chmod)
+	}
+	if len(steps) == 0 {
+		steps = []string{acl, chown, chmod}
+	}
+	return steps
+}
 
 // serverStoreDir is the server's store-directory step: the store directory
 // created if it is missing, with the store's own helper, and judged as
@@ -438,7 +491,8 @@ func serverStoreDir(store *keystore.FileStore, uid, gid uint32) func(context.Con
 			if keystore.StoreDirRace(err) && denied == 1 {
 				return fmt.Errorf("%w (%s)", err, storeDirRaceText)
 			}
-			return fmt.Errorf("%w (%s)", err, fmt.Sprintf(storeDirAccessRepair, uid, gid))
+			d, _ := keystore.StoreDirDenial(err)
+			return fmt.Errorf("%w (%s)", err, storeDirAccessRepair(d, uid, gid))
 		case keystore.StoreDirRefused(err):
 			return fmt.Errorf("%w (%s)", err, storeDirRepair)
 		case keystore.StoreDirRace(err):
