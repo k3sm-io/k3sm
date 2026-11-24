@@ -264,10 +264,12 @@ func TestOutcomeOfMapsStoreErrors(t *testing.T) {
 	}
 }
 
-// A value the store refuses for its kind, an Ed25519 key of the wrong
-// length or with a foreign public half, is the caller's to change: the
-// socket answers it refused, never internal.
-func TestEd25519ValueRefusedNotInternal(t *testing.T) {
+// The bridge's mapping of a put the store refuses for its value: an
+// Ed25519 key of the wrong length or with a foreign public half, put
+// through the real bridge (the socket's put sends opaque only), matches
+// InvalidValue and outcomeOf answers it refused, never internal. The
+// wire's own put path is not what this checks.
+func TestBridgeMapsEd25519ValueRefusalRefused(t *testing.T) {
 	r := newStartedBridge(t, nil)
 	seed := bytes.Repeat([]byte{7}, 32)
 	mismatched := append(bytes.Clone(seed), bytes.Repeat([]byte{9}, 32)...)

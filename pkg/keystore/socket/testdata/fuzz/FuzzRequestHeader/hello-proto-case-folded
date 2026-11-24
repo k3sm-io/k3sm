@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"Proto\":\"k3sm-keys\",\"min\":1,\"max\":1}")

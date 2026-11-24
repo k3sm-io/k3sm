@@ -32,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+	keyentry "k3sm.io/apis/keystore/entry"
 	"k3sm.io/k3sm/pkg/keystore"
 )
 
@@ -768,6 +769,33 @@ func checkRequestOp(t *testing.T, header []byte) {
 	}
 }
 
+// checkHelloAndEntry holds the HELLO reader and the logged entry's reader
+// to the same rule over any header: helloOf never panics and fails only
+// with a protocol error; requestEntry names an entry only when the exact
+// entry field is a valid name in the API grammar, and then that name.
+func checkHelloAndEntry(t *testing.T, header []byte) {
+	t.Helper()
+	if _, err := helloOf(header); err != nil {
+		var pe *ProtocolError
+		if !errors.As(err, &pe) {
+			t.Fatalf("helloOf(%q) = %v, want a protocol error", header, err)
+		}
+	}
+	e, ok := requestEntry(header)
+	if !ok {
+		return
+	}
+	var raw map[string]json.RawMessage
+	var s string
+	if json.Unmarshal(header, &raw) != nil || json.Unmarshal(raw["entry"], &s) != nil {
+		t.Fatalf("requestEntry(%q) = %q from a header with no entry string", header, e)
+	}
+	p, err := keyentry.Parse(s)
+	if err != nil || p.String() != e {
+		t.Fatalf("requestEntry(%q) = %q, the entry field %q parses to %v, %v", header, e, s, p, err)
+	}
+}
+
 // FuzzRequestHeader: decoding a request header never panics; a header over
 // the cap is refused before it is parsed; any other failure is a refusal;
 // and a header that decodes re-encodes to an equivalent request. The
@@ -776,6 +804,7 @@ func checkRequestOp(t *testing.T, header []byte) {
 func FuzzRequestHeader(f *testing.F) {
 	f.Fuzz(func(t *testing.T, header []byte) {
 		checkRequestOp(t, header)
+		checkHelloAndEntry(t, header)
 		for _, mk := range requestTypes {
 			dst := mk()
 			err := decodeRequest(header, dst)

@@ -17,9 +17,11 @@ limitations under the License.
 package keystore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -80,6 +82,23 @@ func TestQuarantinedScopeRevokes(t *testing.T) {
 	}
 	if err := u2.Withdraw(ctx, testDelivery(1).uid); err != nil {
 		t.Fatalf("withdraw in a quarantined scope: %v", err)
+	}
+	// Their audit lines never carry the grant-only results: the premise
+	// of revocationResults, which sizes the revocation budget without
+	// them.
+	revokes := 0
+	for _, line := range bytes.Split(bytes.TrimSpace(readLog(t, s2, auditLogName)), []byte("\n")) {
+		r, err := parseAuditLine(line)
+		if err != nil || (r.Op != "rm" && r.Op != "withdraw") {
+			continue
+		}
+		revokes++
+		if slices.Contains([]string{"floor-degraded", "quarantined"}, r.Result) {
+			t.Errorf("a %s in a quarantined scope audited %q", r.Op, r.Result)
+		}
+	}
+	if revokes < 3 {
+		t.Fatalf("%d rm and withdraw lines in the audit log, want the three revocations'", revokes)
 	}
 }
 
