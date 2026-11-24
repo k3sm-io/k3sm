@@ -1,3 +1,5 @@
+//go:build integration
+
 /*
 Copyright The k3sm Authors.
 
@@ -39,12 +41,18 @@ const u104SockEnv = "K3SM_U104_SOCK"
 // launchd makes it), a process running as the service uid cannot unlink it
 // or rename a socket of its own over it, and once the name is gone (the
 // server not running) it cannot bind one there either: each gets EACCES.
-// Non-root it skips, and the root-run row fails on a SKIP.
+// Non-root it skips, and the root-run row fails on a SKIP. It binds a real
+// socket and runs as root, so it is in the integration tier, which --root
+// builds with -tags integration. It runs install's keystore step with the
+// real euid source and file-attribute writer, which TestMain replaces with
+// stubs that panic.
 func TestSocketDirRootOwnedServiceUIDCannotBind(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root-run (U104): run as root through hack/acceptance/keystore.sh --root")
 	}
 	uid, gid := instServiceIDs(t)
+	setSeam(t, &euidSeam, os.Geteuid)
+	setSeam[fileAttrWriter](t, &fileAttrSeam, realFileAttrWriter{})
 	// A short base: a unix socket path is at most 104 bytes.
 	base, err := os.MkdirTemp("/private/tmp", "k3sm-u104-")
 	if err != nil {
