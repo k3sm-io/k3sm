@@ -270,6 +270,15 @@ tree_dirtied() {
 	fi
 }
 
+# root_run_tail prints the last 40 lines of a failed root run's output, $1,
+# unfiltered and indented: the summary filter keeps only FAIL, panic and
+# file:line lines, and drops what a test logged across lines, a child
+# process's stderr among them.
+root_run_tail() {
+	echo "  the run's last 40 lines:"
+	printf '%s\n' "$1" | tail -n 40 | sed 's/^/    | /'
+}
+
 run_root() {
 	local t out rc=0 n m f before
 	t="$(mktemp -d "${TMPDIR:-/tmp}/keystore-root.XXXXXX")" || { echo "R1 FAIL as root: mktemp -d failed"; return 1; }
@@ -320,6 +329,7 @@ run_root() {
 		return 0
 	fi
 	printf '%s\n' "$out" | grep -E -- '^ *(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' || true
+	root_run_tail "$out"
 	echo "R1 FAIL as root: $n tests passed, $m skipped"
 	return 1
 }
@@ -353,7 +363,7 @@ root_build() {
 # judge_root_row runs root-run row $1's named tests by name under sudo -n, one
 # binary per package, and fails it unless each printed PASS: a SKIP fails.
 judge_root_row() {
-	local i="$1" id="${R_ID[$1]}" spec p pkgs="" names t out rc bad=0 before
+	local i="$1" id="${R_ID[$1]}" spec p pkgs="" names t out rc bad=0 before pbad
 	for spec in ${R_TESTS[$i]}; do
 		case " $pkgs " in *" ${spec%%::*} "*) ;; *) pkgs="$pkgs ${spec%%::*}" ;; esac
 	done
@@ -367,25 +377,27 @@ judge_root_row() {
 			return 1
 		fi
 		rc=0
+		pbad=$bad
 		before="$(tree_state)" || { echo "$id FAIL as root: git status of $K3SM_ROOT failed"; return 1; }
 		out="$(cd "$RS" && sudo -n env TMPDIR="$RB/tmp" ${root_ids[@]+"${root_ids[@]}"} "$RB/pkg.test" -test.count=1 -test.v -test.run "^($names)\$" 2>&1)" || rc=$?
 		if ! tree_dirtied "$before"; then
 			echo "$id FAIL as root: the run of $p changed the source tree"
-			bad=1
+			bad=$((bad + 1))
 		fi
 		for t in ${names//|/ }; do
 			if grep -q -- "--- SKIP: $t " <<<"$out"; then
 				echo "$id FAIL as root: $t ($p) skipped, and a root-run row fails on SKIP"
-				bad=1
+				bad=$((bad + 1))
 			elif ! grep -q -- "--- PASS: $t " <<<"$out"; then
 				echo "$id FAIL as root: $t ($p) did not pass"
-				bad=1
+				bad=$((bad + 1))
 			fi
 		done
 		if [ "$rc" -ne 0 ]; then
 			printf '%s\n' "$out" | grep -E -- '^ *(--- FAIL|FAIL|panic:)|_test\.go:[0-9]+:' || true
-			bad=1
+			bad=$((bad + 1))
 		fi
+		if [ "$bad" -ne "$pbad" ]; then root_run_tail "$out"; fi
 	done
 	if [ "$bad" -ne 0 ]; then return 1; fi
 	if [ "${R_KIND[$i]}" = rootpartial ]; then
