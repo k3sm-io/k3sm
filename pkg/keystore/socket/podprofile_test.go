@@ -24,17 +24,37 @@ import (
 	"testing"
 )
 
+// generatorFold is the case-folding spelling of keystore- the generator
+// writes: each ASCII letter a class, k and s alternations with the
+// Kelvin sign and the long s.
+const generatorFold = "(K|k|\u212a)[Ee][Yy](S|s|\u017f)[Tt][Oo][Rr][Ee]-"
+
+// rootForms are the data root's spellings for sock.
+var rootForms = []string{"/var/lib/k3sm", "/private/var/lib/k3sm", "/System/Volumes/Data/private/var/lib/k3sm"}
+
 // stanzaFor renders a keystore-style deny over dirs: a file deny and a
-// unix connect deny, each with one subpath per dir.
+// unix connect deny, each with one subpath per dir and the generator's
+// case-folding regex for every spelling of sock's data root.
 func stanzaFor(dirs ...string) string {
+	return stanzaWith(func(root string) string { return "^" + root + "/" + generatorFold }, dirs...)
+}
+
+// stanzaWith is stanzaFor with the regex for each data-root spelling
+// pattern returns; "" writes none.
+func stanzaWith(pattern func(root string) string, dirs ...string) string {
 	var file, conn strings.Builder
+	for _, root := range rootForms {
+		if p := pattern(root); p != "" {
+			fmt.Fprintf(&file, "  (regex #\"%s\")\n", p)
+			fmt.Fprintf(&conn, "  (remote unix-socket (regex #\"%s\"))\n", p)
+		}
+	}
 	for _, d := range dirs {
 		fmt.Fprintf(&file, "  (subpath %q)\n", d)
 		fmt.Fprintf(&conn, "  (remote unix-socket (subpath %q))\n", d)
 	}
 	return ";; KEYSTORE: a comment with a ( and a \" in it\n" +
-		"(deny file-read* file-read-metadata file-test-existence file-write* file-link\n" +
-		"  (regex #\"^/var/lib/k3sm/([Kk]|K)eystore-\")\n" + file.String() + "  )\n" +
+		"(deny file-read* file-read-metadata file-test-existence file-write* file-link\n" + file.String() + "  )\n" +
 		"(deny network-outbound\n" + conn.String() + "  )\n"
 }
 
@@ -83,6 +103,16 @@ func TestProfileDeniesSocket(t *testing.T) {
 		{"a file* allow after it", allow + stanzaFor(allForms...) + "(allow file* (subpath \"/var\"))\n", "no file-read* deny"},
 		{"a connect allow after it", allow + stanzaFor(allForms...) + "(allow network* (remote unix-socket))\n", "no network-outbound deny"},
 		{"an allow default after it", allow + stanzaFor(allForms...) + "(allow default)\n", "no file-read* deny"},
+		{"no case-folding regex", allow + stanzaWith(func(string) string { return "" }, allForms...), "no file-read* deny carries the case-folding regex of keystore- names under /var/lib/k3sm"},
+		{"a regex that does not fold", allow + stanzaWith(func(root string) string { return "^" + root + "/keystore-" }, allForms...), "case-folding regex"},
+		{"a regex without the Kelvin sign", allow + stanzaWith(func(root string) string { return "^" + root + "/[Kk][Ee][Yy](S|s|\u017f)[Tt][Oo][Rr][Ee]-" }, allForms...), "case-folding regex"},
+		{"a regex matching any name", allow + stanzaWith(func(root string) string { return "^" + root + "/" }, allForms...), "case-folding regex"},
+		{"the /private regex missing", allow + stanzaWith(func(root string) string {
+			if root == rootForms[1] {
+				return ""
+			}
+			return "^" + root + "/" + generatorFold
+		}, allForms...), "under /private/var/lib/k3sm"},
 		{"unbalanced", allow + stanzaFor(allForms...) + "(deny", "ends inside a list"},
 		{"an unterminated string", "(deny file-read* (subpath \"/var", "ends inside a string"},
 	} {

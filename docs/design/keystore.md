@@ -2004,7 +2004,19 @@ refuses (as it refuses the node) is the configuration state below, retried
 (`TestServerPodPostureFailureIsConfiguration`). The check requires that the text deny
 `file-read*`, `file-write*` and unix-socket `network-outbound` on `keystore-sock/` under the
 data root it serves, in each spelling the generator writes (`/var`, `/private/var`,
-`/System/Volumes/Data`), with no overlapping allow after the deny (`socket.ProfileDeniesSocket`).
+`/System/Volumes/Data`), with no overlapping allow after the deny (`socket.ProfileDeniesSocket`),
+and, for the same operations and every spelling of the data root, a deny carrying the
+case-folding `regex` filter the generator writes for the data root's `keystore-` names (one that
+matches `keystore-`, `KEYSTORE-` and each spelling with a letter replaced by a rune the data volume
+folds onto it, U+212A for `k` and U+017F for `s`, and not `xeystore-`): a profile without it fails
+the check (`TestProfileDeniesSocket`). The check is lexical and narrower than Seatbelt: it reads
+top-level `(allow ...)` and `(deny ...)` forms only, so a rule nested in any other form is not
+seen; only an exact `(subpath "P")` filter, bare or under `(remote unix-socket ...)`, covers the
+socket's directory, so a `literal`, `prefix` or `regex` filter, or one under `require-any` or
+`require-all`, does not; paths are compared as text in the spellings above, with no symlink
+resolved; and the `regex` is judged by the strings it matches as a Go regexp, not by how SBPL
+reads it. It proves the text the linked generator renders carries the deny; it does not prove
+what libsandbox enforces.
 A profile that does not, as from a k3sm built against a runtimed older than the deny or a data
 root the posture does not name, keeps the user scope off for the life of the process with `this
 build's Pod profile does not deny the keystore socket`; the server logs one warning naming

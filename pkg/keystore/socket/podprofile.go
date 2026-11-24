@@ -20,8 +20,12 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
+	"unicode"
+
+	"k3sm.io/runtimed/pkg/keystorepaths"
 )
 
 // ErrPodProfileOpen is a Pod profile that does not deny the keystore
@@ -89,14 +93,27 @@ var podProfileDenies = []struct {
 // socket's directory (socketDirForms) it needs a deny of file-read*,
 // file-write* and unix-socket network-outbound whose filter is a subpath at
 // or above that spelling, with no allow of an overlapping operation after
-// it (Seatbelt is last-match-wins). It returns nil when the profile denies
-// all of them, and an error wrapping ErrPodProfileOpen naming the first
-// missing operation and spelling otherwise, or when the profile does not
-// parse.
+// it (Seatbelt is last-match-wins). For the same operations and every
+// spelling of the data root (the socket directory's parent) it also needs
+// a deny whose filter is the case-folding regex the generator writes for
+// the data root's keystore- names (foldsPrefix), with no overlapping allow
+// after it: without it a Pod could plant a KEYSTORE- spelling of the
+// socket's directory on the case-insensitive data volume. It returns nil
+// when the profile denies all of them, and an error wrapping
+// ErrPodProfileOpen naming the first missing operation and spelling
+// otherwise, or when the profile does not parse.
 //
 // It reads the text the node's generator rendered, so a k3sm linked against
 // a generator that does not deny the socket for this data root is caught at
-// start, whatever the generator's own tests pin.
+// start, whatever the generator's own tests pin. The reading is lexical,
+// and narrower than Seatbelt's: only top-level (allow|deny ...) forms are
+// read, so a rule inside any other form is not seen; a subpath counts only
+// as an exact (subpath "P") filter, or (remote unix-socket (subpath "P")),
+// so a literal, prefix or regex filter, or one under require-any or
+// require-all, never covers the socket's directory; paths are compared as
+// text in the spellings socketDirForms writes, with no symlink resolved;
+// and a regex is judged by the strings it matches (foldsPrefix), not by
+// how SBPL would read it.
 func ProfileDeniesSocket(profile, socketPath string) error {
 	if !filepath.IsAbs(socketPath) {
 		return fmt.Errorf("%w: the socket path %q is not absolute", ErrPodProfileOpen, socketPath)
@@ -106,23 +123,27 @@ func ProfileDeniesSocket(profile, socketPath string) error {
 		return fmt.Errorf("%w: %w", ErrPodProfileOpen, err)
 	}
 	for _, dir := range socketDirForms(filepath.Dir(socketPath)) {
+		root := filepath.Dir(dir)
 		for _, d := range podProfileDenies {
-			if !deniedLast(forms, d.op, d.unix, dir) {
+			if !deniedLast(forms, d.op, func(fl sexp) bool { return covers(fl, d.unix, dir) }) {
 				return fmt.Errorf("%w: no %s deny covers %s with no allow after it", ErrPodProfileOpen, d.op, dir)
+			}
+			if !deniedLast(forms, d.op, func(fl sexp) bool { return foldsPrefix(fl, d.unix, root) }) {
+				return fmt.Errorf("%w: no %s deny carries the case-folding regex of %s names under %s with no allow after it", ErrPodProfileOpen, d.op, keystorepaths.DataRootPrefix, root)
 			}
 		}
 	}
 	return nil
 }
 
-// deniedLast reports whether a top-level deny of op covers dir and no
-// top-level allow after the last such deny names an operation overlapping
-// op.
-func deniedLast(forms []sexp, op string, unix bool, dir string) bool {
+// deniedLast reports whether a top-level deny of op has a filter matching
+// filter and no top-level allow after the last such deny names an
+// operation overlapping op.
+func deniedLast(forms []sexp, op string, filter func(sexp) bool) bool {
 	last := -1
 	for i, f := range forms {
 		head, ops, filters := f.rule()
-		if head == "deny" && slices.Contains(ops, op) && slices.ContainsFunc(filters, func(fl sexp) bool { return covers(fl, unix, dir) }) {
+		if head == "deny" && slices.Contains(ops, op) && slices.ContainsFunc(filters, filter) {
 			last = i
 		}
 	}
@@ -151,6 +172,54 @@ func covers(filter sexp, unix bool, dir string) bool {
 		return false
 	}
 	return pathUnder(dir, filter.list[1].atom)
+}
+
+// foldsPrefix reports whether filter is (regex #"^R/X"), or with unix set
+// (remote unix-socket (regex ...)), where R is root as regexp.QuoteMeta
+// writes it and X, read as a Go regexp anchored at its start, matches every
+// spelling the data volume folds onto keystorepaths.DataRootPrefix
+// (prefixFoldings) and not the prefix with its first letter changed. A
+// regex that does not compile, or one written another way, does not count.
+func foldsPrefix(filter sexp, unix bool, root string) bool {
+	if unix {
+		if len(filter.list) != 3 || filter.list[0].atom != "remote" || filter.list[1].atom != "unix-socket" {
+			return false
+		}
+		filter = filter.list[2]
+	}
+	if len(filter.list) != 2 || filter.list[0].atom != "regex" || !filter.list[1].str {
+		return false
+	}
+	rest, ok := strings.CutPrefix(filter.list[1].atom, "^"+regexp.QuoteMeta(root)+"/")
+	if !ok {
+		return false
+	}
+	re, err := regexp.Compile("^(?:" + rest + ")")
+	if err != nil {
+		return false
+	}
+	for _, name := range prefixFoldings() {
+		if !re.MatchString(name) {
+			return false
+		}
+	}
+	return !re.MatchString("x" + keystorepaths.DataRootPrefix[1:])
+}
+
+// prefixFoldings returns keystorepaths.DataRootPrefix in lower and upper
+// case, and with each letter in turn replaced by every rune that folds onto
+// it (unicode.SimpleFold: K for k is U+212A, s also U+017F).
+func prefixFoldings() []string {
+	prefix := []rune(keystorepaths.DataRootPrefix)
+	out := []string{string(prefix), strings.ToUpper(string(prefix))}
+	for i, r := range prefix {
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			spelled := slices.Clone(prefix)
+			spelled[i] = f
+			out = append(out, string(spelled))
+		}
+	}
+	return out
 }
 
 // opsOverlap reports whether an allow of a can re-open a deny of d: the
