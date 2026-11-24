@@ -4609,16 +4609,20 @@ surface, and the app consumes only those.
   `AuditLost`, `InvalidValue`, `IneligibleUID`, `FloorDegraded`, `ScopeIncomplete`), and the
   chains read-side damage takes; and, over every pair of those joined in one chain, that the
   class is one logged beside the reply and that an internal reply is never left unlogged. The error's own text is never logged: a chain can carry text a
-  decoder built from a decrypted value, and no error in `pkg/keystore` names a length, tag or
-  byte of a value either. That is checked two ways: syntactically, every `len`, index or `tag`
-  an error constructor takes must be on a reviewed list keyed by file and function
-  (`TestNoErrorCarriesValueDerivedNumbers`); and, for what reaches an error through a
-  variable, which that check cannot see, by the sites themselves, which name no such number:
-  a quota refusal names the cap and not the total that counts the value, a refused
-  refresh-owner change names neither owner, and no frame error, read or written, names a
-  number that counts a value: no frame length, no value length and no count of bytes after a
-  header, only a cap or a header length (`TestValueNumbersNotInErrorTexts`,
-  `TestFrameValueLengthErrorNamesNoLength`, `TestFrameErrorsNameNoValueLength`). The ordinary outcomes
+  decoder built from a decrypted value. That is the control on the reply path: an operation's
+  error reaches the client only as its code (`answer`), a reply the server cannot encode
+  (`marshalFrame`'s error) is dropped and answered `internal`, the listener discards the error
+  `Serve` returns, and the damage line carries the class and remedy, never the text. The
+  error texts themselves are kept free of a value's numbers as a second line, not the control.
+  `TestNoErrorCarriesValueDerivedNumbers` is a tripwire for the common shapes only: a `len`,
+  an index or a `tag` written inside an error constructor in `pkg/keystore` must be on a
+  reviewed list keyed by file and function; it cannot see a number that reaches an error
+  through a variable. The sites found that way are fixed and each has its own test: a quota
+  refusal names the cap and not the total that counts the value, a refused refresh-owner
+  change names neither owner, and no frame error, read or written, names a number that counts
+  a value (no frame length, no value length, no count of bytes after a header; only a cap or a
+  header length) (`TestValueNumbersNotInErrorTexts`, `TestFrameValueLengthErrorNamesNoLength`,
+  `TestFrameErrorsNameNoValueLength`). The ordinary outcomes
   (`not-found`, `exists`, `quota`, `rate-limited`, `busy`, `log-full`, and the socket's own
   refusals), a change that committed, and a cancelled or timed-out request are not logged.
   Standing damage cannot flood the log: each (uid, op, class) key logs at most one line every
