@@ -17,8 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,4 +153,24 @@ func TestServerPodPostureFailureIsConfiguration(t *testing.T) {
 			t.Fatal("the posture was never derived")
 		}
 	})
+}
+
+// Under --runtime hostprocess the start log says the Pod-profile check does
+// not apply, and why; under runtimed it says nothing.
+func TestPodProfileCheckScopeLoggedForHostProcess(t *testing.T) {
+	for _, tt := range []struct {
+		runtime string
+		logged  bool
+	}{
+		{runtimeHostProcess, true},
+		{runtimeRuntimed, false},
+		{"", false},
+	} {
+		var buf bytes.Buffer
+		notePodProfileCheckScope(tt.runtime, slog.New(slog.NewTextHandler(&buf, nil)))
+		got := strings.Contains(buf.String(), "does not apply under --runtime hostprocess") && strings.Contains(buf.String(), "refuses them by uid")
+		if got != tt.logged || (!tt.logged && buf.Len() != 0) {
+			t.Errorf("runtime %q logged %q, want logged %v", tt.runtime, buf.String(), tt.logged)
+		}
+	}
 }

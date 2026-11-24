@@ -80,6 +80,18 @@ func TestRunServerStartsKeystoreSocket(t *testing.T) {
 	if id, ok := socketCall.Fun.(*ast.Ident); !ok || id.Name != "startKeystoreSocket" || len(socketCall.Args) != 6 {
 		t.Fatal("the keystore-socket step is not startKeystoreSocket(...)")
 	}
+	noted := false
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		if c, ok := n.(*ast.CallExpr); ok {
+			if id, ok := c.Fun.(*ast.Ident); ok && id.Name == "notePodProfileCheckScope" {
+				noted = true
+			}
+		}
+		return true
+	})
+	if !noted {
+		t.Fatal("runServer does not log the Pod-profile check's scope (notePodProfileCheckScope)")
+	}
 	if !derivesServerPodPosture(socketCall.Args[2]) {
 		t.Fatal("startKeystoreSocket's posture is not func() { return serverPodPosture(...) }, the one the node's runtime renders from")
 	}

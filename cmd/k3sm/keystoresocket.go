@@ -677,6 +677,19 @@ func keystoreSocketPath(workDir string) string {
 	return keystorepaths.SocketPath(keystoreLayout(filepath.Clean(workDir)).DataRoot)
 }
 
+// notePodProfileCheckScope logs, at start, when the socket's Pod-profile
+// check does not apply to the node's Pods: under --runtime hostprocess
+// they run unconfined, under no Seatbelt profile, so the profile the check
+// reads is one no Pod runs under. They run as the server's uid, which the
+// listener refuses (socket.NewListener), and that, not the profile, keeps
+// them off the socket. Any other runtime logs nothing.
+func notePodProfileCheckScope(runtime string, log *slog.Logger) {
+	if runtime != runtimeHostProcess {
+		return
+	}
+	log.Info("keystore socket: the Pod-profile start check does not apply under --runtime hostprocess; hostprocess Pods run unconfined, under no Seatbelt profile, and the listener refuses them by uid", "runtime", runtime)
+}
+
 // startKeystoreSocket is the server's one entry point for the keystore's
 // user socket: it builds the supervisor over the real primitives and runs
 // it, returning the stop runServer defers beside keystore-delivery's, so

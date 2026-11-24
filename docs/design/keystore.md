@@ -2016,7 +2016,10 @@ socket's directory, so a `literal`, `prefix` or `regex` filter, or one under `re
 `require-all`, does not; paths are compared as text in the spellings above, with no symlink
 resolved; and the `regex` is judged by the strings it matches as a Go regexp, not by how SBPL
 reads it. It proves the text the linked generator renders carries the deny; it does not prove
-what libsandbox enforces.
+what libsandbox enforces. Under `--runtime hostprocess` the check still runs but reads a profile
+no Pod runs under: hostprocess Pods run unconfined, as the server's uid, which the listener
+refuses, so the server's start log says the check does not apply there
+(`notePodProfileCheckScope`, `TestPodProfileCheckScopeLoggedForHostProcess`).
 A profile that does not, as from a k3sm built against a runtimed older than the deny or a data
 root the posture does not name, keeps the user scope off for the life of the process with `this
 build's Pod profile does not deny the keystore socket`; the server logs one warning naming
