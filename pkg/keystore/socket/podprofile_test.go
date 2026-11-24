@@ -123,6 +123,7 @@ func TestProfileDeniesSocket(t *testing.T) {
 			}
 			return "^" + root + "/" + generatorFold
 		}, allForms...), "under /private/var/lib/k3sm"},
+		{"the regex in a \"...\" string, not a #\"...\" literal", allow + strings.ReplaceAll(stanzaFor(allForms...), `(regex #"`, `(regex "`), "case-folding regex"},
 		{"unbalanced", allow + stanzaFor(allForms...) + "(deny", "ends inside a list"},
 		{"an unterminated string", "(deny file-read* (subpath \"/var", "ends inside a string"},
 	} {

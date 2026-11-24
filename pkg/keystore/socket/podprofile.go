@@ -184,7 +184,8 @@ func covers(filter sexp, unix bool, dir string) bool {
 	return pathUnder(dir, filter.list[1].atom)
 }
 
-// foldsPrefix reports whether filter is (regex #"^R/X"), or with unix set
+// foldsPrefix reports whether filter is (regex #"^R/X"), its pattern a
+// #"..." literal and never a "..." string, or with unix set
 // (remote unix-socket (regex ...)), where R is root as regexp.QuoteMeta
 // writes it and X is, exactly, the shape the runtime's generator writes for
 // keystorepaths.DataRootPrefix (runtimed keystorePrefixPattern): one group
@@ -205,7 +206,7 @@ func foldsPrefix(filter sexp, unix bool, root string) bool {
 		}
 		filter = filter.list[2]
 	}
-	if len(filter.list) != 2 || filter.list[0].atom != "regex" || !filter.list[1].str {
+	if len(filter.list) != 2 || filter.list[0].atom != "regex" || !filter.list[1].regex {
 		return false
 	}
 	rest, ok := strings.CutPrefix(filter.list[1].atom, "^"+regexp.QuoteMeta(root)+"/")
@@ -321,8 +322,13 @@ func opsOverlap(a, d string) bool {
 // sexp is one SBPL form: an atom (a symbol, or a string when str is set,
 // its quotes removed) or a list.
 type sexp struct {
-	atom   string
-	str    bool
+	atom string
+	str  bool
+	// regex is set for a #"..." literal, which is a str too. The #"..."
+	// spelling is the one the generator writes for a regex filter, so a
+	// regex filter counts only from it (foldsPrefix): a "..." string there
+	// is refused rather than assumed to read the same.
+	regex  bool
 	list   []sexp
 	isList bool
 }
@@ -412,7 +418,8 @@ func (p *sbplReader) form() (sexp, error) {
 	case p.s[p.i] == ')':
 		return sexp{}, fmt.Errorf("an unbalanced ) at byte %d", p.i)
 	case p.s[p.i] == '"' || strings.HasPrefix(p.s[p.i:], `#"`):
-		if p.s[p.i] == '#' {
+		regex := p.s[p.i] == '#'
+		if regex {
 			p.i++
 		}
 		p.i++
@@ -426,7 +433,7 @@ func (p *sbplReader) form() (sexp, error) {
 				p.i += 2
 			case c == '"':
 				p.i++
-				return sexp{atom: b.String(), str: true}, nil
+				return sexp{atom: b.String(), str: true, regex: regex}, nil
 			default:
 				b.WriteByte(c)
 				p.i++
