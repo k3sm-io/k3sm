@@ -89,6 +89,10 @@ type artifact struct {
 	// the post-restart verification does not demand a pid it was never going to
 	// have.
 	oneshot bool
+	// afterBootout, when set, is the label whose bootout must have succeeded
+	// in the same uninstall pass before this entry is removed: a directory
+	// that holds the socket a still-loaded job's definition names stays.
+	afterBootout string
 }
 
 // artifactManifest is the single source of truth for what install lays down and
@@ -255,7 +259,9 @@ func artifactManifest(cfg Config) []artifact {
 		// job, which names no state; the next install creates it again, root's
 		// 0755. assertExists is false: an install that predates the keystore
 		// socket has none.
-		items = append(items, artifact{kind: kindDir, disp: dispRemove, path: filepath.Join(cfg.DataRoot, keystorepaths.SockDir), assertExists: false})
+		// It is removed only when the server's bootout succeeded in that pass:
+		// a job still loaded keeps the socket its definition names.
+		items = append(items, artifact{kind: kindDir, disp: dispRemove, path: filepath.Join(cfg.DataRoot, keystorepaths.SockDir), assertExists: false, afterBootout: ServerLabel})
 		// The secrets encryption pair, PRESERVED with the datastore it unlocks:
 		// deleting the key would leave every Secret in the preserved state.db
 		// unreadable. assertExists is false: encryption is opt-in.

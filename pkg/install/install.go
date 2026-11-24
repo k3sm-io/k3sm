@@ -2766,6 +2766,9 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 		}
 		flush = configFlushPrefixes(cfg)
 	}
+	// bootedOut is each label this pass booted out without an error; an
+	// entry with afterBootout is removed only when its label is in it.
+	bootedOut := map[string]bool{}
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
 		if a.disp == dispRemove && a.kind == kindFile && a.path == identity {
@@ -2797,6 +2800,7 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 					note(err)
 					continue
 				}
+				bootedOut[a.label] = true
 				note(safeRemove(a.path))
 			} else if a.kind == kindSymlink {
 				// The launcher link lives OUTSIDE the trees k3sm owns, so it is
@@ -2816,6 +2820,8 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 						cfg.Logger.Info("link kept: not ours", "path", a.path, "expected-target", a.target)
 					}
 				}
+			} else if a.afterBootout != "" && !bootedOut[a.afterBootout] {
+				cfg.Logger.Warn("kept: its daemon was not booted out in this pass; rerun uninstall once it is", "path", a.path, "label", a.afterBootout)
 			} else {
 				note(safeRemove(a.path))
 			}
