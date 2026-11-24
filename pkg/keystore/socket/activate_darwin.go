@@ -40,14 +40,18 @@ package socket
 #include <unistd.h>
 
 // k3sm_accepting is 1 when fd is a socket in the listening state, 0 when it
-// is not, and -1 with errno set when its socket info cannot be read.
+// is not, and -1 with errno set when its socket info cannot be read: errno
+// is cleared before the call, so a failure reports proc_pidfdinfo's own
+// errno, and a short or size-mismatched return, which sets none, is EINVAL.
 static int k3sm_accepting(int fd) {
 	struct socket_fdinfo si;
+	errno = 0;
 	int n = proc_pidfdinfo(getpid(), fd, PROC_PIDFDSOCKETINFO, &si, sizeof(si));
+	if (n <= 0 && errno != 0) {
+		return -1;
+	}
 	if (n != (int)sizeof(si)) {
-		if (errno == 0) {
-			errno = EINVAL;
-		}
+		errno = EINVAL;
 		return -1;
 	}
 	return (si.psi.soi_options & SO_ACCEPTCONN) ? 1 : 0;
@@ -94,6 +98,9 @@ func (LaunchdActivator) Activate(name string) ([]int, error) {
 func socketAccepting(fd int) (bool, error) {
 	rc, err := C.k3sm_accepting(C.int(fd))
 	if rc < 0 {
+		if err == nil {
+			err = syscall.EINVAL
+		}
 		return false, err
 	}
 	return rc == 1, nil
