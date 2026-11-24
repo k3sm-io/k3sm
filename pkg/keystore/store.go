@@ -240,6 +240,14 @@ type FileStore struct {
 	// (servercounts.go). A pointer, as userScopesStarted is; New allocates
 	// it.
 	counts *serverCounts
+	// inproc is the store lock's in-process half (storelock.go), taken
+	// before the flock. A pointer, as userScopesStarted is, so a copy of
+	// the store shares it; New allocates it.
+	inproc *prefLock
+	// holdObserver, when set, is called as each store lock hold ends, with
+	// its mode and how long it was held on the clock, where a test bounds
+	// the hold.
+	holdObserver func(exclusive bool, held time.Duration)
 }
 
 var _ Store = (*FileStore)(nil)
@@ -280,6 +288,7 @@ func New(cfg Config) *FileStore {
 		lostLines:         new(lostEntryLines),
 		audit:             new(auditState),
 		counts:            newServerCounts(),
+		inproc:            newPrefLock(),
 	}
 	if cfg.LogFlags != nil {
 		s.logFlags = cfg.LogFlags
