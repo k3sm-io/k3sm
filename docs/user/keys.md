@@ -157,12 +157,17 @@ its `keystore-user-scope` row says only what it can check:
   depends on the installed server plist:
   - without the `Sockets` entry (a plist written by an install from before the socket existed)
     it names `run sudo k3sm install (it rewrites the server plist and re-bootstraps the job)`;
-    launchd reads that entry only when the job is bootstrapped. The server logs one warning,
-    `launchd activated no socket for this server`, and does not retry.
-  - with the entry, launchd could not create the socket because the data root's volume was not
-    mounted when the server started; it names `mount the data root, then run sudo k3sm
-    restart`. The server logs one warning, `the socket's parent path was missing when launchd
-    bound it`, and does not retry until it is restarted.
+    launchd reads that entry only when the job is bootstrapped, and a server whose plist lacks
+    it is refused the socket (measured). The server logs one warning, `launchd activated no
+    socket for this server`, and does not retry.
+  - with the entry, launchd provided no socket: a parent of its path is missing (for example a
+    data root on a volume that is not mounted), or the server has not started yet or is
+    restarting. It names `mount the data root, then run sudo k3sm restart; if that does not
+    clear it, run sudo k3sm install`. The server logs one warning, `the job has a socket entry
+    but launchd could not provide the keys socket`, and does not retry until it is restarted.
+  A socket can also be found at the path while the server is not running: launchd leaves it
+  there when the job is unloaded, so the PASS line says what is at the path, not that the server
+  is listening.
 - `keystore user scope: off (<reason>)` (WARN): a check fails, with the server's own reason.
   For a missing, wrong or unflagged log or socket directory it adds `run sudo k3sm install`;
   for `more than one server registered` it names the servers (up to 8, then how many more);
