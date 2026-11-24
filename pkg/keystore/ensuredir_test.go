@@ -252,3 +252,29 @@ func TestEnsureDirSyncsParentOfExistingDir(t *testing.T) {
 		t.Fatalf("EnsureDir with a failing fsync = %v, want it", err)
 	}
 }
+
+// TestMkdirAtExistingSyncFailureKeepsErrExist: when mkdirAt finds the name
+// existing and the parent's fsync then fails, its error carries both, so
+// a caller still tells an existing name (fs.ErrExist) from another failure
+// and still sees the sync's.
+func TestMkdirAtExistingSyncFailureKeepsErrExist(t *testing.T) {
+	s, server := newTestStore(t)
+	if err := os.Mkdir(filepath.Join(server, "keystore"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.OpenRoot(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = parent.Close() }()
+	errSync := errors.New("injected fsync failure")
+	setSyncDir(t, func(*os.Root) error { return errSync })
+	_, err = s.mkdirAt(parent, "keystore")
+	if !errors.Is(err, fs.ErrExist) || !errors.Is(err, errSync) {
+		t.Fatalf("mkdirAt over an existing name with a failed sync: %v, want both fs.ErrExist and the sync's error", err)
+	}
+	// A caller that goes on under an existing name does not take it as one.
+	if err := s.EnsureDir(); !errors.Is(err, errSync) {
+		t.Fatalf("EnsureDir over an existing directory with a failed sync: %v, want the sync's error", err)
+	}
+}

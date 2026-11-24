@@ -138,7 +138,7 @@ func (s *FileStore) openDirForRm(path string) (*os.Root, error) {
 // mkdirAt, so the open never leaves parent.
 func (s *FileStore) openSubdir(parent *os.Root, name string, create bool) (*os.Root, error) {
 	if create {
-		if _, err := s.mkdirAt(parent, name); err != nil && !errors.Is(err, fs.ErrExist) {
+		if _, err := s.mkdirAt(parent, name); err != nil && !existsSynced(err) {
 			return nil, err
 		}
 	}
@@ -197,7 +197,7 @@ func (s *FileStore) mkdirOwned(path string) error {
 	}
 	defer func() { _ = parent.Close() }() // the mkdir is all it is for
 	_, err = s.mkdirAt(parent, filepath.Base(path))
-	if errors.Is(err, fs.ErrExist) {
+	if existsSynced(err) {
 		return nil
 	}
 	if err != nil {
@@ -224,12 +224,15 @@ func (s *FileStore) mkdirOwned(path string) error {
 // new name is durable. An existing name is an error matching fs.ErrExist,
 // after parent is fsynced too: the name may be one another party (the
 // server, or a root put, racing this one) has made and not yet synced, and
-// what the caller writes under it must not outlive it on a power loss.
+// what the caller writes under it must not outlive it on a power loss. When
+// that fsync fails, the error joins both, so it still matches fs.ErrExist,
+// and errExistSync too: a caller that goes on under an existing name
+// (existsSynced) must not.
 func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	if err := parent.Mkdir(name, dirMode); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			if serr := syncDir(parent); serr != nil {
-				return nil, serr
+				return nil, errors.Join(err, fmt.Errorf("%w: %w", errExistSync, serr))
 			}
 		}
 		return nil, err
@@ -276,6 +279,17 @@ func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 		return nil, err
 	}
 	return opened, nil
+}
+
+// errExistSync marks mkdirAt's error for an existing name whose parent's
+// fsync then failed.
+var errExistSync = errors.New("sync the parent after finding the name existing")
+
+// existsSynced reports whether err, from mkdirAt, is an existing name whose
+// parent was fsynced: one a caller may go on under. An existing name whose
+// fsync failed is not.
+func existsSynced(err error) bool {
+	return errors.Is(err, fs.ErrExist) && !errors.Is(err, errExistSync)
 }
 
 // checkNewDir checks the directory open on f is one mkdirAt may hand over:
