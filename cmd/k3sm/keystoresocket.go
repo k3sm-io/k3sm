@@ -440,6 +440,20 @@ func doctorStoreDir(store *keystore.FileStore) func(context.Context) error {
 	}
 }
 
+// postureProfile renders the Pod profile (keystorePodProfile) for the
+// posture derive returns. A derivation that fails is the node's
+// configuration, as the provider refuses the same flags at the node's start:
+// it is returned wrapping socket.ErrPodProfileConfig.
+func postureProfile(derive func() (sandbox.Posture, error)) func() (string, error) {
+	return func() (string, error) {
+		posture, err := derive()
+		if err != nil {
+			return "", fmt.Errorf("%w: derive the runtime's posture: %w", socket.ErrPodProfileConfig, err)
+		}
+		return keystorePodProfile(posture)
+	}
+}
+
 // podPostureErrors are the generator's refusals of a posture value the
 // server's flags set (serverPodPosture): the pod root, the pod logs dir,
 // the status record dir, the data root (a pods root under a keystore name
@@ -459,12 +473,16 @@ var podPostureErrors = []error{
 // (socket.ProfileDeniesSocket). A render the generator refuses for a
 // posture value the flags set (podPostureErrors) is the node's
 // configuration (socket.ErrPodProfileConfig), cleared by fixing the flag
-// and restarting; any other render error is the build's, as a profile that
+// and restarting, and so is a render already wrapping it (a posture
+// derivation that failed, postureProfile); any other render error is the build's, as a profile that
 // does not deny the socket is (socket.ErrPodProfileOpen).
 func podProfileCheck(render func() (string, error), socketPath string) func() error {
 	return func() error {
 		profile, err := render()
 		if err != nil {
+			if errors.Is(err, socket.ErrPodProfileConfig) {
+				return err
+			}
 			for _, target := range podPostureErrors {
 				if errors.Is(err, target) {
 					return fmt.Errorf("%w: render the Pod profile: %w", socket.ErrPodProfileConfig, err)
@@ -664,13 +682,16 @@ func keystoreSocketPath(workDir string) string {
 // it, returning the stop runServer defers beside keystore-delivery's, so
 // LIFO drains it before the control plane stops. listen is how the
 // listening socket is obtained (keystoreSocketListener in runServer), and
-// posture is the server runtime's Seatbelt posture (serverPodPosture), whose
-// Pod profile must deny the socket before the listener serves. A
+// posture derives the server runtime's Seatbelt posture (serverPodPosture),
+// whose Pod profile must deny the socket before the listener serves; it is
+// asked on every pass, and a derivation that fails is the node's
+// configuration (socket.ErrPodProfileConfig: off, retried, the server not
+// stopped). A
 // build failure is logged and retried with backoff
 // (superviseKeystoreSocket); the stop is never nil. Everything it runs is
 // in its own goroutine with recover, so nothing it does stops the
 // apiserver or kine.
-func startKeystoreSocket(ctx context.Context, workDir string, posture sandbox.Posture, cs kubernetes.Interface, listen socket.ListenerSource, logger *slog.Logger) (stop func()) {
+func startKeystoreSocket(ctx context.Context, workDir string, posture func() (sandbox.Posture, error), cs kubernetes.Interface, listen socket.ListenerSource, logger *slog.Logger) (stop func()) {
 	deps := keystoreSocketDeps{
 		workDir:          workDir,
 		layout:           keystoreLayout,
@@ -684,7 +705,7 @@ func startKeystoreSocket(ctx context.Context, workDir string, posture sandbox.Po
 		creds:            socket.KernelPeerCreds{},
 		sandbox:          socket.KernelPeerSandbox{},
 		sandboxCheck:     socket.SandboxSelfCheck,
-		podProfile:       func() (string, error) { return keystorePodProfile(posture) },
+		podProfile:       postureProfile(posture),
 		clock:            wallClock{},
 		log:              logger,
 	}

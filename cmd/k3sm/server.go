@@ -63,6 +63,7 @@ import (
 	"k3sm.io/k3sm/pkg/runtimeclass"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/update"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
@@ -638,7 +639,7 @@ func runServer(args []string) (err error) {
 	defer timedTeardownStep(logger, "helm-controller", stopHelm)
 	defer timedTeardownStep(logger, "manifest-dir", startManifestDir(ctx, restCfg, cs, logger))
 	defer timedTeardownStep(logger, "keystore-delivery", startKeystoreDelivery(ctx, plan, cs, logger))
-	defer timedTeardownStep(logger, "keystore-socket", startKeystoreSocket(ctx, plan.opts.workDir, serverPodPosture(plan.opts), cs, keystoreSocketListener(plan.opts.workDir), logger))
+	defer timedTeardownStep(logger, "keystore-socket", startKeystoreSocket(ctx, plan.opts.workDir, func() (sandbox.Posture, error) { return serverPodPosture(plan.opts) }, cs, keystoreSocketListener(plan.opts.workDir), logger))
 	vmCapable := vmBackendAvailable() // can this node host vm guests? (3d registry, 4c datapath)
 	// 3d. The ingest registry; torn down EARLY, on cpStop's lane, and the defer is its backstop.
 	stopRegistry, registryPuller := startServerRegistry(ctx, plan, restCfg, cs, vmCapable, cpStop, logger)
@@ -845,9 +846,9 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		return nodeOptions{}, fmt.Errorf("read back the server node's client identity: %w", err)
 	}
 
-	// The runtime's Seatbelt posture, the one the keystore socket's start
-	// check renders the Pod profile from (serverPodPosture).
-	podPosture := serverPodPosture(opts)
+	// The directories the runtime renders its Seatbelt posture from; the
+	// keystore socket's start check reads the same ones (serverPodPosture).
+	runtimeDirs := serverRuntimeDirs(opts)
 	nodeOpts := nodeOptions{
 		lan:               plan.lan,
 		lbPrivilegedPorts: validatedLBPorts(opts.lbPrivilegedPorts),
@@ -857,19 +858,19 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		// The kubelet API binds this node's own InternalIP on this port
 		// (resolveKubeletEndpoint), never the wildcard.
 		kubeletPort: opts.kubeletPort,
-		podRoot:     podPosture.WorkDir,
+		podRoot:     runtimeDirs.podRoot,
 		updateRoot:  updateRootFor(opts.workDir),
 		budgetDir:   budgetDirFor(opts.workDir),
-		statusDir:   podPosture.StatusRecordDir,
-		dataRoot:    podPosture.DataRoot,
-		stateDir:    podPosture.StateDir,
+		statusDir:   runtimeDirs.statusDir,
+		dataRoot:    runtimeDirs.dataRoot,
+		stateDir:    runtimeDirs.stateDir,
 		// The recorded release base, which the update watcher's pin admits.
 		updateReleaseBase: opts.updateReleaseBase,
 		// The server's own cluster CA: the update signer it mints chains to it.
 		updateClusterCAPEM: nodeHierarchy.Cluster.CertPEM,
 		// The marker an install leaves when it minted a new admin token.
 		adminTokenMarker: install.AdminTokenRotatedMarkerPath(opts.workDir),
-		logs:             opts.logs,
+		logs:             runtimeDirs.logs,
 		nodeIP:           nodeAddressing.nodeIP,
 		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
 		serviceCIDR: install.DefaultServiceCIDR,

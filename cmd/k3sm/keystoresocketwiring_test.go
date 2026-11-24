@@ -80,8 +80,8 @@ func TestRunServerStartsKeystoreSocket(t *testing.T) {
 	if id, ok := socketCall.Fun.(*ast.Ident); !ok || id.Name != "startKeystoreSocket" || len(socketCall.Args) != 6 {
 		t.Fatal("the keystore-socket step is not startKeystoreSocket(...)")
 	}
-	if c, ok := socketCall.Args[2].(*ast.CallExpr); !ok || c.Fun.(*ast.Ident).Name != "serverPodPosture" {
-		t.Fatal("startKeystoreSocket's posture is not serverPodPosture(), the one the node's runtime is given")
+	if !derivesServerPodPosture(socketCall.Args[2]) {
+		t.Fatal("startKeystoreSocket's posture is not func() { return serverPodPosture(...) }, the one the node's runtime renders from")
 	}
 	if c, ok := socketCall.Args[4].(*ast.CallExpr); !ok || c.Fun.(*ast.Ident).Name != "keystoreSocketListener" {
 		t.Fatal("startKeystoreSocket's listener is not keystoreSocketListener()")
@@ -97,6 +97,25 @@ func TestRunServerStartsKeystoreSocket(t *testing.T) {
 	if d, k := idx("keystore-delivery"), idx("keystore-socket"); d < 0 || k < d {
 		t.Fatalf("keystore-socket (%d) is not deferred after keystore-delivery (%d)", k, d)
 	}
+}
+
+// derivesServerPodPosture reports whether e is a func literal whose one
+// statement returns serverPodPosture(...).
+func derivesServerPodPosture(e ast.Expr) bool {
+	lit, ok := e.(*ast.FuncLit)
+	if !ok || len(lit.Body.List) != 1 {
+		return false
+	}
+	ret, ok := lit.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) != 1 {
+		return false
+	}
+	call, ok := ret.Results[0].(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	id, ok := call.Fun.(*ast.Ident)
+	return ok && id.Name == "serverPodPosture"
 }
 
 // A process launchd did not start as the server's job (this test) gets no

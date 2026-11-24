@@ -1989,8 +1989,19 @@ such entry or a parent of the socket path is missing at the activation call (mea
 three missing levels), gets `ENOENT`. Each keeps the user scope off for the life of the
 process; the server never binds `keys.sock` itself. **The server checks its Pod profile at
 start.** Before the supervisor serves, the server renders a Pod profile with the embedded
-runtimed's own generator (`sandbox.Generate`) over the posture its runtime is built with
-(`serverPodPosture`, `cmd/k3sm/keystoreprofile.go`), and requires that the text deny
+runtimed's own generator (`sandbox.Generate`) over a posture whose pod root, data root and
+state dir are the ones the provider derives for its runtime from the same flags
+(`serverPodPosture`, `cmd/k3sm/keystoreprofile.go`, over `provider.RuntimePosture`, which is
+the provider's own `dataRootOf`, `ownRootStateDir` and `podLogsDirOf`). What is proven is
+narrow: `TestServerPodPostureMatchesRuntime` shows those three fields equal to the provider's
+for a `/private/var` data root under a `/var` pod root (both become the runtime root's
+spelling), a `/System/Volumes/Data` data root, a symlinked `server` state dir (its resolved
+target) and the default (runtimed's default pod root), and
+`TestRuntimePostureIsTheRuntimesConfig` shows the provider's derivation is what `NewRuntimed`
+hands runtimed. The fields runtimed fills from its own state (`Home`, `WorkVolume`, the VIPs)
+are not in it, and no test reads a built runtime's posture back. A posture the provider
+refuses (as it refuses the node) is the configuration state below, retried
+(`TestServerPodPostureFailureIsConfiguration`). The check requires that the text deny
 `file-read*`, `file-write*` and unix-socket `network-outbound` on `keystore-sock/` under the
 data root it serves, in each spelling the generator writes (`/var`, `/private/var`,
 `/System/Volumes/Data`), with no overlapping allow after the deny (`socket.ProfileDeniesSocket`).

@@ -55,10 +55,11 @@ func TestServerPodProfileDeniesKeystoreSocket(t *testing.T) {
 				opts.podRoot = keystoreLayout(opts.workDir).DataRoot
 			}
 			sock := keystoreSocketPath(opts.workDir)
-			if sock != tt.socket || sock != keystorepaths.SocketPath(serverPodPosture(opts).DataRoot) {
+			posture := mustServerPodPosture(t, opts)
+			if sock != tt.socket || sock != keystorepaths.SocketPath(posture.DataRoot) {
 				t.Fatalf("the server serves %s; want %s, under the posture's data root", sock, tt.socket)
 			}
-			profile, err := keystorePodProfile(serverPodPosture(opts))
+			profile, err := keystorePodProfile(posture)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -77,10 +78,20 @@ func TestServerPodProfileDeniesKeystoreSocket(t *testing.T) {
 // dir, and the pod root is the one the node is given.
 func TestServerPodPostureIsTheSockets(t *testing.T) {
 	opts := serverOptions{workDir: "/Volumes/d/server", podRoot: "/opt/pods", logs: containerLogOptions{dir: "/Volumes/d/logs"}}
-	p := serverPodPosture(opts)
+	p := mustServerPodPosture(t, opts)
 	if p.DataRoot != keystoreLayout(opts.workDir).DataRoot || p.StateDir != opts.workDir || p.WorkDir != opts.podRoot || p.PodLogsDir != opts.logs.dir {
 		t.Fatalf("posture %+v does not follow the options %+v", p, opts)
 	}
+}
+
+// mustServerPodPosture is serverPodPosture(opts), failing t on an error.
+func mustServerPodPosture(t *testing.T, opts serverOptions) sandbox.Posture {
+	t.Helper()
+	p, err := serverPodPosture(opts)
+	if err != nil {
+		t.Fatalf("serverPodPosture(%+v): %v", opts, err)
+	}
+	return p
 }
 
 // A Pod profile rendered for a posture whose data root is not the socket's
