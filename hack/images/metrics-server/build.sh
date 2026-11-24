@@ -380,7 +380,13 @@ if [ "$REGEN" = 1 ]; then
 		goenv "$GO" get "$MS_PACKAGE@$MS_VERSION" &&
 		goenv "$GO" get "golang.org/x/net@$MS_XNET" &&
 		# shellcheck disable=SC2086 # MS_FIXES is a space-separated list
-		goenv "$GO" get $MS_FIXES) || die "could not regenerate the graph"
+		goenv "$GO" get $MS_FIXES &&
+		# The gets leave go.sum without the zip hash of a module that only
+		# provides a package the build imports (a fix can pull a newer module
+		# whose new import no get loaded). Getting the built package at the
+		# version go.mod now holds resolves its imports into go.sum; it moves
+		# no version, and unlike go mod tidy it never rewrites the require block.
+		goenv "$GO" get "$MS_PACKAGE@$MS_VERSION") || die "could not regenerate the graph"
 	{ sed -n '/^\/\//p' "$HERE/go.mod"; cat "$WORK/graph/go.mod"; } >"$WORK/graph/go.mod.new"
 	mv "$WORK/graph/go.mod.new" "$WORK/graph/go.mod"
 	cp "$WORK/graph/go.mod" "$WORK/graph/go.sum" "$HERE/"

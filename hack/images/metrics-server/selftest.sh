@@ -10,6 +10,7 @@
 #   - the Dockerfile is COPY-only, FROM scratch
 #   - a module download whose Sum, version or commit is not the pin is refused
 #   - the ldflags carry the pinned build date, and the recipe reads no clock
+#   - the regen recipe gets the built package after the fixes and never tidies
 #   - the committed build info passes the shared buildinfo_problems check
 #   - a govulncheck finding not accepted by id, module and found version, an
 #     expired or other-release acceptance, or a failed run, is refused
@@ -95,6 +96,21 @@ done
 cp "$HERE/go.mod" "$HERE/go.sum" "$tmp/graph/"
 printf 'replace golang.org/x/net => example.com/net v0.0.1\n' >>"$tmp/graph/go.mod"
 if "$BUILD" --check-graph "$tmp/graph" >/dev/null; then bad "a go.mod with a replace passed"; else ok "a go.mod with a replace is refused"; fi
+
+echo "==> the regen recipe resolves go.sum for the built package"
+# --regen-graph needs the network, so this reads the recipe: the get of the built
+# package at the pinned version must come after the MS_FIXES get (which can pull a
+# module whose new import no earlier get loaded), and go mod tidy must not run
+# (it can delete the require block of a graph whose packages it cannot match).
+regen="$(awk '/^if \[ "\$REGEN" = 1 \]; then/ { on = 1 } on { print } on && /^else/ { exit }' "$BUILD")"
+fixes_line="$(grep -n 'get \$MS_FIXES' <<<"$regen" | sed -n 1p | cut -d: -f1)"
+pkg_line="$(grep -n 'get "\$MS_PACKAGE@\$MS_VERSION"' <<<"$regen" | tail -n 1 | cut -d: -f1)"
+if [ -n "$fixes_line" ] && [ -n "$pkg_line" ] && [ "$pkg_line" -gt "$fixes_line" ]; then
+	ok "the regen step gets the built package at the pinned version after the MS_FIXES get"
+else
+	bad "the regen step does not get \$MS_PACKAGE@\$MS_VERSION after the MS_FIXES get (fixes line '$fixes_line', package line '$pkg_line')"
+fi
+if grep -v '^[[:space:]]*#' <<<"$regen" | grep -q 'mod tidy'; then bad "the regen step runs go mod tidy"; else ok "the regen step does not run go mod tidy"; fi
 
 echo "==> a placeholder pin refuses before any go or curl runs"
 mkdir -p "$tmp/tree/hack/images/metrics-server" "$tmp/tree/hack/release/lib" "$tmp/bin"
