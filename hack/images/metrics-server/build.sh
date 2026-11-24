@@ -87,7 +87,7 @@ MS_XNET="v0.60.0"
 # in v0.30.0; v0.29.x is still affected); otel/sdk and the two
 # otlptrace exporters for GHSA-8wmf-6v46-5gfg. Minimal version selection moves
 # otel, otel/metric, otel/trace, otlp proto, go-logr/logr and genproto with them.
-MS_FIXES="google.golang.org/grpc@v1.83.2 github.com/google/cel-go@v0.30.0 go.opentelemetry.io/otel/sdk@v1.45.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.45.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.45.0"
+MS_FIXES="google.golang.org/grpc@v1.83.2 github.com/google/cel-go@v0.30.0 go.opentelemetry.io/otel/sdk@v1.47.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.47.0 go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.47.0"
 # The version marker's variant: a pure-Go build over the patched graph.
 MS_VARIANT="nocgo+xnet-$MS_XNET"
 # The tag the operator pushes; consumers pin the digest image.yaml records.

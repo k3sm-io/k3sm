@@ -30,7 +30,7 @@ the workers.
    The graph also requires each module in `MS_FIXES` at its pinned version, the lowest
    that fixes every advisory open against upstream's own version: `google.golang.org/grpc`
    v1.83.2, `github.com/google/cel-go` v0.30.0, and `go.opentelemetry.io/otel/sdk` and the
-   two `otlptrace` exporters at v1.45.0. They move `otel`, `otel/metric`, `otel/trace`,
+   two `otlptrace` exporters at v1.47.0. They move `otel`, `otel/metric`, `otel/trace`,
    `go.opentelemetry.io/proto/otlp`, `go-logr/logr` and `genproto` with them.
    `--regen-graph` regenerates the two files; review that diff as a dependency change.
 4. Builds `cmd/metrics-server` from that graph (`go build -mod=readonly`) with the pinned Go (`PAYLOAD_GO_VERSION` in
@@ -71,7 +71,7 @@ so there is no image index. The pinned reference names the darwin/arm64 manifest
 | GO-2026-6617, 6612, 6611, 6603 | golang.org/x/net v0.56.0 | yes, on the serve path | `SecureServingInfo.Serve` calls `http2.ConfigureServer` for the secure port, and HTTP/2 framing runs before authentication. Fixed by the x/net v0.60.0 graph. |
 | GO-2026-6610 | golang.org/x/net v0.56.0 | client side only | fixed by the same graph |
 | GO-2026-5970 | golang.org/x/text v0.38.0 | not on attacker input | `idna` on the apiserver host name; fixed by the x/text the graph moves to |
-| GO-2026-6505 | go.opentelemetry.io/otel and its exporters | package init only | no tracing is configured; fixed by otel v1.45.0 in `MS_FIXES` |
+| GO-2026-6505 | go.opentelemetry.io/otel and its exporters | package init only | no tracing is configured; fixed by otel v1.47.0 in `MS_FIXES` |
 | GO-2026-6443 | google.golang.org/grpc | not reachable | package level only; no gRPC server runs; fixed by grpc v1.83.2 in `MS_FIXES` (v1.83.0 and v1.83.1 are still affected) |
 | GO-2026-6348, 6061 | google.golang.org/grpc | client transport only | every trace is `http2Client`, used by an otel exporter that is not configured; fixed by grpc v1.83.2 |
 
