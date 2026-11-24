@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -365,6 +366,7 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 		CheckInstall:      checkInstallOn(pass, store.CheckSocketInstall),
 		ServerCount:       func(ctx context.Context) (int, error) { return countKeystoreServers(ctx, cs) },
 		MaintenanceMarked: logs.MaintenanceMarked,
+		StoreDir:          serverStoreDir(store),
 		OpenLogs: func(ctx context.Context) error {
 			if err := logs.Reopen(ctx); err != nil {
 				return err
@@ -386,6 +388,43 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 		Clock:        deps.clock,
 		Log:          deps.log,
 	}, closeAll, nil
+}
+
+// storeDirRepair is the remedy a refused store directory names: the server
+// creates a missing one, but never repairs one that exists.
+const storeDirRepair = "the server never repairs an existing store directory: as root, make it the service user's at mode 0700, or remove it if it holds nothing, and the next start check creates it"
+
+// serverStoreDir is the server's store-directory step: the store directory
+// created if it is missing, with the store's own helper, and judged as
+// every open judges it (keystore.FileStore.EnsureDir). It runs on every
+// pass, so a directory a racing root put has made but not yet handed to
+// the service user is refused for that pass only; one that stays wrong is
+// refused on every pass and never repaired.
+func serverStoreDir(store *keystore.FileStore) func(context.Context) error {
+	return func(context.Context) error {
+		if err := store.EnsureDir(); err != nil {
+			return fmt.Errorf("%w (%s)", err, storeDirRepair)
+		}
+		return nil
+	}
+}
+
+// doctorStoreDir is doctor's store-directory step: the server's judgement,
+// read-only (keystore.FileStore.CheckDir). A missing directory is one the
+// server has not created yet, since it creates it at start.
+func doctorStoreDir(store *keystore.FileStore) func(context.Context) error {
+	return func(context.Context) error {
+		err := store.CheckDir()
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, fs.ErrNotExist):
+			return fmt.Errorf("%w (the server creates the store directory at start, and has not yet: a server that is running logs why it could not)", err)
+		case errors.Is(err, fs.ErrPermission):
+			return fmt.Errorf("%w (sudo k3sm doctor: the store directory is the service user's)", err)
+		}
+		return fmt.Errorf("%w (%s)", err, storeDirRepair)
+	}
 }
 
 // podProfileCheck is the supervisor's Pod-profile check: the profile render
@@ -802,6 +841,7 @@ func doctorKeystoreUserScope(workDir string) (doctorUserScope, error) {
 			EUID:              euid,
 			ServiceUID:        uid,
 			MaintenanceMarked: store.MaintenanceMarked,
+			StoreDir:          doctorStoreDir(store),
 			OpenLogs:          doctorOpenLogs(store, pass),
 			SandboxCheck:      socket.SandboxSelfCheck,
 			IgnoresOwnership:  pass.ignoresOwnership,

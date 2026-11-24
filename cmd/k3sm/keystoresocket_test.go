@@ -874,6 +874,14 @@ func TestDoctorKeystoreReopenJudgement(t *testing.T) {
 // mint it. It returns a login uid that is not the service user's.
 func newInstalledWiringFixture(t *testing.T) (*wiringFixture, uint32) {
 	t.Helper()
+	return installedWiringFixture(t, true)
+}
+
+// installedWiringFixture is newInstalledWiringFixture; with put unset it is
+// a fresh install: no store directory under the work dir and no root put,
+// so no master either.
+func installedWiringFixture(t *testing.T, put bool) (*wiringFixture, uint32) {
+	t.Helper()
 	if os.Geteuid() == 0 {
 		t.Skip("the test user stands in for the service user, which is never root")
 	}
@@ -897,7 +905,6 @@ func newInstalledWiringFixture(t *testing.T) (*wiringFixture, uint32) {
 		mode os.FileMode
 	}{
 		{f.deps.workDir, 0o700},
-		{storeCfg.Dir, 0o700},
 		{filepath.Join(f.dataRoot, "keystore-sock"), 0o755},
 		{filepath.Join(f.dataRoot, keystore.LogsDirName), 0o755},
 		{filepath.Join(f.dataRoot, keystore.LogsDirName, keystore.FloorDirName), 0o755},
@@ -921,8 +928,11 @@ func newInstalledWiringFixture(t *testing.T) (*wiringFixture, uint32) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := keystore.New(storeCfg).Put(t.Context(), "seed", keystore.KindOpaque, []byte("x")); err != nil {
-		t.Fatalf("minting the master: %v", err)
+	if put {
+		// A root put creates the store directory and mints the master.
+		if _, err := keystore.New(storeCfg).Put(t.Context(), "seed", keystore.KindOpaque, []byte("x")); err != nil {
+			t.Fatalf("minting the master: %v", err)
+		}
 	}
 	peer := uint32(600)
 	if peer == me {
