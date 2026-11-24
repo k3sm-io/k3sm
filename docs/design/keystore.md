@@ -4630,9 +4630,12 @@ surface, and the app consumes only those.
   meanwhile as `suppressed`. The key carries the uid, so one login user's standing damage
   never suppresses another uid's line (`TestStoreErrorLogPerUID`). One uid's keys are bounded
   by the closed sets of ops and classes, and the table holds at most 1024 keys across uids: a
-  new key past that evicts the key whose last line is the oldest, whose suppressed count is
-  then lost and whose next line passes at once (`TestStoreErrorLogged`,
-  `TestStoreErrorLogBounded`, `TestDamageLimiterBounded`).
+  new key past that evicts the key whose last line is the oldest. `suppressed` counts the
+  whole key's suppressed lines, those of every entry its requests named, not only the
+  `requested_entry` the line names. An evicted key's next line passes at once and carries no
+  `suppressed` figure: the count it held moves to `evicted`, which the next line to pass, of
+  any key, reports once (`TestStoreErrorLogged`, `TestStoreErrorLogBounded`,
+  `TestDamageLimiterBounded`, `TestDamageLimiterReportsEvicted`).
 - **Operations on the wire.** The request and reply headers are named Go types in
   `pkg/keystore/socket` (`PutRequest`, `RotateRequest`, `ListRequest`, `RmRequest`,
   `ReadForExecRequest`; `VersionReply`, `ListReply` with `ListEntry`, `RmReply`,

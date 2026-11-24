@@ -115,6 +115,9 @@ const DamageLogInterval = 10 * time.Second
 type damageLimiter struct {
 	mu   sync.Mutex
 	keys map[damageKey]*damageCount
+	// evicted is the lines suppressed under keys evicted since a line last
+	// passed, which the next line to pass reports.
+	evicted uint64
 }
 
 type damageKey struct {
@@ -127,14 +130,17 @@ type damageCount struct {
 	suppressed uint64
 }
 
-// maxDamageKeys caps the limiter's keys. An evicted key loses the count it
-// suppressed since its last line, and its next line passes at once: the
-// cap bounds memory, and a uid's lines stay bounded by its request rate.
+// maxDamageKeys caps the limiter's keys. An evicted key's next line passes
+// at once and carries no suppressed figure: the count it suppressed since
+// its last line moves to the limiter's evicted total, which the next line
+// to pass, of any key, reports. The cap bounds memory, and a uid's lines
+// stay bounded by its request rate.
 const maxDamageKeys = 1024
 
 // pass reports whether a line for k may be logged at now, with the count
-// suppressed since the key's last line.
-func (l *damageLimiter) pass(k damageKey, now time.Time) (bool, uint64) {
+// suppressed since the key's last line and the count suppressed under keys
+// evicted since the last line passed.
+func (l *damageLimiter) pass(k damageKey, now time.Time) (ok bool, suppressed, evicted uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.keys == nil {
@@ -149,11 +155,11 @@ func (l *damageLimiter) pass(k damageKey, now time.Time) (bool, uint64) {
 		l.keys[k] = c
 	} else if now.Sub(c.last) < DamageLogInterval {
 		c.suppressed++
-		return false, 0
+		return false, 0, 0
 	}
-	n := c.suppressed
-	c.last, c.suppressed = now, 0
-	return true, n
+	n, e := c.suppressed, l.evicted
+	c.last, c.suppressed, l.evicted = now, 0, 0
+	return true, n, e
 }
 
 // evictOldest drops the key whose last line is the oldest. l.mu is held.
@@ -168,21 +174,26 @@ func (l *damageLimiter) evictOldest() {
 			oldest, at, found = k, c.last, true
 		}
 	}
+	if found {
+		l.evicted += l.keys[oldest].suppressed
+	}
 	delete(l.keys, oldest)
 }
 
 // logStoreError logs err, op's error for p, at Warn when it is damage,
 // at most once per uid, op and class each DamageLogInterval: the op, the
 // peer's uid, the entry the request named when it is a valid name
-// (requested_entry), the class and its fixed remedy, and the lines
-// suppressed since the key's last. Never the error's text, a value or a
+// (requested_entry), the class and its fixed remedy, the lines suppressed
+// under the whole key since its last line (suppressed: any entry the key's
+// requests named, not only the one this line names), and the lines
+// suppressed under keys evicted since a line last passed (evicted). Never the error's text, a value or a
 // value's length.
 func (h *Handler) logStoreError(op string, p Peer, header []byte, err error) {
 	class := damageClass(err)
 	if class == "" {
 		return
 	}
-	ok, suppressed := h.dmg.pass(damageKey{uid: p.UID, op: op, class: class}, h.now())
+	ok, suppressed, evicted := h.dmg.pass(damageKey{uid: p.UID, op: op, class: class}, h.now())
 	if !ok {
 		return
 	}
@@ -193,6 +204,9 @@ func (h *Handler) logStoreError(op string, p Peer, header []byte, err error) {
 	attrs = append(attrs, "class", class, "remedy", damageRemedies[class])
 	if suppressed > 0 {
 		attrs = append(attrs, "suppressed", suppressed)
+	}
+	if evicted > 0 {
+		attrs = append(attrs, "evicted", evicted)
 	}
 	h.log.Warn("keystore socket: the store reports damage", attrs...)
 }

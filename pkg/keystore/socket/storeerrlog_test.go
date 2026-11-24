@@ -359,7 +359,7 @@ func TestDamageLimiterBounded(t *testing.T) {
 	start := time.Unix(1_000_000, 0)
 	key := func(uid int) damageKey { return damageKey{uid: uint32(uid), op: OpReadForExec, class: DamageCorrupt} }
 	for i := range 2 * maxDamageKeys {
-		if ok, _ := l.pass(key(i), start.Add(time.Duration(i)*time.Millisecond)); !ok {
+		if ok, _, _ := l.pass(key(i), start.Add(time.Duration(i)*time.Millisecond)); !ok {
 			t.Fatalf("uid %d's first line was suppressed", i)
 		}
 		if n := len(l.keys); n > maxDamageKeys {
@@ -728,5 +728,31 @@ func TestPanickedOperationLogged(t *testing.T) {
 	recs := c.records(t)
 	if len(recs) != 1 || recs[0]["level"] != "ERROR" || recs[0]["op"] != OpRm || recs[0]["uid"] != float64(uidA) || recs[0]["requested_entry"] != entryOf(uidA, "a") {
 		t.Fatalf("a panicking rm logged %v, want one Error line naming rm, uid %d and the entry", recs, uidA)
+	}
+}
+
+// An evicted key's suppressed count is not lost: it is reported, as
+// evicted, on the line that passes once it is evicted, here the line of
+// the key whose arrival evicted it; and the evicted key's own next line
+// passes with no suppressed figure.
+func TestDamageLimiterReportsEvicted(t *testing.T) {
+	var l damageLimiter
+	start := time.Unix(1_000_000, 0)
+	key := func(uid int) damageKey { return damageKey{uid: uint32(uid), op: OpReadForExec, class: DamageCorrupt} }
+	l.pass(key(0), start)
+	l.pass(key(0), start.Add(time.Millisecond))
+	l.pass(key(0), start.Add(2*time.Millisecond))
+	for i := 1; i < maxDamageKeys; i++ {
+		l.pass(key(i), start.Add(time.Duration(i+2)*time.Millisecond))
+	}
+	// One key past the cap evicts key 0, the oldest, with its 2 suppressed.
+	at := start.Add(time.Second)
+	ok, suppressed, evicted := l.pass(key(maxDamageKeys), at)
+	if !ok || suppressed != 0 || evicted != 2 {
+		t.Fatalf("the key past the cap: %v, %d suppressed, %d evicted; want a line reporting 2 evicted", ok, suppressed, evicted)
+	}
+	ok, suppressed, evicted = l.pass(key(0), at)
+	if !ok || suppressed != 0 || evicted != 0 {
+		t.Fatalf("the evicted key's next line: %v, %d suppressed, %d evicted; want a line with no figure, the count reported once", ok, suppressed, evicted)
 	}
 }
