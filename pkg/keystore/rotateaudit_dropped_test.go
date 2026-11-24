@@ -78,7 +78,6 @@ func TestRotateAuditWritesDroppedCounts(t *testing.T) {
 		`"result":"dropped","charge":"reconciler","source":"pre-frame","dropped":9,"class":"login"}`,
 		`"source":"pre-frame","dropped":1,"class":"root"}`,
 		`"source":"post-frame","dropped":4,"class":"post-frame"}`,
-		`"source":"unaudited","dropped":2,"class":"unaudited"}`,
 	} {
 		if !strings.HasSuffix(lines[i], want) || !strings.Contains(lines[i], `"op":"refused","via":"root","caller":{"uid":0}`) {
 			t.Fatalf("line %d is %s, want a via-root summary ending %s", i, lines[i], want)
@@ -86,6 +85,20 @@ func TestRotateAuditWritesDroppedCounts(t *testing.T) {
 		if _, _, ok := preFrameCharge([]byte(lines[i] + "\n")); ok {
 			t.Fatalf("line %d is charged to the pre-frame part: %s", i, lines[i])
 		}
+	}
+	// The unaudited count is its own op: committed revocations whose
+	// lines are missing, neither refused nor dropped. The strict reader
+	// takes it, charged to no uid and to no pre-frame part.
+	un := lines[3]
+	if !strings.Contains(un, `"op":"unaudited","via":"root","caller":{"uid":0}`) || !strings.HasSuffix(un, `"result":"committed","count":2}`) ||
+		strings.Contains(un, "refused") || strings.Contains(un, "dropped") {
+		t.Fatalf("the unaudited line is %s, want op unaudited, result committed, count 2, and no refused or dropped", un)
+	}
+	if uid, recon, err := auditLineCharge([]byte(un)); err != nil || uid != 0 || recon {
+		t.Fatalf("the strict reader on the unaudited line: uid %d, reconciler %v, %v; want uid 0 and accepted", uid, recon, err)
+	}
+	if _, _, ok := preFrameCharge([]byte(un + "\n")); ok {
+		t.Fatalf("the unaudited line is charged to the pre-frame part: %s", un)
 	}
 	if damage, _, err := s.CheckLogBounds(context.Background()); err != nil || damage != 0 {
 		t.Fatalf("the audit log reader judges the new log: damage %d, %v", damage, err)

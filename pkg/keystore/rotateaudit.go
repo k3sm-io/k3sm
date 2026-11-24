@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -141,9 +142,11 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 // charged to no uid's share nor to the pre-frame part
 // (docs/design/keystore.md § "Per-uid fairness": root's next audit
 // --rotate writes any count still unwritten as one line charged to no
-// uid). The post-frame and unaudited lines name their count in their
-// source too. A file that does not read writes no line and is left for
-// doctor to report: it never blocks the rotation.
+// uid). The post-frame line names its count in its source too. The
+// unaudited count is no refusal and nothing dropped: the revocations it
+// counts committed, and only their lines are missing, so its line is its
+// own op, unaudited (unauditedRecord). A file that does not read writes no
+// line and is left for doctor to report: it never blocks the rotation.
 func (s *FileStore) rotateDroppedLines(root *os.Root) (preFrameDropped, []byte) {
 	d, err := s.readPreFrameDropped(root)
 	if err != nil {
@@ -156,10 +159,16 @@ func (s *FileStore) rotateDroppedLines(root *os.Root) (preFrameDropped, []byte) 
 		if totals[c] == 0 {
 			continue
 		}
-		rec := preFrameRecord(0, auditResultDropped, c, totals[c], s.now())
-		rec.Via = auditViaRoot
-		if !preFrameCount(c) {
-			rec.Source = string(c) // the count it carries: post-frame or unaudited
+		var rec any
+		if c == countClassUnaudited {
+			rec = unauditedRecord(totals[c], s.now())
+		} else {
+			r := preFrameRecord(0, auditResultDropped, c, totals[c], s.now())
+			r.Via = auditViaRoot
+			if !preFrameCount(c) {
+				r.Source = string(c) // the count it carries: post-frame
+			}
+			rec = r
 		}
 		line, err := json.Marshal(rec)
 		if err != nil {
@@ -168,6 +177,43 @@ func (s *FileStore) rotateDroppedLines(root *os.Root) (preFrameDropped, []byte) 
 		out = append(append(out, line...), '\n')
 	}
 	return d, out
+}
+
+// auditOpUnaudited is the op of root's audit --rotate line for the
+// server's unaudited count, and auditResultUnaudited its result: committed
+// revocations whose own audit lines were not written.
+const (
+	auditOpUnaudited     = "unaudited"
+	auditResultUnaudited = "committed"
+)
+
+// unauditedRec is root's line for the unaudited count: the audit line's
+// fields, charged to no uid (caller uid 0, no scope) and to no pre-frame
+// part (no charge, no source), with the count in count.
+type unauditedRec struct {
+	V         int            `json:"v"`
+	TS        string         `json:"ts"`
+	Op        string         `json:"op"`
+	Via       string         `json:"via"`
+	Caller    preFrameCaller `json:"caller"`
+	Scope     string         `json:"scope"`
+	Name      string         `json:"name"`
+	Namespace string         `json:"namespace"`
+	Result    string         `json:"result"`
+	Count     uint64         `json:"count"`
+}
+
+// unauditedRecord is root's line for n committed revocations whose audit
+// lines were not written, at now.
+func unauditedRecord(n uint64, now time.Time) unauditedRec {
+	return unauditedRec{
+		V:      auditFormat,
+		TS:     now.UTC().Format(time.RFC3339Nano),
+		Op:     auditOpUnaudited,
+		Via:    auditViaRoot,
+		Result: auditResultUnaudited,
+		Count:  n,
+	}
 }
 
 // clearRotatedDropped takes the counts rotate wrote (written) out of the

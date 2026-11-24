@@ -3626,8 +3626,14 @@ service user can only add to.
     the new audit log one line per class with a count, the server's summary-line form with
     `"via":"root"` and caller uid 0 (so it is charged to no uid and to no pre-frame part):
     `{"v":1,…,"op":"refused","via":"root","caller":{"uid":0},…,"result":"dropped","charge":"reconciler","source":"pre-frame","dropped":<total>,"class":"<class>"}`,
-    the pre-frame classes first, then `post-frame` and `unaudited`, whose lines carry their own
-    name as their `source`.
+    the pre-frame classes first, then `post-frame`, whose line carries its own name as its
+    `source`. The `unaudited` count is last and is no refusal and nothing dropped: the
+    revocations it counts committed and only their lines are missing, so its line is its own
+    op, `unaudited`, written only by root's `audit --rotate`:
+    `{"v":1,…,"op":"unaudited","via":"root","caller":{"uid":0},"scope":"","name":"","namespace":"","result":"committed","count":<total>}`.
+    It carries no `charge` or `source`, so it is charged to no uid and to no pre-frame part;
+    the strict audit reader takes it like any line and the pre-frame recount skips it
+    (`TestRotateAuditWritesDroppedCounts`).
     Only once the swap committed does it take the counts it wrote out of the file, leaving what
     the server added since; the server's next reopen moves its in-memory counts by what the file
     lost, so no count is written twice. A run that stops between the swap and that step leaves
@@ -3862,7 +3868,8 @@ refused before its first frame:
 - **Fields.** `op` and `result` are open sets (today `put`, `rotate`, `rm`, `list`,
   `show`, `exec-read`, `deliver`, `withdraw`, `rewrap`, `rm-scope`, `floor-rebuild`,
   `floor-merge`, `floor-merge-dry-run`, `audit-rotate`, `deliver-write`, `deliver-delete`,
-  `refused`; and `ok`, `committed` or a sentinel name: `ok` is a change committed whole,
+  `refused`, `unaudited` (root's `audit --rotate` line for the committed revocations whose
+  lines were not written, with result `committed`); and `ok`, `committed` or a sentinel name: `ok` is a change committed whole,
   `committed` a revocation committed in part and reported after its commit, such as an `rm`
   whose burial stopped part way or a `withdraw` whose floor line failed; a root verb that
   exits 4 or 5, its change made and its report to read, is `committed` too). When such a partial commit's own audit line then fails, the reply
