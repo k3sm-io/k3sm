@@ -775,7 +775,7 @@ pend U102 "the sealed record stores the last delivered version per delivery, rai
 	k3sm/pkg/keystore/reconcile::TestChargingIgnoresTamperedVersionAnnotationAndStatus
 pend U103 "a Secret at a recorded target whose label or owner annotation was removed is never overwritten or deleted, under a revocation, the object's deletion and rm-scope alike; the KeyDelivery gets SecretRetained=True with reason LabelRemoved, and doctor names the Secret and the KeyDelivery (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestStrippedLabelReportedNotDeleted
-rootpartial U104 "root-run: install creates keystore-sock/ root:wheel 0755 and the server plist carries a Sockets listener for keystore-sock/keys.sock; a process running as the service uid cannot unlink, replace or bind keys.sock, whether or not the server runs, and gets EACCES (the root-run test is in the integration tier, run with -tags integration)" "rig leg E24" \
+rootpartial U104 "root-run: install creates keystore-sock/ root:wheel 0755 and the server plist carries a Sockets listener for keystore-sock/keys.sock; a process running as the service uid cannot unlink, replace or bind keys.sock, whether or not the server runs: the unlink, a rename over it and a bind of a new name (keys.sock once it is gone) get EACCES, and a bind of the existing keys.sock gets EADDRINUSE with root's name left in place (rig leg E24 measures that bind; the root-run test is in the integration tier, run with -tags integration)" "rig leg E24" \
 	k3sm/pkg/install::TestServerPlistActivatesKeystoreSocket TestKeystoreSockDirAtInstall TestSocketDirRootOwnedServiceUIDCannotBind
 tagged U104 integration
 rootpend U105 "root-run: every root path walks the keystore trees by descriptor: install over an existing tree, uninstall --purge and doctor each refuse a planted symlink, FIFO or swapped directory, with openat, O_NOFOLLOW, bounded reads and a SameFile re-check (append-only files)" \
@@ -1188,6 +1188,7 @@ U103|never overwritten or deleted
 U103|LabelRemoved
 U104|keystore-sock/ root:wheel 0755
 U104|cannot unlink, replace or bind keys.sock
+U104|EADDRINUSE
 U105|install over an existing tree, uninstall --purge and doctor
 U106|refuses a non-root caller
 U106|through the euid source
