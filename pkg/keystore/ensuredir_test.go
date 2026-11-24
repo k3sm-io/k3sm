@@ -278,3 +278,25 @@ func TestMkdirAtExistingSyncFailureKeepsErrExist(t *testing.T) {
 		t.Fatalf("EnsureDir over an existing directory with a failed sync: %v, want the sync's error", err)
 	}
 }
+
+// TestStoreDirACLRepairIsSymlinkSafe: the repair the store directory's ACL
+// refusal names takes -h, so a root chmod -N run on a symlink the service
+// user planted at the store directory never strips the ACL of the file it
+// points at; the refusal stays a refusal of the existing directory.
+func TestStoreDirACLRepairIsSymlinkSafe(t *testing.T) {
+	const path = "/var/lib/k3sm/server/keystore"
+	err := dirACLRefusal(path)
+	if !strings.Contains(err.Error(), "sudo chmod -h -N "+path) {
+		t.Fatalf("the ACL refusal %q does not name chmod -h -N %s", err, path)
+	}
+	for _, w := range strings.Fields(err.Error()) {
+		if w == "chmod" || w == "chown" || w == "chflags" {
+			if !strings.Contains(err.Error(), w+" -h ") || strings.Count(err.Error(), w+" ") != strings.Count(err.Error(), w+" -h ") {
+				t.Fatalf("the ACL refusal %q names %s without -h", err, w)
+			}
+		}
+	}
+	if !StoreDirRefused(&storeDirError{err: err}) {
+		t.Fatalf("the ACL refusal is not a store-directory refusal")
+	}
+}

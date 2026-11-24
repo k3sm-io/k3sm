@@ -55,7 +55,7 @@ func TestStoreDirDenialNamesItsCause(t *testing.T) {
 			t.Fatalf("the first pass: %v, want the race text", err)
 		}
 		err = step(t.Context())
-		if err == nil || !strings.Contains(err.Error(), "chmod -N "+storeCfg.Dir) || strings.Contains(err.Error(), storeDirRaceText) {
+		if err == nil || !strings.Contains(err.Error(), "chmod -h -N "+storeCfg.Dir) || strings.Contains(err.Error(), storeDirRaceText) {
 			t.Fatalf("the second pass: %v, want chmod -N %s and not the race", err, storeCfg.Dir)
 		}
 		if strings.Contains(err.Error(), "chown") || strings.Contains(err.Error(), "chflags") {
@@ -74,7 +74,7 @@ func TestStoreDirDenialNamesItsCause(t *testing.T) {
 		step := serverStoreDir(keystore.New(storeCfg), storeCfg.UID, storeCfg.GID)
 		for pass := 1; pass <= 2; pass++ {
 			err := step(t.Context())
-			if err == nil || strings.Contains(err.Error(), storeDirRaceText) || !strings.Contains(err.Error(), parent+" denies the service user") || !strings.Contains(err.Error(), "chmod 700 "+parent) {
+			if err == nil || strings.Contains(err.Error(), storeDirRaceText) || !strings.Contains(err.Error(), parent+" denies the service user") || !strings.Contains(err.Error(), "chmod -h 700 "+parent) {
 				t.Fatalf("pass %d: %v, want the parent %s named and not the race", pass, err, parent)
 			}
 		}

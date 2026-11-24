@@ -394,8 +394,10 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 
 // storeDirRepair is the remedy a refused store directory names
 // (keystore.StoreDirRefused): the server creates a missing one, but never
-// repairs one that exists.
-const storeDirRepair = "the server never repairs an existing store directory: as root, make it the service user's at mode 0700 with no extended ACL, or remove it if it holds nothing, and the next start check creates it"
+// repairs one that exists. Every command it names takes -h, so a symlink
+// the service user planted at the store directory is changed itself, never
+// followed to a file root then changes (TestStoreDirRepairIsSymlinkSafe).
+const storeDirRepair = "the server never repairs an existing store directory: as root, make it the service user's at mode 0700 with no extended ACL (chown -h, chmod -h 700 and chmod -h -N on it, which never follow a symlink), or remove it if it holds nothing, and the next start check creates it"
 
 // storeDirRaceText is what a first pass that cannot open the store
 // directory names when it may be the race with a root put
@@ -416,7 +418,8 @@ func storeDirAccessRepair(d keystore.DirDenial, uid, gid uint32) string {
 	switch d.Cause {
 	case keystore.DeniedParent:
 		if d.Unreachable {
-			return fmt.Sprintf("%s cannot be reached: the data root above it denies the service user its search, and a root keys put never changes it: as root, make %s root:wheel at mode 0755, as the installer makes it", d.Path, filepath.Dir(d.Path))
+			up := filepath.Dir(d.Path)
+			return fmt.Sprintf("%s cannot be reached: the data root above it denies the service user its search, and a root keys put never changes it: as root, make %s root:wheel at mode 0755, as the installer makes it: chown -h root:wheel %s, then chmod -h 755 %s", d.Path, up, up, up)
 		}
 		return fmt.Sprintf("%s denies the service user its search or read, so the store directory cannot be reached, and a root keys put never changes it: as root, make it the service user's at mode 0700, as the installer makes it: %s", d.Path, strings.Join(dirRepairSteps(d, uid, gid), ", then "))
 	case keystore.DeniedForeign:
@@ -435,21 +438,24 @@ func storeDirAccessRepair(d keystore.DirDenial, uid, gid uint32) string {
 // other step, chmod -N where an ACL is there or could not be read, then
 // chown and chmod where the owner or the mode is wrong. When nothing read
 // explains the denial (the owner, the mode and the flags are right and no
-// ACL is there), every step that can deny an open is named.
+// ACL is there), every step that can deny an open is named. Every command
+// takes -h: the service user can plant a symlink at d.Path, and a root
+// command that followed it would change whatever it points at
+// (TestStoreDirRepairIsSymlinkSafe).
 func dirRepairSteps(d keystore.DirDenial, uid, gid uint32) []string {
 	var steps []string
 	if d.Immutable {
-		steps = append(steps, fmt.Sprintf("chflags nouchg,noschg %s (it is immutable, and chown and chmod fail on it until then)", d.Path))
+		steps = append(steps, fmt.Sprintf("chflags -h nouchg,noschg %s (it is immutable, and every later step fails on it until then)", d.Path))
 	}
-	acl := fmt.Sprintf("chmod -N %s (its extended ACL can deny the open)", d.Path)
+	acl := fmt.Sprintf("chmod -h -N %s (its extended ACL can deny the open)", d.Path)
 	switch {
 	case d.ACL:
 		steps = append(steps, acl)
 	case d.ACLUnknown:
-		steps = append(steps, fmt.Sprintf("chmod -N %s (its ACL could not be read, and one can deny the open)", d.Path))
+		steps = append(steps, fmt.Sprintf("chmod -h -N %s (its ACL could not be read, and one can deny the open)", d.Path))
 	}
-	chown := fmt.Sprintf("chown %d:%d %s", uid, gid, d.Path)
-	chmod := "chmod 700 " + d.Path
+	chown := fmt.Sprintf("chown -h %d:%d %s", uid, gid, d.Path)
+	chmod := "chmod -h 700 " + d.Path
 	if !d.Known || d.Owner != uid {
 		steps = append(steps, chown)
 	}

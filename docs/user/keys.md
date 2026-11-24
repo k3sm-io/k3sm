@@ -186,7 +186,8 @@ its `keystore-user-scope` row says only what it can check:
   directory at start; once the server has started, the row passes. A directory that is there but
   not the server's user's at mode 0700, or that carries an extended ACL, is refused, by the server
   and by `doctor`, and the server never repairs it: as root, make it the server's user's at 0700
-  with no ACL (`sudo chmod -N` on it removes one), or remove it if it holds
+  with no ACL (`sudo chown -h`, `sudo chmod -h 700` and `sudo chmod -h -N`, which removes one;
+  `-h` changes a symlink planted there itself and never follows it), or remove it if it holds
   nothing, and the server creates it again;
   `the service uid is in the login range` means the service user's uid is 501 or above, where
   login users' uids start, and the listener does not start until the service user is a system

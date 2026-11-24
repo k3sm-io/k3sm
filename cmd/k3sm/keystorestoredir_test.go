@@ -240,7 +240,7 @@ func TestStoreDirRaceTextIsTransient(t *testing.T) {
 	persists("the third consecutive pass")
 	// The directory is the service user's at mode 0: the repair is the
 	// chmod, not a chown it does not need.
-	if err := step(t.Context()); err == nil || !strings.Contains(err.Error(), "chmod 700 "+storeCfg.Dir) || strings.Contains(err.Error(), "chown") || !strings.Contains(err.Error(), "or remove it if it holds nothing") {
+	if err := step(t.Context()); err == nil || !strings.Contains(err.Error(), "chmod -h 700 "+storeCfg.Dir) || strings.Contains(err.Error(), "chown") || !strings.Contains(err.Error(), "or remove it if it holds nothing") {
 		t.Fatalf("a mode-0 directory of the service user's: %v, want chmod 700 and no chown", err)
 	}
 	if err := os.Chmod(storeCfg.Dir, 0o700); err != nil {

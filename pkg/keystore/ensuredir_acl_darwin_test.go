@@ -43,7 +43,7 @@ func TestEnsureDirRefusesExtendedACL(t *testing.T) {
 			t.Fatalf("chmod +a: %v: %s", err, out)
 		}
 		err := s.EnsureDir()
-		if !StoreDirRefused(err) || StoreDirRace(err) || !strings.Contains(err.Error(), "extended ACL") || !strings.Contains(err.Error(), "chmod -N") {
+		if !StoreDirRefused(err) || StoreDirRace(err) || !strings.Contains(err.Error(), "extended ACL") || !strings.Contains(err.Error(), "chmod -h -N") {
 			t.Fatalf("EnsureDir = %v: refused %v race %v, want a refusal naming the ACL", err, StoreDirRefused(err), StoreDirRace(err))
 		}
 		if err := s.CheckDir(); err == nil || !strings.Contains(err.Error(), "extended ACL") {

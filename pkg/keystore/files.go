@@ -651,10 +651,19 @@ func judgeDirACL(root *os.Root, path string) error {
 	case err != nil:
 		return fmt.Errorf("%s: %w", path, err)
 	case acl:
-		return &dirRefusal{fmt.Errorf("%s has an extended ACL, which can grant past its mode (sudo chmod -N %s removes it)", path, path)}
+		return dirACLRefusal(path)
 	}
 	return nil
 }
+
+// dirACLRefusal is judgeDirACL's refusal of path, a store directory with an
+// extended ACL. Its repair takes -h: the service user can plant a symlink
+// at path, and a root chmod -N that followed it would strip the ACL of
+// whatever it points at (TestStoreDirACLRepairIsSymlinkSafe).
+func dirACLRefusal(path string) error {
+	return &dirRefusal{fmt.Errorf("%s has an extended ACL, which can grant past its mode (sudo chmod -h -N %s removes it, and never follows a symlink)", path, path)}
+}
+
 
 // closeAfter closes root once err, the judgement made on it, is known, and
 // returns err, or the close's error when err is nil.

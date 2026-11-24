@@ -4438,11 +4438,16 @@ directory is root's"). A worker node runs no listener (E18).
     a root put left root's when it died before the handover, an operator's `sudo mkdir -m 700`,
     or one carrying a deny ACE, and those never clear. From the second consecutive denied pass
     it names `if this persists, it is not the race`, why (root owns it, or the service user
-    cannot open it), and the steps: `chflags nouchg,noschg` when an immutable flag is set (it
-    denies no open, but `chown` and `chmod` fail on it until then), `chmod -N` when an extended
-    ACL is there or cannot be read, `chown <uid>:<gid>` when the owner is wrong, `chmod 700`
-    when the owner lacks a mode bit, or, when nothing read explains the denial, `chmod -N`,
-    `chown` and `chmod 700` all; `or remove it if it holds nothing`.
+    cannot open it), and the steps: `chflags -h nouchg,noschg` when an immutable flag is set (it
+    denies no open, but `chown` and `chmod` fail on it until then), `chmod -h -N` when an
+    extended ACL is there or cannot be read, `chown -h <uid>:<gid>` when the owner is wrong,
+    `chmod -h 700` when the owner lacks a mode bit, or, when nothing read explains the denial,
+    `chmod -h -N`, `chown -h` and `chmod -h 700` all; `or remove it if it holds nothing`.
+  Every root repair command these remedies and the refusals of an existing directory name takes
+  `-h` (valid for `chown`, `chmod` and `chflags` on macOS): the service user can plant a
+  symlink at the store directory, and a root command that followed it would change whatever it
+  points at, so `-h` changes the link itself (`TestStoreDirRepairIsSymlinkSafe`,
+  `TestStoreDirACLRepairIsSymlinkSafe`).
   The server's step keeps the count; a pass that runs the step and is not denied
   resets it. A refusal of an existing directory on what it is (not a directory, its owner, its
   mode, an extended ACL: `keystore.StoreDirRefused`) names its repair on every pass
