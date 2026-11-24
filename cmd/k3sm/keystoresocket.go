@@ -366,7 +366,7 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 		CheckInstall:      checkInstallOn(pass, store.CheckSocketInstall),
 		ServerCount:       func(ctx context.Context) (int, error) { return countKeystoreServers(ctx, cs) },
 		MaintenanceMarked: logs.MaintenanceMarked,
-		StoreDir:          serverStoreDir(store),
+		StoreDir:          serverStoreDir(store, uid, gid),
 		OpenLogs: func(ctx context.Context) error {
 			if err := logs.Reopen(ctx); err != nil {
 				return err
@@ -395,24 +395,49 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 // repairs one that exists.
 const storeDirRepair = "the server never repairs an existing store directory: as root, make it the service user's at mode 0700 with no extended ACL, or remove it if it holds nothing, and the next start check creates it"
 
-// storeDirRaceText is what the one-pass errors of the race with a root put
-// name (keystore.StoreDirRace): nothing to repair, the next pass retries.
+// storeDirRaceText is what a first pass that cannot open the store
+// directory names when it may be the race with a root put
+// (keystore.StoreDirRace): nothing to repair yet, the next pass retries.
 const storeDirRaceText = "a root keys put may be creating it; retried"
+
+// storeDirAccessRepair is what a store directory the server cannot open
+// names from the second consecutive pass on, or on the first when its
+// owner is neither root nor the service user (keystore.StoreDirDenied and
+// not StoreDirRace): the race clears within a pass, so a denial that
+// persists is a directory that is not the service user's. Its verbs are
+// the service uid and gid.
+const storeDirAccessRepair = "if this persists, a root keys put died before handing it over, or the directory is not the service user's: as root, chown %d:%d and chmod 700 it, or remove it if it holds nothing"
 
 // serverStoreDir is the server's store-directory step: the store directory
 // created if it is missing, with the store's own helper, and judged as
 // every open judges it (keystore.FileStore.EnsureDir). It runs on every
 // pass, so a directory a racing root put has made but not yet handed to
 // the service user is refused for that pass only; one that stays wrong is
-// refused on every pass and never repaired. Only that persistent refusal
-// names the repair (storeDirRepair); the race's errors say they are
-// retried (storeDirRaceText), and any other error stands on its own text.
-func serverStoreDir(store *keystore.FileStore) func(context.Context) error {
+// refused on every pass and never repaired. A refusal on what the
+// directory is names the repair (storeDirRepair). A directory it cannot
+// open is worded as the race (storeDirRaceText) only on the first of
+// consecutive passes that run this step and are denied, and only when
+// its owner could be a racing put's; from the second such pass, or for a
+// third uid's directory, it names the repair (storeDirAccessRepair). Any
+// pass that is not denied resets the count. Any other error stands on its
+// own text. The returned step keeps that count, so it is one supervisor's,
+// called from its one start-check loop.
+func serverStoreDir(store *keystore.FileStore, uid, gid uint32) func(context.Context) error {
+	denied := 0
 	return func(context.Context) error {
 		err := store.EnsureDir()
+		if !keystore.StoreDirDenied(err) {
+			denied = 0
+		}
 		switch {
 		case err == nil:
 			return nil
+		case keystore.StoreDirDenied(err):
+			denied++
+			if keystore.StoreDirRace(err) && denied == 1 {
+				return fmt.Errorf("%w (%s)", err, storeDirRaceText)
+			}
+			return fmt.Errorf("%w (%s)", err, fmt.Sprintf(storeDirAccessRepair, uid, gid))
 		case keystore.StoreDirRefused(err):
 			return fmt.Errorf("%w (%s)", err, storeDirRepair)
 		case keystore.StoreDirRace(err):

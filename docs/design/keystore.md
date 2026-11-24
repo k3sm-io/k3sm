@@ -4361,12 +4361,21 @@ directory is root's"). A worker node runs no listener (E18).
   other only judges it; the server's `mkdir` makes a directory the service user already owns,
   which the put's judgement accepts, and a put's `mkdir` makes one root owns until its
   handover, which the server refuses for that pass only, finding it handed over on the next.
-  The race's one-pass errors (the directory cannot be opened, as a root-owned one before its
-  handover cannot; or a directory the server has just made already holds a name a racing put
-  wrote, `ErrCorrupt` "is not empty") name no repair: they say `a root keys put may be creating
-  it; retried` (`keystore.StoreDirRace`). Only a refusal of an existing directory on what it is
-  (not a directory, its owner, its mode, an extended ACL: `keystore.StoreDirRefused`) names the
-  repair (`TestStoreDirRaceTextIsTransient`, `TestEnsureDirClassifiesRefusals`,
+  A directory the server has just made that already holds a name a racing put wrote
+  (`ErrCorrupt` "is not empty") names no repair: it says `a root keys put may be creating it;
+  retried` (`keystore.StoreDirRace`). A directory the server cannot open (EACCES,
+  `keystore.StoreDirDenied`) is worded as that race only on the first of consecutive passes
+  denied, and only when an `Lstat` of its name (which needs only `server/`'s search permission)
+  shows it root's or the service user's: a root-owned one before its handover cannot be opened,
+  but neither can one a root put left root's when it died before the handover, an operator's
+  `sudo mkdir -m 700`, or another uid's, all at 0700, and those never clear. From the second
+  consecutive denied pass, or on the first for a third uid's directory, it names the repair:
+  `if this persists, a root keys put died before handing it over, or the directory is not the
+  service user's: as root, chown <uid>:<gid> and chmod 700 it, or remove it if it holds
+  nothing`. The server's step keeps the count; a pass that runs the step and is not denied
+  resets it. A refusal of an existing directory on what it is (not a directory, its owner, its
+  mode, an extended ACL: `keystore.StoreDirRefused`) names its repair on every pass
+  (`TestStoreDirRaceTextIsTransient`, `TestEnsureDirClassifiesRefusals`,
   `TestEnsureDirRefusesExtendedACL`).
   Doctor runs the same judgement read-only: before the server's first start it shows the
   user scope off for the store directory, saying the server creates it at start.

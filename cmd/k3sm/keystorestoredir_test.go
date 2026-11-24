@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -189,7 +190,7 @@ func TestDoctorStoreDirRow(t *testing.T) {
 	if _, err := os.Lstat(storeCfg.Dir); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("doctor's step created the store directory: %v", err)
 	}
-	if err := serverStoreDir(store)(t.Context()); err != nil {
+	if err := serverStoreDir(store, storeCfg.UID, storeCfg.GID)(t.Context()); err != nil {
 		t.Fatalf("the server's step: %v", err)
 	}
 	if r := row(); r.status != statusPass {
@@ -200,11 +201,13 @@ func TestDoctorStoreDirRow(t *testing.T) {
 	}
 }
 
-// TestStoreDirRaceTextIsTransient: the server's store-directory step names
-// the "as root, make it ... or remove it" repair only for a persistent
-// refusal of an existing directory; a directory it cannot open, as one a
-// root put has made and not yet handed over, is worded as the one-pass race
-// it is, retried, with no repair.
+// TestStoreDirRaceTextIsTransient: the server's store-directory step words
+// a directory it cannot open, as one a root put has made and not yet
+// handed over, as the one-pass race it may be (retried, no repair) on the
+// first consecutive denied pass only; from the second it names the chown
+// and chmod repair, and a pass that clears resets the count. The "as root,
+// make it ... or remove it" repair is for a refusal on what the directory
+// is.
 func TestStoreDirRaceTextIsTransient(t *testing.T) {
 	f, _ := installedWiringFixture(t, false)
 	storeCfg := f.deps.layout(f.deps.workDir)
@@ -214,20 +217,55 @@ func TestStoreDirRaceTextIsTransient(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(storeCfg.Dir, 0o700) })
-	err := serverStoreDir(store)(t.Context())
-	if err == nil || !strings.Contains(err.Error(), storeDirRaceText) || strings.Contains(err.Error(), storeDirRepair) {
-		t.Fatalf("a directory the server cannot open: %v, want %q and no repair", err, storeDirRaceText)
+	step := serverStoreDir(store, storeCfg.UID, storeCfg.GID)
+	access := fmt.Sprintf(storeDirAccessRepair, storeCfg.UID, storeCfg.GID)
+	race := func(pass string) {
+		t.Helper()
+		err := step(t.Context())
+		if err == nil || !strings.Contains(err.Error(), storeDirRaceText) || strings.Contains(err.Error(), access) || strings.Contains(err.Error(), storeDirRepair) {
+			t.Fatalf("%s: %v, want %q and no repair", pass, err, storeDirRaceText)
+		}
 	}
+	persists := func(pass string) {
+		t.Helper()
+		err := step(t.Context())
+		if err == nil || !strings.Contains(err.Error(), access) || strings.Contains(err.Error(), storeDirRaceText) {
+			t.Fatalf("%s: %v, want %q and not the race text", pass, err, access)
+		}
+	}
+	race("the first pass that cannot open the directory")
 	if !strings.Contains(storeDirRaceText, "a root keys put may be creating it; retried") {
 		t.Fatalf("the race text %q does not say it is transient", storeDirRaceText)
 	}
+	persists("the second consecutive pass")
+	persists("the third consecutive pass")
+	for _, want := range []string{"if this persists, a root keys put died before handing it over, or the directory is not the service user's", fmt.Sprintf("chown %d:%d and chmod 700 it", storeCfg.UID, storeCfg.GID), "or remove it if it holds nothing"} {
+		if !strings.Contains(access, want) {
+			t.Fatalf("the repair %q does not say %q", access, want)
+		}
+	}
+	if err := os.Chmod(storeCfg.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := step(t.Context()); err != nil {
+		t.Fatalf("a pass that clears: %v", err)
+	}
+	if err := os.Chmod(storeCfg.Dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	race("the first denied pass after one that cleared")
+	persists("the second denied pass after one that cleared")
 	if err := os.Chmod(storeCfg.Dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	err = serverStoreDir(store)(t.Context())
+	err := step(t.Context())
 	if err == nil || !strings.Contains(err.Error(), storeDirRepair) || strings.Contains(err.Error(), storeDirRaceText) {
 		t.Fatalf("a wider mode: %v, want the repair and not the race text", err)
 	}
+	if err := os.Chmod(storeCfg.Dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	race("the first denied pass after a refusal, which is not denied")
 }
 
 // TestKeystoreListenerOffWhileMergePending: with a restore staged (the

@@ -123,12 +123,12 @@ func TestEnsureDir(t *testing.T) {
 }
 
 // TestEnsureDirClassifiesRefusals: EnsureDir marks a persistent refusal of
-// an existing directory (its mode or owner) as StoreDirRefused, and the
-// one-pass errors of the race with a root put as StoreDirRace: a directory
-// it cannot open (EACCES, as on one root has made and not yet handed over),
-// and a directory it has just made that a racing put already writes in
-// (ErrCorrupt, not empty). Neither is the other, and the text is the
-// open's.
+// an existing directory (its mode or owner) as StoreDirRefused; a directory
+// it cannot open (EACCES) as StoreDirDenied, and as StoreDirRace too when
+// its owner is root or the service user (as one root has made and not yet
+// handed over), never when it is a third uid's; and a directory it has just
+// made that a racing put already writes in (ErrCorrupt, not empty) as
+// StoreDirRace alone. The text is the open's.
 func TestEnsureDirClassifiesRefusals(t *testing.T) {
 	t.Run("a wider mode is a refusal", func(t *testing.T) {
 		s, server := newTestStore(t)
@@ -141,7 +141,7 @@ func TestEnsureDirClassifiesRefusals(t *testing.T) {
 		}
 		giveToService(t, dir)
 		err := s.EnsureDir()
-		if !StoreDirRefused(err) || StoreDirRace(err) || !strings.Contains(err.Error(), "grants more than") {
+		if !StoreDirRefused(err) || StoreDirRace(err) || StoreDirDenied(err) || !strings.Contains(err.Error(), "grants more than") {
 			t.Fatalf("EnsureDir = %v: refused %v race %v, want a refusal", err, StoreDirRefused(err), StoreDirRace(err))
 		}
 	})
@@ -153,8 +153,31 @@ func TestEnsureDirClassifiesRefusals(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 		err := s.EnsureDir()
-		if !errors.Is(err, fs.ErrPermission) || !StoreDirRace(err) || StoreDirRefused(err) {
-			t.Fatalf("EnsureDir = %v: refused %v race %v, want the race", err, StoreDirRefused(err), StoreDirRace(err))
+		if !errors.Is(err, fs.ErrPermission) || !StoreDirDenied(err) || !StoreDirRace(err) || StoreDirRefused(err) {
+			t.Fatalf("EnsureDir = %v: refused %v denied %v race %v, want denied and the race", err, StoreDirRefused(err), StoreDirDenied(err), StoreDirRace(err))
+		}
+	})
+	t.Run("a third uid's directory it cannot open is denied, never the race", func(t *testing.T) {
+		s, server := newTestStore(t)
+		dir := filepath.Join(server, "keystore")
+		if err := os.Mkdir(dir, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		owner := fi.Sys().(*syscall.Stat_t).Uid
+		if owner == 0 {
+			t.Skip("run as root: the directory is root's, which the race may be")
+		}
+		// The service uid made other than the directory's owner, which is
+		// not root either: a third uid's directory.
+		s.uid = owner + 1
+		err = s.EnsureDir()
+		if !errors.Is(err, fs.ErrPermission) || !StoreDirDenied(err) || StoreDirRace(err) || StoreDirRefused(err) {
+			t.Fatalf("EnsureDir = %v: refused %v denied %v race %v, want denied and not the race", err, StoreDirRefused(err), StoreDirDenied(err), StoreDirRace(err))
 		}
 	})
 	t.Run("a new directory a put already writes in is the race", func(t *testing.T) {
@@ -166,12 +189,12 @@ func TestEnsureDirClassifiesRefusals(t *testing.T) {
 			}
 		}
 		err := s.EnsureDir()
-		if !errors.Is(err, ErrCorrupt) || !StoreDirRace(err) || StoreDirRefused(err) || !strings.Contains(err.Error(), "not empty") {
+		if !errors.Is(err, ErrCorrupt) || !StoreDirRace(err) || StoreDirRefused(err) || StoreDirDenied(err) || !strings.Contains(err.Error(), "not empty") {
 			t.Fatalf("EnsureDir = %v: refused %v race %v, want the race", err, StoreDirRefused(err), StoreDirRace(err))
 		}
 	})
 	t.Run("a nil error is neither", func(t *testing.T) {
-		if StoreDirRefused(nil) || StoreDirRace(nil) {
+		if StoreDirRefused(nil) || StoreDirRace(nil) || StoreDirDenied(nil) {
 			t.Fatal("nil classified")
 		}
 	})
