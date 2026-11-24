@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -731,6 +732,125 @@ var requestTypes = []func() any{
 	func() any { return &ReadForExecRequest{} },
 }
 
+// headerTokens is the fuzz oracle's own read of a header: each top-level
+// key in order with its raw value, tokenized by encoding/json's Decoder,
+// and false when the header is not one JSON object with nothing after it.
+// Unlike json.Unmarshal into a map, which keeps the last of two equal keys,
+// it keeps every key, so a duplicate the parser accepted is seen.
+func headerTokens(header []byte) ([]string, []json.RawMessage, bool) {
+	dec := json.NewDecoder(bytes.NewReader(header))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, nil, false
+	}
+	var (
+		keys []string
+		vals []json.RawMessage
+	)
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, nil, false
+		}
+		k, ok := tok.(string)
+		if !ok {
+			return nil, nil, false
+		}
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return nil, nil, false
+		}
+		keys, vals = append(keys, k), append(vals, v)
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, nil, false
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, nil, false
+	}
+	return keys, vals, true
+}
+
+// duplicateKey reports whether two of keys are the same under
+// encoding/json's case folding, which the strict rule refuses.
+func duplicateKey(keys []string) bool {
+	for i, a := range keys {
+		for _, b := range keys[i+1:] {
+			if strings.EqualFold(a, b) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkDuplicateRefused holds every reader of a header to the strict rule
+// on the oracle's tokens: a header with any key given twice, in any case,
+// is refused by the dispatcher, by every request type's decoder, by the
+// HELLO reader and by the logged entry's reader.
+func checkDuplicateRefused(t *testing.T, header []byte) {
+	t.Helper()
+	keys, _, ok := headerTokens(header)
+	if !ok || !duplicateKey(keys) {
+		return
+	}
+	if op, err := requestOp(header); err == nil {
+		t.Fatalf("requestOp(%q) = %q, accepted a key given twice", header, op)
+	}
+	for _, mk := range requestTypes {
+		if dst := mk(); decodeRequest(header, dst) == nil {
+			t.Fatalf("decodeRequest(%q) into %T accepted a key given twice: %+v", header, dst, dst)
+		}
+	}
+	if h, err := helloOf(header); err == nil {
+		t.Fatalf("helloOf(%q) = %+v, accepted a key given twice", header, h)
+	}
+	if e, ok := requestEntry(header); ok {
+		t.Fatalf("requestEntry(%q) = %q, accepted a key given twice", header, e)
+	}
+}
+
+// checkHelloAgrees holds helloOf to the oracle: it accepts exactly the
+// headers that are one object with no key given twice, whose keys folding
+// to proto, min or max are spelled exactly, and whose fields of those
+// names decode to their types (null is absent), and then reads the same
+// fields.
+func checkHelloAgrees(t *testing.T, header []byte) {
+	t.Helper()
+	got, err := helloOf(header)
+	keys, vals, ok := headerTokens(header)
+	want := helloRequest{}
+	accept := ok && !duplicateKey(keys)
+	for i := 0; accept && i < len(keys); i++ {
+		var dst any
+		switch keys[i] {
+		case "proto":
+			dst = &want.Proto
+		case "min":
+			dst = &want.Min
+		case "max":
+			dst = &want.Max
+		default:
+			for _, k := range []string{"proto", "min", "max"} {
+				if strings.EqualFold(k, keys[i]) {
+					accept = false
+				}
+			}
+			continue
+		}
+		if !bytes.Equal(vals[i], []byte("null")) && json.Unmarshal(vals[i], dst) != nil {
+			accept = false
+		}
+	}
+	switch {
+	case accept && err != nil:
+		t.Fatalf("helloOf(%q) = %v, the oracle accepts it as %+v", header, err, want)
+	case !accept && err == nil:
+		t.Fatalf("helloOf(%q) = %+v, the oracle refuses it", header, got)
+	case accept && got != want:
+		t.Fatalf("helloOf(%q) = %+v, the oracle reads %+v", header, got, want)
+	}
+}
+
 // checkRequestOp holds the dispatcher's read of a request's op to the
 // exact-key rule: it never panics; it fails with a protocol error or
 // names a non-empty op; it fails whenever a key other than "op" folds to
@@ -800,11 +920,15 @@ func checkHelloAndEntry(t *testing.T, header []byte) {
 // the cap is refused before it is parsed; any other failure is a refusal;
 // and a header that decodes re-encodes to an equivalent request. The
 // dispatcher's read of its op keeps to the exact-key rule
-// (checkRequestOp).
+// (checkRequestOp); a key given twice is refused by every reader, on the
+// oracle's own tokens (checkDuplicateRefused); and the HELLO reader
+// accepts exactly what the oracle does (checkHelloAgrees).
 func FuzzRequestHeader(f *testing.F) {
 	f.Fuzz(func(t *testing.T, header []byte) {
 		checkRequestOp(t, header)
 		checkHelloAndEntry(t, header)
+		checkDuplicateRefused(t, header)
+		checkHelloAgrees(t, header)
 		for _, mk := range requestTypes {
 			dst := mk()
 			err := decodeRequest(header, dst)

@@ -4491,7 +4491,10 @@ surface, and the app consumes only those.
   fields ("Strict enough"), never through a case-insensitive, last-key-wins decode: such a field
   spelled in another case (`{"OP":"rm"}`, `{"Proto":…}`), given twice in any case
   (`{"op":"list","Op":"rm"}`) or of the wrong JSON type closes the connection
-  (`TestDispatchOpExactKey`, `TestHelloProtoExactKey`, `FuzzRequestHeader`). The names live in one place,
+  (`TestDispatchOpExactKey`, `TestHelloProtoExactKey`, `FuzzRequestHeader`, whose oracle
+  tokenizes each header with `encoding/json`'s Decoder, so a key given twice that a reader
+  accepted is seen rather than folded by a last-key-wins decode, and holds the HELLO reader to
+  the same strict rule). The names live in one place,
   `pkg/keystore/socket` (U27).
 - **The frame cap follows the value cap.** The largest frame a request needs is the store's
   maximum value, 65,536 bytes (64 KiB), plus the 8,192-byte header cap, plus 9 bytes of type

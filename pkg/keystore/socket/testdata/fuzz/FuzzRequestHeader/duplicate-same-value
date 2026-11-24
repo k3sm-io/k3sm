@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"op\":\"rm\",\"entry\":\"user/501/a\",\"entry\":\"user/501/a\"}")
