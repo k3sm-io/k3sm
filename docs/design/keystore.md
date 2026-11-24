@@ -2065,8 +2065,10 @@ depend on how either regex engine reads anything else. Inside that shape, it pro
 linked generator renders carries the deny with every fold of every letter; it does not test
 that Seatbelt enforces it, which only a sandboxed run can. Under `--runtime hostprocess` the check still runs but reads a profile
 no Pod runs under: hostprocess Pods run unconfined, as the server's uid, which the listener
-refuses, so the server's start log says the check does not apply there
-(`notePodProfileCheckScope`, `TestPodProfileCheckScopeLoggedForHostProcess`).
+refuses, so the server's start log says the check does not apply there. That uid owns the store
+files, so a hostprocess Pod can read them directly, and the same line says the keystore gives no
+confidentiality against it (`notePodProfileCheckScope`,
+`TestPodProfileCheckScopeLoggedForHostProcess`).
 A profile that does not, as from a k3sm built against a runtimed older than the deny or a data
 root the posture does not name, keeps the user scope off for the life of the process with `this
 build's Pod profile does not deny the keystore socket`; the server logs one warning naming

@@ -203,7 +203,7 @@ func TestPodProfileCheckScopeLoggedForHostProcess(t *testing.T) {
 	} {
 		var buf bytes.Buffer
 		notePodProfileCheckScope(tt.runtime, slog.New(slog.NewTextHandler(&buf, nil)))
-		got := strings.Contains(buf.String(), "does not apply under --runtime hostprocess") && strings.Contains(buf.String(), "refuses them by uid")
+		got := strings.Contains(buf.String(), "does not apply under --runtime hostprocess") && strings.Contains(buf.String(), "refuses them by uid") && strings.Contains(buf.String(), "can read them directly") && strings.Contains(buf.String(), "the keystore gives no confidentiality against it")
 		if got != tt.logged || (!tt.logged && buf.Len() != 0) {
 			t.Errorf("runtime %q logged %q, want logged %v", tt.runtime, buf.String(), tt.logged)
 		}

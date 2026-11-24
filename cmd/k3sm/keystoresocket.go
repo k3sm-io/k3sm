@@ -782,12 +782,14 @@ func keystoreSocketPath(workDir string) string {
 // they run unconfined, under no Seatbelt profile, so the profile the check
 // reads is one no Pod runs under. They run as the server's uid, which the
 // listener refuses (socket.NewListener), and that, not the profile, keeps
-// them off the socket. Any other runtime logs nothing.
+// them off the socket. That uid owns the store files, so such a Pod can
+// read them directly: the line says the keystore gives no confidentiality
+// against a hostprocess Pod. Any other runtime logs nothing.
 func notePodProfileCheckScope(runtime string, log *slog.Logger) {
 	if runtime != runtimeHostProcess {
 		return
 	}
-	log.Info("keystore socket: the Pod-profile start check does not apply under --runtime hostprocess; hostprocess Pods run unconfined, under no Seatbelt profile, and the listener refuses them by uid", "runtime", runtime)
+	log.Info("keystore socket: the Pod-profile start check does not apply under --runtime hostprocess; hostprocess Pods run unconfined, under no Seatbelt profile, as the service uid, and the listener refuses them by uid; but that uid owns the store files, so a hostprocess Pod can read them directly, and the keystore gives no confidentiality against it", "runtime", runtime)
 }
 
 // startKeystoreSocket is the server's one entry point for the keystore's
