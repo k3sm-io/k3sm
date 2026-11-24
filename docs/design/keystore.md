@@ -2020,9 +2020,11 @@ data root it serves, in each spelling the generator writes (`/var`, `/private/va
 `/System/Volumes/Data`), with no overlapping allow after the deny (`socket.ProfileDeniesSocket`),
 and, for the same operations and every spelling of the data root, a deny carrying the
 case-folding `regex` filter the generator writes for the data root's `keystore-` names (one that
-matches `keystore-`, `KEYSTORE-` and each spelling with a letter replaced by a rune the data volume
-folds onto it, U+212A for `k` and U+017F for `s`, and not `xeystore-`): a profile without it fails
-the check (`TestProfileDeniesSocket`). The check is lexical and narrower than Seatbelt: it reads
+matches `keystore-`, `KEYSTORE-`, each spelling with a letter replaced by a rune the data volume
+folds onto it, U+212A for `k` and U+017F for `s`, and the mixed-case `KEystore-` and `kEyStOrE-`,
+each with a path after it, `keystore-sock/keys.sock`, and not `xeystore-sock/keys.sock`; so a
+regex ending in `$` after the prefix, or an alternation of only the single-letter spellings, does
+not count): a profile without it fails the check (`TestProfileDeniesSocket`). The check is lexical and narrower than Seatbelt: it reads
 top-level `(allow ...)` and `(deny ...)` forms only, so a rule nested in any other form is not
 seen; only an exact `(subpath "P")` filter, bare or under `(remote unix-socket ...)`, covers the
 socket's directory, so a `literal`, `prefix` or `regex` filter, or one under `require-any` or

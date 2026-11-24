@@ -185,9 +185,13 @@ func covers(filter sexp, unix bool, dir string) bool {
 // foldsPrefix reports whether filter is (regex #"^R/X"), or with unix set
 // (remote unix-socket (regex ...)), where R is root as regexp.QuoteMeta
 // writes it and X, read as a Go regexp anchored at its start, matches every
-// spelling the data volume folds onto keystorepaths.DataRootPrefix
-// (prefixFoldings) and not the prefix with its first letter changed. A
-// regex that does not compile, or one written another way, does not count.
+// spelling the data volume folds onto keystorepaths.DataRootPrefix that it
+// probes (prefixFoldings, then prefixMixedCase) with a path after it, as
+// the socket's own name is (keystorepaths.DataRootPrefix + probePath), and
+// not the prefix with its first letter changed. So a regex anchored at
+// its end ($) after the prefix, or an alternation of only the spellings
+// probed one letter at a time, does not count; nor does one that does not
+// compile, or one written another way.
 func foldsPrefix(filter sexp, unix bool, root string) bool {
 	if unix {
 		if len(filter.list) != 3 || filter.list[0].atom != "remote" || filter.list[1].atom != "unix-socket" {
@@ -206,12 +210,35 @@ func foldsPrefix(filter sexp, unix bool, root string) bool {
 	if err != nil {
 		return false
 	}
-	for _, name := range prefixFoldings() {
-		if !re.MatchString(name) {
+	for _, name := range append(prefixFoldings(), prefixMixedCase()...) {
+		if !re.MatchString(name + probePath) {
 			return false
 		}
 	}
-	return !re.MatchString("x" + keystorepaths.DataRootPrefix[1:])
+	return !re.MatchString("x" + keystorepaths.DataRootPrefix[1:] + probePath)
+}
+
+// probePath is what foldsPrefix appends to each spelling it probes: the
+// rest of the socket's path under a keystore- directory, so a regex must
+// match the names under the prefix, not the prefix alone.
+const probePath = "sock/keys.sock"
+
+// prefixMixedCase returns keystorepaths.DataRootPrefix with two or more
+// letters changed at once, which no single-letter folding (prefixFoldings)
+// probes: its first two letters upper case ("KEystore-") and every other
+// letter upper case from the second ("kEyStOrE-").
+func prefixMixedCase() []string {
+	prefix := []rune(keystorepaths.DataRootPrefix)
+	firstTwo, alternate := slices.Clone(prefix), slices.Clone(prefix)
+	for i := range prefix {
+		if i < 2 {
+			firstTwo[i] = unicode.ToUpper(prefix[i])
+		}
+		if i%2 == 1 {
+			alternate[i] = unicode.ToUpper(prefix[i])
+		}
+	}
+	return []string{string(firstTwo), string(alternate)}
 }
 
 // prefixFoldings returns keystorepaths.DataRootPrefix in lower and upper
