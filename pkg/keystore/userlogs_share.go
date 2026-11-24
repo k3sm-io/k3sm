@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 )
 
@@ -155,19 +156,28 @@ func (l *appendLog) lineRecon(line []byte) bool {
 	return err == nil && recon
 }
 
+// errShareSpent marks the ErrLogFull of a line past its uid's own share,
+// and errBudgetSpent that of a revocation line past the budget it draws on:
+// each is that uid's alone, so the socket answers it with the per-uid
+// log-full code and never as the global append failure (uidLogRefusal).
+var (
+	errShareSpent  = errors.New("the caller's log share is spent")
+	errBudgetSpent = errors.New("the caller's revocation budget is spent")
+)
+
 // shareSpent is the ErrLogFull of a line of the caller's past its own share:
 // that uid's alone, never the global append failure.
 func (l *appendLog) shareSpent() error {
-	return fmt.Errorf("%w (the caller's share of %s is spent)", ErrLogFull, l.name)
+	return fmt.Errorf("%w (%w: the caller's share of %s is spent)", ErrLogFull, errShareSpent, l.name)
 }
 
 // budgetSpent is the ErrLogFull of a revocation line past the budget it
 // draws on.
 func (l *appendLog) budgetSpent(on drawsOn) error {
 	if on == drawsAllowance {
-		return fmt.Errorf("%w (the caller's reconciler allowance in %s is spent)", ErrLogFull, l.name)
+		return fmt.Errorf("%w (%w: the caller's reconciler allowance in %s is spent)", ErrLogFull, errBudgetSpent, l.name)
 	}
-	return fmt.Errorf("%w (the caller's revocation budget in %s is spent)", ErrLogFull, l.name)
+	return fmt.Errorf("%w (%w: the caller's revocation budget in %s is spent)", ErrLogFull, errBudgetSpent, l.name)
 }
 
 // planCharge judges lines, each ending in a newline, appended as one buffer

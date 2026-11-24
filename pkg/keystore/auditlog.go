@@ -32,22 +32,56 @@ const auditFormat = 1
 // auditRecord is one audit line as it is written and read
 // (docs/design/keystore.md § "The audit log"). It has no field for a value
 // and none for a value's length, so no line can carry either. Via names the
-// path the operation came by ("root" for a root verb); a line without it,
-// as every line written before it existed is, still reads. The caller and
-// fingerprint fields are the socket's to add. The delivery field is
+// path the operation came by ("root" for a root verb, "socket" for an
+// operation that arrived on the user socket); a line without it, as every
+// line written before it existed is, still reads. Caller is the socket
+// peer: its uid, and its pid, which is advisory. Version and Fingerprint
+// are the version an operation wrote and its per-scope fingerprint, on the
+// lines of the operations that write one (put, rotate); every other line
+// carries neither. The delivery field is
 // DeliveryUID in Go, not Delivery: the export gate (unexported_test.go)
 // reads a bare Delivery identifier as the delivery type, and would count
 // every exported caller of the audit writer as reaching the user scope.
 type auditRecord struct {
-	V           int    `json:"v"`
-	TS          string `json:"ts"`
-	Op          string `json:"op"`
-	Via         string `json:"via,omitempty"`
-	Scope       string `json:"scope"`
-	Name        string `json:"name"`
-	Namespace   string `json:"namespace"`
-	DeliveryUID string `json:"delivery,omitempty"`
-	Result      string `json:"result"`
+	V           int          `json:"v"`
+	TS          string       `json:"ts"`
+	Op          string       `json:"op"`
+	Via         string       `json:"via,omitempty"`
+	Caller      *auditCaller `json:"caller,omitempty"`
+	Scope       string       `json:"scope"`
+	Name        string       `json:"name"`
+	Version     uint64       `json:"version,omitempty"`
+	Fingerprint string       `json:"fingerprint,omitempty"`
+	Namespace   string       `json:"namespace"`
+	DeliveryUID string       `json:"delivery,omitempty"`
+	Result      string       `json:"result"`
+}
+
+// auditCaller is an audit line's caller: the socket peer's uid, and its
+// pid, advisory only (a pid is reused, and is read at the connection's
+// accept), omitted when the peer credentials gave none.
+type auditCaller struct {
+	UID uint32 `json:"uid"`
+	PID int32  `json:"pid,omitempty"`
+}
+
+// auditCallerKeys are auditCaller's JSON keys, exact.
+var auditCallerKeys = []string{"uid", "pid"}
+
+// UnmarshalJSON decodes a caller object as strictly as the line around it
+// (auditKeysStrictOf): a key given twice, or a known key in another case,
+// makes the whole line damage, so no reader picks between two uids.
+func (c *auditCaller) UnmarshalJSON(b []byte) error {
+	if err := auditKeysStrictOf(b, auditCallerKeys); err != nil {
+		return fmt.Errorf("the caller: %w", err)
+	}
+	type plain auditCaller
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*c = auditCaller(p)
+	return nil
 }
 
 // fileAuditLog is the file-backed audit log.
@@ -91,8 +125,11 @@ func marshalAuditLine(l auditLine, now time.Time) ([]byte, error) {
 		TS:          now.UTC().Format(time.RFC3339Nano),
 		Op:          l.op,
 		Via:         l.via,
+		Caller:      l.caller,
 		Scope:       l.scope,
 		Name:        l.name,
+		Version:     l.version,
+		Fingerprint: l.fingerprint,
 		Namespace:   l.namespace,
 		DeliveryUID: l.delivery,
 		Result:      l.result,
@@ -131,7 +168,7 @@ func parseAuditLine(line []byte) (auditRecord, error) {
 }
 
 // auditKeys are auditRecord's JSON keys, exact.
-var auditKeys = []string{"v", "ts", "op", "via", "scope", "name", "namespace", "delivery", "result"}
+var auditKeys = []string{"v", "ts", "op", "via", "caller", "scope", "name", "version", "fingerprint", "namespace", "delivery", "result"}
 
 // auditKeysStrict refuses line unless it is one JSON object whose keys are
 // each given once and, where one matches a known key under encoding/json's

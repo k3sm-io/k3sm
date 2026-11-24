@@ -35,7 +35,7 @@ func TestRmBurialNeverLosesItsAuditLine(t *testing.T) {
 		t.Run(fmt.Sprintf("tight audit %v", tightAudit), func(t *testing.T) {
 			s, _, u := fileLogScope(t)
 			// The longest name, so the burial is the worst case, 1,891
-			// bytes, and the budget left over, under 2,276, is the window
+			// bytes, and the budget left over, under 2,336, is the window
 			// where the floor holds the burial and less than an audit line.
 			name := strings.Repeat("n", maxNameLen)
 			userPut(t, u, "user/1001/"+name, "a value")

@@ -386,7 +386,7 @@ func TestShareResetAfterAuditRotate(t *testing.T) {
 // past the hard cap, and the audit log's the pre-frame part besides.
 func TestLogReadBoundHoldsBothBudgets(t *testing.T) {
 	s, _ := newServerLogsStore(t)
-	want := int64(256<<20 + 1024*(704<<10+256<<10) + 1<<20)
+	want := int64(256<<20 + 1024*(720<<10+256<<10) + 1<<20)
 	if got := s.logReadBound(); got != want {
 		t.Fatalf("logReadBound at the defaults = %d, want %d", got, want)
 	}

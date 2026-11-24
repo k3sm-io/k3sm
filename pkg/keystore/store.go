@@ -119,7 +119,7 @@ type Config struct {
 	// LogSoftCap and LogHardCap are each append-only log's soft and hard
 	// caps in bytes (keystore.logSoftCap, keystore.logHardCap), and
 	// LogRevocationBudget each uid's bytes per log for the revocation class
-	// past the hard cap. Zero is the default: 64 MiB, 256 MiB and 704 KiB
+	// past the hard cap. Zero is the default: 64 MiB, 256 MiB and 720 KiB
 	// (defaultLogRevocationBytes). A negative value, a soft cap over the
 	// hard cap, or a budget under one worst-case burial plus its audit line
 	// (minLogRevokeBudget), makes every operation fail.
@@ -209,6 +209,10 @@ type FileStore struct {
 	// its floor line, which the next operation on the scope catches up. A
 	// pointer, as userScopesStarted is; New allocates it.
 	lostLines *lostEntryLines
+	// audit is the user-scope audit appends' state: the global append
+	// failure and the unaudited-operation count (userorigin.go). A pointer,
+	// as userScopesStarted is; New allocates it.
+	audit *auditState
 }
 
 var _ Store = (*FileStore)(nil)
@@ -245,6 +249,7 @@ func New(cfg Config) *FileStore {
 		userScopesStarted: new(atomic.Bool),
 		quarantined:       new(atomic.Pointer[map[uint32]bool]),
 		lostLines:         new(lostEntryLines),
+		audit:             new(auditState),
 	}
 	if cfg.LogFlags != nil {
 		s.logFlags = cfg.LogFlags

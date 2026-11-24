@@ -106,32 +106,34 @@ const (
 	maxBurialTombstones = 2 + maxTreeGenerations
 	// maxTombLineBytes and maxRmAuditLineBytes are the longest tombstone and
 	// rm audit line: the longest scope (user/2147483647), a 253-byte name,
-	// the longest result and a full RFC3339Nano timestamp
-	// (TestCheckConfigRevocationBudgetFloor). The tombstone is
+	// the longest result and a full RFC3339Nano timestamp, the audit line as
+	// the socket writes it, with via socket and the longest caller uid and
+	// pid (TestCheckConfigRevocationBudgetFloor). The tombstone is
 	// 15 + 1 + 253 + 1 + 32 + 1 + 2 ("rm") + 1 + 8 (its checksum) + 1 (its
 	// newline) = 315 bytes.
 	maxTombLineBytes    = 315
-	maxRmAuditLineBytes = 384
+	maxRmAuditLineBytes = 444
 	// minLogRevokeBudget is the least revocation budget checkConfig accepts:
 	// one worst-case burial plus its audit line, each one append led by its
-	// newline, 6 × 315 + 1 + 384 + 1 = 2,276 bytes, which is over two whole
+	// newline, 6 × 315 + 1 + 444 + 1 = 2,336 bytes, which is over two whole
 	// appends (2,050).
 	minLogRevokeBudget = maxBurialTombstones*maxTombLineBytes + 1 + maxRmAuditLineBytes + 1
 	// defaultLogRevocationBytes holds one scope's full revocation, under the
 	// longest scope and a 253-byte name, each append charged its leading
 	// newline: each of maxScopeEntries entries rm'd, a burial of
-	// maxBurialTombstones 315-byte tombstones and a 384-byte audit line,
-	// 256 × (6 × 315 + 1 + 384 + 1) = 582,656 bytes; and maxDeliveries
+	// maxBurialTombstones 315-byte tombstones and a 444-byte audit line,
+	// 256 × (6 × 315 + 1 + 444 + 1) = 598,016 bytes; and maxDeliveries
 	// withdraws, each a 91-byte floor line (15 + 1 + 11 + 1 + 32 + 1 + 20 +
 	// 1 + 8 + 1, the checksum included) and a withdraw audit line of at
-	// most 250 bytes, 320 × (91 + 1 + 250 + 1) = 109,760 bytes; 692,416
-	// bytes in all, rounded up to 704 KiB (720,896). With it and the
-	// reconciler allowance logReadBound at the default caps is 256 MiB +
-	// 1024 × (704 KiB + 256 KiB) + 1 MiB = 1,217 MiB, and at the
+	// most 310 bytes, 320 × (91 + 1 + 310 + 1) = 128,960 bytes; each audit
+	// line as the socket writes it, with via and caller; 726,976 bytes in
+	// all, rounded up to 720 KiB (737,280). With it and the reconciler
+	// allowance logReadBound at the default caps is 256 MiB + 1024 ×
+	// (720 KiB + 256 KiB) + 1 MiB = 1,233 MiB, and at the
 	// configuration's upper bounds 2^40 + 1024 × (2^30 + 2^18) + 2^20,
 	// which cannot overflow
 	// (TestDefaultRevocationBudgetHoldsFullRevocation).
-	defaultLogRevocationBytes = 704 << 10
+	defaultLogRevocationBytes = 720 << 10
 
 	// The reader's bounds (docs/design/keystore.md § "Size caps"). A log
 	// is read whole, and the service user can append to it without limit,
@@ -149,14 +151,14 @@ const (
 	maxChargedUIDs = maxRevokeUIDs + 64
 	// maxFloorKeysCeiling is the absolute ceiling on the floor's key bound,
 	// whatever the caps are configured to: what bounds the reader's memory.
-	// At the default caps the size alone would allow about 10.2M keys. The
+	// At the default caps the size alone would allow about 23.5M keys. The
 	// reader's worst case at this ceiling plus the revocation headroom
 	// (278,528 keys), read from scratch on an M1 Ultra: 253-byte names and
 	// the longest scope, about 128 MiB of heap and 0.41 s
 	// (BenchmarkFloorReadLongNames); the most lines the size bound held
 	// under the former 64 KiB revocation budget, about 7.3M, about 69 MiB
-	// and 3.9 s (BenchmarkFloorReadLineCount), about 9.8 s scaled to the
-	// 18.3M lines of 55 bytes today's 961 MiB bound holds (not
+	// and 3.9 s (BenchmarkFloorReadLineCount), about 12.6 s scaled to the
+	// 23.5M lines of 55 bytes today's 1,233 MiB bound holds (not
 	// re-measured). At
 	// 1<<20 the long-name case held about 494 MiB, so the ceiling was
 	// lowered to stay under 200 MiB (docs/design/keystore.md § "Size caps").
@@ -194,8 +196,8 @@ const (
 // lowest user scope, a one-byte name, sequence 1 and its checksum,
 // 8 + 1 + 1 + 1 + 32 + 1 + 1 + 1 + 8 + 1 = 55 bytes. logReadBound itself
 // is the caps' and the margin's alone, so the checksum leaves it as it
-// was; it lowers the key bound the size alone allows, from about 21.9M
-// keys to about 18.3M at the default caps, both far over the 2^18 ceiling
+// was; it lowers the key bound the size alone allows, from about 28.1M
+// keys to about 23.5M at the default caps, both far over the 2^18 ceiling
 // that binds.
 var minFloorLine = func() int {
 	b, err := floorLine(userScopeOf(minScopeUID), "a", [generationSize]byte{}, 1)
@@ -377,10 +379,18 @@ type userFloorLog interface {
 // value and never a value's length.
 type auditLine struct {
 	op, scope, name, namespace, result string
-	// via is the path the operation came by, "root" for a root verb and
-	// "reconciler" for the reconciler's lines, whose revocations draw on
-	// the reconciler allowance; empty writes no via field.
+	// via is the path the operation came by, "root" for a root verb,
+	// "socket" for a user socket operation and "reconciler" for the
+	// reconciler's lines, whose revocations draw on the reconciler
+	// allowance; empty writes no via field.
 	via string
+	// caller is the socket peer (UserScope.WithOrigin); nil writes none.
+	caller *auditCaller
+	// version and fingerprint are the version a put or rotate wrote and its
+	// per-scope fingerprint, never the value or its length; zero and empty
+	// write neither.
+	version     uint64
+	fingerprint string
 	// delivery is the KeyDelivery UID a withdraw names, or
 	// auditPlaceholder for one outside the grammar; empty for other ops.
 	delivery string

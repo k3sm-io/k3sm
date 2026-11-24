@@ -119,6 +119,9 @@ type UserScope struct {
 	// allowRemoved lets rm-scope open a scope key the removed-scopes record
 	// already lists: a rerun after an rm-scope that recorded it and stopped.
 	allowRemoved bool
+	// origin is where the view's operations come from, for their audit
+	// lines (WithOrigin); the zero Origin writes no via and no caller.
+	origin Origin
 }
 
 // UserScope returns uid's view of the store. A uid outside 501 to
@@ -276,6 +279,12 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	}
 	if err := checkScopeQuota(entries, name, value, base); err != nil {
 		return Version{}, err
+	}
+	// The ok line names the version the put writes and its fingerprint,
+	// under the scope's keys, which a minting put opened only after its
+	// line (mint), so its line names neither.
+	if !roomJudged {
+		g.version, g.fingerprint = 1, fingerprint(kind, value, uk.fingerprint)
 	}
 	if err := grant(); err != nil {
 		return Version{}, err

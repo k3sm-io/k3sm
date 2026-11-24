@@ -158,7 +158,7 @@ func TestFloorKeyBoundDerivedFromCaps(t *testing.T) {
 		t.Fatalf("the shortest floor line is %d bytes, want 55", len(line))
 	}
 	l := s.userFloor.(*fileFloorLog).log
-	// At the default caps the size would allow about 18.3M keys; the ceiling
+	// At the default caps the size would allow about 23.5M keys; the ceiling
 	// of 1<<18, which bounds the reader's memory, is met first.
 	if got := l.keyBound(); got != 1<<18 {
 		t.Fatalf("key bound %d at the default caps, want the ceiling %d", got, 1<<18)
