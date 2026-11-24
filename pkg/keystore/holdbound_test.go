@@ -32,20 +32,17 @@ import (
 // inside synctest.Test.
 func bubbleWait(d time.Duration) { <-time.NewTimer(d).C }
 
-// maxExclusiveHold is the design's bound on the work one server exclusive
-// hold does (docs/design/keystore.md § "Lock modes and fairness").
-const maxExclusiveHold = 50 * time.Millisecond
-
 // U108: on synctest's clock, with a GeneratedUID lookup that takes its
 // whole 250 ms deadline, no store lock hold of a server operation (a
 // minting put, a put, rotate, rotate from a version, deliver, withdraw,
 // list, read-for-exec, rm) contains a lookup or any other wait the clock
-// sees: each stays within 50 ms of fake time, because the lookup runs
-// before the lock and its one answer is used for the hold. Before the
-// hoist each operation looked the uid up under the lock, up to three
-// times for a minting deliver. The fake clock does not count CPU or file
-// work, so this bounds no hold's work: the walk and listing tests do that
-// for put and rotate.
+// sees: each hold spans zero fake time, because the lookup runs before
+// the lock and its one answer is used for the hold. Before the hoist each
+// operation looked the uid up under the lock, up to three times for a
+// minting deliver. The fake clock does not count CPU or file work, so
+// this bounds no hold's work: the walk and listing tests check that put
+// and rotate holds walk nothing, and the work itself is measured
+// (K3SM_KEYSTORE_MEASURE), not checked.
 func TestExclusiveHoldBound(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()
@@ -88,8 +85,8 @@ func TestExclusiveHoldBound(t *testing.T) {
 			}
 			mu.Lock()
 			for _, h := range holds {
-				if h > maxExclusiveHold {
-					t.Errorf("%s held the store lock for %s on the clock, past %s", op.name, h, maxExclusiveHold)
+				if h != 0 {
+					t.Errorf("%s held the store lock for %s on the clock, want none: a wait the clock sees ran inside the hold", op.name, h)
 				}
 			}
 			if len(holds) == 0 {

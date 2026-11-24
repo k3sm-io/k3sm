@@ -171,10 +171,12 @@ func TestKeysEnvDefaultsBindRoot(t *testing.T) {
 }
 
 // One lock per tree: the store the delivery reconciler opens and the one
-// the user socket's wiring builds over the same work dir share one
-// keystore.TreeState (the in-process lock and the usage figures), so a
-// revocation the reconciler writes queues behind the socket's writer
-// preference and a write by either is in the other's figures.
+// the user socket's wiring builds over the same work dir hold the same
+// keystore.TreeState, checked by pointer equality of Tree(). That state is
+// the in-process lock and the usage figures, so sharing it is what puts a
+// revocation the reconciler writes behind the socket's writer preference
+// and a write by either into the other's figures; this test checks the
+// sharing only, not the queueing or the figures.
 func TestKeystoreSocketAndDeliveryShareTree(t *testing.T) {
 	f := newWiringFixture(t)
 	var socketStore *keystore.FileStore
