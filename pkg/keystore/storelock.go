@@ -32,7 +32,17 @@ import (
 // (usage.go, for put, rotate and rm), then this in-process lock, then the
 // .lock flock, then the user-scope floor's lock. A system-scope verb, which
 // runs in a root process of its own, takes keystore-lock (the system floor)
-// before the store lock.
+// before the store lock, with one exception: Adopt takes the store lock
+// (openLocked), then keystore-lock (lockFloor). Against another root
+// process taking the two in the usual order that inversion is not a
+// deadlock: each lock wait is bounded (lockWait), so the loser of the pair
+// times out (busy) and releases what it held. It costs at most a bounded
+// busy between root processes, never a deadlock.
+//
+// Writers are not FIFO among themselves: a release wakes every waiting
+// writer and whichever takes l.mu first wins, and the flock behind it
+// promises no order either. Writer preference only keeps new readers out
+// while a writer waits.
 
 // TreeState is the in-process state of one keystore tree that every
 // FileStore over it in one process shares (Config.Tree): the store lock's
