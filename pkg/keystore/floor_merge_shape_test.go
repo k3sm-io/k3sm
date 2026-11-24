@@ -555,6 +555,9 @@ func TestStagedPreFrameDroppedRefused(t *testing.T) {
 			{"no header", func(t *testing.T, s *FileStore, p string) {
 				writeStaged(t, s, name, []byte("501 login 1\n"))
 			}, true},
+			{"the unaudited count on a uid line", func(t *testing.T, s *FileStore, p string) {
+				writeStaged(t, s, name, []byte(preFrameDroppedHeader+"501 unaudited 1\n"))
+			}, true},
 		} {
 			if tc.onlyFile && name != PreFrameDroppedName {
 				continue
@@ -680,6 +683,32 @@ func TestStagedPreFrameDroppedTempNotParsed(t *testing.T) {
 			stageRecipe(t, s, server, 0)
 			writeStaged(t, s, n, nil)
 			wantShapeRefused(t, s, n)
+		})
+	}
+}
+
+// TestStagedServerCountsAccepted: a staged server-counts file carrying the
+// post-frame count (named uids and an others line) or the unaudited count
+// is in the keystore's shape: the strict parser knows both classes, so a
+// backup taken while the server holds either restores.
+func TestStagedServerCountsAccepted(t *testing.T) {
+	h := preFrameDroppedHeader
+	for _, tc := range []struct{ name, body string }{
+		{"post-frame", h + "501 post-frame 3\n502 post-frame 1\nothers post-frame 2\n"},
+		{"unaudited", h + "others unaudited 4\n"},
+		{"every kind", h + "501 login 2\n501 post-frame 3\nothers system-high 1\nothers unaudited 4\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, server := newTestStore(t)
+			stageRecipe(t, s, server, 0)
+			writeStaged(t, s, PreFrameDroppedName, []byte(tc.body))
+			st := openTestStaging(t, s)
+			if err := s.checkStaged(context.Background(), st); err != nil {
+				t.Fatalf("checkStaged: %v", err)
+			}
+			if err := s.chownStaged(context.Background(), st); err != nil {
+				t.Fatalf("chownStaged: %v", err)
+			}
 		})
 	}
 }
