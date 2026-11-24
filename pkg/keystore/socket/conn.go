@@ -55,7 +55,7 @@ type Handler struct {
 	now func() time.Time
 	ops map[string]opFunc // the operations; an op not here is unknown-op
 	log *slog.Logger      // receives the store errors that are damage (logStoreError)
-	dmg damageLimiter     // bounds those lines per op and class
+	dmg damageLimiter     // bounds those lines per uid, op and class
 }
 
 // Peer is the admitted peer of a connection, as the listener read it at

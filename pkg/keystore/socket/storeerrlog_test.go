@@ -115,10 +115,16 @@ func checkStoreErrorLine(t *testing.T, rec map[string]any, op string, uid uint32
 // serveOne serves one HELLO and one request with header on h, for uidA.
 func serveOne(t *testing.T, h *Handler, header string) {
 	t.Helper()
+	serveRequestAs(t, h, uidA, header)
+}
+
+// serveRequestAs serves one HELLO and one request with header on h, for uid.
+func serveRequestAs(t *testing.T, h *Handler, uid uint32, header string) {
+	t.Helper()
 	var in bytes.Buffer
 	in.Write(frameBytes(t, Frame{Type: TypeHello, Header: []byte(helloV1)}))
 	in.Write(frameBytes(t, Frame{Type: TypeRequest, Header: []byte(header)}))
-	if err := h.Serve(t.Context(), &recordingConn{in: bytes.NewReader(in.Bytes())}, Peer{UID: uidA}); err != nil {
+	if err := h.Serve(t.Context(), &recordingConn{in: bytes.NewReader(in.Bytes())}, Peer{UID: uid}); err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
 }
@@ -271,9 +277,9 @@ func TestStoreErrorLogged(t *testing.T) {
 	})
 }
 
-// Standing damage logs at most one line per op and class each
+// Standing damage logs at most one line per uid, op and class each
 // DamageLogInterval: the lines between are suppressed and counted on the
-// pair's next line; another op or class has its own pair.
+// key's next line; another op or class has its own key.
 func TestStoreErrorLogBounded(t *testing.T) {
 	var c logCapture
 	clock := &fixedClock{t: time.Unix(1_000_000, 0)}
@@ -301,11 +307,60 @@ func TestStoreErrorLogBounded(t *testing.T) {
 	checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"), DamageCorrupt, 0)
 	checkStoreErrorLine(t, recs[1], OpList, uidA, "", DamageCorrupt, 0)
 	checkStoreErrorLine(t, recs[2], OpReadForExec, uidA, entryOf(uidA, "a"), DamageCorrupt, 4)
-	var l damageLimiter
-	for i := range 2 * maxDamageKeys {
-		l.pass(damageKey{strconv.Itoa(i), DamageCorrupt}, clock.Now())
+}
+
+// One uid's standing damage never suppresses another uid's line: uid A's
+// repeated damage leaves uid B's first line for the same op and class to
+// pass, and each uid's later lines are counted against its own key.
+func TestStoreErrorLogPerUID(t *testing.T) {
+	var c logCapture
+	clock := &fixedClock{t: time.Unix(1_000_000, 0)}
+	corrupt := func(context.Context, Request) (Reply, error) { return Reply{}, keystore.ErrCorrupt }
+	h, err := NewHandler(clock.Now, withOp(OpReadForExec, corrupt))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if n := len(l.keys); n != maxDamageKeys {
-		t.Fatalf("the limiter holds %d pairs, want at most %d", n, maxDamageKeys)
+	h.log = c.logger()
+	for range 5 {
+		serveRequestAs(t, h, uidA, hdr(t, OpReadForExec, entryOf(uidA, "a"), nil))
+		clock.advance(time.Second)
+	}
+	serveRequestAs(t, h, uidB, hdr(t, OpReadForExec, entryOf(uidB, "a"), nil))
+	serveRequestAs(t, h, uidB, hdr(t, OpReadForExec, entryOf(uidB, "a"), nil))
+	recs := c.records(t)
+	if len(recs) != 2 {
+		t.Fatalf("five reads by uid %d and two by uid %d logged %v, want one line each", uidA, uidB, recs)
+	}
+	checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"), DamageCorrupt, 0)
+	checkStoreErrorLine(t, recs[1], OpReadForExec, uidB, entryOf(uidB, "a"), DamageCorrupt, 0)
+	clock.advance(DamageLogInterval)
+	serveRequestAs(t, h, uidB, hdr(t, OpReadForExec, entryOf(uidB, "a"), nil))
+	recs = c.records(t)
+	if len(recs) != 3 {
+		t.Fatalf("logged %v, want uid %d's second line", recs, uidB)
+	}
+	checkStoreErrorLine(t, recs[2], OpReadForExec, uidB, entryOf(uidB, "a"), DamageCorrupt, 1)
+}
+
+// The limiter's keys stay at most maxDamageKeys however many uids log: a
+// new key past the cap evicts the one whose last line is the oldest, and
+// passes.
+func TestDamageLimiterBounded(t *testing.T) {
+	var l damageLimiter
+	start := time.Unix(1_000_000, 0)
+	key := func(uid int) damageKey { return damageKey{uid: uint32(uid), op: OpReadForExec, class: DamageCorrupt} }
+	for i := range 2 * maxDamageKeys {
+		if ok, _ := l.pass(key(i), start.Add(time.Duration(i)*time.Millisecond)); !ok {
+			t.Fatalf("uid %d's first line was suppressed", i)
+		}
+		if n := len(l.keys); n > maxDamageKeys {
+			t.Fatalf("the limiter holds %d keys, want at most %d", n, maxDamageKeys)
+		}
+	}
+	if _, ok := l.keys[key(maxDamageKeys-1)]; ok {
+		t.Fatalf("uid %d's key outlived %d newer keys", maxDamageKeys-1, maxDamageKeys)
+	}
+	if _, ok := l.keys[key(2*maxDamageKeys-1)]; !ok {
+		t.Fatal("the newest key was evicted")
 	}
 }

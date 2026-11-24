@@ -4564,10 +4564,14 @@ surface, and the app consumes only those.
   byte of a value either (`TestNoErrorCarriesValueDerivedNumbers`). The ordinary outcomes
   (`not-found`, `exists`, `quota`, `rate-limited`, `busy`, `log-full`, and the socket's own
   refusals), a change that committed, and a cancelled or timed-out request are not logged.
-  Standing damage cannot flood the log: each (op, class) pair logs at most one line every
+  Standing damage cannot flood the log: each (uid, op, class) key logs at most one line every
   10 seconds (`socket.DamageLogInterval`), and its next line carries the count it suppressed
-  meanwhile as `suppressed`; the pairs are bounded by the closed sets
-  (`TestStoreErrorLogged`, `TestStoreErrorLogBounded`).
+  meanwhile as `suppressed`. The key carries the uid, so one login user's standing damage
+  never suppresses another uid's line (`TestStoreErrorLogPerUID`). One uid's keys are bounded
+  by the closed sets of ops and classes, and the table holds at most 1024 keys across uids: a
+  new key past that evicts the key whose last line is the oldest, whose suppressed count is
+  then lost and whose next line passes at once (`TestStoreErrorLogged`,
+  `TestStoreErrorLogBounded`, `TestDamageLimiterBounded`).
 - **Operations on the wire.** The request and reply headers are named Go types in
   `pkg/keystore/socket` (`PutRequest`, `RotateRequest`, `ListRequest`, `RmRequest`,
   `ReadForExecRequest`; `VersionReply`, `ListReply` with `ListEntry`, `RmReply`,

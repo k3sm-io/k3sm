@@ -74,32 +74,38 @@ func damageClass(err error) string {
 	return ""
 }
 
-// DamageLogInterval is how often one (op, class) pair may log a line;
+// DamageLogInterval is how often one (uid, op, class) key may log a line;
 // the lines it suppresses meanwhile are counted on its next one.
 const DamageLogInterval = 10 * time.Second
 
-// damageLimiter passes at most one line per (op, class) pair each
-// DamageLogInterval and counts the rest. Its pairs are bounded: op is one
-// of the Handler's registered operations and class one of the closed set,
-// and maxDamageKeys caps them besides.
+// damageLimiter passes at most one line per (uid, op, class) key each
+// DamageLogInterval and counts the rest, so one uid's standing damage
+// never suppresses another uid's line. Its keys are bounded: op is one of
+// the Handler's registered operations and class one of the closed set, so
+// one uid holds a few dozen at most, and maxDamageKeys caps them across
+// uids: a new key past it evicts the key whose last line is the oldest.
 type damageLimiter struct {
 	mu   sync.Mutex
 	keys map[damageKey]*damageCount
 }
 
-type damageKey struct{ op, class string }
+type damageKey struct {
+	uid       uint32
+	op, class string
+}
 
 type damageCount struct {
 	last       time.Time
 	suppressed uint64
 }
 
-// maxDamageKeys caps the limiter's pairs; a pair past it is suppressed
-// unlogged and uncounted, which the closed sets never reach.
-const maxDamageKeys = 64
+// maxDamageKeys caps the limiter's keys. An evicted key loses the count it
+// suppressed since its last line, and its next line passes at once: the
+// cap bounds memory, and a uid's lines stay bounded by its request rate.
+const maxDamageKeys = 1024
 
 // pass reports whether a line for k may be logged at now, with the count
-// suppressed since the pair's last line.
+// suppressed since the key's last line.
 func (l *damageLimiter) pass(k damageKey, now time.Time) (bool, uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -109,7 +115,7 @@ func (l *damageLimiter) pass(k damageKey, now time.Time) (bool, uint64) {
 	c, ok := l.keys[k]
 	if !ok {
 		if len(l.keys) >= maxDamageKeys {
-			return false, 0
+			l.evictOldest()
 		}
 		c = &damageCount{}
 		l.keys[k] = c
@@ -122,18 +128,33 @@ func (l *damageLimiter) pass(k damageKey, now time.Time) (bool, uint64) {
 	return true, n
 }
 
+// evictOldest drops the key whose last line is the oldest. l.mu is held.
+func (l *damageLimiter) evictOldest() {
+	var (
+		oldest damageKey
+		at     time.Time
+		found  bool
+	)
+	for k, c := range l.keys {
+		if !found || c.last.Before(at) {
+			oldest, at, found = k, c.last, true
+		}
+	}
+	delete(l.keys, oldest)
+}
+
 // logStoreError logs err, op's error for p, at Warn when it is damage,
-// at most once per op and class each DamageLogInterval: the op, the
+// at most once per uid, op and class each DamageLogInterval: the op, the
 // peer's uid, the entry the request named when it is a valid name
 // (requested_entry), the class and its fixed remedy, and the lines
-// suppressed since the pair's last. Never the error's text, a value or a
+// suppressed since the key's last. Never the error's text, a value or a
 // value's length.
 func (h *Handler) logStoreError(op string, p Peer, header []byte, err error) {
 	class := damageClass(err)
 	if class == "" {
 		return
 	}
-	ok, suppressed := h.dmg.pass(damageKey{op, class}, h.now())
+	ok, suppressed := h.dmg.pass(damageKey{uid: p.UID, op: op, class: class}, h.now())
 	if !ok {
 		return
 	}
