@@ -4301,9 +4301,27 @@ directory is root's"). A worker node runs no listener (E18).
   names `sudo k3sm install` (U31, U38, E15).
 - **Supervision details.** The start checks run at start and before every retry, in this order:
   the effective uid, the data root's mount flags, the installed files, the maintenance marker
-  (read only), the reopen of both append-only logs (its own step: a reopen that fails keeps the
-  listener off as `logs-unavailable`, with the error), the peer-sandbox self-check, and a server
-  count of exactly one (a count that cannot be read, or of none, keeps the listener off too).
+  (read only), the store directory, the reopen of both append-only logs (its own step: a reopen
+  that fails keeps the listener off as `logs-unavailable`, with the error), the peer-sandbox
+  self-check, and a server count of exactly one (a count that cannot be read, or of none, keeps
+  the listener off too).
+- **The server creates the store directory at start.** The log reopen takes the store lock,
+  whose `.lock` is in `server/keystore/`, so the store-directory step runs before it. When
+  `server/keystore/` is missing, the server, which runs as the service user and owns `server/`,
+  creates it with the store's own helper, the one a first `keys put` uses (`mkdirOwned`: the
+  service user's, 0700, any inherited ACL removed, `server/` fsynced). A directory that exists
+  is judged as every open of the store judges it (a directory, the service user's, granting
+  nothing to group or others), and one that fails is never repaired: the listener stays off as
+  `the store directory is missing or refused`, with the open's refusal and its repair (as root,
+  make it the service user's at 0700, or remove it if it holds nothing), on every pass. So a
+  fresh install's user scope comes up without a root `keys put`. Only the installed server
+  creates it: the step runs after the effective-uid check, and a worker builds no listener. A
+  root `put` racing the step is safe: whichever `mkdir` lands first makes the directory and the
+  other only judges it; the server's `mkdir` makes a directory the service user already owns,
+  which the put's judgement accepts, and a put's `mkdir` makes one root owns until its
+  handover, which the server refuses for that pass only, finding it handed over on the next.
+  Doctor runs the same judgement read-only: before the server's first start it shows the
+  user scope off for the store directory, saying the server creates it at start.
   Nothing is opened on the data root before its mount flags and the installed files are
   vetted, so an install that predates the logs is reported as the install reason, naming
   `sudo k3sm install`. A failed check retries on a doubling backoff from 1 second to 5 minutes,

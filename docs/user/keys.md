@@ -141,6 +141,11 @@ log) and names `sudo k3sm keys audit --rotate` for the audit log or
 
 ### The keystore user scope row in `k3sm doctor`
 
+The server creates `/var/lib/k3sm/server/keystore/` when it starts, as its own user at mode 0700,
+the way the first `put` would. So on a fresh install the user scope comes up once the server
+has started, without a `sudo k3sm keys put` first. The master key is still created only by the
+first root `put` (see the table above), so until then a user's `put` fails.
+
 `doctor` runs in its own process and cannot ask the server whether the listener is serving, so
 its `keystore-user-scope` row says only what it can check:
 
@@ -176,6 +181,12 @@ its `keystore-user-scope` row says only what it can check:
   For a missing, wrong or unflagged log or socket directory it adds `run sudo k3sm install`;
   for `more than one server registered` it names the servers (up to 8, then how many more);
   for `the append-only logs cannot be opened (logs-unavailable)` it shows the error;
+  for `the store directory is missing or refused` it shows why: before the server's first start
+  there is no `/var/lib/k3sm/server/keystore/` yet, and the row says the server creates the store
+  directory at start; once the server has started, the row passes. A directory that is there but
+  not the server's user's at mode 0700 is refused, by the server and by `doctor`, and the server
+  never repairs it: as root, make it the server's user's at 0700, or remove it if it holds
+  nothing, and the server creates it again;
   `the service uid is in the login range` means the service user's uid is 501 or above, where
   login users' uids start, and the listener does not start until the service user is a system
   account below 501;
@@ -552,7 +563,7 @@ The keystore is not part of `k3sm snapshot save`. It lives in three places:
 
 | Path | What it is |
 |---|---|
-| `/var/lib/k3sm/server/keystore/` | The entries and all their versions. |
+| `/var/lib/k3sm/server/keystore/` | The entries and all their versions. The server creates it, empty, when it starts. |
 | `/var/lib/k3sm/server/cred/keystore-master/` | The master key and its fingerprint. |
 | `/var/lib/k3sm/keystore-floor.json` | Root's record of the newest version of each entry, which is how an older copy put back is caught. |
 | `/var/lib/k3sm/keystore-delivery.json` | Which entries are delivered as which Secrets. It holds no value. |
@@ -667,7 +678,9 @@ the same warning, and the merge keeps each deletion it records. An `rm` at this 
 the deletion, but the restored entry's files are still in `pre-restore.d/restored`, out of its
 reach. The merge removes those files before it moves the restored copy into place, so you do not
 need to run `rm` again. A server started before the merge delivers no keys to the cluster and
-deletes no delivered Secret: it logs an error and tries again until the merge has run. Once it
+deletes no delivered Secret: it logs an error and tries again until the merge has run. It also
+creates an empty `/var/lib/k3sm/server/keystore` at start, which the merge then moves aside as
+`planted-<time>` and reports, exiting 4, so keep the server stopped until the merge has run. Once it
 has, the server deletes the Secret delivered from each entry the merge or an `rm` deleted, as
 after any `rm`: once the restore hold has passed and unless the breaker holds (see [Delivering
 an Entry as a Secret](#delivering-an-entry-as-a-secret)). Merge those deletions into the restored floor:
