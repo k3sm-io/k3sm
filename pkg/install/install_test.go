@@ -67,6 +67,9 @@ func TestMain(m *testing.M) {
 	// fake panics instead of reaching the host.
 	euidSeam = func() int { panic("a unit test reached geteuid: inject a fake euid source") }
 	fileAttrSeam = panicFileAttrWriter{}
+	// keystore-sock/'s group: a non-root test cannot chown to wheel, so it
+	// gets the test user's own group (root's is wheel).
+	keystoreSockGID = os.Getgid()
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)

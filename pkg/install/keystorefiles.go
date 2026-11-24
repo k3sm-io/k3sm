@@ -130,7 +130,6 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 	if int64(st.Uid) != int64(rootUID) || st.Mode&0o022 != 0 {
 		return fmt.Errorf("the data root %s is not root's, or is group- or other-writable: %w", dataRoot, errKeystoreFileUntrusted)
 	}
-	rootGID := st.Gid
 	if err := keystore.JudgeDirFlagsACL(dfd); err != nil {
 		return fmt.Errorf("the data root %s: %w: %w", dataRoot, err, errKeystoreFileUntrusted)
 	}
@@ -153,7 +152,7 @@ func ensureKeystoreFiles(dataRoot string, svcUID, svcGID, rootUID int) error {
 	if err := ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID); err != nil {
 		return err
 	}
-	if err := ensureKeystoreSockDir(dfd, rootUID, rootGID); err != nil {
+	if err := ensureKeystoreSockDir(dfd, rootUID); err != nil {
 		return err
 	}
 	g, err := openKeystoreLogs(dfd, rootUID)
@@ -284,15 +283,22 @@ func ensureKeystoreRunDir(dfd, svcUID, svcGID, rootUID int) error {
 	return nil
 }
 
+// keystoreSockGID is keystore-sock/'s group: wheel, the group the server's
+// start check requires (keystore.JudgeSocketDir). A non-root test sets the
+// test user's own group, which it can chown to.
+var keystoreSockGID = 0
+
 // ensureKeystoreSockDir creates keystore-sock/, the keystore socket's
-// directory, root's 0755 in the data root's group (wheel), or keeps the one
-// there, and judges it as the server's install check does: rootUID's, in
-// rootGID, at 0755, with no flag and no ACL. launchd creates keys.sock in
-// it at the job's bootstrap; no service-uid process can create, unlink or
+// directory, rootUID's 0755 in keystoreSockGID (root:wheel), whatever the
+// data root's group BSD mkdir would hand it, or keeps the one there; and
+// judges it as the server's start check does (keystore.JudgeSocketDir:
+// rootUID's, in keystoreSockGID, at 0755, with no flag and no ACL), with
+// the same refusal text. launchd creates keys.sock in it when the server
+// activates its socket; no service-uid process can create, unlink or
 // replace a name there (docs/design/keystore.md § "The socket's directory
 // is root's"). A directory that is anything else is refused and kept as
-// found: an existing keystore-sock/ is never chowned.
-func ensureKeystoreSockDir(dfd, rootUID int, rootGID uint32) error {
+// found: an existing keystore-sock/ is never chowned or chmodded.
+func ensureKeystoreSockDir(dfd, rootUID int) error {
 	name := keystorepaths.SockDir
 	created := true
 	if err := unix.Mkdirat(dfd, name, keystoreSockDirMode); err != nil {
@@ -306,23 +312,20 @@ func ensureKeystoreSockDir(dfd, rootUID int, rootGID uint32) error {
 		return fmt.Errorf("open %s: %w: %w", name, err, errKeystoreFileUntrusted)
 	}
 	defer func() { _ = unix.Close(fd) }() // a directory, read-only
-	// A restrictive umask narrows the mode Mkdirat gave the directory this
-	// call created; it is set through the descriptor. A directory that
-	// was already there is judged as found and never chmodded.
+	// Mkdirat gave the directory this call created the data root's group
+	// (BSD mkdir), and a restrictive umask narrows its mode: both are set
+	// through the descriptor. A directory that was already there is judged
+	// as found.
 	if created {
+		if err := unix.Fchown(fd, rootUID, keystoreSockGID); err != nil {
+			return fmt.Errorf("chown %s: %w", name, err)
+		}
 		if err := unix.Fchmod(fd, keystoreSockDirMode); err != nil {
 			return fmt.Errorf("chmod %s: %w", name, err)
 		}
 	}
-	if err := judgeRootDir(fd, name, rootUID, keystoreSockDirMode); err != nil {
-		return err
-	}
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return fmt.Errorf("stat %s: %w", name, err)
-	}
-	if st.Gid != rootGID {
-		return fmt.Errorf("%s is in group %d, not the data root's %d: %w", name, st.Gid, rootGID, errKeystoreFileUntrusted)
+	if err := keystore.JudgeSocketDir(fd, rootUID, keystoreSockGID); err != nil {
+		return fmt.Errorf("%w: %w", err, errKeystoreFileUntrusted)
 	}
 	return nil
 }

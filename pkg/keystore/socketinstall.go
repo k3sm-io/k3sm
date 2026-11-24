@@ -85,12 +85,26 @@ func (s *FileStore) checkSockDir() error {
 		return bad("cannot be opened", err)
 	}
 	defer func() { _ = unix.Close(fd) }() // read-only directory descriptor
+	return JudgeSocketDir(fd, s.floorUID, s.floorGID)
+}
+
+// JudgeSocketDir judges the socket directory open at fd, as the server's
+// start check does and as install does before it keeps one: a directory
+// of uid in gid (root:wheel in production), mode 0755, with no file flag
+// and no extended ACL. Its error's text names what is wrong and carries no
+// command; install and the start check refuse with the same text.
+func JudgeSocketDir(fd, uid, gid int) error {
+	bad := func(what string, err error) error {
+		return &installError{text: "the socket directory " + keystorepaths.SockDir + " " + what, err: err}
+	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		return bad("cannot be read", err)
 	}
 	switch {
-	case int64(st.Uid) != int64(s.floorUID) || int64(st.Gid) != int64(s.floorGID):
+	case st.Mode&unix.S_IFMT != unix.S_IFDIR:
+		return bad("is not a directory", nil)
+	case int64(st.Uid) != int64(uid) || int64(st.Gid) != int64(gid):
 		return bad("is not owned by root:wheel", nil)
 	case st.Mode&0o7777 != sockDirMode:
 		return bad(fmt.Sprintf("is at mode %04o, not 0755", st.Mode&0o7777), nil)

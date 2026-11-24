@@ -36,8 +36,9 @@ import (
 // u104SockEnv carries the socket path to the service-uid child.
 const u104SockEnv = "K3SM_U104_SOCK"
 
-// U104, root-run: install's keystore step makes keystore-sock/ root's 0755
-// in a root:wheel data root; with a root-owned socket at keys.sock (as
+// U104, root-run: install's keystore step makes keystore-sock/ root:wheel
+// 0755 in a data root of root's in another group (staff), with a real
+// chown; with a root-owned socket at keys.sock (as
 // launchd makes it), a process running as the service uid cannot unlink it
 // or rename a socket of its own over it, and once the name is gone (the
 // server not running) it cannot bind one there either: each gets EACCES.
@@ -81,6 +82,11 @@ func TestSocketDirRootOwnedServiceUIDCannotBind(t *testing.T) {
 		}
 	}
 	if err := os.Chown(own, uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	// BSD mkdir would hand keystore-sock/ this group; install chowns the
+	// directory it creates to wheel.
+	if err := os.Chown(root, 0, 20); err != nil {
 		t.Fatal(err)
 	}
 	if err := ensureKeystoreFiles(root, uid, gid, 0); err != nil {
