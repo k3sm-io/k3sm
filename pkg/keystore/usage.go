@@ -102,7 +102,8 @@ func newUsageTable() *usageTable {
 // lockUID takes uid's mutation lock, which serialises the uid's own put,
 // rotate and rm in this process, before the store lock (storelock.go has
 // the order), waiting at most wait, or until ctx is done. Only the uid's
-// own operations wait on it. The returned function releases it. A nil t
+// own operations wait on it. The returned function releases it, once
+// however often it is called. A nil t
 // (a store a test built without New) holds nothing. A ctx already done
 // takes nothing and returns its error, as prefLock.acquire does: a select
 // with the lock free would otherwise pick at random between the two.
@@ -124,7 +125,8 @@ func (t *usageTable) lockUID(ctx context.Context, uid uint32, wait time.Duration
 	defer timer.Stop()
 	select {
 	case ch <- struct{}{}:
-		return func() { <-ch }, nil
+		var once sync.Once
+		return func() { once.Do(func() { <-ch }) }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-timer.C:
