@@ -70,6 +70,7 @@ const (
 	OffMountUnknown         OffReason = "the data root's mount flags cannot be read"
 	OffInstall              OffReason = "the socket directory or an append-only log is missing, wrong or unflagged"
 	OffLogsUnavailable      OffReason = "the append-only logs cannot be opened (logs-unavailable)"
+	OffStoreDir             OffReason = "the store directory is missing or refused"
 	OffServers              OffReason = "more than one server registered"
 	OffServersUnknown       OffReason = "the server count is unknown"
 	OffListenerUnavailable  OffReason = "the listening socket is unavailable"
@@ -195,6 +196,9 @@ type SupervisorConfig struct {
 	// MaintenanceMarked reports whether the maintenance marker stands. It
 	// only reads: the supervisor polls it while serving.
 	MaintenanceMarked func() (bool, error)
+	// StoreDir is Preconditions.StoreDir; production creates the store
+	// directory in it (keystore.FileStore.EnsureDir). Optional.
+	StoreDir func(ctx context.Context) error
 	// OpenLogs reopens the server's audit and floor append descriptors and
 	// recounts what is charged from the new files (Preconditions.OpenLogs);
 	// production passes (*keystore.ServerLogs).Reopen.
@@ -418,6 +422,7 @@ func (s *Supervisor) check(ctx context.Context) (OffReason, string) {
 		EUID:              s.cfg.EUID,
 		ServiceUID:        s.cfg.ServiceUID,
 		MaintenanceMarked: s.cfg.MaintenanceMarked,
+		StoreDir:          s.cfg.StoreDir,
 		OpenLogs:          s.cfg.OpenLogs,
 		IgnoresOwnership:  s.cfg.IgnoresOwnership,
 		CheckInstall:      s.cfg.CheckInstall,
@@ -439,9 +444,16 @@ type Preconditions struct {
 	// MaintenanceMarked reports whether the maintenance marker stands,
 	// reading it only.
 	MaintenanceMarked func() (bool, error)
-	// OpenLogs is the step after the marker: the supervisor reopens both
-	// append-only logs on it, so the listener starts against the files as
-	// they are now (after maintenance swapped them, too); doctor judges
+	// StoreDir is optional and runs after the marker, before OpenLogs,
+	// whose reopen takes the store lock, whose file is in the store
+	// directory: the supervisor creates that directory in it if it is
+	// missing, and judges one that exists without repairing it; doctor
+	// judges it only, so before the server's first start doctor finds it
+	// missing. An error keeps the listener off with OffStoreDir.
+	StoreDir func(ctx context.Context) error
+	// OpenLogs is the step after the store directory: the supervisor
+	// reopens both append-only logs on it, so the listener starts against
+	// the files as they are now (after maintenance swapped them, too); doctor judges
 	// both logs read-only, holding and writing nothing. An error keeps the
 	// listener off with OffLogsUnavailable.
 	OpenLogs func(ctx context.Context) error
@@ -472,10 +484,9 @@ type Preconditions struct {
 }
 
 // Check runs the start checks in the design's order (the effective uid, the
-// mount flags, the installed files, the maintenance marker, the log reopen,
-// the sandbox self-check, a server count of exactly one, the user scope's
-// start step) and returns the
-// first reason the listener may not start, with its error's text, or ""
+// mount flags, the installed files, the maintenance marker, the store
+// directory, the log reopen, the sandbox self-check, a server count of
+// exactly one, the user scope's start step) and returns the first reason the listener may not start, with its error's text, or ""
 // when every check passes. Nothing is opened on the data root before its
 // mount flags and the installed files are vetted, so an install that
 // predates the logs is reported as the install reason, naming its remedy.
@@ -512,6 +523,11 @@ func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
 		return OffMaintenanceUnknown, err.Error()
 	} else if marked {
 		return OffMaintenance, ""
+	}
+	if p.StoreDir != nil {
+		if _, err := guard(func() (struct{}, error) { return struct{}{}, p.StoreDir(ctx) }); err != nil {
+			return OffStoreDir, err.Error()
+		}
 	}
 	if _, err := guard(func() (struct{}, error) { return struct{}{}, p.OpenLogs(ctx) }); err != nil {
 		return OffLogsUnavailable, err.Error()

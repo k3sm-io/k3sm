@@ -28,6 +28,7 @@ func passing() Preconditions {
 		EUID:              func() int { return 260 },
 		ServiceUID:        260,
 		MaintenanceMarked: func() (bool, error) { return false, nil },
+		StoreDir:          func(context.Context) error { return nil },
 		OpenLogs:          func(context.Context) error { return nil },
 		SandboxCheck:      func() error { return nil },
 		IgnoresOwnership:  func() (bool, error) { return false, nil },
@@ -91,6 +92,17 @@ func TestPreconditionsCheck(t *testing.T) {
 			p.MaintenanceMarked = func() (bool, error) { return true, nil }
 			p.OpenLogs = func(context.Context) error { return boom }
 		}, OffMaintenance},
+		{"store directory", func(p *Preconditions) { p.StoreDir = func(context.Context) error { return boom } }, OffStoreDir},
+		{"store directory panics", func(p *Preconditions) { p.StoreDir = func(context.Context) error { panic("fake") } }, OffStoreDir},
+		{"no store directory step", func(p *Preconditions) { p.StoreDir = nil }, ""},
+		{"marker before store directory", func(p *Preconditions) {
+			p.MaintenanceMarked = func() (bool, error) { return true, nil }
+			p.StoreDir = func(context.Context) error { return boom }
+		}, OffMaintenance},
+		{"store directory before logs", func(p *Preconditions) {
+			p.StoreDir = func(context.Context) error { return boom }
+			p.OpenLogs = func(context.Context) error { return boom }
+		}, OffStoreDir},
 		{"logs before sandbox check", func(p *Preconditions) {
 			p.OpenLogs = func(context.Context) error { return boom }
 			p.SandboxCheck = func() error { return boom }
@@ -118,7 +130,7 @@ func TestPreconditionsCheck(t *testing.T) {
 			}
 		})
 	}
-	for _, r := range []OffReason{OffNotInstalledServer, OffServiceUIDLoginRange, OffMaintenance, OffMaintenanceUnknown, OffIgnoresOwnership, OffMountUnknown, OffLogsUnavailable, OffServers, OffServersUnknown, OffListenerUnavailable, OffListenerFailed, OffSandboxCheckUnusable, OffUserScopeStart} {
+	for _, r := range []OffReason{OffNotInstalledServer, OffServiceUIDLoginRange, OffMaintenance, OffMaintenanceUnknown, OffIgnoresOwnership, OffMountUnknown, OffStoreDir, OffLogsUnavailable, OffServers, OffServersUnknown, OffListenerUnavailable, OffListenerFailed, OffSandboxCheckUnusable, OffUserScopeStart} {
 		if got := r.Remedy(); got != "" {
 			t.Errorf("%q names the remedy %q, want none", r, got)
 		}
