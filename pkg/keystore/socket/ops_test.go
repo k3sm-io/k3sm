@@ -264,6 +264,21 @@ func TestOutcomeOfMapsStoreErrors(t *testing.T) {
 	}
 }
 
+// A value the store refuses for its kind, an Ed25519 key of the wrong
+// length or with a foreign public half, is the caller's to change: the
+// socket answers it refused, never internal.
+func TestEd25519ValueRefusedNotInternal(t *testing.T) {
+	r := newStartedBridge(t, nil)
+	seed := bytes.Repeat([]byte{7}, 32)
+	mismatched := append(bytes.Clone(seed), bytes.Repeat([]byte{9}, 32)...)
+	for i, v := range [][]byte{seed[:31], mismatched} {
+		_, err := r.b.Put(t.Context(), Peer{UID: uidA}, entryOf(uidA, fmt.Sprintf("k%d", i)), keystore.KindEd25519, v)
+		if code, _ := outcomeOf(err); code != CodeRefused || !keystore.InvalidValue(err) {
+			t.Errorf("a put of a %d-byte Ed25519 value = %v, code %q; want refused", len(v), err, code)
+		}
+	}
+}
+
 // The store's own states, made by the real store: its busy lock, the user
 // scope not started, a uid's spent share, and a committed change whose
 // audit line failed.

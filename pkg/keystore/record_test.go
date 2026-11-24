@@ -301,6 +301,13 @@ func TestCheckValue(t *testing.T) {
 			}
 		})
 	}
+	// A refused Ed25519 value is the caller's to change, never damage: it
+	// matches InvalidValue, which the socket answers refused.
+	for _, v := range [][]byte{mismatched, seed[:31], append(bytes.Clone(seed), '\n')} {
+		if err := checkValue(KindEd25519, v); !InvalidValue(err) || errors.Is(err, ErrCorrupt) {
+			t.Errorf("checkValue of a %d-byte Ed25519 value = %v, want InvalidValue", len(v), err)
+		}
+	}
 	// The length of a refused Ed25519 value is part of the secret's shape,
 	// so the refusal names the two valid sizes and not the value's.
 	for _, n := range []int{31, 40, 65} {

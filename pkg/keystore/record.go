@@ -432,6 +432,11 @@ func checkStored(kind Kind, value []byte) error {
 	return err
 }
 
+// errInvalidValue marks a raw value checkValue refuses for its kind: a
+// refusal of the caller's value, which another value can meet, never
+// damage (InvalidValue).
+var errInvalidValue = errors.New("the value is not one the entry's kind takes")
+
 // checkValue validates a raw value for kind before it is sealed. A typed
 // kind has no raw value: it is written from a typed.Envelope, whose times
 // the store stamps.
@@ -445,11 +450,11 @@ func checkValue(kind Kind, value []byte) error {
 			// The expanded form is seed then public key; a public half that
 			// does not belong to the seed is a damaged key, not a valid one.
 			if !bytes.Equal(ed25519.NewKeyFromSeed(value[:ed25519.SeedSize]), value) {
-				return errors.New("the 64-byte Ed25519 key's public half does not match its seed")
+				return fmt.Errorf("%w: the 64-byte Ed25519 key's public half does not match its seed", errInvalidValue)
 			}
 			return nil
 		default:
-			return fmt.Errorf("an Ed25519 key is %d or %d bytes, and this value is neither", ed25519.SeedSize, ed25519.PrivateKeySize)
+			return fmt.Errorf("%w: an Ed25519 key is %d or %d bytes, and this value is neither", errInvalidValue, ed25519.SeedSize, ed25519.PrivateKeySize)
 		}
 	case KindOpaque:
 		if len(value) == 0 {

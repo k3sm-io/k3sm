@@ -76,6 +76,7 @@ func outcomeOf(err error) (Code, string) {
 		errors.Is(err, keystore.ErrTypedCredential),
 		errors.Is(err, keystore.ErrRewrapInProgress),
 		errors.Is(err, keystore.ErrOrphanVersion),
+		keystore.InvalidValue(err),
 		keystore.IneligibleUID(err),
 		keystore.FloorDegraded(err):
 		return CodeRefused, ""

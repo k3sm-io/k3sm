@@ -53,6 +53,11 @@ func ScopesNotCaughtUp(err error) bool { return errors.Is(err, errScopesNotCaugh
 // record is ErrScopeAbsent too, but damage, and is not this.
 func NoScopeKey(err error) bool { return errors.Is(err, errNoScopeKey) }
 
+// InvalidValue reports whether err refused the caller's value as one its
+// kind does not take: an Ed25519 key of the wrong length, or one whose
+// public half does not match its seed. Nothing was written.
+func InvalidValue(err error) bool { return errors.Is(err, errInvalidValue) }
+
 // IneligibleUID reports whether err refused a uid the store gives no user
 // scope: outside the login range, or the store's service uid.
 func IneligibleUID(err error) bool { return errors.Is(err, errIneligibleUID) }
