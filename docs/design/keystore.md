@@ -2030,7 +2030,17 @@ record dir, data root or state dir, or a pods root under a `keystore-*` name:
 the user scope is off with `the Pod profile does not render for this node's configuration`,
 naming the render error and "fix the flag, then `sudo k3sm restart`", and the check is retried
 with the start-check backoff, running no other start check until it passes
-(`TestPodProfileRemedyNamesConfiguration`, `TestPodProfileConfigIsRetried`). Any other render
+(`TestPodProfileRemedyNamesConfiguration`, `TestPodProfileConfigIsRetried`). The restart stays in
+that remedy although the check is retried: each retry derives the posture afresh, but from the
+flags the process read at its start. A derivation the provider refuses for what is on disk
+rather than the flags' shape (a status record dir or a data root, one of its trees or the state
+dir, that resolves somewhere other than its spelling: `ErrStatusRecordDirNotCanonical`,
+`ErrDataRootNotCanonical`) is off with `a path the node's flags name resolves somewhere
+unexpected` instead (`socket.ErrPodProfilePath`), naming "a path the node's flags name resolves
+somewhere unexpected (a symlink was changed?): fix the path it names (retried, no restart
+needed), or fix the flag, then `sudo k3sm restart`", on the same retry
+(`TestServerPodPostureFailureIsConfiguration`, `TestPodProfilePathIsRetried`). The check is
+asked only until it first holds, never again for the life of the supervisor. Any other render
 error stays the build's state above. The barriers relied on are
 that Seatbelt deny and the listener's sandboxed-peer refusal (Open requirement 15); launchd's
 `ESRCH` to a Pod is not one of them. A data root on a volume that is not

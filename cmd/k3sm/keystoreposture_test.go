@@ -112,10 +112,12 @@ func TestServerPodPostureMatchesRuntime(t *testing.T) {
 	}
 }
 
-// A posture the provider cannot derive (here a custom state-dir leaf behind
-// a symlink, which the provider refuses the node for) is the node's
-// configuration: the user scope goes off with OffPodProfileConfig, naming
-// the derivation error, and is retried; nothing in it stops the server.
+// A posture the provider cannot derive is off and retried, and nothing in
+// it stops the server. One refused for what is on disk (here a custom
+// state-dir leaf behind a symlink, ErrDataRootNotCanonical) goes off with
+// OffPodProfilePath, naming the path remedy that needs no restart; one
+// refused for the flags' shape (a state dir with a .. element) goes off
+// with OffPodProfileConfig, naming the flag remedy.
 func TestServerPodPostureFailureIsConfiguration(t *testing.T) {
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -130,29 +132,47 @@ func TestServerPodPostureFailureIsConfiguration(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(data, "cp")); err != nil {
 		t.Fatal(err)
 	}
-	opts := serverOptions{workDir: filepath.Join(data, "cp"), podRoot: data}
-	if _, err := serverPodPosture(opts); !errors.Is(err, provider.ErrDataRootNotCanonical) {
-		t.Fatalf("serverPodPosture = %v, want the provider's refusal", err)
+	for _, tt := range []struct {
+		name   string
+		opts   serverOptions
+		refuse error
+		reason socket.OffReason
+		remedy string
+	}{
+		{"a path on disk that resolves elsewhere", serverOptions{workDir: filepath.Join(data, "cp"), podRoot: data}, provider.ErrDataRootNotCanonical, socket.OffPodProfilePath, socket.PodProfilePathRemedy},
+		{"a flag's shape", serverOptions{workDir: data + "/x/../cp2", podRoot: data}, sandbox.ErrInvalidStateDir, socket.OffPodProfileConfig, socket.PodProfileConfigRemedy},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := serverPodPosture(tt.opts); !errors.Is(err, tt.refuse) {
+				t.Fatalf("serverPodPosture = %v, want the provider's refusal %v", err, tt.refuse)
+			}
+			f := newWiringFixture(t)
+			var derived int
+			f.deps.podProfile = postureProfile(func() (sandbox.Posture, error) { derived++; return serverPodPosture(tt.opts) })
+			synctest.Test(t, func(t *testing.T) {
+				ks, err := newKeystoreSocket(f.deps)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stop := runKeystoreSocket(context.Background(), ks)
+				synctest.Wait()
+				st := ks.sup.State()
+				stop()
+				if st.Phase != socket.PhaseOff || st.Reason != tt.reason || !strings.Contains(st.Detail, "derive the runtime's posture") || st.Until.IsZero() {
+					t.Fatalf("state = %+v, want off with %q naming the derivation and a retry", st, tt.reason)
+				}
+				if st.Reason.Remedy() != tt.remedy {
+					t.Fatalf("remedy = %q, want %q", st.Reason.Remedy(), tt.remedy)
+				}
+				if derived == 0 {
+					t.Fatal("the posture was never derived")
+				}
+			})
+		})
 	}
-	f := newWiringFixture(t)
-	var derived int
-	f.deps.podProfile = postureProfile(func() (sandbox.Posture, error) { derived++; return serverPodPosture(opts) })
-	synctest.Test(t, func(t *testing.T) {
-		ks, err := newKeystoreSocket(f.deps)
-		if err != nil {
-			t.Fatal(err)
-		}
-		stop := runKeystoreSocket(context.Background(), ks)
-		synctest.Wait()
-		st := ks.sup.State()
-		stop()
-		if st.Phase != socket.PhaseOff || st.Reason != socket.OffPodProfileConfig || !strings.Contains(st.Detail, "derive the runtime's posture") || st.Until.IsZero() {
-			t.Fatalf("state = %+v, want off with %q naming the derivation and a retry", st, socket.OffPodProfileConfig)
-		}
-		if derived == 0 {
-			t.Fatal("the posture was never derived")
-		}
-	})
+	if !strings.Contains(socket.PodProfilePathRemedy, "(a symlink was changed?): fix the path it names (retried, no restart needed)") {
+		t.Fatalf("the path remedy %q does not say a fixed path needs no restart", socket.PodProfilePathRemedy)
+	}
 }
 
 // Under --runtime hostprocess the start log says the Pod-profile check does

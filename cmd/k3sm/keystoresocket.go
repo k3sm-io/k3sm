@@ -39,6 +39,7 @@ import (
 	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/k3sm/pkg/keystore/socket"
 	"k3sm.io/k3sm/pkg/kubeclient"
+	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/runtimed/pkg/keystorepaths"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -466,16 +467,24 @@ func doctorStoreDir(store *keystore.FileStore) func(context.Context) error {
 }
 
 // postureProfile renders the Pod profile (keystorePodProfile) for the
-// posture derive returns. A derivation that fails is the node's
-// configuration, as the provider refuses the same flags at the node's start:
-// it is returned wrapping socket.ErrPodProfileConfig.
+// posture derive returns. A derivation that fails because a path the
+// flags name resolves on disk somewhere other than its spelling (the
+// provider's ErrStatusRecordDirNotCanonical or ErrDataRootNotCanonical,
+// the symlink resolution of the data root, its trees and the state dir
+// included) is what is on disk: it is returned wrapping
+// socket.ErrPodProfilePath, cleared by fixing the path. Any other failure
+// is the flags' shape, as the provider refuses the same flags at the
+// node's start: it is returned wrapping socket.ErrPodProfileConfig.
 func postureProfile(derive func() (sandbox.Posture, error)) func() (string, error) {
 	return func() (string, error) {
 		posture, err := derive()
-		if err != nil {
-			return "", fmt.Errorf("%w: derive the runtime's posture: %w", socket.ErrPodProfileConfig, err)
+		switch {
+		case err == nil:
+			return keystorePodProfile(posture)
+		case errors.Is(err, provider.ErrStatusRecordDirNotCanonical), errors.Is(err, provider.ErrDataRootNotCanonical):
+			return "", fmt.Errorf("%w: derive the runtime's posture: %w", socket.ErrPodProfilePath, err)
 		}
-		return keystorePodProfile(posture)
+		return "", fmt.Errorf("%w: derive the runtime's posture: %w", socket.ErrPodProfileConfig, err)
 	}
 }
 
@@ -722,9 +731,11 @@ func notePodProfileCheckScope(runtime string, log *slog.Logger) {
 // listening socket is obtained (keystoreSocketListener in runServer), and
 // posture derives the server runtime's Seatbelt posture (serverPodPosture),
 // whose Pod profile must deny the socket before the listener serves; it is
-// asked on every pass, and a derivation that fails is the node's
-// configuration (socket.ErrPodProfileConfig: off, retried, the server not
-// stopped). A
+// asked when the supervisor's Run starts and again on its backoff only
+// until it first holds, never after. A derivation that fails is off and
+// retried, the server not stopped: as a path on disk that resolves
+// elsewhere (socket.ErrPodProfilePath), or else as the flags' shape
+// (socket.ErrPodProfileConfig). A
 // build failure is logged and retried with backoff
 // (superviseKeystoreSocket); the stop is never nil. Everything it runs is
 // in its own goroutine with recover, so nothing it does stops the

@@ -782,6 +782,39 @@ func TestPodProfileConfigIsRetried(t *testing.T) {
 	})
 }
 
+// A Pod profile whose posture cannot be derived because a path on disk
+// resolves elsewhere (ErrPodProfilePath) is retried like a configuration
+// error, but under its own reason, OffPodProfilePath, naming the path
+// remedy, which needs no restart; once it passes it is not asked again.
+func TestPodProfilePathIsRetried(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, func(c *startChecks) {
+			c.profileErr = fmt.Errorf("%w: derive the runtime's posture: data root is not its own resolved path", ErrPodProfilePath)
+		})
+		st := r.wantState(t, PhaseOff, OffPodProfilePath, MinBackoff)
+		if !strings.Contains(st.Detail, "resolved path") || st.Reason.Remedy() != PodProfilePathRemedy {
+			t.Fatalf("state %+v, remedy %q", st, st.Reason.Remedy())
+		}
+		if !strings.Contains(PodProfilePathRemedy, "fix the path it names (retried, no restart needed)") {
+			t.Fatalf("the path remedy %q does not say a fixed path needs no restart", PodProfilePathRemedy)
+		}
+		if n := r.log.count("level=WARN", PodProfilePathRemedy, string(OffPodProfilePath)); n != 1 {
+			t.Fatalf("%d Warn lines naming the path remedy, want 1:\n%s", n, r.log.b.String())
+		}
+		r.ck.mu.Lock()
+		r.ck.profileErr = nil
+		r.ck.mu.Unlock()
+		advance(MinBackoff)
+		r.wantState(t, PhaseServing, "", 0)
+		r.ck.mu.Lock()
+		profiled := r.ck.profiled
+		r.ck.mu.Unlock()
+		if profiled != 2 {
+			t.Fatalf("profiled %d; want the profile asked twice, and not again once it held", profiled)
+		}
+	})
+}
+
 func TestBackoffDoublesToFiveMinutes(t *testing.T) {
 	d, waits := MinBackoff, []time.Duration{MinBackoff}
 	for d < MaxBackoff {

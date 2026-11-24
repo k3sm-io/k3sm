@@ -39,6 +39,14 @@ var ErrPodProfileOpen = errors.New("the Pod profile does not deny the keystore s
 // is not ErrPodProfileOpen.
 var ErrPodProfileConfig = errors.New("the Pod profile does not render for this node's configuration")
 
+// ErrPodProfilePath is a Pod profile whose posture cannot be derived
+// because a path the server's flags name resolves on disk somewhere other
+// than its spelling (a symlink changed under the data root or the status
+// record dir), so a deny written from the spelling would match nothing.
+// Fixing the path clears it on the next retry, without a restart; it is
+// neither ErrPodProfileConfig nor ErrPodProfileOpen.
+var ErrPodProfilePath = errors.New("a path the node's flags name resolves somewhere unexpected")
+
 // dataVolumeAlias is the macOS data volume's mount point: a path under a
 // firmlink is also reachable through it.
 const dataVolumeAlias = "/System/Volumes/Data"

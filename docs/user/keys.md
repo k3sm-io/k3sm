@@ -205,7 +205,11 @@ running; reinstalling or restarting the same build does not change it. If instea
 refuses to render the profile for this node's settings (an invalid `--pod-logs-dir`, pod root,
 data root or state dir), the user scope is off with `the Pod profile does not render for this
 node's configuration`, the warning names the setting's error and "fix the flag, then
-`sudo k3sm restart`", and the server keeps retrying the check. `doctor` does not render the
+`sudo k3sm restart`", and the server keeps retrying the check. If a path those settings name
+resolves somewhere other than its spelling on disk (a symlink changed under the data root or
+the status directory), the user scope is off with `a path the node's flags name resolves
+somewhere unexpected` instead: fix the path and the next retry clears it, with no restart; a
+fixed flag still needs `sudo k3sm restart`. `doctor` does not render the
 profile, so neither state shows in its row; the server log names it.
 
 ### When a user scope blocks the rebuild

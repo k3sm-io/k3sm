@@ -118,8 +118,17 @@ const (
 	// posture value from the server's flags, such as the pod logs dir, the
 	// pod root, the data root or the state dir, that cannot hold its deny.
 	// It is retried with the start-check backoff, not terminal; the flag is
-	// fixed and the server restarted (PodProfileConfigRemedy).
+	// fixed and the server restarted (PodProfileConfigRemedy): the posture
+	// is derived afresh on each retry, but from the flags the process read
+	// at its start, so only a restart reads a fixed one.
 	OffPodProfileConfig OffReason = "the Pod profile does not render for this node's configuration"
+	// OffPodProfilePath is a posture that cannot be derived because a path
+	// the server's flags name resolves somewhere other than its spelling on
+	// disk (ErrPodProfilePath), as a symlink retargeted under the data root
+	// or the status record dir. It is what is on disk, not the flags' shape:
+	// retried with the start-check backoff, so fixing the path clears it with
+	// no restart (PodProfilePathRemedy).
+	OffPodProfilePath OffReason = "a path the node's flags name resolves somewhere unexpected"
 )
 
 // The supervisor's log text: every off line starts with offMsg, and the
@@ -139,6 +148,10 @@ const (
 	PodProfileRemedy = "install a k3sm built with a matching runtimed"
 	// PodProfileConfigRemedy is OffPodProfileConfig's remedy.
 	PodProfileConfigRemedy = "fix the flag, then `sudo k3sm restart`"
+	// PodProfilePathRemedy is OffPodProfilePath's remedy. A fixed path is
+	// read on the next retry; a fixed flag, as for OffPodProfileConfig,
+	// only by a restarted server.
+	PodProfilePathRemedy = "a path the node's flags name resolves somewhere unexpected (a symlink was changed?): fix the path it names (retried, no restart needed), or fix the flag, then `sudo k3sm restart`"
 	// RestartRemedy is the remedy of every other terminal activation reason.
 	RestartRemedy = "run `sudo k3sm restart`"
 )
@@ -225,7 +238,9 @@ type SupervisorConfig struct {
 	// wrapping ErrPodProfileConfig is the node's configuration: the
 	// supervisor is off with OffPodProfileConfig, logs a Warn naming
 	// PodProfileConfigRemedy, and asks again after the start-check backoff,
-	// running no start check until it passes. Any other error, or a panic,
+	// running no start check until it passes. One wrapping
+	// ErrPodProfilePath is the same, with OffPodProfilePath and
+	// PodProfilePathRemedy. Any other error, or a panic,
 	// is terminal: the supervisor is off with OffPodProfile, logs one Warn
 	// naming PodProfileRemedy, and serves nothing until Run returns.
 	PodProfile func() error
@@ -429,8 +444,10 @@ func (s *Supervisor) Run(ctx context.Context) {
 // podProfileHolds asks the PodProfile check until it passes, reporting
 // false when Run must return: ctx ended a wait, or the check failed in a
 // way no retry changes (terminal, OffPodProfile). A configuration error
-// (ErrPodProfileConfig) is off with OffPodProfileConfig and asked again
-// after the start-check backoff, which it doubles.
+// (ErrPodProfileConfig) is off with OffPodProfileConfig, and a path on disk
+// that resolves elsewhere (ErrPodProfilePath) with OffPodProfilePath; both
+// are asked again after the start-check backoff, which they double. Once
+// it passes it is not asked again for the life of Run.
 func (s *Supervisor) podProfileHolds(ctx context.Context, backoff *time.Duration) bool {
 	if s.cfg.PodProfile == nil {
 		return true
@@ -442,14 +459,20 @@ func (s *Supervisor) podProfileHolds(ctx context.Context, backoff *time.Duration
 			*backoff = MinBackoff
 			return true
 		}
-		if !errors.Is(err, ErrPodProfileConfig) {
+		var reason OffReason
+		switch {
+		case errors.Is(err, ErrPodProfilePath):
+			reason = OffPodProfilePath
+		case errors.Is(err, ErrPodProfileConfig):
+			reason = OffPodProfileConfig
+		default:
 			s.terminal(ctx, OffPodProfile, err.Error())
 			return false
 		}
 		wait := *backoff
 		*backoff = nextBackoff(wait)
-		s.off(OffPodProfileConfig, err.Error(), last, wait)
-		last = OffPodProfileConfig
+		s.off(reason, err.Error(), last, wait)
+		last = reason
 		if !s.wait(ctx, wait) {
 			return false
 		}
@@ -634,6 +657,8 @@ func (r OffReason) Remedy() string {
 		return PodProfileRemedy
 	case OffPodProfileConfig:
 		return PodProfileConfigRemedy
+	case OffPodProfilePath:
+		return PodProfilePathRemedy
 	}
 	return ""
 }
@@ -653,7 +678,7 @@ func (s *Supervisor) off(reason OffReason, detail string, last OffReason, wait t
 		if last != OffNotInstalledServer {
 			s.cfg.Log.Info(offMsg, "reason", string(reason), "err", detail)
 		}
-	case OffInstall, OffPodProfileConfig:
+	case OffInstall, OffPodProfileConfig, OffPodProfilePath:
 		s.cfg.Log.Warn(offMsg+"; "+reason.Remedy(), "reason", string(reason), "err", detail, "retry", wait)
 	default:
 		s.cfg.Log.Warn(offMsg, "reason", string(reason), "err", detail, "retry", wait)
