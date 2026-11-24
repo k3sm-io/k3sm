@@ -59,6 +59,11 @@ type Store interface {
 	// outside the revocation class is ErrAuditFailing. Every operation
 	// calls it, the delivery placeholders included.
 	Admit(p Peer, op string) error
+	// Refused records a request of op for p that the socket refused
+	// itself, for reason (keystore's Refused* closed set): a post-frame
+	// refused line under p's uid, rate-limited per uid with a summary of
+	// the count dropped. It is best effort and reports nothing.
+	Refused(ctx context.Context, p Peer, op, reason string)
 }
 
 // ErrAuditFailing refuses a mutation or read while the store's audit
@@ -103,6 +108,7 @@ type FileStoreBridge struct {
 	mutations *uidRate
 	lists     *uidRate
 	execReads *uidRate
+	refusals  *refusedLines
 }
 
 var _ Store = (*FileStoreBridge)(nil)
@@ -123,6 +129,7 @@ func NewFileStoreBridge(fs *keystore.FileStore, now func() time.Time) (*FileStor
 		mutations: newUIDRate(MutationsPerSecond, time.Second, now),
 		lists:     newUIDRate(ListsPerSecond, time.Second, now),
 		execReads: newUIDRate(ExecReadsPerMinute, time.Minute, now),
+		refusals:  newRefusedLines(now),
 	}, nil
 }
 

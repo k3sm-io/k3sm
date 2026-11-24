@@ -394,6 +394,11 @@ type auditLine struct {
 	// delivery is the KeyDelivery UID a withdraw names, or
 	// auditPlaceholder for one outside the grammar; empty for other ops.
 	delivery string
+	// request is the operation a post-frame refused line refuses, and
+	// dropped a refused summary's count (userrefused.go); empty and zero
+	// write neither.
+	request string
+	dropped uint64
 	// revoke marks the line of an operation in the revocation class that
 	// revoked something: past its uid's share or the hard cap it draws on
 	// one of that uid's revocation budgets, where every other line is

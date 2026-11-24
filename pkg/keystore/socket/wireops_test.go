@@ -192,8 +192,9 @@ func TestOpsWireShapes(t *testing.T) {
 
 // countingStore is a Store that counts its calls and answers each ok.
 type countingStore struct {
-	mu    sync.Mutex
-	calls int
+	mu      sync.Mutex
+	calls   int
+	refused []string
 }
 
 func (s *countingStore) hit() { s.mu.Lock(); s.calls++; s.mu.Unlock() }
@@ -223,6 +224,20 @@ func (s *countingStore) List(context.Context, Peer) ([]keystore.Entry, error) {
 }
 
 func (s *countingStore) Admit(Peer, string) error { return nil }
+
+// Refused records the socket's own refusals by operation and reason; they
+// are not store calls.
+func (s *countingStore) Refused(_ context.Context, _ Peer, op, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refused = append(s.refused, op+" "+reason)
+}
+
+func (s *countingStore) refusals() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.refused...)
+}
 
 func (s *countingStore) ReadForExec(context.Context, Peer, string) (keystore.Version, []byte, error) {
 	s.hit()
@@ -278,6 +293,14 @@ func TestOpsRefuseMalformedRequests(t *testing.T) {
 	}
 	if n := st.n(); n != 0 {
 		t.Fatalf("refused requests reached the store %d times", n)
+	}
+	for _, r := range st.refusals() {
+		if !strings.HasSuffix(r, " bad-header") && !strings.HasSuffix(r, " bad-value") {
+			t.Errorf("a malformed request was recorded as %q, want bad-header or bad-value", r)
+		}
+	}
+	if n := len(st.refusals()); n != 23 {
+		t.Fatalf("%d refusals recorded for the 23 malformed requests", n)
 	}
 	for _, tc := range []struct{ name, header string }{
 		{"unknown fields", `{"op":"rm","entry":"` + e + `","x":{"y":[1,2]},"from_version":"z"}`},
@@ -335,7 +358,8 @@ func TestListWithoutScopeIsEmpty(t *testing.T) {
 
 // deliver, withdraw and deliveries are known operations answered refused
 // until the delivery slice serves them: a stable code, never unknown-op;
-// they reach no store and write no line, and the connection stays open.
+// they reach no store, each is recorded as the socket's own refusal,
+// not-served, and the connection stays open.
 func TestDeliveryOpsRefusedUntilDeliverySlice(t *testing.T) {
 	st := &countingStore{}
 	h, err := NewOpsHandler(time.Now, st)
@@ -353,6 +377,9 @@ func TestDeliveryOpsRefusedUntilDeliverySlice(t *testing.T) {
 	}
 	if st.n() != 0 {
 		t.Fatalf("the delivery operations reached the store %d times", st.n())
+	}
+	if got := strings.Join(st.refusals(), ","); got != "deliver not-served,withdraw not-served,deliveries not-served" {
+		t.Fatalf("the delivery operations' refusals are %s, want one not-served each", got)
 	}
 	if _, err := NewOpsHandler(time.Now, nil); err == nil {
 		t.Fatal("NewOpsHandler took a nil store")
@@ -419,9 +446,13 @@ func unreadable(t *testing.T, p string, restore os.FileMode) {
 // assertRefusedLikeAbsent asks, as uid B, every named operation for other
 // and for B's own absent entry, and requires identical reply frames
 // (not-found for the store's operations, refused for the delivery ones)
-// with each store refusal audited under B.
+// with each refusal audited under B: the store's under the operation, the
+// socket's own as a refused line.
 func assertRefusedLikeAbsent(t *testing.T, r *opsRig, other string) {
 	t.Helper()
+	// A fresh minute for B's refused lines, so none is held back by their
+	// rate limit.
+	r.clock.advance(time.Minute)
 	b := dialOps(t, r.ops, uidB)
 	absent := entryOf(uidB, "absent")
 	for _, c := range namedCases {
@@ -440,8 +471,14 @@ func assertRefusedLikeAbsent(t *testing.T, r *opsRig, other string) {
 			t.Errorf("%s %v of %s: code %q, want %q", c.op, c.extra, other, code, wantCode)
 		}
 		if c.lineOp == "" {
-			if len(lines) != before {
-				t.Errorf("%s of %s wrote %d lines, want none", c.op, other, len(lines)-before)
+			// The socket's own refusal: one refused line under B, naming
+			// the operation and not the entry.
+			if len(lines) != before+1 {
+				t.Errorf("%s of %s wrote %d lines, want its one refused line", c.op, other, len(lines)-before)
+				continue
+			}
+			if l := lines[len(lines)-1]; l.Op != "refused" || l.Request != c.op || l.Result != "not-served" || l.Name != "" || l.Caller.UID != uidB {
+				t.Errorf("%s of %s was audited %+v, want refused %s not-served with caller %d", c.op, other, l, c.op, uidB)
 			}
 			continue
 		}

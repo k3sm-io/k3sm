@@ -301,7 +301,7 @@ func (r *bridgeRig) linesOf(t *testing.T, uid uint32) []auditEntry {
 // operations' calls; none reveals, shows, rewraps, or reads a value
 // unaudited.
 func TestStoreInterfaceHasNoRevealMethod(t *testing.T) {
-	want := []string{"Admit", "List", "Put", "ReadForExec", "Remove", "Rotate", "RotateFrom"}
+	want := []string{"Admit", "List", "Put", "ReadForExec", "Refused", "Remove", "Rotate", "RotateFrom"}
 	banned := []string{"reveal", "show", "rewrap", "current", "get", "export", "dump"}
 	for _, typ := range []reflect.Type{reflect.TypeFor[Store](), reflect.TypeFor[*FileStoreBridge]()} {
 		var got []string

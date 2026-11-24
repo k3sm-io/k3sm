@@ -38,7 +38,9 @@ const auditFormat = 1
 // peer: its uid, and its pid, which is advisory. Version and Fingerprint
 // are the version an operation wrote and its per-scope fingerprint, on the
 // lines of the operations that write one (put, rotate); every other line
-// carries neither. The delivery field is
+// carries neither. Request and Dropped are a post-frame refused line's
+// (userrefused.go): the operation refused, and a summary's dropped count.
+// The delivery field is
 // DeliveryUID in Go, not Delivery: the export gate (unexported_test.go)
 // reads a bare Delivery identifier as the delivery type, and would count
 // every exported caller of the audit writer as reaching the user scope.
@@ -54,7 +56,9 @@ type auditRecord struct {
 	Fingerprint string       `json:"fingerprint,omitempty"`
 	Namespace   string       `json:"namespace"`
 	DeliveryUID string       `json:"delivery,omitempty"`
+	Request     string       `json:"request,omitempty"`
 	Result      string       `json:"result"`
+	Dropped     uint64       `json:"dropped,omitempty"`
 }
 
 // auditCaller is an audit line's caller: the socket peer's uid, and its
@@ -132,7 +136,9 @@ func marshalAuditLine(l auditLine, now time.Time) ([]byte, error) {
 		Fingerprint: l.fingerprint,
 		Namespace:   l.namespace,
 		DeliveryUID: l.delivery,
+		Request:     l.request,
 		Result:      l.result,
+		Dropped:     l.dropped,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode an audit line: %w", err)
@@ -168,7 +174,7 @@ func parseAuditLine(line []byte) (auditRecord, error) {
 }
 
 // auditKeys are auditRecord's JSON keys, exact.
-var auditKeys = []string{"v", "ts", "op", "via", "caller", "scope", "name", "version", "fingerprint", "namespace", "delivery", "result"}
+var auditKeys = []string{"v", "ts", "op", "via", "caller", "scope", "name", "version", "fingerprint", "namespace", "delivery", "request", "result", "dropped"}
 
 // auditKeysStrict refuses line unless it is one JSON object whose keys are
 // each given once and, where one matches a known key under encoding/json's

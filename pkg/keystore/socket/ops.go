@@ -133,6 +133,11 @@ func refusedf(format string, args ...any) error {
 	return fmt.Errorf("%w: "+format, append([]any{ErrRequestRefused}, args...)...)
 }
 
+// valueRefusedf is refusedf for a refusal of the request's value.
+func valueRefusedf(format string, args ...any) error {
+	return fmt.Errorf("%w: %w: "+format, append([]any{ErrRequestRefused, errBadValue}, args...)...)
+}
+
 // NewOpsHandler returns the Handler that serves the operations over store,
 // taking its deadlines from now.
 func NewOpsHandler(now func() time.Time, store Store, opts ...HandlerOption) (*Handler, error) {
@@ -141,14 +146,14 @@ func NewOpsHandler(now func() time.Time, store Store, opts ...HandlerOption) (*H
 	}
 	o := ops{store: store}
 	all := append([]HandlerOption{
-		withOp(OpPut, o.put),
-		withOp(OpRotate, o.rotate),
-		withOp(OpList, o.list),
-		withOp(OpRm, o.rm),
-		withOp(OpReadForExec, o.readForExec),
-		withOp(OpDeliver, o.notServed(OpDeliver)),
-		withOp(OpWithdraw, o.notServed(OpWithdraw)),
-		withOp(OpDeliveries, o.notServed(OpDeliveries)),
+		o.serve(OpPut, o.put),
+		o.serve(OpRotate, o.rotate),
+		o.serve(OpList, o.list),
+		o.serve(OpRm, o.rm),
+		o.serve(OpReadForExec, o.readForExec),
+		o.serve(OpDeliver, o.notServed(OpDeliver)),
+		o.serve(OpWithdraw, o.notServed(OpWithdraw)),
+		o.serve(OpDeliveries, o.notServed(OpDeliveries)),
 	}, opts...)
 	return NewHandler(now, all...)
 }
@@ -157,6 +162,19 @@ func NewOpsHandler(now func() time.Time, store Store, opts ...HandlerOption) (*H
 // admitted peer, never a header field.
 type ops struct {
 	store Store
+}
+
+// serve registers fn as op, recording each refusal the socket gives
+// itself (refusalReason) as a post-frame refused line before the reply is
+// written; a refusal the store gave, the store has audited.
+func (o ops) serve(op string, fn opFunc) HandlerOption {
+	return withOp(op, func(ctx context.Context, req Request) (Reply, error) {
+		rep, err := fn(ctx, req)
+		if reason := refusalReason(err); reason != "" {
+			o.store.Refused(ctx, req.Peer, op, reason)
+		}
+		return rep, err
+	})
 }
 
 func (o ops) put(ctx context.Context, req Request) (Reply, error) {
@@ -189,7 +207,7 @@ func (o ops) rotate(ctx context.Context, req Request) (Reply, error) {
 	)
 	if h.FromVersion != nil {
 		if req.Value != nil {
-			return Reply{}, refusedf("a rotate carries a value or from_version, not both")
+			return Reply{}, valueRefusedf("a rotate carries a value or from_version, not both")
 		}
 		if err := o.store.Admit(req.Peer, OpRotate); err != nil {
 			return Reply{}, err
@@ -297,7 +315,7 @@ func (o ops) notServed(op string) opFunc {
 		if err := o.store.Admit(req.Peer, op); err != nil {
 			return Reply{}, err
 		}
-		return Reply{}, refusedf("%s", reasonDeliverySlice)
+		return Reply{}, fmt.Errorf("%w: %w: %s", ErrRequestRefused, errNotServed, reasonDeliverySlice)
 	}
 }
 
@@ -306,9 +324,9 @@ func (o ops) notServed(op string) opFunc {
 func checkValue(v []byte) error {
 	switch {
 	case len(v) == 0:
-		return refusedf("the request carries no value")
+		return valueRefusedf("the request carries no value")
 	case len(v) > keystore.MaxValueSize:
-		return refusedf("the value is over the %d-byte limit", keystore.MaxValueSize)
+		return valueRefusedf("the value is over the %d-byte limit", keystore.MaxValueSize)
 	}
 	return nil
 }
@@ -316,7 +334,7 @@ func checkValue(v []byte) error {
 // noValue refuses a value on an operation that takes none.
 func noValue(v []byte) error {
 	if v != nil {
-		return refusedf("the operation takes no value")
+		return valueRefusedf("the operation takes no value")
 	}
 	return nil
 }

@@ -787,7 +787,7 @@ type preFrameCaller struct {
 }
 
 // preFrameKeys are preFrameRec's JSON keys, exact.
-var preFrameKeys = append(slices.Clone(auditKeys), "charge", "source", "dropped", "class")
+var preFrameKeys = append(slices.Clone(auditKeys), "charge", "source", "class")
 
 // preFrameRecord is a pre-frame line: a refusal when result is a reason
 // (class ""), a summary of dropped refusals of class when result is

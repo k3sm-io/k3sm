@@ -149,6 +149,7 @@ type auditEntry struct {
 	} `json:"caller"`
 	Scope   string `json:"scope"`
 	Name    string `json:"name"`
+	Request string `json:"request"`
 	Result  string `json:"result"`
 	Charge  string `json:"charge"`
 	Source  string `json:"source"`
