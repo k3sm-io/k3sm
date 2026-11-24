@@ -18,6 +18,7 @@ package keystore
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -105,6 +106,93 @@ func TestPrefLockWriterTimeoutAdmitsReaders(t *testing.T) {
 		l.release(false)
 		if err := l.acquire(ctx, true, 0); err != nil {
 			t.Fatalf("the writer once the share is empty: %v", err)
+		}
+	})
+}
+
+// The reader side: with exclusive holds streaming from several goroutines,
+// each queued behind the last, a waiting reader is handed the lock at the
+// next writer's release, before the writers queued behind it, as
+// sync.RWMutex hands it; without the handoff it waits out its whole wait.
+func TestPrefLockAdmitsReaderUnderWriterStream(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			writers = 3
+			hold    = 40 * time.Millisecond
+			wait    = 2 * time.Second
+		)
+		l := newPrefLock()
+		ctx := context.Background()
+		var (
+			stop atomic.Bool
+			wg   sync.WaitGroup
+			held atomic.Int64
+		)
+		for i := range writers {
+			wg.Go(func() {
+				time.Sleep(time.Duration(i) * hold / writers)
+				for !stop.Load() {
+					if err := l.acquire(ctx, true, wait); err != nil {
+						continue
+					}
+					held.Add(1)
+					time.Sleep(hold)
+					l.release(true)
+				}
+			})
+		}
+		time.Sleep(2 * hold)
+		asked := time.Now()
+		err := l.acquire(ctx, false, wait)
+		served := time.Since(asked)
+		if err == nil {
+			l.release(false)
+		}
+		stop.Store(true)
+		wg.Wait()
+		if err != nil {
+			t.Fatalf("the reader while writers stream, after %s: %v", served, err)
+		}
+		if served > hold {
+			t.Fatalf("the reader was served after %s, past one writer's %s hold", served, hold)
+		}
+		if held.Load() < writers {
+			t.Fatalf("only %d exclusive holds ran", held.Load())
+		}
+	})
+}
+
+// A waiter whose context is cancelled gives up with the context's error and
+// holds nothing; a writer that times out leaves no waiting writer counted.
+func TestPrefLockCancelAndTimeoutLeaveNoWaiter(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		l := newPrefLock()
+		if err := l.acquire(context.Background(), true, time.Second); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 2)
+		go func() { done <- l.acquire(ctx, false, time.Minute) }()
+		go func() { done <- l.acquire(ctx, true, time.Minute) }()
+		synctest.Wait()
+		cancel()
+		for range 2 {
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatalf("a cancelled waiter: %v, want context.Canceled", err)
+			}
+		}
+		if err := l.acquire(context.Background(), true, 10*time.Millisecond); err != errLockTimeout {
+			t.Fatalf("a writer behind the held lock: %v, want errLockTimeout", err)
+		}
+		l.mu.Lock()
+		writers, readers, queued := l.writers, l.readers, len(l.waiting)
+		l.mu.Unlock()
+		if writers != 0 || readers != 0 || queued != 0 {
+			t.Fatalf("after the give-ups: %d writers waiting, %d readers holding, %d readers queued; want none", writers, readers, queued)
+		}
+		l.release(true)
+		if err := l.acquire(context.Background(), false, 0); err != nil {
+			t.Fatalf("a reader once the lock is free: %v", err)
 		}
 	})
 }

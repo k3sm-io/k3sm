@@ -3964,8 +3964,11 @@ refused before its first frame:
   (a waiting writer blocks new readers, as Go's `sync.RWMutex` does) in front of the `flock`, so
   a stream of reads cannot starve a mutation.
   As built: `pkg/keystore`'s store lock takes the in-process lock, then the `.lock` `flock`, both
-  within the one lock wait, and a writer that gives up its wait readmits readers
-  (`TestWriterPreferringLock`). The order every hold keeps is the uid's mutation lock (a `put`,
+  within the one lock wait. As `sync.RWMutex` does, a waiting writer blocks new readers and a
+  writer's release hands the lock to every reader already waiting before the next writer, so
+  neither mode starves the other; a writer that gives up its wait readmits readers
+  (`TestWriterPreferringLock`, `TestPrefLockAdmitsReaderUnderWriterStream`). Every store the
+  server opens over the tree shares that one lock (`Config.Tree`). The order every hold keeps is the uid's mutation lock (a `put`,
   `rotate` or `rm`, so only the uid's own operations wait on it), then the in-process lock, then
   the `.lock` `flock`, then the user-scope floor's lock; a system-scope verb, run as root in a
   process of its own, takes `keystore-lock` before the store lock. A user `list` authenticates

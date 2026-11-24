@@ -51,17 +51,22 @@ func NewTreeState() *TreeState {
 // Tree is the store's TreeState: Config.Tree, or the one New made for it.
 func (s *FileStore) Tree() *TreeState { return s.tree }
 
-// prefLock is a reader-writer lock in which a waiting writer blocks new
-// readers, as sync.RWMutex does, whose acquisition is bounded by a wait and
-// a context, which sync.RWMutex's is not.
+// prefLock is a reader-writer lock with sync.RWMutex's fairness: a waiting
+// writer blocks new readers, and a writer's release hands the lock to every
+// reader already waiting, before any other writer, so neither a stream of
+// readers nor a stream of writers starves the other. Unlike sync.RWMutex,
+// its acquisition is bounded by a wait and a context.
 type prefLock struct {
 	mu      sync.Mutex
 	readers int
 	writer  bool
 	// writers is how many exclusive acquisitions are waiting.
 	writers int
-	// changed is closed, and replaced, on every change a waiter may be
-	// waiting for.
+	// waiting is the readers waiting, each granted by closing its channel
+	// once it holds a share.
+	waiting []chan struct{}
+	// changed is closed, and replaced, on every change a waiting writer
+	// may be waiting for.
 	changed chan struct{}
 }
 
@@ -76,22 +81,21 @@ func (l *prefLock) acquire(ctx context.Context, exclusive bool, wait time.Durati
 	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
+	if !exclusive {
+		return l.acquireShared(ctx, timer.C)
+	}
 	waiting := false
 	for {
 		l.mu.Lock()
-		switch {
-		case exclusive && !l.writer && l.readers == 0:
+		if !l.writer && l.readers == 0 {
 			l.writer = true
 			if waiting {
 				l.writers--
 			}
 			l.mu.Unlock()
 			return nil
-		case !exclusive && !l.writer && l.writers == 0:
-			l.readers++
-			l.mu.Unlock()
-			return nil
-		case exclusive && !waiting:
+		}
+		if !waiting {
 			l.writers++
 			waiting = true
 		}
@@ -106,18 +110,60 @@ func (l *prefLock) acquire(ctx context.Context, exclusive bool, wait time.Durati
 		case <-timer.C:
 			err = errLockTimeout
 		}
-		if waiting {
-			// A writer that gives up no longer holds readers back.
-			l.mu.Lock()
-			l.writers--
-			l.broadcast()
-			l.mu.Unlock()
+		// A writer that gives up no longer holds readers back.
+		l.mu.Lock()
+		l.writers--
+		if l.writers == 0 && !l.writer {
+			l.grantReaders()
 		}
+		l.broadcast()
+		l.mu.Unlock()
 		return err
 	}
 }
 
-// release releases a hold acquire took, exclusive or shared.
+// acquireShared takes a share: at once when no writer holds or waits, or
+// else when a writer's release, or the last waiting writer giving up,
+// grants it.
+func (l *prefLock) acquireShared(ctx context.Context, expired <-chan time.Time) error {
+	l.mu.Lock()
+	if !l.writer && l.writers == 0 {
+		l.readers++
+		l.mu.Unlock()
+		return nil
+	}
+	granted := make(chan struct{})
+	l.waiting = append(l.waiting, granted)
+	l.mu.Unlock()
+	var err error
+	select {
+	case <-granted:
+		return nil
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-expired:
+		err = errLockTimeout
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	select {
+	case <-granted:
+		// Granted as it gave up: the share it was handed is given back.
+		l.readers--
+		l.broadcast()
+	default:
+		for i, c := range l.waiting {
+			if c == granted {
+				l.waiting = append(l.waiting[:i], l.waiting[i+1:]...)
+				break
+			}
+		}
+	}
+	return err
+}
+
+// release releases a hold acquire took, exclusive or shared. A writer's
+// release grants every waiting reader its share first.
 func (l *prefLock) release(exclusive bool) {
 	if l == nil {
 		return
@@ -125,6 +171,7 @@ func (l *prefLock) release(exclusive bool) {
 	l.mu.Lock()
 	if exclusive {
 		l.writer = false
+		l.grantReaders()
 	} else {
 		l.readers--
 	}
@@ -132,7 +179,17 @@ func (l *prefLock) release(exclusive bool) {
 	l.mu.Unlock()
 }
 
-// broadcast wakes every waiter; l.mu is held.
+// grantReaders hands a share to every waiting reader; l.mu is held and no
+// writer holds l.
+func (l *prefLock) grantReaders() {
+	for _, c := range l.waiting {
+		l.readers++
+		close(c)
+	}
+	l.waiting = nil
+}
+
+// broadcast wakes every waiting writer; l.mu is held.
 func (l *prefLock) broadcast() {
 	close(l.changed)
 	l.changed = make(chan struct{})
