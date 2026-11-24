@@ -54,7 +54,9 @@ func outcomeOf(err error) (Code, string) {
 	case errors.Is(err, keystore.ErrLogFull):
 		// The uid's own share or budget (keystore.LogShareRefused), or the
 		// log past its hard cap; checked before AuditRefused, which wraps
-		// the append's own error.
+		// the append's own error, and before ErrRequestRefused, so the
+		// fail-closed refusal past the hard cap (ErrAuditFailingFull) is
+		// log-full.
 		return CodeLogFull, ""
 	case keystore.UserScopeOff(err):
 		return CodeUserScopeOff, ""

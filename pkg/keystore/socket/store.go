@@ -56,7 +56,8 @@ type Store interface {
 	// its header and value passed and before it reaches the store: past
 	// p's uid's rate limit for op it is ErrRateLimited; while the store's
 	// audit appends fail for everyone, a mutation or read
-	// outside the revocation class is ErrAuditFailing. Every operation
+	// outside the revocation class is ErrAuditFailing (ErrAuditFailingFull
+	// when the cause is the audit log past its hard cap). Every operation
 	// calls it, the delivery placeholders included.
 	Admit(p Peer, op string) error
 	// Refused records a request of op for p that the socket refused
@@ -70,8 +71,16 @@ type Store interface {
 // appends fail for everyone (keystore.FileStore.AuditFailing): the
 // fail-closed rule (docs/design/keystore.md § "The audit log"). rotate, rm
 // and withdraw, the revocation class, are never refused so. It is answered
-// refused, the code of the global append failure.
+// refused, except when the failure is the audit log past its hard cap
+// (ErrAuditFailingFull).
 var ErrAuditFailing = fmt.Errorf("%w: the audit log takes no appends, so mutations and reads are refused until one succeeds", ErrRequestRefused)
+
+// ErrAuditFailingFull is ErrAuditFailing when the store reports the
+// global append failure is the audit log past its hard cap
+// (keystore.FileStore.AuditFailingFull): it matches keystore.ErrLogFull
+// too, so it is answered log-full, which tells the client a rotation is
+// what ends it.
+var ErrAuditFailingFull = fmt.Errorf("%w (%w)", ErrAuditFailing, keystore.ErrLogFull)
 
 // revocationOp reports whether op is in the revocation class, which goes
 // ahead while appends fail (its line dropped and counted unaudited).
@@ -208,6 +217,9 @@ func (b *FileStoreBridge) Admit(p Peer, op string) error {
 		return ErrRateLimited
 	}
 	if !revocationOp(op) && b.fs.AuditFailing() {
+		if b.fs.AuditFailingFull() {
+			return ErrAuditFailingFull
+		}
 		return ErrAuditFailing
 	}
 	return nil

@@ -53,8 +53,9 @@ func (r *bridgeRig) padAuditPastCap(t *testing.T, size int64) {
 // on their uid's socket margin; one uid's spent margin refuses its own
 // revocations only, never another uid's. The grant's refusal line cannot
 // be written past the cap, which is the global append failure: until an
-// append succeeds, the next put is refused before the store, and a
-// revocation's append ends it.
+// append succeeds, the next put and read are refused before the store,
+// answered log-full because the store reports the failure is the hard cap,
+// and a revocation's append ends it.
 func TestHardCapRefusesGrantsAndReadsNotRevocations(t *testing.T) {
 	const hardCap = 16 * testShare
 	r := newOpsRig(t, func(c *keystore.Config) {
@@ -84,8 +85,16 @@ func TestHardCapRefusesGrantsAndReadsNotRevocations(t *testing.T) {
 	if !r.fs.AuditFailing() {
 		t.Fatal("the put's refusal line past the hard cap did not enter the global append failure")
 	}
-	if code := codeOf(t, b.call(t, hdr(t, OpPut, entryOf(uidB, "new"), nil), []byte("v"))); code != CodeRefused {
-		t.Fatalf("a put while appends fail: code %q, want refused", code)
+	if !r.fs.AuditFailingFull() {
+		t.Fatal("the global append failure past the hard cap is not reported as the hard cap")
+	}
+	// The fail-closed refusal names the cause the client can act on:
+	// log-full, which a rotation ends, never the bare refused.
+	if code := codeOf(t, b.call(t, hdr(t, OpPut, entryOf(uidB, "new"), nil), []byte("v"))); code != CodeLogFull {
+		t.Fatalf("a put while appends fail past the hard cap: code %q, want log-full", code)
+	}
+	if code := codeOf(t, a.call(t, hdr(t, OpReadForExec, entryOf(uidA, "a0"), nil), nil)); code != CodeLogFull {
+		t.Fatalf("a read while appends fail past the hard cap: code %q, want log-full", code)
 	}
 	a.mustReply(t, hdr(t, OpRm, entryOf(uidA, "a2"), nil), nil, nil)
 	if r.fs.AuditFailing() {

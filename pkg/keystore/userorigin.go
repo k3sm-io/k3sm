@@ -77,7 +77,12 @@ func (u *UserScope) audit(l auditLine) error {
 // hard cap), and how many committed operations went unaudited. A pointer on
 // FileStore, so a copy of the store shares it; New allocates it.
 type auditState struct {
-	failing   atomic.Bool
+	failing atomic.Bool
+	// full is whether the failure that set failing was the audit log past
+	// its hard cap (ErrLogFull, not one uid's own share or budget); it is
+	// written before failing, so a reader that sees failing set sees the
+	// cause of the failure that set it or of a later one.
+	full      atomic.Bool
 	unaudited atomic.Uint64
 }
 
@@ -92,6 +97,7 @@ func (a *auditState) note(err error) {
 	case err == nil:
 		a.failing.Store(false)
 	case !uidLogRefusal(err):
+		a.full.Store(errors.Is(err, ErrLogFull))
 		a.failing.Store(true)
 	}
 }
@@ -121,6 +127,15 @@ func (s *FileStore) UnauditedOps() uint64 {
 // only revocations go ahead. The next append that succeeds clears it.
 func (s *FileStore) AuditFailing() bool {
 	return s.audit != nil && s.audit.failing.Load()
+}
+
+// AuditFailingFull reports whether the global append failure
+// (AuditFailing) is set and was caused by the audit log past its hard cap,
+// which only root's audit --rotate ends, rather than by the file system (a
+// full disk, an I/O error). The socket answers the fail-closed refusal
+// log-full for it, and refused for every other cause.
+func (s *FileStore) AuditFailingFull() bool {
+	return s.audit != nil && s.audit.failing.Load() && s.audit.full.Load()
 }
 
 // uidLogRefusal reports whether err is one uid's own log refusal: its share

@@ -3934,12 +3934,14 @@ refused before its first frame:
   counted in memory, and `doctor` shows the count. A full disk must not keep a revoked
   credential delivered (U109). As built: the failure is the store's own account of its
   appends (`FileStore.AuditFailing`), set by an append the file system or the hard cap
-  refused and cleared by the next one that succeeds, and the socket refuses a request with
-  `refused` while it is set, after the request's header, value and rate limit pass and
-  before the store is called (the deliver and deliveries placeholders too; `withdraw` is
-  in the revocation class). Past the hard cap a grant's own refusal line cannot be written,
-  so a `put` refused `log-full` there sets the failure, and later puts and reads answer
-  `refused` until an append succeeds. Two appends can still succeed while it is set, so the
+  refused and cleared by the next one that succeeds, and the socket refuses a request while
+  it is set, after the request's header, value and rate limit pass and before the store is
+  called (the deliver and deliveries placeholders too; `withdraw` is in the revocation
+  class): with `log-full` when the store reports the failure's cause is the audit log past
+  its hard cap (`FileStore.AuditFailingFull`), which tells the client a rotation ends it,
+  and with `refused` for every other cause. Past the hard cap a grant's own refusal line
+  cannot be written, so a `put` refused `log-full` there sets the failure, and later puts
+  and reads answer `log-full` too until an append succeeds. Two appends can still succeed while it is set, so the
   state recovers without a restart: a revocation's line (which, past the hard cap, draws on
   its uid's margin) and a refused request's own post-frame `refused` line (rate-limited per
   uid as below); either ends the failure for every uid. A read whose line fails is refused
@@ -4278,12 +4280,12 @@ surface, and the app consumes only those.
   | a change that committed whose audit line failed (`keystore.AuditLost`) | `ok` with the warning `committed; audit failed` |
   | the store lock not taken within the 2-second wait (`keystore.LockBusy`, the socket's `ErrBusy`) | `busy` |
   | the uid's rate limit | `rate-limited` |
-  | `ErrLogFull`: the uid's own share or revocation budget (`keystore.LogShareRefused`), or the log past its hard cap | `log-full` |
+  | `ErrLogFull`: the uid's own share or revocation budget (`keystore.LogShareRefused`), or the log past its hard cap; and the socket's fail-closed refusal while the global append failure's cause is the hard cap (`socket.ErrAuditFailingFull`, from `keystore.FileStore.AuditFailingFull`) | `log-full` |
   | the start step not run (`keystore.UserScopeOff`) | `user-scope-off` |
   | `ErrNotFound`, `ErrVersionNotFound`, `ErrScopeAbsent` | `not-found` |
   | `ErrQuota` | `quota` |
   | `ErrScopeOwnerChanged`, `ErrScopeOwnerUnknown` | the code of the same name |
-  | a request the socket refuses before the store (`socket.ErrRequestRefused`, below); an operation refused because its audit line could not be written, the global append failure (`keystore.AuditRefused`); `ErrExists`; `ErrInvalidName`; `ErrKindMismatch`; `ErrTypedCredential`; `ErrRewrapInProgress`; the floor's damage or the scope's quarantine (`keystore.FloorDegraded`) | `refused` |
+  | a request the socket refuses before the store (`socket.ErrRequestRefused`, below); the socket's fail-closed refusal while the global append failure has any cause but the hard cap (`socket.ErrAuditFailing`); an operation refused because its audit line could not be written, the global append failure (`keystore.AuditRefused`); `ErrExists`; `ErrInvalidName`; `ErrKindMismatch`; `ErrTypedCredential`; `ErrRewrapInProgress`; the floor's damage or the scope's quarantine (`keystore.FloorDegraded`) | `refused` |
   | anything else: `ErrCorrupt`, `ErrOrphanVersion`, `ErrMasterMissing`, `ErrMasterUntrusted`, `ErrKindUnsupported`, a cancelled request | `internal` |
 
   `refused` is a request the store will not carry out as it stands, which the client can
@@ -4292,7 +4294,9 @@ surface, and the app consumes only those.
   root can repair, so the client says to run `doctor`. `ErrScopeAbsent` is `not-found` on the
   socket: the peer's own scope holds nothing it can read, and nothing on the socket path
   deletes on that answer, so it is never taken as a definitive absence. A `log-full` from the
-  uid's own share is never the global append failure: that one is `refused`, for every uid.
+  uid's own share is never the global append failure: that one is answered alike for every
+  uid, `log-full` when its cause is the audit log past its hard cap and `refused` for any
+  other cause (a full disk, an I/O error).
 - **Operations on the wire.** The request and reply headers are named Go types in
   `pkg/keystore/socket` (`PutRequest`, `RotateRequest`, `ListRequest`, `RmRequest`,
   `ReadForExecRequest`; `VersionReply`, `ListReply` with `ListEntry`, `RmReply`,

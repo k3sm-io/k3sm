@@ -105,6 +105,9 @@ func TestAuditFailureRefusesOps(t *testing.T) {
 	if !r.fs.AuditFailing() {
 		t.Fatal("a read whose line failed did not enter the global append failure")
 	}
+	if r.fs.AuditFailingFull() {
+		t.Fatal("a broken audit log under its hard cap is reported as the hard cap")
+	}
 	before := map[string]int{}
 	for _, m := range []string{"Put", "List", "ReadForExec"} {
 		before[m] = spy.n(m)
