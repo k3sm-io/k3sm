@@ -473,6 +473,7 @@ func TestDamageClassAgreesWithOutcome(t *testing.T) {
 		{"typed credential", wrap(keystore.ErrTypedCredential), CodeRefused, ""},
 		{"rewrap in progress", wrap(keystore.ErrRewrapInProgress), CodeRefused, ""},
 		{"floor degraded", floorDegradedErr(t), CodeRefused, DamageFloorDegraded},
+		{"unsupported kind wrapped in corrupt", wrap(fmt.Errorf("%w: %w", keystore.ErrCorrupt, keystore.ErrKindUnsupported)), CodeInternal, DamageUnsupportedKind},
 		{"orphan version", wrap(fmt.Errorf("%w: %w", keystore.ErrCorrupt, keystore.ErrOrphanVersion)), CodeRefused, DamageOrphanVersion},
 		{"corrupt", wrap(keystore.ErrCorrupt), CodeInternal, DamageCorrupt},
 		{"floor records entry", wrap(keystore.ErrFloorRecordsEntry), CodeInternal, DamageFloorRecordsEntry},

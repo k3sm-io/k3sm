@@ -75,10 +75,13 @@ func damageClass(err error) string {
 		switch {
 		case errors.Is(err, keystore.ErrFloorRecordsEntry):
 			return DamageFloorRecordsEntry
+		case errors.Is(err, keystore.ErrKindUnsupported):
+			// Before ErrCorrupt: a typed decode can wrap an unsupported
+			// envelope version in ErrCorrupt, and its repair is an upgrade,
+			// never the corrupt class's rm and put.
+			return DamageUnsupportedKind
 		case errors.Is(err, keystore.ErrCorrupt):
 			return DamageCorrupt
-		case errors.Is(err, keystore.ErrKindUnsupported):
-			return DamageUnsupportedKind
 		}
 		return DamageInternal
 	case CodeNotFound:

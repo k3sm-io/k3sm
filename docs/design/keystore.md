@@ -4584,7 +4584,9 @@ surface, and the app consumes only those.
   `floor-records-entry`, `floor-degraded` (the floor's damage or the scope's quarantine,
   answered `refused`), `corrupt`, `unsupported-kind` (`ErrKindUnsupported`, a record of a kind
   or envelope version this build cannot read: its remedy names the upgrade first, then a
-  restore or `rm` and `put` when this k3sm is current, never `doctor`), `scope-incomplete`
+  restore or `rm` and `put` when this k3sm is current, never `doctor`; judged before `corrupt`,
+  so an unsupported envelope version a typed decode wraps in `ErrCorrupt` never gets the
+  corrupt class's `rm` and `put`), `scope-incomplete`
   (an `ErrScopeAbsent` that is damage, `keystore.ScopeIncomplete`: a `scope.key` with no
   `entries/` directory or `deliveries` record beside it, or entries with no `scope.key`, as a
   partial restore leaves; still answered `not-found`, and never a uid with no scope yet,
