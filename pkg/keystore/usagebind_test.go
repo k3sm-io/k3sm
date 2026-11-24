@@ -19,10 +19,12 @@ package keystore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
@@ -60,8 +62,9 @@ func wantFigureIsWalk(t *testing.T, s *FileStore, u *UserScope) {
 }
 
 // copyScopeDir builds a copy of the scope directory src at dst, with fresh
-// inodes and the same bytes and modes, and pads entry a by extra bytes so
-// a figure of src is wrong for the copy.
+// inodes and the same bytes, modes and owners (as root the copy would
+// otherwise be root's, which the store refuses), and pads entry a by extra
+// bytes so a figure of src is wrong for the copy.
 func copyScopeDir(t *testing.T, src, dst string, extra int64) {
 	t.Helper()
 	err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
@@ -81,16 +84,23 @@ func copyScopeDir(t *testing.T, src, dst string, extra int64) {
 			if err := os.Mkdir(to, fi.Mode().Perm()); err != nil {
 				return err
 			}
-			return os.Chmod(to, fi.Mode().Perm())
+		} else {
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(to, b, fi.Mode().Perm()); err != nil {
+				return err
+			}
 		}
-		b, err := os.ReadFile(p)
-		if err != nil {
+		if err := os.Chmod(to, fi.Mode().Perm()); err != nil {
 			return err
 		}
-		if err := os.WriteFile(to, b, fi.Mode().Perm()); err != nil {
-			return err
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("%s: no stat owner", p)
 		}
-		return os.Chmod(to, fi.Mode().Perm())
+		return os.Lchown(to, int(st.Uid), int(st.Gid))
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -104,6 +114,13 @@ func copyScopeDir(t *testing.T, src, dst string, extra int64) {
 		t.Fatal(err)
 	}
 	_ = f.Close()
+	var st syscall.Stat_t
+	if err := syscall.Lstat(filepath.Dir(pad), &st); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Lchown(pad, int(st.Uid), int(st.Gid)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // A scope tree renamed into place under the same scope.key bytes (a copy
