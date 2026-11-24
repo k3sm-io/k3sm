@@ -130,6 +130,13 @@ type Config struct {
 	// cap. A negative value, or one over LogHardCap / 16, makes every
 	// operation fail.
 	LogUIDShare int64
+	// LockWait bounds every wait for the store lock: past it an operation
+	// fails with the store's busy error (errLockTimeout), not the server.
+	// Zero is the default, 10 s, which the root verbs keep; the socket
+	// server's store sets 2 s (docs/design/keystore.md § "The audit log":
+	// an append waits at most 2 seconds for the lock). A negative value
+	// makes every operation fail.
+	LockWait time.Duration
 }
 
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
@@ -232,7 +239,7 @@ func New(cfg Config) *FileStore {
 		rand:            rand.Reader,
 		now:             time.Now,
 		chown:           (*os.File).Chown,
-		lockWait:        lockTimeout,
+		lockWait:        time.Duration(orDefault(int64(cfg.LockWait), int64(lockTimeout))),
 		step:            func(string) error { return nil },
 		owned:           func([]byte) {},
 		entryMade:       func(string) {},
@@ -290,6 +297,8 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: MasterDir is empty", errInvalidConfig)
 	case s.dataRoot == "":
 		return fmt.Errorf("%w: DataRoot is empty", errInvalidConfig)
+	case s.lockWait < 0:
+		return fmt.Errorf("%w: LockWait %v is negative", errInvalidConfig, s.lockWait)
 	case s.logSoftCap < 0 || s.logHardCap < 0 || s.logRevokeBudget < 0 || s.logUIDShare < 0:
 		return fmt.Errorf("%w: a log cap, budget or share is negative", errInvalidConfig)
 	case s.logUIDShare > s.logHardCap/logUIDShareDivisor:
