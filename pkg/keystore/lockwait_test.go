@@ -81,3 +81,38 @@ func TestLockWaitBoundsUserOps(t *testing.T) {
 		}
 	})
 }
+
+// A refusal that comes before its operation takes the lock appends its
+// line under the lock taken briefly; under a lock held past its wait the
+// line is not written and is counted in the uid's post-frame dropped
+// count, so the summary still accounts for it.
+func TestAuditBrieflyCountsLineLockKeptOut(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, server := newMasteredStore(t)
+		fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
+		u := userScope(t, s, 1001)
+		userPut(t, u, "user/1001/a", "one")
+		badPut := func(ctx context.Context) {
+			if _, err := u.Put(ctx, "user/1001/Bad Name", KindOpaque, []byte("v")); !errors.Is(err, ErrInvalidName) {
+				t.Fatalf("a put of a bad name: %v, want ErrInvalidName", err)
+			}
+		}
+		badPut(context.Background())
+		if n := s.PostFrameDropped(1001); n != 0 {
+			t.Fatalf("a refusal whose line was written counted %d dropped, want 0", n)
+		}
+		s.lockWait = New(Config{LockWait: 2 * time.Second}).lockWait
+		f, err := os.OpenFile(filepath.Join(server, "keystore", lockName), os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			t.Fatal(err)
+		}
+		badPut(context.Background())
+		if n := s.PostFrameDropped(1001); n != 1 {
+			t.Fatalf("a refusal under a lock held past its wait counted %d dropped, want 1", n)
+		}
+	})
+}

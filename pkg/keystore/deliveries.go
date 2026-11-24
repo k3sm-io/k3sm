@@ -1474,13 +1474,18 @@ func (g *grantAudit) refusedBriefly(ctx context.Context, err error) {
 // not audited: a store whose configuration is invalid, a keystore directory
 // that is missing (no lock file and no log to append to), a lock held past
 // its wait, or a done context. Appending such a line without the lock is
-// what the contract forbids, and a refusal line is best effort.
+// what the contract forbids, and a refusal line is best effort; the line
+// is counted in the uid's post-frame dropped count instead
+// (AddPostFrameDropped), which the uid's next refused-line summary or
+// root's next audit --rotate writes, and doctor shows.
 func (u *UserScope) auditBriefly(ctx context.Context, l auditLine, err error) {
 	if u.s.checkConfig() != nil {
+		u.s.AddPostFrameDropped(u.uid, 1)
 		return
 	}
 	_, done, lerr := u.s.openLocked(ctx, false, true)
 	if lerr != nil {
+		u.s.AddPostFrameDropped(u.uid, 1)
 		return
 	}
 	defer done()

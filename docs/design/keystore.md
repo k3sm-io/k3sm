@@ -3922,7 +3922,9 @@ refused before its first frame:
   same hold, and a refusal after the lock was taken appends before it is released; a refusal
   that came before the lock takes it briefly to append, and one for which the lock cannot be
   had (the keystore directory missing, the lock held past its wait, an invalid configuration)
-  is not audited rather than appended without it.
+  is not audited rather than appended without it; that line is counted in the uid's
+  post-frame dropped count, which its next refused-line summary or root's next
+  `audit --rotate` writes and `doctor` shows (`TestAuditBrieflyCountsLineLockKeptOut`).
 - **Lock modes and fairness.** Reads (`list`, `read-for-exec`, `deliveries` and the
   reconciler's reads) take the store lock shared, and their audit lines are appended under that
   shared hold (a read is admitted against the share first, then reads, then appends its line,
