@@ -334,10 +334,11 @@ func FuzzSSHImport(f *testing.F) {
 	})
 }
 
-// TestSSHSeedLengthError names the seed's length, then the one wanted.
+// TestSSHSeedLengthError names the length wanted, never the seed's own:
+// a seed's length is part of a secret's shape.
 func TestSSHSeedLengthError(t *testing.T) {
 	_, err := SSHFingerprint(make([]byte, 31))
-	if err == nil || !strings.Contains(err.Error(), "an ssh seed is 31 bytes, not 32") {
-		t.Fatalf("SSHFingerprint of a 31-byte seed: %v, want it to say 31 bytes, not 32", err)
+	if err == nil || !strings.Contains(err.Error(), "an ssh seed is not 32 bytes") || strings.Contains(err.Error(), "31") {
+		t.Fatalf("SSHFingerprint of a 31-byte seed: %v, want it to name 32 bytes and not 31", err)
 	}
 }

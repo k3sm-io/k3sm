@@ -114,7 +114,7 @@ func clearRawKey(raw any) {
 // sshPublicKey returns the SSH public key of an ed25519 seed.
 func sshPublicKey(seed []byte) (ssh.PublicKey, error) {
 	if len(seed) != seedSize {
-		return nil, fmt.Errorf("%w: an ssh seed is %d bytes, not %d", ErrInvalidCredential, len(seed), seedSize)
+		return nil, fmt.Errorf("%w: an ssh seed is not %d bytes", ErrInvalidCredential, seedSize)
 	}
 	pub, err := ssh.NewPublicKey(ed25519.NewKeyFromSeed(seed).Public())
 	if err != nil {

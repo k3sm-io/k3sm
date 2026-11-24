@@ -458,10 +458,10 @@ func checkValue(kind Kind, value []byte) error {
 		}
 	case KindOpaque:
 		if len(value) == 0 {
-			return errors.New("the value is empty")
+			return fmt.Errorf("%w: the value is empty", errInvalidValue)
 		}
 		if len(value) > MaxValueSize {
-			return fmt.Errorf("the value is %d bytes, over the %d-byte limit", len(value), MaxValueSize)
+			return fmt.Errorf("%w: the value is over the %d-byte limit", errInvalidValue, MaxValueSize)
 		}
 		return nil
 	case KindToken, KindSSH, KindOAuth:
