@@ -4378,6 +4378,12 @@ surface, and the app consumes only those.
   | a request the socket refuses before the store (`socket.ErrRequestRefused`, below); the socket's fail-closed refusal while the global append failure has any cause but the hard cap (`socket.ErrAuditFailing`); an operation refused because its audit line could not be written, the global append failure (`keystore.AuditRefused`); `ErrExists`; `ErrInvalidName`; `ErrKindMismatch`; a value its kind does not take, an Ed25519 key of the wrong length or with a foreign public half (`keystore.InvalidValue`); `ErrTypedCredential`; `ErrRewrapInProgress`; a uid the store gives no user scope (`keystore.IneligibleUID`, with an `ineligible-uid` refused line); a sealed version above the entry's pointer (`ErrOrphanVersion`, which also matches `ErrCorrupt`); the floor's damage or the scope's quarantine (`keystore.FloorDegraded`) | `refused` |
   | anything else: `ErrCorrupt`, `ErrMasterMissing`, `ErrMasterUntrusted`, `ErrKindUnsupported`, a cancelled request | `internal` |
 
+  `ErrCorrupt` is judged before the `refused` row: damage read back from the store answers
+  `internal` whatever else its chain matches, so a stored Ed25519 version that authenticates
+  and fails its check, which also matches `keystore.InvalidValue`, is `internal`; only
+  `ErrOrphanVersion` among the errors that match `ErrCorrupt` is `refused`
+  (`TestReadSideDamageAnswersInternal`, `TestStoredEd25519FailingCheckIsCorrupt`).
+
   `refused` is a request the store will not carry out as it stands, which the client can
   change (another name, rotate rather than put, root finishing a rewrap or acknowledging the
   floor's damage, or appends that succeed again); `internal` is damage or a missing key only

@@ -68,6 +68,12 @@ func outcomeOf(err error) (Code, string) {
 		return CodeScopeOwnerChanged, ""
 	case errors.Is(err, keystore.ErrScopeOwnerUnknown):
 		return CodeScopeOwnerUnknown, ""
+	case errors.Is(err, keystore.ErrCorrupt) && !errors.Is(err, keystore.ErrOrphanVersion):
+		// Damage read back from the store is internal, whatever else its
+		// chain matches: a stored version that authenticates and fails its
+		// kind's check also matches InvalidValue, a put's refusal. Only an
+		// orphan version, which the owner can repair, is refused.
+		return CodeInternal, ""
 	case errors.Is(err, ErrRequestRefused),
 		keystore.AuditRefused(err),
 		errors.Is(err, keystore.ErrExists),

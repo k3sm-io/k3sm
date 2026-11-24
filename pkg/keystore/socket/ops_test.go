@@ -279,6 +279,27 @@ func TestEd25519ValueRefusedNotInternal(t *testing.T) {
 	}
 }
 
+// Read-side damage answers internal even when its chain also matches a
+// refusal: a stored Ed25519 version that authenticates and fails its check
+// is ErrCorrupt wrapping the InvalidValue a put of the same bytes gets
+// (the store's shape, TestStoredEd25519FailingCheckIsCorrupt). The orphan
+// version, which also matches ErrCorrupt, is still refused.
+func TestReadSideDamageAnswersInternal(t *testing.T) {
+	r := newStartedBridge(t, nil)
+	_, refusal := r.b.Put(t.Context(), Peer{UID: uidA}, entryOf(uidA, "k"), keystore.KindEd25519, []byte("SECRET!"))
+	if !keystore.InvalidValue(refusal) {
+		t.Fatalf("a put of a 7-byte Ed25519 value = %v, want InvalidValue", refusal)
+	}
+	read := fmt.Errorf("user scope exec-read: %w: version 1: %w", keystore.ErrCorrupt, refusal)
+	if code, _ := outcomeOf(read); code != CodeInternal {
+		t.Errorf("a stored version failing its check = %q, want internal", code)
+	}
+	orphan := fmt.Errorf("%w: %w", keystore.ErrCorrupt, keystore.ErrOrphanVersion)
+	if code, _ := outcomeOf(orphan); code != CodeRefused {
+		t.Errorf("an orphan version = %q, want refused", code)
+	}
+}
+
 // The store's own states, made by the real store: its busy lock, the user
 // scope not started, a uid's spent share, and a committed change whose
 // audit line failed.
