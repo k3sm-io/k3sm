@@ -4568,8 +4568,16 @@ surface, and the app consumes only those.
   `floor-records-entry`, `floor-degraded` (the floor's damage or the scope's quarantine,
   answered `refused`), `corrupt`, `unsupported-kind` (`ErrKindUnsupported`, a record of a kind
   or envelope version this build cannot read: its remedy names the upgrade first, then a
-  restore or `rm` and `put` when this k3sm is current, never `doctor`), and `internal` for any
-  other error answered `internal` (a missing or untrusted master). The class is judged inside the reply this table gives, in its
+  restore or `rm` and `put` when this k3sm is current, never `doctor`), `scope-incomplete`
+  (an `ErrScopeAbsent` that is damage, `keystore.ScopeIncomplete`: a `scope.key` with no
+  `entries/` directory or `deliveries` record beside it, or entries with no `scope.key`, as a
+  partial restore leaves; still answered `not-found`, and never a uid with no scope yet,
+  `keystore.NoScopeKey`), and `internal` for any other error answered `internal` (a missing
+  or untrusted master). The store's interrupted put (`errInterruptedPut`, a `not-found`) is
+  not damage, a put that never committed which the next put discards ("Settled by the
+  implementation"), and it is the system scope's: no socket operation meets it. A user entry
+  directory with no `current`, whatever its shape, is `ErrCorrupt`, answered `internal` and
+  logged `corrupt` (`TestNotFoundDamageLogged`, `TestScopeIncompleteIsNotNoScopeKey`). The class is judged inside the reply this table gives, in its
   order, so the log and the reply never disagree on a chain that matches more than one row:
   the floor's damage with `ErrCorrupt` answers `internal` and logs `corrupt`, and damage
   behind a row that is not damage (`busy`, `not-found`) logs nothing

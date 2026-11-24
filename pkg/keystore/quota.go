@@ -725,7 +725,7 @@ func (u *UserScope) openEntriesForRevoke(root *os.Root) (entries *os.Root, gen [
 	}
 	entries, err = u.s.openSubdir(dir, scopeEntriesName, false)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, r.generation, fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent), nil
+		return nil, r.generation, incompleteScope(fmt.Errorf("%w: the scope has a scope key and no entries/ directory", ErrScopeAbsent)), nil
 	}
 	if err != nil {
 		return nil, r.generation, fmt.Errorf("%w: %s: %w", ErrCorrupt, scopeEntriesName, err), nil

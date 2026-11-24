@@ -37,6 +37,7 @@ const (
 	DamageFloorDegraded     = "floor-degraded"
 	DamageCorrupt           = "corrupt"
 	DamageUnsupportedKind   = "unsupported-kind"
+	DamageScopeIncomplete   = "scope-incomplete"
 	DamageInternal          = "internal"
 )
 
@@ -48,6 +49,7 @@ var damageRemedies = map[string]string{
 	DamageFloorDegraded:     "the user-scope floor holds damage, or the start step quarantined the scope; grants and reads are refused, rm still runs; root runs sudo k3sm doctor",
 	DamageCorrupt:           "a record of the entry fails authentication or does not parse; restore it from backup, or rm the entry and put its value again",
 	DamageUnsupportedKind:   "a record of the entry has a kind or envelope version this build cannot read, written by a newer k3sm or altered to read as one; upgrade k3sm, and if it is already current, restore the entry from backup or rm the entry and put its value again",
+	DamageScopeIncomplete:   "part of the user scope is missing (a scope.key with no entries/ directory or deliveries record beside it, or entries with no scope.key), as a partial restore leaves; root restores the whole scope from one backup, or runs sudo k3sm doctor",
 	DamageInternal:          "the store could not serve the request (a missing or untrusted master key, or another failure only root can repair); root runs sudo k3sm doctor",
 }
 
@@ -61,7 +63,9 @@ var damageRemedies = map[string]string{
 // never disagree on an error whose chain matches more than one sentinel:
 // a chain that is both the floor's damage and ErrCorrupt answers internal
 // and logs corrupt, and one that is both ErrOrphanVersion and ErrNotFound
-// answers not-found and logs nothing.
+// answers not-found and logs nothing. An incomplete scope answers
+// not-found and logs scope-incomplete; an interrupted put, which also
+// answers not-found, is a put that never committed and is not damage.
 func damageClass(err error) string {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return ""
@@ -77,6 +81,13 @@ func damageClass(err error) string {
 			return DamageUnsupportedKind
 		}
 		return DamageInternal
+	case CodeNotFound:
+		// The answer stays not-found: nothing on the socket path deletes on
+		// it. Only the absence of a scope's part beside the rest is damage;
+		// a uid with no scope yet is not.
+		if keystore.ScopeIncomplete(err) {
+			return DamageScopeIncomplete
+		}
 	case CodeRefused:
 		switch {
 		case errors.Is(err, keystore.ErrOrphanVersion):

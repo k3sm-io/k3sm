@@ -685,7 +685,7 @@ func (u *UserScope) readDeliveriesUnfloored(o *openedScope) (uint64, []delivery,
 	b, fi, err := readFile(o.dir, deliveriesName, maxDeliveriesRecordSize)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return 0, nil, fmt.Errorf("%w: the scope has a scope key and no %s record", ErrScopeAbsent, deliveriesName)
+		return 0, nil, incompleteScope(fmt.Errorf("%w: the scope has a scope key and no %s record", ErrScopeAbsent, deliveriesName))
 	case errors.Is(err, errBadFile):
 		return 0, nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, deliveriesName, err)
 	case err != nil:

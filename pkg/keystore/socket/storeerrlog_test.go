@@ -403,6 +403,7 @@ var damageCodes = map[string]Code{
 	DamageFloorRecordsEntry: CodeInternal,
 	DamageCorrupt:           CodeInternal,
 	DamageUnsupportedKind:   CodeInternal,
+	DamageScopeIncomplete:   CodeNotFound,
 	DamageInternal:          CodeInternal,
 }
 
@@ -455,6 +456,7 @@ func TestDamageClassAgreesWithOutcome(t *testing.T) {
 		{"not found", wrap(keystore.ErrNotFound), CodeNotFound, ""},
 		{"version not found", wrap(keystore.ErrVersionNotFound), CodeNotFound, ""},
 		{"scope absent", wrap(keystore.ErrScopeAbsent), CodeNotFound, ""},
+		{"scope incomplete", incompleteScopeErr(t), CodeNotFound, DamageScopeIncomplete},
 		{"quota", wrap(keystore.ErrQuota), CodeQuota, ""},
 		{"owner changed", wrap(keystore.ErrScopeOwnerChanged), CodeScopeOwnerChanged, ""},
 		{"owner unknown", wrap(keystore.ErrScopeOwnerUnknown), CodeScopeOwnerUnknown, ""},
@@ -503,4 +505,92 @@ func TestDamageClassAgreesWithOutcome(t *testing.T) {
 			}
 		}
 	}
+}
+
+// scopeDir is uid's scope directory in r's data root.
+func scopeDir(data string, uid uint32) string {
+	return filepath.Join(data, "server", "keystore", ".user", strconv.FormatUint(uint64(uid), 10))
+}
+
+// incompleteScopeErr is a real store's read of a scope whose scope.key is
+// there and whose deliveries record is gone (keystore.ScopeIncomplete).
+func incompleteScopeErr(t *testing.T) error {
+	t.Helper()
+	r := newStartedBridge(t, nil)
+	p := Peer{UID: uidA, PID: 1}
+	if _, err := r.b.Put(t.Context(), p, entryOf(uidA, "a"), keystore.KindOpaque, []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(scopeDir(r.data, uidA), "deliveries")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := r.b.ReadForExec(t.Context(), p, entryOf(uidA, "a"))
+	if !keystore.ScopeIncomplete(err) {
+		t.Fatalf("a read of a scope with no deliveries record = %v, want an incomplete scope", err)
+	}
+	return err
+}
+
+// Through the real store: a scope whose scope.key is there and whose
+// entries/ directory or deliveries record is gone is damage, answered
+// not-found as before and logged once a DamageLogInterval as
+// scope-incomplete. The store's interrupted put (errInterruptedPut, a
+// not-found) is the system scope's and never reaches the socket: a user
+// entry directory with no current pointer, whatever its shape, is
+// ErrCorrupt (an interrupted put cannot be told there from a committed
+// entry whose pointer was removed), answered internal and logged once as
+// corrupt.
+func TestNotFoundDamageLogged(t *testing.T) {
+	t.Run("scope incomplete", func(t *testing.T) {
+		for _, gone := range []string{"deliveries", "entries"} {
+			t.Run(gone, func(t *testing.T) {
+				var c logCapture
+				r := newOpsRig(t, nil)
+				h, err := NewOpsHandler(time.Now, r.b)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h.log = c.logger()
+				w := dialOps(t, h, uidA)
+				w.mustReply(t, hdr(t, OpPut, entryOf(uidA, "a"), nil), secretValue, nil)
+				if err := os.RemoveAll(filepath.Join(scopeDir(r.data, uidA), gone)); err != nil {
+					t.Fatal(err)
+				}
+				for range 2 {
+					if code := codeOf(t, w.call(t, hdr(t, OpReadForExec, entryOf(uidA, "a"), nil), nil)); code != CodeNotFound {
+						t.Fatalf("a read of a scope with no %s: code %q, want not-found", gone, code)
+					}
+				}
+				recs := c.records(t)
+				if len(recs) != 1 {
+					t.Fatalf("two reads of a scope with no %s logged %v, want one line", gone, recs)
+				}
+				checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"), DamageScopeIncomplete, 0)
+			})
+		}
+	})
+	t.Run("an entry with no pointer", func(t *testing.T) {
+		var c logCapture
+		r := newOpsRig(t, nil)
+		h, err := NewOpsHandler(time.Now, r.b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.log = c.logger()
+		w := dialOps(t, h, uidA)
+		w.mustReply(t, hdr(t, OpPut, entryOf(uidA, "a"), nil), secretValue, nil)
+		if err := os.Remove(filepath.Join(scopeDir(r.data, uidA), "entries", "a", "current")); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			if code := codeOf(t, w.call(t, hdr(t, OpReadForExec, entryOf(uidA, "a"), nil), nil)); code != CodeInternal {
+				t.Fatalf("a read of an entry with no pointer: code %q, want internal", code)
+			}
+		}
+		recs := c.records(t)
+		if len(recs) != 1 {
+			t.Fatalf("two reads of an entry with no pointer logged %v, want one line", recs)
+		}
+		checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"), DamageCorrupt, 0)
+	})
 }
