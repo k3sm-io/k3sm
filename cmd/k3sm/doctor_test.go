@@ -534,7 +534,7 @@ func TestDoctorKeystoreUserScopeRow(t *testing.T) {
 		remedy    string
 		detailHas string
 	}{
-		{name: "start checks pass", seam: userScopeChecks(func(*socket.Preconditions) {}), status: statusPass, detail: "keystore user scope: start checks pass; a root-owned 0666 socket is at /var/lib/k3sm/keystore-sock/keys.sock"},
+		{name: "start checks pass", seam: userScopeChecks(func(*socket.Preconditions) {}), status: statusPass, detail: "keystore user scope: start checks pass; a root-owned 0666 socket is at /var/lib/k3sm/keystore-sock/keys.sock (path facts only: whether the server is serving it is not checked)"},
 		{name: "start checks pass, no socket, plist without the entry", seam: userScope(func(u *doctorUserScope) {
 			u.sockState = func() error { return fmt.Errorf("%w: nothing is at the path", errNoListeningSocket) }
 			u.plistHasSockets = func() (bool, error) { return false, nil }

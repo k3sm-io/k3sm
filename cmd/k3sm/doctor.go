@@ -358,7 +358,7 @@ func checkKeystoreUserScope(env doctorEnv) checkResult {
 		if serr := scope.sockState(); serr != nil {
 			return noKeystoreSocket(name, scope, serr)
 		}
-		return checkResult{name: name, status: statusPass, detail: fmt.Sprintf("keystore user scope: start checks pass; a root-owned %04o socket is at %s", install.KeystoreSocketMode, scope.sockPath)}
+		return checkResult{name: name, status: statusPass, detail: fmt.Sprintf("keystore user scope: start checks pass; a root-owned %04o socket is at %s (path facts only: whether the server is serving it is not checked)", install.KeystoreSocketMode, scope.sockPath)}
 	case reason == socket.OffServersUnknown && errors.Is(countErr, fs.ErrPermission):
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: the server count cannot be read as this user, so the start checks are not all known [%v]", countErr), remedy: "sudo k3sm doctor   # the admin kubeconfig is root's"}
 	}
