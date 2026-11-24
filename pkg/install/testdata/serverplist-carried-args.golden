@@ -50,5 +50,15 @@
       <key>HOME</key>
   <string>/var/lib/k3sm</string>
   </dict>
+  <key>Sockets</key>
+  <dict>
+    <key>keys</key>
+    <dict>
+      <key>SockPathName</key>
+      <string>/var/lib/k3sm/keystore-sock/keys.sock</string>
+      <key>SockPathMode</key>
+      <integer>438</integer>
+    </dict>
+  </dict>
 </dict>
 </plist>

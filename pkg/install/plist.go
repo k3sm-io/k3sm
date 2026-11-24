@@ -25,6 +25,7 @@ import (
 	"strconv"
 
 	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/runtimed/pkg/keystorepaths"
 )
 
 // The two LaunchDaemon plist modes, and why the control plane's is not the
@@ -252,8 +253,32 @@ func ServerPlist(cfg Config) []byte {
 		// is not a relay host). Binds at bootstrap, not on kickstart -k — see the
 		// serverFileLimit reload contract above.
 		SoftFileLimit: serverFileLimit,
+		// The keystore's user socket, which launchd creates and binds as root
+		// in the root-owned keystore-sock/ before it starts the job, and
+		// which the server takes with launch_activate_socket
+		// (docs/design/keystore.md § "The socket's directory is root's").
+		// Like the file limit it binds at bootstrap, which install's
+		// bootout and bootstrap of the job does.
+		Sockets: []launchdSocket{{
+			Name:     KeystoreSocketsEntry,
+			PathName: keystorepaths.SocketPath(cfg.DataRoot),
+			PathMode: KeystoreSocketMode,
+		}},
 	})
 }
+
+// KeystoreSocketsEntry is the key of the server plist's Sockets entry for
+// the keystore's user socket: the name the server passes to
+// launch_activate_socket.
+const KeystoreSocketsEntry = "keys"
+
+// KeystoreSocketMode is the keystore socket's SockPathMode, 0666: every
+// login user may connect, which is the user scope's point; who may do what
+// once connected is the server's peer check, and no one but root can
+// unlink or replace the name, since keystore-sock/ is root's 0755. It is
+// launchd's own default for a Sockets path, as measured, and is named here
+// so the plist says it.
+const KeystoreSocketMode = 0o666
 
 // The teardown budget, and why ExitTimeOut is derived rather than chosen.
 //
@@ -601,6 +626,17 @@ type launchdPlist struct {
 	// mid-teardown orphans the not-yet-reaped children (own process groups). 0
 	// omits the key (launchd default).
 	ExitTimeOut int
+	// Sockets, when set, renders the Sockets dictionary: one unix stream
+	// listener per entry, which launchd creates before it starts the job.
+	Sockets []launchdSocket
+}
+
+// launchdSocket is one Sockets entry: a unix socket at PathName, at
+// PathMode, under the key Name.
+type launchdSocket struct {
+	Name     string
+	PathName string
+	PathMode int
 }
 
 // renderPlist serializes p to a launchd XML property list. String values are
@@ -666,6 +702,19 @@ func renderPlist(p launchdPlist) []byte {
 		for _, k := range sortedKeys(p.EnvironmentVars) {
 			b.WriteString("    ")
 			writeKeyString(&b, k, p.EnvironmentVars[k])
+		}
+		b.WriteString("  </dict>\n")
+	}
+	if len(p.Sockets) > 0 {
+		b.WriteString("  <key>Sockets</key>\n  <dict>\n")
+		for _, s := range p.Sockets {
+			b.WriteString("    <key>")
+			xmlEscape(&b, s.Name)
+			b.WriteString("</key>\n    <dict>\n      <key>SockPathName</key>\n      <string>")
+			xmlEscape(&b, s.PathName)
+			b.WriteString("</string>\n      <key>SockPathMode</key>\n      <integer>")
+			b.WriteString(strconv.Itoa(s.PathMode))
+			b.WriteString("</integer>\n    </dict>\n")
 		}
 		b.WriteString("  </dict>\n")
 	}
