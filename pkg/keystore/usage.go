@@ -137,16 +137,6 @@ func (t *usageTable) set(uid uint32, f *scopeUsage) {
 	t.mu.Unlock()
 }
 
-// forget drops uid's figure: the next put or rotate walks the scope.
-func (t *usageTable) forget(uid uint32) {
-	if t == nil {
-		return
-	}
-	t.mu.Lock()
-	delete(t.byUID, uid)
-	t.mu.Unlock()
-}
-
 // forgetAll drops every uid's figure: a tree put in place under the store
 // (a restore's merge) may hold any scope's entries under its same
 // scope.key, so no figure taken before it is trusted.

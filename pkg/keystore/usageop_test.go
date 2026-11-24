@@ -25,6 +25,13 @@ import (
 	"testing"
 )
 
+// forget drops uid's figure, as a server just started holds none.
+func (t *usageTable) forget(uid uint32) {
+	t.mu.Lock()
+	delete(t.byUID, uid)
+	t.mu.Unlock()
+}
+
 // hasFigure reports whether the store holds a usage figure for uid.
 func hasFigure(s *FileStore, uid uint32) bool {
 	s.usage.mu.Lock()
