@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -76,6 +78,42 @@ func checkCommittedAuditFailure(t *testing.T, err error, logs, verb string) {
 	}
 	if strings.Contains(logs, "injected") {
 		t.Errorf("%s: Warn log %q carries the error text", verb, logs)
+	}
+}
+
+// auditResults is the closed set auditResult names an operation's outcome
+// from; "error" is every refusal it has no other name for.
+var auditResults = []string{
+	auditResultOK, auditResultCommitted, "quota", "not-found", "exists", "scope-absent", "corrupt",
+	"log-full", "invalid-name", "kind-mismatch", "quarantined", "floor-degraded", "error",
+}
+
+// A refusal's audit result names its sentinel from the closed set
+// auditResults: a bad name, a kind mismatch, a quarantine and the floor's
+// damage are told apart, never collapsed to "error"; a refusal with no
+// name of its own is "error", and every result is in the set.
+func TestAuditResultNamesRefusals(t *testing.T) {
+	wrap := func(err error) error { return fmt.Errorf("user scope put: %w", err) }
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{wrap(ErrInvalidName), "invalid-name"},
+		{wrap(ErrKindMismatch), "kind-mismatch"},
+		{wrap(fmt.Errorf("%w: %w", errScopeQuarantined, errFloorDegraded)), "quarantined"},
+		{wrap(errFloorDegraded), "floor-degraded"},
+		{wrap(ErrQuota), "quota"},
+		{wrap(ErrCorrupt), "corrupt"},
+		{wrap(errors.New("no sentinel")), "error"},
+		{wrap(ErrTypedCredential), "error"},
+	} {
+		got := auditResult(tc.err)
+		if got != tc.want {
+			t.Errorf("auditResult(%v) = %q, want %q", tc.err, got, tc.want)
+		}
+		if !slices.Contains(auditResults, got) {
+			t.Errorf("auditResult(%v) = %q, outside auditResults", tc.err, got)
+		}
 	}
 }
 

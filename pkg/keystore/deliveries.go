@@ -1547,7 +1547,9 @@ func (u *UserScope) keepAuditFailure(op string, err, aerr error) error {
 	return err
 }
 
-// auditResult names an operation's outcome for its audit line.
+// auditResult names an operation's outcome for its audit line, from a
+// closed set (auditResults, in the tests): "error" is every refusal it has
+// no other name for.
 func auditResult(err error) string {
 	switch {
 	case err == nil:
@@ -1566,6 +1568,15 @@ func auditResult(err error) string {
 		return "corrupt"
 	case errors.Is(err, ErrLogFull):
 		return "log-full"
+	case errors.Is(err, ErrInvalidName):
+		return "invalid-name"
+	case errors.Is(err, ErrKindMismatch):
+		return "kind-mismatch"
+	case errors.Is(err, errScopeQuarantined):
+		// Before floor-degraded, which a quarantine wraps.
+		return "quarantined"
+	case errors.Is(err, errFloorDegraded):
+		return "floor-degraded"
 	}
 	return "error"
 }

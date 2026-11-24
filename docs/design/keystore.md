@@ -3877,7 +3877,12 @@ refused before its first frame:
   `show`, `exec-read`, `deliver`, `withdraw`, `rewrap`, `rm-scope`, `floor-rebuild`,
   `floor-merge`, `floor-merge-dry-run`, `audit-rotate`, `deliver-write`, `deliver-delete`,
   `refused`, `unaudited` (root's `audit --rotate` line for the committed revocations whose
-  lines were not written, with result `committed`); and `ok`, `committed` or a sentinel name: `ok` is a change committed whole,
+  lines were not written, with result `committed`); and `ok`, `committed` or a sentinel name: a
+  user-scope operation's result is one of a closed set (`keystore.auditResult`): `ok`,
+  `committed`, `quota`, `not-found`, `exists`, `scope-absent`, `corrupt`, `log-full`,
+  `invalid-name`, `kind-mismatch`, `quarantined` (the start step quarantined the scope),
+  `floor-degraded` (the floor's damage refused a grant or read), and `error` for any refusal
+  with no name of its own (`TestAuditResultNamesRefusals`). `ok` is a change committed whole,
   `committed` a revocation committed in part and reported after its commit, such as an `rm`
   whose burial stopped part way or a `withdraw` whose floor line failed; a root verb that
   exits 4 or 5, its change made and its report to read, is `committed` too). When such a partial commit's own audit line then fails, the reply

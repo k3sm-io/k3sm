@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -102,7 +103,7 @@ func worstRevocationLines(t *testing.T) (tomb, rmAudit, withdrawFloor, withdrawA
 		t.Fatal(err)
 	}
 	ts := time.Date(2026, 12, 31, 23, 59, 59, 999999999, time.UTC)
-	for _, result := range []string{"ok", "committed", "scope-absent", "not-found", "log-full", "corrupt", "error"} {
+	for _, result := range revocationResults() {
 		caller := &auditCaller{UID: maxScopeUID, PID: math.MaxInt32}
 		al, err := marshalAuditLine(auditLine{op: "rm", via: auditViaSocket, caller: caller, scope: scope, name: name, result: result}, ts)
 		if err != nil {
@@ -116,6 +117,21 @@ func worstRevocationLines(t *testing.T) (tomb, rmAudit, withdrawFloor, withdrawA
 		withdrawAudit = max(withdrawAudit, len(wl))
 	}
 	return len(tl), rmAudit, len(fl), withdrawAudit
+}
+
+// revocationResults are the results of auditResults an rm or withdraw line
+// can carry with a name: not floor-degraded or quarantined, which refuse
+// only grants and reads (rm and withdraw still run), not kind-mismatch,
+// which no revocation checks, and not invalid-name, whose line names the
+// placeholder rather than the name.
+func revocationResults() []string {
+	return slices.DeleteFunc(slices.Clone(auditResults), func(r string) bool {
+		switch r {
+		case "floor-degraded", "quarantined", "kind-mismatch", "invalid-name":
+			return true
+		}
+		return false
+	})
 }
 
 // The default budget holds one scope's full revocation: every entry rm'd
