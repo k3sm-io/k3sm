@@ -19,6 +19,7 @@ package keystore
 import (
 	"context"
 	"errors"
+	"maps"
 	"strings"
 	"testing"
 )
@@ -63,5 +64,39 @@ func TestMergePendingRefusalSaysWhatItWrote(t *testing.T) {
 	}
 	if want := "writes nothing but, for a user verb, at most its one refused line in the audit log"; !strings.Contains(err.Error(), want) {
 		t.Fatalf("the refusal %q does not say %q", err, want)
+	}
+}
+
+// TestUserReadsRefusedWhileMergePending: while a restore is staged, the
+// reads the socket serves (list and exec-read, through auditedRead) are
+// refused with errMergePending and audited as refused, so no value is
+// served from a keystore whose floor lacks the deletions since the
+// backup; once keys floor merge has run, the same read is served.
+func TestUserReadsRefusedWhileMergePending(t *testing.T) {
+	ctx := context.Background()
+	s, server := newTestStore(t)
+	mustPut(t, s, "k", KindOpaque, []byte("v"))
+	fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
+	_, audit := userLogs(s)
+	u := userScope(t, s, 1001)
+	userPut(t, u, "user/1001/a", "v1")
+	aside := maps.Clone(floorOf(t, server))
+	aside["gone"] = floorEntry{Buried: []burial{{Generation: mgen(100), Deleted: 1}}}
+	writeAsideFloor(t, server, aside)
+	before := len(audit.all())
+	if _, val, err := u.ReadForExec(ctx, "user/1001/a"); !errors.Is(err, errMergePending) || val != nil {
+		t.Fatalf("exec-read with a restore staged: %q %v, want errMergePending and no value", val, err)
+	}
+	if _, err := u.List(ctx); !errors.Is(err, errMergePending) {
+		t.Fatalf("list with a restore staged: %v, want errMergePending", err)
+	}
+	if lines := audit.all()[before:]; len(lines) != 2 || lines[0].result == auditResultOK || lines[1].result == auditResultOK {
+		t.Fatalf("the refused reads' audit lines %+v, want two refused lines", lines)
+	}
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); err != nil {
+		t.Fatalf("keys floor merge: %v", err)
+	}
+	if _, val, err := u.ReadForExec(ctx, "user/1001/a"); err != nil || string(val) != "v1" {
+		t.Fatalf("exec-read after the merge: %q %v, want v1", val, err)
 	}
 }

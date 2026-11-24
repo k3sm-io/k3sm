@@ -630,7 +630,9 @@ var errReadAuditRefused = errors.New("the audit line could not be written, so th
 // like any line and are not in the revocation class. A read whose line
 // cannot be appended is refused (errReadAuditRefused), and so is a
 // scope-absent one, which a list serves as empty; any other refused read's
-// line is written best effort, with the refusal's result.
+// line is written best effort, with the refusal's result. While a restore
+// is staged (userWriteAllowed) it is refused with errMergePending before
+// the scope is opened, and audited as refused.
 func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Root, keys) error) error {
 	if err := u.s.checkConfig(); err != nil {
 		return err
@@ -650,7 +652,18 @@ func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Ro
 	if err := u.s.admit(u.uid, false); err != nil {
 		return err
 	}
-	o, entries, err := u.openScopeFull(root, u.s.loadMaster)
+	// A staged restore refuses the read as it refuses a write
+	// (userWriteAllowed): until keys floor merge has run, the restored
+	// floor lacks every deletion since the backup, so a value revoked since
+	// then could be served. The refusal is audited like any refused read.
+	err = u.userWriteAllowed()
+	var (
+		o       *openedScope
+		entries *os.Root
+	)
+	if err == nil {
+		o, entries, err = u.openScopeFull(root, u.s.loadMaster)
+	}
 	if err == nil {
 		err = fn(entries, o.uk)
 		_ = entries.Close() // read-only; nothing to flush
