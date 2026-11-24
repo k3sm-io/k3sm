@@ -152,11 +152,13 @@ func (failLiveGens) liveGens(string, string) ([][generationSize]byte, error) {
 }
 
 // A refusal that writes nothing to the scope's entries keeps the figure:
-// the next put walks nothing. Before, every failed rm but ErrNotFound
+// the next put walks nothing. The mutation rate limit is the socket's and
+// refuses before the store is reached, so it is not among them. Before, every failed rm but ErrNotFound
 // dropped it, so a uid refused an rm paid a walk on its next put.
 func TestUsageRefusalKeepsFigure(t *testing.T) {
 	ctx := context.Background()
-	s, u := rotateScope(t)
+	s, _, u := fileLogScope(t) // file-backed logs, so a log-room refusal is real
+	userPut(t, u, "user/1001/a", "one")
 	lookup := func(g [generationSize]byte, err error) {
 		setSeam(t, &generatedUIDSeam, func(uint32) ([generationSize]byte, error) { return g, err })
 	}
@@ -181,6 +183,13 @@ func TestUsageRefusalKeepsFigure(t *testing.T) {
 			_, err := u.Put(ctx, "user/1001/big", KindOpaque, []byte("b"))
 			return err
 		}, ErrQuota},
+		{"put refused for log room", func() error {
+			soft, hard := s.logSoftCap, s.logHardCap
+			s.logSoftCap, s.logHardCap = 1, 1 // every log is past it: a grant has no room
+			defer func() { s.logSoftCap, s.logHardCap = soft, hard }()
+			_, err := u.Put(ctx, "user/1001/noroom", KindOpaque, []byte("b"))
+			return err
+		}, ErrLogFull},
 		{"rm of a name not there", func() error { return u.Delete(ctx, "user/1001/none") }, ErrNotFound},
 		{"rm by a reused uid", func() error {
 			lookup(guid(0xB2), nil)
