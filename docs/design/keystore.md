@@ -1545,7 +1545,11 @@ merge is recorded. The user scope is off for the same window, in code: the serve
 (`startUserScopes`) and its store-directory step (`EnsureDir`, which so makes no `keystore/` the
 merge would move aside as planted) refuse with `errMergePending`, as doctor's start step does,
 and every user write verb (put, rotate, rm, deliver, withdraw) asks `FileStore.MergePending` first
-under the store lock (`userWriteAllowed`) and refuses with it, writing nothing
+under the store lock (`userWriteAllowed`) and refuses with it, changing no entry and writing
+nothing but its one refused audit line, as every user refusal is audited; the refusal's text
+says so (`TestMergePendingRefusalSaysWhatItWrote`). The guard fails closed: a store with no data
+root, where `MergePending` is nil because no floor is configured, is refused by it as an
+invalid configuration rather than let through (`TestUserWriteGuardFailsClosed`)
 (`TestUserScopeOffWhileMergePending`, `TestUserScopeDeliverRefusedWhileMergePending`,
 `TestKeystoreListenerOffWhileMergePending`). The guard's limit: it holds from the moment the
 marker exists, not before. The root verbs ask it through the data-root descriptor `keystore-lock`

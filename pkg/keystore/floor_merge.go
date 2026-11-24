@@ -41,7 +41,7 @@ const floorPreRestoreName = floorName + ".pre-restore"
 // errMergePending refuses a verb that changes the keystore while the
 // restore's moved-aside floor is in the data root: the merge has not run, so
 // the restored floor still lacks every deletion since the backup.
-var errMergePending = errors.New("a restore is unfinished: keystore-floor.json.pre-restore, the floor moved aside before it, is still in the data root, and the deletions it records are not merged yet. Run sudo k3sm keys floor merge on it first, as docs/user/keys.md describes (it renames the file when it is done); this verb changes nothing until then")
+var errMergePending = errors.New("a restore is unfinished: keystore-floor.json.pre-restore, the floor moved aside before it, is still in the data root, and the deletions it records are not merged yet. Run sudo k3sm keys floor merge on it first, as docs/user/keys.md describes (it renames the file when it is done); until then this verb changes no entry, and writes nothing but, for a user verb, at most its one refused line in the audit log")
 
 // floorUndoName is the name the undo recipe gives the live floor while it
 // swaps the two floors (docs/user/keys.md): the restored floor is moved here,
@@ -52,7 +52,7 @@ const floorUndoName = floorName + ".undo"
 
 // errUndoPending is errMergePending (errors.Is) for floorUndoName: an undo
 // whose floor swap is unfinished.
-var errUndoPending error = &pendingError{"a restore's undo is unfinished: keystore-floor.json.undo, the floor the undo moves aside while it swaps the two floors, is still in the data root. Finish the floor moves as docs/user/keys.md describes (it becomes keystore-floor.json.pre-restore), then run sudo k3sm keys floor merge --undo; this verb changes nothing until then"}
+var errUndoPending error = &pendingError{"a restore's undo is unfinished: keystore-floor.json.undo, the floor the undo moves aside while it swaps the two floors, is still in the data root. Finish the floor moves as docs/user/keys.md describes (it becomes keystore-floor.json.pre-restore), then run sudo k3sm keys floor merge --undo; until then this verb changes no entry, and writes nothing but, for a user verb, at most its one refused line in the audit log"}
 
 // pendingError is a pending-merge refusal with its own text that is
 // errMergePending to errors.Is.

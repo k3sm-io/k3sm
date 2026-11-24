@@ -296,7 +296,8 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 // userWriteAllowed is the first step of every user write verb's work
 // under the store lock (put, rotate, rm, deliver, withdraw): it refuses
 // (errMergePending) while a restore is staged, keystore-floor.json.pre-restore
-// in the data root (FileStore.MergePending), so no user change lands before
+// or the undo's keystore-floor.json.undo in the data root
+// (FileStore.MergePending), so no user change lands before
 // keys floor merge has run, to be moved aside by it. The start step refuses
 // the same, so the listener is off for that window too.
 //
@@ -307,7 +308,16 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 // It is safe against keys floor merge anyway, which only removes the
 // marker, never makes one. Against the operator's lock-free mv that makes
 // it, no check is, which is why the restore recipe stops the server first.
+//
+// It fails closed: a store with no data root, where MergePending answers
+// nil because no floor is configured, is refused (errInvalidConfig), since
+// there whether a restore is staged cannot be read. The refusal, like
+// every user verb's, is audited by its caller as one refused line; it
+// writes nothing else.
 func (u *UserScope) userWriteAllowed() error {
+	if u.s.dataRoot == "" {
+		return fmt.Errorf("%w: DataRoot is empty, so whether a restore is unfinished cannot be read", errInvalidConfig)
+	}
 	return u.s.MergePending()
 }
 
