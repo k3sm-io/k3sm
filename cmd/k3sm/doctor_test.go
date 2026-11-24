@@ -534,10 +534,10 @@ func TestDoctorKeystoreUserScopeRow(t *testing.T) {
 		remedy    string
 		detailHas string
 	}{
-		{name: "start checks pass", seam: userScopeChecks(func(*socket.Preconditions) {}), status: statusPass, detail: "keystore user scope: start checks pass; launchd's socket (root's, mode 0666) is at /var/lib/k3sm/keystore-sock/keys.sock"},
+		{name: "start checks pass", seam: userScopeChecks(func(*socket.Preconditions) {}), status: statusPass, detail: "keystore user scope: start checks pass; a root-owned 0666 socket is at /var/lib/k3sm/keystore-sock/keys.sock"},
 		{name: "start checks pass, no socket", seam: userScope(func(u *doctorUserScope) {
 			u.sockState = func() error { return fmt.Errorf("%w: nothing is at the path", errNoListeningSocket) }
-		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path"},
+		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path]; run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)", remedy: "sudo k3sm install   # it rewrites the server plist and re-bootstraps the job"},
 		{name: "two servers", seam: userScope(func(u *doctorUserScope) {
 			u.pre.ServerCount = func(context.Context) (int, error) { return 2, nil }
 			u.servers = func() ([]string, error) { return []string{"mac-a", "mac-b"}, nil }

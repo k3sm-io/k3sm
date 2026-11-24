@@ -76,6 +76,12 @@ const (
 	OffListenerFailed       OffReason = "the listener failed"
 	OffSandboxCheckUnusable OffReason = "the peer sandbox check is unusable (sandbox-check-unusable)"
 	OffUserScopeStart       OffReason = "the user scope's start step failed"
+	// OffNotActivated is terminal for the process: launchd has no socket for
+	// it (ErrNotActivated), and only a new bootstrap of the job can give one.
+	OffNotActivated OffReason = "launchd activated no socket for this server"
+	// OffActivatedInheritable is a descriptor launchd handed over without
+	// FD_CLOEXEC, closed and refused (ErrActivatedInheritable).
+	OffActivatedInheritable OffReason = "the activated socket arrived without FD_CLOEXEC"
 )
 
 // The supervisor's log text: every off line starts with offMsg, and the
@@ -83,6 +89,9 @@ const (
 const (
 	offMsg        = "keystore user scope is off"
 	installRemedy = "run `sudo k3sm install`"
+	// NotActivatedRemedy is OffNotActivated's remedy, which doctor names
+	// for a server with no socket at the path too.
+	NotActivatedRemedy = "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"
 )
 
 // Phase is where the supervisor is.
@@ -303,7 +312,17 @@ func (s *Supervisor) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			if !s.backOff(ctx, OffListenerUnavailable, err, &runBackoff) {
+			if errors.Is(err, ErrNotActivated) {
+				// launchd fixed the job's sockets at its bootstrap: no retry
+				// in this process can get one.
+				s.notActivated(ctx, err)
+				return
+			}
+			reason := OffListenerUnavailable
+			if errors.Is(err, ErrActivatedInheritable) {
+				reason = OffActivatedInheritable
+			}
+			if !s.backOff(ctx, reason, err, &runBackoff) {
 				return
 			}
 			continue
@@ -493,8 +512,11 @@ func guard[T any](f func() (T, error)) (v T, err error) {
 // no command puts it right: only a missing, wrong or unflagged installed
 // file names `sudo k3sm install`.
 func (r OffReason) Remedy() string {
-	if r == OffInstall {
+	switch r {
+	case OffInstall:
 		return installRemedy
+	case OffNotActivated:
+		return NotActivatedRemedy
 	}
 	return ""
 }
@@ -519,6 +541,14 @@ func (s *Supervisor) off(reason OffReason, detail string, last OffReason, wait t
 	default:
 		s.cfg.Log.Warn(offMsg, "reason", string(reason), "err", detail, "retry", wait)
 	}
+}
+
+// notActivated records the terminal OffNotActivated, logs it once at Warn
+// naming the remedy, and waits for ctx: nothing is retried.
+func (s *Supervisor) notActivated(ctx context.Context, err error) {
+	s.set(State{Phase: PhaseOff, Reason: OffNotActivated, Detail: err.Error()})
+	s.cfg.Log.Warn(offMsg+"; "+NotActivatedRemedy, "reason", string(OffNotActivated), "err", err.Error())
+	<-ctx.Done()
 }
 
 // backOff records and logs a listener failure and waits out the backoff,

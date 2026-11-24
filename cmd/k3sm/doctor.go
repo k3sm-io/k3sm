@@ -285,6 +285,10 @@ func checkKeystoreMaintenance(env doctorEnv) checkResult {
 	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, left by keys %s, which stopped or did not report; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName, verb), remedy: "sudo k3sm keys " + verb + "   # finishes the run, or prints its committed report"}
 }
 
+// doctorNotActivatedRemedy is the user-scope row's remedy when no socket
+// of launchd's is at the path (socket.NotActivatedRemedy).
+const doctorNotActivatedRemedy = "sudo k3sm install   # it rewrites the server plist and re-bootstraps the job"
+
 // doctorServersShown bounds how many server names the user-scope row
 // lists when more than one is registered.
 const doctorServersShown = 8
@@ -296,7 +300,8 @@ const doctorServersShown = 8
 // it says "start checks pass" and not "on": all it can add is what an
 // lstat of the socket path shows (it never connects; root and the service
 // user would be refused and write a refusal line), and no socket of
-// launchd's there (root's, at the plist's mode) is a WARN. A failed check is "off (<reason>)" with
+// launchd's there (root's, at the plist's mode) is a WARN naming
+// `sudo k3sm install`, which re-bootstraps the job. A failed check is "off (<reason>)" with
 // the supervisor's reason, naming `sudo k3sm install` where that puts it
 // right, and the servers by name when more than one is registered; off is a
 // WARN, since the system scope is unaffected. A server count this user may
@@ -329,9 +334,12 @@ func checkKeystoreUserScope(env doctorEnv) checkResult {
 	switch {
 	case reason == "":
 		if serr := scope.sockState(); serr != nil {
-			return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: start checks pass, but no listening socket at %s [%v]", scope.sockPath, serr)}
+			// launchd made no socket for the job: its definition predates the
+			// Sockets entry, or launchd could not create the path. Only a
+			// new bootstrap of the job gives one.
+			return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: start checks pass, but no listening socket at %s [%v]; %s", scope.sockPath, serr, socket.NotActivatedRemedy), remedy: doctorNotActivatedRemedy}
 		}
-		return checkResult{name: name, status: statusPass, detail: "keystore user scope: start checks pass; launchd's socket (root's, mode 0666) is at " + scope.sockPath}
+		return checkResult{name: name, status: statusPass, detail: "keystore user scope: start checks pass; a root-owned 0666 socket is at " + scope.sockPath}
 	case reason == socket.OffServersUnknown && errors.Is(countErr, fs.ErrPermission):
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: the server count cannot be read as this user, so the start checks are not all known [%v]", countErr), remedy: "sudo k3sm doctor   # the admin kubeconfig is root's"}
 	}

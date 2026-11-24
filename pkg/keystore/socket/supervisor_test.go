@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -30,6 +31,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // pausableListener is a listening socket with SetDeadline, as an activated
@@ -117,6 +120,7 @@ type startChecks struct {
 	ignores    bool
 	mountErr   error
 	install    error
+	listenErr  error
 	logsErr    error
 	sandboxErr error
 	reopens    int
@@ -248,6 +252,9 @@ func (r *supRig) config() SupervisorConfig {
 			defer ck.mu.Unlock()
 			ck.listens++
 			ck.boom("listen")
+			if ck.listenErr != nil {
+				return nil, ck.listenErr
+			}
 			return ck.ln, nil
 		},
 		EUID:       func() int { ck.mu.Lock(); defer ck.mu.Unlock(); ck.boom("euid"); return ck.euid },
@@ -629,6 +636,53 @@ func TestListenerSourceFailureBacksOff(t *testing.T) {
 		advance(MinBackoff)
 		r.wantState(t, PhaseServing, "", 0)
 	})
+}
+
+// No activated socket (ESRCH, ENOENT) is terminal for the process: the
+// supervisor is off as OffNotActivated, logs one Warn naming the remedy,
+// and never asks the source again, however long it waits; a descriptor
+// without FD_CLOEXEC, and any other activation error, back off as before.
+func TestNotActivatedIsTerminal(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, func(c *startChecks) {
+			c.listenErr = fmt.Errorf("%w for the Sockets entry \"keys\": %w", ErrNotActivated, unix.ESRCH)
+		})
+		st := r.wantState(t, PhaseOff, OffNotActivated, 0)
+		if !strings.Contains(st.Detail, "keys") {
+			t.Fatalf("detail %q", st.Detail)
+		}
+		advance(time.Hour)
+		r.ck.mu.Lock()
+		listens := r.ck.listens
+		r.ck.mu.Unlock()
+		if listens != 1 {
+			t.Fatalf("%d listens, want 1: no retry", listens)
+		}
+		if n := r.log.count("level=WARN", "sudo k3sm install", "re-bootstraps the job"); n != 1 {
+			t.Fatalf("%d Warn lines naming the remedy, want 1:\n%s", n, r.log.b.String())
+		}
+		if n := r.log.count("level=ERROR"); n != 0 {
+			t.Fatalf("%d Error lines, want none", n)
+		}
+	})
+	for _, tt := range []struct {
+		err    error
+		reason OffReason
+	}{
+		{ErrActivatedInheritable, OffActivatedInheritable},
+		{fmt.Errorf("%w: not listening", ErrActivatedWrong), OffListenerUnavailable},
+		{errors.New("launchd did not activate the Sockets entry: EINVAL"), OffListenerUnavailable},
+	} {
+		synctest.Test(t, func(t *testing.T) {
+			r := newSupRig(t, func(c *startChecks) { c.listenErr = tt.err })
+			r.wantState(t, PhaseBackingOff, tt.reason, MinBackoff)
+			advance(MinBackoff)
+			r.wantState(t, PhaseBackingOff, tt.reason, 2*MinBackoff)
+		})
+	}
+	if got := OffNotActivated.Remedy(); got != "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)" {
+		t.Fatalf("OffNotActivated's remedy %q", got)
+	}
 }
 
 func TestBackoffDoublesToFiveMinutes(t *testing.T) {

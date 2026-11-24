@@ -118,7 +118,7 @@ func TestPreconditionsCheck(t *testing.T) {
 			}
 		})
 	}
-	for _, r := range []OffReason{OffNotInstalledServer, OffServiceUIDLoginRange, OffMaintenance, OffMaintenanceUnknown, OffIgnoresOwnership, OffMountUnknown, OffLogsUnavailable, OffServers, OffServersUnknown, OffListenerUnavailable, OffListenerFailed, OffSandboxCheckUnusable, OffUserScopeStart} {
+	for _, r := range []OffReason{OffNotInstalledServer, OffServiceUIDLoginRange, OffMaintenance, OffMaintenanceUnknown, OffIgnoresOwnership, OffMountUnknown, OffLogsUnavailable, OffServers, OffServersUnknown, OffListenerUnavailable, OffListenerFailed, OffSandboxCheckUnusable, OffUserScopeStart, OffActivatedInheritable} {
 		if got := r.Remedy(); got != "" {
 			t.Errorf("%q names the remedy %q, want none", r, got)
 		}
