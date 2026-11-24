@@ -33,7 +33,9 @@ func reopenStore(t *testing.T, s *FileStore) *FileStore {
 		Dir: s.dir, MasterDir: s.masterDir, DataRoot: s.dataRoot,
 		UID: s.uid, GID: s.gid, FloorUID: s.floorUID, FloorGID: s.floorGID,
 		LogSoftCap: s.logSoftCap, LogHardCap: s.logHardCap, LogRevocationBudget: s.logRevokeBudget,
+		LogUIDShare: s.logUIDShare,
 	})
+	s2.logAllowance = s.logAllowance
 	s2.logFlags = flagged
 	return s2
 }

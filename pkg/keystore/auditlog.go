@@ -55,17 +55,24 @@ type fileAuditLog struct{ log *appendLog }
 
 func newFileAuditLog(s *FileStore) *fileAuditLog {
 	l := &appendLog{s: s, name: auditLogName}
-	l.lineUID = func(_ *logState, line []byte) (uint32, error) {
-		r, err := parseAuditLine(line)
-		if err != nil {
-			// A line this build cannot read, strictly, is damage charged to
-			// no uid: the audit log is evidence, and one unreadable line is
-			// skipped and counted, never stopping the store.
-			return 0, err
-		}
-		return scopeUID(r.Scope), nil
+	l.lineUID = func(_ *logState, line []byte) (uint32, bool, error) {
+		return auditLineCharge(line)
 	}
 	return &fileAuditLog{log: l}
+}
+
+// auditLineCharge reads line, an audit line without its newline, for
+// charging: the uid of its scope (0 for none) and whether its via is the
+// reconciler's, which in the revocation class draws on that uid's
+// reconciler allowance (lineCharge). A line this build cannot read,
+// strictly, is damage charged to no uid: the audit log is evidence, and one
+// unreadable line is skipped and counted, never stopping the store.
+func auditLineCharge(line []byte) (uint32, bool, error) {
+	r, err := parseAuditLine(line)
+	if err != nil {
+		return 0, false, err
+	}
+	return scopeUID(r.Scope), r.Via == auditViaReconciler, nil
 }
 
 func (a *fileAuditLog) append(l auditLine) error {

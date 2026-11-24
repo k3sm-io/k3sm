@@ -125,10 +125,11 @@ const (
 	// withdraws, each a 91-byte floor line (15 + 1 + 11 + 1 + 32 + 1 + 20 +
 	// 1 + 8 + 1, the checksum included) and a withdraw audit line of at
 	// most 250 bytes, 320 × (91 + 1 + 250 + 1) = 109,760 bytes; 692,416
-	// bytes in all, rounded up to 704 KiB (720,896). With it
-	// logReadBound at the default caps is 256 MiB + 1024 × 704 KiB + 1 MiB
-	// = 961 MiB, and at the configuration's upper bounds 2^40 + 1024 × 2^30
-	// + 2^20, which cannot overflow
+	// bytes in all, rounded up to 704 KiB (720,896). With it and the
+	// reconciler allowance logReadBound at the default caps is 256 MiB +
+	// 1024 × (704 KiB + 256 KiB) + 1 MiB = 1,217 MiB, and at the
+	// configuration's upper bounds 2^40 + 1024 × (2^30 + 2^18) + 2^20,
+	// which cannot overflow
 	// (TestDefaultRevocationBudgetHoldsFullRevocation).
 	defaultLogRevocationBytes = 704 << 10
 
@@ -246,10 +247,11 @@ func (l *appendLog) keyHeadroom() int {
 // headroom. A floor holding more keys is damage.
 func (l *appendLog) readKeyBound() int { return l.keyBound() + l.keyHeadroom() }
 
-// logReadBound is the size past which a log is damage: the hard cap, the
-// revocation budgets of maxRevokeUIDs uids, and a margin.
+// logReadBound is the size past which a log is damage: the hard cap, both
+// revocation budgets of maxRevokeUIDs uids (the socket margin and the
+// reconciler allowance), and a margin.
 func (s *FileStore) logReadBound() int64 {
-	return s.logHardCap + maxRevokeUIDs*s.logRevokeBudget + logBoundMargin
+	return s.logHardCap + maxRevokeUIDs*(s.logRevokeBudget+s.logAllowance) + logBoundMargin
 }
 
 // readBound is the size past which l's log is damage: logReadBound, and
@@ -375,15 +377,17 @@ type userFloorLog interface {
 // value and never a value's length.
 type auditLine struct {
 	op, scope, name, namespace, result string
-	// via is the path the operation came by, "root" for a root verb;
-	// empty writes no via field.
+	// via is the path the operation came by, "root" for a root verb and
+	// "reconciler" for the reconciler's lines, whose revocations draw on
+	// the reconciler allowance; empty writes no via field.
 	via string
 	// delivery is the KeyDelivery UID a withdraw names, or
 	// auditPlaceholder for one outside the grammar; empty for other ops.
 	delivery string
 	// revoke marks the line of an operation in the revocation class that
-	// revoked something: past the hard cap it draws on its uid's revocation
-	// budget, where every other line is refused.
+	// revoked something: past its uid's share or the hard cap it draws on
+	// one of that uid's revocation budgets, where every other line is
+	// refused.
 	revoke bool
 }
 
@@ -479,11 +483,13 @@ type appendLog struct {
 	s    *FileStore
 	name string
 	// lineUID parses one line, without its newline, and returns the uid it
-	// is charged to (0 for none). For the floor it also records the line.
-	lineUID func(st *logState, line []byte) (uint32, error)
-	// whole reports whether every line must be read (the floor), or only
-	// those past the hard cap (the audit log).
-	whole bool
+	// is charged to (0 for none) and whether it carries the reconciler's
+	// via (lineCharge). For the floor it also records the line.
+	lineUID func(st *logState, line []byte) (uint32, bool, error)
+	// floor marks the user-scope floor, whose damaged lines taint the keys
+	// they could name. Both logs are read whole: every uid's share is
+	// counted from the log's first line.
+	floor bool
 	// freeSpace, when set, replaces logFreeSpace: the test seam for the
 	// free-space preflight.
 	freeSpace func(fd int) (uint64, error)
@@ -539,8 +545,13 @@ type logState struct {
 	// at most maxLogLine bytes, so last is too.
 	lastAt int64
 	last   []byte
-	// pastCap is each uid's bytes in lines that start at or past hardCap.
-	pastCap map[uint32]int64
+	// share is each uid's bytes charged to its share; pastCap is each
+	// uid's bytes drawn on its socket margin and allowance each uid's
+	// bytes drawn on its reconciler allowance: its lines that start at or
+	// past hardCap, and those past its share (lineCharge). shareLimit is
+	// the share it was read under.
+	share, pastCap, allowance map[uint32]int64
+	shareLimit                int64
 	// maxSeq is the floor's highest seq per key, and buried its tombstones.
 	maxSeq map[floorKey]uint64
 	buried map[floorKey]bool
@@ -970,9 +981,9 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 		src = l.readAt(f)
 	}
 	fresh := func() {
-		*s = logState{dev: uint64(st.Dev), ino: st.Ino, birth: logBirth(&st), hardCap: l.s.logHardCap, bound: bound, pastCap: map[uint32]int64{}, uidKeys: map[uint32]int{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}, scopes: map[string]string{}, firstGen: map[nameKey][generationSize]byte{}, moreGens: map[nameKey][][generationSize]byte{}}
+		*s = logState{dev: uint64(st.Dev), ino: st.Ino, birth: logBirth(&st), hardCap: l.s.logHardCap, bound: bound, shareLimit: l.s.uidShare(), share: map[uint32]int64{}, pastCap: map[uint32]int64{}, allowance: map[uint32]int64{}, uidKeys: map[uint32]int{}, maxSeq: map[floorKey]uint64{}, buried: map[floorKey]bool{}, scopes: map[string]string{}, firstGen: map[nameKey][generationSize]byte{}, moreGens: map[nameKey][][generationSize]byte{}}
 	}
-	if s.pastCap == nil || s.dev != uint64(st.Dev) || s.ino != st.Ino || s.birth != logBirth(&st) || s.hardCap != l.s.logHardCap || s.bound != bound || st.Size < s.off {
+	if s.pastCap == nil || s.dev != uint64(st.Dev) || s.ino != st.Ino || s.birth != logBirth(&st) || s.hardCap != l.s.logHardCap || s.bound != bound || s.shareLimit != l.s.uidShare() || st.Size < s.off {
 		fresh()
 	} else if len(s.last) > 0 {
 		// The same file at the same or a larger size can still have been
@@ -1002,39 +1013,8 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 		return s, nil
 	}
 	start := s.off
-	if !l.whole && start < s.hardCap {
-		if st.Size <= s.hardCap {
-			// Nothing past the cap to charge; the audit log's lines before
-			// it are not read.
-			return s, nil
-		}
-		// The first line past the cap starts after the newline at or after
-		// hardCap-1.
-		start = s.hardCap - 1
-	}
 	r := bufio.NewReaderSize(io.NewSectionReader(src, start, st.Size-start), 64<<10)
 	off := start
-	if !l.whole && s.off < s.hardCap {
-		// Skip the line that straddles the cap, however long: it is read
-		// through, a chunk the size of the buffer at a time. A last line
-		// with no newline is damage, as it is anywhere.
-		for {
-			skipped, err := r.ReadSlice('\n')
-			off += int64(len(skipped))
-			if err == nil {
-				break
-			}
-			switch {
-			case errors.Is(err, bufio.ErrBufferFull):
-				continue
-			case errors.Is(err, io.EOF):
-				// s.off stays before the cap, so the skip runs again.
-				s.tornSize = st.Size
-				return s, nil
-			}
-			return nil, l.unreadable(off, err)
-		}
-	}
 	for off < st.Size {
 		line, err := readLogLine(r)
 		if errors.Is(err, io.EOF) && len(line) == 0 {
@@ -1052,7 +1032,7 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 			if _, ok := s.frozen[off]; !ok {
 				s.frozen = map[int64][]byte{off: line}
 			}
-			if l.whole {
+			if l.floor {
 				s.tornTaint(off, s.frozen[off])
 			}
 			return s, nil
@@ -1064,7 +1044,7 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 				// are a foreign writer's: the merged line is damage,
 				// classified by the fragment as first read.
 				s.skip(off)
-				if l.whole {
+				if l.floor {
 					s.taintLine(off, frag)
 				}
 				s.lastAt, s.last = off, line
@@ -1099,7 +1079,7 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 			off++
 			continue
 		}
-		uid, perr := l.lineUID(s, line[:len(line)-1])
+		uid, recon, perr := l.lineUID(s, line[:len(line)-1])
 		if errors.Is(perr, errFloorTooManyKeys) {
 			s.bad = s.at(off, perr)
 			return s, nil
@@ -1109,21 +1089,18 @@ func (l *appendLog) syncRead(f *os.File, st unix.Stat_t) (*logState, error) {
 			// lineUID refuses before it records anything. On the floor
 			// it taints what it could have named.
 			s.skip(off)
-			if l.whole {
+			if l.floor {
 				s.taintLine(off, line[:len(line)-1])
 			}
 			uid = 0
 		}
-		if off >= s.hardCap && uid != 0 {
-			if _, ok := s.pastCap[uid]; !ok && len(s.pastCap) >= maxChargedUIDs {
-				// Sticky damage, as a log past its size bound: the map
-				// of charged uids grows no further.
-				s.bad = s.at(off, fmt.Errorf("%w: %s", errLogTooManyUIDs, l.name))
+		if uid != 0 {
+			on, n := lineCharge(s.share[uid], s.hardCap, s.shareLimit, recon, off, int64(len(line)), s.leadEnd == off)
+			if err := s.charge(uid, on, n); err != nil {
+				// Sticky damage, as a log past its size bound: the maps
+				// of charged uids grow no further.
+				s.bad = s.at(off, fmt.Errorf("%w: %s", err, l.name))
 				return s, nil
-			}
-			s.pastCap[uid] += int64(len(line))
-			if s.leadEnd == off && s.leadAt >= s.hardCap {
-				s.pastCap[uid]++
 			}
 		}
 		s.lastAt, s.last = off, line
@@ -1187,10 +1164,11 @@ func skipRestOfLine(r *bufio.Reader, read []byte) (int64, error) {
 }
 
 // room refuses, as ErrLogFull, an operation of uid's that would append to
-// this log past its hard cap: every operation but one that revokes, and one
-// that revokes when uid's revocation budget has no room for a whole line. A
-// log that cannot be opened or read is no answer here: the operation's own
-// read or append of it refuses or, for a revocation, goes ahead.
+// this log past its hard cap or past uid's share: every operation but one
+// that revokes, and one that revokes when the revocation budget it draws on
+// (the socket margin) has no room for a whole line. A log that cannot be
+// opened or read is no answer here: the operation's own read or append of
+// it refuses or, for a revocation, goes ahead.
 func (l *appendLog) room(uid uint32, revoke bool) error {
 	f, st, err := l.open(unix.O_RDONLY)
 	if err != nil {
@@ -1203,11 +1181,13 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 			return err
 		}
 	}
-	if st.Size < l.s.logHardCap {
-		return nil
-	}
-	if !revoke {
+	pastHard := st.Size >= l.s.logHardCap
+	if pastHard && !revoke {
 		return l.pastCap()
+	}
+	if uid == 0 && !pastHard {
+		// Root's lines are charged to no share.
+		return nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1215,17 +1195,30 @@ func (l *appendLog) room(uid uint32, revoke bool) error {
 	if err != nil || state.bad != nil {
 		return nil
 	}
+	if uid == 0 {
+		return l.revokeRoom(state, st.Size, uid, maxAppendLine)
+	}
 	// The line is not written yet: room charges the longest one append of
-	// a line can be, its leading newline included, through the predicate
+	// a line can be, its leading newline included, through the rule
 	// appendLine charges the real line through.
-	return l.revokeRoom(state, st.Size, uid, maxAppendLine)
+	on, n := lineCharge(state.share[uid], state.hardCap, l.s.uidShare(), false, st.Size+1, maxLogLine, true)
+	switch {
+	case on == drawsShare:
+		return nil
+	case !revoke && st.Size+1 >= state.hardCap:
+		return l.pastCap()
+	case !revoke:
+		return l.shareSpent()
+	}
+	return l.revokeRoomOn(state, st.Size, uid, n, on)
 }
 
 // revokeRoomFor refuses, as ErrLogFull, n more bytes of uid's revocation
 // lines, appended now, several appends at once: when they would take the
-// log past logReadBound, or their bytes that could start at or past the
-// hard cap (at most all of n, and at most what lands past the cap) past
-// uid's revocation budget. A log that cannot be opened or read is no
+// log past logReadBound, or their bytes that could draw on uid's socket
+// margin past it: those that could start at or past the hard cap (at most
+// all of n, and at most what lands past the cap), and those below it that
+// uid's share has no room for. A log that cannot be opened or read is no
 // answer here, as for room.
 func (l *appendLog) revokeRoomFor(uid uint32, n int64) error {
 	f, st, err := l.open(unix.O_RDONLY)
@@ -1234,7 +1227,7 @@ func (l *appendLog) revokeRoomFor(uid uint32, n int64) error {
 		return nil
 	}
 	defer func() { _ = f.Close() }() // read-only
-	if st.Size+n <= l.s.logHardCap {
+	if uid == 0 && st.Size+n <= l.s.logHardCap {
 		return nil
 	}
 	l.mu.Lock()
@@ -1246,7 +1239,16 @@ func (l *appendLog) revokeRoomFor(uid uint32, n int64) error {
 	if st.Size+n > l.readBound() {
 		return l.pastCap()
 	}
-	return l.revokeRoom(state, st.Size, uid, min(n, st.Size+n-l.s.logHardCap))
+	above := max(0, min(n, st.Size+n-l.s.logHardCap))
+	charge := above
+	if uid != 0 {
+		left := max(0, l.s.uidShare()-state.share[uid])
+		charge += max(0, n-above-left)
+	}
+	if charge == 0 {
+		return nil
+	}
+	return l.revokeRoomOn(state, st.Size, uid, charge, drawsMargin)
 }
 
 // auditRevokeRoom refuses, as ErrLogFull, n more bytes of uid's revocation
@@ -1305,16 +1307,21 @@ func (l *appendLog) pastCap() error {
 	return fmt.Errorf("%w (%s is past its hard cap)", ErrLogFull, l.name)
 }
 
-// revokeRoom refuses, as ErrLogFull, n more bytes for uid past the hard
-// cap: when they would take the log past logReadBound, or uid's lines that
-// start past the hard cap past its revocation budget. room and appendLine
-// both judge through it.
+// revokeRoom is revokeRoomOn for the socket margin.
 func (l *appendLog) revokeRoom(state *logState, size int64, uid uint32, n int64) error {
+	return l.revokeRoomOn(state, size, uid, n, drawsMargin)
+}
+
+// revokeRoomOn refuses, as ErrLogFull, n more bytes of uid's drawn on the
+// revocation budget on names: when they would take the log past
+// logReadBound, or that budget's bytes past its limit. Neither budget draws
+// on the other. room and appendLine both judge through it.
+func (l *appendLog) revokeRoomOn(state *logState, size int64, uid uint32, n int64, on drawsOn) error {
 	if size+n > l.readBound() {
 		return l.pastCap()
 	}
-	if state.pastCap[uid]+n > l.s.logRevokeBudget {
-		return fmt.Errorf("%w (the caller's revocation budget in %s is spent)", ErrLogFull, l.name)
+	if state.spentOn(uid, on)+n > l.s.budgetOf(on) {
+		return l.budgetSpent(on)
 	}
 	return nil
 }
@@ -1377,16 +1384,12 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 	// the reader passes over.
 	out := []byte{'\n'}
 	lead := int64(len(out))
-	// charge is uid's bytes in lines that start at or past the hard cap,
-	// which the reader charges to its revocation budget, and the leading
-	// newline when it, too, is at or past the cap.
-	var charge int64
-	if st.Size >= l.s.logHardCap {
-		charge = lead
-	}
+	// pastHard is whether any of the buffer starts at or past the hard cap:
+	// root's lines, charged to no uid, are refused there.
+	pastHard := st.Size >= l.s.logHardCap
 	for _, line := range lines {
 		if st.Size+int64(len(out)) >= l.s.logHardCap {
-			charge += int64(len(line))
+			pastHard = true
 		}
 		out = append(out, line...)
 	}
@@ -1409,21 +1412,31 @@ func (l *appendLog) appendLines(uid uint32, lines [][]byte, budget, revoke, slac
 		}
 		return nil
 	}
-	if charge > 0 {
-		if !budget || uid == 0 {
-			return l.pastCap()
-		}
+	if uid == 0 && pastHard {
+		return l.pastCap()
+	}
+	if uid != 0 {
+		// Each line is charged by the reader's one rule (lineCharge): to
+		// uid's share while it has room, else to the budget its via names,
+		// which only the revocation class (budget) may draw on.
 		if err := read(); err != nil {
 			return err
 		}
-		// The leading newline is charged with the lines past the cap, and
-		// otherwise only counted in the size.
-		size := st.Size
-		if st.Size < l.s.logHardCap {
-			size += lead
-		}
-		if err := l.revokeRoom(state, size, uid, charge); err != nil {
+		margin, allowance, err := l.planCharge(state, st.Size, uid, lines, budget)
+		if err != nil {
 			return err
+		}
+		end := st.Size + int64(len(out))
+		for _, b := range []struct {
+			on drawsOn
+			n  int64
+		}{{drawsMargin, margin}, {drawsAllowance, allowance}} {
+			if b.n == 0 {
+				continue
+			}
+			if err := l.revokeRoomOn(state, end-b.n, uid, b.n, b.on); err != nil {
+				return err
+			}
 		}
 	}
 	if l.addsKey != nil {
@@ -1694,7 +1707,7 @@ func (l *appendLog) wholeLine(frag []byte) bool {
 	if len(frag) == 0 || len(frag)+1 > maxLogLine {
 		return false
 	}
-	if l.whole {
+	if l.floor {
 		_, err := parseFloorLine(frag)
 		return err == nil
 	}
@@ -1741,11 +1754,11 @@ func scopeUID(scope string) uint32 {
 type fileFloorLog struct{ log *appendLog }
 
 func newFileFloorLog(s *FileStore) *fileFloorLog {
-	l := &appendLog{s: s, name: userFloorLogName, whole: true}
-	l.lineUID = func(st *logState, line []byte) (uint32, error) {
+	l := &appendLog{s: s, name: userFloorLogName, floor: true}
+	l.lineUID = func(st *logState, line []byte) (uint32, bool, error) {
 		r, err := parseFloorLine(line)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		// A key is recorded on its first line, even at sequence 0: floor
 		// --rebuild writes 0 for an entry with no authenticated pointer, and
@@ -1759,7 +1772,7 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		uid := scopeUID(r.key.scope)
 		if !inSeq && !st.buried[r.key] {
 			if st.keys >= l.readKeyBound() {
-				return 0, errFloorTooManyKeys
+				return 0, false, errFloorTooManyKeys
 			}
 			st.keys++
 			st.uidKeys[uid]++
@@ -1776,7 +1789,7 @@ func newFileFloorLog(s *FileStore) *fileFloorLog {
 		case !inSeq || r.seq > seq:
 			st.maxSeq[r.key] = r.seq
 		}
-		return uid, nil
+		return uid, false, nil
 	}
 	l.addsKey = func(st *logState, line []byte) (bool, error) {
 		r, err := parseFloorLine(bytes.TrimSuffix(line, []byte{'\n'}))
@@ -2208,6 +2221,19 @@ func (s *FileStore) floorGrantRoomKeys(scope string, names []string, write int64
 	if size > s.logReadBound() {
 		return l.pastCap()
 	}
+	// A grant's lines draw on no revocation budget: each must fit uid's
+	// share, by the rule appendLines charges it through.
+	if uid := scopeUID(scope); uid != 0 {
+		used, at := state.share[uid], st.Size
+		for _, line := range lines {
+			on, n := lineCharge(used, state.hardCap, s.uidShare(), false, at+1, int64(len(line)), true)
+			if on != drawsShare {
+				return l.shareSpent()
+			}
+			used += n
+			at += n
+		}
+	}
 	n := len(lines)
 	if newKeys != nil {
 		n = newKeys(state)
@@ -2282,17 +2308,24 @@ func (s *FileStore) CheckLogBounds(ctx context.Context) (damage, spent int, err 
 			if err != nil {
 				return 0, err
 			}
-			for uid, n := range state.pastCap {
-				if uid == 0 {
-					continue
-				}
-				if n > s.logRevokeBudget {
-					return 0, fmt.Errorf("%w: %w (uid %d has %d bytes past the hard cap in %s, over its budget of %d)", errInvalidConfig, errLogRevokeBudgetSpent, uid, n, log.name, s.logRevokeBudget)
-				}
-				if n+maxAppendLine > s.logRevokeBudget {
-					// Root's figures, in the server's log only.
-					slog.Warn("a uid's revocation budget past the hard cap has under one line left; its revocations are refused until the audit log is rotated", "log", log.name, "uid", uid, "bytes", n, "budget", s.logRevokeBudget)
-					spentUIDs[uid] = true
+			for _, b := range []struct {
+				on    drawsOn
+				spent map[uint32]int64
+				what  string
+			}{{drawsMargin, state.pastCap, "socket margin"}, {drawsAllowance, state.allowance, "reconciler allowance"}} {
+				limit := s.budgetOf(b.on)
+				for uid, n := range b.spent {
+					if uid == 0 {
+						continue
+					}
+					if n > limit {
+						return 0, fmt.Errorf("%w: %w (uid %d has %d bytes on its %s in %s, over its budget of %d)", errInvalidConfig, errLogRevokeBudgetSpent, uid, n, b.what, log.name, limit)
+					}
+					if n+maxAppendLine > limit {
+						// Root's figures, in the server's log only.
+						slog.Warn("a uid's revocation budget has under one line left; its revocations that draw on it are refused until the audit log is rotated", "log", log.name, "uid", uid, "budget", b.what, "bytes", n, "limit", limit)
+						spentUIDs[uid] = true
+					}
 				}
 			}
 			if log.addsKey != nil {

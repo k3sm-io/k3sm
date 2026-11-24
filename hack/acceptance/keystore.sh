@@ -660,9 +660,10 @@ pend U65 "ErrScopeAbsent is Indeterminate and deletes nothing; every allow-list 
 	k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate TestEveryDeletingOutcomeNeedsTwoSweeps TestSingleServerRecheckedBeforeEverySweep
 pend U66 "a synthesized GeneratedUID (prefix FFFFEEEE-DDDD-CCCC-BBBB-AAAA) is ErrScopeOwnerUnknown and never bound; ErrScopeOwnerChanged only for a real GeneratedUID that differs (user scopes)" \
 	k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown
-pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own budgets per log above the hard cap: a 256 KiB reconciler allowance and a separate 704 KiB socket margin; neither budget can draw on the other; refused only when the budget it draws on runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; a uid whose budget is spent to under one line is counted per uid and never refuses the store start; a log passes the hard cap by at most 320 KiB per user scope, plus the 1 MiB reconciler budget (socket operations)" \
-	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart TestRevocationAllowanceIsPerUID \
-	TestSocketMarginSeparateFromReconcilerAllowance
+pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own budgets per log above the hard cap: a 256 KiB reconciler allowance and a separate 704 KiB socket margin; neither budget can draw on the other; refused only when the budget it draws on runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; a uid whose budget is spent to under one line is counted per uid and never refuses the store start; a log passes the hard cap by at most 960 KiB per user scope (its 704 KiB socket margin and 256 KiB reconciler allowance), plus the 1 MiB reconciler budget (socket operations)" \
+	k3sm/pkg/keystore::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart TestRevocationAllowanceIsPerUID \
+	TestSocketMarginSeparateFromReconcilerAllowance TestShareLimitRefusesOnlyThatUID TestShareLimitInTheFloor TestShareRunningCountIsTheRecount \
+	TestShareResetAfterAuditRotate TestShareConfigAtMostOneSixteenthOfHardCap TestLogReadBoundHoldsBothBudgets TestSpentRevocationBudgetIsPerUID
 rootcheck U68 "root-run: floor --rebuild and audit --rotate meet a symlink, a FIFO and a swapped directory at the marker, at keystore-staging/ and at their log's directory in keystore-logs/, and refuse before anything changes; a symlink, FIFO or directory inside keystore-staging/ is removed unread and the verb finishes; the verb never follows a planted name, the decoy it points at does not change, and no log byte changes on a refusal (append-only files)" \
 	k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedNames
 pend U69 "the client pins the server: the peer's audit token (LOCAL_PEERTOKEN) must resolve to the cdhash of the installed /Library/k3sm/k3sm, or nothing is written; another service-user binary, a reused pid, a lookup error, an old server after an upgrade and a listener inherited or passed to another process are refused (non-root CLI and exec)" \
@@ -695,7 +696,7 @@ check U82 "eligible peer uids are 501 to 2147483647: nobody (4294967294) and eve
 	k3sm/pkg/keystore/socket::TestPeerUIDRangeRefusesNobodyAndHighUIDs
 pend U83 "the reconciler checks the user-scope floor log: a missing or unflagged floor log is Indeterminate for writes, so no deliver-write runs until floor --rebuild; the floor holds writes and absence-driven deletes: an ErrNotFound delete is Indeterminate while the floor is missing or unflagged, a revocation-driven delete still deletes the Secret without the floor, and only the record withdrawal waits for it (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestReconcilerHoldsWritesWithoutFloor
-pend U84 "when a log's size is past the hard cap, doctor shows a Warn with the overshoot in bytes and the rotate or rebuild hint, and none at or below it; the overshoot is at most 320 KiB per user scope, plus the 1 MiB reconciler budget (socket operations)" \
+pend U84 "when a log's size is past the hard cap, doctor shows a Warn with the overshoot in bytes and the rotate or rebuild hint, and none at or below it; the overshoot is at most 960 KiB per user scope (its 704 KiB socket margin and 256 KiB reconciler allowance), plus the 1 MiB reconciler budget (socket operations)" \
 	k3sm/cmd/k3sm::TestDoctorWarnsOnLogOvershoot
 pend U85 "a reconciler line charged to no uid (a forged-Secret refused line, a drift repair, their summaries) draws on the reconciler budget, 1 MiB per log, separate from every uid and excluded from the hard-cap test; forged Secrets are counted in a bounded LRU of 1024 (namespace, name) pairs with no per-resourceVersion set, new pairs' lines at most 10 a minute and at most one summary refused line a minute carrying the dropped count; past the budget the lines are dropped and counted and doctor warns; N forged updates leave every uid able to read and mutate (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestForgedSecretFloodLeavesEveryUIDServed TestUnchargedLinesHaveOwnBudget
@@ -1066,7 +1067,7 @@ U66|FFFFEEEE-DDDD-CCCC-BBBB-AAAA
 U67|256 KiB reconciler allowance
 U67|704 KiB socket margin
 U67|neither budget can draw on the other
-U67|at most 320 KiB per user scope
+U67|at most 960 KiB per user scope
 U84|overshoot
 U67|one uid's revocations are never refused because of another uid
 U73|an indeterminate sweep keeps the claim

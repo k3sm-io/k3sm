@@ -41,7 +41,7 @@ func TestAuditLineChargedStrictly(t *testing.T) {
 		{`{"V":1,"op":"rm","scope":"user/1001","result":"ok"}`, 0, false},
 		{`{"v":1,"v":1,"op":"rm","scope":"user/1001","result":"ok"}`, 0, false},
 	} {
-		uid, err := l.lineUID(nil, []byte(tc.line))
+		uid, _, err := l.lineUID(nil, []byte(tc.line))
 		if (err == nil) != tc.ok || uid != tc.uid {
 			t.Errorf("lineUID(%s) = %d, %v; want %d, accepted %v", tc.line, uid, err, tc.uid, tc.ok)
 		}

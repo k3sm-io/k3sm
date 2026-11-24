@@ -164,7 +164,7 @@ func TestFloorKeyBoundDerivedFromCaps(t *testing.T) {
 		t.Fatalf("key bound %d at the default caps, want the ceiling %d", got, 1<<18)
 	}
 	// Under small caps the size-derived bound is met first.
-	s.logHardCap, s.logSoftCap, s.logRevokeBudget = 1<<20, 1<<20, maxLogLine
+	s.logHardCap, s.logSoftCap, s.logRevokeBudget, s.logAllowance = 1<<20, 1<<20, maxLogLine, maxLogLine
 	if got, want := l.keyBound(), int(s.logReadBound()/55+1); got != want || want >= 1<<18 {
 		t.Fatalf("key bound %d under 1 MiB caps, want the size-derived %d", got, want)
 	}

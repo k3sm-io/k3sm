@@ -124,6 +124,12 @@ type Config struct {
 	// hard cap, or a budget under one worst-case burial plus its audit line
 	// (minLogRevokeBudget), makes every operation fail.
 	LogSoftCap, LogHardCap, LogRevocationBudget int64
+	// LogUIDShare is each uid's byte share of each append-only log
+	// (keystore.logUIDShare, docs/design/keystore.md § "Per-uid
+	// fairness"). Zero is the default: 16 MiB, 1/16 of the default hard
+	// cap. A negative value, or one over LogHardCap / 16, makes every
+	// operation fail.
+	LogUIDShare int64
 }
 
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
@@ -185,6 +191,10 @@ type FileStore struct {
 	// logSoftCap, logHardCap and logRevokeBudget are Config's log caps,
 	// with the defaults filled in.
 	logSoftCap, logHardCap, logRevokeBudget int64
+	// logUIDShare is Config.LogUIDShare as given, 0 for the default
+	// (uidShare); logAllowance is each uid's reconciler allowance per log,
+	// logReconcilerAllowance, which only a test lowers.
+	logUIDShare, logAllowance int64
 	// userScopesStarted is set by startUserScopes once the server's
 	// user-scope start step has run; until then UserScope refuses
 	// (errUserScopesNotStarted). A pointer, so a copy of the store shares
@@ -229,6 +239,8 @@ func New(cfg Config) *FileStore {
 		logSoftCap:      orDefault(cfg.LogSoftCap, defaultLogSoftCap),
 		logHardCap:      orDefault(cfg.LogHardCap, defaultLogHardCap),
 		logRevokeBudget: orDefault(cfg.LogRevocationBudget, defaultLogRevocationBytes),
+		logUIDShare:     cfg.LogUIDShare,
+		logAllowance:    logReconcilerAllowance,
 
 		userScopesStarted: new(atomic.Bool),
 		quarantined:       new(atomic.Pointer[map[uint32]bool]),
@@ -273,8 +285,12 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: MasterDir is empty", errInvalidConfig)
 	case s.dataRoot == "":
 		return fmt.Errorf("%w: DataRoot is empty", errInvalidConfig)
-	case s.logSoftCap < 0 || s.logHardCap < 0 || s.logRevokeBudget < 0:
-		return fmt.Errorf("%w: a log cap or budget is negative", errInvalidConfig)
+	case s.logSoftCap < 0 || s.logHardCap < 0 || s.logRevokeBudget < 0 || s.logUIDShare < 0:
+		return fmt.Errorf("%w: a log cap, budget or share is negative", errInvalidConfig)
+	case s.logUIDShare > s.logHardCap/logUIDShareDivisor:
+		// A share over 1/16 of the hard cap would let fewer than 16 uids
+		// fill a log for everyone.
+		return fmt.Errorf("%w: LogUIDShare %d is over LogHardCap / %d, %d", errInvalidConfig, s.logUIDShare, logUIDShareDivisor, s.logHardCap/logUIDShareDivisor)
 	case s.logRevokeBudget < minLogRevokeBudget:
 		// A budget under one worst-case burial plus its audit line refuses
 		// an rm's tombstones or its audit line, so it would silently

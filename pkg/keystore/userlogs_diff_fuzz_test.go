@@ -217,11 +217,11 @@ func FuzzLogSyncDifferential(f *testing.F) {
 				name string
 				inc  diffLog
 			}{{"floor", incFloor}, {"audit", incAudit}} {
-				hist := frozen[lg.inc.l.whole]
+				hist := frozen[lg.inc.l.floor]
 				seed := maps.Clone(hist)
 				got := lg.inc.sync(t)
 				maps.Copy(hist, got.frozen)
-				want := syncSeeded(t, s, lg.inc.l.whole, maxKeys, lg.inc.buf, seed)
+				want := syncSeeded(t, s, lg.inc.l.floor, maxKeys, lg.inc.buf, seed)
 				where := fmt.Sprintf("%s after batch %d (%d bytes, hard cap %d)", lg.name, i, len(*lg.inc.buf), s.logHardCap)
 				if gc, wc := diffClass(got.bad), diffClass(want.bad); gc != wc {
 					t.Fatalf("%s: incremental verdict %q (%v), from scratch %q (%v)", where, gc, got.bad, wc, want.bad)
@@ -238,10 +238,13 @@ func FuzzLogSyncDifferential(f *testing.F) {
 				if !maps.Equal(got.pastCap, want.pastCap) {
 					t.Fatalf("%s: incremental past-cap charges %v, from scratch %v", where, got.pastCap, want.pastCap)
 				}
+				if !maps.Equal(got.share, want.share) || !maps.Equal(got.allowance, want.allowance) {
+					t.Fatalf("%s: incremental share and allowance charges %v %v, from scratch %v %v", where, got.share, got.allowance, want.share, want.allowance)
+				}
 				if !maps.Equal(got.uidKeys, want.uidKeys) {
 					t.Fatalf("%s: incremental per-uid key counts %v, from scratch %v", where, got.uidKeys, want.uidKeys)
 				}
-				if lg.inc.l.whole {
+				if lg.inc.l.floor {
 					// The taint set is deterministic: the incremental reader
 					// and one from scratch taint the same keys and mark the
 					// same unattributable damage.
@@ -256,7 +259,7 @@ func FuzzLogSyncDifferential(f *testing.F) {
 						}
 					}
 				}
-				if lg.inc.l.whole {
+				if lg.inc.l.floor {
 					// Empty lines, an append's leading newlines, are benign:
 					// the floor without them reads the same.
 					bare := stripEmptyLines(*lg.inc.buf)

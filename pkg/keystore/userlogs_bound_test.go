@@ -36,9 +36,9 @@ func TestLogReaderSizeBound(t *testing.T) {
 	size := int64(len(readLog(t, s, userFloorLogName)))
 	s.logHardCap = size
 	s.logSoftCap = size
-	s.logRevokeBudget = minLogRevokeBudget
+	s.logRevokeBudget, s.logAllowance = minLogRevokeBudget, minLogRevokeBudget
 	bound := s.logReadBound()
-	if want := size + maxRevokeUIDs*minLogRevokeBudget + logBoundMargin; bound != want {
+	if want := size + maxRevokeUIDs*2*minLogRevokeBudget + logBoundMargin; bound != want {
 		t.Fatalf("the bound is %d, want %d", bound, want)
 	}
 	if got := s.readBoundOf(userFloorLogName); got != bound {
