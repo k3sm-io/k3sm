@@ -47,6 +47,12 @@ func (s *FileStore) StartUserScopes(ctx context.Context) error {
 // pass, even when an earlier pass started the user scope.
 func ScopesNotCaughtUp(err error) bool { return errors.Is(err, errScopesNotCaughtUp) }
 
+// NoScopeKey reports whether err is a uid with no scope yet: no scope
+// directory, or one with no scope.key, the one absence a mutating
+// operation mints over. A scope.key with no entries/ or no deliveries
+// record is ErrScopeAbsent too, but damage, and is not this.
+func NoScopeKey(err error) bool { return errors.Is(err, errNoScopeKey) }
+
 // IneligibleUID reports whether err refused a uid the store gives no user
 // scope: outside the login range, or the store's service uid.
 func IneligibleUID(err error) bool { return errors.Is(err, errIneligibleUID) }

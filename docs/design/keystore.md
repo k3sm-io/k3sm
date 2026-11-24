@@ -4367,7 +4367,12 @@ surface, and the app consumes only those.
   refusal stands until the owner does that; the error the server logs names the entry and
   that remedy. `ErrScopeAbsent` is `not-found` on the
   socket: the peer's own scope holds nothing it can read, and nothing on the socket path
-  deletes on that answer, so it is never taken as a definitive absence. A `log-full` from the
+  deletes on that answer, so it is never taken as a definitive absence. `list` alone answers
+  an empty list rather than `not-found`, and only for a uid with no scope key yet (no scope
+  directory, or one with no `scope.key`: `keystore.NoScopeKey`); a scope whose `scope.key`
+  is there but whose `entries/` directory or `deliveries` record is gone is damage, and its
+  `list` answers that error's own code, never an empty list (`TestListDamagedScopeIsNotEmpty`).
+  A `log-full` from the
   uid's own share is never the global append failure: that one is answered alike for every
   uid, `log-full` when its cause is the audit log past its hard cap and `refused` for any
   other cause (a full disk, an I/O error).

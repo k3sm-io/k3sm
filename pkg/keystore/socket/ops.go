@@ -258,11 +258,13 @@ func (o ops) list(ctx context.Context, req Request) (Reply, error) {
 		return Reply{}, err
 	}
 	es, err := o.store.List(ctx, req.Peer)
-	if errors.Is(err, keystore.ErrScopeAbsent) {
+	if keystore.NoScopeKey(err) {
 		// A uid with no scope yet holds nothing: an empty list, as an
 		// empty scope gives (docs/design/keystore.md § "A read never
 		// mints a scope"). The store has audited the list already: one
 		// whose line failed is refused (keystore.AuditRefused), not this.
+		// A scope that is there but damaged (a scope.key with no entries/
+		// or no deliveries record) is not empty: it answers its own code.
 		es, err = nil, nil
 	}
 	if err != nil {

@@ -21,6 +21,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -141,4 +144,25 @@ func TestUnencodableReplyIsInternal(t *testing.T) {
 		}
 	}
 	w.mustReply(t, `{"op":"ok"}`, nil, nil)
+}
+
+// Only a uid with no scope key lists as empty: a scope whose scope.key is
+// there but whose entries/ directory or deliveries record is gone is
+// damage, and its list answers the store's code, never an empty list.
+func TestListDamagedScopeIsNotEmpty(t *testing.T) {
+	for _, gone := range []string{"entries", "deliveries"} {
+		t.Run(gone, func(t *testing.T) {
+			r := newOpsRig(t, nil)
+			w := dialOps(t, r.ops, uidA)
+			w.mustReply(t, hdr(t, OpPut, entryOf(uidA, "a"), nil), []byte("v"), nil)
+			p := filepath.Join(r.data, "server", "keystore", ".user", strconv.FormatUint(uint64(uidA), 10), gone)
+			if err := os.RemoveAll(p); err != nil {
+				t.Fatal(err)
+			}
+			f := w.call(t, hdr(t, OpList, "", nil), nil)
+			if f.Type == TypeReply {
+				t.Fatalf("list of a scope with no %s replied %s, want the damage's code", gone, f.Header)
+			}
+		})
+	}
 }
