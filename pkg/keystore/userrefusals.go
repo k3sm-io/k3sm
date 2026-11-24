@@ -40,6 +40,13 @@ func (s *FileStore) StartUserScopes(ctx context.Context) error {
 	return s.startUserScopes(ctx)
 }
 
+// ScopesNotCaughtUp reports whether err, from StartUserScopes, is only the
+// named scopes the pass could not catch up, with the log bounds check
+// passed and every other scope started. Any other error of the step (the
+// bounds check failed, or the catch-up failed as a whole) is not, on any
+// pass, even when an earlier pass started the user scope.
+func ScopesNotCaughtUp(err error) bool { return errors.Is(err, errScopesNotCaughtUp) }
+
 // UserScopesStarted reports whether the start step (StartUserScopes) has
 // started the user scope. The step can return an error and still have
 // started it: a scope it could not catch up is named in the error while

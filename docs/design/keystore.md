@@ -3495,7 +3495,12 @@ service user can only add to.
   a transient refusal of the catch-up line (`ErrLogFull`, `errLogNoSpace`, an I/O error) is
   named in the returned error and the scope starts, and the next start step, and for the
   delivery record every operation's own catch-up, tries the line again
-  (`TestFullVolumeAtStartDoesNotQuarantine`). A `withdraw` whose delivery record a damaged
+  (`TestFullVolumeAtStartDoesNotQuarantine`). The socket's supervisor runs the start step
+  on every pass, and the same split holds on every one: only the named per-scope catch-up
+  errors (`ScopesNotCaughtUp`) are logged at Warn while the listener serves; a refused
+  `CheckLogBounds` or a catch-up that failed as a whole fails the step on any pass, the
+  first or a later one after the user scope has started, so the listener stays off on the
+  supervisor's backoff (`TestStartUserScopesStepRefusesOnLaterPass`). A `withdraw` whose delivery record a damaged
   line taints still runs: it checks the record against the highest sequence the floor's
   whole lines hold, seals the tombstone and writes its floor line, which is never refused
   for damage; it only removes, so it cannot bring anything back

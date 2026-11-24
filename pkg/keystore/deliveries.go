@@ -1074,8 +1074,16 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 	}
 	s.quarantined.Store(&quarantined)
 	s.userScopesStarted.Store(true)
-	return scopeErrs
+	if scopeErrs != nil {
+		return fmt.Errorf("%w: %w", errScopesNotCaughtUp, scopeErrs)
+	}
+	return nil
 }
+
+// errScopesNotCaughtUp marks the one error of the start step that leaves
+// the user scope started: named scopes it could not catch up, while the
+// log bounds check passed and every other scope started (ScopesNotCaughtUp).
+var errScopesNotCaughtUp = errors.New("the user scope started, but the start step could not catch up these scopes")
 
 // errScopeQuarantined marks a uid whose scope the start step quarantined
 // (startUserScopes); it wraps errFloorDegraded.

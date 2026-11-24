@@ -372,15 +372,17 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 
 // startUserScopesStep is the supervisor's last start check: the store's
 // start step (the log bounds check, then the delivery catch-up), run on
-// every pass, so a failed one is retried. An error that left the user
-// scope unstarted keeps the listener off with the store's reason; one that
-// named a scope it could not catch up while every other scope started is
-// logged at Warn and the listener serves (docs/design/keystore.md § "The
-// user-scope floor").
+// every pass, so a failed one is retried. Only an error naming scopes it
+// could not catch up while the bounds check passed and every other scope
+// started (keystore.ScopesNotCaughtUp) is logged at Warn and the listener
+// serves; any other error (the log bounds check failed, or the catch-up
+// failed as a whole) keeps the listener off with the store's reason on
+// every pass, the first or a later one alike (docs/design/keystore.md §
+// "The user-scope floor").
 func startUserScopesStep(store *keystore.FileStore, log *slog.Logger) func(context.Context) error {
 	return func(ctx context.Context) error {
 		err := store.StartUserScopes(ctx)
-		if err != nil && store.UserScopesStarted() {
+		if err != nil && keystore.ScopesNotCaughtUp(err) && store.UserScopesStarted() {
 			log.Warn("keystore user scope started, but its start step named scopes it could not catch up", "err", err)
 			return nil
 		}

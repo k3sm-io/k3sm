@@ -978,3 +978,31 @@ func (c *handlerConn) reply(t *testing.T, f socket.Frame, out any) {
 		t.Fatalf("reply header %s: %v", f.Header, err)
 	}
 }
+
+// The start step holds on every pass, not only the first: once a pass has
+// started the user scope, a later pass whose log bounds check fails (the
+// audit log gone, or the request cancelled before the check) still fails
+// the step, so the supervisor keeps the listener off.
+func TestStartUserScopesStepRefusesOnLaterPass(t *testing.T) {
+	f, _ := newInstalledWiringFixture(t)
+	cfg, closeAll, err := keystoreSocketConfig(f.deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAll()
+	if err := cfg.StartScopes(t.Context()); err != nil {
+		t.Fatalf("the first pass: %v", err)
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := cfg.StartScopes(cancelled); err == nil {
+		t.Fatal("a later pass whose bounds check was cancelled passed; want the step to fail")
+	}
+	audit := filepath.Join(f.dataRoot, keystore.LogsDirName, keystore.AuditDirName, keystore.AuditLogName)
+	if err := os.Remove(audit); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.StartScopes(t.Context()); err == nil {
+		t.Fatal("a later pass with the audit log gone passed; want the bounds check's failure")
+	}
+}
