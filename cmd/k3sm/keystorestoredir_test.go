@@ -189,7 +189,7 @@ func TestDoctorStoreDirRow(t *testing.T) {
 	if _, err := os.Lstat(storeCfg.Dir); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("doctor's step created the store directory: %v", err)
 	}
-	if err := serverStoreDir(store)(t.Context()); err != nil {
+	if err := serverStoreDir(store, storeCfg.UID, storeCfg.GID)(t.Context()); err != nil {
 		t.Fatalf("the server's step: %v", err)
 	}
 	if r := row(); r.status != statusPass {
@@ -197,5 +197,102 @@ func TestDoctorStoreDirRow(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(storeCfg.Dir, ".lock")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("doctor's step took the store lock: %v", err)
+	}
+}
+
+// TestStoreDirRaceTextIsTransient: the server's store-directory step words
+// a directory it cannot open, as one a root put has made and not yet
+// handed over, as the one-pass race it may be (retried, no repair) on the
+// first consecutive denied pass only; from the second it names the repair
+// what it reads of the directory calls for (here the chmod), and a pass that clears resets the count. The "as root,
+// make it ... or remove it" repair is for a refusal on what the directory
+// is.
+func TestStoreDirRaceTextIsTransient(t *testing.T) {
+	f, _ := installedWiringFixture(t, false)
+	storeCfg := f.deps.layout(f.deps.workDir)
+	storeCfg.UID, storeCfg.GID = uint32(os.Getuid()), uint32(os.Getgid())
+	store := keystore.New(storeCfg)
+	if err := os.Mkdir(storeCfg.Dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(storeCfg.Dir, 0o700) })
+	step := serverStoreDir(store, storeCfg.UID, storeCfg.GID)
+	access := "if this persists, it is not the race"
+	race := func(pass string) {
+		t.Helper()
+		err := step(t.Context())
+		if err == nil || !strings.Contains(err.Error(), storeDirRaceText) || strings.Contains(err.Error(), access) || strings.Contains(err.Error(), storeDirRepair) {
+			t.Fatalf("%s: %v, want %q and no repair", pass, err, storeDirRaceText)
+		}
+	}
+	persists := func(pass string) {
+		t.Helper()
+		err := step(t.Context())
+		if err == nil || !strings.Contains(err.Error(), access) || strings.Contains(err.Error(), storeDirRaceText) {
+			t.Fatalf("%s: %v, want %q and not the race text", pass, err, access)
+		}
+	}
+	race("the first pass that cannot open the directory")
+	if !strings.Contains(storeDirRaceText, "a root keys put may be creating it; retried") {
+		t.Fatalf("the race text %q does not say it is transient", storeDirRaceText)
+	}
+	persists("the second consecutive pass")
+	persists("the third consecutive pass")
+	// The directory is the service user's at mode 0: the repair is the
+	// chmod, not a chown it does not need.
+	if err := step(t.Context()); err == nil || !strings.Contains(err.Error(), "chmod 700 "+storeCfg.Dir) || strings.Contains(err.Error(), "chown") || !strings.Contains(err.Error(), "or remove it if it holds nothing") {
+		t.Fatalf("a mode-0 directory of the service user's: %v, want chmod 700 and no chown", err)
+	}
+	if err := os.Chmod(storeCfg.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := step(t.Context()); err != nil {
+		t.Fatalf("a pass that clears: %v", err)
+	}
+	if err := os.Chmod(storeCfg.Dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	race("the first denied pass after one that cleared")
+	persists("the second denied pass after one that cleared")
+	if err := os.Chmod(storeCfg.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := step(t.Context())
+	if err == nil || !strings.Contains(err.Error(), storeDirRepair) || strings.Contains(err.Error(), storeDirRaceText) {
+		t.Fatalf("a wider mode: %v, want the repair and not the race text", err)
+	}
+	if err := os.Chmod(storeCfg.Dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	race("the first denied pass after a refusal, which is not denied")
+}
+
+// TestKeystoreListenerOffWhileMergePending: with a restore staged (the
+// floor moved aside as keystore-floor.json.pre-restore in the data root)
+// the server's start checks keep the user scope off, naming keys floor
+// merge, and create no store directory; once the merge has renamed the
+// file every check passes.
+func TestKeystoreListenerOffWhileMergePending(t *testing.T) {
+	f, _ := installedWiringFixture(t, false)
+	aside := filepath.Join(f.dataRoot, "keystore-floor.json.pre-restore")
+	if err := os.WriteFile(aside, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, closeAll, err := keystoreSocketConfig(f.deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAll()
+	if reason, detail := passingChecks(cfg).Check(t.Context()); reason == "" || !strings.Contains(detail, "keys floor merge") {
+		t.Fatalf("the start checks with a restore staged: %q %q, want off naming keys floor merge", reason, detail)
+	}
+	if _, err := os.Lstat(f.deps.layout(f.deps.workDir).Dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the server made a store directory with a restore staged: %v", err)
+	}
+	if err := os.Rename(aside, aside+".merged"); err != nil {
+		t.Fatal(err)
+	}
+	if reason, detail := passingChecks(cfg).Check(t.Context()); reason != "" {
+		t.Fatalf("the start checks after the merge: %q %q, want every check to pass", reason, detail)
 	}
 }

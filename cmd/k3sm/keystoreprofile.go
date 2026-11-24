@@ -17,34 +17,53 @@ limitations under the License.
 package main
 
 import (
+	"log/slog"
 	"path/filepath"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// serverPodPosture is the node-level Seatbelt posture of the server's
-// embedded runtime: the pod root (Posture.WorkDir), the data root, the
-// role's state dir, the status record dir and the container-log root.
-// serverNodeOptions hands these same values to the node, which threads them
-// through provider.RuntimedConfig and runtimed.Config into the
-// sandbox.Posture runtimed renders every Pod profile from, so the keystore
-// socket's start check (keystorePodProfile) and the runtime read one
-// derivation. runtimed exports no way to ask a built runtime for its
-// posture, so the fields runtimed fills from its own state (Home,
-// WorkVolume, the VIPs, ShadowBinDir) are left out: none of them changes
-// the keystore stanza, which runtimed writes from WorkDir, DataRoot and
-// StateDir alone.
-func serverPodPosture(opts serverOptions) sandbox.Posture {
-	return sandbox.Posture{
-		WorkDir:         opts.podRoot,
-		DataRoot:        executor.RuntimeRoot(opts.workDir),
-		StateDir:        opts.workDir,
-		StatusRecordDir: status.Dir(opts.workDir),
-		PodLogsDir:      opts.logs.dir,
+// serverRuntimeDirs are the directories serverNodeOptions hands the
+// server's node, as the flags give them: the pod root, the status record
+// dir, the data root, the role's state dir and the container-log options.
+// The node threads them through runtimedConfig into provider.NewRuntimed,
+// which normalises them before runtimed renders a Pod profile from them.
+func serverRuntimeDirs(opts serverOptions) nodeOptions {
+	return nodeOptions{
+		podRoot:   opts.podRoot,
+		statusDir: status.Dir(opts.workDir),
+		dataRoot:  executor.RuntimeRoot(opts.workDir),
+		stateDir:  opts.workDir,
+		logs:      opts.logs,
 	}
+}
+
+// serverPodPosture is the node-level Seatbelt posture of the server's
+// embedded runtime, the one runtimed renders every Pod profile from: the
+// directories serverNodeOptions gives the node (serverRuntimeDirs), through
+// runtimedConfig, normalised by the provider's own derivation
+// (provider.RuntimePosture), so the keystore socket's start check
+// (keystorePodProfile) and the runtime read one derivation. The error is the
+// one the provider would refuse the node with. runtimed exports no way to
+// ask a built runtime for its posture, so the fields runtimed fills from its
+// own state (Home, WorkVolume, the VIPs, ShadowBinDir) are left out: none of
+// them changes the keystore stanza, which runtimed writes from WorkDir,
+// DataRoot and StateDir alone.
+func serverPodPosture(opts serverOptions) (sandbox.Posture, error) {
+	return provider.RuntimePosture(runtimedConfig(serverRuntimeDirs(opts), nil))
+}
+
+// serverPodPostureSource is the socket's posture source for the server
+// opts configures: serverPodPosture, derived afresh on every call. It logs
+// once, now, when the Pod-profile check does not apply to the node's Pods
+// (notePodProfileCheckScope).
+func serverPodPostureSource(opts serverOptions, log *slog.Logger) func() (sandbox.Posture, error) {
+	notePodProfileCheckScope(opts.rtName, log)
+	return func() (sandbox.Posture, error) { return serverPodPosture(opts) }
 }
 
 // keystoreProfileProbePod is the pod directory, under the posture's pods

@@ -1541,7 +1541,36 @@ Until the merge runs, the restore is unfinished, and the store enforces that: wh
 under `keystore-lock`, before they write anything, with a message naming `keys floor merge`
 (`errMergePending`); Delete runs and writes only its burials (below); and RaiseFloor, which the
 read verbs call first, raises nothing and logs that at Warn, so no pointer put back before the
-merge is recorded. `list` and `show` run with a warning on stderr and, until the merge, find no
+merge is recorded. The user scope is off for the same window, in code: the server's start step
+(`startUserScopes`) and its store-directory step (`EnsureDir`, which so makes no `keystore/` the
+merge would move aside as planted) refuse with `errMergePending`, as doctor's start step does,
+and every user write verb (put, rotate, rm, deliver, withdraw) asks `FileStore.MergePending` first
+under the store lock (`userWriteAllowed`) and refuses with it, changing no entry and writing
+nothing but its one refused audit line, as every user refusal is audited; the refusal's text
+says so (`TestMergePendingRefusalSaysWhatItWrote`). The guard fails closed: a store with no data
+root, where `MergePending` is nil because no floor is configured, is refused by it as an
+invalid configuration rather than let through (`TestUserWriteGuardFailsClosed`). The reads
+the socket serves, `list` and exec-read (both through `auditedRead`), ask the same guard under
+the shared lock before the scope is opened and are refused with `errMergePending`, audited as
+refused, so the gate does not rest on the start step and the recipe's `k3sm stop` alone
+(`TestUserReadsRefusedWhileMergePending`)
+(`TestUserScopeOffWhileMergePending`, `TestUserScopeDeliverRefusedWhileMergePending`,
+`TestKeystoreListenerOffWhileMergePending`). The guard's limit: it holds from the moment the
+marker exists, not before. The root verbs ask it through the data-root descriptor `keystore-lock`
+judged (`floorLock.mergePending`), so their check and write are atomic against `keys floor
+merge`, which holds that lock. A user write verb runs as the service user, which cannot take
+`keystore-lock` and holds no data-root descriptor, so it asks by path (`MergePending`), under the
+store lock only; it is still safe against the merge, which only ever clears the marker, never
+makes it, so a check that saw no marker is never overtaken by one the merge writes. Neither
+check is atomic against the operator's own `mv`s, which take no lock: a write whose check ran
+just before the floor `mv` lands. That is why the recipe stops the server first, and moves the
+floor aside before anything else, so the marker stands before `server/keystore` leaves. The
+undo recipe swaps the two floors through a third name, `keystore-floor.json.undo`, which counts
+as pending exactly as `keystore-floor.json.pre-restore` does, in both checks, with its own
+refusal naming it (`errUndoPending`, `errMergePending` to `errors.Is`): its preconditions run
+before any `mv`, the restored floor goes to `.undo` first, the moved-aside floor into place, then
+`.undo` to `.pre-restore`, so from its first `mv` a pending name stands at every step
+(`TestMergePending`, `TestKeysRollbackRoundTrip`). `list` and `show` run with a warning on stderr and, until the merge, find no
 entry, since the restored tree is staged (below). A successful merge renames its input to
 `keystore-floor.json.merged-<unix>` beside it, through the data root descriptor the lock
 judged (never over an existing file, and only if the name is still the file it read), which
@@ -1554,7 +1583,7 @@ the data root's live floor by inode is refused outright
 (`TestMergeFloorCommittedRerun`, `TestKeysFloorMergeCommittedRerun`). `k3sm start` is not hooked: its start path has no cheap synchronous
 check of the keystore, and it writes no floor. The delivery reconciler, the server's one reader
 that publishes a value, is: each sweep first asks `FileStore.MergePending` (a Lstat of
-`keystore-floor.json.pre-restore`, any answer but not found counting as pending; a store
+`keystore-floor.json.pre-restore`, then of `keystore-floor.json.undo`, any answer but not found counting as pending; a store
 configured with an empty data root has no floor, so no restore can be pending and it is nil, no
 hold), and while it is set the sweep delivers nothing, reads no entry and makes no apiserver call, logs at Error and
 tries again on the next sweep (`TestDeliveryRefusedWhileMergePending`). `list` and `show` still
@@ -1565,8 +1594,11 @@ that the backup's directory and its parent are owned by root with no group or ot
 `find -maxdepth 0 -user root ! -perm +022` that must match both), so the service user cannot swap
 the source between the checks and the copy, and, just before `ditto`, `test ! -L` on its source,
 which `ditto` would follow (`TestKeysRollbackRoundTrip`, the recipe-steps subtest). The save
-recipe makes those directories so (`install -d -o root -g wheel -m 0755`). The
-recipe moves the live `keystore/` into `pre-restore.d/` in the data root, a directory it creates
+recipe makes those directories so (`install -d -o root -g wheel -m 0755`). The recipe moves the
+live floor aside to `keystore-floor.json.pre-restore` first, before anything else moves, so the
+pending-merge guard (below) holds before `server/keystore` leaves and no `EnsureDir` can make a
+new one in its place; the undo likewise swaps the floors before it moves either tree. Then it
+moves the live `keystore/` into `pre-restore.d/` in the data root, a directory it creates
 root:wheel 0700 with `mkdir` (which fails on an existing name) under a parent only root can
 write, so the service user cannot reach the moved-aside entries to copy one back, nor rename the
 directory, as it could under `server/`. It changes no file inside: a rename changes no inode's
@@ -1984,15 +2016,77 @@ such entry or a parent of the socket path is missing at the activation call (mea
 three missing levels), gets `ENOENT`. Each keeps the user scope off for the life of the
 process; the server never binds `keys.sock` itself. **The server checks its Pod profile at
 start.** Before the supervisor serves, the server renders a Pod profile with the embedded
-runtimed's own generator (`sandbox.Generate`) over the posture its runtime is built with
-(`serverPodPosture`, `cmd/k3sm/keystoreprofile.go`), and requires that the text deny
+runtimed's own generator (`sandbox.Generate`) over a posture whose pod root, data root and
+state dir are the ones the provider derives for its runtime from the same flags
+(`serverPodPosture`, `cmd/k3sm/keystoreprofile.go`, over `provider.RuntimePosture`, which is
+the provider's own `dataRootOf`, `ownRootStateDir` and `podLogsDirOf`). What is proven is
+narrow: `TestServerPodPostureMatchesRuntime` shows those three fields equal to the provider's
+for a `/private/var` data root under a `/var` pod root (both become the runtime root's
+spelling), a `/System/Volumes/Data` data root, a symlinked `server` state dir (its resolved
+target) and the default (runtimed's default pod root), and
+`TestRuntimePostureIsTheRuntimesConfig` shows the provider's derivation is what `NewRuntimed`
+hands runtimed. The fields runtimed fills from its own state (`Home`, `WorkVolume`, the VIPs)
+are not in it, and no test reads a built runtime's posture back. **Accepted residual: the
+posture the check approves is not the value the node runs with.** The check derives its own
+posture (`serverPodPosture`), and the node derives its own later, when `NewRuntimed` builds the
+runtime; both resolve paths on disk, so an actor who retargets a symlink one of them resolves
+(the data root, the pod root, the status record dir) between the two derivations makes the node
+run with a posture the check never read. In an installed layout that actor is root; that no
+other uid can retarget one of those links is not proven here. The fix, one derivation handed to
+both, is recorded, not built. A posture the provider
+refuses (as it refuses the node) is the configuration state below, retried
+(`TestServerPodPostureFailureIsConfiguration`). The check requires that the text deny
 `file-read*`, `file-write*` and unix-socket `network-outbound` on `keystore-sock/` under the
 data root it serves, in each spelling the generator writes (`/var`, `/private/var`,
-`/System/Volumes/Data`), with no overlapping allow after the deny (`socket.ProfileDeniesSocket`).
+`/System/Volumes/Data`), with no overlapping allow after the deny (`socket.ProfileDeniesSocket`),
+and, for the same operations and every spelling of the data root, a deny carrying the
+case-folding `regex` filter the generator writes for the data root's `keystore-` names, in the
+generator's own shape and no other: `^<root>/` (the root as `regexp.QuoteMeta` writes it), then
+one group per letter of `keystore-`, in order and with nothing after them, each holding exactly
+that letter's `unicode.SimpleFold` orbit, checked by structure rather than by sampling strings. A
+letter with an orbit of one is the literal (escaped only where `regexp.QuoteMeta` escapes it); an
+ASCII-only orbit may be a class (`[Ee]`) with no escape, range, negation or non-ASCII byte inside
+it; any orbit may be an alternation of single literal runes (`(K|k|K)`, the Kelvin sign U+212A
+written as its UTF-8, and `(S|s|ſ)` with U+017F), with no `(?` syntax and no escape. Seatbelt's
+SBPL regex dialect is not Go's: it takes no `\x{...}` escape, may read a class holding a
+multi-byte character as a class of its bytes, and differs on top-level alternation (runtimed
+`keystorePrefixPattern`). So a `\x`, `\u` or `\p` escape, a `(?` group, a non-ASCII byte inside
+`[...]`, a top-level `|`, a trailing `$`, an alternation of whole spellings, or a group missing
+a fold or carrying a spelling beyond it is refused as `OffPodProfile`, however Go would read it:
+a profile without the shape fails the check (`TestProfileDeniesSocket`). The check is lexical and narrower than Seatbelt: it reads
+top-level `(allow ...)` and `(deny ...)` forms only, so a rule nested in any other form is not
+seen; only an exact `(subpath "P")` filter, bare or under `(remote unix-socket ...)`, covers the
+socket's directory, so a `literal`, `prefix` or `regex` filter, or one under `require-any` or
+`require-all`, does not; paths are compared as text in the spellings above, with no symlink
+resolved; and the `regex` counts only in the shape above, read as text, so the check does not
+depend on how either regex engine reads anything else. Inside that shape, it proves the text the
+linked generator renders carries the deny with every fold of every letter; it does not test
+that Seatbelt enforces it, which only a sandboxed run can. Under `--runtime hostprocess` the check still runs but reads a profile
+no Pod runs under: hostprocess Pods run unconfined, as the server's uid, which the listener
+refuses, so the server's start log says the check does not apply there
+(`notePodProfileCheckScope`, `TestPodProfileCheckScopeLoggedForHostProcess`).
 A profile that does not, as from a k3sm built against a runtimed older than the deny or a data
 root the posture does not name, keeps the user scope off for the life of the process with `this
 build's Pod profile does not deny the keystore socket`; the server logs one warning naming
-`install a k3sm built with a matching runtimed` and keeps running. The barriers relied on are
+`install a k3sm built with a matching runtimed` and keeps running. A render the generator
+refuses for a posture value the server's flags set (an invalid pod logs dir, pod root, status
+record dir, data root or state dir, or a pods root under a `keystore-*` name:
+`podPostureErrors`, `cmd/k3sm/keystoresocket.go`) is the node's configuration, not the build's:
+the user scope is off with `the Pod profile does not render for this node's configuration`,
+naming the render error and "fix the flag, then `sudo k3sm restart`", and the check is retried
+with the start-check backoff, running no other start check until it passes
+(`TestPodProfileRemedyNamesConfiguration`, `TestPodProfileConfigIsRetried`). The restart stays in
+that remedy although the check is retried: each retry derives the posture afresh, but from the
+flags the process read at its start. A derivation the provider refuses for what is on disk
+rather than the flags' shape (a status record dir or a data root, one of its trees or the state
+dir, that resolves somewhere other than its spelling: `ErrStatusRecordDirNotCanonical`,
+`ErrDataRootNotCanonical`) is off with `a path the node's flags name resolves somewhere
+unexpected` instead (`socket.ErrPodProfilePath`), naming "a path the node's flags name resolves
+somewhere unexpected (a symlink was changed?): fix the path it names (retried, no restart
+needed), or fix the flag, then `sudo k3sm restart`", on the same retry
+(`TestServerPodPostureFailureIsConfiguration`, `TestPodProfilePathIsRetried`). The check is
+asked only until it first holds, never again for the life of the supervisor. Any other render
+error stays the build's state above. The barriers relied on are
 that Seatbelt deny and the listener's sandboxed-peer refusal (Open requirement 15); launchd's
 `ESRCH` to a Pod is not one of them. A data root on a volume that is not
 mounted was not measured; a default-layout data root that is not mounted is refused earlier,
@@ -4311,15 +4405,47 @@ directory is root's"). A worker node runs no listener (E18).
   creates it with the store's own helper, the one a first `keys put` uses (`mkdirOwned`: the
   service user's, 0700, any inherited ACL removed, `server/` fsynced). A directory that exists
   is judged as every open of the store judges it (a directory, the service user's, granting
-  nothing to group or others), and one that fails is never repaired: the listener stays off as
+  nothing to group or others), and as carrying no extended ACL, read on the opened directory's
+  descriptor with the check `pre-restore.d` gets (`judgeDirACL`), and one that fails is never repaired: the listener stays off as
   `the store directory is missing or refused`, with the open's refusal and its repair (as root,
-  make it the service user's at 0700, or remove it if it holds nothing), on every pass. So a
+  make it the service user's at 0700 with no extended ACL, or remove it if it holds nothing), on
+  every pass. So a
   fresh install's user scope comes up without a root `keys put`. Only the installed server
   creates it: the step runs after the effective-uid check, and a worker builds no listener. A
   root `put` racing the step is safe: whichever `mkdir` lands first makes the directory and the
   other only judges it; the server's `mkdir` makes a directory the service user already owns,
   which the put's judgement accepts, and a put's `mkdir` makes one root owns until its
   handover, which the server refuses for that pass only, finding it handed over on the next.
+  A directory the server has just made that already holds a name a racing put wrote
+  (`ErrCorrupt` "is not empty") names no repair: it says `a root keys put may be creating it;
+  retried` (`keystore.StoreDirRace`). A directory the server cannot open or reach (EACCES,
+  `keystore.StoreDirDenied`) names the repair for its cause, read without opening it
+  (`keystore.StoreDirDenial`: an `Lstat`, which needs only the parent's search permission, for
+  the owner, the mode and the immutable flags, and `acl_get_link_np` by path for an extended
+  ACL; a diagnosis only, never a judgement):
+  - **A parent that denies the walk** (the parent's open or the `mkdir` in it is denied, or the
+    `Lstat` of the store directory fails with EACCES) is never the race, which never touches
+    `server/`: it names `server/` and makes it the service user's at mode 0700, as the
+    installer makes it, with the steps what was read of `server/` calls for. A `server/` that
+    cannot itself be `Lstat`'d names the data root above it (root:wheel, 0755).
+  - **A third uid's directory** (neither root nor the service user) is never the race, and
+    nothing in it has been checked: `as root, inspect it, then remove it`. No adopt path is
+    offered.
+  - **Root's or the service user's** is worded as the race only on the first of consecutive
+    passes denied: a root-owned one before its handover cannot be opened, but neither can one
+    a root put left root's when it died before the handover, an operator's `sudo mkdir -m 700`,
+    or one carrying a deny ACE, and those never clear. From the second consecutive denied pass
+    it names `if this persists, it is not the race`, why (root owns it, or the service user
+    cannot open it), and the steps: `chflags nouchg,noschg` when an immutable flag is set (it
+    denies no open, but `chown` and `chmod` fail on it until then), `chmod -N` when an extended
+    ACL is there or cannot be read, `chown <uid>:<gid>` when the owner is wrong, `chmod 700`
+    when the owner lacks a mode bit, or, when nothing read explains the denial, `chmod -N`,
+    `chown` and `chmod 700` all; `or remove it if it holds nothing`.
+  The server's step keeps the count; a pass that runs the step and is not denied
+  resets it. A refusal of an existing directory on what it is (not a directory, its owner, its
+  mode, an extended ACL: `keystore.StoreDirRefused`) names its repair on every pass
+  (`TestStoreDirRaceTextIsTransient`, `TestStoreDirDenialNamesItsCause`,
+  `TestEnsureDirClassifiesRefusals`, `TestEnsureDirRefusesExtendedACL`).
   Doctor runs the same judgement read-only: before the server's first start it shows the
   user scope off for the store directory, saying the server creates it at start.
   Nothing is opened on the data root before its mount flags and the installed files are

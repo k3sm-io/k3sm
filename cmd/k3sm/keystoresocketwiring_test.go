@@ -34,7 +34,7 @@ import (
 
 // TestRunServerStartsKeystoreSocket pins the startup call: runServer defers
 // the keystore-socket teardown step over startKeystoreSocket with the
-// runtime's posture (serverPodPosture) and the activated listener source
+// runtime's posture (serverPodPostureSource) and the activated listener source
 // (keystoreSocketListener), after the
 // keystore-delivery step, so LIFO stops the listener first and both before
 // the control plane.
@@ -80,8 +80,8 @@ func TestRunServerStartsKeystoreSocket(t *testing.T) {
 	if id, ok := socketCall.Fun.(*ast.Ident); !ok || id.Name != "startKeystoreSocket" || len(socketCall.Args) != 6 {
 		t.Fatal("the keystore-socket step is not startKeystoreSocket(...)")
 	}
-	if c, ok := socketCall.Args[2].(*ast.CallExpr); !ok || c.Fun.(*ast.Ident).Name != "serverPodPosture" {
-		t.Fatal("startKeystoreSocket's posture is not serverPodPosture(), the one the node's runtime is given")
+	if c, ok := socketCall.Args[2].(*ast.CallExpr); !ok || c.Fun.(*ast.Ident).Name != "serverPodPostureSource" {
+		t.Fatal("startKeystoreSocket's posture is not serverPodPostureSource(), the one the node's runtime renders from")
 	}
 	if c, ok := socketCall.Args[4].(*ast.CallExpr); !ok || c.Fun.(*ast.Ident).Name != "keystoreSocketListener" {
 		t.Fatal("startKeystoreSocket's listener is not keystoreSocketListener()")

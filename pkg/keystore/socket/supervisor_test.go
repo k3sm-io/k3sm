@@ -751,6 +751,70 @@ func TestPodProfileOffIsTerminal(t *testing.T) {
 	})
 }
 
+// A Pod profile the generator refuses for this node's configuration
+// (ErrPodProfileConfig) is retried, not terminal: off with
+// OffPodProfileConfig and its flag remedy, asked again after the start-check
+// backoff, running no start check meanwhile, and the start checks run once
+// it passes.
+func TestPodProfileConfigIsRetried(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, func(c *startChecks) {
+			c.profileErr = fmt.Errorf("%w: render the Pod profile: sbpl: invalid pod-logs dir", ErrPodProfileConfig)
+		})
+		st := r.wantState(t, PhaseOff, OffPodProfileConfig, MinBackoff)
+		if !strings.Contains(st.Detail, "pod-logs dir") || st.Reason.Remedy() != PodProfileConfigRemedy {
+			t.Fatalf("state %+v, remedy %q", st, st.Reason.Remedy())
+		}
+		if n := r.log.count("level=WARN", PodProfileConfigRemedy, string(OffPodProfileConfig)); n != 1 {
+			t.Fatalf("%d Warn lines naming the flag remedy, want 1:\n%s", n, r.log.b.String())
+		}
+		advance(MinBackoff)
+		r.wantState(t, PhaseOff, OffPodProfileConfig, 2*MinBackoff)
+		r.ck.mu.Lock()
+		profiled, counted := r.ck.profiled, r.ck.counted
+		r.ck.profileErr = nil
+		r.ck.mu.Unlock()
+		if profiled != 2 || counted != 0 {
+			t.Fatalf("profiled %d, counted %d; want the profile asked twice and no start check", profiled, counted)
+		}
+		advance(2 * MinBackoff)
+		r.wantState(t, PhaseServing, "", 0)
+	})
+}
+
+// A Pod profile whose posture cannot be derived because a path on disk
+// resolves elsewhere (ErrPodProfilePath) is retried like a configuration
+// error, but under its own reason, OffPodProfilePath, naming the path
+// remedy, which needs no restart; once it passes it is not asked again.
+func TestPodProfilePathIsRetried(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, func(c *startChecks) {
+			c.profileErr = fmt.Errorf("%w: derive the runtime's posture: data root is not its own resolved path", ErrPodProfilePath)
+		})
+		st := r.wantState(t, PhaseOff, OffPodProfilePath, MinBackoff)
+		if !strings.Contains(st.Detail, "resolved path") || st.Reason.Remedy() != PodProfilePathRemedy {
+			t.Fatalf("state %+v, remedy %q", st, st.Reason.Remedy())
+		}
+		if !strings.Contains(PodProfilePathRemedy, "fix the path it names (retried, no restart needed)") {
+			t.Fatalf("the path remedy %q does not say a fixed path needs no restart", PodProfilePathRemedy)
+		}
+		if n := r.log.count("level=WARN", PodProfilePathRemedy, string(OffPodProfilePath)); n != 1 {
+			t.Fatalf("%d Warn lines naming the path remedy, want 1:\n%s", n, r.log.b.String())
+		}
+		r.ck.mu.Lock()
+		r.ck.profileErr = nil
+		r.ck.mu.Unlock()
+		advance(MinBackoff)
+		r.wantState(t, PhaseServing, "", 0)
+		r.ck.mu.Lock()
+		profiled := r.ck.profiled
+		r.ck.mu.Unlock()
+		if profiled != 2 {
+			t.Fatalf("profiled %d; want the profile asked twice, and not again once it held", profiled)
+		}
+	})
+}
+
 func TestBackoffDoublesToFiveMinutes(t *testing.T) {
 	d, waits := MinBackoff, []time.Duration{MinBackoff}
 	for d < MaxBackoff {

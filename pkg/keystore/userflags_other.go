@@ -21,6 +21,7 @@ package keystore
 import (
 	"context"
 	"os"
+	"syscall"
 )
 
 // clearUserFlags is a no-op off Darwin: BSD user flags are a Darwin feature.
@@ -42,3 +43,6 @@ var scopeFchflags = func(int, int) error { return nil }
 
 // setFlagsAt is never called off Darwin: no file carries a user flag.
 var setFlagsAt = func(int, string, uint32) error { return nil }
+
+// statImmutable reports no flag: a build off darwin reads none.
+func statImmutable(*syscall.Stat_t) bool { return false }

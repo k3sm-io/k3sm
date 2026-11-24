@@ -293,8 +293,39 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	return v, err
 }
 
+// userWriteAllowed is the first step of every user write verb's work
+// under the store lock (put, rotate, rm, deliver, withdraw): it refuses
+// (errMergePending) while a restore is staged, keystore-floor.json.pre-restore
+// or the undo's keystore-floor.json.undo in the data root
+// (FileStore.MergePending), so no user change lands before
+// keys floor merge has run, to be moved aside by it. The start step refuses
+// the same, so the listener is off for that window too.
+//
+// It asks by path, not through the data-root descriptor keystore-lock
+// judged as the root verbs do (floorLock.mergePending): a user verb runs
+// as the service user, which cannot take keystore-lock (the floor owner's,
+// granting nothing to group or others) and holds no data-root descriptor.
+// It is safe against keys floor merge anyway, which only removes the
+// marker, never makes one. Against the operator's lock-free mv that makes
+// it, no check is, which is why the restore recipe stops the server first.
+//
+// It fails closed: a store with no data root, where MergePending answers
+// nil because no floor is configured, is refused (errInvalidConfig), since
+// there whether a restore is staged cannot be read. The refusal, like
+// every user verb's, is audited by its caller as one refused line; it
+// writes nothing else.
+func (u *UserScope) userWriteAllowed() error {
+	if u.s.dataRoot == "" {
+		return fmt.Errorf("%w: DataRoot is empty, so whether a restore is unfinished cannot be read", errInvalidConfig)
+	}
+	return u.s.MergePending()
+}
+
 // putLocked is put's work under the exclusive lock.
 func (u *UserScope) putLocked(root *os.Root, name string, kind Kind, value []byte, g *grantAudit) (Version, error) {
+	if err := u.userWriteAllowed(); err != nil {
+		return Version{}, err
+	}
 	if err := u.s.admit(u.uid, false); err != nil {
 		return Version{}, err
 	}
@@ -599,7 +630,9 @@ var errReadAuditRefused = errors.New("the audit line could not be written, so th
 // like any line and are not in the revocation class. A read whose line
 // cannot be appended is refused (errReadAuditRefused), and so is a
 // scope-absent one, which a list serves as empty; any other refused read's
-// line is written best effort, with the refusal's result.
+// line is written best effort, with the refusal's result. While a restore
+// is staged (userWriteAllowed) it is refused with errMergePending before
+// the scope is opened, and audited as refused.
 func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Root, keys) error) error {
 	if err := u.s.checkConfig(); err != nil {
 		return err
@@ -619,7 +652,18 @@ func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Ro
 	if err := u.s.admit(u.uid, false); err != nil {
 		return err
 	}
-	o, entries, err := u.openScopeFull(root, u.s.loadMaster)
+	// A staged restore refuses the read as it refuses a write
+	// (userWriteAllowed): until keys floor merge has run, the restored
+	// floor lacks every deletion since the backup, so a value revoked since
+	// then could be served. The refusal is audited like any refused read.
+	err = u.userWriteAllowed()
+	var (
+		o       *openedScope
+		entries *os.Root
+	)
+	if err == nil {
+		o, entries, err = u.openScopeFull(root, u.s.loadMaster)
+	}
 	if err == nil {
 		err = fn(entries, o.uk)
 		_ = entries.Close() // read-only; nothing to flush

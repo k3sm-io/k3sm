@@ -1745,7 +1745,7 @@ func (s *FileStore) raiseFloor(ctx context.Context) error {
 		// restored entries the operator checks before the merge. Raising
 		// the restored floor before the merge could only record a pointer
 		// put back since, so nothing is raised until the merge has run.
-		slog.Warn("keystore floor: a restore is unfinished (keystore-floor.json.pre-restore is in the data root), so the floor is not raised; run sudo k3sm keys floor merge on it")
+		slog.Warn("keystore floor: a restore or its undo is unfinished (keystore-floor.json.pre-restore or keystore-floor.json.undo is in the data root), so the floor is not raised; finish it with sudo k3sm keys floor merge")
 		return nil
 	}
 	root, done, err := s.openLocked(ctx, false, true)

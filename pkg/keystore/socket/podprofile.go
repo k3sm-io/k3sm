@@ -20,14 +20,33 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"k3sm.io/runtimed/pkg/keystorepaths"
 )
 
 // ErrPodProfileOpen is a Pod profile that does not deny the keystore
 // socket: some spelling of the socket's directory is missing from its
 // file or its connect deny, or an allow after that deny re-opens it.
 var ErrPodProfileOpen = errors.New("the Pod profile does not deny the keystore socket")
+
+// ErrPodProfileConfig is a Pod profile the runtime's generator refuses to
+// render for this node's configuration: a posture value the server's flags
+// set cannot hold its deny. Fixing the flag and restarting clears it, so it
+// is not ErrPodProfileOpen.
+var ErrPodProfileConfig = errors.New("the Pod profile does not render for this node's configuration")
+
+// ErrPodProfilePath is a Pod profile whose posture cannot be derived
+// because a path the server's flags name resolves on disk somewhere other
+// than its spelling (a symlink changed under the data root or the status
+// record dir), so a deny written from the spelling would match nothing.
+// Fixing the path clears it on the next retry, without a restart; it is
+// neither ErrPodProfileConfig nor ErrPodProfileOpen.
+var ErrPodProfilePath = errors.New("a path the node's flags name resolves somewhere unexpected")
 
 // dataVolumeAlias is the macOS data volume's mount point: a path under a
 // firmlink is also reachable through it.
@@ -83,14 +102,28 @@ var podProfileDenies = []struct {
 // socket's directory (socketDirForms) it needs a deny of file-read*,
 // file-write* and unix-socket network-outbound whose filter is a subpath at
 // or above that spelling, with no allow of an overlapping operation after
-// it (Seatbelt is last-match-wins). It returns nil when the profile denies
-// all of them, and an error wrapping ErrPodProfileOpen naming the first
-// missing operation and spelling otherwise, or when the profile does not
-// parse.
+// it (Seatbelt is last-match-wins). For the same operations and every
+// spelling of the data root (the socket directory's parent) it also needs
+// a deny whose filter is the case-folding regex the generator writes for
+// the data root's keystore- names (foldsPrefix), with no overlapping allow
+// after it: without it a Pod could plant a KEYSTORE- spelling of the
+// socket's directory on the case-insensitive data volume. It returns nil
+// when the profile denies all of them, and an error wrapping
+// ErrPodProfileOpen naming the first missing operation and spelling
+// otherwise, or when the profile does not parse.
 //
 // It reads the text the node's generator rendered, so a k3sm linked against
 // a generator that does not deny the socket for this data root is caught at
-// start, whatever the generator's own tests pin.
+// start, whatever the generator's own tests pin. The reading is lexical,
+// and narrower than Seatbelt's: only top-level (allow|deny ...) forms are
+// read, so a rule inside any other form is not seen; a subpath counts only
+// as an exact (subpath "P") filter, or (remote unix-socket (subpath "P")),
+// so a literal, prefix or regex filter, or one under require-any or
+// require-all, never covers the socket's directory; paths are compared as
+// text in the spellings socketDirForms writes, with no symlink resolved;
+// and a regex counts only in the generator's own shape, read by structure
+// (foldsPrefix), so the check never depends on how either regex engine
+// would read anything else.
 func ProfileDeniesSocket(profile, socketPath string) error {
 	if !filepath.IsAbs(socketPath) {
 		return fmt.Errorf("%w: the socket path %q is not absolute", ErrPodProfileOpen, socketPath)
@@ -100,23 +133,27 @@ func ProfileDeniesSocket(profile, socketPath string) error {
 		return fmt.Errorf("%w: %w", ErrPodProfileOpen, err)
 	}
 	for _, dir := range socketDirForms(filepath.Dir(socketPath)) {
+		root := filepath.Dir(dir)
 		for _, d := range podProfileDenies {
-			if !deniedLast(forms, d.op, d.unix, dir) {
+			if !deniedLast(forms, d.op, func(fl sexp) bool { return covers(fl, d.unix, dir) }) {
 				return fmt.Errorf("%w: no %s deny covers %s with no allow after it", ErrPodProfileOpen, d.op, dir)
+			}
+			if !deniedLast(forms, d.op, func(fl sexp) bool { return foldsPrefix(fl, d.unix, root) }) {
+				return fmt.Errorf("%w: no %s deny carries the case-folding regex of %s names under %s with no allow after it", ErrPodProfileOpen, d.op, keystorepaths.DataRootPrefix, root)
 			}
 		}
 	}
 	return nil
 }
 
-// deniedLast reports whether a top-level deny of op covers dir and no
-// top-level allow after the last such deny names an operation overlapping
-// op.
-func deniedLast(forms []sexp, op string, unix bool, dir string) bool {
+// deniedLast reports whether a top-level deny of op has a filter matching
+// filter and no top-level allow after the last such deny names an
+// operation overlapping op.
+func deniedLast(forms []sexp, op string, filter func(sexp) bool) bool {
 	last := -1
 	for i, f := range forms {
 		head, ops, filters := f.rule()
-		if head == "deny" && slices.Contains(ops, op) && slices.ContainsFunc(filters, func(fl sexp) bool { return covers(fl, unix, dir) }) {
+		if head == "deny" && slices.Contains(ops, op) && slices.ContainsFunc(filters, filter) {
 			last = i
 		}
 	}
@@ -145,6 +182,123 @@ func covers(filter sexp, unix bool, dir string) bool {
 		return false
 	}
 	return pathUnder(dir, filter.list[1].atom)
+}
+
+// foldsPrefix reports whether filter is (regex #"^R/X"), or with unix set
+// (remote unix-socket (regex ...)), where R is root as regexp.QuoteMeta
+// writes it and X is, exactly, the shape the runtime's generator writes for
+// keystorepaths.DataRootPrefix (runtimed keystorePrefixPattern): one group
+// per letter, in order and nothing after them, each holding exactly that
+// letter's unicode.SimpleFold orbit (foldGroup). It is checked on the text,
+// by structure, not by sampling strings: Seatbelt's regex dialect is not
+// Go's (it takes no \x{...} escape, may read a class holding a multi-byte
+// character as a class of its bytes, and differs on top-level alternation),
+// so a regex is accepted only in the narrow grammar whose meaning the two
+// dialects share, and anything else, however Go would read it, is refused.
+// What this proves is that the profile carries the generator's fold for
+// every letter; it does not test that Seatbelt enforces it, which only a
+// sandboxed run can.
+func foldsPrefix(filter sexp, unix bool, root string) bool {
+	if unix {
+		if len(filter.list) != 3 || filter.list[0].atom != "remote" || filter.list[1].atom != "unix-socket" {
+			return false
+		}
+		filter = filter.list[2]
+	}
+	if len(filter.list) != 2 || filter.list[0].atom != "regex" || !filter.list[1].str {
+		return false
+	}
+	rest, ok := strings.CutPrefix(filter.list[1].atom, "^"+regexp.QuoteMeta(root)+"/")
+	if !ok {
+		return false
+	}
+	for _, r := range keystorepaths.DataRootPrefix {
+		if rest, ok = foldGroup(rest, foldOrbit(r)); !ok {
+			return false
+		}
+	}
+	return rest == ""
+}
+
+// foldOrbit returns r's unicode.SimpleFold orbit, r first.
+func foldOrbit(r rune) []rune {
+	orbit := []rune{r}
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		orbit = append(orbit, f)
+	}
+	return orbit
+}
+
+// regexMeta are the bytes regexp.QuoteMeta escapes, the only ones a
+// literal may be written escaped.
+const regexMeta = `\.+*?()|[]{}^$`
+
+// foldGroup reads, from the start of s, one letter's group in the
+// generator's grammar and reports whether it holds exactly orbit, each
+// spelling once, returning the rest of s. The group is one of:
+//   - a literal, for an orbit of one: the rune itself, or a backslash and
+//     the rune where it is one of regexMeta;
+//   - a class [ab], for an orbit of ASCII runes only: no escape, range,
+//     negation or byte outside ASCII inside the brackets;
+//   - an alternation (a|b|c) of literal single runes: no (? group syntax,
+//     no escape, nothing nested.
+func foldGroup(s string, orbit []rune) (string, bool) {
+	if s == "" {
+		return "", false
+	}
+	switch s[0] {
+	case '[':
+		end := strings.IndexByte(s, ']')
+		if end < 0 {
+			return "", false
+		}
+		body := s[1:end]
+		for i := 0; i < len(body); i++ {
+			if c := body[i]; c >= utf8.RuneSelf || c == '\\' || c == '-' || c == '^' || c == '[' {
+				return "", false
+			}
+		}
+		return s[end+1:], sameSpellings(strings.Split(body, ""), orbit)
+	case '(':
+		end := strings.IndexByte(s, ')')
+		if end < 0 || strings.HasPrefix(s, "(?") {
+			return "", false
+		}
+		alts := strings.Split(s[1:end], "|")
+		for _, a := range alts {
+			if strings.ContainsAny(a, regexMeta) {
+				return "", false
+			}
+		}
+		return s[end+1:], sameSpellings(alts, orbit)
+	case '\\':
+		if len(s) < 2 || !strings.ContainsRune(regexMeta, rune(s[1])) || len(orbit) != 1 || rune(s[1]) != orbit[0] {
+			return "", false
+		}
+		return s[2:], true
+	}
+	r, n := utf8.DecodeRuneInString(s)
+	if r == utf8.RuneError || strings.ContainsRune(regexMeta, r) || len(orbit) != 1 || r != orbit[0] {
+		return "", false
+	}
+	return s[n:], true
+}
+
+// sameSpellings reports whether spellings, each one whole rune, are orbit's
+// runes, each exactly once.
+func sameSpellings(spellings []string, orbit []rune) bool {
+	if len(spellings) != len(orbit) {
+		return false
+	}
+	seen := make(map[rune]bool, len(orbit))
+	for _, sp := range spellings {
+		r, n := utf8.DecodeRuneInString(sp)
+		if n == 0 || n != len(sp) || r == utf8.RuneError || seen[r] || !slices.Contains(orbit, r) {
+			return false
+		}
+		seen[r] = true
+	}
+	return true
 }
 
 // opsOverlap reports whether an allow of a can re-open a deny of d: the

@@ -1093,21 +1093,15 @@ func (s *FileStore) floorLockOwned(fi fs.FileInfo) error {
 }
 
 // mergePending refuses (errMergePending) while the restore's moved-aside
-// floor, keystore-floor.json.pre-restore, is in the data root, looked up
+// floor, keystore-floor.json.pre-restore, or the undo's
+// keystore-floor.json.undo (mergePendingAt), is in the data root, looked up
 // through l.root under the lock. Every verb that changes the keystore asks
 // it before it writes anything; MergeFloor, which clears it, does not,
 // RaiseFloor writes nothing instead, and Delete runs, raising nothing but
 // the burials it writes, so rm can make room for a merge refused as full.
 // Any answer but not found refuses too.
 func (l *floorLock) mergePending() error {
-	_, err := l.root.Lstat(floorPreRestoreName)
-	switch {
-	case err == nil:
-		return errMergePending
-	case errors.Is(err, fs.ErrNotExist):
-		return nil
-	}
-	return fmt.Errorf("%w (looking for it: %w)", errMergePending, err)
+	return mergePendingAt(l.root.Lstat)
 }
 
 // read reads the floor through l.root, refused unless l.root is still the

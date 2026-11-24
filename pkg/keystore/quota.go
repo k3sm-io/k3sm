@@ -230,6 +230,9 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 // deleteBody is delete's work under the lock. It calls mark before each
 // removal from the entry's tree.
 func (u *UserScope) deleteBody(root *os.Root, name string, mark func()) error {
+	if err := u.userWriteAllowed(); err != nil {
+		return err
+	}
 	// A scope.key that cannot be read refuses the rm before anything is
 	// written; entries/ that cannot be opened (entErr) is judged after the
 	// owner check, below.

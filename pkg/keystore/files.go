@@ -70,6 +70,9 @@ var (
 	// not a regular file, or over its size bound. A reader turns it into its
 	// own refusal; any other read error is an I/O failure and stays one.
 	errBadFile = errors.New("not a readable regular file")
+	// errNewDirNotEmpty is a directory mkdirAt has just made that already
+	// holds a name: another writer found it first and writes in it.
+	errNewDirNotEmpty = errors.New("is not empty")
 )
 
 // openDir opens the directory at path as a root and checks it (see
@@ -87,7 +90,7 @@ func (s *FileStore) openDir(path string, create bool) (*os.Root, error) {
 		return nil, err
 	}
 	if !named.IsDir() {
-		return nil, fmt.Errorf("%s is not a directory (mode %s)", path, named.Mode())
+		return nil, &dirRefusal{fmt.Errorf("%s is not a directory (mode %s)", path, named.Mode())}
 	}
 	root, err := os.OpenRoot(path)
 	if err != nil {
@@ -135,7 +138,7 @@ func (s *FileStore) openDirForRm(path string) (*os.Root, error) {
 // mkdirAt, so the open never leaves parent.
 func (s *FileStore) openSubdir(parent *os.Root, name string, create bool) (*os.Root, error) {
 	if create {
-		if _, err := s.mkdirAt(parent, name); err != nil && !errors.Is(err, fs.ErrExist) {
+		if _, err := s.mkdirAt(parent, name); err != nil && !existsSynced(err) {
 			return nil, err
 		}
 	}
@@ -160,7 +163,8 @@ func (s *FileStore) openSubdir(parent *os.Root, name string, create bool) (*os.R
 // checkRoot checks an opened directory: it must be the very directory Lstat
 // saw as named, so a swap between the two cannot substitute another (and
 // OpenRoot, which follows a symlink, did not), owned by the store's uid, and
-// granting nothing to group or others.
+// granting nothing to group or others. An owner or mode refusal is a
+// dirRefusal.
 func (s *FileStore) checkRoot(root *os.Root, named fs.FileInfo) error {
 	opened, err := root.Stat(".")
 	if err != nil {
@@ -169,12 +173,16 @@ func (s *FileStore) checkRoot(root *os.Root, named fs.FileInfo) error {
 	if !os.SameFile(named, opened) {
 		return errors.New("changed while it was opened")
 	}
-	return s.checkOwned(opened, dirMode)
+	if err := s.checkOwned(opened, dirMode); err != nil {
+		return &dirRefusal{err}
+	}
+	return nil
 }
 
 // mkdirOwned creates the directory at path at dirMode, handed to the service
 // user, with mkdirAt through a root opened on its parent, never by its full
-// path. An existing directory is left as it is for the caller's check. The
+// path. An existing directory is left as it is for the caller's check, its
+// parent fsynced (mkdirAt), so one a racing party made is durable. The
 // parent is opened by path: it is the server work dir, which the openDir note
 // above covers.
 //
@@ -189,7 +197,7 @@ func (s *FileStore) mkdirOwned(path string) error {
 	}
 	defer func() { _ = parent.Close() }() // the mkdir is all it is for
 	_, err = s.mkdirAt(parent, filepath.Base(path))
-	if errors.Is(err, fs.ErrExist) {
+	if existsSynced(err) {
 		return nil
 	}
 	if err != nil {
@@ -212,11 +220,21 @@ func (s *FileStore) mkdirOwned(path string) error {
 // service user prepared, so it is refused as ErrCorrupt and nothing is chowned
 // or chmodded. Once checked, any extended ACL it inherited from parent is
 // removed on the descriptor (removeExtendedACL; a no-op where the build reads
-// no ACL), before the handover. An existing name is an error matching
-// fs.ErrExist. Once handed over, parent is fsynced, so the new name is
-// durable.
+// no ACL), before the handover. Once handed over, parent is fsynced, so the
+// new name is durable. An existing name is an error matching fs.ErrExist,
+// after parent is fsynced too: the name may be one another party (the
+// server, or a root put, racing this one) has made and not yet synced, and
+// what the caller writes under it must not outlive it on a power loss. When
+// that fsync fails, the error joins both, so it still matches fs.ErrExist,
+// and errExistSync too: a caller that goes on under an existing name
+// (existsSynced) must not.
 func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	if err := parent.Mkdir(name, dirMode); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			if serr := syncDir(parent); serr != nil {
+				return nil, errors.Join(err, fmt.Errorf("%w: %w", errExistSync, serr))
+			}
+		}
 		return nil, err
 	}
 	s.dirMade(name)
@@ -263,6 +281,17 @@ func (s *FileStore) mkdirAt(parent *os.Root, name string) (fs.FileInfo, error) {
 	return opened, nil
 }
 
+// errExistSync marks mkdirAt's error for an existing name whose parent's
+// fsync then failed.
+var errExistSync = errors.New("sync the parent after finding the name existing")
+
+// existsSynced reports whether err, from mkdirAt, is an existing name whose
+// parent was fsynced: one a caller may go on under. An existing name whose
+// fsync failed is not.
+func existsSynced(err error) bool {
+	return errors.Is(err, fs.ErrExist) && !errors.Is(err, errExistSync)
+}
+
 // checkNewDir checks the directory open on f is one mkdirAt may hand over:
 // the same file as made, a directory, owned by the euid that made it, and
 // empty.
@@ -279,7 +308,7 @@ func (s *FileStore) checkNewDir(f *os.File, made, opened fs.FileInfo) error {
 	}
 	names, err := f.Readdirnames(1)
 	if len(names) > 0 {
-		return errors.New("is not empty")
+		return errNewDirNotEmpty
 	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("could not be listed: %w", err)
@@ -544,7 +573,7 @@ func readDirEntries(root *os.Root, max int) ([]fs.DirEntry, error) {
 // helper a first put uses (mkdirOwned: the service user's, at dirMode, any
 // inherited extended ACL removed, its parent fsynced), and then judges it as
 // every open does (openDir: a directory, the store's uid's, granting nothing
-// to group or others). An existing directory is only judged: one that fails
+// to group or others), and as carrying no extended ACL (judgeDirACL). An existing directory is only judged: one that fails
 // is refused with the open's text and left as it is, never repaired. The
 // server runs it before its log reopen, which takes the store lock, whose
 // file is in this directory.
@@ -555,16 +584,138 @@ func readDirEntries(root *os.Root, max int) ([]fs.DirEntry, error) {
 // put's judgement accepts. A put's mkdir makes one root owns until its
 // handover, which the server's judgement refuses for that one pass, and the
 // next pass finds the directory handed over.
+//
+// Its error says which: StoreDirRefused for an existing directory refused
+// on what it is (not a directory, its owner, its mode, an extended ACL), which every pass
+// refuses again until it is changed; StoreDirDenied for a directory it
+// cannot open or cannot reach, with what could be read about it without
+// opening it (StoreDirDenial), which is StoreDirRace too only when the
+// directory itself denied the open and its owner is root or the service
+// user (one root owns before its handover cannot be opened, but neither can
+// one a crashed put or an operator left root's); a parent that denies the
+// walk, or a third uid's directory, is never the race; and StoreDirRace for a directory just made that already holds a name a
+// racing put wrote. Any other error is none of these.
+//
+// While a restore is staged (MergePending) it refuses with errMergePending
+// and creates nothing: a directory made then would be moved aside by keys
+// floor merge as planted.
 func (s *FileStore) EnsureDir() error {
 	if err := s.checkConfig(); err != nil {
 		return err
 	}
-	root, err := s.openDir(s.dir, true)
+	if err := s.MergePending(); err != nil {
+		return err
+	}
+	if err := s.mkdirOwned(s.dir); err != nil {
+		switch {
+		case errors.Is(err, errNewDirNotEmpty):
+			return &storeDirError{err: err, race: true}
+		case errors.Is(err, syscall.EACCES):
+			// The parent's open or the mkdir in it was denied: server/, or
+			// the data root above it, which no put touches.
+			return &storeDirError{err: err, denied: true, denial: s.diagnoseDenied(true)}
+		}
+		return err
+	}
+	root, err := s.openDir(s.dir, false)
+	if err == nil {
+		err = closeAfter(root, judgeDirACL(root, s.dir))
+	}
+	if err != nil {
+		var refused *dirRefusal
+		switch {
+		case errors.As(err, &refused):
+			return &storeDirError{err: err}
+		case errors.Is(err, fs.ErrPermission):
+			d := s.diagnoseDenied(false)
+			return &storeDirError{err: err, denied: true, denial: d, race: d.Cause == DeniedOwn}
+		}
+		return err
+	}
+	return nil
+}
+
+// judgeDirACL refuses (dirRefusal) the store directory root holds when it
+// carries an extended ACL, which can grant past the mode openDir judged, as
+// pre-restore.d's is refused (floor_merge_stage.go). It is read on a
+// descriptor of the opened directory, so a name swapped after the open
+// changes nothing. A directory mkdirOwned has just made carries none: it
+// removes any inherited one.
+func judgeDirACL(root *os.Root, path string) error {
+	d, err := root.Open(".")
 	if err != nil {
 		return err
 	}
-	return root.Close()
+	defer func() { _ = d.Close() }() // read-only; nothing to flush
+	switch acl, err := hasExtendedACL(int(d.Fd())); {
+	case err != nil:
+		return fmt.Errorf("%s: %w", path, err)
+	case acl:
+		return &dirRefusal{fmt.Errorf("%s has an extended ACL, which can grant past its mode (sudo chmod -N %s removes it)", path, path)}
+	}
+	return nil
 }
+
+// closeAfter closes root once err, the judgement made on it, is known, and
+// returns err, or the close's error when err is nil.
+func closeAfter(root *os.Root, err error) error {
+	if cerr := root.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// storeDirError is an EnsureDir error marked as a refusal of the existing
+// directory, as a directory the server cannot open (denied), or, with race
+// set, as one that may be the one-pass race with a root put. Its text and
+// chain are err's.
+type storeDirError struct {
+	err    error
+	denied bool
+	race   bool
+	// denial is what a denied open could read (StoreDirDenial).
+	denial DirDenial
+}
+
+func (e *storeDirError) Error() string { return e.err.Error() }
+func (e *storeDirError) Unwrap() error { return e.err }
+
+// StoreDirRefused reports whether err, from EnsureDir, refuses an existing
+// store directory on what it is: not a directory, another owner, a mode
+// granting group or others anything, or an extended ACL. Only a change to
+// the directory clears it.
+func StoreDirRefused(err error) bool {
+	var e *storeDirError
+	return errors.As(err, &e) && !e.race && !e.denied
+}
+
+// StoreDirDenied reports whether err, from EnsureDir, is a store directory
+// the server cannot open (EACCES). One such pass may be the race with a
+// root put (StoreDirRace); the same error pass after pass is a directory
+// that is not the service user's and stays so: a root put that died
+// before its handover, an operator's mkdir as root, or another uid's.
+func StoreDirDenied(err error) bool {
+	var e *storeDirError
+	return errors.As(err, &e) && e.denied
+}
+
+// StoreDirRace reports whether err, from EnsureDir, may be a one-pass error
+// of the race with a root put creating the directory: a directory that
+// cannot be opened and is owned by root or the service user (a third uid's,
+// or a parent that denies the walk, is never the race), or the directory EnsureDir just made already holds a
+// name. A later pass finds a raced directory handed over; the caller counts
+// consecutive denied passes (StoreDirDenied) to tell one that does not.
+func StoreDirRace(err error) bool {
+	var e *storeDirError
+	return errors.As(err, &e) && e.race
+}
+
+// dirRefusal marks openDir's refusal of a directory on what it is (not a
+// directory, its owner, its mode). Its text and chain are err's.
+type dirRefusal struct{ err error }
+
+func (e *dirRefusal) Error() string { return e.err.Error() }
+func (e *dirRefusal) Unwrap() error { return e.err }
 
 // CheckDir is EnsureDir's judgement, read-only, for doctor: a missing
 // directory is an error matching fs.ErrNotExist, and nothing is created.
@@ -576,7 +727,7 @@ func (s *FileStore) CheckDir() error {
 	if err != nil {
 		return err
 	}
-	return root.Close()
+	return closeAfter(root, judgeDirACL(root, s.dir))
 }
 
 // openLocked opens the entries' directory, creating it with create set, and

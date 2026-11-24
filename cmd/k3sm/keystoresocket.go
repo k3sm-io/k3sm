@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +40,7 @@ import (
 	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/k3sm/pkg/keystore/socket"
 	"k3sm.io/k3sm/pkg/kubeclient"
+	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/runtimed/pkg/keystorepaths"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -366,7 +368,7 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 		CheckInstall:      checkInstallOn(pass, store.CheckSocketInstall),
 		ServerCount:       func(ctx context.Context) (int, error) { return countKeystoreServers(ctx, cs) },
 		MaintenanceMarked: logs.MaintenanceMarked,
-		StoreDir:          serverStoreDir(store),
+		StoreDir:          serverStoreDir(store, uid, gid),
 		OpenLogs: func(ctx context.Context) error {
 			if err := logs.Reopen(ctx); err != nil {
 				return err
@@ -390,22 +392,113 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 	}, closeAll, nil
 }
 
-// storeDirRepair is the remedy a refused store directory names: the server
-// creates a missing one, but never repairs one that exists.
-const storeDirRepair = "the server never repairs an existing store directory: as root, make it the service user's at mode 0700, or remove it if it holds nothing, and the next start check creates it"
+// storeDirRepair is the remedy a refused store directory names
+// (keystore.StoreDirRefused): the server creates a missing one, but never
+// repairs one that exists.
+const storeDirRepair = "the server never repairs an existing store directory: as root, make it the service user's at mode 0700 with no extended ACL, or remove it if it holds nothing, and the next start check creates it"
+
+// storeDirRaceText is what a first pass that cannot open the store
+// directory names when it may be the race with a root put
+// (keystore.StoreDirRace): nothing to repair yet, the next pass retries.
+const storeDirRaceText = "a root keys put may be creating it; retried"
+
+// storeDirAccessRepair is what a store directory the server cannot open
+// names when it is not, or no longer may be, the race with a root put
+// (keystore.StoreDirDenied and not, or no longer, StoreDirRace). It is
+// built from what EnsureDir read without opening the directory
+// (keystore.StoreDirDenial): a parent that denies the walk names that
+// parent; a third uid's directory is to be inspected and removed, never
+// adopted, since nothing in it has been checked; a directory root or the
+// service user owns names each repair what was read calls for, and every
+// one of them when nothing read explains the denial. uid and gid are the
+// service user's.
+func storeDirAccessRepair(d keystore.DirDenial, uid, gid uint32) string {
+	switch d.Cause {
+	case keystore.DeniedParent:
+		if d.Unreachable {
+			return fmt.Sprintf("%s cannot be reached: the data root above it denies the service user its search, and a root keys put never changes it: as root, make %s root:wheel at mode 0755, as the installer makes it", d.Path, filepath.Dir(d.Path))
+		}
+		return fmt.Sprintf("%s denies the service user its search or read, so the store directory cannot be reached, and a root keys put never changes it: as root, make it the service user's at mode 0700, as the installer makes it: %s", d.Path, strings.Join(dirRepairSteps(d, uid, gid), ", then "))
+	case keystore.DeniedForeign:
+		return fmt.Sprintf("the store directory is owned by uid %d, neither root nor the service user, so nothing in it has been checked: as root, inspect it, then remove it, and the next start check creates it", d.Owner)
+	}
+	why := "the service user cannot open it"
+	if d.Known && d.Owner == 0 {
+		why = "root owns it: a root keys put died before handing it over, or root made it"
+	}
+	return fmt.Sprintf("if this persists, it is not the race: %s; as root, %s, or remove it if it holds nothing", why, strings.Join(dirRepairSteps(d, uid, gid), ", then "))
+}
+
+// dirRepairSteps are the commands that repair d.Path, a directory that
+// must be the service user's at mode 0700 with no extended ACL, from what
+// was read of it: chflags first where an immutable flag would fail every
+// other step, chmod -N where an ACL is there or could not be read, then
+// chown and chmod where the owner or the mode is wrong. When nothing read
+// explains the denial (the owner, the mode and the flags are right and no
+// ACL is there), every step that can deny an open is named.
+func dirRepairSteps(d keystore.DirDenial, uid, gid uint32) []string {
+	var steps []string
+	if d.Immutable {
+		steps = append(steps, fmt.Sprintf("chflags nouchg,noschg %s (it is immutable, and chown and chmod fail on it until then)", d.Path))
+	}
+	acl := fmt.Sprintf("chmod -N %s (its extended ACL can deny the open)", d.Path)
+	switch {
+	case d.ACL:
+		steps = append(steps, acl)
+	case d.ACLUnknown:
+		steps = append(steps, fmt.Sprintf("chmod -N %s (its ACL could not be read, and one can deny the open)", d.Path))
+	}
+	chown := fmt.Sprintf("chown %d:%d %s", uid, gid, d.Path)
+	chmod := "chmod 700 " + d.Path
+	if !d.Known || d.Owner != uid {
+		steps = append(steps, chown)
+	}
+	if !d.Known || d.Mode&0o700 != 0o700 {
+		steps = append(steps, chmod)
+	}
+	if len(steps) == 0 {
+		steps = []string{acl, chown, chmod}
+	}
+	return steps
+}
 
 // serverStoreDir is the server's store-directory step: the store directory
 // created if it is missing, with the store's own helper, and judged as
 // every open judges it (keystore.FileStore.EnsureDir). It runs on every
 // pass, so a directory a racing root put has made but not yet handed to
 // the service user is refused for that pass only; one that stays wrong is
-// refused on every pass and never repaired.
-func serverStoreDir(store *keystore.FileStore) func(context.Context) error {
+// refused on every pass and never repaired. A refusal on what the
+// directory is names the repair (storeDirRepair). A directory it cannot
+// open is worded as the race (storeDirRaceText) only on the first of
+// consecutive passes that run this step and are denied, and only when
+// its owner could be a racing put's; from the second such pass, or for a
+// third uid's directory, it names the repair (storeDirAccessRepair). Any
+// pass that is not denied resets the count. Any other error stands on its
+// own text. The returned step keeps that count, so it is one supervisor's,
+// called from its one start-check loop.
+func serverStoreDir(store *keystore.FileStore, uid, gid uint32) func(context.Context) error {
+	denied := 0
 	return func(context.Context) error {
-		if err := store.EnsureDir(); err != nil {
-			return fmt.Errorf("%w (%s)", err, storeDirRepair)
+		err := store.EnsureDir()
+		if !keystore.StoreDirDenied(err) {
+			denied = 0
 		}
-		return nil
+		switch {
+		case err == nil:
+			return nil
+		case keystore.StoreDirDenied(err):
+			denied++
+			if keystore.StoreDirRace(err) && denied == 1 {
+				return fmt.Errorf("%w (%s)", err, storeDirRaceText)
+			}
+			d, _ := keystore.StoreDirDenial(err)
+			return fmt.Errorf("%w (%s)", err, storeDirAccessRepair(d, uid, gid))
+		case keystore.StoreDirRefused(err):
+			return fmt.Errorf("%w (%s)", err, storeDirRepair)
+		case keystore.StoreDirRace(err):
+			return fmt.Errorf("%w (%s)", err, storeDirRaceText)
+		}
+		return err
 	}
 }
 
@@ -427,15 +520,62 @@ func doctorStoreDir(store *keystore.FileStore) func(context.Context) error {
 	}
 }
 
+// postureProfile renders the Pod profile (keystorePodProfile) for the
+// posture derive returns. A derivation that fails because a path the
+// flags name resolves on disk somewhere other than its spelling (the
+// provider's ErrStatusRecordDirNotCanonical or ErrDataRootNotCanonical,
+// the symlink resolution of the data root, its trees and the state dir
+// included) is what is on disk: it is returned wrapping
+// socket.ErrPodProfilePath, cleared by fixing the path. Any other failure
+// is the flags' shape, as the provider refuses the same flags at the
+// node's start: it is returned wrapping socket.ErrPodProfileConfig.
+func postureProfile(derive func() (sandbox.Posture, error)) func() (string, error) {
+	return func() (string, error) {
+		posture, err := derive()
+		switch {
+		case err == nil:
+			return keystorePodProfile(posture)
+		case errors.Is(err, provider.ErrStatusRecordDirNotCanonical), errors.Is(err, provider.ErrDataRootNotCanonical):
+			return "", fmt.Errorf("%w: derive the runtime's posture: %w", socket.ErrPodProfilePath, err)
+		}
+		return "", fmt.Errorf("%w: derive the runtime's posture: %w", socket.ErrPodProfileConfig, err)
+	}
+}
+
+// podPostureErrors are the generator's refusals of a posture value the
+// server's flags set (serverPodPosture): the pod root, the pod logs dir,
+// the status record dir, the data root (a pods root under a keystore name
+// included) and the state dir. A render that fails with one of them is the
+// node's configuration, not the build's.
+var podPostureErrors = []error{
+	sandbox.ErrInvalidWorkDir,
+	sandbox.ErrWorkDirEscapesHome,
+	sandbox.ErrInvalidPodLogsDir,
+	sandbox.ErrInvalidStatusRecordDir,
+	sandbox.ErrInvalidDataRoot,
+	sandbox.ErrInvalidStateDir,
+}
+
 // podProfileCheck is the supervisor's Pod-profile check: the profile render
 // returns, read for a deny of the socket at socketPath
-// (socket.ProfileDeniesSocket). A render that fails is the same failure: a
-// node whose generator refuses its own posture has no profile that denies
-// the socket.
+// (socket.ProfileDeniesSocket). A render the generator refuses for a
+// posture value the flags set (podPostureErrors) is the node's
+// configuration (socket.ErrPodProfileConfig), cleared by fixing the flag
+// and restarting, and so is a render already wrapping it (a posture
+// derivation that failed, postureProfile); any other render error is the build's, as a profile that
+// does not deny the socket is (socket.ErrPodProfileOpen).
 func podProfileCheck(render func() (string, error), socketPath string) func() error {
 	return func() error {
 		profile, err := render()
 		if err != nil {
+			if errors.Is(err, socket.ErrPodProfileConfig) {
+				return err
+			}
+			for _, target := range podPostureErrors {
+				if errors.Is(err, target) {
+					return fmt.Errorf("%w: render the Pod profile: %w", socket.ErrPodProfileConfig, err)
+				}
+			}
 			return fmt.Errorf("%w: render the Pod profile: %w", socket.ErrPodProfileOpen, err)
 		}
 		return socket.ProfileDeniesSocket(profile, socketPath)
@@ -625,18 +765,36 @@ func keystoreSocketPath(workDir string) string {
 	return keystorepaths.SocketPath(keystoreLayout(filepath.Clean(workDir)).DataRoot)
 }
 
+// notePodProfileCheckScope logs, at start, when the socket's Pod-profile
+// check does not apply to the node's Pods: under --runtime hostprocess
+// they run unconfined, under no Seatbelt profile, so the profile the check
+// reads is one no Pod runs under. They run as the server's uid, which the
+// listener refuses (socket.NewListener), and that, not the profile, keeps
+// them off the socket. Any other runtime logs nothing.
+func notePodProfileCheckScope(runtime string, log *slog.Logger) {
+	if runtime != runtimeHostProcess {
+		return
+	}
+	log.Info("keystore socket: the Pod-profile start check does not apply under --runtime hostprocess; hostprocess Pods run unconfined, under no Seatbelt profile, and the listener refuses them by uid", "runtime", runtime)
+}
+
 // startKeystoreSocket is the server's one entry point for the keystore's
 // user socket: it builds the supervisor over the real primitives and runs
 // it, returning the stop runServer defers beside keystore-delivery's, so
 // LIFO drains it before the control plane stops. listen is how the
 // listening socket is obtained (keystoreSocketListener in runServer), and
-// posture is the server runtime's Seatbelt posture (serverPodPosture), whose
-// Pod profile must deny the socket before the listener serves. A
+// posture derives the server runtime's Seatbelt posture (serverPodPosture),
+// whose Pod profile must deny the socket before the listener serves; it is
+// asked when the supervisor's Run starts and again on its backoff only
+// until it first holds, never after. A derivation that fails is off and
+// retried, the server not stopped: as a path on disk that resolves
+// elsewhere (socket.ErrPodProfilePath), or else as the flags' shape
+// (socket.ErrPodProfileConfig). A
 // build failure is logged and retried with backoff
 // (superviseKeystoreSocket); the stop is never nil. Everything it runs is
 // in its own goroutine with recover, so nothing it does stops the
 // apiserver or kine.
-func startKeystoreSocket(ctx context.Context, workDir string, posture sandbox.Posture, cs kubernetes.Interface, listen socket.ListenerSource, logger *slog.Logger) (stop func()) {
+func startKeystoreSocket(ctx context.Context, workDir string, posture func() (sandbox.Posture, error), cs kubernetes.Interface, listen socket.ListenerSource, logger *slog.Logger) (stop func()) {
 	deps := keystoreSocketDeps{
 		workDir:          workDir,
 		layout:           keystoreLayout,
@@ -650,7 +808,7 @@ func startKeystoreSocket(ctx context.Context, workDir string, posture sandbox.Po
 		creds:            socket.KernelPeerCreds{},
 		sandbox:          socket.KernelPeerSandbox{},
 		sandboxCheck:     socket.SandboxSelfCheck,
-		podProfile:       func() (string, error) { return keystorePodProfile(posture) },
+		podProfile:       postureProfile(posture),
 		clock:            wallClock{},
 		log:              logger,
 	}
@@ -672,11 +830,15 @@ func doctorOpenLogs(store *keystore.FileStore, pass *dataRootPass) func(context.
 }
 
 // doctorStartScopes is doctor's start step: the read-only half of the
-// server's (keystore.FileStore.CheckLogBounds), whose refusal leaves the
-// server's user scope unstarted with the same reason. The catch-up, which
-// writes, is the server's alone.
+// server's (a staged restore, keystore.FileStore.MergePending, then
+// keystore.FileStore.CheckLogBounds), whose refusal leaves the server's
+// user scope unstarted with the same reason. The catch-up, which writes, is
+// the server's alone.
 func doctorStartScopes(store *keystore.FileStore) func(context.Context) error {
 	return func(ctx context.Context) error {
+		if err := store.MergePending(); err != nil {
+			return err
+		}
 		_, _, err := store.CheckLogBounds(ctx)
 		return err
 	}

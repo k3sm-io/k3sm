@@ -22,6 +22,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -119,4 +120,161 @@ func TestEnsureDir(t *testing.T) {
 			t.Fatal("the refused directory was changed")
 		}
 	})
+}
+
+// TestEnsureDirClassifiesRefusals: EnsureDir marks a persistent refusal of
+// an existing directory (its mode or owner) as StoreDirRefused; a directory
+// it cannot open (EACCES) as StoreDirDenied, and as StoreDirRace too when
+// its owner is root or the service user (as one root has made and not yet
+// handed over), never when it is a third uid's; and a directory it has just
+// made that a racing put already writes in (ErrCorrupt, not empty) as
+// StoreDirRace alone. The text is the open's.
+func TestEnsureDirClassifiesRefusals(t *testing.T) {
+	t.Run("a wider mode is a refusal", func(t *testing.T) {
+		s, server := newTestStore(t)
+		dir := filepath.Join(server, "keystore")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		giveToService(t, dir)
+		err := s.EnsureDir()
+		if !StoreDirRefused(err) || StoreDirRace(err) || StoreDirDenied(err) || !strings.Contains(err.Error(), "grants more than") {
+			t.Fatalf("EnsureDir = %v: refused %v race %v, want a refusal", err, StoreDirRefused(err), StoreDirRace(err))
+		}
+	})
+	t.Run("a directory it cannot open is the race", func(t *testing.T) {
+		s, server := newTestStore(t)
+		dir := filepath.Join(server, "keystore")
+		if err := os.Mkdir(dir, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		err := s.EnsureDir()
+		if !errors.Is(err, fs.ErrPermission) || !StoreDirDenied(err) || !StoreDirRace(err) || StoreDirRefused(err) {
+			t.Fatalf("EnsureDir = %v: refused %v denied %v race %v, want denied and the race", err, StoreDirRefused(err), StoreDirDenied(err), StoreDirRace(err))
+		}
+	})
+	t.Run("a third uid's directory it cannot open is denied, never the race", func(t *testing.T) {
+		s, server := newTestStore(t)
+		dir := filepath.Join(server, "keystore")
+		if err := os.Mkdir(dir, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		owner := fi.Sys().(*syscall.Stat_t).Uid
+		if owner == 0 {
+			t.Skip("run as root: the directory is root's, which the race may be")
+		}
+		// The service uid made other than the directory's owner, which is
+		// not root either: a third uid's directory.
+		s.uid = owner + 1
+		err = s.EnsureDir()
+		if !errors.Is(err, fs.ErrPermission) || !StoreDirDenied(err) || StoreDirRace(err) || StoreDirRefused(err) {
+			t.Fatalf("EnsureDir = %v: refused %v denied %v race %v, want denied and not the race", err, StoreDirRefused(err), StoreDirDenied(err), StoreDirRace(err))
+		}
+	})
+	t.Run("a parent that denies the walk is denied, never the race", func(t *testing.T) {
+		for _, tt := range []struct {
+			name string
+			mk   bool
+		}{{"with the directory there", true}, {"with no directory yet", false}} {
+			t.Run(tt.name, func(t *testing.T) {
+				s, server := newTestStore(t)
+				if tt.mk {
+					if err := os.Mkdir(filepath.Join(server, "keystore"), 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.Chmod(server, 0); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(server, 0o700) })
+				err := s.EnsureDir()
+				d, ok := StoreDirDenial(err)
+				if !StoreDirDenied(err) || StoreDirRace(err) || StoreDirRefused(err) || !ok || d.Cause != DeniedParent || d.Path != server || d.Unreachable {
+					t.Fatalf("EnsureDir = %v: denied %v race %v denial %+v, want the parent %s, not the race", err, StoreDirDenied(err), StoreDirRace(err), d, server)
+				}
+			})
+		}
+	})
+	t.Run("a new directory a put already writes in is the race", func(t *testing.T) {
+		s, server := newTestStore(t)
+		dir := filepath.Join(server, "keystore")
+		s.dirMade = func(string) {
+			if err := os.WriteFile(filepath.Join(dir, "planted"), nil, 0o600); err != nil {
+				t.Error(err)
+			}
+		}
+		err := s.EnsureDir()
+		if !errors.Is(err, ErrCorrupt) || !StoreDirRace(err) || StoreDirRefused(err) || StoreDirDenied(err) || !strings.Contains(err.Error(), "not empty") {
+			t.Fatalf("EnsureDir = %v: refused %v race %v, want the race", err, StoreDirRefused(err), StoreDirRace(err))
+		}
+	})
+	t.Run("a nil error is neither", func(t *testing.T) {
+		if StoreDirRefused(nil) || StoreDirRace(nil) || StoreDirDenied(nil) {
+			t.Fatal("nil classified")
+		}
+	})
+}
+
+// TestEnsureDirSyncsParentOfExistingDir: when the store directory already
+// exists, as when a racing root put made it first, EnsureDir still fsyncs
+// server/, so the name it then works under is durable; a failed fsync is
+// its error.
+func TestEnsureDirSyncsParentOfExistingDir(t *testing.T) {
+	s, server := newTestStore(t)
+	dir := filepath.Join(server, "keystore")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	giveToService(t, dir)
+	var synced []string
+	setSyncDir(t, func(root *os.Root) error {
+		synced = append(synced, root.Name())
+		return fsyncDir(root)
+	})
+	if err := s.EnsureDir(); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+	if !slices.Contains(synced, server) {
+		t.Fatalf("synced %q; want the parent %s of the existing directory", synced, server)
+	}
+	boom := errors.New("fsync failed")
+	setSyncDir(t, func(*os.Root) error { return boom })
+	if err := s.EnsureDir(); !errors.Is(err, boom) {
+		t.Fatalf("EnsureDir with a failing fsync = %v, want it", err)
+	}
+}
+
+// TestMkdirAtExistingSyncFailureKeepsErrExist: when mkdirAt finds the name
+// existing and the parent's fsync then fails, its error carries both, so
+// a caller still tells an existing name (fs.ErrExist) from another failure
+// and still sees the sync's.
+func TestMkdirAtExistingSyncFailureKeepsErrExist(t *testing.T) {
+	s, server := newTestStore(t)
+	if err := os.Mkdir(filepath.Join(server, "keystore"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.OpenRoot(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = parent.Close() }()
+	errSync := errors.New("injected fsync failure")
+	setSyncDir(t, func(*os.Root) error { return errSync })
+	_, err = s.mkdirAt(parent, "keystore")
+	if !errors.Is(err, fs.ErrExist) || !errors.Is(err, errSync) {
+		t.Fatalf("mkdirAt over an existing name with a failed sync: %v, want both fs.ErrExist and the sync's error", err)
+	}
+	// A caller that goes on under an existing name does not take it as one.
+	if err := s.EnsureDir(); !errors.Is(err, errSync) {
+		t.Fatalf("EnsureDir over an existing directory with a failed sync: %v, want the sync's error", err)
+	}
 }

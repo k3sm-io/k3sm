@@ -41,26 +41,65 @@ const floorPreRestoreName = floorName + ".pre-restore"
 // errMergePending refuses a verb that changes the keystore while the
 // restore's moved-aside floor is in the data root: the merge has not run, so
 // the restored floor still lacks every deletion since the backup.
-var errMergePending = errors.New("a restore is unfinished: keystore-floor.json.pre-restore, the floor moved aside before it, is still in the data root, and the deletions it records are not merged yet. Run sudo k3sm keys floor merge on it first, as docs/user/keys.md describes (it renames the file when it is done); this verb changes nothing until then")
+var errMergePending = errors.New("a restore is unfinished: keystore-floor.json.pre-restore, the floor moved aside before it, is still in the data root, and the deletions it records are not merged yet. Run sudo k3sm keys floor merge on it first, as docs/user/keys.md describes (it renames the file when it is done); until then this verb changes no entry, and writes nothing but, for a user verb, at most its one refused line in the audit log")
+
+// floorUndoName is the name the undo recipe gives the live floor while it
+// swaps the two floors (docs/user/keys.md): the restored floor is moved here,
+// the moved-aside one into place, then this one to floorPreRestoreName. While
+// it is there the undo is unfinished, so it is pending as floorPreRestoreName
+// is, and no step of the swap leaves neither name.
+const floorUndoName = floorName + ".undo"
+
+// errUndoPending is errMergePending (errors.Is) for floorUndoName: an undo
+// whose floor swap is unfinished.
+var errUndoPending error = &pendingError{"a restore's undo is unfinished: keystore-floor.json.undo, the floor the undo moves aside while it swaps the two floors, is still in the data root. Finish the floor moves as docs/user/keys.md describes (it becomes keystore-floor.json.pre-restore), then run sudo k3sm keys floor merge --undo; until then this verb changes no entry, and writes nothing but, for a user verb, at most its one refused line in the audit log"}
+
+// pendingError is a pending-merge refusal with its own text that is
+// errMergePending to errors.Is.
+type pendingError struct{ text string }
+
+func (e *pendingError) Error() string        { return e.text }
+func (e *pendingError) Is(target error) bool { return target == errMergePending }
+
+// pendingNames are the data-root names that each mean a restore, or its
+// undo, is unfinished, with the refusal each gives.
+var pendingNames = []struct {
+	name string
+	err  error
+}{
+	{floorPreRestoreName, errMergePending},
+	{floorUndoName, errUndoPending},
+}
+
+// mergePendingAt is the pending-merge answer by lstat, a lookup of a name
+// directly under the data root: the refusal of the first pending name that
+// is there, or of one whose lookup fails other than as not found.
+func mergePendingAt(lstat func(string) (fs.FileInfo, error)) error {
+	for _, p := range pendingNames {
+		_, err := lstat(p.name)
+		switch {
+		case err == nil:
+			return p.err
+		case !errors.Is(err, fs.ErrNotExist):
+			return fmt.Errorf("%w (looking for %s: %w)", p.err, p.name, err)
+		}
+	}
+	return nil
+}
 
 // MergePending returns errMergePending while the restore's moved-aside
 // floor, keystore-floor.json.pre-restore, is in the data root: the merge has
 // not run, so the restored floor lacks every deletion since the backup, and
-// a reader that publishes a value (the delivery reconciler) must not. Any
-// answer but not found counts as pending. It takes no lock and writes
-// nothing; with no data root configured there is no floor, and it is nil.
+// a reader that publishes a value (the delivery reconciler) must not. It is
+// errUndoPending (errMergePending to errors.Is) while the undo's
+// keystore-floor.json.undo is there. Any answer but not found counts as
+// pending. It takes no lock and writes nothing; with no data root
+// configured there is no floor, and it is nil.
 func (s *FileStore) MergePending() error {
 	if s.dataRoot == "" {
 		return nil
 	}
-	_, err := os.Lstat(filepath.Join(s.dataRoot, floorPreRestoreName))
-	switch {
-	case err == nil:
-		return errMergePending
-	case errors.Is(err, fs.ErrNotExist):
-		return nil
-	}
-	return fmt.Errorf("%w (looking for it: %w)", errMergePending, err)
+	return mergePendingAt(func(name string) (fs.FileInfo, error) { return os.Lstat(filepath.Join(s.dataRoot, name)) })
 }
 
 // MergeReport is what MergeFloor did with the moved-aside floor's burials.

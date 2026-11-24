@@ -184,8 +184,9 @@ its `keystore-user-scope` row says only what it can check:
   for `the store directory is missing or refused` it shows why: before the server's first start
   there is no `/var/lib/k3sm/server/keystore/` yet, and the row says the server creates the store
   directory at start; once the server has started, the row passes. A directory that is there but
-  not the server's user's at mode 0700 is refused, by the server and by `doctor`, and the server
-  never repairs it: as root, make it the server's user's at 0700, or remove it if it holds
+  not the server's user's at mode 0700, or that carries an extended ACL, is refused, by the server
+  and by `doctor`, and the server never repairs it: as root, make it the server's user's at 0700
+  with no ACL (`sudo chmod -N` on it removes one), or remove it if it holds
   nothing, and the server creates it again;
   `the service uid is in the login range` means the service user's uid is 501 or above, where
   login users' uids start, and the listener does not start until the service user is a system
@@ -200,7 +201,16 @@ Pod profile its built-in runtime gives Pods on this node and checks that the pro
 the socket under this node's data root. If it does not, the user scope stays off for the life of
 the server, with `this build's Pod profile does not deny the keystore socket`. The server logs
 one warning naming the remedy, `install a k3sm built with a matching runtimed`, and keeps
-running; reinstalling or restarting the same build does not change it.
+running; reinstalling or restarting the same build does not change it. If instead the runtime
+refuses to render the profile for this node's settings (an invalid `--pod-logs-dir`, pod root,
+data root or state dir), the user scope is off with `the Pod profile does not render for this
+node's configuration`, the warning names the setting's error and "fix the flag, then
+`sudo k3sm restart`", and the server keeps retrying the check. If a path those settings name
+resolves somewhere other than its spelling on disk (a symlink changed under the data root or
+the status directory), the user scope is off with `a path the node's flags name resolves
+somewhere unexpected` instead: fix the path and the next retry clears it, with no restart; a
+fixed flag still needs `sudo k3sm restart`. `doctor` does not render the
+profile, so neither state shows in its row; the server log names it.
 
 ### When a user scope blocks the rebuild
 
@@ -626,7 +636,10 @@ sudo shasum -a 256 -c /var/root/keystore-floor-backup/$B/keystore-floor.json.sha
 restore was never finished or undone, and moving the live copies aside now would replace it:
 finish or undo that restore first, as below, and do not go on. `shasum` must print `OK`. If it
 does not, the saved floor has changed since you saved it: do not use it. Then move the live
-copies aside and put the backup in place. `mkdir` makes a new directory that only root can
+copies aside and put the backup in place. The live floor moves aside first: its new name,
+`keystore-floor.json.pre-restore`, is what marks the restore unfinished, and from then on the
+keystore writes nothing and the server creates no `server/keystore` in place of the one you move
+next. `mkdir` makes a new directory that only root can
 open, in `/var/lib/k3sm`, which root owns, and fails if the name already exists. `mv` then moves the live `keystore/` into it, so
 nothing running as the service user can reach the moved-aside entries or copy one back into the
 restored keystore. The files inside are not changed: they keep their owner and mode, so an undo
@@ -660,10 +673,10 @@ and start again. The
 ! pgrep -u _k3sm || exit 1
 test "$(sudo find /path/to/backup -maxdepth 0 -user root \! -perm +022 | grep -c .)" -eq 1 || exit 1
 test "$(sudo find /path/to/backup/$B -maxdepth 0 -user root -perm 0700 | grep -c .)" -eq 1 || exit 1
-sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1
-sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
 sudo test ! -e /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
+sudo mkdir -m 0700 /var/lib/k3sm/pre-restore.d || exit 1
+sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
 sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
 sudo test ! -L /path/to/backup/$B/keystore || exit 1
 sudo ditto /path/to/backup/$B/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
@@ -678,10 +691,12 @@ the same warning, and the merge keeps each deletion it records. An `rm` at this 
 the deletion, but the restored entry's files are still in `pre-restore.d/restored`, out of its
 reach. The merge removes those files before it moves the restored copy into place, so you do not
 need to run `rm` again. A server started before the merge delivers no keys to the cluster and
-deletes no delivered Secret: it logs an error and tries again until the merge has run. It also
-creates an empty `/var/lib/k3sm/server/keystore` at start, which the merge then moves aside as
-`planted-<time>` and reports, exiting 4, so keep the server stopped until the merge has run. Once it
-has, the server deletes the Secret delivered from each entry the merge or an `rm` deleted, as
+deletes no delivered Secret: it logs an error and tries again until the merge has run. The
+server enforces the rest too: until the merge has run, its keystore user scope stays off, naming
+`keys floor merge` (`sudo k3sm doctor` shows the same), it creates no
+`/var/lib/k3sm/server/keystore`, and a user's `put`, `rotate`, `rm` or delivery change is refused
+with the same message, changing nothing. Keeping the server stopped until the merge has run is
+still the recipe. Once it has, the server deletes the Secret delivered from each entry the merge or an `rm` deleted, as
 after any `rm`: once the restore hold has passed and unless the breaker holds (see [Delivering
 an Entry as a Secret](#delivering-an-entry-as-a-secret)). Merge those deletions into the restored floor:
 
@@ -819,9 +834,16 @@ To undo the restore instead, stop the server and stage the two copies the other 
 and the restored `keystore/` becomes the moved-aside copy. Every line ends in `|| exit 1`, as
 above. The floors swap places: the floor you moved aside
 goes back in place, and the restored floor becomes `keystore-floor.json.pre-restore`, so the
-merge runs in reverse and keeps every deletion you made after the restore. If you already ran
+merge runs in reverse and keeps every deletion you made after the restore. The two `test`
+lines come first, before anything moves. The floors move next, as in the restore, so the
+restored floor is `keystore-floor.json.pre-restore` before `server/keystore` leaves: the
+restored floor goes to `keystore-floor.json.undo`, the floor you moved aside into place, and
+`keystore-floor.json.undo` to `keystore-floor.json.pre-restore`. While either
+`keystore-floor.json.undo` or `keystore-floor.json.pre-restore` is in the data root the keystore
+counts as mid-restore, as in the restore, so every step of the swap keeps it so; a
+`keystore-floor.json.undo` left behind names itself in the refusal. If you already ran
 the merge, the floor you moved aside is now `keystore-floor.json.merged-<time>`: use that name
-in the first floor `mv` instead. `--undo` tells the reverse merge to read the record the first
+in the second floor `mv` instead. `--undo` tells the reverse merge to read the record the first
 merge left beside that file, `keystore-floor.json.merged-<time>.retired`, which lists what the
 first merge retired; leave that record in place. `--undo` uses only the record whose merge read
 the floor you put back, so it refuses when that floor is not the first merge's input, or when no
@@ -833,11 +855,12 @@ the steps while anything still runs as the service user, as in the restore.
 sudo k3sm stop
 ! pgrep -u _k3sm || exit 1
 sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo test ! -e /var/lib/k3sm/keystore-floor.json.undo || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.undo || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
-sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1
-sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
-sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1
 sudo k3sm keys floor merge --undo --dry-run
 sudo k3sm keys floor merge --undo
 sudo rm -rf /var/lib/k3sm/pre-restore.d
