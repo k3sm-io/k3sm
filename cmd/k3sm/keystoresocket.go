@@ -39,6 +39,7 @@ import (
 	"k3sm.io/k3sm/pkg/keystore/socket"
 	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/runtimed/pkg/keystorepaths"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // keystoreServerCountTimeout bounds one count of the cluster's servers, so a
@@ -259,8 +260,13 @@ type keystoreSocketDeps struct {
 	creds        socket.PeerCredSource
 	sandbox      socket.PeerSandboxSource
 	sandboxCheck func() error
-	clock        socket.Clock
-	log          *slog.Logger
+	// podProfile renders the Pod profile this node's runtime gives a pod
+	// (keystorePodProfile over serverPodPosture in production); the
+	// supervisor asks once, before it serves, whether that text denies the
+	// socket under the data root layout derives (podProfileCheck).
+	podProfile func() (string, error)
+	clock      socket.Clock
+	log        *slog.Logger
 }
 
 // keystoreSocket is a built supervisor and what it holds open: the server's
@@ -341,6 +347,9 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 	if deps.openDataRoot == nil || deps.ignoresOwnership == nil {
 		return socket.SupervisorConfig{}, nil, errors.New("no data-root opener or mount-flag check")
 	}
+	if deps.podProfile == nil {
+		return socket.SupervisorConfig{}, nil, errors.New("no Pod profile source")
+	}
 	pass := &dataRootPass{path: storeCfg.DataRoot, open: deps.openDataRoot, ignores: deps.ignoresOwnership}
 	closeAll := func() {
 		_ = logs.Close() // the listener is stopped: nothing appends any more
@@ -368,6 +377,7 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 			return nil
 		},
 		SandboxCheck: deps.sandboxCheck,
+		PodProfile:   podProfileCheck(deps.podProfile, keystorepaths.SocketPath(storeCfg.DataRoot)),
 		StartScopes:  startUserScopesStep(store, deps.log),
 		Creds:        deps.creds,
 		Sandbox:      deps.sandbox,
@@ -376,6 +386,21 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 		Clock:        deps.clock,
 		Log:          deps.log,
 	}, closeAll, nil
+}
+
+// podProfileCheck is the supervisor's Pod-profile check: the profile render
+// returns, read for a deny of the socket at socketPath
+// (socket.ProfileDeniesSocket). A render that fails is the same failure: a
+// node whose generator refuses its own posture has no profile that denies
+// the socket.
+func podProfileCheck(render func() (string, error), socketPath string) func() error {
+	return func() error {
+		profile, err := render()
+		if err != nil {
+			return fmt.Errorf("%w: render the Pod profile: %w", socket.ErrPodProfileOpen, err)
+		}
+		return socket.ProfileDeniesSocket(profile, socketPath)
+	}
 }
 
 // startUserScopesStep is the supervisor's last start check: the store's
@@ -565,12 +590,14 @@ func keystoreSocketPath(workDir string) string {
 // user socket: it builds the supervisor over the real primitives and runs
 // it, returning the stop runServer defers beside keystore-delivery's, so
 // LIFO drains it before the control plane stops. listen is how the
-// listening socket is obtained (keystoreSocketListener in runServer). A
+// listening socket is obtained (keystoreSocketListener in runServer), and
+// posture is the server runtime's Seatbelt posture (serverPodPosture), whose
+// Pod profile must deny the socket before the listener serves. A
 // build failure is logged and retried with backoff
 // (superviseKeystoreSocket); the stop is never nil. Everything it runs is
 // in its own goroutine with recover, so nothing it does stops the
 // apiserver or kine.
-func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Interface, listen socket.ListenerSource, logger *slog.Logger) (stop func()) {
+func startKeystoreSocket(ctx context.Context, workDir string, posture sandbox.Posture, cs kubernetes.Interface, listen socket.ListenerSource, logger *slog.Logger) (stop func()) {
 	deps := keystoreSocketDeps{
 		workDir:          workDir,
 		layout:           keystoreLayout,
@@ -584,6 +611,7 @@ func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Inte
 		creds:            socket.KernelPeerCreds{},
 		sandbox:          socket.KernelPeerSandbox{},
 		sandboxCheck:     socket.SandboxSelfCheck,
+		podProfile:       func() (string, error) { return keystorePodProfile(posture) },
 		clock:            wallClock{},
 		log:              logger,
 	}

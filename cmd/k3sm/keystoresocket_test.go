@@ -46,6 +46,8 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/keystore"
 	"k3sm.io/k3sm/pkg/keystore/socket"
+	"k3sm.io/k3sm/pkg/provider/podlogs"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // stillClock is a socket.Clock whose waits never end on their own: a test
@@ -183,8 +185,18 @@ func newWiringFixture(t *testing.T) *wiringFixture {
 		creds:        fakePeerCreds{},
 		sandbox:      fakePeerSandbox{},
 		sandboxCheck: func() error { return errFakeSandboxCheck },
-		clock:        f.clock,
-		log:          f.logger,
+		// The runtime's generator over a posture whose pod root and data
+		// root are the temp data root, as on a default node.
+		podProfile: func() (string, error) {
+			return keystorePodProfile(sandbox.Posture{
+				WorkDir:    f.dataRoot,
+				DataRoot:   f.dataRoot,
+				StateDir:   filepath.Join(f.dataRoot, "server"),
+				PodLogsDir: podlogs.DefaultPodLogsDir,
+			})
+		},
+		clock: f.clock,
+		log:   f.logger,
 	}
 	return f
 }
