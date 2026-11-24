@@ -269,7 +269,7 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	if err := ctx.Err(); err != nil {
 		return Version{}, err // done during the walk: no hold, nothing written
 	}
-	u = u.withGUID() // then the lookup, so its answer is fresh at the lock
+	u = u.withGUID() // then the lookup, so the answer is at most the store lock's wait (plus its 250 ms deadline) old in the hold
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Version{}, fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)

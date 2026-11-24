@@ -190,7 +190,7 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err // done during the uid's wait: no lookup, no hold
 	}
-	u = u.withGUID() // after the uid's wait, so the answer is fresh at the lock
+	u = u.withGUID() // after the uid's wait, so the answer is at most the store lock's wait (plus its 250 ms deadline) old in the hold
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)

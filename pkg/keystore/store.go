@@ -979,12 +979,13 @@ func listEntry(e *entry, k keys, fl floor) Entry {
 // record is opened, so a list costs one
 // record open and one directory listing an entry under the shared lock
 // however many versions it keeps. VersionCount is the number of version
-// files present in the range. Any other failure, a pointer the floor rules
-// out included, is the entry's Err. A version file present but damaged is
+// files present in the range. Any other failure is the entry's Err. A version file present but damaged is
 // reported by no list: root's keys list (FileStore.List) and doctor open no
 // user-scope version, so that damage surfaces only through a rotate
-// --from-version of that version, which opens it, or a Rewrap, which then
-// refuses.
+// --from-version of that version, which opens and refuses it, or a
+// user-scope rm, whose burial reads each version's header; a Rewrap opens
+// no user record. The floor is not checked here: List rules out a pointer
+// the floor forbids (flooredPointer) before it calls this.
 func listUserEntry(e *entry, k keys) Entry {
 	cur, _, low, err := e.checkedRange(k, nil)
 	if err != nil {

@@ -181,7 +181,7 @@ func TestUserListOpensOnlyCurrentVersion(t *testing.T) {
 }
 
 // A user rotate's orphan check looks at the version above the pointer
-// only, in one Lstat (orphanAbove), never listing the entry's directory: a
+// only, in one Lstat (orphanAbove): a
 // junk v<cur+1> is still discarded, and a file planted further up, which
 // no crash or copied-back pointer leaves without v<cur+1>, is not read.
 func TestUserRotateOrphanCheckReadsOnlyNextVersion(t *testing.T) {

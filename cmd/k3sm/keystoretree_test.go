@@ -25,7 +25,7 @@ import (
 // Two spellings of one keystore directory, through a symlink (on macOS
 // t.TempDir is under /var, itself a link to /private/var), get one
 // TreeState, so their stores share one lock and one set of usage figures.
-// A directory not there yet is keyed by its cleaned path.
+// A directory not there yet is keyed by its nearest existing ancestor, resolved.
 func TestKeystoreTreeKeyedOnResolvedDir(t *testing.T) {
 	real := filepath.Join(t.TempDir(), "keystore")
 	if err := os.Mkdir(real, 0o700); err != nil {
