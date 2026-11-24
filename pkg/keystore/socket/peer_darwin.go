@@ -19,7 +19,7 @@ limitations under the License.
 package socket
 
 // The kernel reads behind KernelPeerCreds and KernelPeerSandbox, the only cgo
-// in this package.
+// in this package besides launch_activate_socket (activate_darwin.go).
 //
 // The peer-credential read is a deliberate leaf copy of the two existing
 // ones, which are unexported in their repos: uidVerifier.Verify in
