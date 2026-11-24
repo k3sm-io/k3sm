@@ -184,6 +184,13 @@ its `keystore-user-scope` row says only what it can check:
 - `keystore user scope: the server count cannot be read as this user` (WARN): run
   `sudo k3sm doctor`; this does not mean the user scope is off.
 
+The server makes one check `doctor` does not repeat: before it serves the socket, it renders the
+Pod profile its built-in runtime gives Pods on this node and checks that the profile denies Pods
+the socket under this node's data root. If it does not, the user scope stays off for the life of
+the server, with `this build's Pod profile does not deny the keystore socket`. The server logs
+one warning naming the remedy, `install a k3sm built with a matching runtimed`, and keeps
+running; reinstalling or restarting the same build does not change it.
+
 ### When a user scope blocks the rebuild
 
 `floor --rebuild` refuses, changing nothing, when a user scope does not open, or when a scope has

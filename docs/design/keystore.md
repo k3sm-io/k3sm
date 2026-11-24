@@ -1974,14 +1974,27 @@ server binds `keys.sock` itself, and the bind is kept from Pods by the Seatbelt 
 other service-uid code by the client's server pin ("The client pins the server"). **The K7a
 amendment of 2026-11-23 records that the activated form ships**: launchd activated the socket
 for a `UserName` job, root:daemon 0666 in the root 0755 directory; the job got one descriptor,
-`FD_CLOEXEC` already set; no other process, a Pod's included, could obtain the listener (Open
-requirement 5); and the client-side peer reads as launchd (`LOCAL_PEERCRED` uid 0) while the
-audit token names the accepting server, which the client check of Open requirement 4 accepts.
+`FD_CLOEXEC` already set; no process tried but the job, a Pod's included, obtained the
+listener, since launchd answered each with `ESRCH` (measured on macOS 27.2.1 only: a bonus
+barrier, not a guarantee, Open requirement 5); and the client-side peer reads as launchd
+(`LOCAL_PEERCRED` uid 0) while the audit token names the accepting server, which the client check of Open requirement 4 accepts.
 A server launchd did not start, or whose plist has no `Sockets` key, gets `ESRCH` (both
 measured); one for which launchd has no `keys` socket, because its loaded definition has no
 such entry or a parent of the socket path is missing at the activation call (measured with
 three missing levels), gets `ENOENT`. Each keeps the user scope off for the life of the
-process; the server never binds `keys.sock` itself. A data root on a volume that is not
+process; the server never binds `keys.sock` itself. **The server checks its Pod profile at
+start.** Before the supervisor serves, the server renders a Pod profile with the embedded
+runtimed's own generator (`sandbox.Generate`) over the posture its runtime is built with
+(`serverPodPosture`, `cmd/k3sm/keystoreprofile.go`), and requires that the text deny
+`file-read*`, `file-write*` and unix-socket `network-outbound` on `keystore-sock/` under the
+data root it serves, in each spelling the generator writes (`/var`, `/private/var`,
+`/System/Volumes/Data`), with no overlapping allow after the deny (`socket.ProfileDeniesSocket`).
+A profile that does not, as from a k3sm built against a runtimed older than the deny or a data
+root the posture does not name, keeps the user scope off for the life of the process with `this
+build's Pod profile does not deny the keystore socket`; the server logs one warning naming
+`install a k3sm built with a matching runtimed` and keeps running. The barriers relied on are
+that Seatbelt deny and the listener's sandboxed-peer refusal (Open requirement 15); launchd's
+`ESRCH` to a Pod is not one of them. A data root on a volume that is not
 mounted was not measured; a default-layout data root that is not mounted is refused earlier,
 by the shadowed-work-dir check (`refuseShadowedWorkDir`, `cmd/k3sm/server.go`), before the
 server reaches this step.
@@ -5895,17 +5908,26 @@ text points here.
    in K7a).** A process descended from the server's job can ask launchd for the job's sockets
    with `launch_activate_socket`, and Pods descend from it (`runtimed/pkg/runtime/podreap.go:40`).
    Two denies are in question, and they differ:
-   (i) *The launchd activation-lookup deny is not needed.* A Pod process, and every other
-   process but the job, gets `ESRCH` (measured on macOS 27.2.1, K7a amendment 2026-11-23), so
-   the activated form ships and no Pod profile carries a lookup deny. *Test:* rig leg E27 (a
-   Pod's `launch_activate_socket` for the server's socket name gets no descriptor), which also
-   owes the macOS 26 measurement; U122.
+   (i) *No launchd activation-lookup deny is added, and launchd's answer is not relied on.* In
+   K7a (amendment 2026-11-23) launchd answered `ESRCH` to a Pod process and to every other
+   process but the job. That is measured on macOS 27.2.1 only; it is a bonus barrier, not a
+   guarantee, and another macOS release may answer otherwise. The activated form ships because
+   the barriers relied on do not depend on it: the Seatbelt deny of (ii) and the listener's
+   sandboxed-peer refusal (Open requirement 15). No Pod profile carries a lookup deny. *Test:*
+   rig leg E27 (a Pod's `launch_activate_socket` for the server's socket name gets no
+   descriptor), which also owes the macOS 26 measurement; U122.
    (ii) *The Seatbelt path deny on `keystore-sock/` is required and stays.* It is the first
    barrier between a Pod and the socket: without it a native Pod connected to `keys.sock` (K0
    leg 4). Every Pod profile carries runtimed's keystore stanza
    (`runtimed/pkg/sandbox/keystore.go`, `keystoreDenyStanza`), which denies connect and bind on
    `keystore-sock/` and `keys.sock` (U16), and the provider's socket denies name `keys.sock`
-   (U46, `k3sm/pkg/provider::TestRuntimedSocketDeniedToPods`).
+   (U46, `k3sm/pkg/provider::TestRuntimedSocketDeniedToPods`). The server checks at start that
+   the Pod profile its embedded runtime renders for its own posture carries this deny for the
+   data root it serves, in every spelling, and keeps the user scope off if it does not (K7a
+   amendment; `this build's Pod profile does not deny the keystore socket`). *Test:*
+   `k3sm/cmd/k3sm::TestServerPodProfileDeniesKeystoreSocket`, which renders the profile with
+   the linked runtimed for the default and for custom data roots, so a k3sm built against a
+   runtimed without the deny fails it; `TestKeystorePodProfileMismatchTurnsScopeOff`.
 6. **Same-target cross-record deletion (K13b).** Two honoured records, of two uids, can name
    the same `(namespace, secretName)`. The orphan sweep, the lost-authority delete and
    `rm-scope` match a Secret against one record's target, so one uid's tombstone, or a forged
