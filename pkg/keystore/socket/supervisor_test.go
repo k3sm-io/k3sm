@@ -638,51 +638,52 @@ func TestListenerSourceFailureBacksOff(t *testing.T) {
 	})
 }
 
-// No activated socket (ESRCH, ENOENT) is terminal for the process: the
-// supervisor is off as OffNotActivated, logs one Warn naming the remedy,
-// and never asks the source again, however long it waits; a descriptor
-// without FD_CLOEXEC, and any other activation error, back off as before.
-func TestNotActivatedIsTerminal(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		r := newSupRig(t, func(c *startChecks) {
-			c.listenErr = fmt.Errorf("%w for the Sockets entry \"keys\": %w", ErrNotActivated, unix.ESRCH)
-		})
-		st := r.wantState(t, PhaseOff, OffNotActivated, 0)
-		if !strings.Contains(st.Detail, "keys") {
-			t.Fatalf("detail %q", st.Detail)
-		}
-		advance(time.Hour)
-		r.ck.mu.Lock()
-		listens := r.ck.listens
-		r.ck.mu.Unlock()
-		if listens != 1 {
-			t.Fatalf("%d listens, want 1: no retry", listens)
-		}
-		if n := r.log.count("level=WARN", "sudo k3sm install", "re-bootstraps the job"); n != 1 {
-			t.Fatalf("%d Warn lines naming the remedy, want 1:\n%s", n, r.log.b.String())
-		}
-		if n := r.log.count("level=ERROR"); n != 0 {
-			t.Fatalf("%d Error lines, want none", n)
-		}
-	})
+// Every outcome of the activation that is not a listener is terminal for
+// the process: the supervisor is off with the outcome's reason, logs one
+// Warn naming its remedy, and never asks the source again, however long it
+// waits. A listener source error that is not the activation's backs off as
+// before.
+func TestActivationOutcomesAreTerminal(t *testing.T) {
 	for _, tt := range []struct {
-		err    error
 		reason OffReason
+		cause  error
+		remedy string
 	}{
-		{ErrActivatedInheritable, OffActivatedInheritable},
-		{fmt.Errorf("%w: not listening", ErrActivatedWrong), OffListenerUnavailable},
-		{errors.New("launchd did not activate the Sockets entry: EINVAL"), OffListenerUnavailable},
+		{OffNotActivated, unix.ESRCH, "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"},
+		{OffSocketParentMissing, unix.ENOENT, "mount the data root, then run `sudo k3sm restart`"},
+		{OffAlreadyActivated, unix.EALREADY, "run `sudo k3sm restart`"},
+		{OffActivatedInheritable, ErrActivatedInheritable, "run `sudo k3sm restart`"},
+		{OffListenerUnavailable, ErrActivatedWrong, "run `sudo k3sm restart`"},
 	} {
 		synctest.Test(t, func(t *testing.T) {
-			r := newSupRig(t, func(c *startChecks) { c.listenErr = tt.err })
-			r.wantState(t, PhaseBackingOff, tt.reason, MinBackoff)
-			advance(MinBackoff)
-			r.wantState(t, PhaseBackingOff, tt.reason, 2*MinBackoff)
+			r := newSupRig(t, func(c *startChecks) {
+				c.listenErr = &ActivationError{Reason: tt.reason, Err: fmt.Errorf("the Sockets entry \"keys\": %w", tt.cause)}
+			})
+			st := r.wantState(t, PhaseOff, tt.reason, 0)
+			if !strings.Contains(st.Detail, "keys") {
+				t.Fatalf("detail %q", st.Detail)
+			}
+			advance(time.Hour)
+			r.ck.mu.Lock()
+			listens := r.ck.listens
+			r.ck.mu.Unlock()
+			if listens != 1 {
+				t.Fatalf("%s: %d listens, want 1: no retry", tt.reason, listens)
+			}
+			if n := r.log.count("level=WARN", tt.remedy); n != 1 {
+				t.Fatalf("%s: %d Warn lines naming %q, want 1:\n%s", tt.reason, n, tt.remedy, r.log.b.String())
+			}
+			if n := r.log.count("level=ERROR"); n != 0 {
+				t.Fatalf("%s: %d Error lines, want none", tt.reason, n)
+			}
 		})
 	}
-	if got := OffNotActivated.Remedy(); got != "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)" {
-		t.Fatalf("OffNotActivated's remedy %q", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		r := newSupRig(t, func(c *startChecks) { c.listenErr = errors.New("some other listener source failure") })
+		r.wantState(t, PhaseBackingOff, OffListenerUnavailable, MinBackoff)
+		advance(MinBackoff)
+		r.wantState(t, PhaseBackingOff, OffListenerUnavailable, 2*MinBackoff)
+	})
 }
 
 func TestBackoffDoublesToFiveMinutes(t *testing.T) {

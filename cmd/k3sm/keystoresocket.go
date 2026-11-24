@@ -497,15 +497,27 @@ func (wallClock) After(d time.Duration) (<-chan time.Time, func() bool) {
 	return t.C, t.Stop
 }
 
+// keystoreActivation is the process's one activation of the keystore
+// socket: launchd hands a job's socket over once (a second
+// launch_activate_socket answers EALREADY), so every listener source this
+// process builds shares it, and its socket lives until the process exits.
+var keystoreActivation struct {
+	once sync.Once
+	v    *socket.Activation
+}
+
 // keystoreSocketListener is the server's listener source: the socket
 // launchd activated for the server plist's Sockets entry
-// (install.KeystoreSocketsEntry). A server launchd did not start, or whose
-// plist predates the entry, gets socket.ErrNotActivated, and the user scope
-// stays off as "the listening socket is unavailable"; the server never
-// binds keys.sock itself. The descriptor must be bound at the keystore
-// socket's path under the work dir's data root.
+// (install.KeystoreSocketsEntry), through the process's one activation. A
+// server launchd did not start, or whose plist predates the entry, gets
+// socket.ErrNotActivated, and the user scope stays off for the life of the
+// process; the server never binds keys.sock itself. The descriptor must be
+// bound at the keystore socket's path under the work dir's data root.
 func keystoreSocketListener(workDir string) socket.ListenerSource {
-	return socket.ActivatedListener(install.KeystoreSocketsEntry, keystoreSocketPath(workDir), socket.LaunchdActivator{})
+	keystoreActivation.once.Do(func() {
+		keystoreActivation.v = socket.NewActivation(install.KeystoreSocketsEntry, keystoreSocketPath(workDir), socket.LaunchdActivator{})
+	})
+	return keystoreActivation.v.Source()
 }
 
 // keystoreSocketPath is the keystore socket's path for the server whose

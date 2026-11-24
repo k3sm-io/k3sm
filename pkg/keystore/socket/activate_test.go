@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -36,14 +37,28 @@ type fakeActivator struct {
 	err   error
 	calls int
 	t     *testing.T
+	// handed is set once a call returned descriptors; unlocked once a call
+	// ran without syscall.ForkLock read-held.
+	handed, unlocked bool
 }
 
+// Activate answers EALREADY after a call that handed descriptors over, as
+// launch_activate_socket does, and records whether syscall.ForkLock was
+// read-held during the call.
 func (a *fakeActivator) Activate(string) ([]int, error) {
 	a.calls++
+	if syscall.ForkLock.TryLock() {
+		syscall.ForkLock.Unlock()
+		a.unlocked = true
+	}
+	if a.handed {
+		return nil, unix.EALREADY
+	}
 	var fds []int
 	if a.fds != nil {
 		fds = a.fds(a.t)
 	}
+	a.handed = a.handed || len(fds) > 0
 	return fds, a.err
 }
 
@@ -83,7 +98,7 @@ func rawSocket(t *testing.T, typ int, path string, listen, cloexec bool) int {
 
 func listenerFD(t *testing.T, ln net.Listener) int {
 	t.Helper()
-	al, ok := ln.(activatedListener)
+	al, ok := ln.(heldListener)
 	if !ok {
 		t.Fatalf("listener is %T", ln)
 	}
@@ -103,24 +118,29 @@ func closed(fd int) bool {
 	return errors.Is(err, unix.EBADF)
 }
 
-// U120 (the server's half): the listener source takes launchd's
-// descriptor, never binds, closes the original, and serves a close-on-exec
-// duplicate that an exec'd child does not hold; the same listener is
-// handed back until it is closed, and then launchd is asked again.
-func TestActivatedListenerIsCloseOnExecAndReused(t *testing.T) {
+// U120 (the server's half): the activation takes launchd's descriptor
+// with syscall.ForkLock read-held, never binds, closes the original, and
+// serves a close-on-exec duplicate that an exec'd child does not hold. It
+// activates once per process: a Close leaves the socket open and serving,
+// every later call returns the same listener without asking launchd, and a
+// second activation in the process gets EALREADY, terminal as
+// OffAlreadyActivated.
+func TestActivatedListenerIsCloseOnExecAndHeld(t *testing.T) {
 	dir := sockDir(t)
 	path := filepath.Join(dir, "keys.sock")
 	var orig []int
 	a := &fakeActivator{t: t, fds: func(t *testing.T) []int {
-		_ = os.Remove(path)
 		fd := rawSocket(t, unix.SOCK_STREAM, path, true, true)
 		orig = append(orig, fd)
 		return []int{fd}
 	}}
-	src := ActivatedListener("keys", path, a)
+	src := NewActivation("keys", path, a).Source()
 	ln, err := src(context.Background())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if a.unlocked {
+		t.Fatal("launch_activate_socket ran without syscall.ForkLock read-held")
 	}
 	if !closed(orig[0]) {
 		t.Fatal("launchd's original descriptor is still open")
@@ -134,34 +154,62 @@ func TestActivatedListenerIsCloseOnExecAndReused(t *testing.T) {
 	if err != nil || string(out) != "absent\n" {
 		t.Fatalf("an exec'd child sees descriptor %d: %q, %v", fd, out, err)
 	}
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
 	again, err := src(context.Background())
 	if err != nil || again != ln || a.calls != 1 {
-		t.Fatalf("second call: %v, same %v, %d activations; want the same listener and one activation", err, again == ln, a.calls)
+		t.Fatalf("after a Close: %v, same %v, %d activations; want the same listener and one activation", err, again == ln, a.calls)
 	}
 	go func() {
 		if c, err := net.Dial("unix", path); err == nil {
 			_ = c.Close()
 		}
 	}()
-	c, err := ln.Accept()
+	c, err := again.Accept()
 	if err != nil {
-		t.Fatalf("accept on the activated listener: %v", err)
+		t.Fatalf("accept after a Close: %v", err)
 	}
 	_ = c.Close()
-	if err := ln.Close(); err != nil {
-		t.Fatal(err)
+	_, err = NewActivation("keys", path, a).Source()(context.Background())
+	var ae *ActivationError
+	if !errors.As(err, &ae) || ae.Reason != OffAlreadyActivated || !errors.Is(err, unix.EALREADY) {
+		t.Fatalf("a second activation: %v, want OffAlreadyActivated over EALREADY", err)
 	}
-	third, err := src(context.Background())
-	if err != nil || third == ln || a.calls != 2 {
-		t.Fatalf("after close: %v, same %v, %d activations; want a fresh activation", err, third == ln, a.calls)
-	}
-	_ = third.Close()
+	_ = listenerFDClose(t, again)
 }
 
-// No activated socket is ErrNotActivated (the supervisor's terminal off);
-// a descriptor without FD_CLOEXEC is ErrActivatedInheritable; anything
-// that is not exactly one listening stream socket at the keystore path is
-// ErrActivatedWrong. Every descriptor handed over is closed.
+// listenerFDClose closes the held listener's descriptor for the test's
+// cleanup (Close does not).
+func listenerFDClose(t *testing.T, ln net.Listener) error {
+	t.Helper()
+	return ln.(heldListener).UnixListener.Close()
+}
+
+// launchd binds an activated socket under /var/run/com.apple.launchd.<random>/
+// and renames it into place, so the descriptor's address reads that name
+// (measured); it is accepted for the entry's own name only.
+func TestLaunchdBindName(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/var/run/com.apple.launchd.IIQ24YBjg6/keys":      true,
+		"/var/run/com.apple.launchd.IIQ24YBjg6/other":     false,
+		"/var/run/com.apple.launchd./keys":                false,
+		"/var/run/com.apple.launchd.a/b/keys":             false,
+		"/var/run/com.apple.launchd.../keys":              false,
+		"/tmp/com.apple.launchd.IIQ24YBjg6/keys":          false,
+		"/var/run/com.apple.launchd.IIQ24YBjg6/keys.sock": false,
+	} {
+		if got := launchdBindName(p, "keys"); got != want {
+			t.Errorf("%s: %v, want %v", p, got, want)
+		}
+	}
+}
+
+// Each refusal is an ActivationError with its terminal reason: ESRCH is
+// OffNotActivated, ENOENT OffSocketParentMissing, a descriptor without
+// FD_CLOEXEC OffActivatedInheritable, and anything that is not exactly
+// one listening stream socket at the keystore path ErrActivatedWrong
+// (OffListenerUnavailable). Every descriptor handed over is closed.
 func TestActivatedListenerRefusals(t *testing.T) {
 	dir := sockDir(t)
 	path := filepath.Join(dir, "keys.sock")
@@ -186,20 +234,22 @@ func TestActivatedListenerRefusals(t *testing.T) {
 		a    *fakeActivator
 		is   error
 		want string
+		r    OffReason
 	}{
-		{"not the launchd job", &fakeActivator{err: unix.ESRCH}, ErrNotActivated, "not the server's launchd job"},
-		{"no such entry or path", &fakeActivator{err: unix.ENOENT}, ErrNotActivated, "could not create its path"},
-		{"another launchd error", &fakeActivator{err: unix.EINVAL, fds: atPath(unix.SOCK_STREAM, true, true)}, unix.EINVAL, "did not activate"},
-		{"no descriptor", &fakeActivator{}, ErrActivatedWrong, "no descriptor"},
+		{"not the launchd job", &fakeActivator{err: unix.ESRCH}, ErrNotActivated, "not the server's launchd job", OffNotActivated},
+		{"the parent path is missing", &fakeActivator{err: unix.ENOENT}, ErrNotActivated, "parent path is missing", OffSocketParentMissing},
+		{"already activated", &fakeActivator{err: unix.EALREADY}, unix.EALREADY, "already handed", OffAlreadyActivated},
+		{"another launchd error", &fakeActivator{err: unix.EINVAL, fds: atPath(unix.SOCK_STREAM, true, true)}, unix.EINVAL, "did not activate", OffListenerUnavailable},
+		{"no descriptor", &fakeActivator{}, ErrActivatedWrong, "no descriptor", OffListenerUnavailable},
 		{"two descriptors", &fakeActivator{fds: give(func(t *testing.T) []int {
 			return []int{rawSocket(t, unix.SOCK_STREAM, fresh(), true, true), rawSocket(t, unix.SOCK_STREAM, fresh(), true, true)}
-		})}, ErrActivatedWrong, "more than one descriptor"},
-		{"without FD_CLOEXEC", &fakeActivator{fds: atPath(unix.SOCK_STREAM, true, false)}, ErrActivatedInheritable, "FD_CLOEXEC"},
-		{"a datagram socket", &fakeActivator{fds: atPath(unix.SOCK_DGRAM, false, true)}, ErrActivatedWrong, "not a stream socket"},
-		{"bound, not listening", &fakeActivator{fds: atPath(unix.SOCK_STREAM, false, true)}, ErrActivatedWrong, "not listening"},
+		})}, ErrActivatedWrong, "more than one descriptor", OffListenerUnavailable},
+		{"without FD_CLOEXEC", &fakeActivator{fds: atPath(unix.SOCK_STREAM, true, false)}, ErrActivatedInheritable, "FD_CLOEXEC", OffActivatedInheritable},
+		{"a datagram socket", &fakeActivator{fds: atPath(unix.SOCK_DGRAM, false, true)}, ErrActivatedWrong, "not a stream socket", OffListenerUnavailable},
+		{"bound, not listening", &fakeActivator{fds: atPath(unix.SOCK_STREAM, false, true)}, ErrActivatedWrong, "not listening", OffListenerUnavailable},
 		{"listening at another path", &fakeActivator{fds: give(func(t *testing.T) []int {
 			return []int{rawSocket(t, unix.SOCK_STREAM, fresh(), true, true)}
-		})}, ErrActivatedWrong, "not " + path},
+		})}, ErrActivatedWrong, "not " + path, OffListenerUnavailable},
 		{"not a socket", &fakeActivator{fds: give(func(t *testing.T) []int {
 			var p [2]int
 			if err := unix.Pipe(p[:]); err != nil {
@@ -208,14 +258,15 @@ func TestActivatedListenerRefusals(t *testing.T) {
 			_ = unix.Close(p[1])
 			unix.CloseOnExec(p[0])
 			return p[:1]
-		})}, ErrActivatedWrong, "SO_TYPE"},
+		})}, ErrActivatedWrong, "SO_TYPE", OffListenerUnavailable},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			handed = nil
 			tt.a.t = t
-			ln, err := ActivatedListener("keys", path, tt.a)(context.Background())
-			if ln != nil || !errors.Is(err, tt.is) {
-				t.Fatalf("got %v, %v; want %v", ln, err, tt.is)
+			ln, err := NewActivation("keys", path, tt.a).Source()(context.Background())
+			var ae *ActivationError
+			if ln != nil || !errors.Is(err, tt.is) || !errors.As(err, &ae) || ae.Reason != tt.r {
+				t.Fatalf("got %v, %v; want %v as %q", ln, err, tt.is, tt.r)
 			}
 			if !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("error %q does not say %q", err, tt.want)
@@ -227,7 +278,7 @@ func TestActivatedListenerRefusals(t *testing.T) {
 			}
 		})
 	}
-	if _, err := ActivatedListener("keys", path, nil)(context.Background()); !errors.Is(err, ErrNotActivated) {
+	if _, err := NewActivation("keys", path, nil).Source()(context.Background()); !errors.Is(err, ErrNotActivated) {
 		t.Fatalf("nil activator: %v", err)
 	}
 }

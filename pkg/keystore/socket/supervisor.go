@@ -76,9 +76,19 @@ const (
 	OffListenerFailed       OffReason = "the listener failed"
 	OffSandboxCheckUnusable OffReason = "the peer sandbox check is unusable (sandbox-check-unusable)"
 	OffUserScopeStart       OffReason = "the user scope's start step failed"
-	// OffNotActivated is terminal for the process: launchd has no socket for
-	// it (ErrNotActivated), and only a new bootstrap of the job can give one.
+	// The activation's terminal reasons (ActivationError): launchd hands a
+	// job's socket over once per process, so none is retried.
+	//
+	// OffNotActivated is ESRCH: the process is not the server's launchd job,
+	// or the job's plist has no Sockets entry; only a new bootstrap of the
+	// job, which install does, can give one.
 	OffNotActivated OffReason = "launchd activated no socket for this server"
+	// OffSocketParentMissing is ENOENT: launchd binds the socket at the
+	// job's activation call, and the socket's parent path was missing then
+	// (a data root on a volume that is not mounted).
+	OffSocketParentMissing OffReason = "the socket's parent path was missing when launchd bound it"
+	// OffAlreadyActivated is EALREADY: this process took the socket before.
+	OffAlreadyActivated OffReason = "launchd already handed this process the socket"
 	// OffActivatedInheritable is a descriptor launchd handed over without
 	// FD_CLOEXEC, closed and refused (ErrActivatedInheritable).
 	OffActivatedInheritable OffReason = "the activated socket arrived without FD_CLOEXEC"
@@ -92,6 +102,10 @@ const (
 	// NotActivatedRemedy is OffNotActivated's remedy, which doctor names
 	// for a server with no socket at the path too.
 	NotActivatedRemedy = "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"
+	// ParentMissingRemedy is OffSocketParentMissing's remedy.
+	ParentMissingRemedy = "mount the data root, then run `sudo k3sm restart`"
+	// RestartRemedy is the remedy of every other terminal activation reason.
+	RestartRemedy = "run `sudo k3sm restart`"
 )
 
 // Phase is where the supervisor is.
@@ -312,17 +326,14 @@ func (s *Supervisor) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			if errors.Is(err, ErrNotActivated) {
-				// launchd fixed the job's sockets at its bootstrap: no retry
-				// in this process can get one.
-				s.notActivated(ctx, err)
+			var ae *ActivationError
+			if errors.As(err, &ae) {
+				// launchd hands a job's socket over once per process: no
+				// retry in this process can get one.
+				s.notActivated(ctx, ae)
 				return
 			}
-			reason := OffListenerUnavailable
-			if errors.Is(err, ErrActivatedInheritable) {
-				reason = OffActivatedInheritable
-			}
-			if !s.backOff(ctx, reason, err, &runBackoff) {
+			if !s.backOff(ctx, OffListenerUnavailable, err, &runBackoff) {
 				return
 			}
 			continue
@@ -517,6 +528,10 @@ func (r OffReason) Remedy() string {
 		return installRemedy
 	case OffNotActivated:
 		return NotActivatedRemedy
+	case OffSocketParentMissing:
+		return ParentMissingRemedy
+	case OffAlreadyActivated, OffActivatedInheritable:
+		return RestartRemedy
 	}
 	return ""
 }
@@ -543,11 +558,16 @@ func (s *Supervisor) off(reason OffReason, detail string, last OffReason, wait t
 	}
 }
 
-// notActivated records the terminal OffNotActivated, logs it once at Warn
-// naming the remedy, and waits for ctx: nothing is retried.
-func (s *Supervisor) notActivated(ctx context.Context, err error) {
-	s.set(State{Phase: PhaseOff, Reason: OffNotActivated, Detail: err.Error()})
-	s.cfg.Log.Warn(offMsg+"; "+NotActivatedRemedy, "reason", string(OffNotActivated), "err", err.Error())
+// notActivated records the activation's terminal reason, logs it once at
+// Warn naming the remedy (RestartRemedy for a reason without its own), and
+// waits for ctx: nothing is retried.
+func (s *Supervisor) notActivated(ctx context.Context, ae *ActivationError) {
+	remedy := ae.Reason.Remedy()
+	if remedy == "" {
+		remedy = RestartRemedy
+	}
+	s.set(State{Phase: PhaseOff, Reason: ae.Reason, Detail: ae.Error()})
+	s.cfg.Log.Warn(offMsg+"; "+remedy, "reason", string(ae.Reason), "err", ae.Error())
 	<-ctx.Done()
 }
 
