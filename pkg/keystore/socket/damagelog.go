@@ -36,6 +36,7 @@ const (
 	DamageFloorRecordsEntry = "floor-records-entry"
 	DamageFloorDegraded     = "floor-degraded"
 	DamageCorrupt           = "corrupt"
+	DamageUnsupportedKind   = "unsupported-kind"
 	DamageInternal          = "internal"
 )
 
@@ -46,6 +47,7 @@ var damageRemedies = map[string]string{
 	DamageFloorRecordsEntry: "the floor still records the entry but its directory is missing (a restored or rolled-back keystore); root runs sudo k3sm doctor",
 	DamageFloorDegraded:     "the user-scope floor holds damage, or the start step quarantined the scope; grants and reads are refused, rm still runs; root runs sudo k3sm doctor",
 	DamageCorrupt:           "a record of the entry fails authentication or does not parse; restore it from backup, or rm the entry and put its value again",
+	DamageUnsupportedKind:   "a record of the entry has a kind or envelope version this build cannot read, written by a newer k3sm or altered to read as one; upgrade k3sm, and if it is already current, restore the entry from backup or rm the entry and put its value again",
 	DamageInternal:          "the store could not serve the request (a missing or untrusted master key, or another failure only root can repair); root runs sudo k3sm doctor",
 }
 
@@ -71,6 +73,8 @@ func damageClass(err error) string {
 			return DamageFloorRecordsEntry
 		case errors.Is(err, keystore.ErrCorrupt):
 			return DamageCorrupt
+		case errors.Is(err, keystore.ErrKindUnsupported):
+			return DamageUnsupportedKind
 		}
 		return DamageInternal
 	case CodeRefused:

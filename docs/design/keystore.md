@@ -4566,8 +4566,10 @@ surface, and the app consumes only those.
   the API grammar), a class from a closed set and that class's fixed remedy. The classes are
   `orphan-version` (answered `refused`; the owner can `rm` the entry and `put` it again),
   `floor-records-entry`, `floor-degraded` (the floor's damage or the scope's quarantine,
-  answered `refused`), `corrupt`, and `internal` for any other error answered `internal` (a
-  missing or untrusted master). The class is judged inside the reply this table gives, in its
+  answered `refused`), `corrupt`, `unsupported-kind` (`ErrKindUnsupported`, a record of a kind
+  or envelope version this build cannot read: its remedy names the upgrade first, then a
+  restore or `rm` and `put` when this k3sm is current, never `doctor`), and `internal` for any
+  other error answered `internal` (a missing or untrusted master). The class is judged inside the reply this table gives, in its
   order, so the log and the reply never disagree on a chain that matches more than one row:
   the floor's damage with `ErrCorrupt` answers `internal` and logs `corrupt`, and damage
   behind a row that is not damage (`busy`, `not-found`) logs nothing

@@ -157,6 +157,7 @@ func TestStoreErrorLogged(t *testing.T) {
 			{"floor records a deleted entry", wrap(keystore.ErrFloorRecordsEntry), DamageFloorRecordsEntry},
 			{"orphan version", wrap(fmt.Errorf("%w: %w: rm and put it again", keystore.ErrCorrupt, keystore.ErrOrphanVersion)), DamageOrphanVersion},
 			{"master missing", wrap(keystore.ErrMasterMissing), DamageInternal},
+			{"kind unsupported", wrap(fmt.Errorf("%w: record kind 0xee", keystore.ErrKindUnsupported)), DamageUnsupportedKind},
 			{"internal", leakyErr(errors.New("an error no table names")), DamageInternal},
 			{"not found", wrap(keystore.ErrNotFound), ""},
 			{"exists", wrap(keystore.ErrExists), ""},
@@ -401,6 +402,7 @@ var damageCodes = map[string]Code{
 	DamageFloorDegraded:     CodeRefused,
 	DamageFloorRecordsEntry: CodeInternal,
 	DamageCorrupt:           CodeInternal,
+	DamageUnsupportedKind:   CodeInternal,
 	DamageInternal:          CodeInternal,
 }
 
@@ -467,10 +469,15 @@ func TestDamageClassAgreesWithOutcome(t *testing.T) {
 		{"floor records entry", wrap(keystore.ErrFloorRecordsEntry), CodeInternal, DamageFloorRecordsEntry},
 		{"master missing", wrap(keystore.ErrMasterMissing), CodeInternal, DamageInternal},
 		{"master untrusted", wrap(keystore.ErrMasterUntrusted), CodeInternal, DamageInternal},
-		{"kind unsupported", wrap(keystore.ErrKindUnsupported), CodeInternal, DamageInternal},
+		{"kind unsupported", wrap(keystore.ErrKindUnsupported), CodeInternal, DamageUnsupportedKind},
 		{"cancelled", context.Canceled, CodeInternal, ""},
 		{"timed out", context.DeadlineExceeded, CodeInternal, ""},
 		{"unknown", errors.New("x"), CodeInternal, DamageInternal},
+	}
+	for class := range damageCodes {
+		if damageRemedies[class] == "" {
+			t.Errorf("class %q has no remedy", class)
+		}
 	}
 	for _, k := range kinds {
 		if code, _ := outcomeOf(k.err); code != k.code {
