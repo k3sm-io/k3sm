@@ -117,7 +117,10 @@ func (u *UserScope) rotate(ctx context.Context, name string, next nextValue) (v 
 	}
 	defer unlockUID()
 	u.prepareUsage(ctx) // the scope's figure, walked before the store lock
-	u = u.withGUID()    // then the lookup, so its answer is fresh at the lock
+	if err := ctx.Err(); err != nil {
+		return Version{}, err // done during the walk: no hold, nothing written
+	}
+	u = u.withGUID() // then the lookup, so its answer is fresh at the lock
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Version{}, fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)

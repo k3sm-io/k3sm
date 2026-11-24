@@ -73,11 +73,15 @@ type prefLock struct {
 func newPrefLock() *prefLock { return &prefLock{changed: make(chan struct{})} }
 
 // acquire takes l, exclusive or shared, waiting at most wait, or until ctx
-// is done: then errLockTimeout, or ctx's error, with nothing held. A nil l,
-// a store a test built without New, holds nothing.
+// is done: then errLockTimeout, or ctx's error, with nothing held. A ctx
+// already done takes nothing, even an uncontended l. A nil l, a store a
+// test built without New, holds nothing.
 func (l *prefLock) acquire(ctx context.Context, exclusive bool, wait time.Duration) error {
 	if l == nil {
 		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()

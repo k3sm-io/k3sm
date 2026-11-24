@@ -603,8 +603,12 @@ func (s *FileStore) flockWait(ctx context.Context, f *os.File, how int) error {
 	return s.flockWaitFor(ctx, f, how, s.lockWait)
 }
 
-// flockWaitFor is flockWait, waiting at most wait.
+// flockWaitFor is flockWait, waiting at most wait. A ctx already done
+// takes nothing, even an uncontended flock.
 func (s *FileStore) flockWaitFor(ctx context.Context, f *os.File, how int, wait time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	deadline := time.Now().Add(wait)
 	for {
 		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)

@@ -218,9 +218,10 @@ func scopeKeyDigest(dir *os.Root) ([sha256.Size]byte, error) {
 // lock, when it has none bound to the scope.key on disk: the caller holds
 // the uid's mutation lock. A figure bound to another scope.key (an rm-scope
 // and a new mint, a Rewrap's re-seal) is rebuilt here, outside the hold. It
-// is best effort: a scope that cannot be walked now, or a ctx done during
-// the walk, leaves no new figure, and the judgement under the lock walks
-// then.
+// is best effort: a scope that cannot be walked now leaves no new figure,
+// and the judgement under the lock walks then; a ctx done during the walk
+// leaves none either, and the caller returns ctx's error before the store
+// lock (put, rotate).
 func (u *UserScope) prepareUsage(ctx context.Context) {
 	if u.s.usage == nil || ctx.Err() != nil {
 		return
@@ -296,7 +297,10 @@ func (u *UserScope) walkUsage(ctx context.Context, root *os.Root, underLock bool
 // usageUnderLock is the scope's figure for a quota judgement under the
 // store lock, a copy the caller owns: the one this process keeps when it is
 // bound to the scope.key on disk, else a walk now, which becomes the
-// figure.
+// figure. That walk is the one scope walk a put or rotate hold can do: the
+// figure is still absent or stale at the lock when the walk before it
+// failed, a root rm-scope and a new mint or a Rewrap landed between that
+// walk and the lock, or the put minted the scope under this hold.
 func (u *UserScope) usageUnderLock(root *os.Root) (map[string]int64, error) {
 	dir, err := u.openScopeDir(root, false)
 	if err != nil {
