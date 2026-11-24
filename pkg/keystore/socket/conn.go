@@ -23,8 +23,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
+
+	keyentry "k3sm.io/apis/keystore/entry"
+	"k3sm.io/k3sm/pkg/keystore"
 )
 
 // RequestBound is how long the server waits for a complete HELLO from
@@ -52,6 +56,7 @@ type Conn interface {
 type Handler struct {
 	now func() time.Time
 	ops map[string]opFunc // the operations; an op not here is unknown-op
+	log *slog.Logger      // receives the store errors that are damage (logStoreError)
 }
 
 // Peer is the admitted peer of a connection, as the listener read it at
@@ -108,7 +113,7 @@ func NewHandler(now func() time.Time, opts ...HandlerOption) (*Handler, error) {
 	if now == nil {
 		return nil, errors.New("keystore socket: nil clock")
 	}
-	h := &Handler{now: now}
+	h := &Handler{now: now, log: slog.Default()}
 	for _, o := range opts {
 		o(h)
 	}
@@ -308,7 +313,9 @@ func (h *Handler) serveRequest(ctx context.Context, c Conn, p Peer, first byte) 
 	// connection stays open so a newer client can fall back.
 	rt, header, value := TypeError, any(errorHeader{Code: CodeUnknownOp}), []byte(nil)
 	if op, ok := h.ops[name]; ok {
-		rt, header, value = answer(op(ctx, Request{Peer: p, Op: name, Header: f.Header, Value: f.Value}))
+		rep, oerr := op(ctx, Request{Peer: p, Op: name, Header: f.Header, Value: f.Value})
+		h.logStoreError(name, p, f.Header, oerr)
+		rt, header, value = answer(rep, oerr)
 	}
 	// A reply the server cannot encode (a header that does not marshal,
 	// or one past its cap) is answered internal: the operation has run,
@@ -339,6 +346,61 @@ func answer(reply Reply, err error) (FrameType, any, []byte) {
 		return TypeError, errorHeader{Code: code}, nil
 	}
 	return TypeReply, replyHeader{header: reply.Header, warning: warning}, reply.Value
+}
+
+// damage reports whether err, an operation's error, is damage the server's
+// log names: an error answered internal (a corrupt record, a floor that is
+// stale or records a deleted entry, a missing or untrusted master), a
+// sealed version above the pointer (ErrOrphanVersion, answered refused),
+// and the floor's damage or the scope's quarantine (keystore.FloorDegraded).
+// The ordinary outcomes (not-found, exists, quota, rate-limited, busy,
+// log-full and the socket's own refusals) are not: each has its audit
+// line, and a peer could fill the server's log with them.
+func damage(err error) bool {
+	if err == nil || keystore.Committed(err) {
+		return false
+	}
+	if code, _ := outcomeOf(err); code == CodeInternal {
+		return true
+	}
+	return errors.Is(err, keystore.ErrCorrupt) ||
+		errors.Is(err, keystore.ErrOrphanVersion) ||
+		errors.Is(err, keystore.ErrFloorRecordsEntry) ||
+		keystore.FloorDegraded(err)
+}
+
+// logStoreError logs err, op's error for p, at Warn when it is damage: the
+// op, the peer's uid, the entry when the request header names a valid one,
+// and the error's text, which names the entry and its remedy and is built
+// from fixed strings and names only. No value, nor its length, is logged.
+func (h *Handler) logStoreError(op string, p Peer, header []byte, err error) {
+	if !damage(err) {
+		return
+	}
+	attrs := []any{"op", op, "uid", p.UID}
+	if e, ok := requestEntry(header); ok {
+		attrs = append(attrs, "entry", e)
+	}
+	h.log.Warn("keystore socket: the store reports damage", append(attrs, "error", err.Error())...)
+}
+
+// requestEntry is the entry a request header names, read by its exact
+// name, when it is a valid entry name in the API grammar; nothing else of
+// the header is read.
+func requestEntry(header []byte) (string, bool) {
+	fields, err := exactFields(header, "entry")
+	if err != nil {
+		return "", false
+	}
+	var s string
+	if decodeField(fields["entry"], &s) != nil || s == "" {
+		return "", false
+	}
+	e, err := keyentry.Parse(s)
+	if err != nil {
+		return "", false
+	}
+	return e.String(), true
 }
 
 // replyHeader is a reply's header with the warning an outcome adds.

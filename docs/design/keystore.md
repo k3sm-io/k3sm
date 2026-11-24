@@ -4389,6 +4389,17 @@ surface, and the app consumes only those.
   uid's own share is never the global append failure: that one is answered alike for every
   uid, `log-full` when its cause is the audit log past its hard cap and `refused` for any
   other cause (a full disk, an I/O error).
+  *The server's log.* The reply carries only the code, so the request boundary
+  (`Handler.serveRequest`) logs each store error that is damage at Warn: the op, the peer's
+  uid, the entry when the request header names a valid one (by its exact name, in the API
+  grammar), and the error's text, which names the entry and its remedy. The damage is every
+  error answered `internal` (a corrupt record, a floor that is stale or still records a
+  deleted entry, a missing or untrusted master), an orphan version, and the floor's damage or
+  the scope's quarantine (`keystore.FloorDegraded`), both answered `refused`. The store builds
+  those errors from fixed strings and names, so no line carries a value, nor its length. The
+  ordinary outcomes (`not-found`, `exists`, `quota`, `rate-limited`, `busy`, `log-full`, and
+  the socket's own refusals) are not logged at Warn: each has its audit line, and a peer
+  could otherwise fill the server's log with them (`TestStoreErrorLogged`).
 - **Operations on the wire.** The request and reply headers are named Go types in
   `pkg/keystore/socket` (`PutRequest`, `RotateRequest`, `ListRequest`, `RmRequest`,
   `ReadForExecRequest`; `VersionReply`, `ListReply` with `ListEntry`, `RmReply`,
