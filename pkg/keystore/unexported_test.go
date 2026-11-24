@@ -28,9 +28,11 @@ import (
 	"testing"
 )
 
-// TestUserScopeIsUnexported holds the user scope inside this package until
-// the socket slice, which lifts this test: no package outside pkg/keystore
-// (its sub-packages and cmd/k3sm included) may reference UserScope,
+// TestUserScopeIsUnexported holds the user scope inside this package and
+// pkg/keystore/socket, the socket slice's package, for which the ban on
+// references is lifted (referenceAllowed): no other package outside
+// pkg/keystore (its other sub-packages and cmd/k3sm included) may
+// reference UserScope,
 // ResolveEntry or ParseEntry, nor the delivery verbs Deliver, Withdraw and
 // Delivery (which also names their parameter type). ParseEntry is held
 // whole, since a reference cannot be told to use only its system form
@@ -66,7 +68,9 @@ import (
 //     TestRebuildDropsRemovedScopeKeys.
 //
 // The socket slice lifts the ban on references, never the prerequisite
-// check.
+// check: a reference from pkg/keystore/socket is no failure, but it still
+// counts as an exported identifier reaching the user scope, so the
+// prerequisites are checked whenever one exists.
 //
 // This is a guardrail, not a proof: a syntactic scan without types can be
 // walked around (a call through an interface value or a func-typed field,
@@ -106,7 +110,11 @@ func TestUserScopeIsUnexported(t *testing.T) {
 		rel, _ := filepath.Rel(root, p)
 		for _, name := range bannedRefs(f) {
 			exported = true
-			t.Errorf("%s references %s: the user scope stays inside pkg/keystore until the socket slice", rel, name)
+			if referenceAllowed(filepath.ToSlash(filepath.Dir(rel))) {
+				t.Logf("%s references %s (ban lifted for its package; prerequisites checked)", rel, name)
+				continue
+			}
+			t.Errorf("%s references %s: the user scope stays inside pkg/keystore and pkg/keystore/socket", rel, name)
 		}
 		return nil
 	})
@@ -134,6 +142,12 @@ func TestUserScopeIsUnexported(t *testing.T) {
 		}
 	}
 }
+
+// referenceAllowed reports whether a file in dir, relative to the module
+// root, may reference the user scope's names: pkg/keystore/socket only, the
+// socket server whose store bridge opens a peer's view per request. Its
+// sub-packages and every other directory stay banned.
+func referenceAllowed(dir string) bool { return dir == "pkg/keystore/socket" }
 
 // exportPrereqs are the tests that must exist, each in its package's test
 // files, before any exported identifier reaches the user scope: U51's (the
@@ -712,4 +726,23 @@ func contains(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// TestReferenceAllowedOnlySocket: the ban on references is lifted for
+// pkg/keystore/socket alone, never its sub-packages, cmd/k3sm or another
+// package.
+func TestReferenceAllowedOnlySocket(t *testing.T) {
+	for dir, want := range map[string]bool{
+		"pkg/keystore/socket":      true,
+		"pkg/keystore/socket/sub":  false,
+		"pkg/keystore/reconcile":   false,
+		"cmd/k3sm":                 false,
+		"pkg/keystore/socketx":     false,
+		"x/pkg/keystore/socket":    false,
+		"pkg/keystore/socket/../x": false,
+	} {
+		if got := referenceAllowed(dir); got != want {
+			t.Errorf("referenceAllowed(%q) = %v, want %v", dir, got, want)
+		}
+	}
 }

@@ -236,7 +236,8 @@ func TestIntegrationDeadPeerRefused(t *testing.T) {
 	pc, credErr := readPeerCred(c)
 	t.Logf("measured: readPeerCred uidRead=%v uid=%d pid=%d tokenEUID=%d tokenPID=%d token=%v err=%v",
 		pc.UIDRead, pc.UID, pc.PID, pc.TokenEUID, pc.TokenPID, pc.Token, credErr)
-	uid, reason := l.check(c)
+	peer, reason := l.check(c)
+	uid := peer.UID
 	t.Logf("measured: listener check uid=%d reason=%q", uid, reason)
 	if reason == "" {
 		t.Fatalf("the listener admitted a peer that had exited before the accept (uid %d)", uid)
@@ -285,7 +286,8 @@ func TestIntegrationSandboxedPeerRefused(t *testing.T) {
 	if err != nil || !sandboxed {
 		t.Fatalf("the real sandbox source answered sandboxed=%v err=%v for a sandbox-exec child", sandboxed, err)
 	}
-	uid, reason := l.check(c)
+	peer, reason := l.check(c)
+	uid := peer.UID
 	t.Logf("measured: listener check uid=%d reason=%q", uid, reason)
 	if reason != ReasonSandboxed {
 		t.Fatalf("listener check = %q under uid %d, want %q", reason, uid, ReasonSandboxed)

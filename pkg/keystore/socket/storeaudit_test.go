@@ -46,7 +46,11 @@ type storeRig struct {
 	logs *keystore.ServerLogs
 }
 
-func newStoreRig(t *testing.T) *storeRig {
+func newStoreRig(t *testing.T) *storeRig { t.Helper(); return newStoreRigWith(t, nil) }
+
+// newStoreRigWith is newStoreRig with the store's Config passed through
+// tune, when it is not nil, before the store is made.
+func newStoreRigWith(t *testing.T, tune func(*keystore.Config)) *storeRig {
 	t.Helper()
 	if os.Geteuid() == 0 {
 		t.Skip("the test user stands in for the service user, which is never root")
@@ -72,14 +76,18 @@ func newStoreRig(t *testing.T) *storeRig {
 	r.writeLog(t, r.auditPath(), nil)
 	r.writeLog(t, r.floorPath(), nil)
 	uid, gid := os.Getuid(), os.Getgid()
-	r.fs = keystore.New(keystore.Config{
+	cfg := keystore.Config{
 		Dir:       filepath.Join(data, "server", "keystore"),
 		MasterDir: filepath.Join(data, "server", "cred", "keystore-master"),
 		UID:       uint32(uid), GID: uint32(gid),
 		DataRoot: data,
 		FloorUID: uid, FloorGID: gid,
 		LogFlags: func(*os.File) (uint32, error) { return sfAppend, nil },
-	})
+	}
+	if tune != nil {
+		tune(&cfg)
+	}
+	r.fs = keystore.New(cfg)
 	r.logs = r.fs.ServerLogs()
 	t.Cleanup(func() { _ = r.logs.Close() })
 	return r
@@ -137,6 +145,7 @@ type auditEntry struct {
 	Via    string `json:"via"`
 	Caller struct {
 		UID uint32 `json:"uid"`
+		PID int32  `json:"pid"`
 	} `json:"caller"`
 	Scope   string `json:"scope"`
 	Name    string `json:"name"`
