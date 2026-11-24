@@ -32,6 +32,13 @@ func (t *usageTable) forget(uid uint32) {
 	t.mu.Unlock()
 }
 
+// set keeps f as uid's figure, whatever the generation.
+func (t *usageTable) set(uid uint32, f *scopeUsage) {
+	t.mu.Lock()
+	t.byUID[uid] = f
+	t.mu.Unlock()
+}
+
 // hasFigure reports whether the store holds a usage figure for uid.
 func hasFigure(s *FileStore, uid uint32) bool {
 	s.usage.mu.Lock()

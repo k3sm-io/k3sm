@@ -48,7 +48,10 @@ import (
 //     after it may have written, or whose outcome is not known, drops it, and
 //     the next put or rotate walks again.
 //   - A restart, a crash included, starts with no figure: the first put or
-//     rotate of each scope walks it, before the lock.
+//     rotate of each scope walks it, before the lock. So does a listener
+//     start (FileStore.StartUserScopes, which the socket's supervisor runs
+//     on every start pass) and a restore's merge, which drop every figure
+//     (forgetAll); a figure taken before either is never put back.
 //
 // So a figure that is lost, or that may be stale, is recomputed from the
 // files, never trusted. No other process writes a user scope's entries but
@@ -67,6 +70,9 @@ type usageTable struct {
 	mu    sync.Mutex
 	byUID map[uint32]*scopeUsage
 	locks map[uint32]chan struct{}
+	// gen counts forgetAll calls: a figure taken, or a walk begun, before
+	// one is never put back after it (setAt, confirm).
+	gen uint64
 }
 
 func newUsageTable() *usageTable {
@@ -128,24 +134,43 @@ func (t *usageTable) get(uid uint32, key [sha256.Size]byte) map[string]int64 {
 	return nil
 }
 
-func (t *usageTable) set(uid uint32, f *scopeUsage) {
+// generation is the table's forgetAll count, read before a walk whose
+// figure setAt then keeps.
+func (t *usageTable) generation() uint64 {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.gen
+}
+
+// setAt keeps f as uid's figure, a walk's begun at generation gen: unless
+// a forgetAll ran since, when the walk may have counted a tree no longer in
+// place and f is dropped.
+func (t *usageTable) setAt(uid uint32, f *scopeUsage, gen uint64) {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
-	t.byUID[uid] = f
+	if t.gen == gen {
+		t.byUID[uid] = f
+	}
 	t.mu.Unlock()
 }
 
-// forgetAll drops every uid's figure: a tree put in place under the store
-// (a restore's merge) may hold any scope's entries under its same
-// scope.key, so no figure taken before it is trusted.
+// forgetAll drops every uid's figure, and moves the generation on so that
+// no figure taken before it is put back after it: a tree put in place
+// under the store (a restore's merge) may hold any scope's entries under
+// its same scope.key, and a listener that starts again
+// (FileStore.StartUserScopes) may follow writes this process did not see.
 func (t *usageTable) forgetAll() {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
 	clear(t.byUID)
+	t.gen++
 	t.mu.Unlock()
 }
 
@@ -166,6 +191,7 @@ type usageOp struct {
 	t   *usageTable
 	uid uint32
 	f   *scopeUsage
+	gen uint64
 }
 
 // begin takes uid's figure out of the table for an op about to write.
@@ -175,7 +201,7 @@ func (t *usageTable) begin(uid uint32) *usageOp {
 		return o
 	}
 	t.mu.Lock()
-	o.f = t.byUID[uid]
+	o.f, o.gen = t.byUID[uid], t.gen
 	delete(t.byUID, uid)
 	t.mu.Unlock()
 	return o
@@ -183,8 +209,9 @@ func (t *usageTable) begin(uid uint32) *usageOp {
 
 // confirm ends the op: its figure, changed by fn (nil leaves it as it
 // was, for an op that wrote nothing after all), goes back into the table,
-// unless another figure was set for the uid since. A second confirm does
-// nothing; an op never confirmed leaves the uid with no figure.
+// unless another figure was set for the uid since, or a forgetAll ran
+// since begin (the generation moved), when it is dropped. A second confirm
+// does nothing; an op never confirmed leaves the uid with no figure.
 func (o *usageOp) confirm(fn func(entries map[string]int64)) {
 	if o == nil || o.t == nil || o.f == nil {
 		return
@@ -195,7 +222,7 @@ func (o *usageOp) confirm(fn func(entries map[string]int64)) {
 		fn(f.entries)
 	}
 	o.t.mu.Lock()
-	if _, ok := o.t.byUID[o.uid]; !ok {
+	if _, ok := o.t.byUID[o.uid]; !ok && o.t.gen == o.gen {
 		o.t.byUID[o.uid] = f
 	}
 	o.t.mu.Unlock()
@@ -226,6 +253,7 @@ func (u *UserScope) prepareUsage(ctx context.Context) {
 	if u.s.usage == nil || ctx.Err() != nil {
 		return
 	}
+	gen := u.s.usage.generation()
 	root, err := u.s.openDir(u.s.dir, false)
 	if err != nil {
 		return
@@ -235,7 +263,7 @@ func (u *UserScope) prepareUsage(ctx context.Context) {
 		return
 	}
 	if f, err := u.walkUsage(ctx, root, false); err == nil {
-		u.s.usage.set(u.uid, f)
+		u.s.usage.setAt(u.uid, f, gen)
 	}
 }
 
@@ -314,11 +342,12 @@ func (u *UserScope) usageUnderLock(root *os.Root) (map[string]int64, error) {
 	if m := u.s.usage.get(u.uid, key); m != nil {
 		return m, nil
 	}
+	gen := u.s.usage.generation()
 	f, err := u.walkUsage(context.Background(), root, true)
 	if err != nil {
 		return nil, err
 	}
-	u.s.usage.set(u.uid, f)
+	u.s.usage.setAt(u.uid, f, gen)
 	return maps.Clone(f.entries), nil
 }
 

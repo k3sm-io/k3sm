@@ -111,3 +111,44 @@ func TestFlockWaitDoneCtxTakesNothing(t *testing.T) {
 		t.Fatalf("the flock was taken with ctx done: another descriptor gets %v", err)
 	}
 }
+
+// A forgetAll while an op holds the figure, or while a walk builds one,
+// leaves no figure once they end: the op's confirm and the walk's set
+// keep nothing taken before it.
+func TestForgetAllDuringOpLeavesNoFigure(t *testing.T) {
+	s, u := rotateScope(t)
+	op := s.usage.begin(1001)
+	s.usage.forgetAll()
+	op.confirm(func(m map[string]int64) { m["b"] = 1 })
+	if hasFigure(s, 1001) {
+		t.Fatal("an op's confirm put back a figure taken before a forgetAll")
+	}
+	once := false
+	s.usageLstat = func(bool) {
+		if !once {
+			once = true
+			s.usage.forgetAll()
+		}
+	}
+	u.prepareUsage(context.Background())
+	if !once {
+		t.Fatal("the walk before the lock did not run")
+	}
+	if hasFigure(s, 1001) {
+		t.Fatal("a walk begun before a forgetAll kept its figure")
+	}
+}
+
+// The store's start step, which the socket's supervisor runs on every
+// listener start pass, drops every figure: a listener started again holds
+// none from before it.
+func TestStartUserScopesForgetsUsageFigures(t *testing.T) {
+	s, _ := rotateScope(t)
+	if !hasFigure(s, 1001) {
+		t.Fatal("no figure after the first put")
+	}
+	_ = s.StartUserScopes(context.Background()) // its outcome is not what is judged
+	if hasFigure(s, 1001) {
+		t.Fatal("a listener start kept a usage figure from before it")
+	}
+}

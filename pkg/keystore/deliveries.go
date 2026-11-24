@@ -1055,6 +1055,10 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 	if s.userScopesStarted == nil {
 		return fmt.Errorf("%w: the store was not made by New", errInvalidConfig)
 	}
+	// A listener starting again (a rebuild, a restart after a panic, a
+	// second server gone) may follow writes this process did not make: no
+	// usage figure taken before is trusted (usage.go).
+	s.usage.forgetAll()
 	damage, spent, err := s.CheckLogBounds(ctx)
 	if err != nil {
 		return err

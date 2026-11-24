@@ -844,7 +844,9 @@ func (s *FileStore) moveStaged(st *mergeStaging) error {
 		return fmt.Errorf("move %s/%s to %s: %w", preRestoreDirName, stagedTreeName, s.dir, err)
 	}
 	// The tree in place now holds the staged scopes, each under the same
-	// scope.key as before it: no usage figure taken before is trusted.
+	// scope.key as before it. The restore recipe stops the server first,
+	// so its restart holds no figure: that is the protection. This covers
+	// only a figure this process holds, should it be the one merging.
 	s.usage.forgetAll()
 	for _, d := range []*os.File{st.parent, st.dirF} {
 		if err := syncMovedDir(d); err != nil {

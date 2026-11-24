@@ -32,10 +32,12 @@ import (
 // is counted unaudited.
 var errAuditLost = errors.New("the change stands, but its audit line was not written")
 
-// StartUserScopes is the server's start step for the user scope: the log
-// bounds check, then the delivery catch-up (startUserScopes). Until it has
-// run, every user-scope request is refused (UserScopeOff). The socket
-// server calls it once, before it serves.
+// StartUserScopes is the server's start step for the user scope: it drops
+// every usage figure of the store's tree, then runs the log bounds check,
+// then the delivery catch-up (startUserScopes). Until it has run, every
+// user-scope request is refused (UserScopeOff). The socket's supervisor
+// calls it on every start pass, before the listener serves, so a listener
+// started again holds no figure from before.
 func (s *FileStore) StartUserScopes(ctx context.Context) error {
 	return s.startUserScopes(ctx)
 }
