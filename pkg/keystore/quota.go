@@ -722,7 +722,7 @@ func (u *UserScope) openEntriesForRevoke(root *os.Root) (entries *os.Root, gen [
 	defer func() { _ = dir.Close() }() // nothing is written in the scope directory
 	r, err := u.s.readScopeKeyRecord(dir)
 	if err != nil {
-		return nil, gen, nil, err
+		return nil, gen, nil, u.lostScopeKey(dir, err)
 	}
 	entries, err = u.s.openSubdir(dir, scopeEntriesName, false)
 	if errors.Is(err, fs.ErrNotExist) {

@@ -4561,7 +4561,12 @@ surface, and the app consumes only those.
   socket: the peer's own scope holds nothing it can read, and nothing on the socket path
   deletes on that answer, so it is never taken as a definitive absence. `list` alone answers
   an empty list rather than `not-found`, and only for a uid with no scope key yet (no scope
-  directory, or one with no `scope.key`: `keystore.NoScopeKey`); a scope whose `scope.key`
+  directory, or one with no `scope.key` and no entry in its `entries/`, which is what a mint
+  that crashed before its `scope.key` leaves: `keystore.NoScopeKey`). A scope directory whose
+  `entries/` holds a name and which has no `scope.key` lost its key: a mint over it would
+  orphan those entries and is refused, so every read (`read-for-exec`, `list`, `rotate`, `rm`)
+  answers it `not-found` as an incomplete scope (`keystore.ScopeIncomplete`), never an empty
+  list, and logs it (`TestNotFoundDamageLogged`, `TestCrashedMintIsNoScopeKey`); a scope whose `scope.key`
   is there but whose `entries/` directory or `deliveries` record is gone is damage, and its
   `list` answers that error's own code, `not-found` (`ErrScopeAbsent`), never an empty list
   (`TestListDamagedScopeIsNotEmpty`).

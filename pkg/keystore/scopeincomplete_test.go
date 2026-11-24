@@ -25,12 +25,13 @@ import (
 )
 
 // A scope that lost part of itself, a scope.key with no deliveries record
-// or no entries/ directory beside it, is ErrScopeAbsent and also
+// or no entries/ directory beside it, or entries with no scope.key, is
+// ErrScopeAbsent and also
 // ScopeIncomplete, the damage the socket logs; a uid with no scope yet is
 // ErrScopeAbsent and NoScopeKey, and never ScopeIncomplete.
 func TestScopeIncompleteIsNotNoScopeKey(t *testing.T) {
 	ctx := context.Background()
-	for _, gone := range []string{deliveriesName, scopeEntriesName} {
+	for _, gone := range []string{deliveriesName, scopeEntriesName, scopeKeyName} {
 		t.Run(gone, func(t *testing.T) {
 			s, server := newMasteredStore(t)
 			fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1), 1002: guid(0xA2)})
@@ -52,5 +53,27 @@ func TestScopeIncompleteIsNotNoScopeKey(t *testing.T) {
 				t.Fatalf("a read of a uid with no scope = %v, want ErrScopeAbsent with no scope key, not incomplete", err)
 			}
 		})
+	}
+}
+
+// A scope directory with no scope.key and an empty entries/, what a mint
+// that crashed before its scope.key leaves, is still a uid with no scope
+// yet (NoScopeKey), not an incomplete scope, and the next put mints over
+// it.
+func TestCrashedMintIsNoScopeKey(t *testing.T) {
+	ctx := context.Background()
+	s, server := newMasteredStore(t)
+	fakeGUIDs(t, map[uint32][generationSize]byte{1001: guid(0xA1)})
+	u := userScope(t, s, 1001)
+	userPut(t, u, "user/1001/a", "v")
+	if err := u.Delete(ctx, "user/1001/a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(scopeDir(server, "1001"), scopeKeyName)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := u.Current(ctx, "user/1001/a")
+	if !NoScopeKey(err) || ScopeIncomplete(err) {
+		t.Fatalf("a read of a scope with an empty entries/ and no scope key = %v, want no scope key, not incomplete", err)
 	}
 }

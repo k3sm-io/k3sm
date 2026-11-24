@@ -701,7 +701,7 @@ func (u *UserScope) openScopeFull(root *os.Root, wrap func() (keys, error)) (*op
 	}()
 	ku, gen, err := u.readScopeKey(dir, wrap)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, u.lostScopeKey(dir, err)
 	}
 	uk, err := deriveKeys(ku, u.scope)
 	dk := deliveriesKey(ku, u.scope)
@@ -723,6 +723,34 @@ func (u *UserScope) openScopeFull(root *os.Root, wrap func() (keys, error)) (*op
 	}
 	ok = true
 	return &openedScope{dir: dir, key: dk, gen: gen, uk: uk}, entries, nil
+}
+
+// lostScopeKey is err, from reading dir's scope.key, made an incomplete
+// scope (ScopeIncomplete) when it is errNoScopeKey and dir's entries/
+// holds a name: the scope lost its key, and a mint over it would orphan
+// those entries, so it is neither a uid with no scope yet nor mintable
+// (checkMintable refuses it the same way). An entries/ that is empty, with
+// or without a deliveries record, is what a mint that crashed before its
+// scope.key leaves, and stays errNoScopeKey; so does an entries/ that does
+// not open as the store's, which a mint would judge itself.
+func (u *UserScope) lostScopeKey(dir *os.Root, err error) error {
+	if !errors.Is(err, errNoScopeKey) {
+		return err
+	}
+	entries, oerr := u.s.openSubdir(dir, scopeEntriesName, false)
+	if oerr != nil {
+		return err
+	}
+	defer func() { _ = entries.Close() }() // read-only
+	f, oerr := entries.Open(".")
+	if oerr != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }() // read-only
+	if names, _ := f.Readdirnames(1); len(names) == 0 {
+		return err
+	}
+	return incompleteScope(fmt.Errorf("%w: entries/ holds names and there is no scope key; restore scope.key", ErrScopeAbsent))
 }
 
 // openScopeDir opens .user/<uid>/ under root, each level with openSubdir,

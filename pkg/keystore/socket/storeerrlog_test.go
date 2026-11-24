@@ -576,6 +576,61 @@ func TestNotFoundDamageLogged(t *testing.T) {
 			})
 		}
 	})
+	t.Run("entries with no scope key", func(t *testing.T) {
+		var c logCapture
+		r := newOpsRig(t, nil)
+		h, err := NewOpsHandler(time.Now, r.b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.log = c.logger()
+		w := dialOps(t, h, uidA)
+		w.mustReply(t, hdr(t, OpPut, entryOf(uidA, "a"), nil), secretValue, nil)
+		// Removing scope.key in place leaves every other file, and its
+		// owner, as the store wrote it.
+		if err := os.Remove(filepath.Join(scopeDir(r.data, uidA), "scope.key")); err != nil {
+			t.Fatal(err)
+		}
+		reads := []struct {
+			op, entry string
+			value     []byte
+		}{
+			{OpReadForExec, entryOf(uidA, "a"), nil},
+			{OpList, "", nil},
+			{OpRotate, entryOf(uidA, "a"), []byte("v2")},
+			{OpRm, entryOf(uidA, "a"), nil},
+		}
+		for _, rd := range reads {
+			for range 2 {
+				if code := codeOf(t, w.call(t, hdr(t, rd.op, rd.entry, nil), rd.value)); code != CodeNotFound {
+					t.Fatalf("%s of a scope whose entries have no scope key: code %q, want not-found", rd.op, code)
+				}
+			}
+		}
+		recs := c.records(t)
+		if len(recs) != len(reads) {
+			t.Fatalf("two of each op over entries with no scope key logged %v, want one line an op", recs)
+		}
+		for i, rd := range reads {
+			checkStoreErrorLine(t, recs[i], rd.op, uidA, rd.entry, DamageScopeIncomplete, 0)
+		}
+		// A uid with no scope at all is not damage: nothing is logged, and
+		// its list is empty.
+		wb := dialOps(t, h, uidB)
+		var lr ListReply
+		wb.mustReply(t, hdr(t, OpList, "", nil), nil, &lr)
+		if len(lr.Entries) != 0 {
+			t.Fatalf("a uid with no scope listed %+v", lr.Entries)
+		}
+		for _, op := range []string{OpReadForExec, OpRm} {
+			if code := codeOf(t, wb.call(t, hdr(t, op, entryOf(uidB, "a"), nil), nil)); code != CodeNotFound {
+				t.Fatalf("%s for a uid with no scope: code %q, want not-found", op, code)
+			}
+		}
+		if n := len(c.records(t)); n != len(reads) {
+			t.Fatalf("a uid with no scope logged %v", c.records(t)[len(reads):])
+		}
+	})
 	t.Run("an entry with no pointer", func(t *testing.T) {
 		var c logCapture
 		r := newOpsRig(t, nil)
