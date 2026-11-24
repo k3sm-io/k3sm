@@ -62,15 +62,20 @@ func TestUserScopeOffWhileMergePending(t *testing.T) {
 	if err := u.Withdraw(ctx, "00000000-0000-4000-8000-000000000000"); !errors.Is(err, errMergePending) {
 		t.Fatalf("a user withdraw with a restore staged: %v, want errMergePending", err)
 	}
+	// Reads are refused too (readScopeHeld), so what the refused writes
+	// left is read once the merge has run.
+	if _, _, err := u.Current(ctx, "user/1001/a"); !errors.Is(err, errMergePending) {
+		t.Fatalf("a user read with a restore staged: %v, want errMergePending", err)
+	}
+
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); err != nil {
+		t.Fatalf("keys floor merge: %v", err)
+	}
 	if v, val, err := u.Current(ctx, "user/1001/a"); err != nil || v.Version != 1 || string(val) != "v1" {
 		t.Fatalf("a after the refused writes: %+v %q %v, want version 1 unchanged", v, val, err)
 	}
 	if _, _, err := u.Current(ctx, "user/1001/b"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("b after the refused put: %v, want ErrNotFound", err)
-	}
-
-	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); err != nil {
-		t.Fatalf("keys floor merge: %v", err)
 	}
 	if err := s.StartUserScopes(ctx); err != nil {
 		t.Fatalf("the start step after the merge: %v", err)

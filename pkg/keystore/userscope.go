@@ -631,8 +631,8 @@ var errReadAuditRefused = errors.New("the audit line could not be written, so th
 // cannot be appended is refused (errReadAuditRefused), and so is a
 // scope-absent one, which a list serves as empty; any other refused read's
 // line is written best effort, with the refusal's result. While a restore
-// is staged (userWriteAllowed) it is refused with errMergePending before
-// the scope is opened, and audited as refused.
+// is staged it is refused with errMergePending before the scope is opened
+// (readScopeHeld), and audited as refused.
 func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Root, keys) error) error {
 	if err := u.s.checkConfig(); err != nil {
 		return err
@@ -652,23 +652,9 @@ func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Ro
 	if err := u.s.admit(u.uid, false); err != nil {
 		return err
 	}
-	// A staged restore refuses the read as it refuses a write
-	// (userWriteAllowed): until keys floor merge has run, the restored
-	// floor lacks every deletion since the backup, so a value revoked since
-	// then could be served. The refusal is audited like any refused read.
-	err = u.userWriteAllowed()
-	var (
-		o       *openedScope
-		entries *os.Root
-	)
-	if err == nil {
-		o, entries, err = u.openScopeFull(root, u.s.loadMaster)
-	}
-	if err == nil {
-		err = fn(entries, o.uk)
-		_ = entries.Close() // read-only; nothing to flush
-		o.close()
-	}
+	// The staged-restore guard is readScopeHeld's, so a refused read is
+	// audited like any refused read.
+	err = u.readScopeHeld(root, func(entries *os.Root, o *openedScope) error { return fn(entries, o.uk) })
 	l.result = auditResult(err)
 	// A scope-absent answer is served as an empty list (the socket's list),
 	// so a read whose line failed is refused then too, never served with
@@ -686,7 +672,9 @@ func (u *UserScope) read(ctx context.Context, fn func(*os.Root, keys) error) err
 	return u.readScope(ctx, func(entries *os.Root, o *openedScope) error { return fn(entries, o.uk) })
 }
 
-// readScope is read, giving fn the opened scope.
+// readScope is read, giving fn the opened scope. It is the one way a user
+// read reaches the scope (readScopeHeld), so every reader, audited or not,
+// carries the staged-restore guard.
 func (u *UserScope) readScope(ctx context.Context, fn func(*os.Root, *openedScope) error) error {
 	if err := u.s.checkConfig(); err != nil {
 		return err
@@ -703,6 +691,19 @@ func (u *UserScope) readScope(ctx context.Context, fn func(*os.Root, *openedScop
 		return err
 	}
 	defer done()
+	return u.readScopeHeld(root, fn)
+}
+
+// readScopeHeld is a user read's work under the shared lock: the choke
+// point every user reader (readScope, auditedRead) goes through. While a
+// restore is staged it refuses with errMergePending before the scope is
+// opened (userWriteAllowed): until keys floor merge has run, the restored
+// floor lacks every deletion since the backup, so a value or delivery
+// revoked since then could be served.
+func (u *UserScope) readScopeHeld(root *os.Root, fn func(*os.Root, *openedScope) error) error {
+	if err := u.userWriteAllowed(); err != nil {
+		return err
+	}
 	o, entries, err := u.openScopeFull(root, u.s.loadMaster)
 	if err != nil {
 		return err

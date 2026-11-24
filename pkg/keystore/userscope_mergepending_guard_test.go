@@ -100,3 +100,36 @@ func TestUserReadsRefusedWhileMergePending(t *testing.T) {
 		t.Fatalf("exec-read after the merge: %q %v, want v1", val, err)
 	}
 }
+
+// TestUserScopeCurrentAndDeliveryRefusedWhileMergePending: the staged-
+// restore guard sits at the read choke point (readScopeHeld), so the
+// unaudited readers, Current and Delivery (lookupDelivery), are refused
+// with errMergePending as the audited ones are, and served again once
+// keys floor merge has run.
+func TestUserScopeCurrentAndDeliveryRefusedWhileMergePending(t *testing.T) {
+	ctx := context.Background()
+	s, server, u := newDeliveryScope(t)
+	d := testDelivery(1)
+	if err := u.Deliver(ctx, exportDelivery(d)); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	userPut(t, u, "user/1001/a", "v1")
+	aside := maps.Clone(floorOf(t, server))
+	aside["gone"] = floorEntry{Buried: []burial{{Generation: mgen(100), Deleted: 1}}}
+	writeAsideFloor(t, server, aside)
+	if _, val, err := u.Current(ctx, "user/1001/a"); !errors.Is(err, errMergePending) || val != nil {
+		t.Fatalf("Current with a restore staged: %q %v, want errMergePending and no value", val, err)
+	}
+	if _, err := u.Delivery(ctx, d.uid); !errors.Is(err, errMergePending) {
+		t.Fatalf("Delivery with a restore staged: %v, want errMergePending", err)
+	}
+	if _, err := mergeStaged(t, s, ctx, MergeOptions{}); err != nil {
+		t.Fatalf("keys floor merge: %v", err)
+	}
+	if _, val, err := u.Current(ctx, "user/1001/a"); err != nil || string(val) != "v1" {
+		t.Fatalf("Current after the merge: %q %v, want v1", val, err)
+	}
+	if _, err := u.Delivery(ctx, d.uid); err != nil {
+		t.Fatalf("Delivery after the merge: %v", err)
+	}
+}

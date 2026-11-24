@@ -1549,11 +1549,13 @@ under the store lock (`userWriteAllowed`) and refuses with it, changing no entry
 nothing but its one refused audit line, as every user refusal is audited; the refusal's text
 says so (`TestMergePendingRefusalSaysWhatItWrote`). The guard fails closed: a store with no data
 root, where `MergePending` is nil because no floor is configured, is refused by it as an
-invalid configuration rather than let through (`TestUserWriteGuardFailsClosed`). The reads
-the socket serves, `list` and exec-read (both through `auditedRead`), ask the same guard under
-the shared lock before the scope is opened and are refused with `errMergePending`, audited as
-refused, so the gate does not rest on the start step and the recipe's `k3sm stop` alone
-(`TestUserReadsRefusedWhileMergePending`)
+invalid configuration rather than let through (`TestUserWriteGuardFailsClosed`). Every user
+read asks the same guard at its one choke point (`readScopeHeld`), under the shared lock before
+the scope is opened, and is refused with `errMergePending`: the reads the socket serves, `list`
+and exec-read (both through `auditedRead`), audited as refused, and the unaudited readers,
+`Current` and `Delivery`, too, so the gate does not rest on the start step and the recipe's
+`k3sm stop` alone (`TestUserReadsRefusedWhileMergePending`,
+`TestUserScopeCurrentAndDeliveryRefusedWhileMergePending`)
 (`TestUserScopeOffWhileMergePending`, `TestUserScopeDeliverRefusedWhileMergePending`,
 `TestKeystoreListenerOffWhileMergePending`). The guard's limit: it holds from the moment the
 marker exists, not before. The root verbs ask it through the data-root descriptor `keystore-lock`
