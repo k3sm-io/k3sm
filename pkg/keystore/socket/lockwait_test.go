@@ -190,3 +190,74 @@ func TestAbandonedLockWaitsBounded(t *testing.T) {
 		}
 	})
 }
+
+// TestLockWaitSlotsReservedUpFront: requests arriving together against a
+// lock that ignores its context cannot all pass the bound. At most
+// MaxAbandonedLockWaits lock calls are ever outstanding, the rest are busy
+// at once without calling lock, and the count returns to zero when the
+// abandoned calls return.
+func TestLockWaitSlotsReservedUpFront(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const requests = 3 * MaxAbandonedLockWaits
+		var slots atomic.Int32
+		l := &heldLock{free: make(chan struct{}), ignoreCtx: true}
+		var calls, outstanding, peak atomic.Int32
+		lock := func(ctx context.Context) (func(), error) {
+			calls.Add(1)
+			n := outstanding.Add(1)
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+			defer outstanding.Add(-1)
+			return l.lock(ctx)
+		}
+		type result struct {
+			err   error
+			after time.Duration
+		}
+		results := make(chan result, requests)
+		start := time.Now()
+		for range requests {
+			go func() {
+				err := withStoreLock(t.Context(), lock, func() error { return nil }, &slots)
+				results <- result{err, time.Since(start)}
+			}()
+		}
+		synctest.Wait()
+		if got := len(results); got != requests-MaxAbandonedLockWaits {
+			t.Fatalf("%d requests answered at once, want %d busy without a wait", got, requests-MaxAbandonedLockWaits)
+		}
+		for range requests - MaxAbandonedLockWaits {
+			r := <-results
+			if !errors.Is(r.err, ErrBusy) || r.after != 0 {
+				t.Fatalf("request = %v after %v, want busy at once", r.err, r.after)
+			}
+		}
+		if got := calls.Load(); got != MaxAbandonedLockWaits {
+			t.Fatalf("lock called %d times, want %d", got, MaxAbandonedLockWaits)
+		}
+		for range MaxAbandonedLockWaits {
+			r := <-results
+			if !errors.Is(r.err, ErrBusy) || r.after != LockWait {
+				t.Fatalf("waiting request = %v after %v, want busy after %v", r.err, r.after, LockWait)
+			}
+		}
+		if got := slots.Load(); got != MaxAbandonedLockWaits {
+			t.Fatalf("%d slots held while the lock calls are abandoned, want %d", got, MaxAbandonedLockWaits)
+		}
+		close(l.free)
+		synctest.Wait()
+		if got := slots.Load(); got != 0 {
+			t.Fatalf("%d slots held after the abandoned calls returned, want 0", got)
+		}
+		if got := peak.Load(); got > MaxAbandonedLockWaits {
+			t.Fatalf("%d lock calls outstanding at once, want at most %d", got, MaxAbandonedLockWaits)
+		}
+		if got := l.unlocked.Load(); got != MaxAbandonedLockWaits {
+			t.Fatalf("%d late locks released, want %d", got, MaxAbandonedLockWaits)
+		}
+	})
+}
