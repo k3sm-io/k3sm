@@ -213,6 +213,10 @@ type FileStore struct {
 	// (uidShare); logAllowance is each uid's reconciler allowance per log,
 	// logReconcilerAllowance, which only a test lowers.
 	logUIDShare, logAllowance int64
+	// configHardCap is the hard cap Config named (its default when it
+	// named none), against which checkConfig judges the effective share,
+	// the default included, of a Config that names no share.
+	configHardCap int64
 	// userScopesStarted is set by startUserScopes once the server's
 	// user-scope start step has run; until then UserScope refuses
 	// (errUserScopesNotStarted). A pointer, so a copy of the store shares
@@ -268,6 +272,7 @@ func New(cfg Config) *FileStore {
 		logHardCap:      orDefault(cfg.LogHardCap, defaultLogHardCap),
 		logRevokeBudget: orDefault(cfg.LogRevocationBudget, defaultLogRevocationBytes),
 		logUIDShare:     cfg.LogUIDShare,
+		configHardCap:   orDefault(cfg.LogHardCap, defaultLogHardCap),
 		logAllowance:    logReconcilerAllowance,
 
 		userScopesStarted: new(atomic.Bool),
@@ -323,6 +328,11 @@ func (s *FileStore) checkConfig() error {
 		// A share over 1/16 of the hard cap would let fewer than 16 uids
 		// fill a log for everyone.
 		return fmt.Errorf("%w: LogUIDShare %d is over LogHardCap / %d, %d", errInvalidConfig, s.logUIDShare, logUIDShareDivisor, s.logHardCap/logUIDShareDivisor)
+	case s.logUIDShare == 0 && s.uidShare() > s.configHardCap/logUIDShareDivisor:
+		// The effective share is judged too: a Config that names a hard
+		// cap and no share gets the default share, which must fit the
+		// same 1/16 of that cap.
+		return fmt.Errorf("%w: the default per-uid log share %d (LogUIDShare unset) is over LogHardCap / %d, %d", errInvalidConfig, s.uidShare(), logUIDShareDivisor, s.configHardCap/logUIDShareDivisor)
 	case s.logRevokeBudget < minLogRevokeBudget:
 		// A budget under one worst-case burial plus its audit line refuses
 		// an rm's tombstones or its audit line, so it would silently

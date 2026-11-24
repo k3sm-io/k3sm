@@ -389,8 +389,8 @@ func TestLogSharePerUIDRefusesOnlyThatUID(t *testing.T) {
 }
 
 // TestLogShareAtMostOneSixteenthOfHardCap (U51): the share is a fixed byte
-// count of at most 1/16 of the hard cap. A share above it refuses the
-// start step, and the socket then answers user-scope-off; at 1/16 the
+// count of at most 1/16 of the hard cap, the default share when none is
+// set included. A share above it refuses the start step, and the socket then answers user-scope-off; at 1/16 the
 // store starts, and the uid's lines stop within that many bytes.
 func TestLogShareAtMostOneSixteenthOfHardCap(t *testing.T) {
 	const hardCap = 16 * testShare
@@ -412,6 +412,17 @@ func TestLogShareAtMostOneSixteenthOfHardCap(t *testing.T) {
 	}
 	if code, _ := over.connect(t, uidA).do(t, "put", entryOf(uidA, "a"), []byte("v")); code != CodeUserScopeOff {
 		t.Fatalf("a put on a store whose start refused its share = %q, want user-scope-off", code)
+	}
+	// The share judged is the effective one: with no LogUIDShare, the
+	// default share over 1/16 of a small hard cap refuses the start step
+	// too, and the default caps, share and hard cap both unset, start.
+	unset := newStoreRigWith(t, func(c *keystore.Config) { bridgeConfig(0, 0)(c); caps(0)(c) })
+	if err := unset.fs.StartUserScopes(t.Context()); err == nil {
+		t.Fatalf("the start step took the default share over 1/16 of a hard cap of %d", hardCap)
+	}
+	defaults := newStoreRigWith(t, bridgeConfig(0, 0))
+	if err := defaults.fs.StartUserScopes(t.Context()); err != nil {
+		t.Fatalf("the start step refused the default share and hard cap: %v", err)
 	}
 	r := newBridgeRig(t, caps(hardCap/16), &fixedClock{step: time.Second})
 	if err := r.fs.StartUserScopes(t.Context()); err != nil {
