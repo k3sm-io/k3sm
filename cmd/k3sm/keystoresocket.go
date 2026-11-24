@@ -393,7 +393,7 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 // storeDirRepair is the remedy a refused store directory names
 // (keystore.StoreDirRefused): the server creates a missing one, but never
 // repairs one that exists.
-const storeDirRepair = "the server never repairs an existing store directory: as root, make it the service user's at mode 0700, or remove it if it holds nothing, and the next start check creates it"
+const storeDirRepair = "the server never repairs an existing store directory: as root, make it the service user's at mode 0700 with no extended ACL, or remove it if it holds nothing, and the next start check creates it"
 
 // storeDirRaceText is what the one-pass errors of the race with a root put
 // name (keystore.StoreDirRace): nothing to repair, the next pass retries.

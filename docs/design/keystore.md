@@ -4335,9 +4335,11 @@ directory is root's"). A worker node runs no listener (E18).
   creates it with the store's own helper, the one a first `keys put` uses (`mkdirOwned`: the
   service user's, 0700, any inherited ACL removed, `server/` fsynced). A directory that exists
   is judged as every open of the store judges it (a directory, the service user's, granting
-  nothing to group or others), and one that fails is never repaired: the listener stays off as
+  nothing to group or others), and as carrying no extended ACL, read on the opened directory's
+  descriptor with the check `pre-restore.d` gets (`judgeDirACL`), and one that fails is never repaired: the listener stays off as
   `the store directory is missing or refused`, with the open's refusal and its repair (as root,
-  make it the service user's at 0700, or remove it if it holds nothing), on every pass. So a
+  make it the service user's at 0700 with no extended ACL, or remove it if it holds nothing), on
+  every pass. So a
   fresh install's user scope comes up without a root `keys put`. Only the installed server
   creates it: the step runs after the effective-uid check, and a worker builds no listener. A
   root `put` racing the step is safe: whichever `mkdir` lands first makes the directory and the
@@ -4348,8 +4350,9 @@ directory is root's"). A worker node runs no listener (E18).
   handover cannot; or a directory the server has just made already holds a name a racing put
   wrote, `ErrCorrupt` "is not empty") name no repair: they say `a root keys put may be creating
   it; retried` (`keystore.StoreDirRace`). Only a refusal of an existing directory on what it is
-  (not a directory, its owner, its mode: `keystore.StoreDirRefused`) names the repair
-  (`TestStoreDirRaceTextIsTransient`, `TestEnsureDirClassifiesRefusals`).
+  (not a directory, its owner, its mode, an extended ACL: `keystore.StoreDirRefused`) names the
+  repair (`TestStoreDirRaceTextIsTransient`, `TestEnsureDirClassifiesRefusals`,
+  `TestEnsureDirRefusesExtendedACL`).
   Doctor runs the same judgement read-only: before the server's first start it shows the
   user scope off for the store directory, saying the server creates it at start.
   Nothing is opened on the data root before its mount flags and the installed files are

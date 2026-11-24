@@ -184,8 +184,9 @@ its `keystore-user-scope` row says only what it can check:
   for `the store directory is missing or refused` it shows why: before the server's first start
   there is no `/var/lib/k3sm/server/keystore/` yet, and the row says the server creates the store
   directory at start; once the server has started, the row passes. A directory that is there but
-  not the server's user's at mode 0700 is refused, by the server and by `doctor`, and the server
-  never repairs it: as root, make it the server's user's at 0700, or remove it if it holds
+  not the server's user's at mode 0700, or that carries an extended ACL, is refused, by the server
+  and by `doctor`, and the server never repairs it: as root, make it the server's user's at 0700
+  with no ACL (`sudo chmod -N` on it removes one), or remove it if it holds
   nothing, and the server creates it again;
   `the service uid is in the login range` means the service user's uid is 501 or above, where
   login users' uids start, and the listener does not start until the service user is a system

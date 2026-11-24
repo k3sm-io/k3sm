@@ -551,7 +551,7 @@ func readDirEntries(root *os.Root, max int) ([]fs.DirEntry, error) {
 // helper a first put uses (mkdirOwned: the service user's, at dirMode, any
 // inherited extended ACL removed, its parent fsynced), and then judges it as
 // every open does (openDir: a directory, the store's uid's, granting nothing
-// to group or others). An existing directory is only judged: one that fails
+// to group or others), and as carrying no extended ACL (judgeDirACL). An existing directory is only judged: one that fails
 // is refused with the open's text and left as it is, never repaired. The
 // server runs it before its log reopen, which takes the store lock, whose
 // file is in this directory.
@@ -564,7 +564,7 @@ func readDirEntries(root *os.Root, max int) ([]fs.DirEntry, error) {
 // next pass finds the directory handed over.
 //
 // Its error says which: StoreDirRefused for an existing directory refused
-// on what it is (not a directory, its owner, its mode), which every pass
+// on what it is (not a directory, its owner, its mode, an extended ACL), which every pass
 // refuses again until it is changed, and StoreDirRace for the one-pass
 // errors of that race (the directory cannot be opened, as one root owns
 // before its handover cannot; or a directory just made already holds a
@@ -587,6 +587,9 @@ func (s *FileStore) EnsureDir() error {
 		return err
 	}
 	root, err := s.openDir(s.dir, false)
+	if err == nil {
+		err = closeAfter(root, judgeDirACL(root, s.dir))
+	}
 	if err != nil {
 		var refused *dirRefusal
 		switch {
@@ -597,7 +600,37 @@ func (s *FileStore) EnsureDir() error {
 		}
 		return err
 	}
-	return root.Close()
+	return nil
+}
+
+// judgeDirACL refuses (dirRefusal) the store directory root holds when it
+// carries an extended ACL, which can grant past the mode openDir judged, as
+// pre-restore.d's is refused (floor_merge_stage.go). It is read on a
+// descriptor of the opened directory, so a name swapped after the open
+// changes nothing. A directory mkdirOwned has just made carries none: it
+// removes any inherited one.
+func judgeDirACL(root *os.Root, path string) error {
+	d, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }() // read-only; nothing to flush
+	switch acl, err := hasExtendedACL(int(d.Fd())); {
+	case err != nil:
+		return fmt.Errorf("%s: %w", path, err)
+	case acl:
+		return &dirRefusal{fmt.Errorf("%s has an extended ACL, which can grant past its mode (sudo chmod -N %s removes it)", path, path)}
+	}
+	return nil
+}
+
+// closeAfter closes root once err, the judgement made on it, is known, and
+// returns err, or the close's error when err is nil.
+func closeAfter(root *os.Root, err error) error {
+	if cerr := root.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // storeDirError is an EnsureDir error marked as a refusal of the existing
@@ -612,9 +645,9 @@ func (e *storeDirError) Error() string { return e.err.Error() }
 func (e *storeDirError) Unwrap() error { return e.err }
 
 // StoreDirRefused reports whether err, from EnsureDir, refuses an existing
-// store directory on what it is: not a directory, another owner, or a mode
-// granting group or others anything. Only a change to the directory clears
-// it.
+// store directory on what it is: not a directory, another owner, a mode
+// granting group or others anything, or an extended ACL. Only a change to
+// the directory clears it.
 func StoreDirRefused(err error) bool {
 	var e *storeDirError
 	return errors.As(err, &e) && !e.race
@@ -646,7 +679,7 @@ func (s *FileStore) CheckDir() error {
 	if err != nil {
 		return err
 	}
-	return root.Close()
+	return closeAfter(root, judgeDirACL(root, s.dir))
 }
 
 // openLocked opens the entries' directory, creating it with create set, and
