@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"k3sm.io/runtimed/pkg/keystorepaths"
 )
@@ -120,8 +121,9 @@ var podProfileDenies = []struct {
 // so a literal, prefix or regex filter, or one under require-any or
 // require-all, never covers the socket's directory; paths are compared as
 // text in the spellings socketDirForms writes, with no symlink resolved;
-// and a regex is judged by the strings it matches (foldsPrefix), not by
-// how SBPL would read it.
+// and a regex counts only in the generator's own shape, read by structure
+// (foldsPrefix), so the check never depends on how either regex engine
+// would read anything else.
 func ProfileDeniesSocket(profile, socketPath string) error {
 	if !filepath.IsAbs(socketPath) {
 		return fmt.Errorf("%w: the socket path %q is not absolute", ErrPodProfileOpen, socketPath)
@@ -184,14 +186,18 @@ func covers(filter sexp, unix bool, dir string) bool {
 
 // foldsPrefix reports whether filter is (regex #"^R/X"), or with unix set
 // (remote unix-socket (regex ...)), where R is root as regexp.QuoteMeta
-// writes it and X, read as a Go regexp anchored at its start, matches every
-// spelling the data volume folds onto keystorepaths.DataRootPrefix that it
-// probes (prefixFoldings, then prefixMixedCase) with a path after it, as
-// the socket's own name is (keystorepaths.DataRootPrefix + probePath), and
-// not the prefix with its first letter changed. So a regex anchored at
-// its end ($) after the prefix, or an alternation of only the spellings
-// probed one letter at a time, does not count; nor does one that does not
-// compile, or one written another way.
+// writes it and X is, exactly, the shape the runtime's generator writes for
+// keystorepaths.DataRootPrefix (runtimed keystorePrefixPattern): one group
+// per letter, in order and nothing after them, each holding exactly that
+// letter's unicode.SimpleFold orbit (foldGroup). It is checked on the text,
+// by structure, not by sampling strings: Seatbelt's regex dialect is not
+// Go's (it takes no \x{...} escape, may read a class holding a multi-byte
+// character as a class of its bytes, and differs on top-level alternation),
+// so a regex is accepted only in the narrow grammar whose meaning the two
+// dialects share, and anything else, however Go would read it, is refused.
+// What this proves is that the profile carries the generator's fold for
+// every letter; it does not test that Seatbelt enforces it, which only a
+// sandboxed run can.
 func foldsPrefix(filter sexp, unix bool, root string) bool {
 	if unix {
 		if len(filter.list) != 3 || filter.list[0].atom != "remote" || filter.list[1].atom != "unix-socket" {
@@ -206,55 +212,93 @@ func foldsPrefix(filter sexp, unix bool, root string) bool {
 	if !ok {
 		return false
 	}
-	re, err := regexp.Compile("^(?:" + rest + ")")
-	if err != nil {
-		return false
-	}
-	for _, name := range append(prefixFoldings(), prefixMixedCase()...) {
-		if !re.MatchString(name + probePath) {
+	for _, r := range keystorepaths.DataRootPrefix {
+		if rest, ok = foldGroup(rest, foldOrbit(r)); !ok {
 			return false
 		}
 	}
-	return !re.MatchString("x" + keystorepaths.DataRootPrefix[1:] + probePath)
+	return rest == ""
 }
 
-// probePath is what foldsPrefix appends to each spelling it probes: the
-// rest of the socket's path under a keystore- directory, so a regex must
-// match the names under the prefix, not the prefix alone.
-const probePath = "sock/keys.sock"
-
-// prefixMixedCase returns keystorepaths.DataRootPrefix with two or more
-// letters changed at once, which no single-letter folding (prefixFoldings)
-// probes: its first two letters upper case ("KEystore-") and every other
-// letter upper case from the second ("kEyStOrE-").
-func prefixMixedCase() []string {
-	prefix := []rune(keystorepaths.DataRootPrefix)
-	firstTwo, alternate := slices.Clone(prefix), slices.Clone(prefix)
-	for i := range prefix {
-		if i < 2 {
-			firstTwo[i] = unicode.ToUpper(prefix[i])
-		}
-		if i%2 == 1 {
-			alternate[i] = unicode.ToUpper(prefix[i])
-		}
+// foldOrbit returns r's unicode.SimpleFold orbit, r first.
+func foldOrbit(r rune) []rune {
+	orbit := []rune{r}
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		orbit = append(orbit, f)
 	}
-	return []string{string(firstTwo), string(alternate)}
+	return orbit
 }
 
-// prefixFoldings returns keystorepaths.DataRootPrefix in lower and upper
-// case, and with each letter in turn replaced by every rune that folds onto
-// it (unicode.SimpleFold: K for k is U+212A, s also U+017F).
-func prefixFoldings() []string {
-	prefix := []rune(keystorepaths.DataRootPrefix)
-	out := []string{string(prefix), strings.ToUpper(string(prefix))}
-	for i, r := range prefix {
-		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-			spelled := slices.Clone(prefix)
-			spelled[i] = f
-			out = append(out, string(spelled))
-		}
+// regexMeta are the bytes regexp.QuoteMeta escapes, the only ones a
+// literal may be written escaped.
+const regexMeta = `\.+*?()|[]{}^$`
+
+// foldGroup reads, from the start of s, one letter's group in the
+// generator's grammar and reports whether it holds exactly orbit, each
+// spelling once, returning the rest of s. The group is one of:
+//   - a literal, for an orbit of one: the rune itself, or a backslash and
+//     the rune where it is one of regexMeta;
+//   - a class [ab], for an orbit of ASCII runes only: no escape, range,
+//     negation or byte outside ASCII inside the brackets;
+//   - an alternation (a|b|c) of literal single runes: no (? group syntax,
+//     no escape, nothing nested.
+func foldGroup(s string, orbit []rune) (string, bool) {
+	if s == "" {
+		return "", false
 	}
-	return out
+	switch s[0] {
+	case '[':
+		end := strings.IndexByte(s, ']')
+		if end < 0 {
+			return "", false
+		}
+		body := s[1:end]
+		for i := 0; i < len(body); i++ {
+			if c := body[i]; c >= utf8.RuneSelf || c == '\\' || c == '-' || c == '^' || c == '[' {
+				return "", false
+			}
+		}
+		return s[end+1:], sameSpellings(strings.Split(body, ""), orbit)
+	case '(':
+		end := strings.IndexByte(s, ')')
+		if end < 0 || strings.HasPrefix(s, "(?") {
+			return "", false
+		}
+		alts := strings.Split(s[1:end], "|")
+		for _, a := range alts {
+			if strings.ContainsAny(a, regexMeta) {
+				return "", false
+			}
+		}
+		return s[end+1:], sameSpellings(alts, orbit)
+	case '\\':
+		if len(s) < 2 || !strings.ContainsRune(regexMeta, rune(s[1])) || len(orbit) != 1 || rune(s[1]) != orbit[0] {
+			return "", false
+		}
+		return s[2:], true
+	}
+	r, n := utf8.DecodeRuneInString(s)
+	if r == utf8.RuneError || strings.ContainsRune(regexMeta, r) || len(orbit) != 1 || r != orbit[0] {
+		return "", false
+	}
+	return s[n:], true
+}
+
+// sameSpellings reports whether spellings, each one whole rune, are orbit's
+// runes, each exactly once.
+func sameSpellings(spellings []string, orbit []rune) bool {
+	if len(spellings) != len(orbit) {
+		return false
+	}
+	seen := make(map[rune]bool, len(orbit))
+	for _, sp := range spellings {
+		r, n := utf8.DecodeRuneInString(sp)
+		if n == 0 || n != len(sp) || r == utf8.RuneError || seen[r] || !slices.Contains(orbit, r) {
+			return false
+		}
+		seen[r] = true
+	}
+	return true
 }
 
 // opsOverlap reports whether an allow of a can re-open a deny of d: the

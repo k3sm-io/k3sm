@@ -2019,19 +2019,28 @@ refuses (as it refuses the node) is the configuration state below, retried
 data root it serves, in each spelling the generator writes (`/var`, `/private/var`,
 `/System/Volumes/Data`), with no overlapping allow after the deny (`socket.ProfileDeniesSocket`),
 and, for the same operations and every spelling of the data root, a deny carrying the
-case-folding `regex` filter the generator writes for the data root's `keystore-` names (one that
-matches `keystore-`, `KEYSTORE-`, each spelling with a letter replaced by a rune the data volume
-folds onto it, U+212A for `k` and U+017F for `s`, and the mixed-case `KEystore-` and `kEyStOrE-`,
-each with a path after it, `keystore-sock/keys.sock`, and not `xeystore-sock/keys.sock`; so a
-regex ending in `$` after the prefix, or an alternation of only the single-letter spellings, does
-not count): a profile without it fails the check (`TestProfileDeniesSocket`). The check is lexical and narrower than Seatbelt: it reads
+case-folding `regex` filter the generator writes for the data root's `keystore-` names, in the
+generator's own shape and no other: `^<root>/` (the root as `regexp.QuoteMeta` writes it), then
+one group per letter of `keystore-`, in order and with nothing after them, each holding exactly
+that letter's `unicode.SimpleFold` orbit, checked by structure rather than by sampling strings. A
+letter with an orbit of one is the literal (escaped only where `regexp.QuoteMeta` escapes it); an
+ASCII-only orbit may be a class (`[Ee]`) with no escape, range, negation or non-ASCII byte inside
+it; any orbit may be an alternation of single literal runes (`(K|k|K)`, the Kelvin sign U+212A
+written as its UTF-8, and `(S|s|ſ)` with U+017F), with no `(?` syntax and no escape. Seatbelt's
+SBPL regex dialect is not Go's: it takes no `\x{...}` escape, may read a class holding a
+multi-byte character as a class of its bytes, and differs on top-level alternation (runtimed
+`keystorePrefixPattern`). So a `\x`, `\u` or `\p` escape, a `(?` group, a non-ASCII byte inside
+`[...]`, a top-level `|`, a trailing `$`, an alternation of whole spellings, or a group missing
+a fold or carrying a spelling beyond it is refused as `OffPodProfile`, however Go would read it:
+a profile without the shape fails the check (`TestProfileDeniesSocket`). The check is lexical and narrower than Seatbelt: it reads
 top-level `(allow ...)` and `(deny ...)` forms only, so a rule nested in any other form is not
 seen; only an exact `(subpath "P")` filter, bare or under `(remote unix-socket ...)`, covers the
 socket's directory, so a `literal`, `prefix` or `regex` filter, or one under `require-any` or
 `require-all`, does not; paths are compared as text in the spellings above, with no symlink
-resolved; and the `regex` is judged by the strings it matches as a Go regexp, not by how SBPL
-reads it. It proves the text the linked generator renders carries the deny; it does not prove
-what libsandbox enforces. Under `--runtime hostprocess` the check still runs but reads a profile
+resolved; and the `regex` counts only in the shape above, read as text, so the check does not
+depend on how either regex engine reads anything else. Inside that shape, it proves the text the
+linked generator renders carries the deny with every fold of every letter; it does not test
+that Seatbelt enforces it, which only a sandboxed run can. Under `--runtime hostprocess` the check still runs but reads a profile
 no Pod runs under: hostprocess Pods run unconfined, as the server's uid, which the listener
 refuses, so the server's start log says the check does not apply there
 (`notePodProfileCheckScope`, `TestPodProfileCheckScopeLoggedForHostProcess`).

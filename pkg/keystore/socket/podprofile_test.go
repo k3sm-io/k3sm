@@ -32,14 +32,6 @@ const generatorFold = "(K|k|\u212a)[Ee][Yy](S|s|\u017f)[Tt][Oo][Rr][Ee]-"
 // rootForms are the data root's spellings for sock.
 var rootForms = []string{"/var/lib/k3sm", "/private/var/lib/k3sm", "/System/Volumes/Data/private/var/lib/k3sm"}
 
-// TestPrefixMixedCaseProbes: the mixed-case probes change two or more
-// letters at once, which no single-letter folding does.
-func TestPrefixMixedCaseProbes(t *testing.T) {
-	if got, want := prefixMixedCase(), []string{"KEystore-", "kEyStOrE-"}; !slices.Equal(got, want) {
-		t.Fatalf("prefixMixedCase = %q, want %q", got, want)
-	}
-}
-
 // stanzaFor renders a keystore-style deny over dirs: a file deny and a
 // unix connect deny, each with one subpath per dir and the generator's
 // case-folding regex for every spelling of sock's data root.
@@ -115,7 +107,15 @@ func TestProfileDeniesSocket(t *testing.T) {
 		{"a regex that does not fold", allow + stanzaWith(func(root string) string { return "^" + root + "/keystore-" }, allForms...), "case-folding regex"},
 		{"a regex without the Kelvin sign", allow + stanzaWith(func(root string) string { return "^" + root + "/[Kk][Ee][Yy](S|s|\u017f)[Tt][Oo][Rr][Ee]-" }, allForms...), "case-folding regex"},
 		{"a regex anchored at its end after the prefix", allow + stanzaWith(func(root string) string { return "^" + root + "/" + generatorFold + "$" }, allForms...), "case-folding regex"},
-		{"an alternation of the single-letter probes alone", allow + stanzaWith(func(root string) string { return "^" + root + "/(" + strings.Join(prefixFoldings(), "|") + ")" }, allForms...), "case-folding regex"},
+		{"an alternation of whole spellings", allow + stanzaWith(func(root string) string {
+			return "^" + root + "/(keystore-|KEYSTORE-|\u212aeystore-|eystore-|key\u017ftore-)"
+		}, allForms...), "case-folding regex"},
+		{"a \\x{...} escape, which SBPL does not read", allow + stanzaWith(func(root string) string { return "^" + root + `/[Kk\x{212A}][Ee][Yy](S|s|\x{17F})[Tt][Oo][Rr][Ee]-` }, allForms...), "case-folding regex"},
+		{"a class holding a literal Kelvin sign", allow + stanzaWith(func(root string) string { return "^" + root + "/[Kk\u212a][Ee][Yy](S|s|\u017f)[Tt][Oo][Rr][Ee]-" }, allForms...), "case-folding regex"},
+		{"a top-level alternation", allow + stanzaWith(func(root string) string { return "^" + root + "/" + generatorFold + "|zz" }, allForms...), "case-folding regex"},
+		{"an alternation missing one fold", allow + stanzaWith(func(root string) string { return "^" + root + "/(K|k|\u212a)[Ee][Yy](S|s)[Tt][Oo][Rr][Ee]-" }, allForms...), "case-folding regex"},
+		{"an alternation with a spelling beyond the fold", allow + stanzaWith(func(root string) string { return "^" + root + "/(K|k|\u212a)(E|e|q)[Yy](S|s|\u017f)[Tt][Oo][Rr][Ee]-" }, allForms...), "case-folding regex"},
+		{"a group that is not a plain alternation", allow + stanzaWith(func(root string) string { return "^" + root + "/(?i:k)[Ee][Yy](S|s|\u017f)[Tt][Oo][Rr][Ee]-" }, allForms...), "case-folding regex"},
 		{"a regex matching any name", allow + stanzaWith(func(root string) string { return "^" + root + "/" }, allForms...), "case-folding regex"},
 		{"the /private regex missing", allow + stanzaWith(func(root string) string {
 			if root == rootForms[1] {
