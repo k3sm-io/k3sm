@@ -22,9 +22,13 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/keystore/socket"
@@ -116,5 +120,70 @@ func TestKeystoreSocketPathIsThePlists(t *testing.T) {
 	want := keystoreSocketPath("/var/lib/k3sm/server")
 	if want != "/var/lib/k3sm/keystore-sock/keys.sock" || !strings.Contains(plist, "<string>"+want+"</string>") {
 		t.Fatalf("the server requires %s; the plist names it: %v", want, strings.Contains(plist, want))
+	}
+}
+
+// fixedActivator hands out one listening socket at path, then EALREADY.
+type fixedActivator struct {
+	t    *testing.T
+	path string
+	done bool
+}
+
+func (a *fixedActivator) Activate(string) ([]int, error) {
+	if a.done {
+		return nil, unix.EALREADY
+	}
+	a.done = true
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		a.t.Fatal(err)
+	}
+	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: a.path}); err != nil {
+		a.t.Fatal(err)
+	}
+	if err := unix.Listen(fd, 4); err != nil {
+		a.t.Fatal(err)
+	}
+	unix.CloseOnExec(fd)
+	return []int{fd}, nil
+}
+
+// The activation's path check is doctor's rule: a socket at the clients'
+// path that this (non-root) user owns, in its group, is refused as OffActivatedWrong, the
+// descriptor launchd handed over notwithstanding; a missing path and a
+// regular file are refused by the same rule (TestDoctorKeystoreSocketLstat).
+func TestActivationRefusesClientPathNotRoots(t *testing.T) {
+	dir, err := os.MkdirTemp("", "kswd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "keys.sock")
+	act := socket.NewActivation(install.KeystoreSocketsEntry, path, &fixedActivator{t: t, path: path}, checkKeystoreSocketPath)
+	_, err = act.Source()(context.Background())
+	var ae *socket.ActivationError
+	if !errors.As(err, &ae) || ae.Reason != socket.OffActivatedWrong || !errors.Is(err, errNoListeningSocket) {
+		t.Fatalf("got %v, want OffActivatedWrong over doctor's no-listening-socket rule", err)
+	}
+	for _, p := range []string{filepath.Join(dir, "absent"), dir} {
+		if err := checkKeystoreSocketPath(p); !errors.Is(err, errNoListeningSocket) {
+			t.Errorf("%s: %v, want no listening socket", p, err)
+		}
+	}
+}
+
+// The holder records the first work dir; a source asked for another one
+// refuses, terminally, and never hands out the first one's listener.
+func TestKeystoreActivationHolderRefusesAnotherWorkDir(t *testing.T) {
+	var h keystoreActivationHolder
+	first := h.source("/var/lib/k3sm/server", &fixedActivator{t: t, path: "/nonexistent"})
+	_, err := h.source("/Volumes/other/server", &fixedActivator{t: t})(context.Background())
+	var ae *socket.ActivationError
+	if !errors.Is(err, errActivationWorkDir) || !errors.As(err, &ae) || ae.Reason != socket.OffActivatedWrong {
+		t.Fatalf("another work dir: %v, want errActivationWorkDir as OffActivatedWrong", err)
+	}
+	if first == nil || h.source("/var/lib/k3sm/server/", nil) == nil {
+		t.Fatal("the first work dir's source")
 	}
 }

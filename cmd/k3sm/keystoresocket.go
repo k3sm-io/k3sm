@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -498,13 +499,48 @@ func (wallClock) After(d time.Duration) (<-chan time.Time, func() bool) {
 	return t.C, t.Stop
 }
 
-// keystoreActivation is the process's one activation of the keystore
-// socket: launchd hands a job's socket over once (a second
+// keystoreActivationHolder holds the process's one activation of the
+// keystore socket: launchd hands a job's socket over once (a second
 // launch_activate_socket answers EALREADY), so every listener source this
 // process builds shares it, and its socket lives until the process exits.
-var keystoreActivation struct {
-	once sync.Once
-	v    *socket.Activation
+// It records the work dir of the first call; a later call naming another
+// work dir gets a source that refuses, never the first one's listener.
+type keystoreActivationHolder struct {
+	mu      sync.Mutex // guards workDir and v
+	workDir string
+	v       *socket.Activation
+}
+
+// errActivationWorkDir is a listener source asked for a work dir other
+// than the one the process's activation was made for.
+var errActivationWorkDir = errors.New("the keystore socket was activated for another work dir")
+
+// source returns the activation's listener source for workDir, making the
+// activation with a on the first call.
+func (h *keystoreActivationHolder) source(workDir string, a socket.Activator) socket.ListenerSource {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	workDir = filepath.Clean(workDir)
+	if h.v == nil {
+		h.workDir = workDir
+		h.v = socket.NewActivation(install.KeystoreSocketsEntry, keystoreSocketPath(workDir), a, checkKeystoreSocketPath)
+	}
+	if workDir != h.workDir {
+		err := &socket.ActivationError{Reason: socket.OffActivatedWrong, Err: fmt.Errorf("%w: %s, not %s", errActivationWorkDir, workDir, h.workDir)}
+		return func(context.Context) (net.Listener, error) { return nil, err }
+	}
+	return h.v.Source()
+}
+
+// keystoreActivation is the process's holder.
+var keystoreActivation keystoreActivationHolder
+
+// checkKeystoreSocketPath is the activation's check of the path clients
+// connect to: doctor's rule (lstatKeystoreSocket), a root:daemon socket at
+// the plist's mode in a root:wheel 0755 directory, so the descriptor
+// served is tied to a name only root can replace.
+func checkKeystoreSocketPath(path string) error {
+	return lstatKeystoreSocket(path, launchdSocketOwner)
 }
 
 // keystoreSocketListener is the server's listener source: the socket
@@ -512,13 +548,9 @@ var keystoreActivation struct {
 // (install.KeystoreSocketsEntry), through the process's one activation. A
 // server launchd did not start, or whose plist predates the entry, gets
 // socket.ErrNotActivated, and the user scope stays off for the life of the
-// process; the server never binds keys.sock itself. The descriptor must be
-// bound at the keystore socket's path under the work dir's data root.
+// process; the server never binds keys.sock itself.
 func keystoreSocketListener(workDir string) socket.ListenerSource {
-	keystoreActivation.once.Do(func() {
-		keystoreActivation.v = socket.NewActivation(install.KeystoreSocketsEntry, keystoreSocketPath(workDir), socket.LaunchdActivator{})
-	})
-	return keystoreActivation.v.Source()
+	return keystoreActivation.source(workDir, socket.LaunchdActivator{})
 }
 
 // keystoreSocketPath is the keystore socket's path for the server whose

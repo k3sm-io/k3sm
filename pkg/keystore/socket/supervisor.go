@@ -83,15 +83,18 @@ const (
 	// or the job's plist has no Sockets entry; only a new bootstrap of the
 	// job, which install does, can give one.
 	OffNotActivated OffReason = "launchd activated no socket for this server"
-	// OffSocketParentMissing is ENOENT: launchd binds the socket at the
-	// job's activation call, and the socket's parent path was missing then
-	// (a data root on a volume that is not mounted).
-	OffSocketParentMissing OffReason = "the socket's parent path was missing when launchd bound it"
+	// OffSocketParentMissing is ENOENT (<launch.h>: no socket of that name
+	// owned by the caller), measured when deeper levels of the socket's
+	// path are missing at the job's activation call.
+	OffSocketParentMissing OffReason = "the job has a socket entry but launchd could not provide the keys socket: a parent of its path is missing, for example a data root on a volume that is not mounted"
 	// OffAlreadyActivated is EALREADY: this process took the socket before.
 	OffAlreadyActivated OffReason = "launchd already handed this process the socket"
 	// OffActivatedInheritable is a descriptor launchd handed over without
 	// FD_CLOEXEC, closed and refused (ErrActivatedInheritable).
 	OffActivatedInheritable OffReason = "the activated socket arrived without FD_CLOEXEC"
+	// OffActivatedWrong is an activated descriptor, or the socket path
+	// clients connect to, that is not the keystore's (ErrActivatedWrong).
+	OffActivatedWrong OffReason = "the activated socket or its path is not the keystore's"
 )
 
 // The supervisor's log text: every off line starts with offMsg, and the
@@ -103,7 +106,7 @@ const (
 	// for a server with no socket at the path too.
 	NotActivatedRemedy = "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"
 	// ParentMissingRemedy is OffSocketParentMissing's remedy.
-	ParentMissingRemedy = "mount the data root, then run `sudo k3sm restart`"
+	ParentMissingRemedy = "mount the data root, then run `sudo k3sm restart`; if that does not clear it, run `sudo k3sm install`"
 	// RestartRemedy is the remedy of every other terminal activation reason.
 	RestartRemedy = "run `sudo k3sm restart`"
 )
@@ -532,6 +535,8 @@ func (r OffReason) Remedy() string {
 		return ParentMissingRemedy
 	case OffAlreadyActivated, OffActivatedInheritable:
 		return RestartRemedy
+	case OffActivatedWrong:
+		return NotActivatedRemedy
 	}
 	return ""
 }

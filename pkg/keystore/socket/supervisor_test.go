@@ -650,10 +650,11 @@ func TestActivationOutcomesAreTerminal(t *testing.T) {
 		remedy string
 	}{
 		{OffNotActivated, unix.ESRCH, "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"},
-		{OffSocketParentMissing, unix.ENOENT, "mount the data root, then run `sudo k3sm restart`"},
+		{OffSocketParentMissing, unix.ENOENT, "mount the data root, then run `sudo k3sm restart`; if that does not clear it, run `sudo k3sm install`"},
 		{OffAlreadyActivated, unix.EALREADY, "run `sudo k3sm restart`"},
 		{OffActivatedInheritable, ErrActivatedInheritable, "run `sudo k3sm restart`"},
-		{OffListenerUnavailable, ErrActivatedWrong, "run `sudo k3sm restart`"},
+		{OffActivatedWrong, ErrActivatedWrong, "run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)"},
+		{OffListenerUnavailable, unix.EINVAL, "run `sudo k3sm restart`"},
 	} {
 		synctest.Test(t, func(t *testing.T) {
 			r := newSupRig(t, func(c *startChecks) {
