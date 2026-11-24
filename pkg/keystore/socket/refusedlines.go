@@ -138,16 +138,6 @@ func (l *refusedLines) count(uid uint32, n uint64) {
 	rc.dropped += n
 }
 
-// pending is uid's dropped count not yet summarized.
-func (l *refusedLines) pending(uid uint32) uint64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if rc := l.uids[uid]; rc != nil {
-		return rc.dropped
-	}
-	return 0
-}
-
 // expire forgets the lines a window or more old.
 func (rc *refusedCount) expire(now time.Time) {
 	i := 0

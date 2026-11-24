@@ -24,6 +24,16 @@ import (
 	"time"
 )
 
+// pending is uid's dropped count not yet summarized.
+func (l *refusedLines) pending(uid uint32) uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if rc := l.uids[uid]; rc != nil {
+		return rc.dropped
+	}
+	return 0
+}
+
 // refusedOfUID is uid's post-frame refused lines, summaries included.
 func (r *bridgeRig) refusedOfUID(t *testing.T, uid uint32) []auditEntry {
 	t.Helper()
