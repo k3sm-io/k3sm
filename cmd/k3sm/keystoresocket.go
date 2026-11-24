@@ -500,9 +500,9 @@ func (wallClock) After(d time.Duration) (<-chan time.Time, func() bool) {
 }
 
 // keystoreActivationHolder holds the process's one activation of the
-// keystore socket: launchd hands a job's socket over once (a second
-// launch_activate_socket answers EALREADY), so every listener source this
-// process builds shares it, and its socket lives until the process exits.
+// keystore socket: it never calls launch_activate_socket twice (a second
+// call's answer would be <launch.h>'s documented EALREADY, not measured),
+// so every listener source this process builds shares it, and its socket lives until the process exits.
 // It records the work dir of the first call; a later call naming another
 // work dir gets a source that refuses, never the first one's listener.
 type keystoreActivationHolder struct {
@@ -537,8 +537,10 @@ var keystoreActivation keystoreActivationHolder
 
 // checkKeystoreSocketPath is the activation's check of the path clients
 // connect to: doctor's rule (lstatKeystoreSocket), a root:daemon socket at
-// the plist's mode in a root:wheel 0755 directory, so the descriptor
-// served is tied to a name only root can replace.
+// the plist's mode in a root:wheel 0755 directory. It checks that only
+// root could have put a socket at the clients' path; the descriptor's own
+// address is launchd's private bind name, so the descriptor cannot be
+// tied to the path.
 func checkKeystoreSocketPath(path string) error {
 	return lstatKeystoreSocket(path, launchdSocketOwner)
 }
