@@ -83,8 +83,23 @@ func (s *FileStore) RefusedIneligible(ctx context.Context, uid uint32, pid int32
 	if !slices.Contains(refusedOps, op) {
 		return errRefusedField
 	}
-	u := &UserScope{s: s, uid: uid, origin: SocketOrigin(pid)}
-	return u.appendBriefly(ctx, auditLine{op: auditOpRefused, request: op, result: RefusedIneligibleUID})
+	if err := s.checkConfig(); err != nil {
+		return err
+	}
+	_, done, err := s.openLocked(ctx, false, true)
+	if err != nil {
+		return fmt.Errorf("a refused line: %w", err)
+	}
+	defer done()
+	err = s.auditSink.append(auditLine{
+		op:      auditOpRefused,
+		via:     auditViaSocket,
+		caller:  &auditCaller{UID: uid, PID: max(pid, 0)},
+		request: op,
+		result:  RefusedIneligibleUID,
+	})
+	s.audit.note(err)
+	return err
 }
 
 // RefusedDropped appends the summary of n post-frame refused lines of the
