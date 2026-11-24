@@ -93,8 +93,7 @@ func TestRotateAtQuotaNoFullWalk(t *testing.T) {
 
 // The figure each put, rotate and rm keeps is what a walk of the scope
 // counts; a figure bound to another scope.key (one rm-scope removed, or a
-// Rewrap re-sealed) is not trusted, and the judgement under the lock walks
-// again.
+// Rewrap re-sealed) is not trusted, and the scope is walked again.
 func TestUsageFigureMatchesWalk(t *testing.T) {
 	ctx := context.Background()
 	s, u := rotateScope(t)
@@ -122,7 +121,7 @@ func TestUsageFigureMatchesWalk(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		f, err := u.walkUsage(root, false)
+		f, err := u.walkUsage(context.Background(), root, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -136,12 +135,12 @@ func TestUsageFigureMatchesWalk(t *testing.T) {
 	s.usage.byUID[1001].key = sha256.Sum256([]byte("another scope.key"))
 	s.usage.byUID[1001].entries["a"] = 0 // and stale low: never trusted
 	s.usage.mu.Unlock()
-	under, _ := countUsageLstats(s)
+	under, outside := countUsageLstats(s)
 	if _, err := u.Rotate(ctx, "user/1001/a", []byte("four")); err != nil {
 		t.Fatal(err)
 	}
-	if under.Load() == 0 {
-		t.Fatal("a figure bound to another scope.key was trusted: no walk under the lock")
+	if walked(under, outside) == 0 {
+		t.Fatal("a figure bound to another scope.key was trusted: no walk")
 	}
 	if got, want := figure(), walk(); !maps.Equal(got, want) {
 		t.Fatalf("after the re-walk the figure is %v, a walk counts %v", got, want)

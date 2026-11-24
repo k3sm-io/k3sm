@@ -260,13 +260,13 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	}
 	// The entries' directory is never created here: a root put creates it
 	// with the master.
-	u = u.withGUID()
 	unlockUID, err := u.s.usage.lockUID(ctx, u.uid, u.s.lockWait)
 	if err != nil {
 		return Version{}, err
 	}
 	defer unlockUID()
-	u.prepareUsage() // the scope's figure, walked before the store lock
+	u.prepareUsage(ctx) // the scope's figure, walked before the store lock
+	u = u.withGUID()    // then the lookup, so its answer is fresh at the lock
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Version{}, fmt.Errorf("%w: the keystore directory is missing; a root put creates the keystore", ErrMasterMissing)
@@ -329,18 +329,22 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	if err := grant(); err != nil {
 		return Version{}, err
 	}
+	// The figure is out of the table from the mkdir to its update, so a
+	// failure or a panic in between leaves none (usageOp).
+	op := u.s.usage.begin(u.uid)
 	e, err := u.createUserEntry(entries, name)
 	if err != nil {
-		u.s.usage.forget(u.uid) // what the mkdir left is not known
+		if errors.Is(err, ErrExists) {
+			op.confirm(nil) // the mkdir found the entry: nothing written
+		}
 		return Version{}, err
 	}
 	defer e.close()
 	v, err := u.s.writeEntry(e, uk, kind, value)
 	if err != nil {
-		u.s.usage.forget(u.uid)
 		return Version{}, err
 	}
-	u.usageAfterPut(entries, name)
+	u.usageAfterPut(op, entries, name)
 	// The record, the pointer, then the floor line: a crash between the
 	// last two leaves the floor one behind, which a read accepts.
 	if err := u.s.userFloor.append(u.scope, name, e.generation, 1, false); err != nil {

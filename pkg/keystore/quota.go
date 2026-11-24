@@ -47,8 +47,8 @@ const (
 
 // walkScopeEntries is every entry name in entries with its sealed bytes
 // (entryBytes); lstat, when set, is called before each file's Lstat, where
-// a test counts the walk.
-func walkScopeEntries(entries *os.Root, lstat func()) (map[string]int64, error) {
+// a test counts the walk, and a non-nil return stops the walk with it.
+func walkScopeEntries(entries *os.Root, lstat func() error) (map[string]int64, error) {
 	names, err := readDirNames(entries, maxDirNames)
 	if err != nil {
 		return nil, err
@@ -117,7 +117,7 @@ func (u *UserScope) deliveriesBytes(root *os.Root) (int64, error) {
 // entryBytes sums the sizes of the regular files in entries/name, without
 // following a symlink; lstat, when set, is called before each file's
 // Lstat. A name that is not a directory counts nothing.
-func entryBytes(entries *os.Root, name string, lstat func()) (int64, error) {
+func entryBytes(entries *os.Root, name string, lstat func() error) (int64, error) {
 	e, err := openEntryDirRaw(entries, name)
 	if errors.Is(err, ErrNotFound) || errors.Is(err, ErrCorrupt) {
 		return 0, nil
@@ -133,7 +133,9 @@ func entryBytes(entries *os.Root, name string, lstat func()) (int64, error) {
 	var total int64
 	for _, f := range files {
 		if lstat != nil {
-			lstat()
+			if err := lstat(); err != nil {
+				return 0, err
+			}
 		}
 		fi, err := e.root.Lstat(f)
 		if errors.Is(err, fs.ErrNotExist) {
@@ -180,12 +182,12 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
-	u = u.withGUID()
 	unlockUID, err := u.s.usage.lockUID(ctx, u.uid, u.s.lockWait)
 	if err != nil {
 		return err
 	}
 	defer unlockUID()
+	u = u.withGUID() // after the uid's wait, so the answer is fresh at the lock
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -194,22 +196,30 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 		return err
 	}
 	defer done()
-	defer func() { // the scope's figure: the entry removed, or recomputed
-		if err == nil {
-			u.s.usage.update(u.uid, func(m map[string]int64) { delete(m, name) })
-		} else if !errors.Is(err, ErrNotFound) {
-			u.s.usage.forget(u.uid)
-		}
-	}()
 	defer func() { // before done: the line is appended under the lock
 		l := auditLine{op: "rm", name: name, revoke: err == nil || Committed(err)}
 		err = u.keepAuditFailure("rm", err, u.appendAudit(l, err))
 	}()
-	return u.deleteBody(root, name)
+	// The scope's figure is taken out at the first removal from the
+	// entry's tree (mark) and put back, without the entry, only by an rm
+	// that removed it all; an rm that removed nothing from the tree, a
+	// refusal or a burial alone, leaves the figure as it was.
+	var op *usageOp
+	mark := func() {
+		if op == nil {
+			op = u.s.usage.begin(u.uid)
+		}
+	}
+	err = u.deleteBody(root, name, mark)
+	if op != nil && err == nil {
+		op.confirm(func(m map[string]int64) { delete(m, name) })
+	}
+	return err
 }
 
-// deleteBody is delete's work under the lock.
-func (u *UserScope) deleteBody(root *os.Root, name string) error {
+// deleteBody is delete's work under the lock. It calls mark before each
+// removal from the entry's tree.
+func (u *UserScope) deleteBody(root *os.Root, name string, mark func()) error {
 	// A scope.key that cannot be read refuses the rm before anything is
 	// written; entries/ that cannot be opened (entErr) is judged after the
 	// owner check, below.
@@ -281,6 +291,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		if err := b.bury(u); err != nil {
 			return err
 		}
+		mark()
 		err := entries.RemoveAll(name)
 		if err == nil {
 			err = syncDir(entries)
@@ -326,6 +337,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 		// Nothing sealed stands (a crash between the put's mkdir and its
 		// generation write): no copy of it could be served, so there is
 		// nothing to bury and it is removed.
+		mark()
 		err := entries.RemoveAll(name)
 		if err == nil {
 			err = syncDir(entries)
@@ -341,6 +353,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	// never what it names. A removal that fails from here on is after the
 	// commit: the tombstones are written, so the entry is refused as
 	// deleted whatever of its tree stays.
+	mark()
 	err = e.root.RemoveAll(currentName)
 	if err == nil {
 		err = syncDir(e.root)

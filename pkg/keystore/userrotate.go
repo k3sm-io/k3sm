@@ -111,13 +111,13 @@ func (u *UserScope) rotate(ctx context.Context, name string, next nextValue) (v 
 	if err := u.s.checkConfig(); err != nil {
 		return Version{}, err
 	}
-	u = u.withGUID()
 	unlockUID, err := u.s.usage.lockUID(ctx, u.uid, u.s.lockWait)
 	if err != nil {
 		return Version{}, err
 	}
 	defer unlockUID()
-	u.prepareUsage() // the scope's figure, walked before the store lock
+	u.prepareUsage(ctx) // the scope's figure, walked before the store lock
+	u = u.withGUID()    // then the lookup, so its answer is fresh at the lock
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Version{}, fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
@@ -199,10 +199,12 @@ func (u *UserScope) rotateBody(ctx context.Context, root *os.Root, name string, 
 	if err := u.checkUsageQuota(root, name, value); err != nil {
 		return Version{}, err
 	}
+	// The orphan check may remove a junk version: the figure is out of
+	// the table across it, and back only when nothing was removed.
+	op := u.s.usage.begin(u.uid)
 	discarded, err := orphanAbove(e, uk, cur)
-	if discarded > 0 {
-		// Damage removed from the entry: the figure no longer matches it.
-		u.s.usage.forget(u.uid)
+	if discarded == 0 {
+		op.confirm(nil)
 	}
 	if err != nil {
 		if errors.Is(err, ErrOrphanVersion) {
@@ -220,28 +222,29 @@ func (u *UserScope) rotateBody(ctx context.Context, root *os.Root, name string, 
 		return Version{}, err
 	}
 	before, berr := lstatSize(e.root, currentName)
+	// The figure is out of the table from the version's write to its
+	// update, so a failure or a panic in between leaves none (usageOp).
+	op = u.s.usage.begin(u.uid)
 	v, err := u.commitRotation(e, uk, old, cur, seq, value)
 	if err != nil && !Committed(err) {
 		// Nothing committed, and the version written may not have been
-		// removed: the figure is recomputed.
-		u.s.usage.forget(u.uid)
+		// removed: no figure, so the next judgement walks.
 		return v, err
 	}
-	u.usageAfterRotate(e, before, berr, v.Version)
+	u.usageAfterRotate(op, e, before, berr, v.Version)
 	return v, err
 }
 
-// usageAfterRotate adds to the scope's figure what a committed rotation
-// wrote to e: version nv, and the pointer's change from before (berr: its
-// size before could not be read, so the figure is recomputed).
-func (u *UserScope) usageAfterRotate(e *entry, before int64, berr error, nv uint64) {
+// usageAfterRotate ends op, the rotation's hold on the figure, with what a
+// committed rotation wrote to e: version nv, and the pointer's change from
+// before (berr: its size before could not be read, so no figure is kept).
+func (u *UserScope) usageAfterRotate(op *usageOp, e *entry, before int64, berr error, nv uint64) {
 	vsize, verr := lstatSize(e.root, versionName(nv))
 	after, aerr := lstatSize(e.root, currentName)
 	if berr != nil || verr != nil || aerr != nil {
-		u.s.usage.forget(u.uid)
 		return
 	}
-	u.s.usage.update(u.uid, func(m map[string]int64) { m[e.name] += vsize + after - before })
+	op.confirm(func(m map[string]int64) { m[e.name] += vsize + after - before })
 }
 
 // orphanAbove is a user rotate's orphan check, in one Lstat and at most one

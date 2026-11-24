@@ -843,6 +843,9 @@ func (s *FileStore) moveStaged(st *mergeStaging) error {
 		}
 		return fmt.Errorf("move %s/%s to %s: %w", preRestoreDirName, stagedTreeName, s.dir, err)
 	}
+	// The tree in place now holds the staged scopes, each under the same
+	// scope.key as before it: no usage figure taken before is trusted.
+	s.usage.forgetAll()
 	for _, d := range []*os.File{st.parent, st.dirF} {
 		if err := syncMovedDir(d); err != nil {
 			return fmt.Errorf("%w: fsync %s: %w", errMovedNotSynced, d.Name(), err)
