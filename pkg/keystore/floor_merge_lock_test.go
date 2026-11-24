@@ -369,6 +369,25 @@ func TestMergePending(t *testing.T) {
 	if err := s.MergePending(); err != nil {
 		t.Fatalf("MergePending after the merge: %v", err)
 	}
+	// The undo recipe's intermediate name is pending too, to the
+	// path-based check and to a root verb under the lock alike, and the
+	// refusal names it.
+	undo := floorPath(server) + ".undo"
+	if err := os.WriteFile(undo, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MergePending(); !errors.Is(err, errMergePending) || !strings.Contains(err.Error(), "keystore-floor.json.undo") {
+		t.Fatalf("MergePending with the undo's floor in place: %v, want errMergePending naming keystore-floor.json.undo", err)
+	}
+	if _, err := s.Put(context.Background(), "n", KindOpaque, []byte("v")); !errors.Is(err, errMergePending) || !strings.Contains(err.Error(), "keystore-floor.json.undo") {
+		t.Fatalf("Put with the undo's floor in place: %v, want errMergePending naming keystore-floor.json.undo", err)
+	}
+	if err := os.Remove(undo); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MergePending(); err != nil {
+		t.Fatalf("MergePending once the undo's floor is moved on: %v", err)
+	}
 }
 
 // TestDeleteNotFoundReportsEviction (U192): a Delete of a name with nothing

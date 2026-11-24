@@ -841,6 +841,35 @@ func mergedFloors(t *testing.T, floor string) []string {
 	return merged
 }
 
+// undoSwap runs the undo recipe's moves (docs/user/keys.md) in its order:
+// the preconditions first, then the floors, then the trees. After each move
+// a merge is pending (keystore.FileStore.MergePending), so no step of the
+// swap leaves the keystore looking finished: first the undo's
+// keystore-floor.json.undo, then keystore-floor.json.pre-restore.
+func undoSwap(t *testing.T, h *keysHarness, floor, asideFloor, aside, staged string) {
+	t.Helper()
+	for _, p := range []string{staged, floor + ".undo"} {
+		if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("test ! -e %s: %v", p, err)
+		}
+	}
+	store := keystore.New(h.storeCfg)
+	for _, mv := range [][2]string{
+		{floor, floor + ".undo"},
+		{asideFloor, floor},
+		{floor + ".undo", floor + ".pre-restore"},
+		{aside, staged},
+		{h.keystoreDir(), aside},
+	} {
+		if err := os.Rename(mv[0], mv[1]); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MergePending(); err == nil {
+			t.Fatalf("after mv %s %s: no merge pending, want one at every step of the undo", mv[0], mv[1])
+		}
+	}
+}
+
 func TestKeysRollbackRoundTrip(t *testing.T) {
 	// saveRmRestore saves keystore/ and the floor, rm's the entry, then
 	// restores keystore/ as the recipe does, with the saved floor when
@@ -897,10 +926,14 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 			// restore survives the undo.
 			"sudo k3sm stop",
 			"! pgrep -u _k3sm || exit 1",
-			"sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1",
-			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
-			"sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1",
+			// Every precondition before any mv; then the floors, renamed
+			// so a pending name (.undo or .pre-restore) is there at every
+			// step; then the trees.
 			"sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1",
+			"sudo test ! -e /var/lib/k3sm/keystore-floor.json.undo || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.undo || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json || exit 1",
+			"sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1",
 			"sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1",
 			"sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1",
 			"sudo k3sm keys floor merge --undo --dry-run",
@@ -1223,17 +1256,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		if _, err := os.Lstat(staged); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("test ! -e %s: %v", staged, err)
 		}
-		for _, mv := range [][2]string{
-			{aside, staged},
-			{h.keystoreDir(), aside},
-			{merged[0], floor + ".undo"},
-			{floor, floor + ".pre-restore"},
-			{floor + ".undo", floor},
-		} {
-			if err := os.Rename(mv[0], mv[1]); err != nil {
-				t.Fatal(err)
-			}
-		}
+		undoSwap(t, h, floor, merged[0], aside, staged)
 		h.mustRun(0, "floor", "merge", "--undo", "--dry-run")
 		if out := h.stdout.String(); !strings.Contains(out, "buried live system/other: deleted since the restore") {
 			t.Fatalf("the reverse merge --dry-run printed %q, want other buried live, deleted since the restore", out)
@@ -1281,17 +1304,7 @@ func TestKeysRollbackRoundTrip(t *testing.T) {
 		floor := recipeFloor(h)
 		merged := mergedFloors(t, floor)
 		staged := filepath.Join(recipePreRestore(h), "restored")
-		for _, mv := range [][2]string{
-			{aside, staged},
-			{h.keystoreDir(), aside},
-			{merged[0], floor + ".undo"},
-			{floor, floor + ".pre-restore"},
-			{floor + ".undo", floor},
-		} {
-			if err := os.Rename(mv[0], mv[1]); err != nil {
-				t.Fatal(err)
-			}
-		}
+		undoSwap(t, h, floor, merged[0], aside, staged)
 		record := merged[0] + ".retired"
 		if err := os.Rename(record, record+".aside"); err != nil {
 			t.Fatal(err)

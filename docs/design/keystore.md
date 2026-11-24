@@ -1556,7 +1556,13 @@ store lock only; it is still safe against the merge, which only ever clears the 
 makes it, so a check that saw no marker is never overtaken by one the merge writes. Neither
 check is atomic against the operator's own `mv`s, which take no lock: a write whose check ran
 just before the floor `mv` lands. That is why the recipe stops the server first, and moves the
-floor aside before anything else, so the marker stands before `server/keystore` leaves. `list` and `show` run with a warning on stderr and, until the merge, find no
+floor aside before anything else, so the marker stands before `server/keystore` leaves. The
+undo recipe swaps the two floors through a third name, `keystore-floor.json.undo`, which counts
+as pending exactly as `keystore-floor.json.pre-restore` does, in both checks, with its own
+refusal naming it (`errUndoPending`, `errMergePending` to `errors.Is`): its preconditions run
+before any `mv`, the restored floor goes to `.undo` first, the moved-aside floor into place, then
+`.undo` to `.pre-restore`, so from its first `mv` a pending name stands at every step
+(`TestMergePending`, `TestKeysRollbackRoundTrip`). `list` and `show` run with a warning on stderr and, until the merge, find no
 entry, since the restored tree is staged (below). A successful merge renames its input to
 `keystore-floor.json.merged-<unix>` beside it, through the data root descriptor the lock
 judged (never over an existing file, and only if the name is still the file it read), which
@@ -1569,7 +1575,7 @@ the data root's live floor by inode is refused outright
 (`TestMergeFloorCommittedRerun`, `TestKeysFloorMergeCommittedRerun`). `k3sm start` is not hooked: its start path has no cheap synchronous
 check of the keystore, and it writes no floor. The delivery reconciler, the server's one reader
 that publishes a value, is: each sweep first asks `FileStore.MergePending` (a Lstat of
-`keystore-floor.json.pre-restore`, any answer but not found counting as pending; a store
+`keystore-floor.json.pre-restore`, then of `keystore-floor.json.undo`, any answer but not found counting as pending; a store
 configured with an empty data root has no floor, so no restore can be pending and it is nil, no
 hold), and while it is set the sweep delivers nothing, reads no entry and makes no apiserver call, logs at Error and
 tries again on the next sweep (`TestDeliveryRefusedWhileMergePending`). `list` and `show` still

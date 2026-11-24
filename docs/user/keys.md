@@ -834,11 +834,16 @@ To undo the restore instead, stop the server and stage the two copies the other 
 and the restored `keystore/` becomes the moved-aside copy. Every line ends in `|| exit 1`, as
 above. The floors swap places: the floor you moved aside
 goes back in place, and the restored floor becomes `keystore-floor.json.pre-restore`, so the
-merge runs in reverse and keeps every deletion you made after the restore. The floors move
-first, as in the restore, so the restored floor is `keystore-floor.json.pre-restore` before
-`server/keystore` leaves. If you already ran
+merge runs in reverse and keeps every deletion you made after the restore. The two `test`
+lines come first, before anything moves. The floors move next, as in the restore, so the
+restored floor is `keystore-floor.json.pre-restore` before `server/keystore` leaves: the
+restored floor goes to `keystore-floor.json.undo`, the floor you moved aside into place, and
+`keystore-floor.json.undo` to `keystore-floor.json.pre-restore`. While either
+`keystore-floor.json.undo` or `keystore-floor.json.pre-restore` is in the data root the keystore
+counts as mid-restore, as in the restore, so every step of the swap keeps it so; a
+`keystore-floor.json.undo` left behind names itself in the refusal. If you already ran
 the merge, the floor you moved aside is now `keystore-floor.json.merged-<time>`: use that name
-in the first floor `mv` instead. `--undo` tells the reverse merge to read the record the first
+in the second floor `mv` instead. `--undo` tells the reverse merge to read the record the first
 merge left beside that file, `keystore-floor.json.merged-<time>.retired`, which lists what the
 first merge retired; leave that record in place. `--undo` uses only the record whose merge read
 the floor you put back, so it refuses when that floor is not the first merge's input, or when no
@@ -849,10 +854,11 @@ the steps while anything still runs as the service user, as in the restore.
 ```
 sudo k3sm stop
 ! pgrep -u _k3sm || exit 1
-sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json.undo || exit 1
-sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
-sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json || exit 1
 sudo test ! -e /var/lib/k3sm/pre-restore.d/restored || exit 1
+sudo test ! -e /var/lib/k3sm/keystore-floor.json.undo || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json /var/lib/k3sm/keystore-floor.json.undo || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json.pre-restore /var/lib/k3sm/keystore-floor.json || exit 1
+sudo mv /var/lib/k3sm/keystore-floor.json.undo /var/lib/k3sm/keystore-floor.json.pre-restore || exit 1
 sudo mv /var/lib/k3sm/pre-restore.d/keystore /var/lib/k3sm/pre-restore.d/restored || exit 1
 sudo mv /var/lib/k3sm/server/keystore /var/lib/k3sm/pre-restore.d/keystore || exit 1
 sudo k3sm keys floor merge --undo --dry-run
