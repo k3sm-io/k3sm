@@ -543,6 +543,54 @@ func TestCrossUserRefusedFakePeerCred(t *testing.T) {
 	}
 }
 
+// TestCrossUserRefusedShareSpent (U45, the qualifier): once peer B's log
+// share is spent, B's own absent name answers from B's own state,
+// log-full, but another uid's name, and a system/ name, still answer
+// not-found in every form, refused before any scope of theirs is opened:
+// what B learns is about B's own state, never A's. A's lines and value
+// are unchanged.
+func TestCrossUserRefusedShareSpent(t *testing.T) {
+	r := newOpsRig(t, func(c *keystore.Config) { c.LogUIDShare = testShare })
+	a := dialOps(t, r.ops, uidA)
+	a.mustReply(t, hdr(t, OpPut, entryOf(uidA, "secret"), nil), []byte("a-value"), nil)
+	if err := r.spend(t, Peer{UID: uidB}); !keystore.LogShareRefused(err) {
+		t.Fatalf("spending B's share ended with %v, want its own share refused", err)
+	}
+	beforeA := r.linesOf(t, uidA)
+	b := dialOps(t, r.ops, uidB)
+	forms := []struct {
+		op    string
+		value []byte
+		extra map[string]any
+	}{
+		{OpReadForExec, nil, nil},
+		{OpRm, nil, nil},
+		{OpRotate, []byte("x"), nil},
+		{OpRotate, nil, map[string]any{"from_version": 1}},
+	}
+	for _, tc := range []struct {
+		entry string
+		code  Code
+	}{
+		{entryOf(uidA, "secret"), CodeNotFound},
+		{"system/seed", CodeNotFound},
+		{entryOf(uidB, "absent"), CodeLogFull},
+	} {
+		for _, form := range forms {
+			f := b.call(t, hdr(t, form.op, tc.entry, form.extra), form.value)
+			if code := codeOf(t, f); f.Type != TypeError || code != tc.code {
+				t.Errorf("with B's share spent, %s %v of %s answered %#02x %s, want %s", form.op, form.extra, tc.entry, byte(f.Type), f.Header, tc.code)
+			}
+		}
+	}
+	if got := r.linesOf(t, uidA); !reflect.DeepEqual(got, beforeA) {
+		t.Fatalf("uid %d's lines changed under B's requests: %+v, was %+v", uidA, got, beforeA)
+	}
+	if f := a.mustReply(t, hdr(t, OpReadForExec, entryOf(uidA, "secret"), nil), nil, nil); string(f.Value) != "a-value" {
+		t.Fatalf("A's value after B's requests is %q, want a-value", f.Value)
+	}
+}
+
 // TestNonRootCannotNameSystemEntries (U45): a peer naming a system/ entry,
 // one that exists, is answered as for an absent entry of its own, byte for
 // byte, audited under its own uid; the system entry's directory is
