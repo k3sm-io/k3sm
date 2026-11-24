@@ -29,12 +29,15 @@ import (
 const maxExclusiveHold = 50 * time.Millisecond
 
 // U108: on synctest's clock, with a GeneratedUID lookup that takes its
-// whole 250 ms deadline, no exclusive hold of a server operation (a minting
-// put, a put, rotate, rotate from a version, deliver, withdraw, rm) lasts
-// more than 50 ms: the lookup runs before the lock and its one answer is
-// used for the hold. Each operation looked the uid up under the lock, up to
-// three times for a minting deliver, before the hoist. The shared holds of
-// list and read-for-exec are reported too, and held to the same bound.
+// whole 250 ms deadline, no store lock hold of a server operation (a
+// minting put, a put, rotate, rotate from a version, deliver, withdraw,
+// list, read-for-exec, rm) contains a lookup or any other wait the clock
+// sees: each stays within 50 ms of fake time, because the lookup runs
+// before the lock and its one answer is used for the hold. Before the
+// hoist each operation looked the uid up under the lock, up to three
+// times for a minting deliver. The fake clock does not count CPU or file
+// work, so this bounds no hold's work: the walk and listing tests do that
+// for put and rotate.
 func TestExclusiveHoldBound(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx := context.Background()

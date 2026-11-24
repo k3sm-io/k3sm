@@ -199,7 +199,7 @@ func (u *UserScope) rotateBody(ctx context.Context, root *os.Root, name string, 
 	if err := u.checkUsageQuota(root, name, value); err != nil {
 		return Version{}, err
 	}
-	discarded, err := discardOrphansCounted(ctx, e, uk, 1, cur)
+	discarded, err := orphanAbove(e, uk, cur)
 	if discarded > 0 {
 		// Damage removed from the entry: the figure no longer matches it.
 		u.s.usage.forget(u.uid)
@@ -242,6 +242,38 @@ func (u *UserScope) usageAfterRotate(e *entry, before int64, berr error, nv uint
 		return
 	}
 	u.s.usage.update(u.uid, func(m map[string]int64) { m[e.name] += vsize + after - before })
+}
+
+// orphanAbove is a user rotate's orphan check, in one Lstat and at most one
+// record open whatever the entry's size: only version cur+1 is looked at.
+// That is sufficient under the user scope's crash model: a user rotation
+// writes exactly the version above the pointer, so a crash before its flip
+// leaves at most v<cur+1>, and a pointer copied back from V to an older cur
+// leaves cur+1 to V, whose lowest is again cur+1. Every user version is
+// kept (none is pruned), so no state those leave has a version file above
+// the pointer without v<cur+1>; a file further up with none at cur+1 is
+// planted, and a later rotation renames over it. A v<cur+1> that
+// authenticates is the orphan, refused (ErrOrphanVersion) and kept; one that
+// does not is junk, removed, and counted in discarded.
+func orphanAbove(e *entry, uk keys, cur uint64) (discarded int, err error) {
+	n := versionName(cur + 1)
+	if _, err := e.root.Lstat(n); errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	} else if err != nil {
+		return 0, fmt.Errorf("check for an orphaned %s: %w", n, err)
+	}
+	r, pt, err := e.openRecord(uk, n, false, cur+1)
+	clear(pt) // only whether it opens is wanted
+	switch {
+	case err == nil:
+		return 0, orphanError(e, Kind(r.kind) == KindOAuth, cur+1, cur)
+	case !errors.Is(err, ErrCorrupt):
+		return 0, fmt.Errorf("check the orphaned %s: %w", n, err)
+	}
+	if err := e.root.Remove(n); err != nil {
+		return 0, fmt.Errorf("discard the orphaned %s: %w", n, err)
+	}
+	return 1, syncDir(e.root)
 }
 
 // commitRotation writes version cur+1 sealing value, flips the pointer to

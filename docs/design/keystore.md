@@ -3978,27 +3978,28 @@ refused before its first frame:
     that hold, so a slow directory service never stretches a hold. The root verbs that hold the
     lock for their whole run (`rm-scope`, `floor --rebuild`, `audit --rotate`, Rewrap) are
     outside the bound. The bound is asserted on a fake clock (U108) and measured in K7a.
-    As built, the bound holds for what a fake clock can see: the GeneratedUID lookup is taken
-    before the lock for a `put`, `rotate`, `rm`, `deliver` and each read, and its one answer, an
-    error included, serves the whole hold (`TestExclusiveHoldBound`), and the quota judgement walks
-    nothing under the lock (the usage figure, "Quotas"). On the wall clock a hold is dominated by
-    its fsyncs: a `rotate` holds the lock about 21 ms on a developer Mac, about 31 ms on an entry of
-    20,000 versions, and a `list` of that entry 11 ms (720 ms when it opened every version). Two
-    holds still grow with the versions of the entry they act on, the uid's own: `rotate`'s orphan
-    check lists the entry's directory, and `rm` reads each version record's header for its
-    burial and unlinks each file. Both are bounded by an entry's 65,536 versions; neither is
-    chunked yet.
+    As built, the fake clock (U108, `TestExclusiveHoldBound`) proves that no hold of a `put`,
+    `rotate`, `rm`, `deliver`, `withdraw` or read contains a GeneratedUID lookup or any other wait
+    the clock can see: the lookup is taken before the lock, inside the uid's mutation lock, and
+    its one answer, an error included, serves the whole hold. It proves nothing about the work a
+    hold does, which the fake clock does not count. That work is bounded for `put` and `rotate`:
+    the quota is judged on the usage figure ("Quotas") and `rotate`'s orphan check reads only the
+    version above the pointer. On the wall clock their holds are dominated by fsyncs: a `rotate`
+    holds the lock about 21 ms on a developer Mac whether its entry keeps one version or 20,000,
+    and a user `list` of an entry of 20,000 versions about 11 ms (720 ms when it opened every
+    version). Not bounded yet: an `rm` reads each version record's header for its burial and
+    unlinks each file under one exclusive hold, so its hold grows with the versions of the entry
+    it removes, up to an entry's 65,536; U108 stays partial until that is chunked.
   - *Revocations retry.* A reconciler revocation (a `deliver-delete`, a withdrawal, a rotation
     write) that gets `ErrBusy` retries within the same sweep, up to 3 times with jittered
     waits, before the result is `Indeterminate` (U89).
   - *What one uid can do to another through the lock.* It cannot be refused for another uid's
     log lines ("Per-uid fairness"), but it can delay another uid: its exclusive holds are at most
     5 a second (the mutation rate limit, "The socket") of at most 50 ms each, so one uid holds
-    the lock exclusively for at most 250 ms in any second. That holds for a `put`, `rotate`,
-    `deliver` and `withdraw` however large the uid's scope (`TestLockHoldBoundPerUID`: another
-    uid's `rm` answers within a 100 ms wait while a uid with 60,000 files in its scope rotates at
-    its rate limit); an `rm` of one of the uid's own entries that holds tens of thousands of
-    versions can exceed 50 ms (the hold-time bound above). Many uids together can push another
+    the lock exclusively for at most 250 ms in any second. It does not hold yet for an `rm` of
+    an entry of tens of thousands of versions, whose hold grows with them (the hold-time bound
+    above); a `put` or `rotate` costs no walk of the scope and no listing of the entry under the
+    lock (`TestLockHoldBoundPerUID`). Many uids together can push another
     uid's wait past the 2-second bound, which is `busy`, never a refusal for the share and
     never a deletion.
 - **Order: a grant appends first; a revocation commits first.** A grant (a user `put`, and
@@ -6855,7 +6856,7 @@ carried by the unit rows.
 | U105 | every root path walks the keystore trees by descriptor: run as root (a root-run row, `--root`), `sudo k3sm install` over an existing tree, `uninstall --purge` and `doctor` each refuse a planted symlink, FIFO or swapped directory under `.user/` and at every `keystore-*` name, with `openat`, `O_NOFOLLOW`, bounded reads and a `SameFile` re-check, and change nothing they were not meant to | `k3sm/pkg/install::TestInstallOverExistingTreeWalksByDescriptor`, `TestPurgeWalksKeystoreByDescriptor`, `k3sm/cmd/k3sm::TestDoctorWalksKeystoreByDescriptor` (integration, root-run) | pending: the append-only files |
 | U106 | every root verb refuses a non-root caller: one table test runs `rm-scope`, `floor --rebuild`, `audit --rotate`, `rewrap` and `deliver system/…` with a non-root euid through the euid source, and each is refused with the same message and exit code, changing nothing (seam: euid source) | `k3sm/cmd/k3sm::TestRootVerbsRefuseNonRootEUID` | pending: the KeyDelivery reconciler (lifecycle), each verb's case added by the change that adds the verb |
 | U107 | with the user floor missing or unflagged, an absence-driven delete (`ErrNotFound`) is `Indeterminate` and deletes nothing, while a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial) deletes the Secret after its two spaced observations | `k3sm/pkg/keystore/reconcile::TestNotFoundDeleteWaitsForFloor`, `TestRevocationDeleteProceedsWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
-| U108 | the exclusive hold bound on a fake clock: no server exclusive hold does more than 50 ms of work; the GeneratedUID lookup runs before the lock is taken and its answer is cached for the hold, so a lookup that takes its whole 250 ms deadline adds nothing to the hold (seams: clock, GeneratedUID lookup) | `k3sm/pkg/keystore::TestExclusiveHoldBound`, `TestRotateAtQuotaNoFullWalk`, `TestUsageFigureMatchesWalk`, `TestUserListOpensOnlyCurrentVersion` | checked: the user-scope store |
+| U108 | the exclusive hold bound on a fake clock: no server exclusive hold does more than 50 ms of work; the GeneratedUID lookup runs before the lock is taken and its answer is cached for the hold, so a lookup that takes its whole 250 ms deadline adds nothing to the hold (seams: clock, GeneratedUID lookup) | `k3sm/pkg/keystore::TestExclusiveHoldBound`, `TestRotateAtQuotaNoFullWalk`, `TestUsageFigureMatchesWalk`, `TestUserListOpensOnlyCurrentVersion`, `TestUserRotateOrphanCheckReadsOnlyNextVersion` | partial: no lookup or wait inside a hold, and no scope walk or entry listing in a `put` or `rotate` hold, checked (the user-scope store); pending: an `rm` hold bounded however many versions its entry keeps (its burial's header reads and its unlinks chunked) |
 | U109 | with every audit append failing (a full disk), revocation deletes go ahead: the reconciler's `deliver-delete` and a socket `withdraw`, `rm` or `rotate` still act, their lines dropped and counted in memory and shown by `doctor`, while user mutations and reads stay refused | `k3sm/pkg/keystore/reconcile::TestRevocationDeleteProceedsOnAppendFailure` | pending: the KeyDelivery reconciler (lifecycle) |
 | U110 | when a second server registers at runtime, the next single-server check stops the listener, closing its connections, and each KeyDelivery gets `Ready=False` and `SecretRetained=True` with reason `UserScopeOff`; the delivered Secrets stay, nothing rotates or deletes them, and `doctor` says they must be deleted by hand | `k3sm/pkg/keystore/reconcile::TestSecondServerAtRuntimeStopsListenerAndReports` | pending: the KeyDelivery reconciler (lifecycle) |
 | U111 | the owner annotation never decides precedence: a Secret whose owner annotation is rewritten to name another recorded UID of the same target stays with the object that holds the claim by honoured record, `creationTimestamp` and name; an `Indeterminate` object counts as honoured | `k3sm/pkg/keystore/reconcile::TestAnnotationRewriteCannotTakeOverTarget` | pending: the KeyDelivery reconciler (authority) |

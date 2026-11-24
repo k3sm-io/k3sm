@@ -180,3 +180,24 @@ func TestUserListOpensOnlyCurrentVersion(t *testing.T) {
 		t.Fatalf("with v1 removed: %+v, %v; want the entry marked ErrCorrupt", es, err)
 	}
 }
+
+// A user rotate's orphan check looks at the version above the pointer
+// only, in one Lstat (orphanAbove), never listing the entry's directory: a
+// junk v<cur+1> is still discarded, and a file planted further up, which
+// no crash or copied-back pointer leaves without v<cur+1>, is not read.
+func TestUserRotateOrphanCheckReadsOnlyNextVersion(t *testing.T) {
+	ctx := context.Background()
+	s, u := rotateScope(t)
+	dir := filepath.Join(scopeDir(filepath.Dir(s.dir), "1001"), scopeEntriesName, "a")
+	for _, n := range []uint64{2, 4} {
+		if err := os.WriteFile(filepath.Join(dir, versionName(n)), []byte("junk"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if v, err := u.Rotate(ctx, "user/1001/a", []byte("two")); err != nil || v.Version != 2 {
+		t.Fatalf("rotate over a junk v2: %+v, %v", v, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, versionName(4))); err != nil || string(b) != "junk" {
+		t.Fatalf("the rotate read past the version above its pointer: v4 is %q, %v", b, err)
+	}
+}
