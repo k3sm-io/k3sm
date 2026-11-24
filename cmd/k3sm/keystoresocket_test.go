@@ -1006,3 +1006,12 @@ func TestStartUserScopesStepRefusesOnLaterPass(t *testing.T) {
 		t.Fatal("a later pass with the audit log gone passed; want the bounds check's failure")
 	}
 }
+
+// runKeystoreSocket runs the built ks (superviseKeystoreSocket) on the wall
+// clock. A nil ks (a worker) runs nothing and stops at once.
+func runKeystoreSocket(ctx context.Context, ks *keystoreSocket) (stop func()) {
+	if ks == nil {
+		return noStop
+	}
+	return superviseKeystoreSocket(ctx, func() (*keystoreSocket, error) { return ks, nil }, wallClock{}, ks.log)
+}

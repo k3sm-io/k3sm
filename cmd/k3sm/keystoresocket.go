@@ -396,17 +396,6 @@ func startUserScopesStep(store *keystore.FileStore, log *slog.Logger) func(conte
 	}
 }
 
-// runKeystoreSocket runs the built ks (superviseKeystoreSocket). A nil ks
-// (a worker) runs nothing and stops at once.
-//
-//lint:ignore U1000 not called until the listener's socket source is chosen; the server start then runs the socket it built through it
-func runKeystoreSocket(ctx context.Context, ks *keystoreSocket) (stop func()) {
-	if ks == nil {
-		return noStop
-	}
-	return superviseKeystoreSocket(ctx, func() (*keystoreSocket, error) { return ks, nil }, wallClock{}, ks.log)
-}
-
 // superviseKeystoreSocket builds the listener's supervisor with build and
 // runs it, in one goroutine, and returns the stop. A build that fails (the
 // service-user lookup, say) is logged and retried on the supervisor's
@@ -508,15 +497,25 @@ func (wallClock) After(d time.Duration) (<-chan time.Time, func() bool) {
 	return t.C, t.Stop
 }
 
+// keystoreSocketListener is the server's listener source: the socket
+// launchd activated for the server plist's Sockets entry
+// (install.KeystoreSocketsEntry). A server launchd did not start, or whose
+// plist predates the entry, gets socket.ErrNotActivated, and the user scope
+// stays off as "the listening socket is unavailable"; the server never
+// binds keys.sock itself.
+func keystoreSocketListener() socket.ListenerSource {
+	return socket.ActivatedListener(install.KeystoreSocketsEntry, socket.LaunchdActivator{})
+}
+
 // startKeystoreSocket is the server's one entry point for the keystore's
 // user socket: it builds the supervisor over the real primitives and runs
 // it, returning the stop runServer defers beside keystore-delivery's, so
 // LIFO drains it before the control plane stops. listen is how the
-// listening socket is obtained, which this wiring leaves to its caller. A
+// listening socket is obtained (keystoreSocketListener in runServer). A
 // build failure is logged and retried with backoff
-// (superviseKeystoreSocket); the stop is never nil.
-//
-//lint:ignore U1000 the server start calls it once the listening socket's source is chosen
+// (superviseKeystoreSocket); the stop is never nil. Everything it runs is
+// in its own goroutine with recover, so nothing it does stops the
+// apiserver or kine.
 func startKeystoreSocket(ctx context.Context, workDir string, cs kubernetes.Interface, listen socket.ListenerSource, logger *slog.Logger) (stop func()) {
 	deps := keystoreSocketDeps{
 		workDir:          workDir,

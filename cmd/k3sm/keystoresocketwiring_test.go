@@ -1,0 +1,107 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"context"
+	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
+	"testing"
+
+	"k3sm.io/k3sm/pkg/keystore/socket"
+)
+
+// TestRunServerStartsKeystoreSocket pins the startup call: runServer defers
+// the keystore-socket teardown step over startKeystoreSocket with the
+// activated listener source (keystoreSocketListener), after the
+// keystore-delivery step, so LIFO stops the listener first and both before
+// the control plane.
+func TestRunServerStartsKeystoreSocket(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "server.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var run *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "runServer" {
+			run = fd
+		}
+	}
+	if run == nil {
+		t.Fatal("no runServer in server.go")
+	}
+	var steps []string
+	var socketCall *ast.CallExpr
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		ds, ok := n.(*ast.DeferStmt)
+		if !ok {
+			return true
+		}
+		if id, ok := ds.Call.Fun.(*ast.Ident); !ok || id.Name != "timedTeardownStep" || len(ds.Call.Args) != 3 {
+			return true
+		}
+		lit, ok := ds.Call.Args[1].(*ast.BasicLit)
+		if !ok {
+			return true
+		}
+		name, _ := strconv.Unquote(lit.Value)
+		steps = append(steps, name)
+		if name == "keystore-socket" {
+			socketCall, _ = ds.Call.Args[2].(*ast.CallExpr)
+		}
+		return true
+	})
+	if socketCall == nil {
+		t.Fatalf("runServer defers no keystore-socket step; steps %q", steps)
+	}
+	if id, ok := socketCall.Fun.(*ast.Ident); !ok || id.Name != "startKeystoreSocket" || len(socketCall.Args) != 5 {
+		t.Fatal("the keystore-socket step is not startKeystoreSocket(...)")
+	}
+	if c, ok := socketCall.Args[3].(*ast.CallExpr); !ok || c.Fun.(*ast.Ident).Name != "keystoreSocketListener" {
+		t.Fatal("startKeystoreSocket's listener is not keystoreSocketListener()")
+	}
+	idx := func(s string) int {
+		for i, v := range steps {
+			if v == s {
+				return i
+			}
+		}
+		return -1
+	}
+	if d, k := idx("keystore-delivery"), idx("keystore-socket"); d < 0 || k < d {
+		t.Fatalf("keystore-socket (%d) is not deferred after keystore-delivery (%d)", k, d)
+	}
+}
+
+// A process launchd did not start as the server's job (this test) gets no
+// activated socket: the production source refuses with ErrNotActivated and
+// binds nothing, which keeps the user scope off as the listening socket
+// being unavailable.
+func TestKeystoreSocketListenerOffOutsideLaunchd(t *testing.T) {
+	ln, err := keystoreSocketListener()(context.Background())
+	if ln != nil {
+		_ = ln.Close()
+		t.Fatal("a listener outside the launchd job")
+	}
+	if !errors.Is(err, socket.ErrNotActivated) {
+		t.Fatalf("got %v, want ErrNotActivated", err)
+	}
+}
