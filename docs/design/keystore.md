@@ -2026,7 +2026,14 @@ spelling), a `/System/Volumes/Data` data root, a symlinked `server` state dir (i
 target) and the default (runtimed's default pod root), and
 `TestRuntimePostureIsTheRuntimesConfig` shows the provider's derivation is what `NewRuntimed`
 hands runtimed. The fields runtimed fills from its own state (`Home`, `WorkVolume`, the VIPs)
-are not in it, and no test reads a built runtime's posture back. A posture the provider
+are not in it, and no test reads a built runtime's posture back. **Accepted residual: the
+posture the check approves is not the value the node runs with.** The check derives its own
+posture (`serverPodPosture`), and the node derives its own later, when `NewRuntimed` builds the
+runtime; both resolve paths on disk, so an actor who retargets a symlink one of them resolves
+(the data root, the pod root, the status record dir) between the two derivations makes the node
+run with a posture the check never read. In an installed layout that actor is root; that no
+other uid can retarget one of those links is not proven here. The fix, one derivation handed to
+both, is recorded, not built. A posture the provider
 refuses (as it refuses the node) is the configuration state below, retried
 (`TestServerPodPostureFailureIsConfiguration`). The check requires that the text deny
 `file-read*`, `file-write*` and unix-socket `network-outbound` on `keystore-sock/` under the
