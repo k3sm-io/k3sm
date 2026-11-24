@@ -2125,15 +2125,24 @@ recovery: it is never persisted, so a restart, a crash included, starts with non
 or possibly stale figure is recomputed from the files, never trusted. The figure is built by a
 walk of the scope before the store lock, under the uid's own mutation lock, which its `put`,
 `rotate` and `rm` hold, so no write of the server lands in the scope during the walk; under the
-store lock it is trusted only while the scope's `scope.key` is byte for byte the one it was built
-beside (an `rm-scope` and a new mint, or a Rewrap's re-seal, makes it stale, and that judgement
-walks the scope once and keeps the result; the walk before the lock checks the digest too, so
+store lock it is trusted only while the scope it was built in is still on disk, by two
+bindings: the scope's `scope.key` byte for byte the one it was built beside, and the scope's
+`entries/` directory the same directory, by device and inode. `entries/` is bound rather than
+`.user/<uid>/` because it is the tree the figure counts: a scope directory renamed into place
+brings its own `entries/`, and an `entries/` replaced inside a scope directory that stayed
+changes it too, while no user operation creates or replaces it (a mint creates it with
+`scope.key`). An `rm-scope` and a new mint, or a Rewrap's re-seal, changes the first binding; a
+scope tree renamed into place under the same `scope.key` bytes changes the second
+(`TestUsageFigureBoundToEntriesDirectory`, `TestUsageFigureScopeKeyReplacedOnDisk`; an
+unchanged tree keeps its figure, `TestUsageFigureKeptForUnchangedTree`). Either makes it stale,
+and that judgement walks the scope once and keeps the result; the walk before the lock checks
+both bindings too, so
 a stale figure is rebuilt there, outside the hold, and that walk stops when its request's
 context ends, leaving no figure, and the request then returns its context's error before the
 store lock, taking no hold and writing nothing). That walk under the lock is the one scope walk
 left in a `put` or `rotate` hold, a fallback: the figure is still absent or stale at the lock
-when the walk before it failed, when a root `rm-scope` and a new mint, or a Rewrap, landed
-between that walk and the lock, or when the `put` minted the scope in this hold. The hold does
+when the walk before it failed, when a root `rm-scope` and a new mint, a Rewrap, or a tree put
+in place landed between that walk and the lock, or when the `put` minted the scope in this hold. The hold does
 not release the lock to walk outside it and retry: that walk is documented, not removed. A `put`, `rotate` or `rm` takes the figure out of the table
 before its first write to the scope's entries and puts it back, changed by what it wrote or
 removed, only through its own confirm after the update, so a failure, an outcome not known, or
@@ -2159,7 +2168,10 @@ rebuild, a run after a recovered panic, a second server gone) holds none from be
 drop is never put back after it, the table's generation having moved
 (`TestForgetAllDuringOpLeavesNoFigure`). A restore puts a tree back under the same
 `scope.key`s with the server stopped, as its recipe requires: the stopped server is the
-protection, since the restart holds no figure. The restore's merge also forgets every figure
+procedure and the protection, since the restart holds no figure. The `entries/` binding is a
+second line behind it, for a scope tree renamed into place while a server runs; it does not see
+files changed inside an `entries/` that stayed, which the paragraph above leaves out of the
+model. The restore's merge also forgets every figure
 of the process that runs it (`TestFloorMergeForgetsUsageFigures`), which covers only a figure
 held in that process.
 
