@@ -4322,9 +4322,14 @@ surface, and the app consumes only those.
   present value may be empty). Frame types: `0x01` HELLO, `0x02` request, `0x03` reply,
   `0x04` error; any other byte is an unknown type. The client sends HELLO first and requests
   after it; any other type from the client, a second HELLO included, closes the connection. A
-  request header names its operation in `op` (missing or empty closes); an error header is
-  `{"code":"<code>"}`. A HELLO or request header that is not a JSON object, or a HELLO whose
-  `proto` is not `k3sm-keys`, closes the connection. The names live in one place,
+  request header names its operation in `op` (missing, empty, null or not a string closes); an
+  error header is `{"code":"<code>"}`. A HELLO or request header that is not a JSON object, or a
+  HELLO whose `proto` is not `k3sm-keys`, closes the connection. The dispatcher reads `op`, and
+  the HELLO its `proto`, `min` and `max`, by their exact names, as the operations read their
+  fields ("Strict enough"), never through a case-insensitive, last-key-wins decode: such a field
+  spelled in another case (`{"OP":"rm"}`, `{"Proto":…}`), given twice in any case
+  (`{"op":"list","Op":"rm"}`) or of the wrong JSON type closes the connection
+  (`TestDispatchOpExactKey`, `TestHelloProtoExactKey`, `FuzzRequestHeader`). The names live in one place,
   `pkg/keystore/socket` (U27).
 - **The frame cap follows the value cap.** The largest frame a request needs is the store's
   maximum value, 65,536 bytes (64 KiB), plus the 8,192-byte header cap, plus 9 bytes of type

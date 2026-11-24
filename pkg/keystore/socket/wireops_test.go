@@ -682,11 +682,52 @@ var requestTypes = []func() any{
 	func() any { return &ReadForExecRequest{} },
 }
 
+// checkRequestOp holds the dispatcher's read of a request's op to the
+// exact-key rule: it never panics; it fails with a protocol error or
+// names a non-empty op; it fails whenever a key other than "op" folds to
+// it; and the op it names is the one both a case-insensitive, last-wins
+// decoder and an exact-name decoder read, so no two decoders disagree.
+func checkRequestOp(t *testing.T, header []byte) {
+	t.Helper()
+	op, err := requestOp(header)
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(header, &raw) // nil when it is no object; then requestOp must fail
+	folded := false
+	for k := range raw {
+		if k != "op" && strings.EqualFold(k, "op") {
+			folded = true
+		}
+	}
+	if err != nil {
+		var pe *ProtocolError
+		if !errors.As(err, &pe) || op != "" {
+			t.Fatalf("requestOp(%q) = %q, %v; want a protocol error and no op", header, op, err)
+		}
+		return
+	}
+	if folded || raw == nil {
+		t.Fatalf("requestOp(%q) = %q, want a close: a key folds to op, or no object", header, op)
+	}
+	var exact string
+	if json.Unmarshal(raw["op"], &exact) != nil || exact != op || op == "" {
+		t.Fatalf("requestOp(%q) = %q, the exact op field reads %q", header, op, exact)
+	}
+	var lenient struct {
+		Op string `json:"op"`
+	}
+	if json.Unmarshal(header, &lenient) != nil || lenient.Op != op {
+		t.Fatalf("requestOp(%q) = %q, a lenient decoder reads %q", header, op, lenient.Op)
+	}
+}
+
 // FuzzRequestHeader: decoding a request header never panics; a header over
 // the cap is refused before it is parsed; any other failure is a refusal;
-// and a header that decodes re-encodes to an equivalent request.
+// and a header that decodes re-encodes to an equivalent request. The
+// dispatcher's read of its op keeps to the exact-key rule
+// (checkRequestOp).
 func FuzzRequestHeader(f *testing.F) {
 	f.Fuzz(func(t *testing.T, header []byte) {
+		checkRequestOp(t, header)
 		for _, mk := range requestTypes {
 			dst := mk()
 			err := decodeRequest(header, dst)
