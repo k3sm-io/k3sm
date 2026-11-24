@@ -88,7 +88,8 @@ func judgeScopeQuota(used map[string]int64, name string, value []byte, base int6
 	}
 	add := entryWriteBytes(name, value)
 	if total+add > maxScopeBytes {
-		return fmt.Errorf("%w: the scope's sealed records would be %d bytes with its deliveries record, over %d", ErrQuota, total+add, maxScopeBytes)
+		// The total is not named: it counts the value's length.
+		return fmt.Errorf("%w: the scope's sealed records would be over %d bytes with its deliveries record and this value", ErrQuota, maxScopeBytes)
 	}
 	return nil
 }

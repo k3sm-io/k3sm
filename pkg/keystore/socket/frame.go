@@ -192,7 +192,9 @@ func readFrame(r io.Reader, mode readMode) (Frame, error) {
 	}
 	rest -= 4
 	if vl := binary.BigEndian.Uint32(vp[:]); vl != rest {
-		return Frame{}, protocolErrorf("value length %d does not fill the %d bytes left in the frame", vl, rest)
+		// Neither length is named: what is left of the frame is the
+		// value's length.
+		return Frame{}, protocolErrorf("the value length does not fill the bytes left in the frame")
 	}
 	f.Value = make([]byte, rest)
 	if err := readBody(r, f.Value); err != nil {

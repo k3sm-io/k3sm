@@ -275,3 +275,22 @@ func TestReadHelloRefusesBeforeTheBody(t *testing.T) {
 		t.Fatalf("ReadHello on a HELLO = %q, %v", f.Header, err)
 	}
 }
+
+// A frame whose value length does not fill it is refused without naming
+// either length: what is left of the frame after the header is the
+// value's length, and an error's text can reach a log.
+func TestFrameValueLengthErrorNamesNoLength(t *testing.T) {
+	value := bytes.Repeat([]byte("v"), 1234)
+	hdr := []byte("{}")
+	n := uint32(1 + 4 + len(hdr) + 4 + len(value))
+	b := cat(be(n), []byte{byte(TypeRequest)}, be(uint32(len(hdr))), hdr, be(4321), value)
+	_, err := ReadFrame(bytes.NewReader(b))
+	if !isProtocolError(err) {
+		t.Fatalf("a short value length: %v, want a protocol error", err)
+	}
+	for _, leak := range []string{"1234", "4321"} {
+		if bytes.Contains([]byte(err.Error()), []byte(leak)) {
+			t.Errorf("the refusal %q carries %s, a value length", err, leak)
+		}
+	}
+}

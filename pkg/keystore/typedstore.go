@@ -189,7 +189,8 @@ func (s *FileStore) sameRefreshOwner(en *entry, k keys, old Version, owner strin
 		return fmt.Errorf("%w: version %d: %w", ErrCorrupt, old.Version, err)
 	}
 	if env.Credential.RefreshOwner != owner {
-		return fmt.Errorf("%w: the entry's refresh owner is %s, not %s", ErrRefreshOwnerFixed, env.Credential.RefreshOwner, owner)
+		// Neither owner is named: both are read from a value.
+		return fmt.Errorf("%w: the rotation names a refresh owner other than the entry's", ErrRefreshOwnerFixed)
 	}
 	return nil
 }

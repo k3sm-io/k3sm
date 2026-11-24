@@ -4583,7 +4583,14 @@ surface, and the app consumes only those.
   behind a row that is not damage (`busy`, `not-found`) logs nothing
   (`TestDamageClassAgreesWithOutcome`, over every kind both read and every pair of them). The error's own text is never logged: a chain can carry text a
   decoder built from a decrypted value, and no error in `pkg/keystore` names a length, tag or
-  byte of a value either (`TestNoErrorCarriesValueDerivedNumbers`). The ordinary outcomes
+  byte of a value either. That is checked two ways: syntactically, every `len`, index or `tag`
+  an error constructor takes must be on a reviewed list keyed by file and function
+  (`TestNoErrorCarriesValueDerivedNumbers`); and, for what reaches an error through a
+  variable, which that check cannot see, by the sites themselves, which name no such number:
+  a quota refusal names the cap and not the total that counts the value, a refused
+  refresh-owner change names neither owner, and a frame whose value length does not fill it
+  names neither length (`TestValueNumbersNotInErrorTexts`,
+  `TestFrameValueLengthErrorNamesNoLength`). The ordinary outcomes
   (`not-found`, `exists`, `quota`, `rate-limited`, `busy`, `log-full`, and the socket's own
   refusals), a change that committed, and a cancelled or timed-out request are not logged.
   Standing damage cannot flood the log: each (uid, op, class) key logs at most one line every

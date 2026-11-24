@@ -69,52 +69,99 @@ func TestUndecodableTypedVersionErrorCarriesNoValueBytes(t *testing.T) {
 	}
 }
 
+// The errors the syntactic check (TestNoErrorCarriesValueDerivedNumbers)
+// cannot see, a value's number or bytes passed through a variable, carry
+// none either: a quota refusal names the cap, never the total that counts
+// the value's length, and a refused refresh-owner change names neither
+// owner, both read from a value.
+func TestValueNumbersNotInErrorTexts(t *testing.T) {
+	t.Run("quota", func(t *testing.T) {
+		value := bytes.Repeat([]byte("v"), 4321)
+		base := int64(maxScopeBytes - 100)
+		err := judgeScopeQuota(map[string]int64{}, "token", value, base)
+		if !errors.Is(err, ErrQuota) {
+			t.Fatalf("a put past the byte budget: %v, want ErrQuota", err)
+		}
+		total := base + entryWriteBytes("token", value)
+		for _, leak := range []string{strconv.FormatInt(total, 10), strconv.Itoa(len(value))} {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("the quota refusal %q carries %s, a number counting the value's length", err, leak)
+			}
+		}
+	})
+	t.Run("refresh owner", func(t *testing.T) {
+		owned := func(access, owner string) typed.Envelope {
+			e := oauthEnvelope(access, "r-"+access)
+			e.Credential.RefreshOwner = owner
+			return e
+		}
+		s, _ := newTypedStore(t)
+		mustPutCredential(t, s, "pair", KindOAuth, owned("a1", "server/owner-one"))
+		_, err := s.RotateCredential(context.Background(), "pair", KindOAuth, owned("a2", "server/owner-two"))
+		if !errors.Is(err, ErrRefreshOwnerFixed) {
+			t.Fatalf("a rotation to another owner: %v, want ErrRefreshOwnerFixed", err)
+		}
+		for _, leak := range []string{"owner-one", "owner-two"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("the refusal %q carries %q, read from a value", err, leak)
+			}
+		}
+	})
+}
+
 // valueLengthAllowed are the error arguments in pkg/keystore that take a
 // length, an index or a tag and are not of a stored value: ciphertext,
-// key files, metadata records and counts. Each is "file: expression".
+// key files, metadata records and counts. Each is "file: function:
+// expression", the function a method's Type.Name and a package-level
+// declaration's "var", so an entry reviewed in one function never admits
+// the same expression in another function of its file.
 // Anything else of that shape in an error is a value-derived number, which
 // no error may carry.
 var valueLengthAllowed = []string{
-	"auditlog.go: len(b)",
-	"deliver/declaration.go: len(d.Targets)",
-	"deliver/state.go: len(d.Secrets)",
-	"deliveries.go: len(b)",
-	"deliveries.go: len(ds)",
-	"deliveries.go: len(errs)",
-	"deliveries.go: len(pt)",
-	"deliveries.go: len(r.b)",
-	"deliveries.go: len(sealed)",
-	"deliveries.go: pt[0]",
-	"deliveries.go: state[0]",
-	"files.go: len(b)",
-	"floor_merge_retired.go: len(b)",
-	"floor_merge.go: len(mergedBytes)",
-	"floor.go: len(b)",
-	"floor.go: len(bs)",
-	"floor.go: len(found)",
-	"maintruns.go: keys[i]",
-	"maintruns.go: len(f)",
-	"maintruns.go: len(keys)",
-	"maintruns.go: len(lines)",
-	"master.go: len(raw)",
-	"quota.go: len(order)",
-	"quota.go: len(took)",
-	"record.go: b[0]",
-	"record.go: b[1]",
-	"record.go: len(b)",
-	"record.go: len(key)",
-	"removedscopes.go: len(ids)",
-	"rewrap.go: len(key)",
-	"rewrap.go: len(newMaster)",
-	"rotateaudit.go: len(left)",
-	"serverlogs.go: len(line)",
-	"socket/frame.go: len(f.Header)",
-	"store.go: len(pt)",
-	"typed/envelope.go: fs[i]",
-	"typed/envelope.go: fs[next]",
-	"typed/envelope.go: other[i]",
-	"userscope.go: len(ku)",
-	"userscope.go: len(names)",
+	"auditlog.go: marshalAuditLine: len(b)",
+	"deliver/declaration.go: Parse: len(d.Targets)",
+	"deliver/state.go: ParseState: len(d.Secrets)",
+	"deliveries.go: parseDeliveries: len(pt)",
+	"deliveries.go: parseDeliveries: len(r.b)",
+	"deliveries.go: parseDeliveries: pt[0]",
+	"deliveries.go: parseDeliveries: state[0]",
+	"deliveries.go: parseDeliveriesRecord: len(b)",
+	"deliveries.go: UserScope.addDeliveryLocked: len(ds)",
+	"deliveries.go: UserScope.auditSealed: len(errs)",
+	"deliveries.go: UserScope.auditSealed: len(sealed)",
+	"deliveries.go: UserScope.writeDeliveries: len(b)",
+	"deliveries.go: UserScope.writeDeliveries: len(pt)",
+	"files.go: FileStore.readRandom: len(b)",
+	"floor_merge_retired.go: FileStore.writeRetiredPending: len(b)",
+	"floor_merge.go: FileStore.mergeFloor: len(mergedBytes)",
+	"floor.go: FileStore.syncFloor: len(found)",
+	"floor.go: floorLock.updatePruned: len(b)",
+	"floor.go: parseFloor: len(bs)",
+	"maintruns.go: parseMaintenanceRun: keys[i]",
+	"maintruns.go: parseMaintenanceRun: len(f)",
+	"maintruns.go: parseMaintenanceRun: len(keys)",
+	"maintruns.go: parseMaintenanceRuns: len(lines)",
+	"master.go: FileStore.readKeyFile: len(raw)",
+	"quota.go: userBurial.bury: len(order)",
+	"quota.go: userBurial.bury: len(took)",
+	"record.go: newGCM: len(key)",
+	"record.go: parseRecord: b[1]",
+	"record.go: parseRecordOf: b[0]",
+	"record.go: parseRecordOf: len(b)",
+	"removedscopes.go: parseRemovedScopes: len(ids)",
+	"rewrap.go: FileStore.recordsSealedUnder: len(key)",
+	"rewrap.go: FileStore.rewrap: len(newMaster)",
+	"rotateaudit.go: cloneArchive: len(left)",
+	"rotateaudit.go: stripXattrs: len(left)",
+	"serverlogs.go: ServerLogs.appendLocked: len(line)",
+	"socket/frame.go: AppendFrame: len(f.Header)",
+	"store.go: decodePointer: len(pt)",
+	"typed/envelope.go: Decode: fs[i]",
+	"typed/envelope.go: Decode: fs[next]",
+	"typed/envelope.go: Encode: other[i]",
+	"userscope.go: UserScope.checkMintable: len(names)",
+	"userscope.go: UserScope.mint: len(names)",
+	"userscope.go: UserScope.openScopeKey: len(ku)",
 }
 
 // errorShapes are the calls whose arguments become an error's text.
@@ -140,32 +187,35 @@ func TestNoErrorCarriesValueDerivedNumbers(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		ast.Inspect(f, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok || !slices.Contains(errorShapes, exprString(call.Fun)) {
-				return true
-			}
-			for _, arg := range call.Args {
-				ast.Inspect(arg, func(m ast.Node) bool {
-					switch x := m.(type) {
-					case *ast.CallExpr:
-						if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "len" {
-							found = append(found, path+": "+exprString(x))
-							return false
-						}
-					case *ast.IndexExpr:
-						found = append(found, path+": "+exprString(x))
-						return false
-					case *ast.Ident:
-						if x.Name == "tag" {
-							found = append(found, path+": tag")
-						}
-					}
+		for _, decl := range f.Decls {
+			where := path + ": " + declName(decl) + ": "
+			ast.Inspect(decl, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok || !slices.Contains(errorShapes, exprString(call.Fun)) {
 					return true
-				})
-			}
-			return true
-		})
+				}
+				for _, arg := range call.Args {
+					ast.Inspect(arg, func(m ast.Node) bool {
+						switch x := m.(type) {
+						case *ast.CallExpr:
+							if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "len" {
+								found = append(found, where+exprString(x))
+								return false
+							}
+						case *ast.IndexExpr:
+							found = append(found, where+exprString(x))
+							return false
+						case *ast.Ident:
+							if x.Name == "tag" {
+								found = append(found, where+"tag")
+							}
+						}
+						return true
+					})
+				}
+				return true
+			})
+		}
 		return nil
 	})
 	if err != nil {
@@ -183,6 +233,26 @@ func TestNoErrorCarriesValueDerivedNumbers(t *testing.T) {
 			t.Errorf("valueLengthAllowed lists %s, which no error takes any more", a)
 		}
 	}
+}
+
+// declName names a top-level declaration for valueLengthAllowed: a
+// function by its name, a method as Type.Name, anything else as "var".
+func declName(d ast.Decl) string {
+	fd, ok := d.(*ast.FuncDecl)
+	if !ok {
+		return "var"
+	}
+	if fd.Recv == nil || len(fd.Recv.List) == 0 {
+		return fd.Name.Name
+	}
+	t := fd.Recv.List[0].Type
+	if st, ok := t.(*ast.StarExpr); ok {
+		t = st.X
+	}
+	if ix, ok := t.(*ast.IndexExpr); ok {
+		t = ix.X
+	}
+	return exprString(t) + "." + fd.Name.Name
 }
 
 // exprString is e as source, for the shapes the check matches.
