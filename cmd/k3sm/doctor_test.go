@@ -535,9 +535,14 @@ func TestDoctorKeystoreUserScopeRow(t *testing.T) {
 		detailHas string
 	}{
 		{name: "start checks pass", seam: userScopeChecks(func(*socket.Preconditions) {}), status: statusPass, detail: "keystore user scope: start checks pass; a root-owned 0666 socket is at /var/lib/k3sm/keystore-sock/keys.sock"},
-		{name: "start checks pass, no socket", seam: userScope(func(u *doctorUserScope) {
+		{name: "start checks pass, no socket, plist without the entry", seam: userScope(func(u *doctorUserScope) {
 			u.sockState = func() error { return fmt.Errorf("%w: nothing is at the path", errNoListeningSocket) }
+			u.plistHasSockets = func() (bool, error) { return false, nil }
 		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path]; run `sudo k3sm install` (it rewrites the server plist and re-bootstraps the job)", remedy: "sudo k3sm install   # it rewrites the server plist and re-bootstraps the job"},
+		{name: "start checks pass, no socket, plist with the entry", seam: userScope(func(u *doctorUserScope) {
+			u.sockState = func() error { return fmt.Errorf("%w: nothing is at the path", errNoListeningSocket) }
+			u.plistHasSockets = func() (bool, error) { return true, nil }
+		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path]; mount the data root, then run `sudo k3sm restart`", remedy: "sudo k3sm restart   # once the data root is mounted"},
 		{name: "two servers", seam: userScope(func(u *doctorUserScope) {
 			u.pre.ServerCount = func(context.Context) (int, error) { return 2, nil }
 			u.servers = func() ([]string, error) { return []string{"mac-a", "mac-b"}, nil }

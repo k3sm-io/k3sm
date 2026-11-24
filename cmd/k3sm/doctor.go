@@ -285,9 +285,30 @@ func checkKeystoreMaintenance(env doctorEnv) checkResult {
 	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("a %s marker stands, left by keys %s, which stopped or did not report; the keystore user scope stays off while it stands", keystore.MaintenanceMarkerName, verb), remedy: "sudo k3sm keys " + verb + "   # finishes the run, or prints its committed report"}
 }
 
-// doctorNotActivatedRemedy is the user-scope row's remedy when no socket
-// of launchd's is at the path (socket.NotActivatedRemedy).
-const doctorNotActivatedRemedy = "sudo k3sm install   # it rewrites the server plist and re-bootstraps the job"
+// The user-scope row's two no-socket remedies: a server plist without the
+// Sockets entry (launchd answers ESRCH; socket.NotActivatedRemedy), and a
+// plist with it, where launchd bound nothing because the socket's parent
+// path was missing at the server's activation (ENOENT;
+// socket.ParentMissingRemedy).
+const (
+	doctorNotActivatedRemedy  = "sudo k3sm install   # it rewrites the server plist and re-bootstraps the job"
+	doctorParentMissingRemedy = "sudo k3sm restart   # once the data root is mounted"
+)
+
+// noKeystoreSocket is the row when the start checks pass and no socket of
+// launchd's is at the path: the remedy follows from whether the installed
+// server plist carries the Sockets entry (unreadable counts as without).
+func noKeystoreSocket(name string, scope doctorUserScope, serr error) checkResult {
+	has := false
+	if scope.plistHasSockets != nil {
+		has, _ = scope.plistHasSockets() // unreadable: install rewrites it
+	}
+	remedy, text := doctorNotActivatedRemedy, socket.NotActivatedRemedy
+	if has {
+		remedy, text = doctorParentMissingRemedy, socket.ParentMissingRemedy
+	}
+	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: start checks pass, but no listening socket at %s [%v]; %s", scope.sockPath, serr, text), remedy: remedy}
+}
 
 // doctorServersShown bounds how many server names the user-scope row
 // lists when more than one is registered.
@@ -334,12 +355,9 @@ func checkKeystoreUserScope(env doctorEnv) checkResult {
 	switch {
 	case reason == "":
 		if serr := scope.sockState(); serr != nil {
-			// launchd made no socket for the job: its definition predates the
-			// Sockets entry, or launchd could not create the path. Only a
-			// new bootstrap of the job gives one.
-			return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: start checks pass, but no listening socket at %s [%v]; %s", scope.sockPath, serr, socket.NotActivatedRemedy), remedy: doctorNotActivatedRemedy}
+			return noKeystoreSocket(name, scope, serr)
 		}
-		return checkResult{name: name, status: statusPass, detail: "keystore user scope: start checks pass; a root-owned 0666 socket is at " + scope.sockPath}
+		return checkResult{name: name, status: statusPass, detail: fmt.Sprintf("keystore user scope: start checks pass; a root-owned %04o socket is at %s", install.KeystoreSocketMode, scope.sockPath)}
 	case reason == socket.OffServersUnknown && errors.Is(countErr, fs.ErrPermission):
 		return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: the server count cannot be read as this user, so the start checks are not all known [%v]", countErr), remedy: "sudo k3sm doctor   # the admin kubeconfig is root's"}
 	}

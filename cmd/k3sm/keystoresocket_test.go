@@ -600,14 +600,25 @@ func mustHandler(t *testing.T) *socket.Handler {
 // is bound.
 func TestDoctorKeystoreSocketLstat(t *testing.T) {
 	const svc = 260
-	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, 0, launchdSocketOwner); err != nil {
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, 0, 1, launchdSocketOwner); err != nil {
 		t.Fatalf("launchd's socket: %v", err)
 	}
-	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, svc, launchdSocketOwner); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "owned by uid 260, not root's") {
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, svc, 1, launchdSocketOwner); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "owned by uid 260, not root's") {
 		t.Fatalf("the service user's socket: %v", err)
 	}
-	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o600, 0, launchdSocketOwner); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "mode 0600, not 0666") {
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o600, 0, 1, launchdSocketOwner); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "mode 0600, not 0666") {
 		t.Fatalf("a root socket at 0600: %v", err)
+	}
+	if err := judgeKeystoreSocket(unix.S_IFSOCK|0o666, 0, 0, launchdSocketOwner); !errors.Is(err, errNoListeningSocket) || !strings.Contains(err.Error(), "group is 0, not daemon's 1") {
+		t.Fatalf("a root:wheel socket: %v", err)
+	}
+	if err := judgeKeystoreSockDir(unix.S_IFDIR|0o755, 0, 0); err != nil {
+		t.Fatalf("a root:wheel 0755 directory: %v", err)
+	}
+	for _, d := range []struct{ mode, owner, group uint32 }{{unix.S_IFDIR | 0o775, 0, 0}, {unix.S_IFDIR | 0o755, svc, 0}, {unix.S_IFDIR | 0o755, 0, 20}, {unix.S_IFREG | 0o755, 0, 0}} {
+		if err := judgeKeystoreSockDir(d.mode, d.owner, d.group); !errors.Is(err, errNoListeningSocket) {
+			t.Errorf("directory %#o %d:%d: %v, want no listening socket", d.mode, d.owner, d.group, err)
+		}
 	}
 	dir := t.TempDir()
 	file := filepath.Join(dir, "file")

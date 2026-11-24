@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -593,19 +594,28 @@ type doctorUserScope struct {
 	// error.
 	servers  func() ([]string, error)
 	sockPath string
-	// sockState lstats sockPath, never following or connecting: nil when
-	// launchd's socket is there (root's, at install.KeystoreSocketMode).
+	// sockState lstats sockPath and its directory, never following or
+	// connecting: nil when launchd's socket is there (root:daemon, at
+	// install.KeystoreSocketMode, in a root:wheel 0755 directory).
 	sockState func() error
+	// plistHasSockets reports whether the installed server plist carries
+	// the keystore's Sockets entry, which tells doctor's two no-socket
+	// remedies apart.
+	plistHasSockets func() (bool, error)
 }
 
 // errNoListeningSocket is a socket path that holds no socket of
 // launchd's.
 var errNoListeningSocket = errors.New("no listening socket")
 
-// launchdSocketOwner is the owner of a socket launchd creates for a job's
-// Sockets entry: root, whatever the job's UserName (measured 2026-11-23:
-// root:daemon 0666 in the root 0755 directory).
-const launchdSocketOwner = 0
+// launchdSocketOwner and launchdSocketGroup are the owner and group of a
+// socket launchd creates for a job's Sockets entry: root:daemon, whatever
+// the job's UserName (measured on macOS 27.2.1, in a root:wheel 0755
+// directory).
+const (
+	launchdSocketOwner = 0
+	launchdSocketGroup = 1
+)
 
 // lstatKeystoreSocket judges what is at path by lstat alone: nil for a
 // socket owned by owner (launchdSocketOwner in production) at
@@ -619,22 +629,54 @@ func lstatKeystoreSocket(path string, owner uint32) error {
 		}
 		return fmt.Errorf("lstat the socket path: %w", err)
 	}
-	return judgeKeystoreSocket(uint32(st.Mode), st.Uid, owner)
+	if err := judgeKeystoreSocket(uint32(st.Mode), st.Uid, st.Gid, owner); err != nil {
+		return err
+	}
+	if err := unix.Lstat(filepath.Dir(path), &st); err != nil {
+		return fmt.Errorf("lstat the socket's directory: %w", err)
+	}
+	return judgeKeystoreSockDir(uint32(st.Mode), st.Uid, st.Gid)
+}
+
+// judgeKeystoreSockDir is the rule for the socket's directory: root:wheel
+// 0755, a directory.
+func judgeKeystoreSockDir(mode, owner, group uint32) error {
+	switch {
+	case mode&unix.S_IFMT != unix.S_IFDIR:
+		return fmt.Errorf("%w: the socket's directory is not a directory", errNoListeningSocket)
+	case owner != 0 || group != 0:
+		return fmt.Errorf("%w: the socket's directory is owned by %d:%d, not root:wheel", errNoListeningSocket, owner, group)
+	case mode&0o7777 != 0o755:
+		return fmt.Errorf("%w: the socket's directory is at mode %04o, not 0755", errNoListeningSocket, mode&0o7777)
+	}
+	return nil
 }
 
 // judgeKeystoreSocket is lstatKeystoreSocket's rule over an lstat's mode
 // and owner. A socket of the service user's is the self-bind form, which
 // does not ship, so it is no listening socket either.
-func judgeKeystoreSocket(mode, owner, want uint32) error {
+func judgeKeystoreSocket(mode, owner, group, want uint32) error {
 	switch {
 	case mode&unix.S_IFMT != unix.S_IFSOCK:
 		return fmt.Errorf("%w: the path is not a socket", errNoListeningSocket)
+	case group != launchdSocketGroup:
+		return fmt.Errorf("%w: the socket's group is %d, not daemon's %d, which launchd's socket's is", errNoListeningSocket, group, launchdSocketGroup)
 	case owner != want:
 		return fmt.Errorf("%w: the socket is owned by uid %d, not root's, which launchd's socket is (run sudo k3sm install, which renders the server plist's Sockets entry)", errNoListeningSocket, owner)
 	case mode&0o7777 != install.KeystoreSocketMode:
 		return fmt.Errorf("%w: the socket is at mode %04o, not %04o", errNoListeningSocket, mode&0o7777, install.KeystoreSocketMode)
 	}
 	return nil
+}
+
+// installedPlistHasSockets reports whether the installed io.k3sm.server
+// plist names the keystore's Sockets entry.
+func installedPlistHasSockets() (bool, error) {
+	b, err := os.ReadFile(filepath.Join(install.DefaultLaunchDaemonDir, install.ServerLabel+".plist"))
+	if err != nil {
+		return false, err
+	}
+	return bytes.Contains(b, []byte("<key>Sockets</key>")) && bytes.Contains(b, []byte("<key>"+install.KeystoreSocketsEntry+"</key>")), nil
 }
 
 // readAdminKubeconfig loads the admin kubeconfig at path, opening it first
@@ -706,9 +748,10 @@ func doctorKeystoreUserScope(workDir string) (doctorUserScope, error) {
 			ServerCount:       count,
 			StartScopes:       doctorStartScopes(store),
 		},
-		release:   pass.end,
-		servers:   func() ([]string, error) { return names, countErr },
-		sockPath:  sock,
-		sockState: func() error { return lstatKeystoreSocket(sock, launchdSocketOwner) },
+		release:         pass.end,
+		servers:         func() ([]string, error) { return names, countErr },
+		sockPath:        sock,
+		sockState:       func() error { return lstatKeystoreSocket(sock, launchdSocketOwner) },
+		plistHasSockets: installedPlistHasSockets,
 	}, nil
 }
