@@ -4615,9 +4615,10 @@ surface, and the app consumes only those.
   (`TestNoErrorCarriesValueDerivedNumbers`); and, for what reaches an error through a
   variable, which that check cannot see, by the sites themselves, which name no such number:
   a quota refusal names the cap and not the total that counts the value, a refused
-  refresh-owner change names neither owner, and a frame whose value length does not fill it
-  names neither length (`TestValueNumbersNotInErrorTexts`,
-  `TestFrameValueLengthErrorNamesNoLength`). The ordinary outcomes
+  refresh-owner change names neither owner, and no frame error, read or written, names a
+  number that counts a value: no frame length, no value length and no count of bytes after a
+  header, only a cap or a header length (`TestValueNumbersNotInErrorTexts`,
+  `TestFrameValueLengthErrorNamesNoLength`, `TestFrameErrorsNameNoValueLength`). The ordinary outcomes
   (`not-found`, `exists`, `quota`, `rate-limited`, `busy`, `log-full`, and the socket's own
   refusals), a change that committed, and a cancelled or timed-out request are not logged.
   Standing damage cannot flood the log: each (uid, op, class) key logs at most one line every

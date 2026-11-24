@@ -142,10 +142,10 @@ func readFrame(r io.Reader, mode readMode) (Frame, error) {
 	}
 	n := binary.BigEndian.Uint32(prefix[:4])
 	if n > MaxFrame {
-		return Frame{}, protocolErrorf("frame length %d over the cap %d", n, MaxFrame)
+		return Frame{}, protocolErrorf("frame length over the cap %d", MaxFrame)
 	}
 	if n < minFrame {
-		return Frame{}, protocolErrorf("frame length %d under the minimum %d", n, minFrame)
+		return Frame{}, protocolErrorf("frame length under the minimum %d", minFrame)
 	}
 	if err := readBody(r, prefix[4:5]); err != nil {
 		return Frame{}, err
@@ -173,7 +173,7 @@ func readFrame(r io.Reader, mode readMode) (Frame, error) {
 		return Frame{}, protocolErrorf("header length %d past the frame", hl)
 	}
 	if hello && hl != rest {
-		return Frame{}, protocolErrorf("HELLO carries %d bytes after its header", rest-hl)
+		return Frame{}, protocolErrorf("HELLO carries bytes after its header")
 	}
 	f.Header = make([]byte, hl)
 	if err := readBody(r, f.Header); err != nil {
@@ -184,7 +184,7 @@ func readFrame(r io.Reader, mode readMode) (Frame, error) {
 		return f, nil
 	}
 	if rest < 4 {
-		return Frame{}, protocolErrorf("%d bytes after the header, too few for a value length", rest)
+		return Frame{}, protocolErrorf("too few bytes after the header for a value length")
 	}
 	var vp [4]byte
 	if err := readBody(r, vp[:]); err != nil {
@@ -232,7 +232,7 @@ func AppendFrame(b []byte, f Frame) ([]byte, error) {
 		n += 4 + len(f.Value)
 	}
 	if n > MaxFrame {
-		return b, protocolErrorf("frame length %d over the cap %d", n, MaxFrame)
+		return b, protocolErrorf("frame length over the cap %d", MaxFrame)
 	}
 	b = binary.BigEndian.AppendUint32(b, uint32(n))
 	b = append(b, byte(f.Type))
