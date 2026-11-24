@@ -610,7 +610,6 @@ func runServer(args []string) (err error) {
 	// a crash before then leaves the record for the count (see crashBreaker).
 	healthyReset := time.AfterFunc(executor.CrashLoopWindow, breaker.resetIfHealthy)
 	defer healthyReset.Stop()
-
 	// 2. Client for the post-bring-up provisioning + Service watch.
 	restCfg, cs, err := kubeclient.FromPath(exec.Kubeconfig())
 	if err != nil {
@@ -634,13 +633,11 @@ func runServer(args []string) (err error) {
 	}
 	stopAddons := startEmbeddedAddons(ctx, plan, restCfg, cs, logger)
 	defer timedTeardownStep(logger, "add-on-regate", stopAddons)
-	// 3c''/3c'/3c'''. Each starts here (a defer's arguments run now); each stop drains before exec.Stop's (LIFO).
+	// 3c''/3c'/3c''', then the keystore (its socket fails off, never the server). Each starts here (a defer's arguments run now); each stop drains before exec.Stop's (LIFO).
 	stopHelm := startHelmController(ctx, plan, restCfg, cs, logger)
 	defer timedTeardownStep(logger, "helm-controller", stopHelm)
 	defer timedTeardownStep(logger, "manifest-dir", startManifestDir(ctx, restCfg, cs, logger))
 	defer timedTeardownStep(logger, "keystore-delivery", startKeystoreDelivery(ctx, plan, cs, logger))
-	// The keystore's user socket, on launchd's activated descriptor; a failed
-	// start leaves the user scope off, never this server.
 	defer timedTeardownStep(logger, "keystore-socket", startKeystoreSocket(ctx, plan.opts.workDir, cs, keystoreSocketListener(), logger))
 	vmCapable := vmBackendAvailable() // can this node host vm guests? (3d registry, 4c datapath)
 	// 3d. The ingest registry; torn down EARLY, on cpStop's lane, and the defer is its backstop.
