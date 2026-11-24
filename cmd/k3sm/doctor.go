@@ -287,12 +287,12 @@ func checkKeystoreMaintenance(env doctorEnv) checkResult {
 
 // The user-scope row's two no-socket remedies: a server plist without the
 // Sockets entry (launchd answers ESRCH; socket.NotActivatedRemedy), and a
-// plist with it, where launchd bound nothing because the socket's parent
-// path was missing at the server's activation (ENOENT;
-// socket.ParentMissingRemedy).
+// plist with it, where launchd has no keys socket for the job: its loaded
+// definition has no such entry, or a parent of the socket path is missing
+// (ENOENT; socket.ParentMissingRemedy).
 const (
 	doctorNotActivatedRemedy  = "sudo k3sm install   # it rewrites the server plist and re-bootstraps the job"
-	doctorParentMissingRemedy = "sudo k3sm restart   # once the data root is mounted; if that does not clear it, sudo k3sm install"
+	doctorParentMissingRemedy = "sudo k3sm install   # it rewrites and reloads the server's definition; if the data root is on a volume that is not mounted, mount it first"
 )
 
 // noKeystoreSocket is the row when the start checks pass and no socket of
@@ -306,7 +306,7 @@ func noKeystoreSocket(name string, scope doctorUserScope, serr error) checkResul
 	remedy, text := doctorNotActivatedRemedy, socket.NotActivatedRemedy
 	if has {
 		remedy = doctorParentMissingRemedy
-		text = "the plist has the socket entry but launchd provided no socket: a parent of its path is missing (a data root on a volume that is not mounted), or the server has not started yet or is restarting; " + socket.ParentMissingRemedy
+		text = "the plist has the socket entry, but launchd has no `keys` socket for this job: its loaded definition has no such entry, or a parent of the socket path is missing (measured with three missing levels); or the server has not started yet or is restarting; " + socket.ParentMissingRemedy
 	}
 	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: start checks pass, but no listening socket at %s [%v]; %s", scope.sockPath, serr, text), remedy: remedy}
 }
