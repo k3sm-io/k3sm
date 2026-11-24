@@ -19,12 +19,15 @@ limitations under the License.
 package install
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -119,13 +122,13 @@ func TestSocketDirRootOwnedServiceUIDCannotBind(t *testing.T) {
 	copyTestBinary(t, bin)
 	child := func(phase string) {
 		t.Helper()
-		cmd := exec.Command(bin, "-test.run=^TestU104ServiceUIDChild$", "-test.v", "-test.count=1")
+		cmd := exec.Command(bin, "-test.run="+u104ChildRun, "-test.v", "-test.count=1")
 		cmd.Dir = own
 		cmd.Env = append(os.Environ(), u104SockEnv+"="+sock, "K3SM_U104_PHASE="+phase, "K3SM_U104_OWN="+own)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
 		out, err := cmd.CombinedOutput()
 		t.Logf("child as uid %d (%s):\n%s", uid, phase, out)
-		if err != nil {
+		if err := u104ChildPassed(out, err); err != nil {
 			t.Fatalf("as the service user (%s): %v", phase, err)
 		}
 	}
@@ -139,6 +142,50 @@ func TestSocketDirRootOwnedServiceUIDCannotBind(t *testing.T) {
 	child("absent")
 	if _, err := os.Lstat(sock); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("keys.sock after the bind attempt: %v; want nothing", err)
+	}
+}
+
+// u104ChildRun is the child's -test.run pattern.
+const u104ChildRun = "^TestU104ServiceUIDChild$"
+
+// u104ChildPassed is nil only when the child exited 0 and its verbose
+// output carries TestU104ServiceUIDChild's PASS line: a pattern that
+// matched no test ("no tests to run") or a child that skipped exits 0 too,
+// and would pass the parent vacuously.
+func u104ChildPassed(out []byte, err error) error {
+	switch {
+	case err != nil:
+		return err
+	case bytes.Contains(out, []byte("no tests to run")):
+		return errors.New("the child ran no test: its -test.run pattern matched nothing")
+	case !bytes.Contains(out, []byte("--- PASS: TestU104ServiceUIDChild")):
+		return errors.New("the child's output has no PASS line for TestU104ServiceUIDChild")
+	}
+	return nil
+}
+
+// The parent's child check refuses a vacuous child, shown without root
+// by running this test binary itself as the child: a -test.run pattern
+// that matches nothing, and the real pattern with no socket in the
+// environment (the child skips), each exit 0 and are each refused.
+func TestU104ChildCheckRefusesAVacuousChild(t *testing.T) {
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range []string{"^TestU104ServiceUIDChildRenamed$", u104ChildRun} {
+		cmd := exec.Command(bin, "-test.run="+run, "-test.v", "-test.count=1")
+		cmd.Env = slices.DeleteFunc(os.Environ(), func(e string) bool { return strings.HasPrefix(e, u104SockEnv+"=") })
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("-test.run=%s: %v\n%s", run, err, out)
+		}
+		if u104ChildPassed(out, nil) == nil {
+			t.Errorf("-test.run=%s: the child check passed a child that ran nothing:\n%s", run, out)
+		}
+	}
+	if err := u104ChildPassed([]byte("=== RUN   TestU104ServiceUIDChild\n--- PASS: TestU104ServiceUIDChild (0.00s)\nPASS\n"), nil); err != nil {
+		t.Errorf("a child that passed: %v", err)
 	}
 }
 
