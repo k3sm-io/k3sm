@@ -33,6 +33,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -466,14 +467,39 @@ func (v *keysVerb) store() (keysStore, error) {
 }
 
 // keystoreLayout is the store's Config, without its owner, for the server
-// work dir work (absolute and clean): the layout the keys verbs and the
-// server's delivery reconciler both open.
+// work dir work (absolute and clean): the layout the keys verbs, the
+// server's delivery reconciler and its socket all open. Every Config it
+// returns for one work dir carries the same keystore.TreeState
+// (keystoreTree), so the stores this process opens over the tree share one
+// in-process lock and one set of usage figures.
 func keystoreLayout(work string) keystore.Config {
+	dir := filepath.Join(work, keystoreSubdir)
 	return keystore.Config{
-		Dir:       filepath.Join(work, keystoreSubdir),
+		Dir:       dir,
 		MasterDir: filepath.Join(executor.CredDir(work), keystoreMasterSubdir),
 		DataRoot:  executor.RuntimeRoot(work),
+		Tree:      keystoreTree(dir),
 	}
+}
+
+// keystoreTrees is this process's keystore.TreeState for each store
+// directory it opened.
+var keystoreTrees = struct {
+	mu    sync.Mutex
+	byDir map[string]*keystore.TreeState
+}{byDir: map[string]*keystore.TreeState{}}
+
+// keystoreTree is the one TreeState this process uses for the store at
+// dir.
+func keystoreTree(dir string) *keystore.TreeState {
+	keystoreTrees.mu.Lock()
+	defer keystoreTrees.mu.Unlock()
+	t, ok := keystoreTrees.byDir[dir]
+	if !ok {
+		t = keystore.NewTreeState()
+		keystoreTrees.byDir[dir] = t
+	}
+	return t
 }
 
 // scrubTokens name scrubPaths' roots, by position.

@@ -145,6 +145,14 @@ type Config struct {
 	// judged as the lookup's is: an error, an all-zero or a synthesized
 	// answer fails closed with ErrScopeOwnerUnknown.
 	GeneratedUID func(uid uint32) ([16]byte, error)
+	// Tree is the in-process state every FileStore over this tree in one
+	// process must share: the store lock's in-process half and the user
+	// scopes' usage figures (TreeState). Two stores over one tree with
+	// their own would let one's holds skip the other's writer preference,
+	// and one's writes go missing from the other's figures. Nil gives the
+	// store a state of its own, which only a process with one store over
+	// the tree may use.
+	Tree *TreeState
 }
 
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
@@ -240,16 +248,19 @@ type FileStore struct {
 	// (servercounts.go). A pointer, as userScopesStarted is; New allocates
 	// it.
 	counts *serverCounts
+	// tree is Config.Tree, or a state of the store's own; inproc and
+	// usage are its parts.
+	tree *TreeState
 	// inproc is the store lock's in-process half (storelock.go), taken
 	// before the flock. A pointer, as userScopesStarted is, so a copy of
-	// the store shares it; New allocates it.
+	// the store shares it; it is tree's.
 	inproc *prefLock
 	// holdObserver, when set, is called as each store lock hold ends, with
 	// its mode and how long it was held on the clock, where a test bounds
 	// the hold.
 	holdObserver func(exclusive bool, held time.Duration)
 	// usage is the user scopes' usage figures and the uids' mutation locks
-	// (usage.go). A pointer, as userScopesStarted is; New allocates it.
+	// (usage.go). A pointer, as userScopesStarted is; it is tree's.
 	usage *usageTable
 	// usageLstat, when set, is called before each file Lstat of a scope
 	// usage walk, with whether the walk runs under the store lock, where a
@@ -295,9 +306,12 @@ func New(cfg Config) *FileStore {
 		lostLines:         new(lostEntryLines),
 		audit:             new(auditState),
 		counts:            newServerCounts(),
-		inproc:            newPrefLock(),
-		usage:             newUsageTable(),
 	}
+	tree := cfg.Tree
+	if tree == nil {
+		tree = NewTreeState()
+	}
+	s.tree, s.inproc, s.usage = tree, tree.inproc, tree.usage
 	if cfg.LogFlags != nil {
 		s.logFlags = cfg.LogFlags
 	}

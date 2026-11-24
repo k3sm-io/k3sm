@@ -34,6 +34,23 @@ import (
 // runs in a root process of its own, takes keystore-lock (the system floor)
 // before the store lock.
 
+// TreeState is the in-process state of one keystore tree that every
+// FileStore over it in one process shares (Config.Tree): the store lock's
+// in-process half and the user scopes' usage figures.
+type TreeState struct {
+	inproc *prefLock
+	usage  *usageTable
+}
+
+// NewTreeState returns a fresh TreeState, for the one process that opens
+// the tree.
+func NewTreeState() *TreeState {
+	return &TreeState{inproc: newPrefLock(), usage: newUsageTable()}
+}
+
+// Tree is the store's TreeState: Config.Tree, or the one New made for it.
+func (s *FileStore) Tree() *TreeState { return s.tree }
+
 // prefLock is a reader-writer lock in which a waiting writer blocks new
 // readers, as sync.RWMutex does, whose acquisition is bounded by a wait and
 // a context, which sync.RWMutex's is not.

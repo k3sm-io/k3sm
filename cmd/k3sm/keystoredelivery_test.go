@@ -28,6 +28,7 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
+	"k3sm.io/k3sm/pkg/keystore"
 	keydeliver "k3sm.io/k3sm/pkg/keystore/deliver"
 )
 
@@ -166,5 +167,33 @@ func TestKeysEnvDefaultsBindRoot(t *testing.T) {
 	}
 	if cerr == nil && st.Uid != 0 {
 		t.Fatalf("the default chown succeeded and left the file uid %d, not root's", st.Uid)
+	}
+}
+
+// One lock per tree: the store the delivery reconciler opens and the one
+// the user socket's wiring builds over the same work dir share one
+// keystore.TreeState (the in-process lock and the usage figures), so a
+// revocation the reconciler writes queues behind the socket's writer
+// preference and a write by either is in the other's figures.
+func TestKeystoreSocketAndDeliveryShareTree(t *testing.T) {
+	f := newWiringFixture(t)
+	var socketStore *keystore.FileStore
+	f.deps.opened = func(s *keystore.FileStore) { socketStore = s }
+	_, closeAll, err := keystoreSocketConfig(f.deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAll()
+	ids := keystoreDeliveryIDs{euid: func() int { return 501 }, egid: func() int { return 20 }, service: func() (uint32, uint32, error) { return 777, 778, nil }}
+	cfg, err := keystoreDeliveryConfig(f.deps.workDir, true, false, fake.NewClientset(), ids, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, ok := cfg.Store.(*keystore.FileStore)
+	if !ok || socketStore == nil {
+		t.Fatalf("the stores: delivery %T, socket %v", cfg.Store, socketStore)
+	}
+	if delivery.Tree() == nil || delivery.Tree() != socketStore.Tree() {
+		t.Fatal("the delivery reconciler's store and the socket's store hold different in-process lock and usage state over one tree")
 	}
 }
