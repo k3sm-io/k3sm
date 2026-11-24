@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -560,7 +561,9 @@ func (s *FileStore) openLocked(ctx context.Context, create, exclusive bool) (*os
 // in-process writer-preferring lock (storelock.go), then the store-wide
 // flock on root's lock file, waiting at most s.lockWait for the two
 // together, or until ctx is done. The returned function releases the flock,
-// then the in-process lock.
+// then the in-process lock, once: a second call does nothing, so a caller's
+// deferred release after an explicit one never releases another holder's
+// in-process lock.
 func (s *FileStore) lock(ctx context.Context, root *os.Root, exclusive bool) (func(), error) {
 	start := time.Now()
 	if err := s.inproc.acquire(ctx, exclusive, s.lockWait); err != nil {
@@ -572,12 +575,15 @@ func (s *FileStore) lock(ctx context.Context, root *os.Root, exclusive bool) (fu
 		return nil, err
 	}
 	held := time.Now()
+	var once sync.Once
 	return func() {
-		if s.holdObserver != nil {
-			s.holdObserver(exclusive, time.Since(held))
-		}
-		unlock()
-		s.inproc.release(exclusive)
+		once.Do(func() {
+			if s.holdObserver != nil {
+				s.holdObserver(exclusive, time.Since(held))
+			}
+			unlock()
+			s.inproc.release(exclusive)
+		})
 	}, nil
 }
 

@@ -132,7 +132,7 @@ func TestUsageFigureMatchesWalk(t *testing.T) {
 	}
 	// Bound to another scope.key: the next judgement walks under the lock.
 	s.usage.mu.Lock()
-	s.usage.byUID[1001].key = sha256.Sum256([]byte("another scope.key"))
+	s.usage.byUID[1001].bind.key = sha256.Sum256([]byte("another scope.key"))
 	s.usage.byUID[1001].entries["a"] = 0 // and stale low: never trusted
 	s.usage.mu.Unlock()
 	under, outside := countUsageLstats(s)

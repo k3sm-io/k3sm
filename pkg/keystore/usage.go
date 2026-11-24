@@ -25,6 +25,7 @@ import (
 	"maps"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -38,11 +39,15 @@ import (
 //   - It is built by a walk of the scope taken before the store lock, under
 //     the uid's mutation lock, which every put, rotate and rm of the uid
 //     holds, so no write of this process lands in the scope while it walks.
-//   - Under the store lock it is trusted only when the scope.key it was built
-//     beside is still the one on disk (the same bytes): a scope root removed
-//     and minted again (rm-scope), or a Rewrap that re-sealed scope.key, makes
-//     it stale, and the quota is judged by a walk under the lock instead,
-//     which then becomes the figure.
+//   - Under the store lock it is trusted only when the scope it was built
+//     in is still the one on disk (scopeBinding): the same scope.key bytes,
+//     and the same entries/ directory, by device and inode. A scope root
+//     removed and minted again (rm-scope), or a Rewrap that re-sealed
+//     scope.key, changes the first; a scope tree renamed into place under
+//     the same scope.key bytes (a copy put back while the server was
+//     stopped, say) changes the second. Either makes the figure stale, and
+//     the quota is judged by a walk under the lock instead, which then
+//     becomes the figure.
 //   - Every committed put, rotate and rm of this process changes it in the
 //     same hold, by the bytes it wrote or removed; any of them that fails
 //     after it may have written, or whose outcome is not known, drops it, and
@@ -58,11 +63,26 @@ import (
 // root's rm-scope, which removes the scope with its scope.key.
 
 // scopeUsage is one scope's figure: every entry name in entries/ with its
-// sealed bytes, as walkScopeEntries counts them, beside the digest of
-// the scope.key it was taken under (zero: no scope.key).
+// sealed bytes, as walkScopeEntries counts them, beside the binding of the
+// scope it was taken in.
 type scopeUsage struct {
-	key     [sha256.Size]byte
+	bind    scopeBinding
 	entries map[string]int64
+}
+
+// scopeBinding is what a figure is bound to: the digest of the scope's
+// scope.key bytes (zero: no scope.key), and the device and inode of its
+// entries/ directory (zero: no entries/). The directory bound is entries/,
+// not .user/<uid>, because entries/ is the tree the figure counts: a scope
+// directory renamed into place brings its own entries/, so the binding
+// sees that, and it sees an entries/ replaced inside a scope directory
+// that stayed, which the scope directory's identity would not. A user
+// operation never creates or replaces entries/ (a mint creates it with
+// scope.key, which changes the digest in the same hold), so the binding
+// changes only when the tree under the figure did.
+type scopeBinding struct {
+	key      [sha256.Size]byte
+	dev, ino uint64
 }
 
 // usageTable is the store's figures and the uids' mutation locks.
@@ -83,8 +103,13 @@ func newUsageTable() *usageTable {
 // rotate and rm in this process, before the store lock (storelock.go has
 // the order), waiting at most wait, or until ctx is done. Only the uid's
 // own operations wait on it. The returned function releases it. A nil t
-// (a store a test built without New) holds nothing.
+// (a store a test built without New) holds nothing. A ctx already done
+// takes nothing and returns its error, as prefLock.acquire does: a select
+// with the lock free would otherwise pick at random between the two.
 func (t *usageTable) lockUID(ctx context.Context, uid uint32, wait time.Duration) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if t == nil {
 		return func() {}, nil
 	}
@@ -107,28 +132,26 @@ func (t *usageTable) lockUID(ctx context.Context, uid uint32, wait time.Duration
 	}
 }
 
-// fresh reports whether uid has a figure taken beside the scope.key whose
-// digest is key.
-func (t *usageTable) fresh(uid uint32, key [sha256.Size]byte) bool {
+// fresh reports whether uid has a figure bound to b.
+func (t *usageTable) fresh(uid uint32, b scopeBinding) bool {
 	if t == nil {
 		return false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	f := t.byUID[uid]
-	return f != nil && f.key == key
+	return f != nil && f.bind == b
 }
 
-// get is a copy of uid's figure's entries, when it has one taken beside
-// the scope.key whose digest is key; nil otherwise. A copy, so the caller
-// reads it outside t.mu.
-func (t *usageTable) get(uid uint32, key [sha256.Size]byte) map[string]int64 {
+// get is a copy of uid's figure's entries, when it has one bound to b; nil
+// otherwise. A copy, so the caller reads it outside t.mu.
+func (t *usageTable) get(uid uint32, b scopeBinding) map[string]int64 {
 	if t == nil {
 		return nil
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if f := t.byUID[uid]; f != nil && f.key == key {
+	if f := t.byUID[uid]; f != nil && f.bind == b {
 		return maps.Clone(f.entries)
 	}
 	return nil
@@ -228,23 +251,39 @@ func (o *usageOp) confirm(fn func(entries map[string]int64)) {
 	o.t.mu.Unlock()
 }
 
-// scopeKeyDigest is the digest of dir's scope.key bytes, the zero digest
-// when it has none: what a figure is bound to.
-func scopeKeyDigest(dir *os.Root) ([sha256.Size]byte, error) {
-	b, _, err := readFile(dir, scopeKeyName, int64(maxScopeKeyRecordSize))
+// bindingOf is the binding of the scope directory dir: its scope.key's
+// digest and its entries/ directory's identity, each zero when absent.
+// entries/ is Lstat'd, so a symlink under its name binds the link, and the
+// walk then refuses it as openSubdir does.
+func bindingOf(dir *os.Root) (scopeBinding, error) {
+	var b scopeBinding
+	raw, _, err := readFile(dir, scopeKeyName, int64(maxScopeKeyRecordSize))
+	switch {
+	case err == nil:
+		b.key = sha256.Sum256(raw)
+	case !errors.Is(err, fs.ErrNotExist):
+		return scopeBinding{}, err
+	}
+	fi, err := dir.Lstat(scopeEntriesName)
 	if errors.Is(err, fs.ErrNotExist) {
-		return [sha256.Size]byte{}, nil
+		return b, nil
 	}
 	if err != nil {
-		return [sha256.Size]byte{}, err
+		return scopeBinding{}, err
 	}
-	return sha256.Sum256(b), nil
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return scopeBinding{}, fmt.Errorf("%s: no device and inode", scopeEntriesName)
+	}
+	b.dev, b.ino = uint64(st.Dev), st.Ino // Dev is int32 on darwin
+	return b, nil
 }
 
 // prepareUsage builds uid's figure by walking the scope before the store
-// lock, when it has none bound to the scope.key on disk: the caller holds
-// the uid's mutation lock. A figure bound to another scope.key (an rm-scope
-// and a new mint, a Rewrap's re-seal) is rebuilt here, outside the hold. It
+// lock, when it has none bound to the scope on disk (scopeBinding): the
+// caller holds the uid's mutation lock. A figure bound to another scope.key
+// (an rm-scope and a new mint, a Rewrap's re-seal) or another entries/ (a
+// tree renamed into place) is rebuilt here, outside the hold. It
 // is best effort: a scope that cannot be walked now leaves no new figure,
 // and the judgement under the lock walks then; a ctx done during the walk
 // leaves none either, and the caller returns ctx's error before the store
@@ -259,7 +298,7 @@ func (u *UserScope) prepareUsage(ctx context.Context) {
 		return
 	}
 	defer func() { _ = root.Close() }() // read-only
-	if key, err := u.scopeKeyOf(root); err == nil && u.s.usage.fresh(u.uid, key) {
+	if b, err := u.bindingIn(root); err == nil && u.s.usage.fresh(u.uid, b) {
 		return
 	}
 	if f, err := u.walkUsage(ctx, root, false); err == nil {
@@ -267,18 +306,18 @@ func (u *UserScope) prepareUsage(ctx context.Context) {
 	}
 }
 
-// scopeKeyOf is the digest of the scope's scope.key under root, the zero
-// digest when the scope has none.
-func (u *UserScope) scopeKeyOf(root *os.Root) ([sha256.Size]byte, error) {
+// bindingIn is the binding of the scope under root, the zero binding when
+// the scope has no directory.
+func (u *UserScope) bindingIn(root *os.Root) (scopeBinding, error) {
 	dir, err := u.openScopeDir(root, false)
 	if errors.Is(err, errNoScopeKey) {
-		return [sha256.Size]byte{}, nil
+		return scopeBinding{}, nil
 	}
 	if err != nil {
-		return [sha256.Size]byte{}, err
+		return scopeBinding{}, err
 	}
 	defer func() { _ = dir.Close() }() // read-only
-	return scopeKeyDigest(dir)
+	return bindingOf(dir)
 }
 
 // walkUsage walks the scope under root into a figure: underLock says
@@ -298,7 +337,7 @@ func (u *UserScope) walkUsage(ctx context.Context, root *os.Root, underLock bool
 		return nil, err
 	}
 	defer func() { _ = dir.Close() }() // read-only
-	if f.key, err = scopeKeyDigest(dir); err != nil {
+	if f.bind, err = bindingOf(dir); err != nil {
 		return nil, err
 	}
 	entries, err := u.s.openSubdir(dir, scopeEntriesName, false)
@@ -324,22 +363,23 @@ func (u *UserScope) walkUsage(ctx context.Context, root *os.Root, underLock bool
 
 // usageUnderLock is the scope's figure for a quota judgement under the
 // store lock, a copy the caller owns: the one this process keeps when it is
-// bound to the scope.key on disk, else a walk now, which becomes the
-// figure. That walk is the one scope walk a put or rotate hold can do: the
-// figure is still absent or stale at the lock when the walk before it
-// failed, a root rm-scope and a new mint or a Rewrap landed between that
-// walk and the lock, or the put minted the scope under this hold.
+// bound to the scope on disk (scopeBinding), else a walk now, which becomes
+// the figure. That walk is the one scope walk a put or rotate hold can do:
+// the figure is still absent or stale at the lock when the walk before it
+// failed, a root rm-scope and a new mint, a Rewrap or a tree put in place
+// landed between that walk and the lock, or the put minted the scope under
+// this hold.
 func (u *UserScope) usageUnderLock(root *os.Root) (map[string]int64, error) {
 	dir, err := u.openScopeDir(root, false)
 	if err != nil {
 		return nil, err
 	}
-	key, err := scopeKeyDigest(dir)
+	b, err := bindingOf(dir)
 	_ = dir.Close() // read-only
 	if err != nil {
 		return nil, err
 	}
-	if m := u.s.usage.get(u.uid, key); m != nil {
+	if m := u.s.usage.get(u.uid, b); m != nil {
 		return m, nil
 	}
 	gen := u.s.usage.generation()

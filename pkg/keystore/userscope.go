@@ -592,6 +592,9 @@ func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Ro
 	if err := u.s.checkConfig(); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err // done before the lookup: none runs, no lock is taken
+	}
 	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, false)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -631,6 +634,9 @@ func (u *UserScope) read(ctx context.Context, fn func(*os.Root, keys) error) err
 func (u *UserScope) readScope(ctx context.Context, fn func(*os.Root, *openedScope) error) error {
 	if err := u.s.checkConfig(); err != nil {
 		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err // done before the lookup: none runs, no lock is taken
 	}
 	u = u.withGUID()
 	root, done, err := u.s.openLocked(ctx, false, false)

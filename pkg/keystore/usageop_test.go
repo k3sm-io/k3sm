@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"testing"
 )
@@ -243,7 +244,7 @@ func TestPrepareUsageHonoursContext(t *testing.T) {
 func TestStaleFigureRebuiltBeforeLock(t *testing.T) {
 	s, u := rotateScope(t)
 	s.usage.mu.Lock()
-	s.usage.byUID[1001].key = sha256.Sum256([]byte("another scope.key"))
+	s.usage.byUID[1001].bind.key = sha256.Sum256([]byte("another scope.key"))
 	s.usage.mu.Unlock()
 	under, outside := countUsageLstats(s)
 	userPut(t, u, "user/1001/b", "bee")
@@ -289,7 +290,8 @@ func TestLookupAfterUIDLockAndWalk(t *testing.T) {
 
 // Concurrent puts of one uid, and of two uids, share the usage table
 // without a data race (run with -race): each judgement reads its own copy
-// of the figure.
+// of the figure, and each uid's figure after them is what a walk of its
+// scope counts.
 func TestUsageConcurrentPuts(t *testing.T) {
 	ctx := context.Background()
 	s, _ := newMasteredStore(t)
@@ -320,12 +322,10 @@ func TestUsageConcurrentPuts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, uid := range []uint32{1001, 1002} {
-		s.usage.mu.Lock()
-		n := len(s.usage.byUID[uid].entries)
-		s.usage.mu.Unlock()
-		if n != 5 {
-			t.Fatalf("uid %d's figure holds %d entries, want 5", uid, n)
+	for uid, u := range map[uint32]*UserScope{1001: a, 1002: b} {
+		got, want := figureOf(s, uid), walkOf(t, u)
+		if len(got) != 5 || !maps.Equal(got, want) {
+			t.Fatalf("uid %d's figure is %v, a walk of its scope counts %v; want the 5 entries", uid, got, want)
 		}
 	}
 }

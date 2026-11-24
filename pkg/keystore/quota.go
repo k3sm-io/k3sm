@@ -187,6 +187,9 @@ func (u *UserScope) delete(ctx context.Context, name string) (err error) {
 		return err
 	}
 	defer unlockUID()
+	if err := ctx.Err(); err != nil {
+		return err // done during the uid's wait: no lookup, no hold
+	}
 	u = u.withGUID() // after the uid's wait, so the answer is fresh at the lock
 	root, done, err := u.s.openLocked(ctx, false, true)
 	if errors.Is(err, fs.ErrNotExist) {
