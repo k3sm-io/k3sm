@@ -542,7 +542,7 @@ func TestDoctorKeystoreUserScopeRow(t *testing.T) {
 		{name: "start checks pass, no socket, plist with the entry", seam: userScope(func(u *doctorUserScope) {
 			u.sockState = func() error { return fmt.Errorf("%w: nothing is at the path", errNoListeningSocket) }
 			u.plistHasSockets = func() (bool, error) { return true, nil }
-		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path]; mount the data root, then run `sudo k3sm restart`", remedy: "sudo k3sm restart   # once the data root is mounted"},
+		}), status: statusWarn, detail: "keystore user scope: start checks pass, but no listening socket at /var/lib/k3sm/keystore-sock/keys.sock", detailHas: "nothing is at the path]; the plist has the socket entry but launchd provided no socket: a parent of its path is missing (a data root on a volume that is not mounted), or the server has not started yet or is restarting; mount the data root, then run `sudo k3sm restart`; if that does not clear it, run `sudo k3sm install`", remedy: "sudo k3sm restart   # once the data root is mounted; if that does not clear it, sudo k3sm install"},
 		{name: "two servers", seam: userScope(func(u *doctorUserScope) {
 			u.pre.ServerCount = func(context.Context) (int, error) { return 2, nil }
 			u.servers = func() ([]string, error) { return []string{"mac-a", "mac-b"}, nil }

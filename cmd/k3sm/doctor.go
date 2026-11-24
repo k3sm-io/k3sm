@@ -292,7 +292,7 @@ func checkKeystoreMaintenance(env doctorEnv) checkResult {
 // socket.ParentMissingRemedy).
 const (
 	doctorNotActivatedRemedy  = "sudo k3sm install   # it rewrites the server plist and re-bootstraps the job"
-	doctorParentMissingRemedy = "sudo k3sm restart   # once the data root is mounted"
+	doctorParentMissingRemedy = "sudo k3sm restart   # once the data root is mounted; if that does not clear it, sudo k3sm install"
 )
 
 // noKeystoreSocket is the row when the start checks pass and no socket of
@@ -305,7 +305,8 @@ func noKeystoreSocket(name string, scope doctorUserScope, serr error) checkResul
 	}
 	remedy, text := doctorNotActivatedRemedy, socket.NotActivatedRemedy
 	if has {
-		remedy, text = doctorParentMissingRemedy, socket.ParentMissingRemedy
+		remedy = doctorParentMissingRemedy
+		text = "the plist has the socket entry but launchd provided no socket: a parent of its path is missing (a data root on a volume that is not mounted), or the server has not started yet or is restarting; " + socket.ParentMissingRemedy
 	}
 	return checkResult{name: name, status: statusWarn, detail: fmt.Sprintf("keystore user scope: start checks pass, but no listening socket at %s [%v]; %s", scope.sockPath, serr, text), remedy: remedy}
 }
