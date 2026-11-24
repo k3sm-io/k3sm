@@ -4402,15 +4402,20 @@ surface, and the app consumes only those.
   other cause (a full disk, an I/O error).
   *The server's log.* The reply carries only the code, so the request boundary
   (`Handler.serveRequest`) logs each store error that is damage at Warn: the op, the peer's
-  uid, the entry when the request header names a valid one (by its exact name, in the API
-  grammar), and the error's text, which names the entry and its remedy. The damage is every
-  error answered `internal` (a corrupt record, a floor that is stale or still records a
-  deleted entry, a missing or untrusted master), an orphan version, and the floor's damage or
-  the scope's quarantine (`keystore.FloorDegraded`), both answered `refused`. The store builds
-  those errors from fixed strings and names, so no line carries a value, nor its length. The
-  ordinary outcomes (`not-found`, `exists`, `quota`, `rate-limited`, `busy`, `log-full`, and
-  the socket's own refusals) are not logged at Warn: each has its audit line, and a peer
-  could otherwise fill the server's log with them (`TestStoreErrorLogged`).
+  uid, `requested_entry` when the request header names a valid entry (by its exact name, in
+  the API grammar), a class from a closed set and that class's fixed remedy. The classes are
+  `orphan-version` (answered `refused`; the owner can `rm` the entry and `put` it again),
+  `floor-records-entry`, `floor-degraded` (the floor's damage or the scope's quarantine,
+  answered `refused`), `corrupt`, and `internal` for any other error answered `internal` (a
+  missing or untrusted master). The error's own text is never logged: a chain can carry text a
+  decoder built from a decrypted value, and no error in `pkg/keystore` names a length, tag or
+  byte of a value either (`TestNoErrorCarriesValueDerivedNumbers`). The ordinary outcomes
+  (`not-found`, `exists`, `quota`, `rate-limited`, `busy`, `log-full`, and the socket's own
+  refusals), a change that committed, and a cancelled or timed-out request are not logged.
+  Standing damage cannot flood the log: each (op, class) pair logs at most one line every
+  10 seconds (`socket.DamageLogInterval`), and its next line carries the count it suppressed
+  meanwhile as `suppressed`; the pairs are bounded by the closed sets
+  (`TestStoreErrorLogged`, `TestStoreErrorLogBounded`).
 - **Operations on the wire.** The request and reply headers are named Go types in
   `pkg/keystore/socket` (`PutRequest`, `RotateRequest`, `ListRequest`, `RmRequest`,
   `ReadForExecRequest`; `VersionReply`, `ListReply` with `ListEntry`, `RmReply`,

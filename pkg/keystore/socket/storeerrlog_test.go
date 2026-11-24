@@ -27,7 +27,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -86,13 +85,17 @@ func (c *logCapture) bytes() []byte {
 }
 
 // checkStoreErrorLine holds rec to the shape of a store-error line: Warn,
-// the op, the uid, the entry when want names one, the error text, and no
-// other field.
-func checkStoreErrorLine(t *testing.T, rec map[string]any, op string, uid uint32, entry string) {
+// the op, the uid, requested_entry when entry names one, the class and its
+// fixed remedy, suppressed when want is not 0, and no other field: never
+// the error's text.
+func checkStoreErrorLine(t *testing.T, rec map[string]any, op string, uid uint32, entry, class string, suppressed uint64) {
 	t.Helper()
-	keys := []string{"error", "level", "msg", "op", "uid"}
+	keys := []string{"class", "level", "msg", "op", "remedy", "uid"}
 	if entry != "" {
-		keys = append(keys, "entry")
+		keys = append(keys, "requested_entry")
+	}
+	if suppressed != 0 {
+		keys = append(keys, "suppressed")
 	}
 	var got []string
 	for k := range rec {
@@ -103,68 +106,78 @@ func checkStoreErrorLine(t *testing.T, rec map[string]any, op string, uid uint32
 	if !slices.Equal(got, keys) {
 		t.Errorf("log line %v has fields %q, want %q", rec, got, keys)
 	}
-	if rec["level"] != "WARN" || rec["op"] != op || rec["uid"] != float64(uid) || (entry != "" && rec["entry"] != entry) {
-		t.Errorf("log line %v, want Warn for %s by uid %d naming %q", rec, op, uid, entry)
-	}
-	if s, _ := rec["error"].(string); s == "" {
-		t.Errorf("log line %v carries no error text", rec)
+	if rec["level"] != "WARN" || rec["op"] != op || rec["uid"] != float64(uid) || (entry != "" && rec["requested_entry"] != entry) ||
+		rec["class"] != class || rec["remedy"] != damageRemedies[class] || (suppressed != 0 && rec["suppressed"] != float64(suppressed)) {
+		t.Errorf("log line %v, want Warn for %s by uid %d naming %q, class %s, %d suppressed", rec, op, uid, entry, class, suppressed)
 	}
 }
 
+// serveOne serves one HELLO and one request with header on h, for uidA.
+func serveOne(t *testing.T, h *Handler, header string) {
+	t.Helper()
+	var in bytes.Buffer
+	in.Write(frameBytes(t, Frame{Type: TypeHello, Header: []byte(helloV1)}))
+	in.Write(frameBytes(t, Frame{Type: TypeRequest, Header: []byte(header)}))
+	if err := h.Serve(t.Context(), &recordingConn{in: bytes.NewReader(in.Bytes())}, Peer{UID: uidA}); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+}
+
+// leakyErr is an error whose text carries what a decoder might have built
+// from a decrypted value: its bytes, a length and a tag.
+func leakyErr(sentinel error) error {
+	return fmt.Errorf("%w: tag 0x7e claims 4242 bytes: %s", sentinel, secretValue)
+}
+
 // The server logs the store errors that are damage, at Warn, with the op,
-// the peer's uid, the entry when the request named a valid one, and the
-// error's text: an error answered internal, a corrupt record, a floor that
-// is stale or records a deleted entry, an orphan version, the floor's
-// damage and the scope's quarantine. The ordinary outcomes, which have
-// their audit lines, are not logged, and no line carries a value or its
-// length.
+// the peer's uid, the entry when the request named a valid one, a class of
+// the closed set and its fixed remedy, never the error's text: an error
+// answered internal, a corrupt record, a floor that is stale or records a
+// deleted entry, an orphan version, the floor's damage and the scope's
+// quarantine. The ordinary outcomes, which have their audit lines, a
+// change that committed and a cancelled or timed-out request are not
+// logged, and no line carries a value, a length or a tag from the error.
 func TestStoreErrorLogged(t *testing.T) {
 	t.Run("each outcome", func(t *testing.T) {
 		wrap := func(err error) error { return fmt.Errorf("user scope exec-read: %w", err) }
 		for _, tc := range []struct {
-			name   string
-			err    error
-			logged bool
+			name  string
+			err   error
+			class string
 		}{
-			{"corrupt", wrap(keystore.ErrCorrupt), true},
-			{"floor stale", wrap(fmt.Errorf("%w: the current pointer is older than the floor records", keystore.ErrCorrupt)), true},
-			{"floor records a deleted entry", wrap(keystore.ErrFloorRecordsEntry), true},
-			{"orphan version", wrap(fmt.Errorf("%w: %w: rm and put it again", keystore.ErrCorrupt, keystore.ErrOrphanVersion)), true},
-			{"master missing", wrap(keystore.ErrMasterMissing), true},
-			{"internal", errors.New("an error no table names"), true},
-			{"not found", wrap(keystore.ErrNotFound), false},
-			{"exists", wrap(keystore.ErrExists), false},
-			{"quota", wrap(keystore.ErrQuota), false},
-			{"rate limited", ErrRateLimited, false},
-			{"busy", ErrBusy, false},
-			{"log full", wrap(keystore.ErrLogFull), false},
-			{"refused by the socket", refusedf("x"), false},
-			{"invalid name", wrap(keystore.ErrInvalidName), false},
-			{"committed", fmt.Errorf("%w: the floor line was not written", keystore.ErrCommitted), false},
-			{"ok", nil, false},
+			{"corrupt", wrap(leakyErr(keystore.ErrCorrupt)), DamageCorrupt},
+			{"floor stale", wrap(fmt.Errorf("%w: the current pointer is older than the floor records", keystore.ErrCorrupt)), DamageCorrupt},
+			{"floor records a deleted entry", wrap(keystore.ErrFloorRecordsEntry), DamageFloorRecordsEntry},
+			{"orphan version", wrap(fmt.Errorf("%w: %w: rm and put it again", keystore.ErrCorrupt, keystore.ErrOrphanVersion)), DamageOrphanVersion},
+			{"master missing", wrap(keystore.ErrMasterMissing), DamageInternal},
+			{"internal", leakyErr(errors.New("an error no table names")), DamageInternal},
+			{"not found", wrap(keystore.ErrNotFound), ""},
+			{"exists", wrap(keystore.ErrExists), ""},
+			{"quota", wrap(keystore.ErrQuota), ""},
+			{"rate limited", ErrRateLimited, ""},
+			{"busy", ErrBusy, ""},
+			{"log full", wrap(keystore.ErrLogFull), ""},
+			{"refused by the socket", refusedf("x"), ""},
+			{"invalid name", wrap(keystore.ErrInvalidName), ""},
+			{"committed", fmt.Errorf("%w: the floor line was not written", keystore.ErrCommitted), ""},
+			{"cancelled", wrap(fmt.Errorf("%w: %w", keystore.ErrCorrupt, context.Canceled)), ""},
+			{"timed out", wrap(context.DeadlineExceeded), ""},
+			{"ok", nil, ""},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				var c logCapture
-				h, err := NewHandler(time.Now,
+				clock := &fixedClock{t: time.Unix(1_000_000, 0)}
+				h, err := NewHandler(clock.Now,
 					withOp(OpReadForExec, func(context.Context, Request) (Reply, error) { return Reply{}, tc.err }))
 				if err != nil {
 					t.Fatal(err)
 				}
 				h.log = c.logger()
-				for _, header := range []string{
-					hdr(t, OpReadForExec, entryOf(uidA, "a"), nil),
-					hdr(t, OpReadForExec, "not a name", nil),
-				} {
-					var in bytes.Buffer
-					in.Write(frameBytes(t, Frame{Type: TypeHello, Header: []byte(helloV1)}))
-					in.Write(frameBytes(t, Frame{Type: TypeRequest, Header: []byte(header)}))
-					conn := &recordingConn{in: bytes.NewReader(in.Bytes())}
-					if err := h.Serve(t.Context(), conn, Peer{UID: uidA}); err != nil {
-						t.Fatalf("Serve: %v", err)
-					}
-				}
+				serveOne(t, h, hdr(t, OpReadForExec, entryOf(uidA, "a"), nil))
+				clock.advance(DamageLogInterval)
+				serveOne(t, h, hdr(t, OpReadForExec, "not a name", nil))
 				recs := c.records(t)
-				if !tc.logged {
+				if tc.class == "" {
 					if len(recs) != 0 {
 						t.Fatalf("%v logged %v, want nothing", tc.err, recs)
 					}
@@ -173,11 +186,14 @@ func TestStoreErrorLogged(t *testing.T) {
 				if len(recs) != 2 {
 					t.Fatalf("%v logged %v, want one line a request", tc.err, recs)
 				}
-				checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"))
+				checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"), tc.class, 0)
 				// A name that is not one is not logged.
-				checkStoreErrorLine(t, recs[1], OpReadForExec, uidA, "")
-				if !strings.Contains(recs[0]["error"].(string), tc.err.Error()) {
-					t.Errorf("log line %v, want the error text %q", recs[0], tc.err)
+				checkStoreErrorLine(t, recs[1], OpReadForExec, uidA, "", tc.class, 0)
+				out := c.bytes()
+				for _, leak := range []string{string(secretValue[:6]), "4242", "0x7e"} {
+					if bytes.Contains(out, []byte(leak)) {
+						t.Fatalf("the server log carries %q from the error: %s", leak, out)
+					}
 				}
 			})
 		}
@@ -220,14 +236,11 @@ func TestStoreErrorLogged(t *testing.T) {
 		if len(recs) != 1 {
 			t.Fatalf("a corrupt read logged %v, want one line", recs)
 		}
-		checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"))
-		if s := recs[0]["error"].(string); !strings.Contains(s, "corrupt") {
-			t.Errorf("the corrupt read's line %q does not say corrupt", s)
-		}
+		checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"), DamageCorrupt, 0)
 
 		// A floor line no key can be read from: the floor is damaged for
-		// every key, so a put, which carries a value, and a read are
-		// refused.
+		// every key, so a put, which carries a value, is refused; a read,
+		// another op, logs its own line.
 		fp := filepath.Join(r.data, "keystore-logs", "floor", "keystore-user-floor.log")
 		fb, err := os.ReadFile(fp)
 		if err != nil {
@@ -243,20 +256,11 @@ func TestStoreErrorLogged(t *testing.T) {
 		if code := codeOf(t, w.call(t, hdr(t, OpPut, entryOf(uidA, "c"), nil), secretValue)); code != CodeRefused {
 			t.Fatalf("a put over floor damage: code %q, want refused", code)
 		}
-		if code := codeOf(t, w.call(t, hdr(t, OpReadForExec, entryOf(uidA, "b"), nil), nil)); code != CodeRefused {
-			t.Fatalf("a read over floor damage: code %q, want refused", code)
-		}
 		recs = c.records(t)
-		if len(recs) != 3 {
-			t.Fatalf("logged %v, want three lines", recs)
+		if len(recs) != 2 {
+			t.Fatalf("logged %v, want two lines", recs)
 		}
-		checkStoreErrorLine(t, recs[1], OpPut, uidA, entryOf(uidA, "c"))
-		checkStoreErrorLine(t, recs[2], OpReadForExec, uidA, entryOf(uidA, "b"))
-		for _, rec := range recs[1:] {
-			if s := rec["error"].(string); !strings.Contains(s, "floor") {
-				t.Errorf("the floor-damage line %q does not name the floor", s)
-			}
-		}
+		checkStoreErrorLine(t, recs[1], OpPut, uidA, entryOf(uidA, "c"), DamageFloorDegraded, 0)
 		out := c.bytes()
 		if bytes.Contains(out, secretValue[:6]) {
 			t.Fatalf("the server log holds the value: %s", out)
@@ -265,4 +269,43 @@ func TestStoreErrorLogged(t *testing.T) {
 			t.Fatalf("the server log holds the value's length, %d: %s", len(secretValue), out)
 		}
 	})
+}
+
+// Standing damage logs at most one line per op and class each
+// DamageLogInterval: the lines between are suppressed and counted on the
+// pair's next line; another op or class has its own pair.
+func TestStoreErrorLogBounded(t *testing.T) {
+	var c logCapture
+	clock := &fixedClock{t: time.Unix(1_000_000, 0)}
+	corrupt := func(context.Context, Request) (Reply, error) { return Reply{}, keystore.ErrCorrupt }
+	h, err := NewHandler(clock.Now, withOp(OpReadForExec, corrupt), withOp(OpList, corrupt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.log = c.logger()
+	read := hdr(t, OpReadForExec, entryOf(uidA, "a"), nil)
+	for range 5 {
+		serveOne(t, h, read)
+		clock.advance(time.Second)
+	}
+	serveOne(t, h, hdr(t, OpList, "", nil))
+	if recs := c.records(t); len(recs) != 2 {
+		t.Fatalf("five reads and a list in 5 s logged %v, want the first read's line and the list's", recs)
+	}
+	clock.advance(DamageLogInterval)
+	serveOne(t, h, read)
+	recs := c.records(t)
+	if len(recs) != 3 {
+		t.Fatalf("logged %v, want a third line once the interval passed", recs)
+	}
+	checkStoreErrorLine(t, recs[0], OpReadForExec, uidA, entryOf(uidA, "a"), DamageCorrupt, 0)
+	checkStoreErrorLine(t, recs[1], OpList, uidA, "", DamageCorrupt, 0)
+	checkStoreErrorLine(t, recs[2], OpReadForExec, uidA, entryOf(uidA, "a"), DamageCorrupt, 4)
+	var l damageLimiter
+	for i := range 2 * maxDamageKeys {
+		l.pass(damageKey{strconv.Itoa(i), DamageCorrupt}, clock.Now())
+	}
+	if n := len(l.keys); n != maxDamageKeys {
+		t.Fatalf("the limiter holds %d pairs, want at most %d", n, maxDamageKeys)
+	}
 }
