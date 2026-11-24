@@ -158,9 +158,13 @@ The fixed decisions:
         master.next.sha256
     keystore/                           0700, service user, a SIBLING of cred/
       .lock                             0600, the one lock file (see "Concurrency")
-      .preframe-dropped                 0600, written by the server only: the pre-frame refusals
-                                        counted as dropped and not yet in the audit log ("Per-uid
-                                        fairness"); a restore's staged tree may hold it, and its
+      .preframe-dropped                 0600, written by the server only: the server-counts file.
+                                        Its name says pre-frame, but it carries three kinds of
+                                        count: the pre-frame refusals counted as dropped and not
+                                        yet in the audit log ("Per-uid fairness"), the post-frame
+                                        refused lines dropped and not yet summarized, and the
+                                        committed revocations with no audit line ("The audit
+                                        log"); a restore's staged tree may hold it, and its
                                         temporary file, judged and parsed strictly
       .user                             reserved for user scopes (see "Scope"); created by the
                                         user-scope store, laid out under "User scope"
@@ -3591,12 +3595,21 @@ service user can only add to.
     with the count, and the count is persisted, not kept only in memory: the next summary line
     written for that source carries it, and root's next `audit --rotate` writes any count still
     unwritten as one line charged to no uid (U85, U126).
-    For the pre-frame part the server persists its dropped counts in `.preframe-dropped` in the
-    store directory it owns (`server/keystore/`, 0700; the audit log's directory is root's): one
-    header line, then at most 256 lines `<uid> <class> <count>`, each at most 64 bytes, with the
-    uids past 256 folded into one `others <class> <count>` line per class. It is written temp,
+    For the pre-frame part the server persists its dropped counts in `.preframe-dropped`, the
+    server-counts file, in the store directory it owns (`server/keystore/`, 0700; the audit
+    log's directory is root's): one header line, then lines `<uid> <class> <count>` for at most
+    256 uids, each line at most 64 bytes, with the uids past 256 folded into one
+    `others <class> <count>` line per class. The same file, in the same format, carries the
+    server's two other counts that must outlast it, each as its own class beside the five
+    pre-frame ones: `post-frame`, a uid's post-frame refused lines dropped and not yet
+    summarized ("The audit log", refused lines), and `unaudited`, the committed revocations
+    whose audit line could not be written, which names no uid and is written only as its
+    `others unaudited <count>` line (a uid line naming it does not parse). Neither is a
+    pre-frame class: no pre-frame line or summary carries it, and it draws on no budget. The
+    file's size bound counts a line for each class a named uid may carry, so the encoder's
+    output always fits it. It is written temp,
     fsync, rename and directory fsync through a descriptor of the store directory, `O_NOFOLLOW`,
-    0600, when the pending counts change, at most once a second on the server's clock, and
+    0600, when any of its counts changes, at most once a second on the server's clock, and
     emptied to its header once every count has reached the audit log; it is read, owner and mode
     checked and strictly parsed, and merged when the server opens its logs and again on each
     reopen. It is written under the server's in-process mutex **without** the store lock, which
@@ -3607,14 +3620,19 @@ service user can only add to.
     reads the file through the store directory it judged and holds, and writes at the start of
     the new audit log one line per class with a count, the server's summary-line form with
     `"via":"root"` and caller uid 0 (so it is charged to no uid and to no pre-frame part):
-    `{"v":1,…,"op":"refused","via":"root","caller":{"uid":0},…,"result":"dropped","charge":"reconciler","source":"pre-frame","dropped":<total>,"class":"<class>"}`.
+    `{"v":1,…,"op":"refused","via":"root","caller":{"uid":0},…,"result":"dropped","charge":"reconciler","source":"pre-frame","dropped":<total>,"class":"<class>"}`,
+    the pre-frame classes first, then `post-frame` and `unaudited`, whose lines carry their own
+    name as their `source`.
     Only once the swap committed does it take the counts it wrote out of the file, leaving what
     the server added since; the server's next reopen moves its in-memory counts by what the file
     lost, so no count is written twice. A run that stops between the swap and that step leaves
     the counts in the file, and the next rotate writes them again: counted twice, never lost.
     One race does lose a count: the server writes the file without the store lock, so a server
     write that lands between rotate's re-read of the file and its rewrite is overwritten, and
-    that one window's increment is counted once too few, at most one second's refusals.
+    that one window's increment is counted once too few, at most one second's refusals. Both
+    limits hold for the post-frame and unaudited counts the same way: a rotate that stops at
+    that point can report one twice, and a server write landing during a rotate can lose one
+    second's increment.
   - *The pre-frame part is split so a login user cannot spend it for everyone.* A login user
     can be refused at will (a self-sandboxed process is refused as `sandboxed` under its own
     uid), so the 256 KiB pre-frame part is not one pool. A **login line** is a pre-frame line
@@ -3653,7 +3671,8 @@ service user can only add to.
   - *Past the share, reads are refused too.* A uid past its share has its own mutations and
     its own reads refused with `ErrLogFull` (code `log-full`) before any line is written, so
     no read is a way around the share. Its `refused` lines and their summaries are not written
-    either: the server counts that uid's dropped lines in memory, `doctor` shows the count,
+    either: the server counts that uid's dropped lines as its `post-frame` count, persisted in
+    the server-counts file `.preframe-dropped` ("Per-uid fairness"), `doctor` shows the count,
     and root's next `audit --rotate` writes it as one line charged to no uid.
   - *A share refusal is one uid's alone.* No other uid is refused for it: every other uid's
     mutations and reads draw on its own share, which no other uid's lines are charged to (U51).
@@ -3914,7 +3933,12 @@ refused before its first frame:
   class above all (`withdraw`, `rm`, `rotate`), commits its change to the store, then appends
   its audit line, then replies. If the append fails after the commit, the change stands and the
   reply says so: `ok` with the warning `committed; audit failed`, which the CLI prints. The
-  server counts every such unaudited operation in memory, and `doctor` shows the count (U112).
+  server counts every such unaudited operation as its `unaudited` count, persisted in the
+  server-counts file `.preframe-dropped` and read back when the server opens its logs, so it
+  outlasts a restart; `doctor` shows the count, and root's next `audit --rotate` writes it as
+  one line charged to no uid (U112). The two limits of the pre-frame counts hold for it
+  ("Per-uid fairness"): a rotate that stops between its swap and its rewrite of the file can
+  report it twice, and a server write landing during a rotate can lose one second's increment.
   An audit line carries only validated fields; a field that failed its grammar is a fixed
   placeholder.
 - **Root verbs append after they run (deviation).** The root `k3sm keys` verbs that change
@@ -3931,7 +3955,8 @@ refused before its first frame:
   server refuses user mutations and reads (`list`, `read-for-exec`, `deliveries`) until an
   append succeeds (U32). The revocation class is the exception: a socket `withdraw`, `rm` or
   `rotate` and the reconciler's revocation deletes still go ahead, their lines dropped and
-  counted in memory, and `doctor` shows the count. A full disk must not keep a revoked
+  counted (the socket's as the persisted `unaudited` count above), and `doctor` shows the
+  count. A full disk must not keep a revoked
   credential delivered (U109). As built: the failure is the store's own account of its
   appends (`FileStore.AuditFailing`), set by an append the file system or the hard cap
   refused and cleared by the next one that succeeds, and the socket refuses a request while
@@ -3979,8 +4004,12 @@ refused before its first frame:
   count is written as one summary, `"result":"dropped"` with a `dropped` count and no
   `request`, at most once a minute (the first a minute after the uid's first refusal), the
   next time that uid is refused, before that refusal's own line. So a uid writes at most 11
-  such lines a minute however many of its requests are refused. A count still pending when
-  the server stops is lost with it (`keystore/socket.FileStoreBridge`, `keystore.UserScope.Refused`).
+  such lines a minute however many of its requests are refused. The count is the store's
+  `post-frame` count, persisted in the server-counts file `.preframe-dropped` ("Per-uid
+  fairness"), not the limiter's: a count still pending when the server stops is read back at
+  its next start, shown by `doctor`, and written by the next summary for that uid or root's
+  next `audit --rotate`, whichever comes first (`keystore/socket.FileStoreBridge`,
+  `keystore.FileStore.AddPostFrameDropped`, `keystore.UserScope.Refused`).
   Pre-frame refusals are rate-limited the same way, per peer uid, with their own dropped-count
   summary (U54).
   A pre-frame line is `{"v":1,"ts":…,"op":"refused","via":"socket","caller":{"uid":<peer
@@ -6674,7 +6703,7 @@ carried by the unit rows.
 | U109 | with every audit append failing (a full disk), revocation deletes go ahead: the reconciler's `deliver-delete` and a socket `withdraw`, `rm` or `rotate` still act, their lines dropped and counted in memory and shown by `doctor`, while user mutations and reads stay refused | `k3sm/pkg/keystore/reconcile::TestRevocationDeleteProceedsOnAppendFailure` | pending: the KeyDelivery reconciler (lifecycle) |
 | U110 | when a second server registers at runtime, the next single-server check stops the listener, closing its connections, and each KeyDelivery gets `Ready=False` and `SecretRetained=True` with reason `UserScopeOff`; the delivered Secrets stay, nothing rotates or deletes them, and `doctor` says they must be deleted by hand | `k3sm/pkg/keystore/reconcile::TestSecondServerAtRuntimeStopsListenerAndReports` | pending: the KeyDelivery reconciler (lifecycle) |
 | U111 | the owner annotation never decides precedence: a Secret whose owner annotation is rewritten to name another recorded UID of the same target stays with the object that holds the claim by honoured record, `creationTimestamp` and name; an `Indeterminate` object counts as honoured | `k3sm/pkg/keystore/reconcile::TestAnnotationRewriteCannotTakeOverTarget` | pending: the KeyDelivery reconciler (authority) |
-| U112 | outside a grant (put, deliver), which appends before its first write, the order is commit, then append, then reply: an append that fails after the commit answers `ok` with the warning `committed; audit failed`, the server then refuses user mutations except the revocation class, and `doctor` counts the unaudited operations | `k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed`, `k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps`, `k3sm/pkg/keystore::TestUnauditedOpsCountsCommittedRevocations`, `TestUserRotateCrashOrder` | pending: the socket operations |
+| U112 | outside a grant (put, deliver), which appends before its first write, the order is commit, then append, then reply: an append that fails after the commit answers `ok` with the warning `committed; audit failed`, the server then refuses user mutations except the revocation class, and `doctor` counts the unaudited operations | `k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed`, `k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps`, `k3sm/pkg/keystore::TestUnauditedOpsCountsCommittedRevocations`, `TestUserRotateCrashOrder` | checked: the socket operations (the persisted unaudited count) |
 | U113 | the listener refuses to start unless the server's effective uid is the service uid (the `_k3sm` uid install creates): a rootless `k3sm server`, whose Pods inherit the daemon's login uid, runs no listener, and the server log and `doctor` say "user scope needs the installed server" (seam: euid source) | `k3sm/pkg/keystore/socket::TestListenerRefusesUnlessServiceUID` | checked: the socket listener (lifecycle) |
 | U114 | `rm-scope` writes `keystore-removed-scopes.json` in the data root, root-owned, through the data-root descriptor rules, listing the removed scope's uid and bound GeneratedUID before it removes the scope; only a scope listed there counts as removed for the finalizer, and a plain `ErrScopeAbsent` stays non-definitive and keeps the finalizer (seam: euid source) | `k3sm/cmd/k3sm::TestRmScopeRecordsRemovedScope`, `k3sm/pkg/keystore/reconcile::TestOnlyRecordedRemovalCountsAsWithdrawn` | pending: the KeyDelivery reconciler (lifecycle) |
 | U115 | `rm-scope` names each blocking binding, a RoleBinding with its namespace; `--remove-bindings` deletes each listed binding through the admin client before anything else changes, and a failed delete stops the verb, changing nothing further | `k3sm/cmd/k3sm::TestRmScopeNamesBindingsAndRemovesThem` | pending: the KeyDelivery reconciler (lifecycle) |
