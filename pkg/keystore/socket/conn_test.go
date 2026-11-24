@@ -56,13 +56,23 @@ func serve(t *testing.T, now func() time.Time) *session {
 	return serveWith(t, h)
 }
 
-// serveWith starts h's Serve on a pipe, inside the caller's synctest bubble.
+// testPeer is the admitted peer serveWith serves for.
+var testPeer = Peer{UID: 501, PID: 4242}
+
+// serveWith starts h's Serve on a pipe for testPeer, inside the caller's
+// synctest bubble.
 func serveWith(t *testing.T, h *Handler) *session {
+	t.Helper()
+	return serveAs(t, h, testPeer)
+}
+
+// serveAs starts h's Serve on a pipe for p, a fake admitted peer.
+func serveAs(t *testing.T, h *Handler, p Peer) *session {
 	t.Helper()
 	client, server := net.Pipe()
 	s := &session{client: client, done: make(chan error, 1), start: time.Now()}
 	go func() {
-		err := h.Serve(t.Context(), server)
+		err := h.Serve(t.Context(), server, p)
 		_ = server.Close() // the caller's close, as a listener would
 		s.done <- err
 	}()
@@ -78,7 +88,7 @@ func (s *session) send(t *testing.T, typ FrameType, header string, value []byte)
 
 func (s *session) recv(t *testing.T, want FrameType, header any) {
 	t.Helper()
-	f, err := ReadFrame(s.client)
+	f, err := ReadReply(s.client)
 	if err != nil {
 		t.Fatalf("recv: %v", err)
 	}
@@ -222,7 +232,7 @@ func TestHelloReplyCarriesVersionAndMaxFrame(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := serve(t, time.Now)
 		s.send(t, TypeHello, helloV1, nil)
-		f, err := ReadFrame(s.client)
+		f, err := ReadReply(s.client)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -115,8 +115,8 @@ func TestBoundedLockWait(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			h.ops = map[string]opFunc{"put": func(ctx context.Context, _ []byte) error {
-				return WithStoreLock(ctx, l.lock, func() error { return nil })
+			h.ops = map[string]opFunc{"put": func(ctx context.Context, _ Request) (Reply, error) {
+				return Reply{}, WithStoreLock(ctx, l.lock, func() error { return nil })
 			}}
 			s := serveWith(t, h)
 			s.send(t, TypeHello, helloV1, nil)

@@ -36,9 +36,9 @@ func TestLogReaderSizeBound(t *testing.T) {
 	size := int64(len(readLog(t, s, userFloorLogName)))
 	s.logHardCap = size
 	s.logSoftCap = size
-	s.logRevokeBudget = minLogRevokeBudget
+	s.logRevokeBudget, s.logAllowance = minLogRevokeBudget, minLogRevokeBudget
 	bound := s.logReadBound()
-	if want := size + maxRevokeUIDs*minLogRevokeBudget + logBoundMargin; bound != want {
+	if want := size + maxRevokeUIDs*2*minLogRevokeBudget + logBoundMargin; bound != want {
 		t.Fatalf("the bound is %d, want %d", bound, want)
 	}
 	if got := s.readBoundOf(userFloorLogName); got != bound {
@@ -174,7 +174,12 @@ func TestLogReadBoundAuditCarriesPreFrameBudget(t *testing.T) {
 	}
 	// An audit log past the floor's bound but within its own is read; one
 	// past its own is refused.
-	s.logHardCap, s.logSoftCap, s.logRevokeBudget = 1<<10, 1<<10, minLogRevokeBudget
+	// The revocation budget is at its minimum and the reconciler allowance is
+	// shrunk, so the bound, which counts maxRevokeUIDs of each, stays a few
+	// MiB: at the default allowance it is about 260 MiB, and the two fills
+	// would write that twice. The property tested is the PreFrameBudget step.
+	s.logHardCap, s.logSoftCap = 1<<10, 1<<10
+	s.logRevokeBudget, s.logAllowance = minLogRevokeBudget, 64
 	line := []byte(`{"v":1}` + "\n")
 	fill := func(n int64) {
 		t.Helper()

@@ -357,6 +357,12 @@ func TestAuditLineNeverCarriesValue(t *testing.T) {
 		for k := range m {
 			switch k {
 			case "v", "ts", "op", "scope", "name", "namespace", "delivery", "result":
+			case "version", "fingerprint":
+				// The version a put wrote and its per-scope keyed
+				// fingerprint: never the value, never its length.
+				if r.Op != "put" || r.Result != "ok" {
+					t.Fatalf("line %d (%s %s) carries %q", i, r.Op, r.Result, k)
+				}
 			default:
 				t.Fatalf("line %d carries the field %q", i, k)
 			}

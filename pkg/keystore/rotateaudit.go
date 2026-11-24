@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -33,7 +34,7 @@ import (
 // The root maintenance verb audit --rotate (docs/design/keystore.md § "Root
 // maintenance verbs", "audit --rotate keeps four archives"): it swaps in a
 // replacement audit/ directory holding a flagged log, empty but for the
-// server's persisted pre-frame refusal counts (rotateDroppedLines), and an
+// server's persisted counts (rotateDroppedLines), and an
 // archives/ directory (root's 0700) with the old log's bytes as
 // keystore-audit.log.1 and the older archives one number up, by the same
 // directory swap as floor --rebuild.
@@ -132,30 +133,43 @@ func (s *FileStore) RotateAudit(ctx context.Context, attrs FileAttrWriter, disca
 	return rep, nil
 }
 
-// rotateDroppedLines reads the server's persisted pre-frame refusal counts
+// rotateDroppedLines reads the server's persisted counts
 // (PreFrameDroppedName) through root, the store directory the run judged
 // and holds, and returns them with the lines rotate writes at the start of
-// the new audit log for them: one per class with a count, in class order,
-// the summary-line form the server writes (preFrameRecord) with via root
-// and caller uid 0, so it reads as no pre-frame line and is charged to no
-// uid's share nor to the pre-frame part (docs/design/keystore.md §
-// "Per-uid fairness": root's next audit --rotate writes any count still
-// unwritten as one line charged to no uid). A file that does not read
-// writes no line and is left for doctor to report.
+// the new audit log for them: one per class with a count, in class order
+// (countClasses), the summary-line form the server writes (preFrameRecord)
+// with via root and caller uid 0, so it reads as no pre-frame line and is
+// charged to no uid's share nor to the pre-frame part
+// (docs/design/keystore.md § "Per-uid fairness": root's next audit
+// --rotate writes any count still unwritten as one line charged to no
+// uid). The post-frame line names its count in its source too. The
+// unaudited count is no refusal and nothing dropped: the revocations it
+// counts committed, and only their lines are missing, so its line is its
+// own op, unaudited (unauditedRecord). A file that does not read writes no
+// line and is left for doctor to report: it never blocks the rotation.
 func (s *FileStore) rotateDroppedLines(root *os.Root) (preFrameDropped, []byte) {
 	d, err := s.readPreFrameDropped(root)
 	if err != nil {
-		slog.Warn("keystore audit --rotate: the persisted pre-frame refusal count does not read, so the new audit log carries no line for it; doctor reports it", "file", PreFrameDroppedName, "err", err)
+		slog.Warn("keystore audit --rotate: the persisted server counts do not read, so the new audit log carries no line for them; doctor reports it", "file", PreFrameDroppedName, "err", err)
 		return newPreFrameDropped(), nil
 	}
 	totals := d.totals()
 	var out []byte
-	for _, c := range preFrameClasses {
+	for _, c := range countClasses {
 		if totals[c] == 0 {
 			continue
 		}
-		rec := preFrameRecord(0, auditResultDropped, c, totals[c], s.now())
-		rec.Via = auditViaRoot
+		var rec any
+		if c == countClassUnaudited {
+			rec = unauditedRecord(totals[c], s.now())
+		} else {
+			r := preFrameRecord(0, auditResultDropped, c, totals[c], s.now())
+			r.Via = auditViaRoot
+			if !preFrameCount(c) {
+				r.Source = string(c) // the count it carries: post-frame
+			}
+			rec = r
+		}
 		line, err := json.Marshal(rec)
 		if err != nil {
 			continue // a fixed shape of strings and integers always encodes
@@ -163,6 +177,43 @@ func (s *FileStore) rotateDroppedLines(root *os.Root) (preFrameDropped, []byte) 
 		out = append(append(out, line...), '\n')
 	}
 	return d, out
+}
+
+// auditOpUnaudited is the op of root's audit --rotate line for the
+// server's unaudited count, and auditResultUnaudited its result: committed
+// revocations whose own audit lines were not written.
+const (
+	auditOpUnaudited     = "unaudited"
+	auditResultUnaudited = "committed"
+)
+
+// unauditedRec is root's line for the unaudited count: the audit line's
+// fields, charged to no uid (caller uid 0, no scope) and to no pre-frame
+// part (no charge, no source), with the count in count.
+type unauditedRec struct {
+	V         int            `json:"v"`
+	TS        string         `json:"ts"`
+	Op        string         `json:"op"`
+	Via       string         `json:"via"`
+	Caller    preFrameCaller `json:"caller"`
+	Scope     string         `json:"scope"`
+	Name      string         `json:"name"`
+	Namespace string         `json:"namespace"`
+	Result    string         `json:"result"`
+	Count     uint64         `json:"count"`
+}
+
+// unauditedRecord is root's line for n committed revocations whose audit
+// lines were not written, at now.
+func unauditedRecord(n uint64, now time.Time) unauditedRec {
+	return unauditedRec{
+		V:      auditFormat,
+		TS:     now.UTC().Format(time.RFC3339Nano),
+		Op:     auditOpUnaudited,
+		Via:    auditViaRoot,
+		Result: auditResultUnaudited,
+		Count:  n,
+	}
 }
 
 // clearRotatedDropped takes the counts rotate wrote (written) out of the
@@ -180,7 +231,7 @@ func (s *FileStore) clearRotatedDropped(root *os.Root, written preFrameDropped) 
 		err = s.writePreFrameDropped(root, cur)
 	}
 	if err != nil {
-		slog.Warn("keystore audit --rotate: the new audit log carries the pre-frame refusal counts, but they were not taken out of the persisted file; the next rotate writes them again", "file", PreFrameDroppedName, "err", err)
+		slog.Warn("keystore audit --rotate: the new audit log carries the server counts, but they were not taken out of the persisted file; the next rotate writes them again", "file", PreFrameDroppedName, "err", err)
 	}
 }
 

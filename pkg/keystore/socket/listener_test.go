@@ -180,6 +180,7 @@ type rig struct {
 	cancel  context.CancelFunc
 	done    chan error
 	pid     int32
+	hopts   []HandlerOption // the handler's options; none by default
 }
 
 // peer is one dialled connection: the client end and the server end the
@@ -230,7 +231,7 @@ func startRigAudit(t *testing.T, service uint32, audit RefusalAuditor) *rig {
 // serve starts r's Listener as service over audit.
 func (r *rig) serve(t *testing.T, service uint32, audit RefusalAuditor) *rig {
 	t.Helper()
-	h, err := NewHandler(time.Now)
+	h, err := NewHandler(time.Now, r.hopts...)
 	if err != nil {
 		t.Fatal(err)
 	}

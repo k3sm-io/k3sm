@@ -578,8 +578,8 @@ check U25 "backup and restore round trip: a restored tree with cleared flags is 
 	TestBackupRestoreRoundTripRebuild TestRebuildKeepsDamagedEntryCorrupt TestSwapCallOrder TestSwapRerunFromEachStep TestMaintenanceRepairsHardLinkedLog TestMaintenanceStagingDirIsRootOnly TestMaintenanceLocksBeforeMarker TestOldLogUnflaggedServiceOwnedRefused
 check U26 "peers uid 0, the service uid and uid < 501 are refused before any frame is read (socket listener)" \
 	k3sm/pkg/keystore/socket::TestPeerEligibility
-check U27 "framing: an oversize frame, unknown type or missing HELLO closes; an unknown header field is ignored; HELLO picks the highest common version (socket listener)" \
-	k3sm/pkg/keystore/socket::FuzzFrameReader TestFramingBounds TestSubLengthsWithinFrame TestHelloReadDeadline TestUnknownHeaderFieldsIgnored TestHelloVersionRange TestHelloReplyCarriesVersionAndMaxFrame TestHelloNoOverlapSendsUnsupportedVersion TestUnknownOpKeepsConnection TestFrameCapCoversMaxValue
+check U27 "framing: an oversize frame, unknown type or missing HELLO closes; an unknown header field is ignored; HELLO picks the highest common version; a known request header field of the wrong type is refused (socket listener)" \
+	k3sm/pkg/keystore/socket::FuzzFrameReader FuzzRequestHeader TestFramingBounds TestSubLengthsWithinFrame TestHelloReadDeadline TestUnknownHeaderFieldsIgnored TestHelloVersionRange TestHelloReplyCarriesVersionAndMaxFrame TestHelloNoOverlapSendsUnsupportedVersion TestUnknownOpKeepsConnection TestFrameCapCoversMaxValue
 check U28 "64 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after HELLO or between requests is closed (socket listener)" \
 	k3sm/pkg/keystore/socket::TestConnectionCapsPerUID TestRequestTimeout TestIdleTimeoutAfterHelloAndBetweenRequests
 check U29 "a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request (socket listener)" \
@@ -588,13 +588,13 @@ check U30 "with two servers registered, the listener does not start and doctor s
 	k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers TestSecondServerStopsServingListener k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow TestKeystoreServerCountNames
 check U31 "a missing or unflagged file logs the install Warn at start and on each retry; doctor reports user scope off (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry TestInstallMissingLogNamesInstall TestPreconditionsCheck k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow TestDoctorKeystoreSocketLstat TestDoctorKeystoreKubeconfigPermission TestDoctorKeystoreReopenJudgement
-pend U32 "the order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (socket operations)" \
-	k3sm/pkg/keystore/socket::TestAuditBeforeReply TestAuditFailureRefusesOps
-pend U33 "refused lines are rate-limited per uid with a summary of the dropped count (socket operations)" \
+check U32 "a grant (put, deliver) appends its audit line before its first write, and every other operation's order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (socket operations)" \
+	k3sm/pkg/keystore/socket::TestAuditBeforeReply TestAuditFailureRefusesOps k3sm/pkg/keystore::TestExecReadRefusedWhenAuditFails TestUserRotateCrashOrder
+check U33 "refused lines are rate-limited per uid with a summary of the dropped count (socket operations)" \
 	k3sm/pkg/keystore/socket::TestRefusedLinesRateLimited
-pend U34 "5 mutating ops a second per uid; 30 read-for-exec a minute per uid, each audited exec-read (socket operations)" \
-	k3sm/pkg/keystore/socket::TestMutationRateLimit TestExecReadCapPerUID
-pend U35 "the socket server's store interface has no reveal, show or rewrap method (socket operations)" \
+check U34 "5 mutating ops a second per uid; 30 read-for-exec a minute per uid, each audited exec-read (socket operations)" \
+	k3sm/pkg/keystore/socket::TestMutationRateLimit TestExecReadCapPerUID k3sm/pkg/keystore::TestExecReadAudited
+check U35 "the socket server's store interface has no reveal, show or rewrap method (socket operations)" \
 	k3sm/pkg/keystore/socket::TestStoreInterfaceHasNoRevealMethod
 pend U36 "the client refuses a socket whose connected peer uid is not the service uid, whatever the path checks said (non-root CLI and exec)" \
 	k3sm/cmd/k3sm::TestClientRefusesForeignServerUID
@@ -615,7 +615,7 @@ pend U43 "reasons are the closed set; absent and not yours both read EntryUnavai
 pend U44 "losing authority deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; ownership is the label, the owner annotation and that UID in the sealed record, not the ownerReference; the Secret's namespace and name must equal the record's target for that UID, and the record's entry must match the owner annotation; the orphan sweep removes a labelled Secret only when its owner annotation names a UID the sealed record holds, it is that UID's recorded target, and that object is gone or withdrawn, never on the label and owner annotation alone, never an unlabelled or foreign one; a forged label and a real UID on another Secret are left alone, charged to no share, one refused line under the reconciler, against the reconciler budget (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret TestFinalizerCrashOrder TestOrphanSweep TestForgedOwnerAnnotationOnOtherSecretIsLeftAlone
 pend U45 "cross-user refusal with a fake peer-credential seam: a peer with uid B asks for list, read-for-exec, rotate, rm, deliver, withdraw and deliveries of uid A's entries and objects, and for any system/... name; every call is ErrNotFound with text identical to an absent entry of B's own, and the refused audit lines carry uid B (socket operations)" \
-	k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred TestNonRootCannotNameSystemEntries
+	k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred TestNonRootCannotNameSystemEntries k3sm/pkg/keystore::TestUserRotateNotFoundIsNoOp TestExecReadAudited
 check U46 "baseSocketDenies derives keys.sock from runtimed's keystorepaths.SocketPath(dataRoot), <dataRoot>/keystore-sock/keys.sock (socket listener)" \
 	k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket TestBaseSocketDeniesResolvesDataRoot runtimed/pkg/keystorepaths::TestNames
 pend U47 "seam guard: the real primitives the keystore's tests replace are unreachable from a test build (user scopes)" \
@@ -627,8 +627,8 @@ pend U49 "the shared keystore path names build with CGO_ENABLED=0 and import onl
 	runtimed/pkg/keystorepaths::TestLeafImportsOnlyTheStandardLibrary k3sm/pkg/keystore::TestKeystoreImportsNoSandbox
 rootcheck U50 "root-run: the defeat list run as the service user against both flagged logs, by name under --root, a SKIP failing it, in a root-owned 0755 directory (a name operation refused by the flag or by the directory, EPERM or EACCES) and a service-owned 0700 one (refused by the flag, EPERM), then an owner chflags uchg beside sappnd and an owner chmod +a ACL write, each refused or, if it lands, refused by judgeLog: each defeat fails, F_SETFL clearing O_APPEND included, bytes and flag unchanged, O_APPEND still succeeds and a seek-then-write appends at the end" \
 	k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser
-pend U51 "per-uid log fairness: the share is a fixed byte count, at most 1/16 of the hard cap; every line, reads included, is charged to its uid; a uid past its share has its mutations and reads refused with ErrLogFull while another uid's succeed, never as the global append failure; it cannot get another uid's mutations, reads or revocations refused, though it can delay them through the store lock; list and deliveries are rate-limited per uid (socket operations)" \
-	k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID TestLogShareAtMostOneSixteenthOfHardCap TestShareRefusalIsNotGlobalAppendFailure TestReadRateLimitPerUID TestReadsChargedToShare TestShareExhaustionIsolatedPerUID
+partial U51 "per-uid log fairness: the share is a fixed byte count, at most 1/16 of the hard cap; every line, reads included, is charged to its uid; a uid past its share has its mutations and reads refused with ErrLogFull while another uid's succeed, never as the global append failure; it cannot get another uid's mutations, reads or revocations refused, though it can delay them through the store lock; list and deliveries are rate-limited per uid (socket operations); delivered: all of it but the deliveries rate limit, through the socket's store bridge" "deliveries rate-limited per uid (the deliveries operation)" \
+	k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID TestLogShareAtMostOneSixteenthOfHardCap TestShareRefusalIsNotGlobalAppendFailure TestReadRateLimitPerUID TestReadsChargedToShare TestShareExhaustionIsolatedPerUID k3sm/pkg/keystore::TestShareRefusalNotGlobalAppendFailureInStore TestExecReadPastShareRefused
 check U52 "every root verb writes one audit line with via root once the log exists, and none before it; adopt, floor merge and its dry run included, a change made with exit 4 or 5 audited committed, a put, rotate or adopt whose later step failed (ErrCommitted) included, and an rm-scope whose removed-scopes record was renamed into place but whose data-root fsync failed (rm-scope's exit 4: this run changed something, or the record's durability is uncertain) (append-only files)" \
 	k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine TestAdoptWritesAuditLine TestFloorMergeWritesAuditLine TestKeysAuditResult TestKeysRmScopePartialExitsFour k3sm/pkg/keystore::TestRmScopeRecordFsyncFailureIsCommitted
 pend U53 "every reconciler Secret write and delete, and every record withdrawal, writes one audit line with via reconciler, except drift repairs, coalesced to one line per delivery per 10 minutes (KeyDelivery lifecycle)" \
@@ -660,9 +660,10 @@ pend U65 "ErrScopeAbsent is Indeterminate and deletes nothing; every allow-list 
 	k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate TestEveryDeletingOutcomeNeedsTwoSweeps TestSingleServerRecheckedBeforeEverySweep
 pend U66 "a synthesized GeneratedUID (prefix FFFFEEEE-DDDD-CCCC-BBBB-AAAA) is ErrScopeOwnerUnknown and never bound; ErrScopeOwnerChanged only for a real GeneratedUID that differs (user scopes)" \
 	k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown
-pend U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own budgets per log above the hard cap: a 256 KiB reconciler allowance and a separate 704 KiB socket margin; neither budget can draw on the other; refused only when the budget it draws on runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; a uid whose budget is spent to under one line is counted per uid and never refuses the store start; a log passes the hard cap by at most 320 KiB per user scope, plus the 1 MiB reconciler budget (socket operations)" \
-	k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart TestRevocationAllowanceIsPerUID \
-	TestSocketMarginSeparateFromReconcilerAllowance
+check U67 "the revocation class (withdraw, rm, rotate, the withdrawal's floor line, the reconciler's deliver-delete, its deliver-write of a withdrawal and its rotation write) bypasses the share past it and draws on its uid's own budgets per log above the hard cap: a 256 KiB reconciler allowance and a separate 720 KiB socket margin; neither budget can draw on the other; refused only when the budget it draws on runs out, so one uid's revocations are never refused because of another uid; a no-op revocation is charged to the share; a uid whose budget is spent to under one line is counted per uid and never refuses the store start; a log passes the hard cap by at most 976 KiB per user scope (its 720 KiB socket margin and 256 KiB reconciler allowance), plus the 1 MiB reconciler budget (socket operations)" \
+	k3sm/pkg/keystore::TestRevocationBypassesShareUsesReserve TestNoOpRevocationChargedToShare TestReserveKeepsReconcilerPart TestRevocationAllowanceIsPerUID \
+	TestSocketMarginSeparateFromReconcilerAllowance TestShareLimitRefusesOnlyThatUID TestShareLimitInTheFloor TestShareRunningCountIsTheRecount \
+	TestShareResetAfterAuditRotate TestShareConfigAtMostOneSixteenthOfHardCap TestLogReadBoundHoldsBothBudgets TestSpentRevocationBudgetIsPerUID TestUserRotateNoOpChargedToShare
 rootcheck U68 "root-run: floor --rebuild and audit --rotate meet a symlink, a FIFO and a swapped directory at the marker, at keystore-staging/ and at their log's directory in keystore-logs/, and refuse before anything changes; a symlink, FIFO or directory inside keystore-staging/ is removed unread and the verb finishes; the verb never follows a planted name, the decoy it points at does not change, and no log byte changes on a refusal (append-only files)" \
 	k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedNames
 pend U69 "the client pins the server: the peer's audit token (LOCAL_PEERTOKEN) must resolve to the cdhash of the installed /Library/k3sm/k3sm, or nothing is written; another service-user binary, a reused pid, a lookup error, an old server after an upgrade and a listener inherited or passed to another process are refused (non-root CLI and exec)" \
@@ -695,7 +696,7 @@ check U82 "eligible peer uids are 501 to 2147483647: nobody (4294967294) and eve
 	k3sm/pkg/keystore/socket::TestPeerUIDRangeRefusesNobodyAndHighUIDs
 pend U83 "the reconciler checks the user-scope floor log: a missing or unflagged floor log is Indeterminate for writes, so no deliver-write runs until floor --rebuild; the floor holds writes and absence-driven deletes: an ErrNotFound delete is Indeterminate while the floor is missing or unflagged, a revocation-driven delete still deletes the Secret without the floor, and only the record withdrawal waits for it (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestReconcilerHoldsWritesWithoutFloor
-pend U84 "when a log's size is past the hard cap, doctor shows a Warn with the overshoot in bytes and the rotate or rebuild hint, and none at or below it; the overshoot is at most 320 KiB per user scope, plus the 1 MiB reconciler budget (socket operations)" \
+check U84 "when a log's size is past the hard cap, doctor shows a Warn with the overshoot in bytes and the rotate or rebuild hint, and none at or below it; the overshoot is at most 976 KiB per user scope (its 720 KiB socket margin and 256 KiB reconciler allowance), plus the 1 MiB reconciler budget (socket operations)" \
 	k3sm/cmd/k3sm::TestDoctorWarnsOnLogOvershoot
 pend U85 "a reconciler line charged to no uid (a forged-Secret refused line, a drift repair, their summaries) draws on the reconciler budget, 1 MiB per log, separate from every uid and excluded from the hard-cap test; forged Secrets are counted in a bounded LRU of 1024 (namespace, name) pairs with no per-resourceVersion set, new pairs' lines at most 10 a minute and at most one summary refused line a minute carrying the dropped count; past the budget the lines are dropped and counted and doctor warns; N forged updates leave every uid able to read and mutate (KeyDelivery lifecycle)" \
 	k3sm/pkg/keystore/reconcile::TestForgedSecretFloodLeavesEveryUIDServed TestUnchargedLinesHaveOwnBudget
@@ -749,8 +750,8 @@ pend U110 "when a second server registers at runtime, the next single-server che
 	k3sm/pkg/keystore/reconcile::TestSecondServerAtRuntimeStopsListenerAndReports
 pend U111 "the owner annotation never decides precedence: a Secret whose owner annotation is rewritten to name another recorded UID stays with the object that holds the claim by honoured record, creationTimestamp and name; an Indeterminate object counts as honoured (KeyDelivery reconciler)" \
 	k3sm/pkg/keystore/reconcile::TestAnnotationRewriteCannotTakeOverTarget
-pend U112 "the order is commit, then append, then reply: an append that fails after the commit answers ok with the warning committed; audit failed, the server then refuses user mutations except the revocation class, and doctor counts the unaudited operations (socket operations)" \
-	k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps
+check U112 "outside a grant (put, deliver), which appends before its first write, the order is commit, then append, then reply: an append that fails after the commit answers ok with the warning committed; audit failed, the server then refuses user mutations except the revocation class, and doctor counts the unaudited operations (socket operations)" \
+	k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps k3sm/pkg/keystore::TestUnauditedOpsCountsCommittedRevocations TestUserRotateCrashOrder
 check U113 "the listener refuses to start unless the server's effective uid is the service uid: a rootless k3sm server runs no listener, and the server log and doctor say user scope needs the installed server (socket listener)" \
 	k3sm/pkg/keystore/socket::TestListenerRefusesUnlessServiceUID
 pend U114 "rm-scope writes keystore-removed-scopes.json in the data root, root-owned, through the data-root descriptor rules, before it removes the scope; only a scope listed there counts as removed for the finalizer, and a plain ErrScopeAbsent stays non-definitive and keeps the finalizer (KeyDelivery lifecycle)" \
@@ -1064,9 +1065,9 @@ U64|ErrScopeAbsent
 U64|a missing entries/ directory or a missing deliveries record is ErrScopeAbsent too
 U66|FFFFEEEE-DDDD-CCCC-BBBB-AAAA
 U67|256 KiB reconciler allowance
-U67|704 KiB socket margin
+U67|720 KiB socket margin
 U67|neither budget can draw on the other
-U67|at most 320 KiB per user scope
+U67|at most 976 KiB per user scope
 U84|overshoot
 U67|one uid's revocations are never refused because of another uid
 U73|an indeterminate sweep keeps the claim

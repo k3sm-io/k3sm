@@ -158,13 +158,13 @@ func TestFloorKeyBoundDerivedFromCaps(t *testing.T) {
 		t.Fatalf("the shortest floor line is %d bytes, want 55", len(line))
 	}
 	l := s.userFloor.(*fileFloorLog).log
-	// At the default caps the size would allow about 18.3M keys; the ceiling
+	// At the default caps the size would allow about 23.5M keys; the ceiling
 	// of 1<<18, which bounds the reader's memory, is met first.
 	if got := l.keyBound(); got != 1<<18 {
 		t.Fatalf("key bound %d at the default caps, want the ceiling %d", got, 1<<18)
 	}
 	// Under small caps the size-derived bound is met first.
-	s.logHardCap, s.logSoftCap, s.logRevokeBudget = 1<<20, 1<<20, maxLogLine
+	s.logHardCap, s.logSoftCap, s.logRevokeBudget, s.logAllowance = 1<<20, 1<<20, maxLogLine, maxLogLine
 	if got, want := l.keyBound(), int(s.logReadBound()/55+1); got != want || want >= 1<<18 {
 		t.Fatalf("key bound %d under 1 MiB caps, want the size-derived %d", got, want)
 	}

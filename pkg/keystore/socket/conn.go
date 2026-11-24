@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 )
@@ -52,25 +53,65 @@ type Handler struct {
 	ops map[string]opFunc // the operations; an op not here is unknown-op
 }
 
-// opFunc runs one operation on its request header. A nil error is answered
-// with a TypeReply, and an error with the TypeError its code maps to
-// (codeOf); either way the connection stays open.
-type opFunc func(ctx context.Context, header []byte) error
+// Peer is the admitted peer of a connection, as the listener read it at
+// accept: UID is the authority every operation acts for, PID is advisory,
+// for an audit line. No request header field can change either.
+type Peer struct {
+	UID uint32
+	PID int32
+}
 
-// codeOf maps an operation's error to its reply's code.
-func codeOf(err error) Code {
-	if errors.Is(err, ErrBusy) {
-		return CodeBusy
+// Request is one request as an operation receives it: the connection's
+// admitted peer, the op it names, its whole header (an operation decodes
+// its own fields; unknown fields are ignored) and its value, nil when the
+// frame carries none. The value is the server's to zero once the reply is
+// written; an operation never keeps it.
+type Request struct {
+	Peer   Peer
+	Op     string
+	Header []byte
+	Value  []byte
+}
+
+// Reply is an operation's answer: its header, marshalled as a JSON object
+// (nil is {}), and an optional value, which Serve writes as the reply's
+// binary part and then zeroes. A header never carries a value.
+type Reply struct {
+	Header any
+	Value  []byte
+}
+
+// opFunc runs one operation. Its reply is written when the error maps to
+// no code (outcomeOf: nil, or a change that committed), with the warning
+// the error carries; any other error is answered with the TypeError its
+// code maps to and the reply is dropped, its value zeroed. Either way the
+// connection stays open.
+type opFunc func(ctx context.Context, req Request) (Reply, error)
+
+// HandlerOption configures a Handler at construction.
+type HandlerOption func(*Handler)
+
+// withOp registers op under name (NewOpsHandler registers the
+// operations; a later registration of a name replaces the earlier).
+func withOp(name string, op opFunc) HandlerOption {
+	return func(h *Handler) {
+		if h.ops == nil {
+			h.ops = map[string]opFunc{}
+		}
+		h.ops[name] = op
 	}
-	return CodeInternal
 }
 
 // NewHandler returns a Handler that takes its deadlines from now.
-func NewHandler(now func() time.Time) (*Handler, error) {
+func NewHandler(now func() time.Time, opts ...HandlerOption) (*Handler, error) {
 	if now == nil {
 		return nil, errors.New("keystore socket: nil clock")
 	}
-	return &Handler{now: now}, nil
+	h := &Handler{now: now}
+	for _, o := range opts {
+		o(h)
+	}
+	return h, nil
 }
 
 // requestHeader is the part of a request header the dispatcher reads.
@@ -84,8 +125,9 @@ type requestHeader struct {
 // between frames and an error otherwise (a *ProtocolError for a frame or
 // handshake that breaks the protocol, ErrUnsupportedVersion after its
 // reply); the caller closes c in every case. Cancelling ctx expires c's
-// deadlines, so Serve returns.
-func (h *Handler) Serve(ctx context.Context, c Conn) error {
+// deadlines, so Serve returns. Every request is served for p, the peer the
+// listener admitted.
+func (h *Handler) Serve(ctx context.Context, c Conn, p Peer) error {
 	expired := time.Unix(1, 0)
 	stop := context.AfterFunc(ctx, func() {
 		_ = c.SetReadDeadline(expired)  // best effort: the read fails either way
@@ -115,7 +157,7 @@ func (h *Handler) Serve(ctx context.Context, c Conn) error {
 	}
 	v, ok := selectVersion(hello.Min, hello.Max, MinVersion, MaxVersion)
 	if !ok {
-		if err := h.write(ctx, c, h.now().Add(RequestBound), TypeError, errorHeader{Code: CodeUnsupportedVersion}); err != nil {
+		if err := h.write(ctx, c, h.now().Add(RequestBound), TypeError, errorHeader{Code: CodeUnsupportedVersion}, nil); err != nil {
 			return err
 		}
 		return ErrUnsupportedVersion
@@ -127,7 +169,7 @@ func (h *Handler) Serve(ctx context.Context, c Conn) error {
 	if err := c.SetReadDeadline(h.now().Add(IdleBound)); err != nil {
 		return err
 	}
-	if err := h.write(ctx, c, h.now().Add(RequestBound), TypeHello, HelloReply{Proto: Proto, Version: v, MaxFrame: MaxFrame}); err != nil {
+	if err := h.write(ctx, c, h.now().Add(RequestBound), TypeHello, HelloReply{Proto: Proto, Version: v, MaxFrame: MaxFrame}, nil); err != nil {
 		return err
 	}
 	for {
@@ -143,59 +185,142 @@ func (h *Handler) Serve(ctx context.Context, c Conn) error {
 			}
 			return err
 		}
-		// The request: the rest of its frame and its reply within
-		// RequestBound of its first byte.
-		end := h.now().Add(RequestBound)
-		if err := c.SetReadDeadline(end); err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		f, err := ReadFrame(io.MultiReader(bytes.NewReader(first[:]), c))
-		if err != nil {
-			return err
-		}
-		if f.Type != TypeRequest {
-			return protocolErrorf("frame type %#02x after HELLO, not a request", byte(f.Type))
-		}
-		var req requestHeader
-		if err := json.Unmarshal(f.Header, &req); err != nil {
-			return protocolErrorf("malformed request header: %v", err)
-		}
-		if req.Op == "" {
-			return protocolErrorf("request names no op")
-		}
-		// An op the server does not have is answered unknown-op, and the
-		// connection stays open so a newer client can fall back.
-		rt, reply := TypeError, any(errorHeader{Code: CodeUnknownOp})
-		if op, ok := h.ops[req.Op]; ok {
-			if err := op(ctx, f.Header); err != nil {
-				reply = errorHeader{Code: codeOf(err)}
-			} else {
-				rt, reply = TypeReply, struct{}{}
-			}
-		}
-		if err := c.SetReadDeadline(h.now().Add(IdleBound)); err != nil {
-			return err
-		}
-		if err := h.write(ctx, c, end, rt, reply); err != nil {
+		if err := h.serveRequest(ctx, c, p, first[0]); err != nil {
 			return err
 		}
 	}
 }
 
-// write sends one header-only frame, finishing by deadline.
-func (h *Handler) write(ctx context.Context, c Conn, deadline time.Time, t FrameType, header any) error {
-	hb, err := json.Marshal(header)
+// serveRequest reads and answers one request whose first byte is first:
+// the rest of its frame and its reply within RequestBound of that byte.
+// The request's value is zeroed on every way out, an early return and a
+// panic out of the operation included, and so is the reply's encoding.
+func (h *Handler) serveRequest(ctx context.Context, c Conn, p Peer, first byte) error {
+	end := h.now().Add(RequestBound)
+	if err := c.SetReadDeadline(end); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f, err := ReadFrame(io.MultiReader(bytes.NewReader([]byte{first}), c))
+	defer func() { clear(f.Value) }()
 	if err != nil {
 		return err
 	}
+	if f.Type != TypeRequest {
+		return protocolErrorf("frame type %#02x after HELLO, not a request", byte(f.Type))
+	}
+	var req requestHeader
+	if err := json.Unmarshal(f.Header, &req); err != nil {
+		return protocolErrorf("malformed request header: %v", err)
+	}
+	if req.Op == "" {
+		return protocolErrorf("request names no op")
+	}
+	// An op the server does not have is answered unknown-op, and the
+	// connection stays open so a newer client can fall back.
+	rt, header, value := TypeError, any(errorHeader{Code: CodeUnknownOp}), []byte(nil)
+	if op, ok := h.ops[req.Op]; ok {
+		rt, header, value = answer(op(ctx, Request{Peer: p, Op: req.Op, Header: f.Header, Value: f.Value}))
+	}
+	// A reply the server cannot encode (a header that does not marshal,
+	// or one past its cap) is answered internal: the operation has run,
+	// and the connection stays open for the next request.
+	b, err := marshalFrame(rt, header, value)
+	clear(value)
+	if err != nil {
+		b, err = marshalFrame(TypeError, errorHeader{Code: CodeInternal}, nil)
+	}
+	// The encoding holds a copy of the reply's value: it is zeroed too.
+	defer clear(b)
+	if err != nil {
+		return err
+	}
+	if err := c.SetReadDeadline(h.now().Add(IdleBound)); err != nil {
+		return err
+	}
+	return h.writeEncoded(ctx, c, end, b)
+}
+
+// answer is the frame an operation's result is answered with: its reply,
+// with the warning its error carries, when the error maps to no code; the
+// error's code otherwise, the reply's value zeroed.
+func answer(reply Reply, err error) (FrameType, any, []byte) {
+	code, warning := outcomeOf(err)
+	if code != "" {
+		clear(reply.Value)
+		return TypeError, errorHeader{Code: code}, nil
+	}
+	return TypeReply, replyHeader{header: reply.Header, warning: warning}, reply.Value
+}
+
+// replyHeader is a reply's header with the warning an outcome adds.
+type replyHeader struct {
+	header  any
+	warning string
+}
+
+// MarshalJSON writes the operation's header as an object, with "warning"
+// set when there is one; a header that is not an object is refused.
+func (r replyHeader) MarshalJSON() ([]byte, error) {
+	if r.header == nil && r.warning == "" {
+		return []byte("{}"), nil
+	}
+	fields := map[string]json.RawMessage{}
+	if r.header != nil {
+		b, err := json.Marshal(r.header)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(b, &fields); err != nil {
+			return nil, fmt.Errorf("keystore socket: a reply header must be a JSON object: %w", err)
+		}
+		if fields == nil {
+			fields = map[string]json.RawMessage{}
+		}
+	}
+	if r.warning != "" {
+		w, err := json.Marshal(r.warning)
+		if err != nil {
+			return nil, err
+		}
+		fields["warning"] = w
+	}
+	return json.Marshal(fields)
+}
+
+// write sends one frame, with value as its binary part when it is not nil,
+// finishing by deadline.
+func (h *Handler) write(ctx context.Context, c Conn, deadline time.Time, t FrameType, header any, value []byte) error {
+	b, err := marshalFrame(t, header, value)
+	if err != nil {
+		return err
+	}
+	// The encoding holds a copy of the value: it is zeroed with it.
+	defer clear(b)
+	return h.writeEncoded(ctx, c, deadline, b)
+}
+
+// marshalFrame is the encoding of one frame, header marshalled as JSON and
+// value as its binary part when it is not nil. It fails, encoding nothing,
+// when the header does not marshal or the frame is past a cap.
+func marshalFrame(t FrameType, header any, value []byte) ([]byte, error) {
+	hb, err := json.Marshal(header)
+	if err != nil {
+		return nil, err
+	}
+	return AppendFrame(nil, Frame{Type: t, Header: hb, Value: value})
+}
+
+// writeEncoded writes b, one encoded frame, finishing by deadline.
+func (h *Handler) writeEncoded(ctx context.Context, c Conn, deadline time.Time, b []byte) error {
 	if err := c.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return WriteFrame(c, Frame{Type: t, Header: hb})
+	_, err := c.Write(b)
+	return err
 }

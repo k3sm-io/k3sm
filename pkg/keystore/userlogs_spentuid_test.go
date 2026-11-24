@@ -32,8 +32,14 @@ func reopenStore(t *testing.T, s *FileStore) *FileStore {
 	s2 := New(Config{
 		Dir: s.dir, MasterDir: s.masterDir, DataRoot: s.dataRoot,
 		UID: s.uid, GID: s.gid, FloorUID: s.floorUID, FloorGID: s.floorGID,
-		LogSoftCap: s.logSoftCap, LogHardCap: s.logHardCap, LogRevocationBudget: s.logRevokeBudget,
+		LogUIDShare: s.logUIDShare,
 	})
+	// The caps as s holds them, a test's lowered ones included, set the
+	// way that test set them: on the store, beside the hard cap its Config
+	// named, which the effective share is judged against.
+	s2.logSoftCap, s2.logHardCap, s2.logRevokeBudget = s.logSoftCap, s.logHardCap, s.logRevokeBudget
+	s2.configHardCap = s.configHardCap
+	s2.logAllowance = s.logAllowance
 	s2.logFlags = flagged
 	return s2
 }

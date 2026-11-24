@@ -70,7 +70,9 @@ func TestPreFrameDroppedEncodeFits(t *testing.T) {
 }
 
 // TestPreFrameDroppedRoundTrip: for random counts (few or many uids, each
-// under one or several classes, short or long numbers, saturated totals)
+// under one or several of the file's classes, the post-frame and unaudited
+// ones included, an unaudited count under a uid too, which the writer folds
+// into its others line; short or long numbers, saturated totals)
 // parse(encode(x)) succeeds and keeps every class's total.
 func TestPreFrameDroppedRoundTrip(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2))
@@ -82,7 +84,7 @@ func TestPreFrameDroppedRoundTrip(t *testing.T) {
 			if r.IntN(2) == 0 {
 				u = uint32(r.IntN(2000))
 			}
-			for _, c := range preFrameClasses[:1+r.IntN(len(preFrameClasses))] {
+			for _, c := range countClasses[:1+r.IntN(len(countClasses))] {
 				n := r.Uint64() >> r.IntN(64)
 				if r.IntN(50) == 0 {
 					n = math.MaxUint64
@@ -90,7 +92,7 @@ func TestPreFrameDroppedRoundTrip(t *testing.T) {
 				d.uids[preFrameKey{c, u}] = n
 			}
 		}
-		for _, c := range preFrameClasses {
+		for _, c := range countClasses {
 			if r.IntN(3) == 0 {
 				d.others[c] = r.Uint64() >> r.IntN(64)
 			}

@@ -587,7 +587,7 @@ func TestListenerRecoversPanic(t *testing.T) {
 		}
 
 		// A panic in a connection's goroutine ends that connection only.
-		r.h.ops = map[string]opFunc{"boom": func(context.Context, []byte) error { panic("fake: op panicked") }}
+		r.h.ops = map[string]opFunc{"boom": func(context.Context, Request) (Reply, error) { panic("fake: op panicked") }}
 		p := r.dial(t, 502)
 		p.admitted(t)
 		if err := WriteFrame(p.client, Frame{Type: TypeRequest, Header: []byte(`{"op":"boom"}`)}); err != nil {

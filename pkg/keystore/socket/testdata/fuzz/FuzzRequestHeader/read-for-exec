@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"op\":\"read-for-exec\",\"entry\":\"system/signer-key\"}")

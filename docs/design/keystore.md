@@ -158,9 +158,13 @@ The fixed decisions:
         master.next.sha256
     keystore/                           0700, service user, a SIBLING of cred/
       .lock                             0600, the one lock file (see "Concurrency")
-      .preframe-dropped                 0600, written by the server only: the pre-frame refusals
-                                        counted as dropped and not yet in the audit log ("Per-uid
-                                        fairness"); a restore's staged tree may hold it, and its
+      .preframe-dropped                 0600, written by the server only: the server-counts file.
+                                        Its name says pre-frame, but it carries three kinds of
+                                        count: the pre-frame refusals counted as dropped and not
+                                        yet in the audit log ("Per-uid fairness"), the post-frame
+                                        refused lines dropped and not yet summarized, and the
+                                        committed revocations with no audit line ("The audit
+                                        log"); a restore's staged tree may hold it, and its
                                         temporary file, judged and parsed strictly
       .user                             reserved for user scopes (see "Scope"); created by the
                                         user-scope store, laid out under "User scope"
@@ -3491,7 +3495,12 @@ service user can only add to.
   a transient refusal of the catch-up line (`ErrLogFull`, `errLogNoSpace`, an I/O error) is
   named in the returned error and the scope starts, and the next start step, and for the
   delivery record every operation's own catch-up, tries the line again
-  (`TestFullVolumeAtStartDoesNotQuarantine`). A `withdraw` whose delivery record a damaged
+  (`TestFullVolumeAtStartDoesNotQuarantine`). The socket's supervisor runs the start step
+  on every pass, and the same split holds on every one: only the named per-scope catch-up
+  errors (`ScopesNotCaughtUp`) are logged at Warn while the listener serves; a refused
+  `CheckLogBounds` or a catch-up that failed as a whole fails the step on any pass, the
+  first or a later one after the user scope has started, so the listener stays off on the
+  supervisor's backoff (`TestStartUserScopesStepRefusesOnLaterPass`). A `withdraw` whose delivery record a damaged
   line taints still runs: it checks the record against the highest sequence the floor's
   whole lines hold, seals the tombstone and writes its floor line, which is never refused
   for damage; it only removes, so it cannot bring anything back
@@ -3510,14 +3519,16 @@ service user can only add to.
   `FileStore.LogSizes` gives the sizes and caps to the
   `doctor` row. **The reader is bounded**, since the service user can append to either log
   without limit: a log larger than the hard cap plus 1024 uids' revocation budgets plus 1 MiB
-  (961 MiB at the defaults) is damage (`logReadBound`; the configuration is bounded from
+  (1,233 MiB at the defaults) is damage (`logReadBound`; the configuration is bounded from
   above, a hard cap of at most 2^40 bytes and a revocation budget of at most 2^30, refused
   at `checkConfig` past either, so the sum cannot overflow). *`logReadBound` grows with the
-  budgets still to land.* Today it holds the hard cap, `maxRevokeUIDs` (1024) uids'
-  revocation budgets and the 1 MiB margin. When the socket's 704 KiB margin and the
-  reconciler's 256 KiB per-uid allowance and 1 MiB budget land ("Per-uid fairness"), each
+  budgets still to land.* Today it holds the hard cap, `maxRevokeUIDs` (1024) uids' two
+  revocation budgets (the 720 KiB socket margin and the 256 KiB reconciler allowance) and
+  the 1 MiB margin, 1,233 MiB at the defaults; the reconciler's 1 MiB budget, all but its
+  pre-frame part, is still to land. With the socket's 720 KiB margin, the
+  reconciler's 256 KiB per-uid allowance and its 1 MiB budget ("Per-uid fairness"), each
   is a line class written past the hard cap, so the bound becomes the hard cap plus 1024 ×
-  (704 KiB + 256 KiB) plus the 1 MiB reconciler budget plus the 1 MiB margin: the most the
+  (720 KiB + 256 KiB) plus the 1 MiB reconciler budget plus the 1 MiB margin: the most the
   server itself can write past the hard cap, 1024 uids at both their budgets and the
   reconciler at its own, with the margin above it, so no log the server wrote reads as
   damage. Each budget's change raises the bound in the same change. The first to land is the
@@ -3527,7 +3538,7 @@ service user can only add to.
   `(scope, name, generation)` keys than its key bound is damage too, the key bound being that size bound over the shortest line
   that adds a key (55 bytes, its checksum included), held to a ceiling of 2^18 (262,144) keys whatever the caps are
   configured to (larger caps do not raise it), plus the revocation headroom of 1/16 of that ("Per-uid fairness"): 278,528
-  keys for the reader. The size alone would allow about 18.3 million keys at the defaults, so
+  keys for the reader. The size alone would allow about 23.5 million keys at the defaults, so
   the ceiling is met first there, and it is what bounds the reader's memory. The reader
   interns scope strings and indexes each key's generations by `(scope, name)`, so `rm`'s
   read of a name's live generations does not scan the floor. Measured on an M1 Ultra, read
@@ -3535,8 +3546,8 @@ service user can only add to.
   (86 MiB of lines), holds about 128 MiB of heap and takes about 0.41 s
   (`BenchmarkFloorReadLongNames`); the time worst case, the most lines the size bound holds
   (measured at about 7.3 million, 321 MiB, under the former 64 KiB revocation budget), holds
-  about 69 MiB and takes about 3.9 s (`BenchmarkFloorReadLineCount`); at today's 961 MiB
-  bound, about 18.3 million lines of 55 bytes, the time scales to about 9.8 s (not re-measured), and the
+  about 69 MiB and takes about 3.9 s (`BenchmarkFloorReadLineCount`); at today's 1,233 MiB
+  bound, about 23.5 million lines of 55 bytes, the time scales to about 12.6 s (not re-measured), and the
   heap, bounded by the key ceiling, does not grow; 262,144 keys of the shortest lines hold about 64 MiB and
   take about 0.23 s (`BenchmarkFloorReadAtKeyBound`). At a ceiling of 2^20 the long-name case
   held about 494 MiB, over the 200 MiB the reader is allowed, so the ceiling was lowered. The
@@ -3562,7 +3573,7 @@ service user can only add to.
   cap: a configured share above `logHardCap / 16` is refused at server start. At the default
   caps, fewer than 16 uids cannot by themselves bring a log to the hard cap: 15 uids at their
   shares and both their revocation budgets, with the reconciler budget below, come to
-  15 × (16 MiB + 448 KiB) + 1 MiB, under 248 MiB of the 256 MiB. Root's own lines, charged to
+  15 × (16 MiB + 976 KiB) + 1 MiB = 261,424 KiB, about 255.3 MiB, under the 256 MiB. Root's own lines, charged to
   no uid, are not bounded by this. The server counts each uid's bytes per log from the log at
   start and on every append.
   - *What is charged.* Every line counts against the share of the uid it acts for, reads
@@ -3589,12 +3600,21 @@ service user can only add to.
     with the count, and the count is persisted, not kept only in memory: the next summary line
     written for that source carries it, and root's next `audit --rotate` writes any count still
     unwritten as one line charged to no uid (U85, U126).
-    For the pre-frame part the server persists its dropped counts in `.preframe-dropped` in the
-    store directory it owns (`server/keystore/`, 0700; the audit log's directory is root's): one
-    header line, then at most 256 lines `<uid> <class> <count>`, each at most 64 bytes, with the
-    uids past 256 folded into one `others <class> <count>` line per class. It is written temp,
+    For the pre-frame part the server persists its dropped counts in `.preframe-dropped`, the
+    server-counts file, in the store directory it owns (`server/keystore/`, 0700; the audit
+    log's directory is root's): one header line, then lines `<uid> <class> <count>` for at most
+    256 uids, each line at most 64 bytes, with the uids past 256 folded into one
+    `others <class> <count>` line per class. The same file, in the same format, carries the
+    server's two other counts that must outlast it, each as its own class beside the five
+    pre-frame ones: `post-frame`, a uid's post-frame refused lines dropped and not yet
+    summarized ("The audit log", refused lines), and `unaudited`, the committed revocations
+    whose audit line could not be written, which names no uid and is written only as its
+    `others unaudited <count>` line (a uid line naming it does not parse). Neither is a
+    pre-frame class: no pre-frame line or summary carries it, and it draws on no budget. The
+    file's size bound counts a line for each class a named uid may carry, so the encoder's
+    output always fits it. It is written temp,
     fsync, rename and directory fsync through a descriptor of the store directory, `O_NOFOLLOW`,
-    0600, when the pending counts change, at most once a second on the server's clock, and
+    0600, when any of its counts changes, at most once a second on the server's clock, and
     emptied to its header once every count has reached the audit log; it is read, owner and mode
     checked and strictly parsed, and merged when the server opens its logs and again on each
     reopen. It is written under the server's in-process mutex **without** the store lock, which
@@ -3605,21 +3625,40 @@ service user can only add to.
     reads the file through the store directory it judged and holds, and writes at the start of
     the new audit log one line per class with a count, the server's summary-line form with
     `"via":"root"` and caller uid 0 (so it is charged to no uid and to no pre-frame part):
-    `{"v":1,…,"op":"refused","via":"root","caller":{"uid":0},…,"result":"dropped","charge":"reconciler","source":"pre-frame","dropped":<total>,"class":"<class>"}`.
+    `{"v":1,…,"op":"refused","via":"root","caller":{"uid":0},…,"result":"dropped","charge":"reconciler","source":"pre-frame","dropped":<total>,"class":"<class>"}`,
+    the pre-frame classes first, then `post-frame`, whose line carries its own name as its
+    `source`. The `unaudited` count is last and is no refusal and nothing dropped: the
+    revocations it counts committed and only their lines are missing, so its line is its own
+    op, `unaudited`, written only by root's `audit --rotate`:
+    `{"v":1,…,"op":"unaudited","via":"root","caller":{"uid":0},"scope":"","name":"","namespace":"","result":"committed","count":<total>}`.
+    It carries no `charge` or `source`, so it is charged to no uid and to no pre-frame part;
+    the strict audit reader takes it like any line and the pre-frame recount skips it
+    (`TestRotateAuditWritesDroppedCounts`).
     Only once the swap committed does it take the counts it wrote out of the file, leaving what
     the server added since; the server's next reopen moves its in-memory counts by what the file
     lost, so no count is written twice. A run that stops between the swap and that step leaves
     the counts in the file, and the next rotate writes them again: counted twice, never lost.
     One race does lose a count: the server writes the file without the store lock, so a server
     write that lands between rotate's re-read of the file and its rewrite is overwritten, and
-    that one window's increment is counted once too few, at most one second's refusals.
+    that one window's increment is counted once too few, at most one second's refusals. Both
+    limits hold for the post-frame and unaudited counts the same way: a rotate that stops at
+    that point can report one twice, and a server write landing during a rotate can lose one
+    second's increment.
+    The persisted counts file is therefore **best-effort evidence**, not an exact ledger.
+    Besides that race, a count can be lost three ways: the service user, which owns the
+    store directory and is trusted, can edit or truncate the file; root's clear after a
+    rotate can race the server's own write of the file, so one side's update overwrites the
+    other's; and a crash between a revocation's commit and its audit append leaves neither
+    the line nor an `unaudited` count (as does a crash after a failed append and before the
+    server's next write of the file). Each loss undercounts; none hides a line that was
+    written, and the audit log itself stays the record of what was.
     The count in that `via: root` line is the service user's persisted claim, which root
     carries without vouching for it: the service user owns the store directory and can write
     any count there, the same residual as forged pre-frame lines (below), with a root label.
     The server keeps the file within the bounds its own reader enforces: a uid line that would
     name more than 256 uids, pass the line bound or overrun the size bound folds, with every
-    line after it, into the per-class `others` lines, so a written file always reads back and
-    keeps each class's total.
+    line after it, into the per-class `others` lines (the `unaudited` count is only ever on its
+    `others` line), so a written file always reads back and keeps each class's total.
   - *The pre-frame part is split so a login user cannot spend it for everyone.* A login user
     can be refused at will (a self-sandboxed process is refused as `sandboxed` under its own
     uid), so the 256 KiB pre-frame part is not one pool. A **login line** is a pre-frame line
@@ -3658,7 +3697,8 @@ service user can only add to.
   - *Past the share, reads are refused too.* A uid past its share has its own mutations and
     its own reads refused with `ErrLogFull` (code `log-full`) before any line is written, so
     no read is a way around the share. Its `refused` lines and their summaries are not written
-    either: the server counts that uid's dropped lines in memory, `doctor` shows the count,
+    either: the server counts that uid's dropped lines as its `post-frame` count, persisted in
+    the server-counts file `.preframe-dropped` ("Per-uid fairness"), `doctor` shows the count,
     and root's next `audit --rotate` writes it as one line charged to no uid.
   - *A share refusal is one uid's alone.* No other uid is refused for it: every other uid's
     mutations and reads draw on its own share, which no other uid's lines are charged to (U51).
@@ -3681,23 +3721,24 @@ service user can only add to.
     - the **reconciler allowance**, 256 KiB, used only by the reconciler's revocation lines for
       that uid's deliveries (`deliver-delete`, the withdrawal's `deliver-write` and floor line,
       the rotation write);
-    - the **socket margin**, 704 KiB (`defaultLogRevocationBytes`), used only by that uid's
+    - the **socket margin**, 720 KiB (`defaultLogRevocationBytes`), used only by that uid's
       own socket `withdraw`, `rm` and `rotate` lines and their floor lines. It holds one
       scope's full revocation under the longest scope (`user/2147483647`) and a 253-byte name.
       Each of its 256 entries `rm`'d is a burial of at most 6 tombstones (the floor's live
       generation, the one the pointer authenticates, and the 4 the tree alone may name,
       `maxBurialTombstones`) of 315 bytes (15 + 1 + 253 + 1 + 32 + 1 + 2 + 1 + 8 + 1: scope,
       name, generation, `rm`, checksum and newline, each field after the first led by its
-      space) and an `rm` audit line of at most 384 bytes (the
-      longest result, a full RFC3339Nano timestamp), each of the two appends charged its
-      leading newline: 256 × (6 × 315 + 1 + 384 + 1) = 582,656 bytes.
+      space) and an `rm` audit line of at most 444 bytes (the
+      longest result, a full RFC3339Nano timestamp, and the socket's `via` and `caller` with the
+      longest uid and pid), each of the two appends charged its
+      leading newline: 256 × (6 × 315 + 1 + 444 + 1) = 598,016 bytes.
       Each of its 320 deliveries withdrawn (`maxDeliveries`) is a 91-byte floor line
       (15 + 1 + 11 + 1 + 32 + 1 + 20 + 1 + 8 + 1) and a
-      `withdraw` audit line of at most 250 bytes: 320 × (91 + 1 + 250 + 1) = 109,760 bytes. In
-      all 692,416 bytes, rounded up to 704 KiB (720,896), which the checksum leaves as it was. With it `logReadBound` at the default
-      caps is 256 MiB + 1024 × 704 KiB + 1 MiB = 961 MiB, and at the configuration's upper
-      bounds still 2^40 + 1024 × 2^30 + 2^20, which cannot overflow. A configured budget under
-      one worst-case burial plus its audit line, 6 × 315 + 1 + 384 + 1 = 2,276 bytes
+      `withdraw` audit line of at most 310 bytes, `via` and `caller` included: 320 × (91 + 1 + 310 + 1) = 128,960 bytes. In
+      all 726,976 bytes, rounded up to 720 KiB (737,280), which the checksum leaves as it was. With it `logReadBound` at the default
+      caps is 256 MiB + 1024 × (720 KiB + 256 KiB) + 1 MiB = 1,233 MiB, and at the configuration's upper
+      bounds still 2^40 + 1024 × (2^30 + 2^18) + 2^20, which cannot overflow. A configured budget under
+      one worst-case burial plus its audit line, 6 × 315 + 1 + 444 + 1 = 2,336 bytes
       (`minLogRevokeBudget`), is refused at `checkConfig`. The budget is kept per log, so
       a burial, charged to the floor's, never takes the room of its audit line, charged to the
       audit log's, which the revocation's admission found for a whole append (`room`,
@@ -3750,13 +3791,13 @@ service user can only add to.
     share`. The CLI prints that warning line and exits 0, so the user knows the Pods still hold
     the old value (U92).
   - *The socket margin keeps a user able to revoke.* A uid past its share, even with 64 live
-    deliveries, still has its 704 KiB socket margin for `withdraw`, `rm` and `rotate`, about 352
+    deliveries, still has its 720 KiB socket margin for `withdraw`, `rm` and `rotate`, about 360
     of them at two lines of at most 1 KiB each (the operation's line and its floor line). A uid
     that spends its margin, for instance by rotating without end, refuses only its own further
     socket revocations, until root rotates the log.
   - *How far a log can pass the hard cap.* Only revocation lines are written past the hard
     cap, and each uid's are bounded by its two budgets, so a log can grow past the hard cap by
-    at most 960 KiB (256 KiB plus 704 KiB) times the number of user scopes, plus the 1 MiB
+    at most 976 KiB (256 KiB plus 720 KiB) times the number of user scopes, plus the 1 MiB
     reconciler budget, whose lines the hard cap does not test either. User scopes are
     bounded by the host's eligible local accounts: a scope is minted only for an eligible uid
     (501 to 2147483647) with a real, non-synthesized GeneratedUID ("Key hierarchy", "Eligible
@@ -3835,7 +3876,8 @@ refused before its first frame:
 - **Fields.** `op` and `result` are open sets (today `put`, `rotate`, `rm`, `list`,
   `show`, `exec-read`, `deliver`, `withdraw`, `rewrap`, `rm-scope`, `floor-rebuild`,
   `floor-merge`, `floor-merge-dry-run`, `audit-rotate`, `deliver-write`, `deliver-delete`,
-  `refused`; and `ok`, `committed` or a sentinel name: `ok` is a change committed whole,
+  `refused`, `unaudited` (root's `audit --rotate` line for the committed revocations whose
+  lines were not written, with result `committed`); and `ok`, `committed` or a sentinel name: `ok` is a change committed whole,
   `committed` a revocation committed in part and reported after its commit, such as an `rm`
   whose burial stopped part way or a `withdraw` whose floor line failed; a root verb that
   exits 4 or 5, its change made and its report to read, is `committed` too). When such a partial commit's own audit line then fails, the reply
@@ -3855,6 +3897,16 @@ refused before its first frame:
   `socket`, `root` or `reconciler`. `caller.user` is display-only beside the uid, and `pid` is
   advisory. Readers ignore unknown fields, and `v` bumps only on a breaking change (U23). The
   user docs specify the format.
+  As built: every line of a socket operation carries `via` `socket` and `caller` with the
+  peer's `uid` (the scope's own) and its `pid` when the peer credentials gave one; `caller.user`
+  is not written yet, since the store has no bounded source for it and the socket margin is
+  sized for the line without it. `version` and `fingerprint` are on the lines of the operations
+  that write a version, and only those: a `put`'s `ok` line (version 1, and the fingerprint
+  when its scope already exists; a put that mints its scope has no key when its line is
+  written, so it names no fingerprint) and a committed `rotate`'s line (the new version).
+  `rm`, `withdraw`, `list`, `exec-read` and every refusal carry neither. The `caller` object
+  is parsed as strictly as the line: a key given twice or spelled in another case makes the
+  line damage, charged to no uid.
 - **Never a value, never a value length.** Mode 0600 because entry names are private to their
   owner; readable by root and the service user only. Every line also goes to the server log at
   Info, without `fingerprint`.
@@ -3873,7 +3925,8 @@ refused before its first frame:
   is not audited rather than appended without it.
 - **Lock modes and fairness.** Reads (`list`, `read-for-exec`, `deliveries` and the
   reconciler's reads) take the store lock shared, and their audit lines are appended under that
-  shared hold, which excludes the maintenance verbs as an exclusive hold does; the server
+  shared hold (a read is admitted against the share first, then reads, then appends its line,
+  then replies; a read whose line is not written returns no value), which excludes the maintenance verbs as an exclusive hold does; the server
   serialises its own appends and share counts in process. Mutations take the lock exclusive.
   In the server both modes go through one in-process reader-writer lock with writer preference
   (a waiting writer blocks new readers, as Go's `sync.RWMutex` does) in front of the `flock`, so
@@ -3907,7 +3960,12 @@ refused before its first frame:
   class above all (`withdraw`, `rm`, `rotate`), commits its change to the store, then appends
   its audit line, then replies. If the append fails after the commit, the change stands and the
   reply says so: `ok` with the warning `committed; audit failed`, which the CLI prints. The
-  server counts every such unaudited operation in memory, and `doctor` shows the count (U112).
+  server counts every such unaudited operation as its `unaudited` count, persisted in the
+  server-counts file `.preframe-dropped` and read back when the server opens its logs, so it
+  outlasts a restart; `doctor` shows the count, and root's next `audit --rotate` writes it as
+  one line charged to no uid (U112). The two limits of the pre-frame counts hold for it
+  ("Per-uid fairness"): a rotate that stops between its swap and its rewrite of the file can
+  report it twice, and a server write landing during a rotate can lose one second's increment.
   An audit line carries only validated fields; a field that failed its grammar is a fixed
   placeholder.
 - **Root verbs append after they run (deviation).** The root `k3sm keys` verbs that change
@@ -3924,8 +3982,23 @@ refused before its first frame:
   server refuses user mutations and reads (`list`, `read-for-exec`, `deliveries`) until an
   append succeeds (U32). The revocation class is the exception: a socket `withdraw`, `rm` or
   `rotate` and the reconciler's revocation deletes still go ahead, their lines dropped and
-  counted in memory, and `doctor` shows the count. A full disk must not keep a revoked
-  credential delivered (U109). The user docs recommend, without requiring, a data volume with
+  counted (the socket's as the persisted `unaudited` count above), and `doctor` shows the
+  count. A full disk must not keep a revoked
+  credential delivered (U109). As built: the failure is the store's own account of its
+  appends (`FileStore.AuditFailing`), set by an append the file system or the hard cap
+  refused and cleared by the next one that succeeds, and the socket refuses a request while
+  it is set, after the request's header, value and rate limit pass and before the store is
+  called (the deliver and deliveries placeholders too; `withdraw` is in the revocation
+  class): with `log-full` when the store reports the failure's cause is the audit log past
+  its hard cap (`FileStore.AuditFailingFull`), which tells the client a rotation ends it,
+  and with `refused` for every other cause. Past the hard cap a grant's own refusal line
+  cannot be written, so a `put` refused `log-full` there sets the failure, and later puts
+  and reads answer `log-full` too until an append succeeds. Two appends can still succeed while it is set, so the
+  state recovers without a restart: a revocation's line (which, past the hard cap, draws on
+  its uid's margin) and a refused request's own post-frame `refused` line (rate-limited per
+  uid as below); either ends the failure for every uid. A read whose line fails is refused
+  even when its answer is that the scope does not exist, so a `list` for a uid with no
+  scope is never served as an empty list without its line. The user docs recommend, without requiring, a data volume with
   an APFS reserve (`diskutil apfs addVolume … -reserve`), so that other writers on the Mac
   cannot fill the keystore's disk.
 - **Coverage.** Three sources write lines besides the socket's operations, so no act on the
@@ -3942,6 +4015,33 @@ refused before its first frame:
     carrying the peer uid (U54).
 - **`refused` lines are rate-limited per uid**, at most 10 a minute, with one summary line
   giving the count dropped, so a hostile local user cannot fill the log with refusals (U33).
+  A post-frame line is the line of a request the socket refused itself, after the peer was
+  admitted and before the store was called: `{"v":1,"ts":…,"op":"refused","via":"socket","caller":{"uid":<peer
+  uid>,"pid":<pid>},"scope":"user/<peer uid>","name":"","namespace":"","request":"<op>","result":"<reason>"}`,
+  `request` naming the operation as the log names it (`put`, `rotate`, `rm`, `list`,
+  `exec-read`, `deliver`, `withdraw`, `deliveries`) and `result` one of a closed set:
+  `bad-header` (a header field of the wrong type, a kind the socket does not store, a header
+  over its cap), `bad-value` (a value missing, empty, oversize, or where the operation takes
+  none), `not-served` (a delivery placeholder), `rate-limited`, `audit-failing` (the
+  fail-closed rule below), and `ineligible-uid` (a peer the listener admitted whose uid the
+  store gives no user scope, outside the login range or the store's own service uid: the
+  store refuses it before any view, so the socket answers `refused`, not `internal`, and
+  writes this line, which names no scope, `"scope":""`, and is charged to no uid's share;
+  its dropped count waits in the persisted count for root's next `audit --rotate`,
+  `TestIneligibleUIDRefusedWithLine`). It carries no entry name, value or other text the peer sent, is
+  appended under the store lock taken for it alone, and is charged to the caller's share,
+  so a line past the share is not written. The 10 a minute are counted per uid on a sliding
+  minute, rate-limited answers included, before the line is written; every line not written
+  (past the limit or the share, the lock not had, the append failed) is counted, and the
+  count is written as one summary, `"result":"dropped"` with a `dropped` count and no
+  `request`, at most once a minute (the first a minute after the uid's first refusal), the
+  next time that uid is refused, before that refusal's own line. So a uid writes at most 11
+  such lines a minute however many of its requests are refused. The count is the store's
+  `post-frame` count, persisted in the server-counts file `.preframe-dropped` ("Per-uid
+  fairness"), not the limiter's: a count still pending when the server stops is read back at
+  its next start, shown by `doctor`, and written by the next summary for that uid or root's
+  next `audit --rotate`, whichever comes first (`keystore/socket.FileStoreBridge`,
+  `keystore.FileStore.AddPostFrameDropped`, `keystore.UserScope.Refused`).
   Pre-frame refusals are rate-limited the same way, per peer uid, with their own dropped-count
   summary (U54).
   A pre-frame line is `{"v":1,"ts":…,"op":"refused","via":"socket","caller":{"uid":<peer
@@ -4203,6 +4303,19 @@ surface, and the app consumes only those.
   JSON header (at most 8 KiB, never a value) and an optional length-prefixed binary value. Each
   prefix is 4 bytes, big-endian. Each sub-length must be at most the frame length, checked
   before anything is allocated; a frame that breaks this closes the connection.
+- **The reply header cap.** A reply's header alone may pass 8 KiB, up to `MaxReplyHeader`
+  (128,818 bytes): the list of a full scope, 256 rows each at its widest (a 269-byte API name,
+  a 7-byte kind, a 20-digit version, a 20-character versions count, a 29-byte RFC 3339 time, a
+  64-hex-digit fingerprint, a 7-byte status, the field names and punctuation: 502 bytes), plus
+  the wrapper and the `committed; audit failed` warning. So one list call names every entry
+  of a full scope, and no cursor is needed. The cap is computed from those widths and a
+  compile check holds it inside the 128 KiB frame cap with the type and header prefix; a test
+  marshals the worst-case list and holds it under the cap. Only the client's reader
+  (`ReadReply`) takes a reply header past 8 KiB; the server's reader holds every frame,
+  a reply included, to 8 KiB. A reply the server cannot encode (a header that does not
+  marshal, or one past its cap) is answered with an error frame, code `internal`, and the
+  connection stays open: the request's audit line and share charge are already spent, and
+  the client gets an answer rather than a dropped connection.
 - **Frame layout, exactly.** The frame length counts the type byte, both prefixes, the header
   and the value, never its own 4 bytes, and must equal them exactly: the value is present iff
   bytes remain after the header, and then its prefix must account for every one of them (a
@@ -4232,6 +4345,89 @@ surface, and the app consumes only those.
   `scope-owner-changed`, `scope-owner-unknown`, `user-scope-off`, `rate-limited`, `refused`,
   `unsupported-version`, `unknown-op`, `internal`. A client maps any code it does not know to a
   generic failure that prints the code (U38).
+- **Store errors on the wire.** Each error the store returns to a socket operation maps to
+  one code of the set; the set does not grow for them. The table lives in one place,
+  `pkg/keystore/socket` (`outcomeOf`), checked in this order:
+
+  | Store error | Reply |
+  |---|---|
+  | none; or a change that committed (`ErrCommitted`) with a later step failed | `ok` |
+  | a change that committed whose audit line failed (`keystore.AuditLost`) | `ok` with the warning `committed; audit failed` |
+  | the store lock not taken within the 2-second wait (`keystore.LockBusy`, the socket's `ErrBusy`) | `busy` |
+  | the uid's rate limit | `rate-limited` |
+  | `ErrLogFull`: the uid's own share or revocation budget (`keystore.LogShareRefused`), or the log past its hard cap; and the socket's fail-closed refusal while the global append failure's cause is the hard cap (`socket.ErrAuditFailingFull`, from `keystore.FileStore.AuditFailingFull`) | `log-full` |
+  | the start step not run (`keystore.UserScopeOff`) | `user-scope-off` |
+  | `ErrNotFound`, `ErrVersionNotFound`, `ErrScopeAbsent` | `not-found` |
+  | `ErrQuota` | `quota` |
+  | `ErrScopeOwnerChanged`, `ErrScopeOwnerUnknown` | the code of the same name |
+  | a request the socket refuses before the store (`socket.ErrRequestRefused`, below); the socket's fail-closed refusal while the global append failure has any cause but the hard cap (`socket.ErrAuditFailing`); an operation refused because its audit line could not be written, the global append failure (`keystore.AuditRefused`); `ErrExists`; `ErrInvalidName`; `ErrKindMismatch`; `ErrTypedCredential`; `ErrRewrapInProgress`; a uid the store gives no user scope (`keystore.IneligibleUID`, with an `ineligible-uid` refused line); a sealed version above the entry's pointer (`ErrOrphanVersion`, which also matches `ErrCorrupt`); the floor's damage or the scope's quarantine (`keystore.FloorDegraded`) | `refused` |
+  | anything else: `ErrCorrupt`, `ErrMasterMissing`, `ErrMasterUntrusted`, `ErrKindUnsupported`, a cancelled request | `internal` |
+
+  `refused` is a request the store will not carry out as it stands, which the client can
+  change (another name, rotate rather than put, root finishing a rewrap or acknowledging the
+  floor's damage, or appends that succeed again); `internal` is damage or a missing key only
+  root can repair, so the client says to run `doctor`. A user rotate that finds a sealed
+  version above the pointer (a rotation that crashed before its flip, or an older pointer
+  copied back inside the floor's lag window) is `refused`, not `internal`: the scope's owner
+  cannot adopt it (`adopt` is root's, for the system scope) and cannot reach the file, but
+  can repair the entry itself, with `rm` and then `put` of the value. The store never
+  discards an orphan that authenticates (it may be the newer committed version), so the
+  refusal stands until the owner does that; the error the server logs names the entry and
+  that remedy. `ErrScopeAbsent` is `not-found` on the
+  socket: the peer's own scope holds nothing it can read, and nothing on the socket path
+  deletes on that answer, so it is never taken as a definitive absence. `list` alone answers
+  an empty list rather than `not-found`, and only for a uid with no scope key yet (no scope
+  directory, or one with no `scope.key`: `keystore.NoScopeKey`); a scope whose `scope.key`
+  is there but whose `entries/` directory or `deliveries` record is gone is damage, and its
+  `list` answers that error's own code, never an empty list (`TestListDamagedScopeIsNotEmpty`).
+  A `log-full` from the
+  uid's own share is never the global append failure: that one is answered alike for every
+  uid, `log-full` when its cause is the audit log past its hard cap and `refused` for any
+  other cause (a full disk, an I/O error).
+- **Operations on the wire.** The request and reply headers are named Go types in
+  `pkg/keystore/socket` (`PutRequest`, `RotateRequest`, `ListRequest`, `RmRequest`,
+  `ReadForExecRequest`; `VersionReply`, `ListReply` with `ListEntry`, `RmReply`,
+  `ReadForExecReply`), and these are their definitions. Every request header carries `op`.
+
+  | `op` | request header | request value | reply header | reply value |
+  |---|---|---|---|---|
+  | `put` | `entry`, `kind` (optional; `opaque`, the only kind the socket stores) | the value, required | `version`, `fingerprint` | none |
+  | `rotate` | `entry`, and `from_version` (optional) | the value when `from_version` is absent; none when it is present | `version`, `fingerprint` | none |
+  | `list` | nothing more | none | `entries`: each `name`, `kind`, `version`, `versions`, `created` (RFC 3339, UTC), `fingerprint`, `status` | none |
+  | `rm` | `entry` | none | `{}` | none |
+  | `read-for-exec` | `entry` | none | `version` | the entry's current value |
+  | `deliver`, `withdraw`, `deliveries` | (the delivery slice defines them) | | answered `refused` until that slice serves them, never `unknown-op`, with a post-frame `refused` line, `not-served` | |
+
+  - *Names.* `entry` is the API form only, `user/<uid>/<name>` ("Scope strings and names":
+    no bare name, and the short name is CLI input, resolved before it reaches the API). The
+    socket hands it to the store unparsed; the store's entry parser judges it, so a bare name,
+    a short name or any malformed name is `ErrInvalidName`, `refused`, and another uid's or a
+    `system/` name is `not-found` as below. `list` names each entry in the same form, built
+    from the grammar package's own `Entry.String`. A list field that means what a field of
+    `k3sm keys list -o json` means carries that field's name; `status` is `ok`, `corrupt` or
+    `error`, and the error text stays in the server. No reply carries a value's length.
+  - *Fingerprints.* `put` and `rotate` return the fingerprint the store computed as it sealed
+    the value, never by reading it back; it is per scope (U9).
+  - *Strict enough.* Unknown fields are ignored and a field set to `null` is absent. Field
+    names match exactly, never case-folded. A known field of the wrong JSON type (a string
+    where a number is expected, a negative or fractional `from_version`) is `refused`, and so
+    is a header over the 8 KiB cap, judged before it is parsed. A value that is missing or
+    empty where one is required, over the store's 64 KiB value cap, or present on an
+    operation that takes none (`list`, `rm`, `read-for-exec`, and `rotate` with
+    `from_version`), and a `rotate` with both a value or neither, are `refused` before the
+    store is reached, so they write no store line, only the socket's post-frame `refused`
+    line ("The audit log", refused lines); they are never `internal`. A value is
+    zeroed once its reply is written, whatever the outcome.
+  - *A uid with no scope.* `list` for a peer whose scope does not exist yet answers an empty
+    `entries` list, not `not-found` ("A read never mints a scope"). The store has already
+    written its `list` line, with the result `scope-absent`, charged to the peer; nothing was
+    read and nothing is minted.
+  - *Another uid's name, a `system/` name.* `read-for-exec`, `rotate` (either form) and `rm`
+    of such a name answer exactly the bytes an absent entry of the peer's own answers, the
+    error frame `{"code":"not-found"}`; the store refuses it before it opens any scope, and
+    its line is the operation's own, with the result `not-found`, the peer as `caller` and
+    the peer's scope, never the other uid's (U45). `list` names no entry: a name in its header
+    is an unknown field.
 - CLI and server are one binary, so version skew exists only between an upgrade's install
   and the server's restart; the server pin refuses that window first ("The client pins the
   server"), and the CLI prints "the server is not running the installed build; restart it" and
@@ -4245,7 +4441,14 @@ before it; a connection past either connection cap is closed at accept with noth
 no `refused` line);
 5 mutating operations a second per uid; `list` and `deliveries` rate-limited per uid like
 mutations, at 5 a second; `read-for-exec` at most 30 a minute per uid, each audited as
-`exec-read` (U28, U34, U51). Reads are limited too because each one writes an audit line; that
+`exec-read` (U28, U34, U51). As built (`socket.MutationsPerSecond`, `ListsPerSecond`,
+`ExecReadsPerMinute`): each is a sliding window per uid on the server's clock; the 5
+mutations count `put`, `rotate` (either form), `rm`, `deliver` and `withdraw` together; the
+5 a second of `list` and `deliveries` count the two together; the delivery placeholders
+take their operation's limit before they answer `refused`. A request is judged in this
+order: its header and value, then its uid's rate limit, then the fail-closed rule, then the
+store; a request past its limit is `rate-limited` and the store is not called, and one
+refused by the fail-closed rule has used its place in the limit. Reads are limited too because each one writes an audit line; that
 line is charged to the uid's log share like a mutation's, and past the share the read is
 refused ("Per-uid fairness").
 
@@ -5252,7 +5455,7 @@ the uid throughout.
    to, reads included. Past that share its own mutations and reads are refused with
    `ErrLogFull`, except its revocations (`withdraw`, `rm`, `rotate`, and the reconciler's
    deletions and first rotation write per delivery), which draw on its own revocation budgets
-   above the hard cap: a 704 KiB socket margin for its own revocations and a 256 KiB reconciler
+   above the hard cap: a 720 KiB socket margin for its own revocations and a 256 KiB reconciler
    allowance for the reconciler's. It cannot fill a log for other users, and its log lines
    cannot get another uid's mutations, reads or revocations refused, since those draw on that
    uid's own share and budgets. It can delay them through the shared store lock, by at most
@@ -5264,7 +5467,8 @@ the uid throughout.
    socket revocations never draw on the reconciler allowance. What it can exhaust is its own
    socket margin, by rotating past its share; that refuses only its own further socket
    revocations, until root rotates the log. Each scope can push a log past the hard cap by at
-   most 320 KiB, and the reconciler budget by 1 MiB more, so the overshoot is bounded by the
+   most 976 KiB (its 720 KiB socket margin and 256 KiB reconciler allowance), and the
+   reconciler budget by 1 MiB more, so the overshoot is bounded by the
    host's eligible local accounts, and `doctor` warns when it is non-zero. A namespace writer
    who plants forged Secrets spends only the reconciler budget, never a uid's share.
 6. A user account deleted and recreated under the same uid loses its old scope, by design
@@ -6472,15 +6676,15 @@ carried by the unit rows.
 | U24 | the logs' sizes and soft cap are exposed for `doctor` (`LogSizes`); past the hard cap every mutating user op is `ErrLogFull`, except the revocation class, which draws on its uid's revocation budget; a line over 1 KiB is refused, and one found past the hard cap in the audit log is skipped and charged to no uid, while in the floor it is damage; the reader is bounded in size and floor keys, and the writer never appends past either bound: a floor line adding a key past the key bound is ErrLogFull, a grant without room for its keys is refused before its first write naming doctor, and a revocation of a key the floor holds still goes through, so put/rm churn never makes the floor damage; the reader reads through a line straddling the cap, and never blocks on a FIFO; a log or data root carrying a file flag beside `SF_APPEND` or a non-empty extended ACL is refused as untrusted; an append preflights free space and refuses, retryably, below 1 MiB plus the line, except a revocation's line, which keeps only a minimal check of the line plus 9 KiB; a put whose floor line would be refused after its commit (at the key bound, at a cap straddle where a minting put's second line would start past the hard cap, or below the free-space margin) is refused before its first write, and so is a deliver's; a grant line adding a key is refused once its uid has added its lifetime share of keys, buried or live (uidKeyShare, 4,112), while its rm still succeeds and another uid's grant succeeds, and a revocation line adding a key lands in a revocation headroom past the key bound, which the reader's bound includes; a configuration whose bounds sit below what an existing log holds is refused at store open; an append reserves its line's blocks on the log's descriptor before it writes, and a refused reservation is refused for space with the log byte-identical; a configuration under which a uid's lines past the hard cap already exceed its revocation budget is refused at store open naming the remedy, a budget under two lines is refused, and the default budget holds one scope's full revocation | `k3sm/pkg/keystore::TestLogHardCapRefusesMutations`, `TestAuditLineBoundedAtOneKiB`, `TestLogReaderSizeBound`, `TestLogReadBoundAuditCarriesPreFrameBudget`, `TestFloorKeyBound`, `TestFloorKeyBoundChurnRefusesGrants`, `TestFloorWriterRefusesKeyPastBound`, `TestFloorKeyBoundDerivedFromCaps`, `TestAuditStraddlingLineCharged`, `TestLogOpenFIFORefused`, `TestLogAppendPreflightsFreeSpace`, `TestRevocationLinesSkipFreeMargin`, `TestRevocationLineAtKeyBound`, `TestLogRefusesExtraFlags`, `TestLogDataRootRefusesExtraFlags`, `TestLogRefusesExtendedACL`, `TestAuditOverlongLineSkipped`, `TestPutRefusedFirstBelowFloorMargin`, `TestPutRefusedFirstAtKeyBound`, `TestPutRefusedFirstAtCapStraddle`, `TestDeliverRefusedFirstBelowFloorMargin`, `TestPutFloorLineSurvivesVolumeFiller`, `TestPutPreflightReservesValueRoom`, `TestFloorLineBudgetFollowsClass`, `TestLogFullTextNamesNoNumbers`, `TestLogErrorsNameNoFigures`, `TestFloorSeqZeroLineIsPresent`, `TestFloorKeyShareRefusesOneUID`, `TestFloorKeyShareChargesBuriedKeys`, `TestFloorKeyShareLifetimeArithmetic`, `TestFloorDeliverRoomExistingKeyPastBound`, `TestFloorTombstoneLandsInHeadroom`, `TestFloorReaderAcceptsHeadroom`, `TestCheckLogBoundsRefusesShrunkCaps`, `TestCheckLogBoundsRefusesKeysPastBound`, `TestCheckConfigBoundsCapsAbove`, `TestLogMissingWithScopesNamesRestore`, `TestLogAppendReservesBlocks`, `TestReserveLogBlocksRounds`, `TestCheckLogBoundsRefusesSpentRevocationBudget`, `TestCheckLogBoundsRefusesAtSpent`, `TestSpentRevocationBudgetIsPerUID`, `TestCheckConfigRevocationBudgetFloor`, `TestDefaultRevocationBudgetHoldsFullRevocation` | checked: the append-only files (the store side) |
 | U25 | backup and restore round trip: a restored tree with cleared flags is refused until floor --rebuild, which takes the restored root-owned unflagged floor as input, then opens; the rebuild writes a line for every entry directory holding a generation file, an authenticated pointer's sequence or, with none, sequence 0, so a damaged entry stays ErrCorrupt and never becomes ErrNotFound; the maintenance verbs take the locks, keystore-lock then the store lock, before they write the marker, build the replacement directory in a root-only 0700 keystore-staging/, swap it in with RENAME_SWAP, and leave the live set one complete set at every step; they take a log with a second link as input, which the steady-state check refuses naming the verb, leaving a fresh canonical log with one link, and refuse an unflagged old log the service user owns; past the 30 s wait they name the service-user holder and k3sm stop | `TestBackupRestoreRoundTripRebuild`, `TestRebuildKeepsDamagedEntryCorrupt`, `TestSwapCallOrder`, `TestSwapRerunFromEachStep`, `TestMaintenanceRepairsHardLinkedLog`, `TestMaintenanceStagingDirIsRootOnly`, `TestMaintenanceLocksBeforeMarker`, `TestOldLogUnflaggedServiceOwnedRefused`; rig leg E17 | done: the append-only files (floor --rebuild) |
 | U26 | peers uid 0, the service uid and uid < 501 are refused before any frame is read (seam: peer-credential source) | `k3sm/pkg/keystore/socket::TestPeerEligibility` | checked: the socket listener (peer admission) |
-| U27 | framing: an oversize frame, unknown type, a sub-length past the frame length or missing `HELLO` closes; `HELLO` past the 10-second bound closes; an unknown header field is ignored; `HELLO` picks the highest common version and the reply carries it and the server's frame cap; no common version sends `unsupported-version` then closes; an unknown `op` answers `unknown-op` and keeps the connection; the frame cap covers the largest value, header and framing | `k3sm/pkg/keystore/socket::FuzzFrameReader` (committed seeds), `TestFramingBounds`, `TestSubLengthsWithinFrame`, `TestHelloReadDeadline`, `TestUnknownHeaderFieldsIgnored`, `TestHelloVersionRange`, `TestHelloReplyCarriesVersionAndMaxFrame`, `TestHelloNoOverlapSendsUnsupportedVersion`, `TestUnknownOpKeepsConnection`, `TestFrameCapCoversMaxValue` | checked: the socket listener (framing and HELLO) |
+| U27 | framing: an oversize frame, unknown type, a sub-length past the frame length or missing `HELLO` closes; `HELLO` past the 10-second bound closes; an unknown header field is ignored; `HELLO` picks the highest common version and the reply carries it and the server's frame cap; no common version sends `unsupported-version` then closes; an unknown `op` answers `unknown-op` and keeps the connection; a known request header field of the wrong type is `refused`; the frame cap covers the largest value, header and framing | `k3sm/pkg/keystore/socket::FuzzFrameReader` (committed seeds), `FuzzRequestHeader` (committed seeds), `TestFramingBounds`, `TestSubLengthsWithinFrame`, `TestHelloReadDeadline`, `TestUnknownHeaderFieldsIgnored`, `TestHelloVersionRange`, `TestHelloReplyCarriesVersionAndMaxFrame`, `TestHelloNoOverlapSendsUnsupportedVersion`, `TestUnknownOpKeepsConnection`, `TestFrameCapCoversMaxValue` | checked: the socket listener (framing and HELLO) |
 | U28 | 64 connections in all, 2 per uid; a request past 10 s is cut; a connection idle 30 s after `HELLO` or between requests is closed | `k3sm/pkg/keystore/socket::TestConnectionCapsPerUID`, `TestRequestTimeout`, `TestIdleTimeoutAfterHelloAndBetweenRequests` (`testing/synctest`) | checked: the socket listener (caps and timeouts) |
 | U29 | a listener panic is recovered and restarted; the apiserver is untouched; a stale socket is unlinked only if a service-user socket; a lock wait past 2 s fails the request (seam: clock) | `k3sm/pkg/keystore/socket::TestListenerRecoversPanic`, `TestStaleSocketUnlinkChecksOwner`, `TestBoundedLockWait`, `TestAbandonedLockWaitsBounded`, `TestLockWaitSlotsReservedUpFront`, `TestCheckBackoffResetsOnPassingChecks`, `k3sm/cmd/k3sm::TestKeystoreSocketWiring`, `TestKeystoreSocketRecoversSupervisorPanic` | checked: the socket listener (lifecycle) |
 | U30 | with two servers registered, the listener does not start and `doctor` says why | `k3sm/pkg/keystore/socket::TestUserScopeRefusedWithTwoServers`, `TestSecondServerStopsServingListener`, `k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow`, `TestKeystoreServerCountNames` | checked: the socket listener (lifecycle) |
 | U31 | a missing or unflagged file logs the install Warn at start and on each retry; `doctor` reports user scope off (seams: chflags flag source, clock) | `k3sm/pkg/keystore/socket::TestListenerWarnsOnEveryRetry`, `TestInstallMissingLogNamesInstall`, `TestPreconditionsCheck`, `k3sm/cmd/k3sm::TestDoctorKeystoreUserScopeRow`, `TestDoctorKeystoreSocketLstat`, `TestDoctorKeystoreKubeconfigPermission`, `TestDoctorKeystoreReopenJudgement` | checked: the socket listener (server wiring and doctor) |
-| U32 | the order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (U109, U112) | `k3sm/pkg/keystore/socket::TestAuditBeforeReply`, `TestAuditFailureRefusesOps` | pending: the socket operations |
-| U33 | `refused` lines are rate-limited per uid with a summary of the dropped count | `k3sm/pkg/keystore/socket::TestRefusedLinesRateLimited` | pending: the socket operations |
-| U34 | 5 mutating ops a second per uid; 30 `read-for-exec` a minute per uid, each audited `exec-read` | `k3sm/pkg/keystore/socket::TestMutationRateLimit`, `TestExecReadCapPerUID` | pending: the socket operations |
-| U35 | the socket server's store interface has no reveal, show or rewrap method | `k3sm/pkg/keystore/socket::TestStoreInterfaceHasNoRevealMethod` | pending: the socket operations |
+| U32 | a grant (put, deliver) appends its audit line before its first write, and every other operation's order is commit, append, reply, so the audit line is written before the reply; a failed append refuses user mutations and reads, except the revocation class (U109, U112) | `k3sm/pkg/keystore/socket::TestAuditBeforeReply`, `TestAuditFailureRefusesOps`, `k3sm/pkg/keystore::TestExecReadRefusedWhenAuditFails`, `TestUserRotateCrashOrder` | checked: the socket operations (the bridge's fail-closed rule) |
+| U33 | `refused` lines are rate-limited per uid with a summary of the dropped count | `k3sm/pkg/keystore/socket::TestRefusedLinesRateLimited` | checked: the socket operations (the post-frame refused line) |
+| U34 | 5 mutating ops a second per uid; 30 `read-for-exec` a minute per uid, each audited `exec-read` | `k3sm/pkg/keystore/socket::TestMutationRateLimit`, `TestExecReadCapPerUID`, `k3sm/pkg/keystore::TestExecReadAudited` | checked: the socket operations (the bridge's rate limits) |
+| U35 | the socket server's store interface has no reveal, show or rewrap method | `k3sm/pkg/keystore/socket::TestStoreInterfaceHasNoRevealMethod` | checked: the socket operations (the store bridge) |
 | U36 | the client refuses a socket whose connected peer uid is not the service uid, whatever the path checks said (seam: peer-credential source, client side) | `k3sm/cmd/k3sm::TestClientRefusesForeignServerUID` | pending: the non-root CLI and `exec` |
 | U37 | `exec` sets the variable only in the child; nothing on stdout, nothing on disk; the value never enters argv; no non-root verb writes a value to stdout | `k3sm/cmd/k3sm::TestKeysExecEnvOnlyInChild`, `TestNoNonRootVerbWritesValue` | pending: the non-root CLI and `exec` |
 | U38 | an unknown error code prints the code; a connect failure names `sudo k3sm install` | `k3sm/cmd/k3sm::TestUnknownErrorCodeFallback`, `TestConnectErrorNamesInstall` | pending: the non-root CLI and `exec` |
@@ -6490,13 +6694,13 @@ carried by the unit rows.
 | U42 | an unrecorded UID, a digest mismatch, or a denied SAR gets no Secret; the SARs ask `create keydeliveries` and `create secrets` with no name, and `update` and `delete` secrets with `resourceNames` `spec.secretName`; encryption off refuses (G18 for KeyDelivery); each SAR carries the user `k3sm:local:<uid>` and the groups the impersonated create carried, so a grant bound to `k3sm:local-users` passes the create and every sweep alike | `k3sm/pkg/keystore/reconcile::TestUnrecordedOrRetargetedDeliveryGetsNoSecret`, `TestSARCreateUnnamedUpdateDeleteNamed`, `TestSARCarriesImpersonatedUserAndGroups`, `TestGroupBoundGrantHonouredConsistently`, `TestEncryptionOffRefusesKeyDelivery`; rig leg E23 | pending: the KeyDelivery reconciler (authority) |
 | U43 | reasons are the closed set, each on the condition type and status the reason table gives; "absent" and "not yours" both read `EntryUnavailable`; a pre-existing Secret not claimed by a KeyDelivery (unlabelled, or Phase A's) is `SecretExists`; a second declaration is `SecretClaimed`, the oldest honoured record by `creationTimestamp`, then name, winning; `observedGeneration` tracks; `Ready=False` for any authority failure carries the one reason `NotAuthorized` with the `Authorized` reason in its message; `Ready` is `Unknown`, `Pending` before the first sweep and while `Authorized` is `Unknown`; each `Authorized=False` reason is tied to its action (`EntryUnavailable`, `NotRecorded` for a withdrawn UID or a digest mismatch, and `NotAuthorized` delete; `NotRecorded` for a UID never recorded retains), and a Secret kept under `Authorized=False` sets `SecretRetained=True` (`DeletePending` or `Unowned`) | `k3sm/pkg/keystore/reconcile::TestConditionReasonsClosedSet`, `TestReasonConditionTable`, `TestOneDeclarationPerSecret`, `TestReadyFalseCarriesNotAuthorized`, `TestReadyUnknownPending`, `TestAuthorizedFalseReasonActionMap`, `TestSecretRetainedWhenKept` | pending: the KeyDelivery reconciler (authority) |
 | U44 | losing authority (a definitive denial) deletes exactly the owned Secret; the crash order is Secret, record, finalizer at every interruption point; ownership is the label, the owner annotation and that UID in the sealed record, not the ownerReference; the Secret's namespace and name must equal the record's target for that UID, and the record's entry must match the owner annotation; the orphan sweep removes a labelled Secret only when its owner annotation names a KeyDelivery UID the sealed record holds, it is that UID's recorded target, and that object no longer exists or is withdrawn, and never one with the label and owner annotation alone, an unlabelled or a foreign one; a forged label and a real UID on another Secret are left alone, charged to no share and logged as one `refused` line under the reconciler, against the reconciler budget, never as the owner's `deliver-delete` | `k3sm/pkg/keystore/reconcile::TestLostAuthorityDeletesOnlyOwnedSecret`, `TestFinalizerCrashOrder`, `TestOrphanSweep`, `TestForgedOwnerAnnotationOnOtherSecretIsLeftAlone` | pending: the KeyDelivery reconciler (lifecycle) |
-| U45 | cross-user refusal with a fake peer-credential source: a peer with uid B asks for `list`, `read-for-exec`, `rotate`, `rm`, `deliver`, `withdraw` and `deliveries` of uid A's entries and objects, and for any `system/…` name; every call is `ErrNotFound` with text identical to an absent entry of B's own, and the `refused` audit lines carry uid B | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestNonRootCannotNameSystemEntries` | pending: the socket operations |
+| U45 | cross-user refusal with a fake peer-credential source: a peer with uid B, in its normal state (a started scope, under its rate limit and share), asks for `read-for-exec`, `rotate` and `rm` of uid A's entries, for `list`, and for any `system/…` name; every call answers byte for byte as for an absent entry of B's own (`list` shows B's own scope only), and the audit lines carry uid B. The delivery operations (`deliver`, `withdraw` and `deliveries`) answer `refused` to every caller until they are served, so they are not part of this claim yet | `k3sm/pkg/keystore/socket::TestCrossUserRefusedFakePeerCred`, `TestNonRootCannotNameSystemEntries`, `k3sm/pkg/keystore::TestUserRotateNotFoundIsNoOp`, `TestExecReadAudited` | pending: the socket operations |
 | U46 | `baseSocketDenies` derives the `keys.sock` path from `runtimed/pkg/keystorepaths` (`SocketPath(dataRoot)`, `<dataRoot>/keystore-sock/keys.sock`) and denies `connect(2)` to it | `k3sm/pkg/provider::TestBaseSocketDeniesKeystoreSocket`, `TestBaseSocketDeniesResolvesDataRoot`; `runtimed/pkg/keystorepaths::TestNames` | checked: the socket listener (pod denies) |
 | U47 | seam guard: `pkg/keystore`'s `TestMain` installs a panicking stub on each of its seams, so no unit test reaches a real primitive | `k3sm/pkg/keystore::TestRealPrimitivesUnreachable` | pending: the user-scope store |
 | U48 | seam guard: `pkg/keystore/socket`'s `TestMain` installs a panicking stub on each of its seams, so no unit test reaches a real primitive; the server-side peer-credential source is a constructor parameter of the listener, not a package variable, and the constructor refuses nil | `k3sm/pkg/keystore/socket::TestRealPrimitivesUnreachable`, `TestListenerRequiresPeerCredSource` | checked: the socket listener (seam guard) |
 | U49 | `runtimed/pkg/keystorepaths` builds with `CGO_ENABLED=0` and imports only the standard library; `k3sm/pkg/keystore` imports that leaf and never `runtimed/pkg/sandbox` | `runtimed/pkg/keystorepaths::TestLeafImportsOnlyTheStandardLibrary`; `k3sm/pkg/keystore::TestKeystoreImportsNoSandbox` | pending: runtimed's sandbox change, the append-only files |
 | U50 | the defeat list, run as the service user against both flagged logs (integration, a root-run row: `--root` runs it by name and fails it on SKIP, and `--check` prints it uncounted; flag variant): `chflags nosappnd`, `O_TRUNC`, `ftruncate`, `pwrite` at an offset, a shared writable `mmap` write, `F_PUNCHHOLE`, `link()`, `fclonefileat` then a swap, a `renamex_np` swap through the parent, `exchangedata`, `unlink` and `rename` through the parent, a second open with `O_TRUNC`, owner `chmod` and `fchmod`, and `F_SETFL` clearing `O_APPEND` then a `pwrite` at 0, in a root-owned 0755 directory (a name operation is refused by the flag or by the directory, `EPERM` or `EACCES`) and in a service-owned 0700 one (refused by the flag, `EPERM`), then an owner `chflags uchg` beside `sappnd` (`EPERM`, or if it lands `judgeLog` refuses the log) and an owner `chmod +a` ACL write (refused, or if it lands `judgeLog` refuses the log); each fails, the bytes and the flag are unchanged, and an `O_APPEND` write, and a seek-then-write that lands at the end, still succeeds | `k3sm/pkg/keystore::TestAppendOnlyDefeatListAsServiceUser` | checked as a root-run row (`--root`): the append-only files |
-| U51 | per-uid log fairness: the share is a fixed byte count, 16 MiB by default, and a share above 1/16 of the hard cap is refused at start; every line is charged to the uid it acts for, reads (`list`, `read-for-exec`, `deliveries`) included; a uid past its share has its own mutations and reads refused with `ErrLogFull` (`log-full`) while another uid's succeed, and that refusal is never the global append failure that refuses every uid's reads; a uid past its share cannot get another uid's mutations, reads or revocations refused, though it can delay them through the store lock (U89); `list` and `deliveries` are rate-limited per uid | `k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID`, `TestLogShareAtMostOneSixteenthOfHardCap`, `TestShareRefusalIsNotGlobalAppendFailure`, `TestReadRateLimitPerUID`, `TestReadsChargedToShare`, `TestShareExhaustionIsolatedPerUID` | pending: the socket operations |
+| U51 | per-uid log fairness: the share is a fixed byte count, 16 MiB by default, and a share above 1/16 of the hard cap is refused at start; every line is charged to the uid it acts for, reads (`list`, `read-for-exec`, `deliveries`) included; a uid past its share has its own mutations and reads refused with `ErrLogFull` (`log-full`) while another uid's succeed, and that refusal is never the global append failure that refuses every uid's reads; a uid past its share cannot get another uid's mutations, reads or revocations refused, though it can delay them through the store lock (U89); `list` and `deliveries` are rate-limited per uid | `k3sm/pkg/keystore/socket::TestLogSharePerUIDRefusesOnlyThatUID`, `TestLogShareAtMostOneSixteenthOfHardCap`, `TestShareRefusalIsNotGlobalAppendFailure`, `TestReadRateLimitPerUID`, `TestReadsChargedToShare`, `TestShareExhaustionIsolatedPerUID`, `k3sm/pkg/keystore::TestShareRefusalNotGlobalAppendFailureInStore`, `TestExecReadPastShareRefused` | partial: all but the `deliveries` rate limit checked, through the socket's store bridge (the socket operations); pending: `deliveries` rate-limited per uid (the deliveries operation) |
 | U52 | every root verb writes one audit line with `via` `root` once the log exists, and none before it; `adopt`, `floor merge` and its dry run included, a change made with exit 4 or 5 audited `committed`, a put, rotate or adopt whose later step failed (`ErrCommitted`) included, and an rm-scope whose removed-scopes record was renamed into place but whose data-root fsync failed (rm-scope's exit 4: this run changed something, or the record's durability is uncertain) | `k3sm/cmd/k3sm::TestEveryRootVerbWritesAuditLine`, `TestAdoptWritesAuditLine`, `TestFloorMergeWritesAuditLine`, `TestKeysAuditResult`, `TestKeysRmScopePartialExitsFour`, `k3sm/pkg/keystore::TestRmScopeRecordFsyncFailureIsCommitted` | pending: the append-only files |
 | U53 | every reconciler Secret write and delete, and every record withdrawal, writes one audit line with `via` `reconciler`, except drift repairs, coalesced to one line per delivery per 10 minutes (U86) | `k3sm/pkg/keystore/reconcile::TestEveryReconcilerWriteAndDeleteAudited` | pending: the KeyDelivery reconciler (lifecycle) |
 | U54 | a pre-frame refusal (uid 0, the service uid, a uid below 501) writes a `refused` line with the peer uid, rate-limited per uid, drawing on the reconciler budget with its once-a-minute dropped-count summary; a dropped count is persisted in `.preframe-dropped` in the store directory, not kept only in memory, survives a reopen, is emptied once in the audit log, folds uids past 256 into `others`, is reported unreadable rather than reset, is shown by `doctor`, and is written by the next `audit --rotate` | `k3sm/pkg/keystore/socket::TestPreFrameRefusalsAudited`, `TestPreFrameRefusalLinesRateLimited`, `TestPreFrameReservedClassLimits`, `k3sm/pkg/keystore::TestPreFrameFsyncFailureIsWrittenNotDropped`, `TestPreFrameDroppedSurvivesReopen`, `TestPreFrameDroppedClearedOnceWritten`, `TestPreFrameDroppedCoalesced`, `TestPreFrameDroppedFoldsOthers`, `TestPreFrameDroppedCorruptFile`, `TestPreFrameDroppedParseStrict`, `TestPreFrameDroppedEncodeFits`, `TestPreFrameDroppedRoundTrip`, `TestRotateAuditWritesDroppedCounts`, `TestRotateAuditKeepsDroppedOnRefusal`, `TestRotateAuditIgnoresHostileDropped`, `k3sm/cmd/k3sm::TestDoctorKeystorePreFrameDropped` | checked: the socket listener (the server append path) |
@@ -6512,7 +6716,7 @@ carried by the unit rows.
 | U64 | a missing `.user/<uid>/` or `scope.key` answers `ErrScopeAbsent`, never `ErrNotFound`; inside a scope whose `scope.key` opens, a missing `entries/` directory or a missing `deliveries` record is `ErrScopeAbsent` too; `ErrNotFound` only for an entry missing from an `entries/` that exists and opened; a read (`list`, `read-for-exec`, `deliveries`, a reconciler read) on a uid with no scope creates no directory and mints no `K_u`; the first mutating operation does, writing `entries/` and an empty `deliveries` record before `scope.key` | `k3sm/pkg/keystore::TestReadDoesNotMintScope`, `TestMissingScopeIsScopeAbsent`, `TestMissingEntriesDirIsScopeAbsent`, `TestMissingDeliveriesRecordIsScopeAbsent` | pending: the user-scope store |
 | U65 | the reconciler reads `ErrScopeAbsent` as `Indeterminate` and deletes nothing; every outcome on the allow-list, not only a SAR denial, deletes only on two consecutive sweeps for the same generation; the single-server check is re-run from a fresh List before every sweep, and a second server or a failed List runs no sweep | `k3sm/pkg/keystore/reconcile::TestAbsentScopeIsIndeterminate`, `TestEveryDeletingOutcomeNeedsTwoSweeps`, `TestSingleServerRecheckedBeforeEverySweep` | pending: the KeyDelivery reconciler (lifecycle) |
 | U66 | the GeneratedUID lookup recognises the synthesized compatibility form (prefix `FFFFEEEE-DDDD-CCCC-BBBB-AAAA`) and answers `ErrScopeOwnerUnknown`, never a changed owner, and no mint binds it; `ErrScopeOwnerChanged` only when a real, non-synthesized GeneratedUID differs from the bound one (seam: GeneratedUID lookup) | `k3sm/pkg/keystore::TestSynthesizedGeneratedUIDIsUnknown` | pending: the user-scope store |
-| U67 | the revocation class (`withdraw`, `rm`, `rotate`, the withdrawal's floor line, the reconciler's `deliver-delete`, its `deliver-write` of a withdrawal and its rotation write) is charged to the share while it has room and past it bypasses the share and the hard cap, drawing on its uid's own budgets per log, counted per uid from the log: a 256 KiB reconciler allowance for the reconciler's lines and a separate 704 KiB socket margin for the uid's own `withdraw`, `rm` and `rotate` and their floor lines; neither budget can draw on the other; only the budget a line draws on running out refuses it, so one uid's revocations are never refused because of another uid: uid A uses up its budgets and uid B's revocation still succeeds; a uid with 64 live deliveries past its share still revokes from its socket margin, and spending that margin leaves the reconciler allowance whole; a no-op `rm`, `withdraw` or `rotate` is charged like any line and refused past the share; a uid whose budget is spent to under one line is counted and logged per uid and never refuses the store start, so after a restart uid B's `rm` and `withdraw` succeed while uid A's next revocation is refused, and only a log over a uid's budget (lowered caps) is refused at store open; a log passes the hard cap by at most 320 KiB per user scope, plus the 1 MiB reconciler budget | `k3sm/pkg/keystore/socket::TestRevocationBypassesShareUsesReserve`, `TestNoOpRevocationChargedToShare`, `TestReserveKeepsReconcilerPart`, `TestRevocationAllowanceIsPerUID`, `TestSocketMarginSeparateFromReconcilerAllowance` | pending: the socket operations |
+| U67 | the revocation class (`withdraw`, `rm`, `rotate`, the withdrawal's floor line, the reconciler's `deliver-delete`, its `deliver-write` of a withdrawal and its rotation write) is charged to the share while it has room and past it bypasses the share and the hard cap, drawing on its uid's own budgets per log, counted per uid from the log: a 256 KiB reconciler allowance for the reconciler's lines and a separate 720 KiB socket margin for the uid's own `withdraw`, `rm` and `rotate` and their floor lines; neither budget can draw on the other; only the budget a line draws on running out refuses it, so one uid's revocations are never refused because of another uid: uid A uses up its budgets and uid B's revocation still succeeds; a uid with 64 live deliveries past its share still revokes from its socket margin, and spending that margin leaves the reconciler allowance whole; a no-op `rm`, `withdraw` or `rotate` is charged like any line and refused past the share; a uid whose budget is spent to under one line is counted and logged per uid and never refuses the store start, so after a restart uid B's `rm` and `withdraw` succeed while uid A's next revocation is refused, and only a log over a uid's budget (lowered caps) is refused at store open; a log passes the hard cap by at most 976 KiB per user scope (its 720 KiB socket margin and 256 KiB reconciler allowance), plus the 1 MiB reconciler budget | `k3sm/pkg/keystore::TestRevocationBypassesShareUsesReserve`, `TestNoOpRevocationChargedToShare`, `TestReserveKeepsReconcilerPart`, `TestRevocationAllowanceIsPerUID`, `TestSocketMarginSeparateFromReconcilerAllowance`, `TestShareLimitRefusesOnlyThatUID`, `TestShareLimitInTheFloor`, `TestShareRunningCountIsTheRecount`, `TestShareResetAfterAuditRotate`, `TestShareConfigAtMostOneSixteenthOfHardCap`, `TestLogReadBoundHoldsBothBudgets`, `TestSpentRevocationBudgetIsPerUID`, `TestUserRotateNoOpChargedToShare` | checked: the socket operations |
 | U68 | root-run: floor --rebuild and audit --rotate meet a symlink, a FIFO and a swapped directory at the marker, at keystore-staging/ and at their log's directory in keystore-logs/, and refuse before anything changes; a symlink, FIFO or directory inside keystore-staging/ is removed unread and the verb finishes; the verb never follows a planted name, the decoy it points at does not change, and no log byte changes on a refusal (integration, a root-run row: `--root`) | `k3sm/cmd/k3sm::TestMaintenanceRefusesPlantedNames` (integration, root-run) | checked as a root-run row (`--root`): the append-only files |
 | U69 | the client pins the server: it reads the peer's audit token (`LOCAL_PEERTOKEN`) and refuses, writing nothing, unless the peer's cdhash equals the cdhash of the installed `/Library/k3sm/k3sm`; a service-user peer that is another binary, a reused pid, a code lookup error, an old server after an upgrade (which prints the restart message) and a listener inherited or passed to another process are each refused (seams: peer-credential source, client side; server code identity) | `k3sm/cmd/k3sm::TestClientPinsServerByInstalledCDHash`, `TestClientRefusesServiceUIDPeerOfOtherCode`, `TestClientRefusesReusedPeerPID`, `TestClientCDHashMismatchNamesRestart`, `TestClientPinWithInheritedOrPassedListener` | pending: the non-root CLI and `exec` |
 | U70 | (helper variant only) the floor helper admits only a peer that runs as the service uid and whose audit token resolves to the installed binary's cdhash, and the server admits only a helper that runs as root and is that binary; it refuses every request but `append` and `read` | `k3sm/pkg/keystore/floorhelper::TestFloorHelperPeerPinned`, `TestFloorHelperRefusesOtherRequests` | pending: the K0 amendment (helper variant only) |
@@ -6529,7 +6733,7 @@ carried by the unit rows.
 | U81 | a KeyDelivery never touches a Phase A Secret: the user-scope label value is the constant `keydelivery` and the entry is in the annotation `k3sm.io/keystore-entry`; a target that is present and not claimed by a KeyDelivery, unlabelled or delivered by Phase A, is `SecretExists` and is never overwritten or deleted; the Phase A reconciler leaves alone a Secret carrying `k3sm.io/keystore-entry` | `k3sm/pkg/keystore/reconcile::TestKeyDeliveryNeverTouchesPhaseASecret` | pending: the KeyDelivery reconciler (authority) |
 | U82 | eligible peer uids are 501 to 2147483647: `nobody` (4294967294), 2147483648 and every uid at 2^31 or above are refused before any frame, with a `refused` line, as uid 500 is; 501 and 2147483647 are admitted; no scope is minted outside the range (seam: peer-credential source) | `k3sm/pkg/keystore/socket::TestPeerUIDRangeRefusesNobodyAndHighUIDs` | checked: the socket listener (peer admission) |
 | U83 | the reconciler checks the user-scope floor log: a missing or unflagged floor log is `Indeterminate` for writes, so no `deliver-write` runs until `floor --rebuild`; the floor holds writes and absence-driven deletes: an `ErrNotFound` delete is `Indeterminate` while the floor is missing or unflagged, a revocation-driven delete (a withdrawn record, a digest mismatch, a SAR denial) still deletes the Secret without the floor, and only the record withdrawal waits for it (U107; the store's flag check, faked at the reconciler's store interface) | `k3sm/pkg/keystore/reconcile::TestReconcilerHoldsWritesWithoutFloor` | pending: the KeyDelivery reconciler (lifecycle) |
-| U84 | when a log's size is past the hard cap, `doctor` shows a Warn with the overshoot in bytes and the `audit --rotate` or `floor --rebuild` hint, and none at or below it; the overshoot is at most 320 KiB per user scope, plus the 1 MiB reconciler budget | `k3sm/cmd/k3sm::TestDoctorWarnsOnLogOvershoot` | pending: the socket operations |
+| U84 | when a log's size is past the hard cap, `doctor` shows a Warn with the overshoot in bytes and the `audit --rotate` or `floor --rebuild` hint, and none at or below it; the overshoot is at most 976 KiB per user scope (its 720 KiB socket margin and 256 KiB reconciler allowance), plus the 1 MiB reconciler budget | `k3sm/cmd/k3sm::TestDoctorWarnsOnLogOvershoot` | checked: the socket operations (doctor's overshoot Warn) |
 | U85 | a reconciler line charged to no uid (a forged-Secret `refused` line, a drift repair, their summaries) draws on the reconciler budget, 1 MiB per log, separate from every uid and excluded from the hard-cap test; forged Secrets are counted in a bounded LRU of 1024 (namespace, name) pairs with no per-`resourceVersion` set, new pairs' lines at most 10 a minute and at most one summary `refused` line a minute carrying the dropped count; past the budget the lines are dropped and counted and `doctor` warns; N forged updates leave every uid able to read and mutate | `k3sm/pkg/keystore/reconcile::TestForgedSecretFloodLeavesEveryUIDServed`, `TestUnchargedLinesHaveOwnBudget` | pending: the KeyDelivery reconciler (lifecycle) |
 | U86 | a drift repair (the reconciler re-creating or repairing a delivered Secret that someone other than the reconciler edited or deleted, at the version already delivered) is reconciler-class: it draws on the reconciler budget and is never charged to the owner's share or budgets; repairs are coalesced to one audit line per delivery per 10 minutes with a count, and rate-limited per delivery with exponential backoff capped at 10 minutes; a write of a new version after the owner's own `rotate` or `put` stays charged to the owner; `Ready=Delivered` compares `k3sm.io/keystore-digest`, the sha256 of the Secret's `data`, each sweep, so a substituted `data` under an intact version annotation is drift | `k3sm/pkg/keystore/reconcile::TestDriftRepairNotChargedToOwner`, `TestSubstitutedDataIsDrift` | pending: the KeyDelivery reconciler (lifecycle) |
 | U87 | the admission policy also matches UPDATE and DELETE of `keydeliveries` and admits one only when the requester equals `oldObject.spec.requestedBy`, is the k3sm server's identity, or is in `system:masters` (and, for DELETE only, the namespace controller's ServiceAccount); a finalizer edit is an UPDATE, so another author can neither delete the object nor strip its finalizer; the reconciler's and `withdraw`'s own writes pass; on a DELETE `object` is null and only `oldObject` is read; `failurePolicy` is `Fail` | `k3sm/pkg/policy::TestVAPRefusesDeleteByOtherAuthor`, `TestVAPRefusesFinalizerStripByOtherAuthor`; rig leg E23 | pending: KeyDelivery authoring |
@@ -6557,7 +6761,7 @@ carried by the unit rows.
 | U109 | with every audit append failing (a full disk), revocation deletes go ahead: the reconciler's `deliver-delete` and a socket `withdraw`, `rm` or `rotate` still act, their lines dropped and counted in memory and shown by `doctor`, while user mutations and reads stay refused | `k3sm/pkg/keystore/reconcile::TestRevocationDeleteProceedsOnAppendFailure` | pending: the KeyDelivery reconciler (lifecycle) |
 | U110 | when a second server registers at runtime, the next single-server check stops the listener, closing its connections, and each KeyDelivery gets `Ready=False` and `SecretRetained=True` with reason `UserScopeOff`; the delivered Secrets stay, nothing rotates or deletes them, and `doctor` says they must be deleted by hand | `k3sm/pkg/keystore/reconcile::TestSecondServerAtRuntimeStopsListenerAndReports` | pending: the KeyDelivery reconciler (lifecycle) |
 | U111 | the owner annotation never decides precedence: a Secret whose owner annotation is rewritten to name another recorded UID of the same target stays with the object that holds the claim by honoured record, `creationTimestamp` and name; an `Indeterminate` object counts as honoured | `k3sm/pkg/keystore/reconcile::TestAnnotationRewriteCannotTakeOverTarget` | pending: the KeyDelivery reconciler (authority) |
-| U112 | the order is commit, then append, then reply: an append that fails after the commit answers `ok` with the warning `committed; audit failed`, the server then refuses user mutations except the revocation class, and `doctor` counts the unaudited operations | `k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed`, `k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps` | pending: the socket operations |
+| U112 | outside a grant (put, deliver), which appends before its first write, the order is commit, then append, then reply: an append that fails after the commit answers `ok` with the warning `committed; audit failed`, the server then refuses user mutations except the revocation class, and `doctor` counts the unaudited operations | `k3sm/pkg/keystore/socket::TestAuditFailureAfterCommitRepliesCommittedAuditFailed`, `k3sm/cmd/k3sm::TestDoctorCountsUnauditedOps`, `k3sm/pkg/keystore::TestUnauditedOpsCountsCommittedRevocations`, `TestUserRotateCrashOrder` | checked: the socket operations (the persisted unaudited count) |
 | U113 | the listener refuses to start unless the server's effective uid is the service uid (the `_k3sm` uid install creates): a rootless `k3sm server`, whose Pods inherit the daemon's login uid, runs no listener, and the server log and `doctor` say "user scope needs the installed server" (seam: euid source) | `k3sm/pkg/keystore/socket::TestListenerRefusesUnlessServiceUID` | checked: the socket listener (lifecycle) |
 | U114 | `rm-scope` writes `keystore-removed-scopes.json` in the data root, root-owned, through the data-root descriptor rules, listing the removed scope's uid and bound GeneratedUID before it removes the scope; only a scope listed there counts as removed for the finalizer, and a plain `ErrScopeAbsent` stays non-definitive and keeps the finalizer (seam: euid source) | `k3sm/cmd/k3sm::TestRmScopeRecordsRemovedScope`, `k3sm/pkg/keystore/reconcile::TestOnlyRecordedRemovalCountsAsWithdrawn` | pending: the KeyDelivery reconciler (lifecycle) |
 | U115 | `rm-scope` names each blocking binding, a RoleBinding with its namespace; `--remove-bindings` deletes each listed binding through the admin client before anything else changes, and a failed delete stops the verb, changing nothing further | `k3sm/cmd/k3sm::TestRmScopeNamesBindingsAndRemovesThem` | pending: the KeyDelivery reconciler (lifecycle) |

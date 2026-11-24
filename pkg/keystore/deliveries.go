@@ -1051,8 +1051,6 @@ func (u *UserScope) catchUpDeliveryLine(gen [generationSize]byte, rd deliveriesR
 // damage so quarantines only the scopes that have something to catch up. A
 // scope the catch-up could not open at all has no line to write: it is
 // logged and named in the returned error, and it still starts.
-//
-//lint:ignore U1000 the server start calls it once the socket lands; until then TestUserScopeIsUnexported holds the user scope in this package.
 func (s *FileStore) startUserScopes(ctx context.Context) error {
 	if s.userScopesStarted == nil {
 		return fmt.Errorf("%w: the store was not made by New", errInvalidConfig)
@@ -1076,8 +1074,16 @@ func (s *FileStore) startUserScopes(ctx context.Context) error {
 	}
 	s.quarantined.Store(&quarantined)
 	s.userScopesStarted.Store(true)
-	return scopeErrs
+	if scopeErrs != nil {
+		return fmt.Errorf("%w: %w", errScopesNotCaughtUp, scopeErrs)
+	}
+	return nil
 }
+
+// errScopesNotCaughtUp marks the one error of the start step that leaves
+// the user scope started: named scopes it could not catch up, while the
+// log bounds check passed and every other scope started (ScopesNotCaughtUp).
+var errScopesNotCaughtUp = errors.New("the user scope started, but the start step could not catch up these scopes")
 
 // errScopeQuarantined marks a uid whose scope the start step quarantined
 // (startUserScopes); it wraps errFloorDegraded.
@@ -1411,6 +1417,11 @@ type grantAudit struct {
 	u               *UserScope
 	op, name, ns    string
 	appended, tried bool
+	// version and fingerprint are what a put's ok line names: version 1
+	// and its per-scope fingerprint, set once the scope's keys are open
+	// (a put that mints its scope has no key yet, and names neither).
+	version     uint64
+	fingerprint string
 }
 
 // grant returns op's grant audit line over the validated name and
@@ -1434,7 +1445,7 @@ func (g *grantAudit) take() error {
 		return fmt.Errorf("the user-scope floor: %w", err)
 	}
 	g.tried = true
-	if err := g.u.s.auditSink.append(auditLine{op: g.op, scope: g.u.scope, name: g.name, namespace: g.ns, result: "ok"}); err != nil {
+	if err := g.u.audit(auditLine{op: g.op, name: g.name, namespace: g.ns, version: g.version, fingerprint: g.fingerprint, result: "ok"}); err != nil {
 		return fmt.Errorf("%w: %w", errAuditRefused, err)
 	}
 	g.appended = true
@@ -1448,7 +1459,7 @@ func (g *grantAudit) refused(err error) {
 	if g.tried && !g.appended {
 		return
 	}
-	_ = g.u.s.auditSink.append(auditLine{op: g.op, scope: g.u.scope, name: g.name, namespace: g.ns, result: auditResult(err)}) // already refused
+	_ = g.u.audit(auditLine{op: g.op, name: g.name, namespace: g.ns, result: auditResult(err)}) // already refused
 }
 
 // refusedBriefly audits err, a refusal before the grant took the store
@@ -1485,10 +1496,18 @@ var errAuditRefused = errors.New("the audit line could not be written, so nothin
 // must already be validated (or auditPlaceholder), and never a value. It is
 // the revocations' order: commit, then audit. Its error, after a change was
 // made, matches ErrCommitted.
+//
+// A committed change whose line fails is counted as an unaudited operation
+// (FileStore.UnauditedOps); a refusal's line that fails changed nothing and
+// is not.
 func (u *UserScope) appendAudit(l auditLine, err error) error {
-	l.scope, l.result = u.scope, auditResult(err)
-	if aerr := u.s.auditSink.append(l); aerr != nil {
-		return committedf(aerr, "the change stands, but its audit line was not written")
+	l.result = auditResult(err)
+	if aerr := u.audit(l); aerr != nil {
+		if err == nil || Committed(err) {
+			u.s.countUnaudited()
+		}
+		// committedf's text, with errAuditLost matchable for AuditLost.
+		return fmt.Errorf("%w: %w: %v", ErrCommitted, errAuditLost, aerr)
 	}
 	return nil
 }

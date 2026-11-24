@@ -274,7 +274,8 @@ func (l *Listener) admit(ctx context.Context, wg *sync.WaitGroup, c net.Conn) {
 			}
 		}
 	}()
-	uid, reason := l.check(c)
+	peer, reason := l.check(c)
+	uid := peer.UID
 	if reason != "" {
 		_ = c.Close() // refused: nothing was written, nothing is owed
 		l.refusals.refuse(uid, reason)
@@ -293,7 +294,8 @@ func (l *Listener) admit(ctx context.Context, wg *sync.WaitGroup, c net.Conn) {
 		defer func() { _ = c.Close() }() // the connection is over either way
 		// How the connection ended is its own business: a client that
 		// closes, breaks the protocol or times out has been answered or cut.
-		_ = l.h.Serve(ctx, c)
+		// Every request acts for the peer admitted here, read at accept.
+		_ = l.h.Serve(ctx, c, peer)
 	})
 }
 
@@ -306,34 +308,36 @@ func (l *Listener) recovered(what string) {
 }
 
 // check reads c's peer and returns the reason it is refused, or "" for an
-// eligible peer, with the uid a refusal names. The uid range is judged as
+// eligible peer, with the peer read: its uid is the one a refusal names, and
+// an admitted peer's uid and pid are what its requests are served for. The uid range is judged as
 // soon as a uid is read, before anything read after it, so an ineligible
 // peer is refused under its own uid even when a later read fails; an
 // eligible uid whose later reads fail is refused as cred-unreadable under
 // that uid, and NoUID is named only when no uid was read. The token must
 // then name the uid and pid read beside it.
-func (l *Listener) check(c net.Conn) (uint32, string) {
+func (l *Listener) check(c net.Conn) (Peer, string) {
 	pc, err := l.creds.PeerCred(c)
 	if !pc.UIDRead {
-		return NoUID, ReasonCredUnreadable // a source that read no uid fails closed, error or not
+		return Peer{UID: NoUID}, ReasonCredUnreadable // a source that read no uid fails closed, error or not
 	}
+	p := Peer{UID: pc.UID, PID: pc.PID}
 	if reason := uidRefusal(pc.UID, l.serviceUID); reason != "" {
-		return pc.UID, reason
+		return p, reason
 	}
 	if err != nil {
-		return pc.UID, ReasonCredUnreadable
+		return p, ReasonCredUnreadable
 	}
 	if pc.TokenEUID != pc.UID || pc.TokenPID != pc.PID {
-		return pc.UID, ReasonTokenMismatch
+		return p, ReasonTokenMismatch
 	}
 	sandboxed, err := l.sandbox.Sandboxed(pc.Token)
 	if err != nil {
-		return pc.UID, ReasonSandboxUnknown
+		return p, ReasonSandboxUnknown
 	}
 	if sandboxed {
-		return pc.UID, ReasonSandboxed
+		return p, ReasonSandboxed
 	}
-	return pc.UID, ""
+	return p, ""
 }
 
 // uidRefusal returns the reason uid is not an eligible peer, or "".

@@ -397,7 +397,7 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	v, line, err := s.GenerateSSH(ctx, "deploy", "ci")
 	check("GenerateSSH", v, line, err)
 	v, err = s.Put(ctx, "raw", KindOpaque, planted)
-	check("Put (an opaque value, not the pair)", v)
+	check("Put (an opaque value, not the pair)", v, err)
 	fp, ok, err := s.InterruptedRewrap(ctx)
 	check("InterruptedRewrap", fp, ok, err)
 	ok, err = s.RecordsSealedUnder(ctx, rewrapKey(7))
@@ -406,45 +406,132 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	check("UserScopesExist", ok, err)
 
 	// A user scope holding a planted pair, read through every UserScope
-	// method, the deliveries path included.
+	// method, the deliveries path included, twice: through the view as
+	// UserScope returns it, and through the socket's view of the same scope
+	// (WithOrigin(SocketOrigin)), whose operations are the socket's path.
+	// Each view walks its own pair, deleted at the end of its walk.
 	startScopes(t, s)
 	u, err := s.UserScope(1001)
 	check("UserScope", u, err)
 	if err != nil {
 		t.Fatal(err)
 	}
-	v, err = u.Put(ctx, "user/1001/pair", KindOpaque, []byte("placeholder"))
-	check("UserScope.Put", v, err)
-	if err != nil {
-		t.Fatal(err)
+	walkUser := func(label string, view *UserScope) {
+		t.Helper()
+		const pair, opaque = "user/1001/pair", "user/1001/opaque"
+		v, err := view.Put(ctx, pair, KindOpaque, []byte("placeholder"))
+		check(label+".Put", v, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plantUserTyped(t, view, pair, KindOAuth, oauthEnvelope("access-u", string(planted)))
+		v, raw, err := view.Current(ctx, pair)
+		check(label+".Current", v, raw, err)
+		if !errors.Is(err, ErrTypedCredential) {
+			t.Errorf("%s.Current of the planted pair: %v, want ErrTypedCredential", label, err)
+		}
+		v, raw, err = view.ReadForExec(ctx, pair)
+		check(label+".ReadForExec", v, raw, err)
+		if !errors.Is(err, ErrTypedCredential) || raw != nil {
+			t.Errorf("%s.ReadForExec of the planted pair: %d bytes, %v; want none and ErrTypedCredential", label, len(raw), err)
+		}
+		list, err := view.List(ctx)
+		check(label+".List", list, err)
+		if len(list) != 1 || list[0].Err != nil || list[0].Current.Kind != KindOAuth {
+			t.Errorf("%s.List = %+v, want the planted oauth pair", label, list)
+		}
+		// A user entry is never typed, so Rotate of a raw value over the
+		// planted pair is refused; RotateFrom carries the pair's envelope
+		// forward as its next version. Neither returns any of it.
+		v, err = view.Rotate(ctx, pair, planted)
+		check(label+".Rotate", v, err)
+		if !errors.Is(err, ErrKindMismatch) {
+			t.Errorf("%s.Rotate of a raw value over the planted pair: %v, want ErrKindMismatch", label, err)
+		}
+		v, err = view.RotateFrom(ctx, pair, 1)
+		check(label+".RotateFrom", v, err)
+		v, raw, err = view.ReadForExec(ctx, pair)
+		check(label+".ReadForExec (rotated pair)", v, raw, err)
+		w := view.WithOrigin(SocketOrigin(7))
+		check(label+".WithOrigin", w)
+		if w == view {
+			t.Errorf("%s.WithOrigin returned the view itself, want a copy", label)
+		}
+
+		// The socket stores opaque values only, so a user scope cannot hold
+		// a typed pair in this release but by planting. The token is planted
+		// a second way, as an opaque user value, and every method is called
+		// on it: only the value reads return it, ReadForExec (the socket's
+		// read for exec, the one way a user reaches its own value) and
+		// Current (this package's own read, which no socket operation
+		// calls). Every other result, and their versions and errors beside
+		// the value, must carry none of it.
+		value := func(what string, v Version, raw []byte, err error) {
+			t.Helper()
+			check(what, v, err)
+			if err != nil || !bytes.Equal(raw, planted) {
+				t.Errorf("%s of the opaque token: %d bytes, %v; want the token", what, len(raw), err)
+			}
+		}
+		v, err = view.Put(ctx, opaque, KindOpaque, planted)
+		check(label+".Put (the opaque token)", v, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		v, raw, err = view.ReadForExec(ctx, opaque)
+		value(label+".ReadForExec (opaque)", v, raw, err)
+		v, raw, err = view.Current(ctx, opaque)
+		value(label+".Current (opaque)", v, raw, err)
+		list, err = view.List(ctx)
+		check(label+".List (opaque)", list, err)
+		v, err = view.Rotate(ctx, opaque, planted)
+		check(label+".Rotate (opaque)", v, err)
+		if err != nil {
+			t.Errorf("%s.Rotate of the opaque token: %v", label, err)
+		}
+		v, err = view.RotateFrom(ctx, opaque, 1)
+		check(label+".RotateFrom (opaque)", v, err)
+		if err != nil {
+			t.Errorf("%s.RotateFrom of the opaque token: %v", label, err)
+		}
+		v, err = view.RotateFrom(ctx, opaque, 9)
+		check(label+".RotateFrom (opaque, no such version)", v, err)
+		v, err = view.Rotate(ctx, opaque, nil)
+		check(label+".Rotate (opaque, empty)", v, err)
+		list, err = view.List(ctx)
+		check(label+".List (rotated)", list, err)
+
+		err = view.Refused(ctx, "exec-read", RefusedBadValue)
+		check(label+".Refused", err)
+		err = view.RefusedDropped(ctx, 1)
+		check(label+".RefusedDropped", err)
+		d := exportDelivery(testDelivery(1))
+		d.Entry = pair
+		d.Items = nil
+		err = view.Deliver(ctx, d)
+		check(label+".Deliver", err)
+		got, err := view.Delivery(ctx, d.UID)
+		check(label+".Delivery", got, err)
+		err = view.Withdraw(ctx, d.UID)
+		check(label+".Withdraw", err)
+		err = view.Delete(ctx, opaque)
+		check(label+".Delete (opaque)", err)
+		err = view.Delete(ctx, pair)
+		check(label+".Delete", err)
 	}
-	plantUserTyped(t, u, "user/1001/pair", KindOAuth, oauthEnvelope("access-u", string(planted)))
-	v, raw, err = u.Current(ctx, "user/1001/pair")
-	check("UserScope.Current", v, raw, err)
-	if !errors.Is(err, ErrTypedCredential) {
-		t.Errorf("UserScope.Current of the planted pair: %v, want ErrTypedCredential", err)
-	}
-	list, err = u.List(ctx)
-	check("UserScope.List", list, err)
-	if len(list) != 1 || list[0].Err != nil || list[0].Current.Kind != KindOAuth {
-		t.Errorf("UserScope.List = %+v, want the planted oauth pair", list)
-	}
-	d := exportDelivery(testDelivery(1))
-	d.Entry = "user/1001/pair"
-	d.Items = nil
-	err = u.Deliver(ctx, d)
-	check("UserScope.Deliver", err)
-	got, err := u.Delivery(ctx, d.UID)
-	check("UserScope.Delivery", got, err)
-	err = u.Withdraw(ctx, d.UID)
-	check("UserScope.Withdraw", err)
-	err = u.Delete(ctx, "user/1001/pair")
-	check("UserScope.Delete", err)
+	walkUser("UserScope", u)
+	socketView := u.WithOrigin(SocketOrigin(4242))
+	walkUser("SocketView", socketView)
 
 	// MergeFloor takes an options struct reflection cannot build: a dry
 	// run, which writes nothing, is called by hand.
 	mr, err := s.MergeFloor(ctx, MergeOptions{DryRun: true})
 	check("MergeFloor", mr, err)
+
+	// RefusedIneligible takes a pid reflection does not build: the
+	// socket's refused line for a uid with no user scope, by hand.
+	err = s.RefusedIneligible(ctx, 100, 4242, "list")
+	check("RefusedIneligible", err)
 
 	err = s.Delete(ctx, "pair")
 	check("Delete", err)
@@ -461,6 +548,13 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 			t.Errorf("the audit sink or the user-scope floor carries the refresh token as %q", enc)
 		}
 	}
+	viaSocket := false
+	for _, l := range lines {
+		viaSocket = viaSocket || l.via == auditViaSocket
+	}
+	if !viaSocket {
+		t.Error("no audit line came by the socket: the socket view's operations were not walked")
+	}
 
 	// The root maintenance verbs take a file-attribute writer reflection
 	// cannot build: each is called by hand with a recording one, last, as
@@ -475,11 +569,17 @@ func TestPlantedRefreshTokenNeverReturned(t *testing.T) {
 	// called above, each with its reason. It is empty: every method is
 	// called.
 	allow := map[string]string{}
-	for _, recv := range []any{s, u} {
+	// The socket view is walked as a receiver of its own: a method called
+	// on the plain view does not cover it on the socket's path.
+	for _, r := range []struct {
+		label string
+		recv  any
+	}{{"FileStore", s}, {"UserScope", u}, {"SocketView", socketView}} {
+		recv := r.recv
 		rt := reflect.TypeOf(recv)
 		for i := 0; i < rt.NumMethod(); i++ {
 			m := rt.Method(i)
-			key := rt.Elem().Name() + "." + m.Name
+			key := r.label + "." + m.Name
 			if covered[key] || allow[key] != "" {
 				continue
 			}

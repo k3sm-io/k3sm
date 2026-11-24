@@ -99,6 +99,12 @@ func TestPreconditionsCheck(t *testing.T) {
 			p.SandboxCheck = func() error { return boom }
 			p.ServerCount = func(context.Context) (int, error) { return 2, nil }
 		}, OffSandboxCheckUnusable},
+		{"start step fails", func(p *Preconditions) { p.StartScopes = func(context.Context) error { return boom } }, OffUserScopeStart},
+		{"start step panics", func(p *Preconditions) { p.StartScopes = func(context.Context) error { panic("fake") } }, OffUserScopeStart},
+		{"servers before start step", func(p *Preconditions) {
+			p.ServerCount = func(context.Context) (int, error) { return 2, nil }
+			p.StartScopes = func(context.Context) error { return boom }
+		}, OffServers},
 		{"install before servers", func(p *Preconditions) {
 			p.CheckInstall = func(context.Context) error { return boom }
 			p.ServerCount = func(context.Context) (int, error) { return 2, nil }
@@ -112,7 +118,7 @@ func TestPreconditionsCheck(t *testing.T) {
 			}
 		})
 	}
-	for _, r := range []OffReason{OffNotInstalledServer, OffServiceUIDLoginRange, OffMaintenance, OffMaintenanceUnknown, OffIgnoresOwnership, OffMountUnknown, OffLogsUnavailable, OffServers, OffServersUnknown, OffListenerUnavailable, OffListenerFailed, OffSandboxCheckUnusable} {
+	for _, r := range []OffReason{OffNotInstalledServer, OffServiceUIDLoginRange, OffMaintenance, OffMaintenanceUnknown, OffIgnoresOwnership, OffMountUnknown, OffLogsUnavailable, OffServers, OffServersUnknown, OffListenerUnavailable, OffListenerFailed, OffSandboxCheckUnusable, OffUserScopeStart} {
 		if got := r.Remedy(); got != "" {
 			t.Errorf("%q names the remedy %q, want none", r, got)
 		}

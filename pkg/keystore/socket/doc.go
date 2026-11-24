@@ -23,7 +23,9 @@ limitations under the License.
 // value. The frame length counts the body only, never its own 4 bytes, and
 // must equal the body exactly: the value is present iff bytes remain after
 // the header, and then its length must account for every one of them. The
-// frame cap is MaxFrame and the header cap MaxHeader; every length is checked
+// frame cap is MaxFrame and the header cap MaxHeader, except a reply's
+// header, which the client's reader (ReadReply) takes up to MaxReplyHeader,
+// a full scope's list; every length is checked
 // against its cap and against what remains of the frame before anything is
 // allocated. Frames are strict (a frame that breaks a rule is a
 // *ProtocolError, which closes the connection); headers are tolerant

@@ -78,7 +78,17 @@ func TestCheckConfigRevocationBudgetFloor(t *testing.T) {
 // worstRevocationLines is the longest line of each revocation: an rm's
 // tombstone and audit line under the longest scope and a 253-byte name,
 // and a withdraw's floor line and audit line, at the longest result and a
-// full RFC3339Nano timestamp.
+// full RFC3339Nano timestamp, each audit line as the socket writes it, the
+// socket margin's own lines: via socket and the caller with the longest
+// uid and pid.
+//
+// A user rotate's lines (up to 535 bytes each: its audit line and its
+// floor line) are revocations too and draw on the same socket margin; they
+// are not counted here. That is an accepted residual, not a gap this
+// margin closes: a uid that rotates without end spends its own margin and
+// refuses only its own further socket revocations (docs/design/keystore.md
+// § "Per-uid fairness", "The socket margin keeps a user able to revoke").
+// The margin is not changed for them.
 func worstRevocationLines(t *testing.T) (tomb, rmAudit, withdrawFloor, withdrawAudit int) {
 	t.Helper()
 	scope := userScopeOf(maxScopeUID)
@@ -93,12 +103,13 @@ func worstRevocationLines(t *testing.T) (tomb, rmAudit, withdrawFloor, withdrawA
 	}
 	ts := time.Date(2026, 12, 31, 23, 59, 59, 999999999, time.UTC)
 	for _, result := range []string{"ok", "committed", "scope-absent", "not-found", "log-full", "corrupt", "error"} {
-		al, err := marshalAuditLine(auditLine{op: "rm", scope: scope, name: name, result: result}, ts)
+		caller := &auditCaller{UID: maxScopeUID, PID: math.MaxInt32}
+		al, err := marshalAuditLine(auditLine{op: "rm", via: auditViaSocket, caller: caller, scope: scope, name: name, result: result}, ts)
 		if err != nil {
 			t.Fatal(err)
 		}
 		rmAudit = max(rmAudit, len(al))
-		wl, err := marshalAuditLine(auditLine{op: "withdraw", scope: scope, namespace: strings.Repeat("n", 63), delivery: "00000000-0000-0000-0000-000000000000", result: result}, ts)
+		wl, err := marshalAuditLine(auditLine{op: "withdraw", via: auditViaSocket, caller: caller, scope: scope, namespace: strings.Repeat("n", 63), delivery: "00000000-0000-0000-0000-000000000000", result: result}, ts)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -210,7 +210,10 @@ type ServerLogs struct {
 	// PreFrameDroppedName; droppedDirty is set when pending or others
 	// changed since, droppedAt is when it was last written, and droppedErr
 	// is why the file did not read, which turns its writes off.
+	// written holds the pre-frame part alone; countsGen is the store's
+	// counts' generation last written (serverCounts).
 	written      preFrameDropped
+	countsGen    uint64
 	droppedDirty bool
 	droppedAt    time.Time
 	droppedErr   error
@@ -235,9 +238,10 @@ type heldLog struct {
 
 // ServerLogs returns the store's server append surface. It opens neither
 // log: the first Reopen or append opens both and counts the budget. It
-// reads the persisted pre-frame refusal counts (PreFrameDroppedName) and
-// starts from them; a file that does not read is logged and kept
-// (DroppedPersistError).
+// reads the persisted server counts (PreFrameDroppedName) and starts from
+// them, the store's post-frame and unaudited counts included, and from then
+// on is their one writer; a file that does not read is logged and kept
+// (DroppedPersistError). A store has one ServerLogs.
 func (s *FileStore) ServerLogs() *ServerLogs {
 	l := &ServerLogs{
 		s:           s,
@@ -252,6 +256,13 @@ func (s *FileStore) ServerLogs() *ServerLogs {
 	}
 	if s.checkConfig() == nil {
 		l.loadDroppedLocked() // l is not shared yet
+	}
+	if s.counts != nil {
+		l.countsGen = s.counts.generation()
+		// A change to the store's other counts is written as a pre-frame
+		// change is: at once when the last write is a second old, else by
+		// the next call past it, or Close.
+		s.counts.setNotify(func() { l.persistDropped(false) })
 	}
 	return l
 }
@@ -787,7 +798,7 @@ type preFrameCaller struct {
 }
 
 // preFrameKeys are preFrameRec's JSON keys, exact.
-var preFrameKeys = append(slices.Clone(auditKeys), "caller", "charge", "source", "dropped", "class")
+var preFrameKeys = append(slices.Clone(auditKeys), "charge", "source", "class")
 
 // preFrameRecord is a pre-frame line: a refusal when result is a reason
 // (class ""), a summary of dropped refusals of class when result is

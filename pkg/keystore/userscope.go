@@ -119,6 +119,9 @@ type UserScope struct {
 	// allowRemoved lets rm-scope open a scope key the removed-scopes record
 	// already lists: a rerun after an rm-scope that recorded it and stopped.
 	allowRemoved bool
+	// origin is where the view's operations come from, for their audit
+	// lines (WithOrigin); the zero Origin writes no via and no caller.
+	origin Origin
 }
 
 // UserScope returns uid's view of the store. A uid outside 501 to
@@ -199,6 +202,11 @@ func (u *UserScope) Put(ctx context.Context, input string, kind Kind, value []by
 	}
 	v, err := u.put(ctx, name, kind, value, u.grant("put", name, ""))
 	if err != nil {
+		// A put that committed stands: its version is answered with the
+		// error, as Rotate answers its own.
+		if Committed(err) {
+			return v, fail("put", err)
+		}
 		return Version{}, fail("put", err)
 	}
 	return v, nil
@@ -276,6 +284,12 @@ func (u *UserScope) put(ctx context.Context, name string, kind Kind, value []byt
 	}
 	if err := checkScopeQuota(entries, name, value, base); err != nil {
 		return Version{}, err
+	}
+	// The ok line names the version the put writes and its fingerprint,
+	// under the scope's keys, which a minting put opened only after its
+	// line (mint), so its line names neither.
+	if !roomJudged {
+		g.version, g.fingerprint = 1, fingerprint(kind, value, uk.fingerprint)
 	}
 	if err := grant(); err != nil {
 		return Version{}, err
@@ -393,7 +407,9 @@ func openUserEntry(entries *os.Root, name string) (*entry, error) {
 	return e, nil
 }
 
-// Current returns the version input's pointer names, with its value.
+// Current returns the version input's pointer names, with its value. It
+// writes no audit line: it is this package's own read. The socket's read
+// is ReadForExec, audited as exec-read.
 func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte, error) {
 	var (
 		v   Version
@@ -432,13 +448,14 @@ func (u *UserScope) Current(ctx context.Context, input string) (Version, []byte,
 
 // List returns every entry of the scope, sorted by name, as FileStore.List
 // does: an entry that cannot be opened carries Err. A uid with no scope is
-// ErrScopeAbsent.
+// ErrScopeAbsent. It is audited as list (auditedRead).
 func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 	if err := u.quarantineErr(); err != nil {
+		u.auditBriefly(ctx, auditLine{op: "list"}, err)
 		return nil, fail("list", err)
 	}
 	var out []Entry
-	err := u.read(ctx, func(entries *os.Root, uk keys) error {
+	err := u.auditedRead(ctx, auditLine{op: "list"}, func(entries *os.Root, uk keys) error {
 		names, err := readDirNames(entries, maxDirNames)
 		if err != nil {
 			return err
@@ -470,6 +487,89 @@ func (u *UserScope) List(ctx context.Context) ([]Entry, error) {
 		return nil, fail("list", err)
 	}
 	return out, nil
+}
+
+// ReadForExec returns the value of input's current version, with the
+// version: the socket's read-for-exec, the one way a user reaches its own
+// value. It reads raw kinds only, as Current does, and is audited as
+// exec-read (auditedRead): a read whose line cannot be written returns no
+// value.
+func (u *UserScope) ReadForExec(ctx context.Context, input string) (Version, []byte, error) {
+	name, err := u.own("exec-read", input)
+	if err != nil {
+		u.auditBriefly(ctx, auditLine{op: "exec-read", name: auditPlaceholder}, err)
+		return Version{}, nil, fail("exec-read", err)
+	}
+	if err := u.quarantineErr(); err != nil {
+		u.auditBriefly(ctx, auditLine{op: "exec-read", name: name}, err)
+		return Version{}, nil, fail("exec-read", err)
+	}
+	var (
+		v   Version
+		val []byte
+	)
+	err = u.auditedRead(ctx, auditLine{op: "exec-read", name: name}, func(entries *os.Root, uk keys) error {
+		e, err := openUserEntry(entries, name)
+		if err != nil {
+			return err
+		}
+		defer e.close()
+		cur, err := u.flooredPointer(e, uk)
+		if err != nil {
+			return err
+		}
+		v, val, err = e.version(uk, cur)
+		return rawOnly(v, err)
+	})
+	if err != nil {
+		clear(val) // a refused read never hands out its value
+		return Version{}, nil, fail("exec-read", err)
+	}
+	return v, val, nil
+}
+
+// errReadAuditRefused is a read refused because its audit line could not
+// be written: the fail-closed rule for reads, which no exception covers.
+var errReadAuditRefused = errors.New("the audit line could not be written, so the read is refused")
+
+// auditedRead runs fn as read does, under the shared lock, and appends l
+// under that same hold, after the read and before the caller replies
+// (docs/design/keystore.md § "The audit log": lock modes, audit before
+// reply, fail closed). A uid past its share is refused first, with nothing
+// read and no line written (errShareSpent): reads are charged to the share
+// like any line and are not in the revocation class. A read whose line
+// cannot be appended is refused (errReadAuditRefused), and so is a
+// scope-absent one, which a list serves as empty; any other refused read's
+// line is written best effort, with the refusal's result.
+func (u *UserScope) auditedRead(ctx context.Context, l auditLine, fn func(*os.Root, keys) error) error {
+	if err := u.s.checkConfig(); err != nil {
+		return err
+	}
+	root, done, err := u.s.openLocked(ctx, false, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: the keystore directory is missing", ErrScopeAbsent)
+	}
+	if err != nil {
+		return err
+	}
+	defer done()
+	if err := u.s.admit(u.uid, false); err != nil {
+		return err
+	}
+	o, entries, err := u.openScopeFull(root, u.s.loadMaster)
+	if err == nil {
+		err = fn(entries, o.uk)
+		_ = entries.Close() // read-only; nothing to flush
+		o.close()
+	}
+	l.result = auditResult(err)
+	// A scope-absent answer is served as an empty list (the socket's list),
+	// so a read whose line failed is refused then too, never served with
+	// no line.
+	if aerr := u.audit(l); aerr != nil && (err == nil || errors.Is(err, ErrScopeAbsent)) {
+		return fmt.Errorf("%w: %w", errReadAuditRefused, aerr)
+	}
+	return err
 }
 
 // read runs fn on the scope's entries' directory and keys under the shared
@@ -652,7 +752,7 @@ func (u *UserScope) readScopeKey(dir *os.Root, wrap func() (keys, error)) ([]byt
 	if err != nil {
 		return nil, zero, err
 	}
-	live, err := lookupGeneratedUID(u.uid)
+	live, err := u.s.generatedUIDOf(u.uid)
 	if err != nil {
 		return nil, zero, err
 	}
@@ -895,7 +995,7 @@ func (u *UserScope) mint(root *os.Root, wrap []byte, grant func() error) (keys, 
 	if err := u.s.eligibleUID(u.uid); err != nil {
 		return keys{}, nil, err
 	}
-	g, err := lookupGeneratedUID(u.uid)
+	g, err := u.s.generatedUIDOf(u.uid)
 	if err != nil {
 		return keys{}, nil, err
 	}

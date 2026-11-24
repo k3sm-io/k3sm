@@ -32,8 +32,16 @@ const (
 	// headroom for later header fields, and follows the value cap when it
 	// changes.
 	MaxFrame = 2 * keystore.MaxValueSize
-	// MaxHeader is the header cap: the most a frame's JSON header may hold.
+	// MaxHeader is the header cap: the most a frame's JSON header may hold,
+	// every frame but a reply.
 	MaxHeader = 8 << 10
+	// MaxReplyHeader is a reply's header cap: the worst-case list of a full
+	// scope (keystore.MaxScopeEntries rows, each at maxListRow) with the
+	// warning an outcome may add, so one list call names every entry. Only
+	// a reply may carry a header past MaxHeader, and only a client's reader
+	// (ReadReply) takes one.
+	MaxReplyHeader = len(`{"entries":[]}`) + len(`,"warning":""`) + len(WarnAuditFailed) +
+		keystore.MaxScopeEntries*maxListRow
 	// FrameOverhead is the framing a frame carrying a value adds to its
 	// header and value inside the frame length: the type byte and the
 	// header's and the value's length prefixes.
@@ -45,6 +53,10 @@ const (
 // The frame cap must hold the largest value with a full header; this fails
 // to compile (a negative untyped constant converted to uint) if it does not.
 const _ uint = MaxFrame - (keystore.MaxValueSize + MaxHeader + FrameOverhead)
+
+// The frame cap must hold the largest reply header too; this fails to
+// compile if a full scope's list does not fit one frame.
+const _ = uint(MaxFrame - (minFrame + MaxReplyHeader))
 
 // FrameType is a frame's 1-byte type.
 type FrameType byte
@@ -89,17 +101,41 @@ func protocolErrorf(format string, args ...any) error {
 // ReadFrame reads one frame from r. A clean end of stream before a frame
 // starts is io.EOF; one inside a frame is io.ErrUnexpectedEOF. Every length
 // is checked against its cap and against what remains of the frame before
-// the buffer it sizes is allocated.
-func ReadFrame(r io.Reader) (Frame, error) { return readFrame(r, false) }
+// the buffer it sizes is allocated. Every header is held to MaxHeader: this
+// is the server's reader.
+func ReadFrame(r io.Reader) (Frame, error) { return readFrame(r, readAny) }
+
+// ReadReply is the client's reader of the server's answers: as ReadFrame,
+// but a reply's header may be up to MaxReplyHeader, the list of a full
+// scope. Every other type is still held to MaxHeader.
+func ReadReply(r io.Reader) (Frame, error) { return readFrame(r, readReply) }
 
 // ReadHello reads a connection's first frame, which must be a HELLO with no
 // value, as ReadFrame does but stricter: a frame of any other type is
 // refused as soon as its length and type are read, before its header
 // length, header or value is read or allocated, and a HELLO whose length
 // leaves room for a value is refused before its header is read.
-func ReadHello(r io.Reader) (Frame, error) { return readFrame(r, true) }
+func ReadHello(r io.Reader) (Frame, error) { return readFrame(r, readHello) }
 
-func readFrame(r io.Reader, hello bool) (Frame, error) {
+// readMode is which reader readFrame is.
+type readMode int
+
+const (
+	readAny   readMode = iota // ReadFrame
+	readHello                 // ReadHello
+	readReply                 // ReadReply
+)
+
+// headerCap is the most a header of type t may hold.
+func headerCap(t FrameType) uint32 {
+	if t == TypeReply {
+		return uint32(MaxReplyHeader)
+	}
+	return MaxHeader
+}
+
+func readFrame(r io.Reader, mode readMode) (Frame, error) {
+	hello := mode == readHello
 	var prefix [4 + minFrame]byte
 	if _, err := io.ReadFull(r, prefix[:4]); err != nil {
 		return Frame{}, err
@@ -126,8 +162,12 @@ func readFrame(r io.Reader, hello bool) (Frame, error) {
 	}
 	rest := n - minFrame
 	hl := binary.BigEndian.Uint32(prefix[5:])
-	if hl > MaxHeader {
-		return Frame{}, protocolErrorf("header length %d over the cap %d", hl, MaxHeader)
+	limit := uint32(MaxHeader)
+	if mode == readReply {
+		limit = headerCap(f.Type)
+	}
+	if hl > limit {
+		return Frame{}, protocolErrorf("header length %d over the cap %d", hl, limit)
 	}
 	if hl > rest {
 		return Frame{}, protocolErrorf("header length %d past the frame", hl)
@@ -156,6 +196,9 @@ func readFrame(r io.Reader, hello bool) (Frame, error) {
 	}
 	f.Value = make([]byte, rest)
 	if err := readBody(r, f.Value); err != nil {
+		// A value cut part way is zeroed: its first bytes may be a
+		// secret's.
+		clear(f.Value)
 		return Frame{}, err
 	}
 	return f, nil
@@ -173,13 +216,14 @@ func readBody(r io.Reader, b []byte) error {
 }
 
 // AppendFrame appends f's encoding to b. It refuses a frame ReadFrame would
-// refuse.
+// refuse, except that a reply's header may be up to MaxReplyHeader, as
+// ReadReply takes it.
 func AppendFrame(b []byte, f Frame) ([]byte, error) {
 	if !f.Type.known() {
 		return b, protocolErrorf("unknown frame type %#02x", byte(f.Type))
 	}
-	if len(f.Header) > MaxHeader {
-		return b, protocolErrorf("header length %d over the cap %d", len(f.Header), MaxHeader)
+	if limit := headerCap(f.Type); len(f.Header) > int(limit) {
+		return b, protocolErrorf("header length %d over the cap %d", len(f.Header), limit)
 	}
 	n := minFrame + len(f.Header)
 	if f.Value != nil {

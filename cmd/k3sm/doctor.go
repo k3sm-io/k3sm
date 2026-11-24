@@ -142,9 +142,10 @@ type doctorEnv struct {
 	// (keystore.FileStore.FloorDamage), and the damage of a floor past the
 	// reader's bounds as its error. A nil seam leaves the row unprobed.
 	keystoreFloorDamage func(context.Context) (int, error)
-	// keystorePreFrameDropped reads the persisted pre-frame refusal counts
-	// not yet in the audit log (keystore.FileStore.PreFrameDropped),
-	// read-only. A nil seam leaves that part of the keystore-logs row
+	// keystorePreFrameDropped reads the server's persisted counts
+	// (keystore.FileStore.PreFrameDropped), read-only: the pre-frame and
+	// post-frame refusals not yet in the audit log, and the committed
+	// revocations with no audit line. A nil seam leaves that part of the keystore-logs row
 	// unprobed.
 	keystorePreFrameDropped func(context.Context) (keystore.PreFrameDroppedCounts, error)
 	// keystoreMaintenance reads a standing maintenance marker
@@ -387,31 +388,44 @@ func checkKeystoreLossyRuns(env doctorEnv) checkResult {
 }
 
 // keystorePreFrameDroppedHint adds to r, the keystore-logs row as the flag
-// and size checks left it, the pre-frame refusals the server counted as
-// dropped and has not yet written to the audit log, read-only from the
-// file it persists them in: a WARN with the count and the uids named, or a
+// and size checks left it, the server's persisted counts, read-only from
+// the server-counts file: the pre-frame and post-frame refusals the server
+// counted as dropped and has not yet written to the audit log, each with
+// its count and the uids named, and the committed keystore revocations
+// that have no audit line; each is a WARN. A file that does not read is a
 // WARN that the persisted count is unreadable. A file this user may not
-// read adds nothing: the logs row already passed, and doctor as root
-// reads it.
+// read adds nothing: the logs row already passed, and doctor as root reads
+// it.
 func keystorePreFrameDroppedHint(env doctorEnv, r checkResult) checkResult {
 	if env.keystorePreFrameDropped == nil {
 		return r
 	}
 	c, err := env.keystorePreFrameDropped(context.Background())
-	var detail string
+	var details []string
 	switch {
 	case errors.Is(err, fs.ErrPermission):
 		return r
 	case err != nil:
-		detail = fmt.Sprintf("the persisted pre-frame refusal count is unreadable, so refusals the server dropped are not shown: %v", err)
-	case c.Refusals == 0:
-		return r
+		details = append(details, fmt.Sprintf("the persisted pre-frame refusal count is unreadable, so refusals the server dropped and revocations with no audit line are not shown: %v", err))
 	default:
-		detail = fmt.Sprintf("%d pre-frame refusal(s) not recorded for %d uid(s)", c.Refusals, c.UIDs)
-		if c.Others > 0 {
-			detail += fmt.Sprintf(", %d of them for further uids not named", c.Others)
+		if c.Refusals > 0 {
+			d := fmt.Sprintf("%d pre-frame refusal(s) not recorded for %d uid(s)", c.Refusals, c.UIDs)
+			if c.Others > 0 {
+				d += fmt.Sprintf(", %d of them for further uids not named", c.Others)
+			}
+			details = append(details, d)
+		}
+		if c.PostFrame > 0 {
+			details = append(details, fmt.Sprintf("%d post-frame refusal(s) not recorded for %d uid(s)", c.PostFrame, c.PostFrameUIDs))
+		}
+		if c.Unaudited > 0 {
+			details = append(details, fmt.Sprintf("%d committed keystore revocation(s) have no audit line", c.Unaudited))
 		}
 	}
+	if len(details) == 0 {
+		return r
+	}
+	detail := strings.Join(details, "; ")
 	remedy := "sudo k3sm keys audit --rotate   # writes the counts to the new audit log"
 	if r.status == statusWarn {
 		r.detail += "; " + detail
@@ -422,7 +436,9 @@ func keystorePreFrameDroppedHint(env doctorEnv, r checkResult) checkResult {
 }
 
 // keystoreSoftCapHint is the keystore-logs row's WARN when either log is
-// past its soft cap, and whether one is: the audit log's hint says to
+// past its soft cap, and whether one is; a log past its hard cap is named
+// with its overshoot in bytes, and one at or below it never is. The audit
+// log's hint says to
 // export the archives first (copy them off the Mac), then rotate, and the
 // floor's to rebuild it. A size that cannot be read gives no hint: the
 // flag check already passed.
@@ -436,18 +452,32 @@ func keystoreSoftCapHint(env doctorEnv) (checkResult, bool) {
 		return checkResult{}, false
 	}
 	var details, remedies []string
+	overshoot := false
+	past := func(log string, size int64) string {
+		if size > sz.HardCap {
+			overshoot = true
+			return fmt.Sprintf("the %s is %d bytes, %d bytes past its hard cap of %d", log, size, size-sz.HardCap, sz.HardCap)
+		}
+		return fmt.Sprintf("the %s is %d bytes, past its soft cap of %d", log, size, sz.SoftCap)
+	}
 	if sz.Audit > sz.SoftCap {
-		details = append(details, fmt.Sprintf("the audit log is %d bytes, past its soft cap of %d", sz.Audit, sz.SoftCap))
+		details = append(details, past("audit log", sz.Audit))
 		remedies = append(remedies, "export the audit archives first: as root (only root can read them), copy keystore-audit.log.1 to .4 from keystore-logs/audit/archives/ in the data root off the Mac, then run sudo k3sm keys audit --rotate (with --discard-oldest once .4 exists)")
 	}
 	if sz.UserFloor > sz.SoftCap {
-		details = append(details, fmt.Sprintf("the user-scope floor log is %d bytes, past its soft cap of %d", sz.UserFloor, sz.SoftCap))
+		details = append(details, past("user-scope floor log", sz.UserFloor))
 		remedies = append(remedies, "sudo k3sm keys floor --rebuild")
 	}
 	if len(details) == 0 {
 		return checkResult{}, false
 	}
-	return checkResult{name: name, status: statusWarn, detail: strings.Join(details, "; ") + fmt.Sprintf("; past the hard cap of %d no user-scope change is recorded", sz.HardCap), remedy: strings.Join(remedies, "; ")}, true
+	tail := fmt.Sprintf("; past the hard cap of %d no user-scope change is recorded", sz.HardCap)
+	if overshoot {
+		// Only revocation lines pass the hard cap, each uid's bounded by
+		// its own budgets (docs/design/keystore.md § "Per-uid fairness").
+		tail = "; past the hard cap only revocations are recorded, each on its uid's own budgets, and every other user-scope change is refused"
+	}
+	return checkResult{name: name, status: statusWarn, detail: strings.Join(details, "; ") + tail, remedy: strings.Join(remedies, "; ")}, true
 }
 
 // checkArch verifies the binary runs on Apple Silicon (arm64). k3sm is

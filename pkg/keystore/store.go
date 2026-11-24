@@ -119,11 +119,32 @@ type Config struct {
 	// LogSoftCap and LogHardCap are each append-only log's soft and hard
 	// caps in bytes (keystore.logSoftCap, keystore.logHardCap), and
 	// LogRevocationBudget each uid's bytes per log for the revocation class
-	// past the hard cap. Zero is the default: 64 MiB, 256 MiB and 704 KiB
+	// past the hard cap. Zero is the default: 64 MiB, 256 MiB and 720 KiB
 	// (defaultLogRevocationBytes). A negative value, a soft cap over the
 	// hard cap, or a budget under one worst-case burial plus its audit line
 	// (minLogRevokeBudget), makes every operation fail.
 	LogSoftCap, LogHardCap, LogRevocationBudget int64
+	// LogUIDShare is each uid's byte share of each append-only log
+	// (keystore.logUIDShare, docs/design/keystore.md § "Per-uid
+	// fairness"). Zero is the default: 16 MiB, 1/16 of the default hard
+	// cap. A negative value, or one over LogHardCap / 16, makes every
+	// operation fail.
+	LogUIDShare int64
+	// LockWait bounds every wait for the store lock: past it an operation
+	// fails with the store's busy error (errLockTimeout), not the server.
+	// Zero is the default, 10 s, which the root verbs keep; the socket
+	// server's store sets 2 s (docs/design/keystore.md § "The audit log":
+	// an append waits at most 2 seconds for the lock). A negative value
+	// makes every operation fail.
+	LockWait time.Duration
+	// GeneratedUID answers a uid's live GeneratedUID in place of the
+	// directory lookup (mbr_uid_to_uuid), for tests only: nil, as
+	// production leaves it, reads the directory service within its
+	// deadline. A test outside this package, which cannot reach the
+	// package's seam, supplies one so no host lookup runs. Its answer is
+	// judged as the lookup's is: an error, an all-zero or a synthesized
+	// answer fails closed with ErrScopeOwnerUnknown.
+	GeneratedUID func(uid uint32) ([16]byte, error)
 }
 
 // FileStore is the keystore on disk, laid out as docs/design/keystore.md §
@@ -144,6 +165,9 @@ type FileStore struct {
 	now      func() time.Time
 	chown    func(f *os.File, uid, gid int) error
 	lockWait time.Duration
+	// generatedUID is Config.GeneratedUID: nil reads the directory
+	// service through lookupGeneratedUID.
+	generatedUID func(uid uint32) ([16]byte, error)
 	// log is where the store logs; nil is slog.Default(), read at the
 	// call, so a default the binary sets after New still applies.
 	log *slog.Logger
@@ -185,6 +209,14 @@ type FileStore struct {
 	// logSoftCap, logHardCap and logRevokeBudget are Config's log caps,
 	// with the defaults filled in.
 	logSoftCap, logHardCap, logRevokeBudget int64
+	// logUIDShare is Config.LogUIDShare as given, 0 for the default
+	// (uidShare); logAllowance is each uid's reconciler allowance per log,
+	// logReconcilerAllowance, which only a test lowers.
+	logUIDShare, logAllowance int64
+	// configHardCap is the hard cap Config named (its default when it
+	// named none), against which checkConfig judges the effective share,
+	// the default included, of a Config that names no share.
+	configHardCap int64
 	// userScopesStarted is set by startUserScopes once the server's
 	// user-scope start step has run; until then UserScope refuses
 	// (errUserScopesNotStarted). A pointer, so a copy of the store shares
@@ -199,6 +231,15 @@ type FileStore struct {
 	// its floor line, which the next operation on the scope catches up. A
 	// pointer, as userScopesStarted is; New allocates it.
 	lostLines *lostEntryLines
+	// audit is the user-scope audit appends' state: the global append
+	// failure (userorigin.go). A pointer, as userScopesStarted is; New
+	// allocates it.
+	audit *auditState
+	// counts is the server's persisted counts past the pre-frame ones:
+	// post-frame refused lines dropped, and unaudited operations
+	// (servercounts.go). A pointer, as userScopesStarted is; New allocates
+	// it.
+	counts *serverCounts
 }
 
 var _ Store = (*FileStore)(nil)
@@ -218,7 +259,8 @@ func New(cfg Config) *FileStore {
 		rand:            rand.Reader,
 		now:             time.Now,
 		chown:           (*os.File).Chown,
-		lockWait:        lockTimeout,
+		lockWait:        time.Duration(orDefault(int64(cfg.LockWait), int64(lockTimeout))),
+		generatedUID:    cfg.GeneratedUID,
 		step:            func(string) error { return nil },
 		owned:           func([]byte) {},
 		entryMade:       func(string) {},
@@ -229,10 +271,15 @@ func New(cfg Config) *FileStore {
 		logSoftCap:      orDefault(cfg.LogSoftCap, defaultLogSoftCap),
 		logHardCap:      orDefault(cfg.LogHardCap, defaultLogHardCap),
 		logRevokeBudget: orDefault(cfg.LogRevocationBudget, defaultLogRevocationBytes),
+		logUIDShare:     cfg.LogUIDShare,
+		configHardCap:   orDefault(cfg.LogHardCap, defaultLogHardCap),
+		logAllowance:    logReconcilerAllowance,
 
 		userScopesStarted: new(atomic.Bool),
 		quarantined:       new(atomic.Pointer[map[uint32]bool]),
 		lostLines:         new(lostEntryLines),
+		audit:             new(auditState),
+		counts:            newServerCounts(),
 	}
 	if cfg.LogFlags != nil {
 		s.logFlags = cfg.LogFlags
@@ -273,8 +320,19 @@ func (s *FileStore) checkConfig() error {
 		return fmt.Errorf("%w: MasterDir is empty", errInvalidConfig)
 	case s.dataRoot == "":
 		return fmt.Errorf("%w: DataRoot is empty", errInvalidConfig)
-	case s.logSoftCap < 0 || s.logHardCap < 0 || s.logRevokeBudget < 0:
-		return fmt.Errorf("%w: a log cap or budget is negative", errInvalidConfig)
+	case s.lockWait < 0:
+		return fmt.Errorf("%w: LockWait %v is negative", errInvalidConfig, s.lockWait)
+	case s.logSoftCap < 0 || s.logHardCap < 0 || s.logRevokeBudget < 0 || s.logUIDShare < 0:
+		return fmt.Errorf("%w: a log cap, budget or share is negative", errInvalidConfig)
+	case s.logUIDShare > s.logHardCap/logUIDShareDivisor:
+		// A share over 1/16 of the hard cap would let fewer than 16 uids
+		// fill a log for everyone.
+		return fmt.Errorf("%w: LogUIDShare %d is over LogHardCap / %d, %d", errInvalidConfig, s.logUIDShare, logUIDShareDivisor, s.logHardCap/logUIDShareDivisor)
+	case s.logUIDShare == 0 && s.uidShare() > s.configHardCap/logUIDShareDivisor:
+		// The effective share is judged too: a Config that names a hard
+		// cap and no share gets the default share, which must fit the
+		// same 1/16 of that cap.
+		return fmt.Errorf("%w: the default per-uid log share %d (LogUIDShare unset) is over LogHardCap / %d, %d", errInvalidConfig, s.uidShare(), logUIDShareDivisor, s.configHardCap/logUIDShareDivisor)
 	case s.logRevokeBudget < minLogRevokeBudget:
 		// A budget under one worst-case burial plus its audit line refuses
 		// an rm's tombstones or its audit line, so it would silently

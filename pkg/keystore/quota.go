@@ -37,6 +37,9 @@ import (
 const (
 	// maxScopeEntries is the most entries one user scope holds.
 	maxScopeEntries = 256
+	// MaxScopeEntries is maxScopeEntries for the socket, which sizes a
+	// list reply to hold a full scope.
+	MaxScopeEntries = maxScopeEntries
 	// maxScopeBytes is the most sealed record bytes one user scope holds:
 	// every file in every entry directory, version records and pointers.
 	maxScopeBytes = 16 << 20
@@ -194,7 +197,7 @@ func (u *UserScope) deleteBody(root *os.Root, name string) error {
 	// or timed out is no answer, and rm goes ahead. One refused for
 	// capacity, where no lookup ran, refuses rm, retryably: going ahead on
 	// it would let a burst of stuck lookups stand in for the owner check.
-	live, err := lookupGeneratedUID(u.uid)
+	live, err := u.s.generatedUIDOf(u.uid)
 	switch {
 	case errors.Is(err, errLookupNotRun):
 		return err
