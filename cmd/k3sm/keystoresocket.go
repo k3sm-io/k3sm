@@ -288,12 +288,14 @@ func newKeystoreSocket(deps keystoreSocketDeps) (*keystoreSocket, error) {
 }
 
 // keystoreSocketConfig is the supervisor's config for this server: the
-// store's server log surface and its refusal auditor, the peer sources, the
-// handler and the start checks (the effective uid, the service uid, the
+// store (its lock wait the socket's), its server log surface and refusal
+// auditor, the peer sources, the operations' handler over the store's
+// bridge, and the start checks (the effective uid, the service uid, the
 // mount flags of a data-root descriptor opened afresh for each pass and
 // closed when it ends, the store's install check and the log reopen, each
-// held to that descriptor's device, the maintenance marker read and the
-// server count). The returned func closes the descriptors the config holds.
+// held to that descriptor's device, the maintenance marker read, the
+// server count and the store's start step). The returned func closes the
+// descriptors the config holds.
 func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, func(), error) {
 	if deps.listen == nil {
 		return socket.SupervisorConfig{}, nil, errors.New("no listener source")
@@ -308,6 +310,9 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 	}
 	storeCfg := deps.layout(work)
 	storeCfg.UID, storeCfg.GID = uid, gid
+	// The server's waits for the store lock are the socket's bound: past
+	// it a request is answered busy.
+	storeCfg.LockWait = socket.LockWait
 	store := keystore.New(storeCfg)
 	logs := store.ServerLogs()
 	audit, err := socket.NewStoreAuditor(logs, deps.log)
@@ -317,7 +322,11 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 	if deps.clock == nil {
 		return socket.SupervisorConfig{}, nil, errors.New("no clock")
 	}
-	handler, err := socket.NewHandler(deps.clock.Now)
+	bridge, err := socket.NewFileStoreBridge(store, deps.clock.Now)
+	if err != nil {
+		return socket.SupervisorConfig{}, nil, err
+	}
+	handler, err := socket.NewOpsHandler(deps.clock.Now, bridge)
 	if err != nil {
 		return socket.SupervisorConfig{}, nil, err
 	}
@@ -351,6 +360,7 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 			return nil
 		},
 		SandboxCheck: deps.sandboxCheck,
+		StartScopes:  startUserScopesStep(store, deps.log),
 		Creds:        deps.creds,
 		Sandbox:      deps.sandbox,
 		Audit:        audit,
@@ -358,6 +368,24 @@ func keystoreSocketConfig(deps keystoreSocketDeps) (socket.SupervisorConfig, fun
 		Clock:        deps.clock,
 		Log:          deps.log,
 	}, closeAll, nil
+}
+
+// startUserScopesStep is the supervisor's last start check: the store's
+// start step (the log bounds check, then the delivery catch-up), run on
+// every pass, so a failed one is retried. An error that left the user
+// scope unstarted keeps the listener off with the store's reason; one that
+// named a scope it could not catch up while every other scope started is
+// logged at Warn and the listener serves (docs/design/keystore.md § "The
+// user-scope floor").
+func startUserScopesStep(store *keystore.FileStore, log *slog.Logger) func(context.Context) error {
+	return func(ctx context.Context) error {
+		err := store.StartUserScopes(ctx)
+		if err != nil && store.UserScopesStarted() {
+			log.Warn("keystore user scope started, but its start step named scopes it could not catch up", "err", err)
+			return nil
+		}
+		return err
+	}
 }
 
 // runKeystoreSocket runs the built ks (superviseKeystoreSocket). A nil ks
@@ -515,6 +543,17 @@ func doctorOpenLogs(store *keystore.FileStore, pass *dataRootPass) func(context.
 	}
 }
 
+// doctorStartScopes is doctor's start step: the read-only half of the
+// server's (keystore.FileStore.CheckLogBounds), whose refusal leaves the
+// server's user scope unstarted with the same reason. The catch-up, which
+// writes, is the server's alone.
+func doctorStartScopes(store *keystore.FileStore) func(context.Context) error {
+	return func(ctx context.Context) error {
+		_, _, err := store.CheckLogBounds(ctx)
+		return err
+	}
+}
+
 // doctorUserScope is what doctor's user-scope row reads: the start checks
 // as doctor re-runs them, the release of what they hold, the servers the
 // count saw and its error, and the one fact doctor can establish about the
@@ -630,6 +669,7 @@ func doctorKeystoreUserScope(workDir string) (doctorUserScope, error) {
 			EndPass:           pass.end,
 			CheckInstall:      checkInstallOn(pass, store.CheckSocketInstall),
 			ServerCount:       count,
+			StartScopes:       doctorStartScopes(store),
 		},
 		release:   pass.end,
 		servers:   func() ([]string, error) { return names, countErr },

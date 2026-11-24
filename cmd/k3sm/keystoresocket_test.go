@@ -19,7 +19,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -27,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -259,6 +262,64 @@ func TestKeystoreSocketWiring(t *testing.T) {
 		}
 		if _, err := socket.NewSupervisor(cfg); err != nil {
 			t.Errorf("the supervisor refused the config: %v", err)
+		}
+	})
+
+	t.Run("the handler serves the store's operations", func(t *testing.T) {
+		f, peer := newInstalledWiringFixture(t)
+		cfg, closeAll, err := keystoreSocketConfig(f.deps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeAll()
+		ctx := t.Context()
+		// Before the start step every operation is the user scope off.
+		c := dialHandler(t, cfg.Handler, peer)
+		entry := "user/" + strconv.FormatUint(uint64(peer), 10) + "/token"
+		if code := c.errCode(t, c.call(t, map[string]any{"op": socket.OpList}, nil)); code != socket.CodeUserScopeOff {
+			t.Fatalf("list before the start step: code %q, want user-scope-off", code)
+		}
+		if cfg.StartScopes == nil {
+			t.Fatal("the config runs no start step")
+		}
+		if err := cfg.StartScopes(ctx); err != nil {
+			t.Fatalf("the start step: %v", err)
+		}
+		var v socket.VersionReply
+		c.reply(t, c.call(t, map[string]any{"op": socket.OpPut, "entry": entry}, []byte("s3cret")), &v)
+		if v.Version != 1 {
+			t.Fatalf("put: version %d, want 1", v.Version)
+		}
+		var l socket.ListReply
+		c.reply(t, c.call(t, map[string]any{"op": socket.OpList}, nil), &l)
+		if len(l.Entries) != 1 || l.Entries[0].Name != entry || l.Entries[0].Version != 1 || l.Entries[0].Status != "ok" {
+			t.Fatalf("list after the put: %+v, want the one entry at version 1", l.Entries)
+		}
+	})
+
+	t.Run("a start step that fails keeps the listener off with the store's reason", func(t *testing.T) {
+		f, _ := newInstalledWiringFixture(t)
+		cfg, closeAll, err := keystoreSocketConfig(f.deps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeAll()
+		audit := filepath.Join(f.dataRoot, keystore.LogsDirName, keystore.AuditDirName, keystore.AuditLogName)
+		if err := os.Remove(audit); err != nil {
+			t.Fatal(err)
+		}
+		reason, detail := socket.Preconditions{
+			EUID: func() int { return 277 }, ServiceUID: 277,
+			IgnoresOwnership:  func() (bool, error) { return false, nil },
+			CheckInstall:      func(context.Context) error { return nil },
+			MaintenanceMarked: func() (bool, error) { return false, nil },
+			OpenLogs:          func(context.Context) error { return nil },
+			SandboxCheck:      func() error { return nil },
+			ServerCount:       func(context.Context) (int, error) { return 1, nil },
+			StartScopes:       cfg.StartScopes,
+		}.Check(context.Background())
+		if reason != socket.OffUserScopeStart || !strings.Contains(detail, keystore.AuditLogName) {
+			t.Fatalf("Check = %q %q, want the start step's reason naming the audit log", reason, detail)
 		}
 	})
 
@@ -738,5 +799,144 @@ func TestDoctorKeystoreReopenJudgement(t *testing.T) {
 	}
 	if r, d := check(doctorOpenLogs(store, pass), pass.ignoresOwnership, pass.end); r != socket.OffSandboxCheckUnusable && r != "" {
 		t.Fatalf("doctor on an empty audit log: %q %q, want the log step passed", r, d)
+	}
+}
+
+// newInstalledWiringFixture is newWiringFixture over a keystore installed
+// in its temp data root: the test's own user stands in for the service
+// user, the logs carry the append flag through a fake flag source, each
+// uid has a fake GeneratedUID, and the master is minted as root's verbs
+// mint it. It returns a login uid that is not the service user's.
+func newInstalledWiringFixture(t *testing.T) (*wiringFixture, uint32) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("the test user stands in for the service user, which is never root")
+	}
+	f := newWiringFixture(t)
+	me, myGID := uint32(os.Getuid()), uint32(os.Getgid())
+	f.deps.serviceIDs = func() (uint32, uint32, error) { return me, myGID, nil }
+	f.deps.ignoresOwnership = func(*os.File) (bool, error) { return false, nil }
+	layout := f.deps.layout
+	f.deps.layout = func(work string) keystore.Config {
+		c := layout(work)
+		c.LogFlags = func(*os.File) (uint32, error) { return unix.SF_APPEND, nil }
+		c.GeneratedUID = func(uid uint32) ([16]byte, error) {
+			return [16]byte{0x10, 0x20, byte(uid), byte(uid >> 8), byte(uid >> 16), byte(uid >> 24), 1}, nil
+		}
+		return c
+	}
+	storeCfg := f.deps.layout(f.deps.workDir)
+	storeCfg.UID, storeCfg.GID = me, myGID
+	for _, d := range []struct {
+		p    string
+		mode os.FileMode
+	}{
+		{f.deps.workDir, 0o700},
+		{storeCfg.Dir, 0o700},
+		{filepath.Join(f.dataRoot, "keystore-sock"), 0o755},
+		{filepath.Join(f.dataRoot, keystore.LogsDirName), 0o755},
+		{filepath.Join(f.dataRoot, keystore.LogsDirName, keystore.FloorDirName), 0o755},
+		{filepath.Join(f.dataRoot, keystore.LogsDirName, keystore.AuditDirName), 0o755},
+	} {
+		if err := os.Mkdir(d.p, d.mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(d.p, d.mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{
+		filepath.Join(f.dataRoot, keystore.LogsDirName, keystore.AuditDirName, keystore.AuditLogName),
+		filepath.Join(f.dataRoot, keystore.LogsDirName, keystore.FloorDirName, "keystore-user-floor.log"),
+	} {
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := keystore.New(storeCfg).Put(t.Context(), "seed", keystore.KindOpaque, []byte("x")); err != nil {
+		t.Fatalf("minting the master: %v", err)
+	}
+	peer := uint32(600)
+	if peer == me {
+		peer++
+	}
+	return f, peer
+}
+
+// handlerConn is one fake peer's in-memory connection to a handler, after
+// HELLO.
+type handlerConn struct {
+	client net.Conn
+}
+
+// dialHandler serves h for a peer of uid over an in-memory pipe and
+// completes HELLO.
+func dialHandler(t *testing.T, h *socket.Handler, uid uint32) *handlerConn {
+	t.Helper()
+	client, server := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = h.Serve(t.Context(), server, socket.Peer{UID: uid, PID: 4242}) // the test reads the replies
+		_ = server.Close()                                                 // as the listener closes it
+	}()
+	t.Cleanup(func() {
+		_ = client.Close() // ends Serve
+		<-done
+	})
+	c := &handlerConn{client: client}
+	hello := fmt.Sprintf(`{"proto":%q,"min":1,"max":1}`, socket.Proto)
+	if err := socket.WriteFrame(client, socket.Frame{Type: socket.TypeHello, Header: []byte(hello)}); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := socket.ReadFrame(client); err != nil || f.Type != socket.TypeHello {
+		t.Fatalf("HELLO: %v, frame type %#02x", err, byte(f.Type))
+	}
+	return c
+}
+
+// call sends one request and returns the answer.
+func (c *handlerConn) call(t *testing.T, header map[string]any, value []byte) socket.Frame {
+	t.Helper()
+	b, err := json.Marshal(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := socket.WriteFrame(c.client, socket.Frame{Type: socket.TypeRequest, Header: b, Value: value}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := socket.ReadFrame(c.client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// errCode is f's error code, or "" for a reply.
+func (c *handlerConn) errCode(t *testing.T, f socket.Frame) socket.Code {
+	t.Helper()
+	if f.Type == socket.TypeReply {
+		return ""
+	}
+	var eh struct {
+		Code socket.Code `json:"code"`
+	}
+	if err := json.Unmarshal(f.Header, &eh); err != nil {
+		t.Fatalf("error header %s: %v", f.Header, err)
+	}
+	return eh.Code
+}
+
+// reply fails unless f is an ok reply, and decodes its header into out.
+func (c *handlerConn) reply(t *testing.T, f socket.Frame, out any) {
+	t.Helper()
+	if f.Type != socket.TypeReply {
+		t.Fatalf("answer %#02x %s, want an ok reply", byte(f.Type), f.Header)
+	}
+	if err := json.Unmarshal(f.Header, out); err != nil {
+		t.Fatalf("reply header %s: %v", f.Header, err)
 	}
 }

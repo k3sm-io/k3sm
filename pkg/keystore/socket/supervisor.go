@@ -75,6 +75,7 @@ const (
 	OffListenerUnavailable  OffReason = "the listening socket is unavailable"
 	OffListenerFailed       OffReason = "the listener failed"
 	OffSandboxCheckUnusable OffReason = "the peer sandbox check is unusable (sandbox-check-unusable)"
+	OffUserScopeStart       OffReason = "the user scope's start step failed"
 )
 
 // The supervisor's log text: every off line starts with offMsg, and the
@@ -153,6 +154,10 @@ type SupervisorConfig struct {
 	// SandboxCheck is Preconditions.SandboxCheck; production passes
 	// SandboxSelfCheck.
 	SandboxCheck func() error
+	// StartScopes is Preconditions.StartScopes; production runs the
+	// store's start step (keystore.FileStore.StartUserScopes) in it.
+	// Optional.
+	StartScopes func(ctx context.Context) error
 	// Creds, Sandbox, Audit and Handler are given to each run's Listener.
 	Creds   PeerCredSource
 	Sandbox PeerSandboxSource
@@ -339,6 +344,7 @@ func (s *Supervisor) check(ctx context.Context) (OffReason, string) {
 		CheckInstall:      s.cfg.CheckInstall,
 		ServerCount:       s.cfg.ServerCount,
 		SandboxCheck:      s.cfg.SandboxCheck,
+		StartScopes:       s.cfg.StartScopes,
 		EndPass:           s.cfg.EndPass,
 	}.Check(ctx)
 }
@@ -373,6 +379,13 @@ type Preconditions struct {
 	// with OffSandboxCheckUnusable, and so does a nil one. It runs before
 	// the server count.
 	SandboxCheck func() error
+	// StartScopes is optional and runs last, once every other check has
+	// passed: the supervisor runs the store's start step in it (the log
+	// bounds check, then the delivery catch-up), so the listener never
+	// serves a store whose user scope did not start; doctor runs the
+	// step's read-only half, the log bounds check. An error keeps the
+	// listener off with OffUserScopeStart and the store's reason.
+	StartScopes func(ctx context.Context) error
 	// EndPass is optional: when set, Check calls it once it returns, so a
 	// descriptor the pass opened (the data root, opened afresh by
 	// IgnoresOwnership) is closed when the pass ends.
@@ -381,7 +394,8 @@ type Preconditions struct {
 
 // Check runs the start checks in the design's order (the effective uid, the
 // mount flags, the installed files, the maintenance marker, the log reopen,
-// the sandbox self-check, a server count of exactly one) and returns the
+// the sandbox self-check, a server count of exactly one, the user scope's
+// start step) and returns the
 // first reason the listener may not start, with its error's text, or ""
 // when every check passes. Nothing is opened on the data root before its
 // mount flags and the installed files are vetted, so an install that
@@ -437,6 +451,11 @@ func (p Preconditions) Check(ctx context.Context) (OffReason, string) {
 		return OffServers, fmt.Sprintf("%d servers registered", n)
 	case n < 1:
 		return OffServersUnknown, fmt.Sprintf("%d servers registered", n)
+	}
+	if p.StartScopes != nil {
+		if _, err := guard(func() (struct{}, error) { return struct{}{}, p.StartScopes(ctx) }); err != nil {
+			return OffUserScopeStart, err.Error()
+		}
 	}
 	return "", ""
 }

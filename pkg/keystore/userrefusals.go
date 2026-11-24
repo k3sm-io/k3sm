@@ -40,6 +40,14 @@ func (s *FileStore) StartUserScopes(ctx context.Context) error {
 	return s.startUserScopes(ctx)
 }
 
+// UserScopesStarted reports whether the start step (StartUserScopes) has
+// started the user scope. The step can return an error and still have
+// started it: a scope it could not catch up is named in the error while
+// every other scope starts.
+func (s *FileStore) UserScopesStarted() bool {
+	return s.userScopesStarted != nil && s.userScopesStarted.Load()
+}
+
 // LogShareRefused reports whether err is one uid's own log refusal: a line
 // past that uid's share, or a revocation past the budget it draws on. It
 // matches ErrLogFull too, and is never the global append failure
