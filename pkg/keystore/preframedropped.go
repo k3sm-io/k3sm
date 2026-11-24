@@ -38,7 +38,8 @@ import (
 // "Per-uid fairness" and § "The audit log"): the pre-frame refusals counted
 // as dropped and not yet written to the audit log, by class and uid; the
 // post-frame refused lines the socket's limiter or the caller's share
-// dropped and not yet summarized, by uid (countClassPostFrame); and the
+// dropped, and the store's refusal lines auditBriefly could not write for
+// want of the lock, not yet summarized, by uid (countClassPostFrame); and the
 // committed revocations whose audit line could not be written
 // (countClassUnaudited), with no uid. The audit log's directory is root's,
 // so the server keeps it in the store directory it owns; the leading dot

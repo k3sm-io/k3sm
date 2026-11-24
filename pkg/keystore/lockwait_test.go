@@ -83,9 +83,10 @@ func TestLockWaitBoundsUserOps(t *testing.T) {
 }
 
 // A refusal that comes before its operation takes the lock appends its
-// line under the lock taken briefly; under a lock held past its wait the
-// line is not written and is counted in the uid's post-frame dropped
-// count, so the summary still accounts for it.
+// line under the lock taken briefly; under a lock held past its wait, or a
+// configuration checkConfig refuses, the line is not written and is
+// counted in the uid's post-frame dropped count (what a summary line
+// later writes is the refused lines' own concern, not checked here).
 func TestAuditBrieflyCountsLineLockKeptOut(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, server := newMasteredStore(t)
@@ -114,5 +115,26 @@ func TestAuditBrieflyCountsLineLockKeptOut(t *testing.T) {
 		if n := s.PostFrameDropped(1001); n != 1 {
 			t.Fatalf("a refusal under a lock held past its wait counted %d dropped, want 1", n)
 		}
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+			t.Fatal(err)
+		}
+		s.lockWait = -1 // a configuration checkConfig refuses
+		if s.checkConfig() == nil {
+			t.Fatal("checkConfig accepts a negative lock wait")
+		}
+		u.auditBriefly(context.Background(), auditLine{op: "put", name: auditPlaceholder}, ErrInvalidName)
+		if n := s.PostFrameDropped(1001); n != 2 {
+			t.Fatalf("a refusal under an invalid configuration counted %d dropped in all, want 2", n)
+		}
 	})
+}
+
+// AddPostFrameDropped on a store with no server counts does nothing, as
+// PostFrameDropped reads 0 there.
+func TestAddPostFrameDroppedWithoutCounts(t *testing.T) {
+	s := &FileStore{}
+	s.AddPostFrameDropped(1001, 3)
+	if n := s.PostFrameDropped(1001); n != 0 {
+		t.Fatalf("PostFrameDropped = %d without counts, want 0", n)
+	}
 }

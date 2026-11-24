@@ -4041,7 +4041,10 @@ refused before its first frame:
   appended under the store lock taken for it alone, and is charged to the caller's share,
   so a line past the share is not written. The 10 a minute are counted per uid on a sliding
   minute, rate-limited answers included, before the line is written; every line not written
-  (past the limit or the share, the lock not had, the append failed) is counted, and the
+  (past the limit or the share, the lock not had, the append failed) is counted, and so is
+  a store operation's refusal line that came before its lock and could not have it
+  (`auditBriefly`), in the same per-uid count, which `doctor` names as the socket's and the
+  store's refusal lines, and the
   count is written as one summary, `"result":"dropped"` with a `dropped` count and no
   `request`, at most once a minute (the first a minute after the uid's first refusal), the
   next time that uid is refused, before that refusal's own line. So a uid writes at most 11

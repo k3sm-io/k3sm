@@ -416,7 +416,7 @@ func keystorePreFrameDroppedHint(env doctorEnv, r checkResult) checkResult {
 			details = append(details, d)
 		}
 		if c.PostFrame > 0 {
-			details = append(details, fmt.Sprintf("%d post-frame refusal(s) not recorded for %d uid(s)", c.PostFrame, c.PostFrameUIDs))
+			details = append(details, fmt.Sprintf("%d post-frame refusal line(s), the socket's and the store's, not recorded for %d uid(s)", c.PostFrame, c.PostFrameUIDs))
 		}
 		if c.Unaudited > 0 {
 			details = append(details, fmt.Sprintf("%d committed keystore revocation(s) have no audit line", c.Unaudited))
