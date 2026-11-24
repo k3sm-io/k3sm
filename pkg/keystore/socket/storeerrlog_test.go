@@ -442,6 +442,33 @@ func floorDegradedErr(t *testing.T) error {
 	return err
 }
 
+// predicateErr is the error mk returns on a fresh started bridge, which
+// must match the store's predicate named name.
+func predicateErr(t *testing.T, name string, pred func(error) bool, mk func(*bridgeRig) error) error {
+	t.Helper()
+	err := mk(newStartedBridge(t, nil))
+	if !pred(err) {
+		t.Fatalf("%v does not match keystore.%s", err, name)
+	}
+	return err
+}
+
+// userScopeOffErr is a put to a store whose start step has not run
+// (keystore.UserScopeOff).
+func userScopeOffErr(t *testing.T) error {
+	t.Helper()
+	unstarted := newStoreRigWith(t, bridgeConfig(0, 0))
+	b, err := NewFileStoreBridge(unstarted.fs, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = b.Put(t.Context(), Peer{UID: uidA}, entryOf(uidA, "a"), keystore.KindOpaque, []byte("v"))
+	if !keystore.UserScopeOff(err) {
+		t.Fatalf("a put before the start step = %v, want UserScopeOff", err)
+	}
+	return err
+}
+
 // damageClass and outcomeOf judge every error in one order: each error
 // kind either function reads has its pinned reply and class, and over
 // every pair of them joined in one chain the class is one logged beside
@@ -473,6 +500,26 @@ func TestDamageClassAgreesWithOutcome(t *testing.T) {
 		{"typed credential", wrap(keystore.ErrTypedCredential), CodeRefused, ""},
 		{"rewrap in progress", wrap(keystore.ErrRewrapInProgress), CodeRefused, ""},
 		{"floor degraded", floorDegradedErr(t), CodeRefused, DamageFloorDegraded},
+		{"lock busy", predicateErr(t, "LockBusy", keystore.LockBusy, func(*bridgeRig) error { return newStartedBridge(t, nil).lockedPut(t) }), CodeBusy, ""},
+		{"user scope off", userScopeOffErr(t), CodeUserScopeOff, ""},
+		{"audit refused", predicateErr(t, "AuditRefused", keystore.AuditRefused, func(r *bridgeRig) error {
+			r.breakAudit(t)
+			_, err := r.b.Put(t.Context(), Peer{UID: uidA}, entryOf(uidA, "b"), keystore.KindOpaque, []byte("v"))
+			return err
+		}), CodeRefused, ""},
+		{"audit lost", auditLostErr(t), "", ""},
+		{"invalid value", predicateErr(t, "InvalidValue", keystore.InvalidValue, func(r *bridgeRig) error {
+			_, err := r.b.Put(t.Context(), Peer{UID: uidA}, entryOf(uidA, "k"), keystore.KindEd25519, []byte("SECRET!"))
+			return err
+		}), CodeRefused, ""},
+		{"ineligible uid", predicateErr(t, "IneligibleUID", keystore.IneligibleUID, func(r *bridgeRig) error {
+			_, err := r.b.List(t.Context(), Peer{UID: 100})
+			return err
+		}), CodeRefused, ""},
+		{"stored value failing its kind's check", wrap(fmt.Errorf("%w: version 1: %w", keystore.ErrCorrupt, predicateErr(t, "InvalidValue", keystore.InvalidValue, func(r *bridgeRig) error {
+			_, err := r.b.Put(t.Context(), Peer{UID: uidA}, entryOf(uidA, "k"), keystore.KindEd25519, []byte("SECRET!"))
+			return err
+		}))), CodeInternal, DamageCorrupt},
 		{"unsupported kind wrapped in corrupt", wrap(fmt.Errorf("%w: %w", keystore.ErrCorrupt, keystore.ErrKindUnsupported)), CodeInternal, DamageUnsupportedKind},
 		{"orphan version", wrap(fmt.Errorf("%w: %w", keystore.ErrCorrupt, keystore.ErrOrphanVersion)), CodeRefused, DamageOrphanVersion},
 		{"corrupt", wrap(keystore.ErrCorrupt), CodeInternal, DamageCorrupt},

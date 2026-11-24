@@ -4601,8 +4601,14 @@ surface, and the app consumes only those.
   logged `corrupt` (`TestNotFoundDamageLogged`, `TestScopeIncompleteIsNotNoScopeKey`). The class is judged inside the reply this table gives, in its
   order, so the log and the reply never disagree on a chain that matches more than one row:
   the floor's damage with `ErrCorrupt` answers `internal` and logs `corrupt`, and damage
-  behind a row that is not damage (`busy`, `not-found`) logs nothing
-  (`TestDamageClassAgreesWithOutcome`, over every kind both read and every pair of them). The error's own text is never logged: a chain can carry text a
+  behind a row that is not damage (`busy`, `not-found`) logs nothing. That agreement holds by
+  construction: `damageClass` calls `outcomeOf` first and picks a class only among those its
+  code can carry. What `TestDamageClassAgreesWithOutcome` pins is each error kind's reply and
+  class: every sentinel of the table, every predicate `outcomeOf` branches on, each made by
+  the real store where it is unexported (`LockBusy`, `UserScopeOff`, `AuditRefused`,
+  `AuditLost`, `InvalidValue`, `IneligibleUID`, `FloorDegraded`, `ScopeIncomplete`), and the
+  chains read-side damage takes; and, over every pair of those joined in one chain, that the
+  class is one logged beside the reply and that an internal reply is never left unlogged. The error's own text is never logged: a chain can carry text a
   decoder built from a decrypted value, and no error in `pkg/keystore` names a length, tag or
   byte of a value either. That is checked two ways: syntactically, every `len`, index or `tag`
   an error constructor takes must be on a reviewed list keyed by file and function
