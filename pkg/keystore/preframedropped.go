@@ -157,8 +157,15 @@ func (d preFrameDropped) counts() PreFrameDroppedCounts {
 	return out
 }
 
-// encodePreFrameDropped is d in the file's format: the preFrameDroppedUIDs
-// lowest uids named, the rest folded into one others line per class.
+// encodePreFrameDropped is d in the file's format: the lowest uids named,
+// in order, while they fit, and every count past that folded into one
+// others line per class. A uid line is folded, with every line after it,
+// once it would name more than preFrameDroppedUIDs uids, be longer than
+// preFrameDroppedMaxLine, or take the uid lines past the room
+// maxPreFrameDroppedSize leaves after the header and one others line per
+// class at the line bound. So the output always parses
+// (parsePreFrameDropped) and always fits, whatever d holds, and each
+// class's total is kept.
 func encodePreFrameDropped(d preFrameDropped) []byte {
 	keys := make([]preFrameKey, 0, len(d.uids))
 	for k, c := range d.uids {
@@ -173,18 +180,26 @@ func encodePreFrameDropped(d preFrameDropped) []byte {
 	}
 	var b bytes.Buffer
 	b.WriteString(preFrameDroppedHeader)
-	named := 0
+	room := maxPreFrameDroppedSize - len(preFrameDroppedHeader) - len(preFrameClasses)*preFrameDroppedMaxLine
+	named, folding := 0, false
 	var last uint32
 	for _, k := range keys {
-		if named == 0 || k.uid != last {
-			named++
-			last = k.uid
+		if !folding {
+			n := named
+			if n == 0 || k.uid != last {
+				n++
+			}
+			line := fmt.Sprintf("%d %s %d\n", k.uid, k.class, d.uids[k])
+			if n > preFrameDroppedUIDs || len(line) > preFrameDroppedMaxLine || len(line) > room {
+				folding = true
+			} else {
+				b.WriteString(line)
+				room -= len(line)
+				named, last = n, k.uid
+				continue
+			}
 		}
-		if named > preFrameDroppedUIDs {
-			others[k.class] = satAdd(others[k.class], d.uids[k])
-			continue
-		}
-		fmt.Fprintf(&b, "%d %s %d\n", k.uid, k.class, d.uids[k])
+		others[k.class] = satAdd(others[k.class], d.uids[k])
 	}
 	classes := slices.Clone(preFrameClasses)
 	slices.Sort(classes)

@@ -19,10 +19,13 @@ package keystore
 import (
 	"bytes"
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // writeDropped persists d as the server would, in s's store directory.
@@ -112,4 +115,121 @@ func TestRotateAuditKeepsDroppedOnRefusal(t *testing.T) {
 	if err != nil || !bytes.Equal(after, before) {
 		t.Fatalf("the persisted file after a rotate stopped before its swap: %q %v, want %q", after, err, before)
 	}
+}
+
+// TestRotateAuditIgnoresHostileDropped: whatever the service user leaves
+// at PreFrameDroppedName in place of the server's file cannot block audit
+// --rotate. A symlink to another file, a FIFO, a second hard link, mode
+// 0644, a file over the size cap and a file that does not parse each leave
+// the rotate succeeding, the new audit log with no count line, and the
+// name exactly as it was (a symlink's target untouched too).
+func TestRotateAuditIgnoresHostileDropped(t *testing.T) {
+	valid := func() []byte {
+		d := newPreFrameDropped()
+		d.uids[preFrameKey{preFrameClassLogin, 1001}] = 2
+		return encodePreFrameDropped(d)
+	}
+	write := func(t *testing.T, path string, b []byte, mode fs.FileMode) {
+		t.Helper()
+		if err := os.WriteFile(path, b, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		place func(t *testing.T, name, other string)
+	}{
+		{"symlink to another file", func(t *testing.T, name, other string) {
+			write(t, other, valid(), fileMode)
+			if err := os.Symlink(other, name); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"fifo", func(t *testing.T, name, _ string) {
+			if err := unix.Mkfifo(name, uint32(fileMode)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"second hard link", func(t *testing.T, name, other string) {
+			write(t, name, valid(), fileMode)
+			if err := os.Link(name, other); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"mode 0644", func(t *testing.T, name, _ string) {
+			write(t, name, valid(), 0o644)
+		}},
+		{"over the size cap", func(t *testing.T, name, _ string) {
+			b := append(valid(), bytes.Repeat([]byte("x"), maxPreFrameDroppedSize)...)
+			write(t, name, b, fileMode)
+		}},
+		{"does not parse", func(t *testing.T, name, _ string) {
+			write(t, name, []byte(preFrameDroppedHeader+"1001 login 02\n"), fileMode)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _ := fileLogScope(t)
+			name := filepath.Join(s.dir, PreFrameDroppedName)
+			other := filepath.Join(t.TempDir(), "other")
+			tc.place(t, name, other)
+			before := snapshotPath(t, name)
+			otherBefore := snapshotPath(t, other)
+			if _, err := s.RotateAudit(context.Background(), &inoRecorder{}, false); err != nil {
+				t.Fatalf("audit --rotate with a hostile %s: %v", PreFrameDroppedName, err)
+			}
+			if log := readLog(t, s, auditLogName); len(log) != 0 {
+				t.Fatalf("the new audit log holds a line for a hostile %s:\n%s", PreFrameDroppedName, log)
+			}
+			if after := snapshotPath(t, name); after != before {
+				t.Fatalf("%s after the rotate: %+v, want it as it was: %+v", PreFrameDroppedName, after, before)
+			}
+			if after := snapshotPath(t, other); after != otherBefore {
+				t.Fatalf("the other file after the rotate: %+v, want it as it was: %+v", after, otherBefore)
+			}
+		})
+	}
+}
+
+// pathSnapshot is what TestRotateAuditIgnoresHostileDropped compares of a
+// name: its lstat identity and mode, its link target, and a regular file's
+// bytes.
+type pathSnapshot struct {
+	exists  bool
+	mode    fs.FileMode
+	ino     uint64
+	nlink   uint64
+	target  string
+	content string
+}
+
+func snapshotPath(t *testing.T, path string) pathSnapshot {
+	t.Helper()
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		if err == unix.ENOENT {
+			return pathSnapshot{}
+		}
+		t.Fatal(err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := pathSnapshot{exists: true, mode: fi.Mode(), ino: uint64(st.Ino), nlink: uint64(st.Nlink)}
+	switch {
+	case fi.Mode()&fs.ModeSymlink != 0:
+		if snap.target, err = os.Readlink(path); err != nil {
+			t.Fatal(err)
+		}
+	case fi.Mode().IsRegular():
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snap.content = string(b)
+	}
+	return snap
 }
