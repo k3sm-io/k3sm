@@ -34,7 +34,7 @@ import (
 
 // TestRunServerStartsKeystoreSocket pins the startup call: runServer defers
 // the keystore-socket teardown step over startKeystoreSocket with the
-// runtime's posture (serverPodPosture) and the activated listener source
+// runtime's posture (serverPodPostureSource) and the activated listener source
 // (keystoreSocketListener), after the
 // keystore-delivery step, so LIFO stops the listener first and both before
 // the control plane.
@@ -80,20 +80,8 @@ func TestRunServerStartsKeystoreSocket(t *testing.T) {
 	if id, ok := socketCall.Fun.(*ast.Ident); !ok || id.Name != "startKeystoreSocket" || len(socketCall.Args) != 6 {
 		t.Fatal("the keystore-socket step is not startKeystoreSocket(...)")
 	}
-	noted := false
-	ast.Inspect(run.Body, func(n ast.Node) bool {
-		if c, ok := n.(*ast.CallExpr); ok {
-			if id, ok := c.Fun.(*ast.Ident); ok && id.Name == "notePodProfileCheckScope" {
-				noted = true
-			}
-		}
-		return true
-	})
-	if !noted {
-		t.Fatal("runServer does not log the Pod-profile check's scope (notePodProfileCheckScope)")
-	}
-	if !derivesServerPodPosture(socketCall.Args[2]) {
-		t.Fatal("startKeystoreSocket's posture is not func() { return serverPodPosture(...) }, the one the node's runtime renders from")
+	if c, ok := socketCall.Args[2].(*ast.CallExpr); !ok || c.Fun.(*ast.Ident).Name != "serverPodPostureSource" {
+		t.Fatal("startKeystoreSocket's posture is not serverPodPostureSource(), the one the node's runtime renders from")
 	}
 	if c, ok := socketCall.Args[4].(*ast.CallExpr); !ok || c.Fun.(*ast.Ident).Name != "keystoreSocketListener" {
 		t.Fatal("startKeystoreSocket's listener is not keystoreSocketListener()")
@@ -109,25 +97,6 @@ func TestRunServerStartsKeystoreSocket(t *testing.T) {
 	if d, k := idx("keystore-delivery"), idx("keystore-socket"); d < 0 || k < d {
 		t.Fatalf("keystore-socket (%d) is not deferred after keystore-delivery (%d)", k, d)
 	}
-}
-
-// derivesServerPodPosture reports whether e is a func literal whose one
-// statement returns serverPodPosture(...).
-func derivesServerPodPosture(e ast.Expr) bool {
-	lit, ok := e.(*ast.FuncLit)
-	if !ok || len(lit.Body.List) != 1 {
-		return false
-	}
-	ret, ok := lit.Body.List[0].(*ast.ReturnStmt)
-	if !ok || len(ret.Results) != 1 {
-		return false
-	}
-	call, ok := ret.Results[0].(*ast.CallExpr)
-	if !ok {
-		return false
-	}
-	id, ok := call.Fun.(*ast.Ident)
-	return ok && id.Name == "serverPodPosture"
 }
 
 // A process launchd did not start as the server's job (this test) gets no

@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"log/slog"
 	"path/filepath"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -54,6 +55,15 @@ func serverRuntimeDirs(opts serverOptions) nodeOptions {
 // DataRoot and StateDir alone.
 func serverPodPosture(opts serverOptions) (sandbox.Posture, error) {
 	return provider.RuntimePosture(runtimedConfig(serverRuntimeDirs(opts), nil))
+}
+
+// serverPodPostureSource is the socket's posture source for the server
+// opts configures: serverPodPosture, derived afresh on every call. It logs
+// once, now, when the Pod-profile check does not apply to the node's Pods
+// (notePodProfileCheckScope).
+func serverPodPostureSource(opts serverOptions, log *slog.Logger) func() (sandbox.Posture, error) {
+	notePodProfileCheckScope(opts.rtName, log)
+	return func() (sandbox.Posture, error) { return serverPodPosture(opts) }
 }
 
 // keystoreProfileProbePod is the pod directory, under the posture's pods

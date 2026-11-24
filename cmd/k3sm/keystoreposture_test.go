@@ -156,8 +156,23 @@ func TestServerPodPostureFailureIsConfiguration(t *testing.T) {
 }
 
 // Under --runtime hostprocess the start log says the Pod-profile check does
-// not apply, and why; under runtimed it says nothing.
+// not apply, and why; under runtimed it says nothing. The socket's posture
+// source logs it once, when built, and derives serverPodPosture.
 func TestPodProfileCheckScopeLoggedForHostProcess(t *testing.T) {
+	opts := serverOptions{workDir: install.DefaultDataRoot + "/server", rtName: runtimeHostProcess}
+	var buf bytes.Buffer
+	derive := serverPodPostureSource(opts, slog.New(slog.NewTextHandler(&buf, nil)))
+	if !strings.Contains(buf.String(), "does not apply under --runtime hostprocess") {
+		t.Fatalf("the posture source logged %q", buf.String())
+	}
+	got, gerr := derive()
+	want, werr := serverPodPosture(opts)
+	if got != want || (gerr == nil) != (werr == nil) {
+		t.Fatalf("the posture source derived %+v, %v; serverPodPosture %+v, %v", got, gerr, want, werr)
+	}
+	if n := strings.Count(buf.String(), "\n"); n != 1 {
+		t.Fatalf("logged %d lines, want the one at build:\n%s", n, buf.String())
+	}
 	for _, tt := range []struct {
 		runtime string
 		logged  bool

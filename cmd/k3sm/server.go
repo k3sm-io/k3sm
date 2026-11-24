@@ -63,7 +63,6 @@ import (
 	"k3sm.io/k3sm/pkg/runtimeclass"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/update"
-	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
@@ -639,8 +638,7 @@ func runServer(args []string) (err error) {
 	defer timedTeardownStep(logger, "helm-controller", stopHelm)
 	defer timedTeardownStep(logger, "manifest-dir", startManifestDir(ctx, restCfg, cs, logger))
 	defer timedTeardownStep(logger, "keystore-delivery", startKeystoreDelivery(ctx, plan, cs, logger))
-	notePodProfileCheckScope(plan.opts.rtName, logger)
-	defer timedTeardownStep(logger, "keystore-socket", startKeystoreSocket(ctx, plan.opts.workDir, func() (sandbox.Posture, error) { return serverPodPosture(plan.opts) }, cs, keystoreSocketListener(plan.opts.workDir), logger))
+	defer timedTeardownStep(logger, "keystore-socket", startKeystoreSocket(ctx, plan.opts.workDir, serverPodPostureSource(plan.opts, logger), cs, keystoreSocketListener(plan.opts.workDir), logger))
 	vmCapable := vmBackendAvailable() // can this node host vm guests? (3d registry, 4c datapath)
 	// 3d. The ingest registry; torn down EARLY, on cpStop's lane, and the defer is its backstop.
 	stopRegistry, registryPuller := startServerRegistry(ctx, plan, restCfg, cs, vmCapable, cpStop, logger)
