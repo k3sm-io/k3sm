@@ -297,6 +297,44 @@ func TestKeystoreSocketWiring(t *testing.T) {
 		}
 	})
 
+	t.Run("the store waits the socket's lock bound, then answers busy", func(t *testing.T) {
+		f, peer := newInstalledWiringFixture(t)
+		cfg, closeAll, err := keystoreSocketConfig(f.deps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeAll()
+		if err := cfg.StartScopes(t.Context()); err != nil {
+			t.Fatalf("the start step: %v", err)
+		}
+		// Another holder takes the store lock exclusively, as a root verb
+		// would, and keeps it for the whole request.
+		storeCfg := f.deps.layout(f.deps.workDir)
+		held, err := os.Open(filepath.Join(storeCfg.Dir, ".lock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = held.Close() }()
+		if err := unix.Flock(int(held.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Test(t, func(t *testing.T) {
+			c := dialHandler(t, cfg.Handler, peer)
+			start := time.Now()
+			code := c.errCode(t, c.call(t, map[string]any{"op": socket.OpList}, nil))
+			waited := time.Since(start)
+			if code != socket.CodeBusy {
+				t.Fatalf("list with the store lock held: code %q, want busy", code)
+			}
+			// The store's own wait is the socket's bound, not the store's
+			// default: it gives up once socket.LockWait has passed on the
+			// bubble's clock, and not before.
+			if waited < socket.LockWait || waited > socket.LockWait+time.Second {
+				t.Fatalf("busy after %v, want just past the socket's bound of %v", waited, socket.LockWait)
+			}
+		})
+	})
+
 	t.Run("a start step that fails keeps the listener off with the store's reason", func(t *testing.T) {
 		f, _ := newInstalledWiringFixture(t)
 		cfg, closeAll, err := keystoreSocketConfig(f.deps)
