@@ -119,6 +119,36 @@ server's per-boot credential, `<work-dir>/registry/push-credential.json` (mode `
 server as root, `sudo k3sm image --work-dir /var/lib/k3sm/server untag <tag>`. That credential is
 regenerated on every server start. An account that can read it uses it for all four verbs.
 
+## macOS app bundles
+
+The standalone [app-bundle.sh](../../hack/app-bundle.sh) helper publishes signed macOS
+apps under `apps/` in this registry. Each tag names an OCI manifest with artifact type
+`application/vnd.k3sm.app.bundle.v1`, an OCI empty config and one
+`application/vnd.k3sm.app.bundle.v1+zip` layer, titled `bundle.zip` for OCI artifact clients. The layer is a macOS `ditto` archive
+containing the top-level `.app`. The bundle's executable modes, symlinks and signature
+travel together. Registry storage, tag resolution, quotas and garbage collection use the
+same paths as images. A pod can consume the archive as data. The archive is not a pod
+root filesystem. To discover published app tags and their digests while the catalog streams:
+
+```sh
+k3sm image ls -o ndjson | jq -c 'select(.type == "image") | select(.repository | startswith("apps/")) | {repository,tag,digest}'
+```
+
+On the building Mac, run the helper after the build and signing step succeeds.
+
+```sh
+./hack/app-bundle.sh push ./Example.app apps/example:dev
+```
+
+Push makes a private copy of the bundle, verifies its code signature, and packages it
+using macOS tools. The upload uses the existing builder credential from `k3sm image push`.
+Use a temporary directory you own with room for the copy and archive. The helper caps
+archives at 8 GiB. Only a successful publish moves the tag. Keep a version tag on builds
+that should remain reachable through garbage collection. Push prints the manifest digest.
+
+The signature check accepts ad-hoc builds. Consumers that install an archive must
+independently verify the expected publisher identity.
+
 ## Pulling
 
 Pulls are anonymous. The node's runtime pulls with no credential at all, which is what lets a Pod

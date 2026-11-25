@@ -339,6 +339,10 @@ grep -q 'replace google.golang.org/genproto' go.mod || { echo "missing genproto 
 # the real module: hack/acceptance/ci_guard_test.go runs this script in a
 # throwaway module whose graph the lock could never describe.
 if grep -qx "module k3sm.io/k3sm" go.mod 2>/dev/null; then
+	if [ "$(uname -s)" = Darwin ]; then
+		echo "==> [k3sm] macOS app bundle artifact"
+		hack/test-app-bundle.sh
+	fi
 	# The native metrics-server image recipe (hack/images/metrics-server): its
 	# pins, records and refusals, hermetically. The build itself is operator-run.
 	echo "==> [k3sm] metrics-server image recipe (self-test)"
