@@ -19,6 +19,7 @@ usage() {
     cat >&2 <<'USAGE'
 Usage: app-bundle.sh push App.app apps/name:tag
        app-bundle.sh pull apps/name:tag|apps/name@sha256:... destination.zip
+       app-bundle.sh watch apps/name:tag destination.zip [interval-in-seconds]
 USAGE
     exit 2
 }
@@ -168,8 +169,14 @@ download() {
     echo "downloaded $repo@$actual to $output"
 }
 
+# Keep retries outside this lock so another consumer can sync between polls.
+locked_pull() {
+    local script=$1 ref=$2 output=$3
+    /usr/bin/lockf -k "$output.lock" /bin/bash "$script" _pull "$ref" "$output"
+}
+
 main() {
-    local verb=${1:-} output
+    local verb=${1:-} output interval
     case "$verb" in
         push)
             [[ $# == 3 ]] || usage
@@ -177,9 +184,10 @@ main() {
             [[ $reference != sha256:* ]] || die "push requires a tag"
             publish "$2"
             ;;
-        pull|_pull)
-            [[ $# == 3 ]] || usage
+        pull|watch|_pull)
+            [[ $# == 3 || ( $verb == watch && $# == 4 ) ]] || usage
             parse_ref "$2"
+            [[ $verb != watch || $reference != sha256:* ]] || die "watch requires a mutable tag"
             output=$3
             output=$(physical_file "$output")
             trusted_dir "$(dirname "$output")"
@@ -188,7 +196,17 @@ main() {
             if [[ $verb == _pull ]]; then download "$output"; return; fi
             local script
             script=$(physical_file "$0")
-            /usr/bin/lockf -k "$output.lock" /bin/bash "$script" _pull "$2" "$output"
+            interval=${4:-60}
+            [[ $interval =~ ^[1-9][0-9]{0,5}$ ]] || die "expected a positive polling interval of up to six digits"
+            while :; do
+                if locked_pull "$script" "$2" "$output"; then
+                    [[ $verb == watch ]] || return 0
+                else
+                    [[ $verb == watch ]] || return 1
+                    echo "app-bundle: download failed; retrying in ${interval}s" >&2
+                fi
+                sleep "$interval"
+            done
             ;;
         *) usage ;;
     esac
