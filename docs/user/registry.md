@@ -135,7 +135,7 @@ k3sm image ls -o ndjson | jq -c 'select(.type == "image") | select(.repository |
 ```
 
 On the building Mac, publish a completed bundle to a channel tag. On the receiving Mac,
-fetch the archive by tag or digest. Both Macs need the helper file and
+fetch it once or leave a foreground watcher running. Both Macs need the helper file and
 k3sm. The helper uses tools supplied by macOS 26, including Bash, jq, curl and ditto.
 
 ```sh
@@ -144,6 +144,7 @@ k3sm. The helper uses tools supplied by macOS 26, including Bash, jq, curl and d
 
 # Consumer, in a writable directory
 ./hack/app-bundle.sh pull apps/example:dev ./Example.zip
+./hack/app-bundle.sh watch apps/example:dev ./Example.zip 60
 ```
 
 Push makes a private copy of the bundle, verifies its code signature, packages it and
@@ -164,9 +165,15 @@ Only the archive is downloaded. A program that installs it must independently ve
 the publisher identity it expects, such as a Developer ID Team ID, and its installation policy.
 An ad-hoc signature also passes the publisher's structural signature check.
 
+Watch resolves the tag every 60 seconds by default. It checks an existing local archive
+against the advertised layer and skips downloading an identical file. A failed read keeps
+the last complete archive and retries on the next poll. The adjacent `.lock` file serializes
+writers for that destination. Stop the watcher with Control-C. Watch does not extract,
+replace or launch a GUI, so a new build cannot interrupt a running app.
+
 On a cluster Mac, pull uses the cluster CA from the current k3sm kubeconfig and the ready
 endpoint of `k3sm-registry/registry-k3sm`. That identity needs permission to get the named
-EndpointSlice. In a native macOS pod, include the helper and its system tools; pulls
+EndpointSlice. In a native macOS pod, include the helper and its system tools; pull and watch
 use the mounted service-account CA and the registry Service’s fully qualified DNS name directly, with anonymous HTTPS
 reads. `REGISTRY_K3SM_SERVICE_PORT` may supply a different published port. Blob reads are
 confined to the selected repository on that TLS endpoint.
