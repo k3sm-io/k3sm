@@ -134,20 +134,42 @@ root filesystem. To discover published app tags and their digests while the cata
 k3sm image ls -o ndjson | jq -c 'select(.type == "image") | select(.repository | startswith("apps/")) | {repository,tag,digest}'
 ```
 
-On the building Mac, run the helper after the build and signing step succeeds.
+On the building Mac, publish a completed bundle to a channel tag. On the receiving Mac,
+fetch the archive by tag or digest. Both Macs need the helper file and
+k3sm. The helper uses tools supplied by macOS 26, including Bash, jq, curl and ditto.
 
 ```sh
+# Publisher, after the build and signing step succeeds
 ./hack/app-bundle.sh push ./Example.app apps/example:dev
+
+# Consumer, in a writable directory
+./hack/app-bundle.sh pull apps/example:dev ./Example.zip
 ```
 
-Push makes a private copy of the bundle, verifies its code signature, and packages it
-using macOS tools. The upload uses the existing builder credential from `k3sm image push`.
-Use a temporary directory you own with room for the copy and archive. The helper caps
-archives at 8 GiB. Only a successful publish moves the tag. Keep a version tag on builds
-that should remain reachable through garbage collection. Push prints the manifest digest.
+Push makes a private copy of the bundle, verifies its code signature, packages it and
+uploads through the existing `k3sm image push` credential path. The publisher needs
+temporary space for that copy and the archive. Use a trusted temporary directory and
+a trusted download directory, owned by the caller. The helper rejects group- or
+world-writable directories; give other users no write access through ACLs or parent directories. The cluster accepts archives up to the
+registry's configured limits; the helper caps an archive at 8 GiB. A build pipeline can
+run the publish command after each successful build. Only completed pushes move the tag.
+Any principal authorized to write the repository can move it. Use a separate version
+tag for builds that should remain reachable through garbage collection.
 
-The signature check accepts ad-hoc builds. Consumers that install an archive must
-independently verify the expected publisher identity.
+The push prints a manifest digest. To download that exact build, replace `:dev` with
+`@sha256:<64 lowercase hex digits>` in the pull command. The downloader checks a pinned
+manifest against its digest, validates the artifact type and layer descriptor, and checks
+the archive length and SHA-256 before renaming a private temporary file over the destination.
+Only the archive is downloaded. A program that installs it must independently verify
+the publisher identity it expects, such as a Developer ID Team ID, and its installation policy.
+An ad-hoc signature also passes the publisher's structural signature check.
+
+On a cluster Mac, pull uses the cluster CA from the current k3sm kubeconfig and the ready
+endpoint of `k3sm-registry/registry-k3sm`. That identity needs permission to get the named
+EndpointSlice. In a native macOS pod, include the helper and its system tools; pulls
+use the mounted service-account CA and the registry Service’s fully qualified DNS name directly, with anonymous HTTPS
+reads. `REGISTRY_K3SM_SERVICE_PORT` may supply a different published port. Blob reads are
+confined to the selected repository on that TLS endpoint.
 
 ## Pulling
 
