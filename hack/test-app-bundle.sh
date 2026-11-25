@@ -89,3 +89,24 @@ printf 'updated valid bytes' > "$fixture/blob"
 read_fixture apps/example:dev
 cmp "$fixture/blob" "$fixture/fetched.zip"
 echo "app-bundle: archive round trip, unchanged pull, update and rejection checks passed"
+
+# Drive the watch loop without sleeping or contacting the registry. The first
+# poll fails, the second succeeds, and the watcher must schedule both intervals.
+(
+    polls=0
+    locked_pull() {
+        [[ $2 == apps/example:dev && $3 == "$(physical_file "$fixture/fetched.zip")" ]] || exit 1
+        polls=$((polls + 1))
+        echo "$polls" >> "$fixture/polls"
+        [[ $polls -gt 1 ]]
+    }
+    sleep() {
+        [[ $1 == 7 ]] || exit 1
+        if [[ $polls == 2 ]]; then exit 0; fi
+    }
+    main watch apps/example:dev "$fixture/fetched.zip" 7
+)
+[[ $(cat "$fixture/polls") == $'1\n2' ]] || die "watch did not retry"
+if "$here/app-bundle.sh" watch "apps/example@$pin" "$fixture/fetched.zip"; then die "watched a pinned reference"; fi
+if "$here/app-bundle.sh" watch apps/example:dev "$fixture/fetched.zip" 0; then die "allowed a busy poll"; fi
+echo "app-bundle: watch retries and input checks passed"
