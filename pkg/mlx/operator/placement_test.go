@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -270,6 +271,29 @@ func TestValidateDistributed(t *testing.T) {
 			}
 			if !tc.ok && !errors.Is(err, ErrInvalidDistributed) {
 				t.Errorf("ValidateDistributed() = %v, want ErrInvalidDistributed", err)
+			}
+		})
+	}
+}
+
+func TestFreshNodeBudgetLimitsNewRankPlacement(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	model := shardSpec(2, mlxv1alpha1.MLXDistributedBackendRing, "8Gi")
+	nodes := []corev1.Node{gpuNode("a", "16Gi", false), gpuNode("b", "16Gi", false)}
+	const report = `{"schema":1,"observedAt":"2026-11-01T12:00:00Z","platform":"darwin","level":"ok","admit":true,"darwin":{},"recommendation":{"safeAdditionalBytes":1}}`
+	nodes[0].Annotations = map[string]string{"budget.k3sm.io/status": report}
+	for _, tc := range []struct {
+		name string
+		at   time.Time
+		fits bool
+	}{
+		{"fresh observation", now, false},
+		{"expired observation", now.Add(91 * time.Second), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := placeAt(model, Cable{}, nodes, nil, tc.at)
+			if (err == nil) != tc.fits {
+				t.Fatalf("placement error = %v, want fits %v", err, tc.fits)
 			}
 		})
 	}
