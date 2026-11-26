@@ -247,7 +247,7 @@ func (c *Controller) reconcileSharded(ctx context.Context, key string, raw *unst
 	if err != nil {
 		return fmt.Errorf("list pods for mlxmodel %s gpu slots: %w", key, err)
 	}
-	placement, err := Place(model, cable, nodes.Items, HeldGPUSlots(model, allPods.Items))
+	placement, err := placeAt(model, cable, nodes.Items, HeldGPUSlots(model, allPods.Items), c.now())
 	var refused *PlacementError
 	if errors.As(err, &refused) {
 		c.log.Info("sharded mlxmodel cannot be placed yet; no rank pod created",

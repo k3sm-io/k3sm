@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -31,6 +32,7 @@ import (
 	"k3sm.io/k3sm/pkg/gpucapacity"
 	"k3sm.io/k3sm/pkg/mlx"
 	"k3sm.io/k3sm/pkg/mlx/topology"
+	"k3sm.io/k3sm/pkg/placement"
 )
 
 // Placement is a decided placement of a sharded model's ranks (see
@@ -124,6 +126,10 @@ func (e *PlacementError) Error() string { return e.Reason + ": " + e.Message }
 // are ordered), so a gang restart over an unchanged cluster lands every rank
 // where it was.
 func Place(model *mlxv1alpha1.MLXModel, cable Cable, nodes []corev1.Node, held map[string]int64) (Placement, error) {
+	return placeAt(model, cable, nodes, held, time.Now())
+}
+
+func placeAt(model *mlxv1alpha1.MLXModel, cable Cable, nodes []corev1.Node, held map[string]int64, now time.Time) (Placement, error) {
 	d := model.Spec.Distributed
 	if d == nil || d.Ranks < 2 {
 		return Placement{}, &PlacementError{Reason: mlx.ReasonNoDirectLinkTopology, Message: "spec.distributed.ranks must be at least 2"}
@@ -157,7 +163,7 @@ func Place(model *mlxv1alpha1.MLXModel, cable Cable, nodes []corev1.Node, held m
 			continue
 		}
 		free = append(free, node.Name)
-		if mem, ok := node.Status.Allocatable[corev1.ResourceMemory]; ok && mem.Cmp(perRank) >= 0 {
+		if mem, ok := node.Status.Allocatable[corev1.ResourceMemory]; ok && mem.Cmp(perRank) >= 0 && placement.BudgetAllows(node.Annotations, perRank, now) {
 			fitting = append(fitting, node.Name)
 		}
 	}
@@ -178,7 +184,7 @@ func Place(model *mlxv1alpha1.MLXModel, cable Cable, nodes []corev1.Node, held m
 	if len(fitting) < n {
 		return Placement{}, &PlacementError{
 			Reason: mlx.ReasonInsufficientMemory,
-			Message: fmt.Sprintf("each of %d ranks needs %s of allocatable memory; %d of %d candidate nodes have it%s",
+			Message: fmt.Sprintf("each of %d ranks needs %s of allocatable memory within the current node budget; %d of %d candidate nodes have it%s",
 				n, perRank.String(), len(fitting), len(free), nameList(fitting)),
 		}
 	}
